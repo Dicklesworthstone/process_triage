@@ -795,6 +795,7 @@ mod tests {
                 confidence: Default::default(),
                 original_zombie_target: None,
                 d_state_diagnostics: None,
+                supervisor_restart: None,
             }
         }
 

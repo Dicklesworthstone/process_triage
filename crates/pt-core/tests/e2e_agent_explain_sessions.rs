@@ -97,6 +97,7 @@ fn create_session_with_plan(_dir: &TempDir, identity: ProcessIdentity, blocked: 
             confidence: ActionConfidence::Normal,
             original_zombie_target: None,
             d_state_diagnostics: None,
+            supervisor_restart: None,
         }],
         pre_toggled: Vec::new(),
         gates_summary: GatesSummary {
@@ -869,6 +870,7 @@ fn verify_cli_confirms_fresh_all_thread_renice_without_claiming_resource_relief(
             executed_at: Some(executed_at),
             execution_clock: Some(execution_clock),
             time_ms: None,
+            supervisor_restart: None,
         };
         fs::create_dir_all(handle.dir.join("action")).unwrap();
         fs::write(

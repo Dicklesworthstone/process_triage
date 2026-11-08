@@ -412,6 +412,15 @@ impl ProtectedFilter {
         record: &ProcessRecord,
         role: super::cgroup::CgroupRole,
     ) -> Option<ProtectedMatch> {
+        self.is_protected_with_role_and_restart(record, role, false)
+    }
+
+    fn is_protected_with_role_and_restart(
+        &self,
+        record: &ProcessRecord,
+        role: super::cgroup::CgroupRole,
+        bound_restart: bool,
+    ) -> Option<ProtectedMatch> {
         let pid = record.pid.0;
         let ppid = record.ppid.0;
         let make = |field: MatchedField, pattern: String, notes: Option<String>| ProtectedMatch {
@@ -433,6 +442,8 @@ impl ProtectedFilter {
                 ));
             }
             match builtin_placement(role, &record.user, &record.comm, &record.cmd) {
+                BuiltinPlacement::SupervisedService
+                    if bound_restart && role == super::cgroup::CgroupRole::UserService => {}
                 BuiltinPlacement::SupervisedService => {
                     return Some(make(
                         MatchedField::SupervisedService,
@@ -544,6 +555,18 @@ impl ProtectedFilter {
     ///
     /// Returns a `FilterResult` containing passed processes and filtered info.
     pub fn filter_scan_result(&self, scan_result: &ScanResult) -> FilterResult {
+        self.filter_scan_result_with_restarts(scan_result, |_| None)
+    }
+
+    /// Admit a user service to planning only with its separately verified
+    /// restart binding. This waives placement protection alone: invoker chains,
+    /// service ancestors, explicit users/PIDs and command patterns still apply.
+    /// The planner must restrict these records to Keep or supervisor Restart.
+    pub fn filter_scan_result_with_restarts<'a>(
+        &self,
+        scan_result: &ScanResult,
+        mut restart: impl FnMut(&ProcessRecord) -> Option<&'a crate::action::SystemdUserServiceBinding>,
+    ) -> FilterResult {
         let total_before = scan_result.processes.len();
         let mut passed = Vec::with_capacity(total_before);
         let mut filtered = Vec::new();
@@ -566,21 +589,35 @@ impl ProtectedFilter {
                     notes: Some("pt itself or one of the processes that invoked it".to_string()),
                 })
             } else {
-                self.is_protected(record).or_else(|| {
-                    let (daemon_pid, daemon) = self
-                        .builtin
-                        .then(|| service_ancestor(record.pid.0, &by_pid))??;
-                    Some(ProtectedMatch {
-                        pid: record.pid.0,
-                        comm: record.comm.clone(),
-                        cmd_truncated: truncate_cmd(&record.cmd, 80),
-                        matched_field: MatchedField::Builtin,
-                        pattern: "builtin.service_child".to_string(),
-                        notes: Some(format!(
-                            "worker/plugin of service {daemon} (pid {daemon_pid})"
-                        )),
+                let bound_restart = restart(record).is_some_and(|binding| {
+                    binding.target.pid == record.pid
+                        && binding.target.start_id == record.start_id
+                        && binding.target.uid == record.uid
+                        && binding.target.pgid == record.pgid
+                        && binding.target.sid == record.sid
+                        && binding.matches_target(&binding.target)
+                });
+                let role = if self.builtin {
+                    super::cgroup::read_cgroup_role(record.pid.0)
+                } else {
+                    super::cgroup::CgroupRole::Unknown
+                };
+                self.is_protected_with_role_and_restart(record, role, bound_restart)
+                    .or_else(|| {
+                        let (daemon_pid, daemon) = self
+                            .builtin
+                            .then(|| service_ancestor(record.pid.0, &by_pid))??;
+                        Some(ProtectedMatch {
+                            pid: record.pid.0,
+                            comm: record.comm.clone(),
+                            cmd_truncated: truncate_cmd(&record.cmd, 80),
+                            matched_field: MatchedField::Builtin,
+                            pattern: "builtin.service_child".to_string(),
+                            notes: Some(format!(
+                                "worker/plugin of service {daemon} (pid {daemon_pid})"
+                            )),
+                        })
                     })
-                })
             };
             if let Some(match_info) = protection {
                 debug!(
@@ -1359,6 +1396,60 @@ mod tests {
 
     fn default_filter() -> ProtectedFilter {
         ProtectedFilter::from_guardrails(&crate::config::policy::Guardrails::default()).unwrap()
+    }
+
+    #[test]
+    fn supervisor_restart_only_waives_user_service_placement() {
+        let guards = crate::config::policy::Guardrails {
+            never_kill_pid: vec![1],
+            ..Default::default()
+        };
+        let filter = ProtectedFilter::from_guardrails(&guards).unwrap();
+        let ordinary = make_test_record(43210, 4000, "sleep", "sleep 600", "alice");
+        assert_eq!(
+            filter
+                .is_protected_with_role(&ordinary, CgroupRole::UserService)
+                .unwrap()
+                .matched_field,
+            MatchedField::SupervisedService
+        );
+        assert!(filter
+            .is_protected_with_role_and_restart(&ordinary, CgroupRole::UserService, true)
+            .is_none());
+        for role in [CgroupRole::SystemService, CgroupRole::Container] {
+            assert_eq!(
+                filter
+                    .is_protected_with_role_and_restart(&ordinary, role, true)
+                    .unwrap()
+                    .matched_field,
+                MatchedField::SupervisedService
+            );
+        }
+        for protected in [
+            make_test_record(1, 0, "sleep", "sleep 600", "alice"),
+            make_test_record(43210, 1, "sleep", "sleep 600", "alice"),
+            make_test_record(43210, 4000, "sleep", "sleep 600", "root"),
+            make_test_record(43210, 4000, "sshd", "/usr/sbin/sshd -D", "alice"),
+        ] {
+            assert!(
+                filter
+                    .is_protected_with_role_and_restart(&protected, CgroupRole::UserService, true)
+                    .is_some(),
+                "lost explicit or built-in protection for {protected:?}"
+            );
+        }
+        let guards = crate::config::policy::Guardrails {
+            protected_users: vec!["alice".to_string()],
+            ..Default::default()
+        };
+        let explicit = ProtectedFilter::from_guardrails(&guards).unwrap();
+        assert_eq!(
+            explicit
+                .is_protected_with_role_and_restart(&ordinary, CgroupRole::UserService, true)
+                .unwrap()
+                .matched_field,
+            MatchedField::User
+        );
     }
 
     /// One placement rule for the scan filter and the enforcer, with the platform

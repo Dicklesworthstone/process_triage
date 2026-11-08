@@ -25,6 +25,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
+use crate::action::SystemdUserServiceBinding;
 use crate::collect::{ProcessActivity, ProcessRecord};
 use crate::config::{Policy, Priors, ResolvedConfig};
 use crate::decision::decision_store::{DecisionStore, LearnedPrior};
@@ -264,6 +265,9 @@ pub struct ProcessScore<'a> {
     /// Observed kill/respawn history for this command and exact parent incarnation.
     /// This informs action utility and review, never the class posterior.
     pub respawn_history: Option<RespawnLoopSummary>,
+    /// A separately observed service route; it never changes class probabilities.
+    pub supervisor_restart: Option<SystemdUserServiceBinding>,
+    pub supervisor_restart_unavailable: Option<String>,
     /// Whether shared inference was bypassed. Signature candidates currently
     /// require verification, so scoring retains that inference and reports false.
     pub fast_path_used: bool,
@@ -288,8 +292,16 @@ pub struct Scorer {
     activity_window: Option<Duration>,
     activity: BTreeMap<u32, ProcessActivity>,
     respawn_history: BTreeMap<u32, (pt_common::StartId, u32, RespawnLoopSummary)>,
+    supervisor_restarts: BTreeMap<u32, SupervisorRestartObservation>,
     #[cfg(target_os = "linux")]
     provenance: Option<ProvenanceInferenceBundle>,
+}
+
+#[derive(Debug, Clone)]
+struct SupervisorRestartObservation {
+    target: pt_common::ProcessIdentity,
+    binding: Option<SystemdUserServiceBinding>,
+    unavailable: Option<String>,
 }
 
 impl Scorer {
@@ -307,6 +319,7 @@ impl Scorer {
             activity_window: None,
             activity: BTreeMap::new(),
             respawn_history: BTreeMap::new(),
+            supervisor_restarts: BTreeMap::new(),
             #[cfg(target_os = "linux")]
             provenance: None,
         }
@@ -349,6 +362,82 @@ impl Scorer {
         {
             let _ = processes;
         }
+    }
+
+    /// Discover read-only service capabilities once per census. A refresh drops
+    /// every earlier binding, including failures and reused process identities.
+    pub fn collect_supervisor_restarts(&mut self, processes: &[ProcessRecord]) {
+        self.supervisor_restarts.clear();
+        let mut seen = std::collections::HashSet::new();
+        let mut ambiguous = std::collections::HashSet::new();
+        for process in processes {
+            if !seen.insert(process.pid.0) {
+                ambiguous.insert(process.pid.0);
+            }
+        }
+        for process in processes {
+            if ambiguous.contains(&process.pid.0) {
+                continue;
+            }
+            let target = pt_common::ProcessIdentity::full(
+                process.pid.0,
+                process.start_id.clone(),
+                process.uid,
+                process.pgid,
+                process.sid,
+                if process.start_id.0.starts_with("unknown:")
+                    || process.start_id.0.starts_with("synthetic:")
+                {
+                    pt_common::IdentityQuality::NoBootId
+                } else {
+                    pt_common::IdentityQuality::Full
+                },
+            );
+            let (binding, unavailable) = match crate::action::discover_systemd_user_restart(&target)
+            {
+                Ok(binding) => (binding, None),
+                Err(error) => (None, Some(error.to_string())),
+            };
+            if binding.is_some() || unavailable.is_some() {
+                self.supervisor_restarts.insert(
+                    process.pid.0,
+                    SupervisorRestartObservation {
+                        target,
+                        binding,
+                        unavailable,
+                    },
+                );
+            }
+        }
+    }
+
+    fn supervisor_restart_observation(
+        &self,
+        process: &ProcessRecord,
+    ) -> Option<&SupervisorRestartObservation> {
+        self.supervisor_restarts
+            .get(&process.pid.0)
+            .filter(|observed| {
+                observed.target.start_id == process.start_id
+                    && observed.target.uid == process.uid
+                    && observed.target.pgid == process.pgid
+                    && observed.target.sid == process.sid
+            })
+    }
+
+    pub fn supervisor_restart_for(
+        &self,
+        process: &ProcessRecord,
+    ) -> Option<&SystemdUserServiceBinding> {
+        self.supervisor_restart_observation(process)?
+            .binding
+            .as_ref()
+    }
+
+    pub fn supervisor_restart_unavailable_for(&self, process: &ProcessRecord) -> Option<&str> {
+        self.supervisor_restart_observation(process)?
+            .unavailable
+            .as_deref()
     }
 
     /// Join persisted remediation outcomes to one complete process census.
@@ -704,6 +793,10 @@ impl Scorer {
             signature_age_weight,
             learned_prior,
             respawn_history,
+            supervisor_restart: self.supervisor_restart_for(proc).cloned(),
+            supervisor_restart_unavailable: self
+                .supervisor_restart_unavailable_for(proc)
+                .map(str::to_string),
             fast_path_used: false,
             fast_path_skip_reason,
             desktop_app,
@@ -1266,6 +1359,7 @@ mod tests {
                 executed_at: Some(at(killed_at)),
                 execution_clock: None,
                 time_ms: Some(1),
+                supervisor_restart: None,
             };
             let replacement_pid = 6000 + index;
             let mut replacement = record(replacement_pid, "sleep", "sleep 600", FOUR_DAYS);

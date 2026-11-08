@@ -30,7 +30,9 @@ pub use cpuset_quarantine::{
     can_quarantine_cpuset, CpusetQuarantineActionRunner, CpusetQuarantineConfig, QuarantineResult,
     QuarantineReversalMetadata, DEFAULT_QUARANTINE_CPUS, MIN_QUARANTINE_CPUS,
 };
-pub use dispatch::{planning_action_feasibility, CompositeActionRunner};
+pub use dispatch::{
+    planning_action_feasibility, planning_action_feasibility_with_restart, CompositeActionRunner,
+};
 pub use executor::{
     ActionError, ActionExecutor, ActionResult, ActionRunner, ActionStatus, ExecutionError,
     ExecutionResult, ExecutionSummary, IdentityProvider, NoopActionRunner, StaticIdentityProvider,
@@ -49,9 +51,10 @@ pub use signal::{SignalActionRunner, SignalConfig};
 #[cfg(target_os = "linux")]
 pub use supervisor::plan_action_from_container_supervision;
 pub use supervisor::{
-    plan_action_from_app_supervision, plan_action_from_supervisor_info, SupervisorActionConfig,
+    discover_systemd_user_restart, plan_action_from_app_supervision,
+    plan_action_from_supervisor_info, validate_systemd_user_restart, SupervisorActionConfig,
     SupervisorActionError, SupervisorActionResult, SupervisorActionRunner, SupervisorCommand,
-    SupervisorParameters, SupervisorPlanAction, SupervisorType,
+    SupervisorParameters, SupervisorPlanAction, SupervisorType, SystemdUserServiceBinding,
 };
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

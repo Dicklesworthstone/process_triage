@@ -533,6 +533,24 @@ impl PolicyEnforcer {
         action: Action,
         robot_mode: bool,
     ) -> PolicyCheckResult {
+        self.check_action_with_supervisor_restart(candidate, action, robot_mode, None)
+    }
+
+    /// Authorize only the service-placement aspect of a recorded user-service
+    /// restart. Explicit protected users/PIDs/patterns, data loss, robot gates,
+    /// age and rate limits remain independent. Apply revalidates the binding.
+    pub fn check_action_with_supervisor_restart(
+        &self,
+        candidate: &ProcessCandidate,
+        action: Action,
+        robot_mode: bool,
+        supervisor_restart: Option<&crate::action::SystemdUserServiceBinding>,
+    ) -> PolicyCheckResult {
+        let bound_restart = action == Action::Restart
+            && supervisor_restart.is_some_and(|binding| {
+                i32::try_from(binding.target.pid.0).ok() == Some(candidate.pid)
+                    && binding.matches_target(&binding.target)
+            });
         // Keep does nothing, so no gate can block it. Blocking it turned a plain "leave
         // it alone" into a "review" item (every candidate of a `--robot` plan under the
         // default policy, every macOS orphan through never_kill_ppid).
@@ -542,7 +560,12 @@ impl PolicyEnforcer {
 
         let mut warnings = Vec::new();
         if let Some(recorded) = &self.recorded_policy {
-            let check = recorded.check_action(candidate, action, robot_mode);
+            let check = recorded.check_action_with_supervisor_restart(
+                candidate,
+                action,
+                robot_mode,
+                supervisor_restart,
+            );
             if !check.allowed {
                 return check;
             }
@@ -592,6 +615,8 @@ impl PolicyEnforcer {
                 use crate::collect::protected::{builtin_placement, BuiltinPlacement};
                 let user = candidate.user.as_deref().unwrap_or("");
                 match builtin_placement(role, user, argv0, &candidate.cmdline) {
+                    BuiltinPlacement::SupervisedService
+                        if bound_restart && role == crate::collect::CgroupRole::UserService => {}
                     BuiltinPlacement::SupervisedService => {
                         return PolicyCheckResult::blocked(PolicyViolation {
                             kind: ViolationKind::ProtectedPattern,
@@ -754,8 +779,9 @@ impl PolicyEnforcer {
             }
         }
 
-        // Check rate limits (only for kills)
-        if action == Action::Kill {
+        // A real service restart also terminates the bound process. Reaping a
+        // zombie via its parent remains outside these destructive-action caps.
+        if action == Action::Kill || bound_restart {
             let limit = if robot_mode {
                 Some(self.robot_mode.max_kills)
             } else {
@@ -1343,6 +1369,164 @@ mod tests {
             provenance_evidence_completeness: None,
             provenance_confidence_penalty: None,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn user_restart_binding(
+        candidate: &ProcessCandidate,
+    ) -> crate::action::SystemdUserServiceBinding {
+        // SAFETY: geteuid only reads the test process's credentials.
+        let uid = unsafe { libc::geteuid() };
+        let pid = u32::try_from(candidate.pid).unwrap();
+        crate::action::SystemdUserServiceBinding {
+            target: pt_common::ProcessIdentity::full(
+                pid,
+                pt_common::StartId::from_linux("policy-restart", 100, pid),
+                uid,
+                Some(pid),
+                Some(pid),
+                pt_common::IdentityQuality::Full,
+            ),
+            unit: "worker-proof.service".to_string(),
+            control_group: format!(
+                "/user.slice/user-{uid}.slice/user@{uid}.service/worker-proof.service"
+            ),
+            invocation_id: "1234567890abcdef1234567890abcdef".to_string(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bound_user_restart_waives_only_service_placement() {
+        let policy = test_policy();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
+        let mut candidate = test_candidate();
+        candidate.cgroup_role = Some(crate::collect::CgroupRole::UserService);
+        let binding = user_restart_binding(&candidate);
+        assert!(
+            !enforcer
+                .check_action(&candidate, Action::Restart, false)
+                .allowed
+        );
+        assert!(
+            enforcer
+                .check_action_with_supervisor_restart(
+                    &candidate,
+                    Action::Restart,
+                    false,
+                    Some(&binding)
+                )
+                .allowed
+        );
+        for action in [Action::Kill, Action::Pause, Action::Throttle] {
+            assert!(
+                !enforcer
+                    .check_action_with_supervisor_restart(&candidate, action, false, Some(&binding))
+                    .allowed
+            );
+        }
+        let mut foreign = binding.clone();
+        foreign.target.pid.0 += 1;
+        assert!(
+            !enforcer
+                .check_action_with_supervisor_restart(
+                    &candidate,
+                    Action::Restart,
+                    false,
+                    Some(&foreign)
+                )
+                .allowed
+        );
+        for role in [
+            crate::collect::CgroupRole::SystemService,
+            crate::collect::CgroupRole::Container,
+        ] {
+            candidate.cgroup_role = Some(role);
+            assert!(
+                !enforcer
+                    .check_action_with_supervisor_restart(
+                        &candidate,
+                        Action::Restart,
+                        false,
+                        Some(&binding)
+                    )
+                    .allowed
+            );
+        }
+        candidate.cgroup_role = Some(crate::collect::CgroupRole::UserService);
+        for case in 0..6 {
+            let mut policy = policy.clone();
+            let mut protected = candidate.clone();
+            match case {
+                0 => policy.guardrails.never_kill_pid.push(candidate.pid as u32),
+                1 => policy
+                    .guardrails
+                    .never_kill_ppid
+                    .push(candidate.ppid as u32),
+                2 => policy
+                    .guardrails
+                    .protected_users
+                    .push("testuser".to_string()),
+                3 => policy
+                    .guardrails
+                    .protected_groups
+                    .push("testgroup".to_string()),
+                4 => protected.open_write_fds = Some(1),
+                _ => protected.cmdline = "/usr/bin/postgres".to_string(),
+            }
+            let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
+            assert!(
+                !enforcer
+                    .check_action_with_supervisor_restart(
+                        &protected,
+                        Action::Restart,
+                        false,
+                        Some(&binding)
+                    )
+                    .allowed,
+                "case {case}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bound_restart_preserves_recorded_policy_and_destructive_rate_limit() {
+        let current = test_policy();
+        let mut recorded = current.clone();
+        recorded
+            .guardrails
+            .protected_groups
+            .push("testgroup".into());
+        let mut candidate = test_candidate();
+        candidate.cgroup_role = Some(crate::collect::CgroupRole::UserService);
+        let binding = user_restart_binding(&candidate);
+        let enforcer =
+            PolicyEnforcer::new_with_recorded_policy(&current, Some(&recorded), None).unwrap();
+        let result = enforcer.check_action_with_supervisor_restart(
+            &candidate,
+            Action::Restart,
+            false,
+            Some(&binding),
+        );
+        assert_eq!(
+            result.violation.unwrap().kind,
+            ViolationKind::ProtectedGroup
+        );
+
+        let mut capped = current;
+        capped.guardrails.max_kills_per_run = 0;
+        let enforcer = PolicyEnforcer::new(&capped, None).unwrap();
+        let result = enforcer.check_action_with_supervisor_restart(
+            &candidate,
+            Action::Restart,
+            false,
+            Some(&binding),
+        );
+        assert_eq!(
+            result.violation.unwrap().kind,
+            ViolationKind::RateLimitExceeded
+        );
     }
 
     #[test]

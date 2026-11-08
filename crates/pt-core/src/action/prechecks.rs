@@ -17,7 +17,7 @@ use crate::collect::systemd::{SystemdUnit, SystemdUnitType};
 use crate::collect::ProcessState;
 use crate::config::policy::{DataLossGates, Guardrails};
 use crate::decision::Action;
-use crate::plan::PreCheck;
+use crate::plan::{PlanAction, PreCheck};
 use crate::supervision::session::{SessionAnalyzer, SessionConfig, SessionProtectionType};
 use crate::supervision::{detect_supervision, is_human_supervised, SupervisorCategory};
 #[cfg(target_os = "linux")]
@@ -347,6 +347,26 @@ pub trait PreCheckProvider {
         }
         results
     }
+
+    /// Preserve the recorded action route when running live gates. Implementors
+    /// without a supervisor adapter retain the ordinary refusal behavior.
+    fn run_checks_for_plan(&self, action: &PlanAction) -> Vec<PreCheckResult> {
+        if action.routing == crate::plan::ActionRouting::Supervisor
+            || action.supervisor_restart.is_some()
+        {
+            return vec![PreCheckResult::Blocked {
+                check: PreCheck::CheckSupervisor,
+                reason: "precheck provider does not implement supervisor-aware safety checks"
+                    .to_string(),
+            }];
+        }
+        self.run_checks_for_action(
+            &crate::plan::effective_pre_checks(action),
+            action.target.pid.0,
+            action.target.sid,
+            action.action,
+        )
+    }
 }
 
 /// Refuse disruptive actions when a Linux FUSE server is present or its device
@@ -661,7 +681,7 @@ fn lsof_lock_evidence(
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn parse_proc_tty(pid: u32, content: &str) -> Result<bool, String> {
+pub(super) fn parse_proc_tty(pid: u32, content: &str) -> Result<bool, String> {
     let invalid = |reason: &str| format!("invalid /proc/{pid}/stat TTY evidence: {reason}");
     let open = content.find('(').ok_or_else(|| invalid("missing comm"))?;
     let close = content
@@ -1650,12 +1670,13 @@ impl LivePreCheckProvider {
     }
 }
 
-impl PreCheckProvider for LivePreCheckProvider {
-    fn check_not_protected(&self, pid: u32) -> PreCheckResult {
-        self.check_not_protected_for_action(pid, Action::Kill)
-    }
-
-    fn check_not_protected_for_action(&self, pid: u32, _action: Action) -> PreCheckResult {
+impl LivePreCheckProvider {
+    fn check_not_protected_with_service(
+        &self,
+        pid: u32,
+        _action: Action,
+        bound_user_service: bool,
+    ) -> PreCheckResult {
         trace!(pid, "checking protection status");
 
         // Read current process state from /proc for TOCTOU safety
@@ -1715,7 +1736,9 @@ impl PreCheckProvider for LivePreCheckProvider {
                     };
                 }
                 let role = crate::collect::read_cgroup_role(pid);
-                if role.is_supervised_service() {
+                if role.is_supervised_service()
+                    && !(bound_user_service && role == crate::collect::CgroupRole::UserService)
+                {
                     return PreCheckResult::Blocked {
                         check: PreCheck::CheckNotProtected,
                         reason: format!(
@@ -1771,6 +1794,188 @@ impl PreCheckProvider for LivePreCheckProvider {
         }
 
         PreCheckResult::Passed
+    }
+
+    /// A verified single-process service may own a detached session. Its own
+    /// no-TTY session-leader status is not an interactive session to preserve;
+    /// every other protection from the shared session analyzer still applies.
+    #[cfg(target_os = "linux")]
+    fn check_bound_restart_session(&self, pid: u32) -> PreCheckResult {
+        let blocked = |reason| PreCheckResult::Blocked {
+            check: PreCheck::CheckSessionSafety,
+            reason,
+        };
+        match self.has_active_tty(pid) {
+            Ok(false) => {}
+            Ok(true) => return blocked("interactive service has an active TTY".to_string()),
+            Err(error) => return blocked(format!("TTY evidence unavailable: {error}")),
+        }
+        if self.config.enhanced_session_safety {
+            let mut analyzer = SessionAnalyzer::with_config(SessionConfig {
+                max_ancestry_depth: 20,
+                protect_same_session: self.config.protect_same_session,
+                protect_parent_shells: self.config.protect_parent_shells,
+                protect_multiplexers: self.config.protect_multiplexers,
+                protect_ssh_chains: self.config.protect_ssh_chains,
+                protect_foreground_groups: true,
+            });
+            let result = match analyzer.analyze(pid, std::process::id()) {
+                Ok(result) => result,
+                Err(error) => {
+                    return blocked(format!("session safety evidence unavailable: {error}"));
+                }
+            };
+            if !detached_service_session_is_safe(&result) {
+                return blocked(format!(
+                    "protected session chain: {}",
+                    result
+                        .protection_types
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+        PreCheckResult::Passed
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_bound_restart_checks(&self, action: &PlanAction) -> Vec<PreCheckResult> {
+        let blocked = |check, reason| PreCheckResult::Blocked { check, reason };
+        let binding = match super::supervisor::restart_binding_for_action(action) {
+            Ok(binding) => binding,
+            Err(error) => {
+                return vec![blocked(PreCheck::CheckSupervisor, error.to_string())];
+            }
+        };
+        let started = Instant::now();
+        let budget = Duration::from_millis(action.timeouts.preflight_ms.min(30_000));
+        let remaining = || {
+            budget
+                .checked_sub(started.elapsed())
+                .filter(|left| !left.is_zero())
+        };
+        if remaining().is_none() {
+            return vec![blocked(
+                PreCheck::CheckSupervisor,
+                "supervisor preflight budget exhausted".to_string(),
+            )];
+        }
+        // Infrastructure protection precedes descriptor and filesystem probes.
+        let protection =
+            self.check_not_protected_with_service(action.target.pid.0, action.action, true);
+        let refused = !protection.is_passed();
+        let mut results = vec![protection];
+        if refused {
+            return results;
+        }
+        let validation = super::supervisor::validate_systemd_user_restart(
+            &action.target,
+            binding,
+            remaining().unwrap_or_default(),
+        );
+        if let Err(error) = validation {
+            results.push(blocked(PreCheck::CheckSupervisor, error.to_string()));
+            return results;
+        }
+        results.push(PreCheckResult::Passed);
+        for check in crate::plan::effective_pre_checks(action) {
+            let Some(left) = remaining() else {
+                results.push(blocked(
+                    check,
+                    "supervisor preflight budget exhausted".to_string(),
+                ));
+                break;
+            };
+            let result = match check {
+                PreCheck::VerifyIdentity
+                | PreCheck::CheckNotProtected
+                | PreCheck::CheckSupervisor => continue,
+                PreCheck::CheckSessionSafety => {
+                    self.check_bound_restart_session(action.target.pid.0)
+                }
+                PreCheck::CheckDataLossGate => {
+                    let window = Duration::from_secs(self.config.block_if_recent_io_seconds);
+                    let cached = self
+                        .recent_io
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .contains_key(&action.target.pid.0);
+                    if !window.is_zero() && !cached && window >= left {
+                        blocked(
+                            PreCheck::CheckDataLossGate,
+                            "complete recent-I/O evidence must be primed before the bounded \
+                             supervisor preflight; the required window is not shortened"
+                                .to_string(),
+                        )
+                    } else {
+                        self.check_data_loss(action.target.pid.0)
+                    }
+                }
+                PreCheck::CheckAgentSupervision => {
+                    self.check_agent_supervision(action.target.pid.0)
+                }
+                PreCheck::VerifyProcessState => self.check_process_state(action.target.pid.0),
+            };
+            let refused = !result.is_passed();
+            results.push(result);
+            if refused {
+                break;
+            }
+        }
+        if results.iter().all(PreCheckResult::is_passed) && remaining().is_none() {
+            results.push(blocked(
+                PreCheck::CheckSupervisor,
+                "supervisor preflight budget exhausted".to_string(),
+            ));
+        }
+        results
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn detached_service_session_is_safe(result: &crate::supervision::session::SessionResult) -> bool {
+    result.tty_nr.is_none()
+        && (!result.is_protected || !result.protection_types.is_empty())
+        && result
+            .protection_types
+            .iter()
+            .all(|protection| *protection == SessionProtectionType::SessionLeader)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl PreCheckProvider for LivePreCheckProvider {
+    fn check_not_protected(&self, pid: u32) -> PreCheckResult {
+        self.check_not_protected_for_action(pid, Action::Kill)
+    }
+
+    fn check_not_protected_for_action(&self, pid: u32, action: Action) -> PreCheckResult {
+        self.check_not_protected_with_service(pid, action, false)
+    }
+
+    fn run_checks_for_plan(&self, action: &PlanAction) -> Vec<PreCheckResult> {
+        if action.routing == crate::plan::ActionRouting::Supervisor
+            || action.supervisor_restart.is_some()
+        {
+            #[cfg(target_os = "linux")]
+            {
+                return self.run_bound_restart_checks(action);
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                return vec![PreCheckResult::Blocked {
+                    check: PreCheck::CheckSupervisor,
+                    reason: "systemd user-service restart requires Linux".to_string(),
+                }];
+            }
+        }
+        self.run_checks_for_action(
+            &crate::plan::effective_pre_checks(action),
+            action.target.pid.0,
+            action.target.sid,
+            action.action,
+        )
     }
 
     fn check_data_loss(&self, pid: u32) -> PreCheckResult {
@@ -2130,6 +2335,80 @@ impl PreCheckProvider for NoopPreCheckProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn isolated_service_session_exception_preserves_every_other_session_protection() {
+        use crate::supervision::session::SessionResult;
+        let leader = SessionResult::protected(
+            vec![SessionProtectionType::SessionLeader],
+            "detached service session".to_string(),
+            vec![],
+        );
+        assert!(detached_service_session_is_safe(&leader));
+        for extra in [
+            SessionProtectionType::SameSession,
+            SessionProtectionType::ParentShell,
+            SessionProtectionType::TmuxServer,
+            SessionProtectionType::TmuxClient,
+            SessionProtectionType::ScreenServer,
+            SessionProtectionType::ScreenClient,
+            SessionProtectionType::SshChain,
+            SessionProtectionType::ForegroundGroup,
+            SessionProtectionType::TtyController,
+        ] {
+            let mut changed = leader.clone();
+            changed.protection_types.push(extra);
+            assert!(!detached_service_session_is_safe(&changed), "{extra:?}");
+        }
+        let mut attached = leader.clone();
+        attached.tty_nr = Some(34816);
+        assert!(!detached_service_session_is_safe(&attached));
+        let mut unknown = leader;
+        unknown.protection_types.clear();
+        assert!(!detached_service_session_is_safe(&unknown));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervisor_preflight_refuses_zero_budget_and_forged_routing_before_probes() {
+        // SAFETY: geteuid only reads the test process's credentials.
+        let uid = unsafe { libc::geteuid() };
+        let identity = pt_common::ProcessIdentity::full(
+            u32::MAX,
+            pt_common::StartId::from_linux("preflight-test", 1, u32::MAX),
+            uid,
+            None,
+            None,
+            pt_common::IdentityQuality::Full,
+        );
+        let binding = crate::action::SystemdUserServiceBinding {
+            target: identity.clone(),
+            unit: "worker-proof.service".into(),
+            control_group: format!(
+                "/user.slice/user-{uid}.slice/user@{uid}.service/worker-proof.service"
+            ),
+            invocation_id: "1234567890abcdef1234567890abcdef".into(),
+        };
+        let mut action: PlanAction = serde_json::from_value(serde_json::json!({
+            "action_id": "preflight-test", "target": identity, "action": "restart",
+            "order": 0, "stage": 0, "pre_checks": [], "rationale": {},
+            "on_success": [], "on_failure": [], "blocked": false,
+            "timeouts": {"preflight_ms": 0, "execute_ms": 1, "verify_ms": 1},
+            "routing": "supervisor", "supervisor_restart": binding,
+        }))
+        .unwrap();
+        let provider = LivePreCheckProvider::with_defaults();
+        let results = provider.run_checks_for_plan(&action);
+        assert!(matches!(&results[0], PreCheckResult::Blocked {
+            check: PreCheck::CheckSupervisor, reason
+        } if reason.contains("budget exhausted")));
+        action.timeouts.preflight_ms = 5000;
+        action.routing = crate::plan::ActionRouting::ZombieToParent;
+        let results = provider.run_checks_for_plan(&action);
+        assert!(matches!(&results[0], PreCheckResult::Blocked {
+            check: PreCheck::CheckSupervisor, reason
+        } if reason.contains("invalid supervisor restart route")));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

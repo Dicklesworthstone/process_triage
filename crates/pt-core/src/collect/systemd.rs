@@ -14,6 +14,301 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
 
+/// Ready-to-restart service state from the current user's actual systemd manager.
+/// Cgroup-only fallback evidence is deliberately insufficient for this type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemdUserServiceState {
+    pub unit: String,
+    pub main_pid: u32,
+    pub control_group: String,
+    pub invocation_id: String,
+}
+
+#[cfg(target_os = "linux")]
+const USER_RESTART_PROPERTIES: &str = "--property=Id,LoadState,ActiveState,SubState,MainPID,ControlPID,ControlGroup,InvocationID,Type,KillMode,Delegate,CanStart,CanStop,RefuseManualStart,RefuseManualStop,DefaultDependencies,Requires,Wants,Requisite,BindsTo,Upholds,Conflicts,ConflictedBy,ConsistsOf,BoundBy,RequiredBy,RequisiteOf,PropagatesStopTo,OnFailure,OnSuccess,FailureAction,SuccessAction,StartLimitAction,StopWhenUnneeded";
+
+/// Names passed to systemctl must name one literal service, never a pattern,
+/// option, path, template without an instance, or escaped alternative spelling.
+pub fn is_literal_service_unit(unit: &str) -> bool {
+    unit.len() <= 255
+        && unit.len() > ".service".len()
+        && unit.ends_with(".service")
+        && !unit.starts_with(['-', '.'])
+        && !unit.ends_with("@.service")
+        && unit
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_.@:-".contains(&byte))
+}
+
+/// Query the current user's manager, with no fallback to the system manager or
+/// a guessed unit. The timeout includes the tool runner's termination grace.
+#[cfg(target_os = "linux")]
+pub fn query_systemd_user_service(
+    unit: &str,
+    uid: u32,
+    timeout: Duration,
+) -> Result<SystemdUserServiceState, String> {
+    let started = std::time::Instant::now();
+    if !is_literal_service_unit(unit) {
+        return Err("restart requires one literal .service unit".to_string());
+    }
+    let output = run_user_systemctl(
+        uid,
+        &["show", "--all", USER_RESTART_PROPERTIES, "--", unit],
+        timeout,
+    )?;
+    let state = parse_systemd_user_service(&output.stdout_str())?;
+    if state.unit != unit {
+        return Err("systemd returned an alias or a different service identity".to_string());
+    }
+    // Every service implicitly Requires its slice. Permit only the manager's
+    // perpetual root slice, and prove its START transaction cannot pull in any
+    // further units. Even active ordinary slices/targets can expand a start job.
+    let remaining = timeout
+        .checked_sub(started.elapsed())
+        .ok_or_else(|| "user-manager scope proof exhausted its budget".to_string())?;
+    let root = run_user_systemctl(
+        uid,
+        &["show", "--all", USER_RESTART_PROPERTIES, "--", "-.slice"],
+        remaining,
+    )?;
+    validate_user_root_slice(&root.stdout_str())?;
+    Ok(state)
+}
+
+/// Run a literal command against `/run/user/<uid>/bus`. ToolRunner clears the
+/// environment, so passing --user alone cannot select the user's manager; using
+/// inherited DBUS_SESSION_BUS_ADDRESS would also permit a different manager.
+#[cfg(target_os = "linux")]
+pub(crate) fn run_user_systemctl(
+    uid: u32,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<crate::collect::tool_runner::ToolOutput, String> {
+    use crate::collect::tool_runner::{ToolConfig, ToolRunner};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    use std::time::Instant;
+
+    let started = Instant::now();
+    // SAFETY: geteuid only reads the caller's credentials.
+    if uid != unsafe { libc::geteuid() } {
+        return Err("restart is restricted to the current user's manager".to_string());
+    }
+    let runtime = format!("/run/user/{uid}");
+    let directory = std::fs::symlink_metadata(&runtime)
+        .map_err(|error| format!("user manager runtime directory unavailable: {error}"))?;
+    if !directory.is_dir() || directory.uid() != uid || directory.mode() & 0o077 != 0 {
+        return Err("user manager runtime directory is not private to this user".to_string());
+    }
+    let bus = std::fs::symlink_metadata(format!("{runtime}/bus"))
+        .map_err(|error| format!("user manager bus unavailable: {error}"))?;
+    if !bus.file_type().is_socket() || bus.uid() != uid {
+        return Err("user manager bus is not a socket owned by this user".to_string());
+    }
+    let systemctl = ["/usr/bin/systemctl", "/bin/systemctl"]
+        .into_iter()
+        .find(|path| std::path::Path::new(path).is_file())
+        .ok_or_else(|| "systemctl is unavailable".to_string())?;
+    let env = ["/usr/bin/env", "/bin/env"]
+        .into_iter()
+        .find(|path| std::path::Path::new(path).is_file())
+        .ok_or_else(|| "env is unavailable".to_string())?;
+    let owned_args = user_systemctl_arguments(uid, systemctl, args);
+    let borrowed_args: Vec<&str> = owned_args.iter().map(String::as_str).collect();
+    // ToolRunner allows 500 ms for SIGTERM cleanup and polls every 10 ms. Reserve
+    // that time before spawning, rather than exceeding the caller's whole budget.
+    let command_timeout = timeout
+        .checked_sub(started.elapsed())
+        .and_then(|remaining| remaining.checked_sub(Duration::from_millis(600)))
+        .filter(|remaining| *remaining >= Duration::from_millis(1))
+        .ok_or_else(|| "systemctl time budget exhausted before invocation".to_string())?;
+    let config = ToolConfig {
+        default_timeout: command_timeout,
+        budget_ms: u64::try_from(command_timeout.as_millis()).unwrap_or(u64::MAX),
+        max_output_bytes: 64 * 1024,
+        use_nice: false,
+        use_ionice: false,
+        ..ToolConfig::default()
+    };
+    let output = ToolRunner::new(config)
+        .run_tool(env, &borrowed_args, Some(command_timeout))
+        .map_err(|error| format!("systemctl failed: {error}"))?;
+    if started.elapsed() >= timeout || output.timed_out {
+        return Err("systemctl time budget exhausted".to_string());
+    }
+    if output.truncated {
+        return Err("systemctl evidence exceeded the output limit".to_string());
+    }
+    if !output.success() {
+        return Err(format!(
+            "systemctl exited with {:?}: {}",
+            output.exit_code,
+            output.stderr_str().trim()
+        ));
+    }
+    Ok(output)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn user_systemctl_arguments(uid: u32, systemctl: &str, args: &[&str]) -> Vec<String> {
+    let mut result = vec![
+        format!("XDG_RUNTIME_DIR=/run/user/{uid}"),
+        format!("DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus"),
+        systemctl.to_string(),
+        "--user".to_string(),
+        "--no-pager".to_string(),
+        "--no-ask-password".to_string(),
+    ];
+    result.extend(args.iter().map(|argument| (*argument).to_string()));
+    result
+}
+
+/// Parse complete properties without turning missing or duplicate evidence into
+/// empty dependency lists. `show --all` is required to retain empty properties.
+#[cfg(any(target_os = "linux", test))]
+fn user_unit_properties(output: &str) -> Result<HashMap<&str, &str>, String> {
+    let mut properties = HashMap::new();
+    if !output.ends_with('\n') {
+        return Err("incomplete systemd service evidence".to_string());
+    }
+    for line in output.lines() {
+        let (key, value) = line
+            .split_once('=')
+            .ok_or_else(|| "malformed systemd service property".to_string())?;
+        if properties.insert(key, value).is_some() {
+            return Err(format!("duplicate systemd service property {key}"));
+        }
+    }
+    Ok(properties)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn required_user_property<'a>(
+    properties: &HashMap<&str, &'a str>,
+    key: &str,
+) -> Result<&'a str, String> {
+    properties
+        .get(key)
+        .copied()
+        .ok_or_else(|| format!("missing systemd service property {key}"))
+}
+
+/// A restart recursively adds START jobs for forward requirements, even if they
+/// are already active, and STOP jobs for conflicts. No dependency-bypass mode is
+/// used: require an isolated service and prove the sole root-slice START is inert.
+#[cfg(any(target_os = "linux", test))]
+fn validate_user_start_scope(properties: &HashMap<&str, &str>, root: bool) -> Result<(), String> {
+    let requires = required_user_property(properties, "Requires")?;
+    if requires != if root { "" } else { "-.slice" } {
+        return Err(format!(
+            "bounded restart requires DefaultDependencies=no and Slice=-.slice; Requires={requires}"
+        ));
+    }
+    for key in [
+        "Wants",
+        "Requisite",
+        "BindsTo",
+        "Upholds",
+        "Conflicts",
+        "ConflictedBy",
+        "OnFailure",
+        "OnSuccess",
+    ] {
+        let actual = required_user_property(properties, key)?;
+        if !actual.is_empty() {
+            return Err(format!(
+                "service transaction would extend its scope: {key}={actual}"
+            ));
+        }
+    }
+    for (key, expected) in [
+        ("DefaultDependencies", "no"),
+        ("FailureAction", "none"),
+        ("SuccessAction", "none"),
+        ("StartLimitAction", "none"),
+        ("StopWhenUnneeded", "no"),
+    ] {
+        let actual = required_user_property(properties, key)?;
+        if actual != expected {
+            return Err(format!(
+                "service transaction has unsafe side effects: {key}={actual}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn validate_user_root_slice(output: &str) -> Result<(), String> {
+    let properties = user_unit_properties(output)?;
+    for (key, expected) in [
+        ("Id", "-.slice"),
+        ("LoadState", "loaded"),
+        ("ActiveState", "active"),
+    ] {
+        if required_user_property(&properties, key)? != expected {
+            return Err(format!(
+                "user manager root slice is unavailable or changed: {key}"
+            ));
+        }
+    }
+    // RequiredBy/BoundBy are intentionally not rejected here: this perpetual
+    // slice receives START, never STOP/RESTART, so reverse propagation cannot
+    // occur. Its RequiredBy list normally includes every service in this slice.
+    validate_user_start_scope(&properties, true)
+}
+
+/// Require a complete ready state and no stop/restart propagation to other units.
+/// Only simple/exec services with control-group termination are supported.
+#[cfg(any(target_os = "linux", test))]
+fn parse_systemd_user_service(output: &str) -> Result<SystemdUserServiceState, String> {
+    let properties = user_unit_properties(output)?;
+    validate_user_start_scope(&properties, false)?;
+    let required = |key: &str| required_user_property(&properties, key);
+    for (key, expected) in [
+        ("LoadState", "loaded"),
+        ("ActiveState", "active"),
+        ("SubState", "running"),
+        ("ControlPID", "0"),
+        ("KillMode", "control-group"),
+        ("Delegate", "no"),
+        ("CanStart", "yes"),
+        ("CanStop", "yes"),
+        ("RefuseManualStart", "no"),
+        ("RefuseManualStop", "no"),
+        ("ConsistsOf", ""),
+        ("BoundBy", ""),
+        ("RequiredBy", ""),
+        ("RequisiteOf", ""),
+        ("PropagatesStopTo", ""),
+    ] {
+        let actual = required(key)?;
+        if actual != expected {
+            return Err(format!(
+                "service is not eligible for bounded restart: {key}={actual}"
+            ));
+        }
+    }
+    if !matches!(required("Type")?, "simple" | "exec") {
+        return Err("bounded restart requires Type=simple or Type=exec".to_string());
+    }
+    let unit = required("Id")?;
+    if !is_literal_service_unit(unit) {
+        return Err("systemd returned an invalid literal service name".to_string());
+    }
+    let main_pid = required("MainPID")?
+        .parse::<u32>()
+        .ok()
+        .filter(|pid| *pid > 1)
+        .ok_or_else(|| "systemd returned no usable MainPID".to_string())?;
+    Ok(SystemdUserServiceState {
+        unit: unit.to_string(),
+        main_pid,
+        control_group: required("ControlGroup")?.to_string(),
+        invocation_id: required("InvocationID")?.to_string(),
+    })
+}
+
 /// Systemd unit information for a process.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SystemdUnit {
@@ -352,6 +647,184 @@ pub fn is_systemd_managed(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn isolated_user_service() -> String {
+        [
+            "Id=pt-restart-test.service",
+            "LoadState=loaded",
+            "ActiveState=active",
+            "SubState=running",
+            "MainPID=1234",
+            "ControlPID=0",
+            "ControlGroup=/user.slice/user-1000.slice/user@1000.service/pt-restart-test.service",
+            "InvocationID=1234567890abcdef1234567890abcdef",
+            "Type=exec",
+            "KillMode=control-group",
+            "Delegate=no",
+            "CanStart=yes",
+            "CanStop=yes",
+            "RefuseManualStart=no",
+            "RefuseManualStop=no",
+            "DefaultDependencies=no",
+            "Requires=-.slice",
+            "Wants=",
+            "Requisite=",
+            "BindsTo=",
+            "Upholds=",
+            "Conflicts=",
+            "ConflictedBy=",
+            "ConsistsOf=",
+            "BoundBy=",
+            "RequiredBy=",
+            "RequisiteOf=",
+            "PropagatesStopTo=",
+            "OnFailure=",
+            "OnSuccess=",
+            "FailureAction=none",
+            "SuccessAction=none",
+            "StartLimitAction=none",
+            "StopWhenUnneeded=no",
+            "",
+        ]
+        .join("\n")
+    }
+
+    #[test]
+    fn user_service_requires_complete_inert_transaction_scope() {
+        let fixture = isolated_user_service();
+        let state = parse_systemd_user_service(&fixture).expect("isolated service");
+        assert_eq!(state.main_pid, 1234);
+        assert_eq!(state.unit, "pt-restart-test.service");
+        for key in [
+            "Wants",
+            "Requisite",
+            "BindsTo",
+            "Upholds",
+            "Conflicts",
+            "ConflictedBy",
+            "ConsistsOf",
+            "BoundBy",
+            "RequiredBy",
+            "RequisiteOf",
+            "PropagatesStopTo",
+            "OnFailure",
+            "OnSuccess",
+        ] {
+            let old = format!("{key}=\n");
+            let expanded = fixture.replace(&old, &format!("{key}=other.service\n"));
+            assert!(parse_systemd_user_service(&expanded).is_err(), "{key}");
+            assert!(
+                parse_systemd_user_service(&fixture.replace(&old, "")).is_err(),
+                "missing {key}"
+            );
+        }
+        for (before, after) in [
+            ("Requires=-.slice", "Requires=basic.target -.slice"),
+            ("Requires=-.slice", "Requires=app.slice"),
+            ("DefaultDependencies=no", "DefaultDependencies=yes"),
+            ("FailureAction=none", "FailureAction=exit"),
+            ("SuccessAction=none", "SuccessAction=exit-force"),
+            ("StartLimitAction=none", "StartLimitAction=reboot"),
+            ("StopWhenUnneeded=no", "StopWhenUnneeded=yes"),
+            ("KillMode=control-group", "KillMode=process"),
+            ("Delegate=no", "Delegate=yes"),
+            ("ControlPID=0", "ControlPID=4321"),
+            ("Type=exec", "Type=oneshot"),
+            ("ActiveState=active", "ActiveState=activating"),
+            ("SubState=running", "SubState=exited"),
+            ("MainPID=1234", "MainPID=0"),
+            ("CanStop=yes", "CanStop=no"),
+            ("RefuseManualStart=no", "RefuseManualStart=yes"),
+        ] {
+            assert!(
+                parse_systemd_user_service(&fixture.replace(before, after)).is_err(),
+                "{after}"
+            );
+        }
+        assert!(parse_systemd_user_service(&format!("{fixture}MainPID=4321\n")).is_err());
+        assert!(parse_systemd_user_service(fixture.trim_end()).is_err());
+    }
+
+    #[test]
+    fn root_slice_start_proof_rejects_outward_jobs_but_not_reverse_dependents() {
+        let fixture = isolated_user_service()
+            .replace("Id=pt-restart-test.service", "Id=-.slice")
+            .replace("Requires=-.slice", "Requires=")
+            .replace(
+                "RequiredBy=\n",
+                "RequiredBy=pt-restart-test.service other.service\n",
+            );
+        validate_user_root_slice(&fixture).expect("perpetual root-slice START is inert");
+        for (before, after) in [
+            ("Requires=\n", "Requires=basic.target\n"),
+            ("Wants=\n", "Wants=unrelated.service\n"),
+            ("Conflicts=\n", "Conflicts=other.service\n"),
+            ("ActiveState=active", "ActiveState=inactive"),
+            ("OnFailure=\n", "OnFailure=recovery.service\n"),
+            ("FailureAction=none", "FailureAction=exit"),
+        ] {
+            assert!(
+                validate_user_root_slice(&fixture.replace(before, after)).is_err(),
+                "{after}"
+            );
+        }
+    }
+
+    #[test]
+    fn user_manager_command_has_explicit_scope_and_literal_arguments() {
+        let args = user_systemctl_arguments(
+            1234,
+            "/usr/bin/systemctl",
+            &[
+                "--job-mode=fail",
+                "try-restart",
+                "--",
+                "worker@blue.service",
+            ],
+        );
+        assert_eq!(args[0], "XDG_RUNTIME_DIR=/run/user/1234");
+        assert_eq!(
+            args[1],
+            "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1234/bus"
+        );
+        assert_eq!(
+            &args[2..],
+            &[
+                "/usr/bin/systemctl",
+                "--user",
+                "--no-pager",
+                "--no-ask-password",
+                "--job-mode=fail",
+                "try-restart",
+                "--",
+                "worker@blue.service",
+            ]
+        );
+        for name in [
+            "worker.service",
+            "worker@blue.service",
+            "build-worker_1.service",
+        ] {
+            assert!(is_literal_service_unit(name), "{name}");
+        }
+        for name in [
+            ".service",
+            "--all.service",
+            "*.service",
+            "a?.service",
+            "a[b].service",
+            "../worker.service",
+            "a/b.service",
+            "worker@.service",
+            "a\\x2db.service",
+            "a\nb.service",
+            "a b.service",
+            "worker.scope",
+            "worker.service\0",
+        ] {
+            assert!(!is_literal_service_unit(name), "{name:?}");
+        }
+    }
 
     #[test]
     fn test_unit_type_from_name() {

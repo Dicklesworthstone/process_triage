@@ -276,6 +276,7 @@ fn agent_apply_uses_abandoned_plus_zombie_posterior_for_kill_constraints() {
                 confidence: ActionConfidence::Normal,
                 original_zombie_target: None,
                 d_state_diagnostics: None,
+                supervisor_restart: None,
             }],
             pre_toggled: Vec::new(),
             gates_summary: GatesSummary {
@@ -401,6 +402,7 @@ fn agent_apply_returns_policy_blocked_for_constraints() {
             confidence: ActionConfidence::Normal,
             original_zombie_target: None,
             d_state_diagnostics: None,
+            supervisor_restart: None,
         }],
         pre_toggled: Vec::new(),
         gates_summary: GatesSummary {

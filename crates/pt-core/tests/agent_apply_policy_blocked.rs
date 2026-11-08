@@ -125,6 +125,7 @@ fn agent_apply_returns_policy_blocked_for_blocked_plan() {
                 confidence: ActionConfidence::Normal,
                 original_zombie_target: None,
                 d_state_diagnostics: None,
+                supervisor_restart: None,
             }],
             pre_toggled: Vec::new(),
             gates_summary: GatesSummary {

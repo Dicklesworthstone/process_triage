@@ -80,6 +80,7 @@ fn test_signal_kill_real() {
         confidence: ActionConfidence::Normal,
         original_zombie_target: None,
         d_state_diagnostics: None,
+        supervisor_restart: None,
     };
 
     // Execute kill
@@ -128,6 +129,7 @@ fn test_signal_pause_resume_real() {
         confidence: ActionConfidence::Normal,
         original_zombie_target: None,
         d_state_diagnostics: None,
+        supervisor_restart: None,
     };
 
     // A fabricated birth identity must refuse before a signal reaches this child.
@@ -233,6 +235,7 @@ fn test_process_group_pause_resume_real() {
         confidence: ActionConfidence::Normal,
         original_zombie_target: None,
         d_state_diagnostics: None,
+        supervisor_restart: None,
     };
 
     // Pause the entire group
@@ -266,6 +269,7 @@ fn test_process_group_pause_resume_real() {
         confidence: ActionConfidence::Normal,
         original_zombie_target: None,
         d_state_diagnostics: None,
+        supervisor_restart: None,
     };
 
     // Resume the entire group
@@ -324,6 +328,7 @@ fn test_zombie_verification_real() {
         confidence: ActionConfidence::Normal,
         original_zombie_target: None,
         d_state_diagnostics: None,
+        supervisor_restart: None,
     };
 
     // Execute kill on zombie should succeed (no-op or ignored signal)

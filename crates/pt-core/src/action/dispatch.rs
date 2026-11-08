@@ -22,6 +22,8 @@ pub struct CompositeActionRunner {
     signal: SignalActionRunner,
     renice: ReniceActionRunner,
     #[cfg(target_os = "linux")]
+    supervisor_restart_attempted: std::cell::Cell<bool>,
+    #[cfg(target_os = "linux")]
     freeze: FreezeActionRunner,
     #[cfg(target_os = "linux")]
     throttle: CpuThrottleActionRunner,
@@ -35,6 +37,8 @@ impl CompositeActionRunner {
         Self {
             signal: SignalActionRunner::with_defaults(),
             renice: ReniceActionRunner::with_defaults(),
+            #[cfg(target_os = "linux")]
+            supervisor_restart_attempted: std::cell::Cell::new(false),
             #[cfg(target_os = "linux")]
             freeze: FreezeActionRunner::with_defaults(),
             #[cfg(target_os = "linux")]
@@ -56,6 +60,19 @@ impl CompositeActionRunner {
     pub fn take_kill_signal_delivered(&self) -> bool {
         self.signal.take_kill_signal_delivered()
     }
+
+    /// A manager-changing command may outlive a timed-out systemctl client.
+    /// Charge such attempts conservatively without claiming a signal was sent.
+    pub fn take_supervisor_restart_attempted(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.supervisor_restart_attempted.replace(false)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
 }
 
 impl Default for CompositeActionRunner {
@@ -73,13 +90,49 @@ pub fn planning_action_feasibility(
     target: &ProcessIdentity,
     state: ProcessState,
 ) -> ActionFeasibility {
+    planning_action_feasibility_with_restart(target, state, None)
+}
+
+/// Reuse the binding already observed for this exact scan incarnation. No
+/// implicit supervisor probing or service operation happens in this function.
+pub fn planning_action_feasibility_with_restart(
+    target: &ProcessIdentity,
+    state: ProcessState,
+    supervisor_restart: Option<&super::supervisor::SystemdUserServiceBinding>,
+) -> ActionFeasibility {
     let mut feasibility =
         ActionFeasibility::from_process_state(state.is_zombie(), state.is_disksleep(), None);
+    let bound_user_restart = !state.is_zombie()
+        && supervisor_restart.is_some_and(|binding| binding.matches_target(target));
+    if bound_user_restart {
+        // A supervised service is eligible only for its reviewed manager route.
+        // Do not let minimization select an unavailable cheaper raw intervention
+        // and hide a supported restart behind a later policy refusal.
+        for action in [
+            Action::Kill,
+            Action::Renice,
+            Action::Pause,
+            Action::Resume,
+            Action::Freeze,
+            Action::Unfreeze,
+            Action::Throttle,
+            Action::Quarantine,
+            Action::Unquarantine,
+        ] {
+            feasibility.disabled.push(DisabledAction {
+                action,
+                reason: "supervised service requires its verified manager restart route"
+                    .to_string(),
+            });
+        }
+        return feasibility;
+    }
     if !state.is_zombie() {
         feasibility.disabled.push(DisabledAction {
             action: Action::Restart,
-            reason: "restart needs a supervisor adapter; only zombie-parent reaping is supported"
-                .to_string(),
+            reason:
+                "restart requires a verified current-user service binding or zombie-parent reaping"
+                    .to_string(),
         });
     }
     feasibility.disabled.push(DisabledAction {
@@ -437,6 +490,12 @@ impl ActionRunner for CompositeActionRunner {
             Action::Restart if action.routing == ActionRouting::ZombieToParent => {
                 self.signal.nudge_parent_to_reap(action)
             }
+            #[cfg(target_os = "linux")]
+            Action::Restart if action.routing == ActionRouting::Supervisor => {
+                super::supervisor::execute_systemd_user_restart(action, || {
+                    self.supervisor_restart_attempted.set(true)
+                })
+            }
             Action::Restart => Err(ActionError::Failed(
                 "restart requires supervisor support".to_string(),
             )),
@@ -466,7 +525,14 @@ impl ActionRunner for CompositeActionRunner {
             Action::Restart if action.routing == ActionRouting::ZombieToParent => {
                 self.signal.verify_zombie_reaped(action)
             }
-            Action::Restart => Ok(()),
+            #[cfg(target_os = "linux")]
+            Action::Restart if action.routing == ActionRouting::Supervisor => {
+                super::supervisor::verify_systemd_user_restart(action)
+            }
+            Action::Restart => Err(ActionError::Failed(
+                "restart verification requires a supported supervisor or zombie-parent route"
+                    .to_string(),
+            )),
             #[cfg(not(target_os = "linux"))]
             Action::Freeze
             | Action::Unfreeze
@@ -528,11 +594,57 @@ mod tests {
                 process_state: None,
                 parent_identity: None,
                 d_state_diagnostics: None,
+                supervisor_restart: None,
             }],
             generated_at: Some("2026-01-15T12:00:00Z".to_string()),
         };
         let plan = generate_plan(&bundle);
         plan.actions[0].clone()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervised_feasibility_offers_only_keep_or_the_bound_restart() {
+        let mut target = make_action().target;
+        // SAFETY: geteuid only reads the test process's credentials.
+        target.uid = unsafe { libc::geteuid() };
+        let uid = target.uid;
+        let binding = super::super::supervisor::SystemdUserServiceBinding {
+            target: target.clone(),
+            unit: "worker-proof.service".into(),
+            control_group: format!(
+                "/user.slice/user-{uid}.slice/user@{uid}.service/worker-proof.service"
+            ),
+            invocation_id: "1234567890abcdef1234567890abcdef".into(),
+        };
+        let feasible = planning_action_feasibility_with_restart(
+            &target,
+            ProcessState::Running,
+            Some(&binding),
+        );
+        assert!(feasible.is_allowed(Action::Keep));
+        assert!(feasible.is_allowed(Action::Restart));
+        for action in [
+            Action::Kill,
+            Action::Renice,
+            Action::Pause,
+            Action::Resume,
+            Action::Freeze,
+            Action::Unfreeze,
+            Action::Throttle,
+            Action::Quarantine,
+            Action::Unquarantine,
+        ] {
+            assert!(!feasible.is_allowed(action), "{action:?}");
+        }
+        let mut replaced = target;
+        replaced.pid = ProcessId(u32::MAX);
+        let feasible = planning_action_feasibility_with_restart(
+            &replaced,
+            ProcessState::Running,
+            Some(&binding),
+        );
+        assert!(!feasible.is_allowed(Action::Restart));
     }
 
     #[test]
@@ -563,8 +675,9 @@ mod tests {
         ] {
             assert!(!zombie.is_allowed(action));
         }
-        assert!(!planning_action_feasibility(&target, ProcessState::DiskSleep)
-            .is_allowed(Action::Kill));
+        assert!(
+            !planning_action_feasibility(&target, ProcessState::DiskSleep).is_allowed(Action::Kill)
+        );
     }
 
     #[test]
@@ -669,13 +782,28 @@ mod tests {
     fn capability_probe_is_read_only_and_respects_runner_protections() {
         let directory = capability_leaf(&[]);
         let observed = cgroup_action_feasibility_at(123, "worker", &directory, None, None);
-        for action in [Action::Freeze, Action::Unfreeze, Action::Throttle, Action::Quarantine] {
-            assert!(observed.is_allowed(action), "{action:?}: {:?}", observed.disabled);
+        for action in [
+            Action::Freeze,
+            Action::Unfreeze,
+            Action::Throttle,
+            Action::Quarantine,
+        ] {
+            assert!(
+                observed.is_allowed(action),
+                "{action:?}: {:?}",
+                observed.disabled
+            );
         }
         for (name, content) in CAPABILITY_FILES {
-            assert_eq!(std::fs::read_to_string(directory.join(name)).unwrap(), content);
+            assert_eq!(
+                std::fs::read_to_string(directory.join(name)).unwrap(),
+                content
+            );
         }
-        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), CAPABILITY_FILES.len());
+        assert_eq!(
+            std::fs::read_dir(&directory).unwrap().count(),
+            CAPABILITY_FILES.len()
+        );
         let protected = cgroup_action_feasibility_at(123, "dockerd", &directory, None, None);
         assert!(!protected.is_allowed(Action::Quarantine));
     }
@@ -716,9 +844,16 @@ mod tests {
             let directory = capability_leaf(&[name]);
             let observed = cgroup_action_feasibility_at(123, "worker", &directory, None, None);
             for checked in [Action::Freeze, Action::Throttle, Action::Quarantine] {
-                assert_eq!(observed.is_allowed(checked), checked != action, "{name}: {checked:?}");
+                assert_eq!(
+                    observed.is_allowed(checked),
+                    checked != action,
+                    "{name}: {checked:?}"
+                );
             }
-            assert!(!directory.join(name).exists(), "capability probe created {name}");
+            assert!(
+                !directory.join(name).exists(),
+                "capability probe created {name}"
+            );
         }
         for (name, value, action) in [
             ("cgroup.events", "populated 1\n", Action::Freeze),
@@ -729,7 +864,11 @@ mod tests {
             std::fs::write(directory.join(name), value).unwrap();
             let observed = cgroup_action_feasibility_at(123, "worker", &directory, None, None);
             for checked in [Action::Freeze, Action::Throttle, Action::Quarantine] {
-                assert_eq!(observed.is_allowed(checked), checked != action, "{name}: {checked:?}");
+                assert_eq!(
+                    observed.is_allowed(checked),
+                    checked != action,
+                    "{name}: {checked:?}"
+                );
             }
         }
     }

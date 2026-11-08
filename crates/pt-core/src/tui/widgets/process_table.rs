@@ -169,14 +169,14 @@ impl<'a> ProcessTable<'a> {
             let sheet = theme.stylesheet();
             match classification.to_uppercase().as_str() {
                 "KILL" => sheet.get_or_default("classification.kill"),
-                "REVIEW" => sheet.get_or_default("classification.review"),
+                "REVIEW" | "RESTART" => sheet.get_or_default("classification.review"),
                 "SPARE" => sheet.get_or_default("classification.spare"),
                 _ => FtuiStyle::default(),
             }
         } else {
             match classification.to_uppercase().as_str() {
                 "KILL" => FtuiStyle::new().fg(PackedRgba::rgb(255, 0, 0)).bold(),
-                "REVIEW" => FtuiStyle::new().fg(PackedRgba::rgb(255, 255, 0)),
+                "REVIEW" | "RESTART" => FtuiStyle::new().fg(PackedRgba::rgb(255, 255, 0)),
                 "SPARE" => FtuiStyle::new().fg(PackedRgba::rgb(0, 255, 0)),
                 _ => FtuiStyle::default(),
             }
@@ -749,14 +749,15 @@ impl ProcessTableState {
         }
     }
 
-    /// Select the executable goal set, or ordinary KILL recommendations when
+    /// Select the executable goal set, or KILL/RESTART recommendations when
     /// no resource goal is active. Goal errors and satisfied goals select none.
     pub fn select_recommended(&mut self) {
         let pids: Vec<u32> = self
             .visible_rows()
             .iter()
             .filter(|row| {
-                row.classification.eq_ignore_ascii_case("KILL")
+                (row.classification.eq_ignore_ascii_case("KILL")
+                    || row.classification.eq_ignore_ascii_case("RESTART"))
                     && self
                         .goal_rank
                         .as_ref()
@@ -883,6 +884,9 @@ fn build_plan_preview(actions: &[&PlanAction]) -> Vec<String> {
             summary.push_str(&format!(" [{}]", routing_label(&action.routing)));
         }
         lines.push(summary);
+        if let Some(binding) = &action.supervisor_restart {
+            lines.push(binding.display_command());
+        }
 
         if !action.pre_checks.is_empty() {
             lines.push(format!(
@@ -910,6 +914,7 @@ fn confidence_label(confidence: ActionConfidence) -> &'static str {
 fn routing_label(routing: &ActionRouting) -> &'static str {
     match routing {
         ActionRouting::Direct => "direct",
+        ActionRouting::Supervisor => "supervisor",
         ActionRouting::ZombieToParent => "zombie_to_parent",
         ActionRouting::ZombieToSupervisor => "zombie_to_supervisor",
         ActionRouting::ZombieInvestigateOnly => "zombie_investigate_only",
@@ -1259,6 +1264,26 @@ mod tests {
         // Verify REVIEW and SPARE are not selected
         assert!(!state.selected.contains(&5678));
         assert!(!state.selected.contains(&9012));
+    }
+
+    #[test]
+    fn restart_recommendations_share_the_exact_goal_selection() {
+        let mut rows = sample_rows();
+        rows[1].classification = "RESTART".to_string();
+        let mut state = ProcessTableState::new();
+        state.set_rows(rows);
+        state.select_recommended();
+        assert_eq!(state.selected_count(), 2);
+        for selected_pid in [1234, 5678] {
+            state.deselect_all();
+            state.set_goal_selection(Some([(selected_pid, 0)].into()));
+            state.select_recommended();
+            assert_eq!(state.get_selected(), vec![selected_pid]);
+        }
+        state.deselect_all();
+        state.set_goal_selection(Some(HashMap::new()));
+        state.select_recommended();
+        assert!(state.get_selected().is_empty());
     }
 
     #[test]

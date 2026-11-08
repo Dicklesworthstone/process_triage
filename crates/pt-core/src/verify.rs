@@ -25,6 +25,10 @@ pub struct SavedActionOutcome {
     pub action: Option<Action>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<ProcessIdentity>,
+    /// Supervisor scope actually used by a service restart, separate from a
+    /// potentially edited plan and from zombie-parent reaping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_restart: Option<crate::action::SystemdUserServiceBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -169,6 +173,29 @@ pub enum ActionPostcondition {
 /// Controller observations bind both process identity and cgroup membership around
 /// their reads. Verifying a configured effect does not establish resource relief.
 pub fn observe_live_postcondition(action: &PlanAction) -> ActionPostcondition {
+    if action.action == Action::Restart && action.routing == crate::plan::ActionRouting::Supervisor
+    {
+        #[cfg(target_os = "linux")]
+        {
+            return match crate::action::supervisor::verify_systemd_user_restart(action) {
+                Ok(()) => ActionPostcondition::Satisfied {
+                    detail: "The bound user service has a new invocation and live MainPID; the \
+                             original incarnation is gone. This does not establish application \
+                             health or resource relief"
+                        .to_string(),
+                },
+                Err(error) => ActionPostcondition::Unavailable {
+                    reason: error.to_string(),
+                },
+            };
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            return ActionPostcondition::Unavailable {
+                reason: "Systemd user-service verification requires Linux".to_string(),
+            };
+        }
+    }
     #[cfg(target_os = "linux")]
     if matches!(
         action.action,
@@ -786,6 +813,25 @@ fn recorded_plan_actions<'a>(
                 outcome.action_id
             )));
         }
+        if action.routing == crate::plan::ActionRouting::Supervisor {
+            crate::action::supervisor::restart_binding_for_action(action).map_err(|error| {
+                VerifyError::InvalidOutcomes(format!(
+                    "{} has an invalid supervisor restart route: {error}",
+                    outcome.action_id
+                ))
+            })?;
+            if outcome.supervisor_restart != action.supervisor_restart {
+                return Err(VerifyError::InvalidOutcomes(format!(
+                    "{} executed supervisor binding does not match the plan",
+                    outcome.action_id
+                )));
+            }
+        } else if outcome.supervisor_restart.is_some() || action.supervisor_restart.is_some() {
+            return Err(VerifyError::InvalidOutcomes(format!(
+                "{} has supervisor evidence without a supervisor restart route",
+                outcome.action_id
+            )));
+        }
         let target = outcome.target.as_ref().ok_or_else(|| {
             VerifyError::InvalidOutcomes(format!(
                 "{} lacks executed target identity",
@@ -1078,6 +1124,34 @@ pub fn verify_plan_with_postconditions(
             )
         } else {
             match (action.action, current_target) {
+                (Action::Restart, _)
+                    if action.routing == crate::plan::ActionRouting::Supervisor =>
+                {
+                    // The old PID is expected to disappear. Neither its absence,
+                    // reuse nor a saved success can prove the new service state.
+                    match observe(action) {
+                        ActionPostcondition::Satisfied { detail } => (
+                            VerifyOutcome::ConfirmedEffect,
+                            "supervisor_restart_verified",
+                            Some(detail),
+                        ),
+                        ActionPostcondition::NotSatisfied { detail } => (
+                            VerifyOutcome::EffectNotObserved,
+                            "supervisor_restart_not_observed",
+                            Some(detail),
+                        ),
+                        ActionPostcondition::Unavailable { reason } => (
+                            VerifyOutcome::Unsupported,
+                            "observation_unavailable",
+                            Some(reason),
+                        ),
+                        ActionPostcondition::IdentityChanged => (
+                            VerifyOutcome::Unsupported,
+                            "supervisor_binding_changed",
+                            Some("The service binding changed during observation".to_string()),
+                        ),
+                    }
+                }
                 (
                     Action::Kill | Action::Pause | Action::Resume | Action::Renice
                     | Action::Freeze | Action::Unfreeze | Action::Throttle | Action::Quarantine,
@@ -1212,7 +1286,7 @@ pub fn verify_plan_with_postconditions(
             ));
         } else if outcome == VerifyOutcome::EffectNotObserved {
             recommendations.push(format!(
-                "PID {} does not satisfy the requested reversible effect; inspect its current state before retrying",
+                "PID {} does not satisfy the requested action effect; inspect its current state before retrying",
                 action.target.pid.0,
             ));
         }
@@ -1251,6 +1325,9 @@ pub fn verify_plan_with_postconditions(
                     Action::Unfreeze => "cgroup_thaw_requested_and_completed",
                     Action::Throttle => "default_cpu_bandwidth_ceiling",
                     Action::Quarantine => "nonempty_effective_cpu_confinement",
+                    Action::Restart if action.routing == crate::plan::ActionRouting::Supervisor => {
+                        "new_live_main_pid_and_invocation_in_bound_user_service"
+                    }
                     _ => "effect_requires_additional_evidence",
                 }
                 .to_string(),
@@ -1354,6 +1431,7 @@ mod tests {
             confidence: ActionConfidence::Normal,
             original_zombie_target: None,
             d_state_diagnostics: None,
+            supervisor_restart: None,
         }
     }
 
@@ -1382,6 +1460,7 @@ mod tests {
             status: "success".to_string(),
             action: Some(action.action),
             target: Some(action.target.clone()),
+            supervisor_restart: action.supervisor_restart.clone(),
             command: Some("node app --port 3000".to_string()),
             parent_pid: Some(10),
             parent_identity: None,
@@ -1420,6 +1499,121 @@ mod tests {
             DateTime::from_timestamp(31, 0).unwrap(),
         )
         .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn supervisor_restart_action() -> PlanAction {
+        let mut action = make_action(123, Action::Restart);
+        // SAFETY: geteuid only reads the test process's credentials.
+        let uid = unsafe { libc::geteuid() };
+        action.target.uid = uid;
+        action.routing = ActionRouting::Supervisor;
+        action.supervisor_restart = Some(crate::action::SystemdUserServiceBinding {
+            target: action.target.clone(),
+            unit: "worker-proof.service".into(),
+            control_group: format!(
+                "/user.slice/user-{uid}.slice/user@{uid}.service/worker-proof.service"
+            ),
+            invocation_id: "1234567890abcdef1234567890abcdef".into(),
+        });
+        action
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervisor_restart_needs_recorded_scope_and_fresh_replacement_proof() {
+        let action = supervisor_restart_action();
+        let saved = execution(&action);
+        let plan = make_plan(vec![action.clone()]);
+        let absent = report(&plan, std::slice::from_ref(&saved), &[]);
+        assert_eq!(
+            absent.action_outcomes[0].outcome,
+            VerifyOutcome::Unsupported
+        );
+        assert_eq!(absent.action_outcomes[0].verified, Some(false));
+        for (observation, expected) in [
+            (
+                ActionPostcondition::Satisfied {
+                    detail: "new invocation and live replacement".into(),
+                },
+                VerifyOutcome::ConfirmedEffect,
+            ),
+            (
+                ActionPostcondition::NotSatisfied {
+                    detail: "original invocation is unchanged".into(),
+                },
+                VerifyOutcome::EffectNotObserved,
+            ),
+            (
+                ActionPostcondition::Unavailable {
+                    reason: "manager bus is unavailable".into(),
+                },
+                VerifyOutcome::Unsupported,
+            ),
+            (
+                ActionPostcondition::IdentityChanged,
+                VerifyOutcome::Unsupported,
+            ),
+        ] {
+            let mut calls = 0;
+            let report = verify_plan_with_postconditions(
+                &plan,
+                std::slice::from_ref(&saved),
+                &[],
+                DateTime::from_timestamp(30, 0).unwrap(),
+                DateTime::from_timestamp(31, 0).unwrap(),
+                |_| {
+                    calls += 1;
+                    observation.clone()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                calls, 1,
+                "missing old PID must not skip service observation"
+            );
+            assert_eq!(report.action_outcomes[0].outcome, expected);
+            assert!(report.action_outcomes[0].expected_resources_freed.is_none());
+            assert_eq!(report.resource_summary.unwrap().expected_freed_mb, 0.0);
+        }
+        for case in 0..2 {
+            let mut changed = saved.clone();
+            if case == 0 {
+                changed.supervisor_restart = None;
+            } else {
+                changed.supervisor_restart.as_mut().unwrap().invocation_id =
+                    "abcdef0123456789abcdef0123456789".into();
+            }
+            assert!(verify_plan(
+                &plan,
+                &[changed],
+                &[],
+                DateTime::from_timestamp(30, 0).unwrap(),
+                DateTime::from_timestamp(31, 0).unwrap()
+            )
+            .is_err());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_restart_and_zero_budget_cannot_claim_verified_recovery() {
+        let mut action = supervisor_restart_action();
+        let failed = failed_attempt(&action);
+        let report = verify_plan_with_postconditions(
+            &make_plan(vec![action.clone()]),
+            &[failed],
+            &[],
+            DateTime::from_timestamp(30, 0).unwrap(),
+            DateTime::from_timestamp(31, 0).unwrap(),
+            |_| panic!("failed attempts are not recovery evidence"),
+        )
+        .unwrap();
+        assert_eq!(report.action_outcomes[0].verified, Some(false));
+        action.timeouts.verify_ms = 0;
+        assert!(
+            matches!(observe_live_postcondition(&action), ActionPostcondition::Unavailable { reason } if reason.contains("budget exhausted"))
+        );
     }
 
     #[test]

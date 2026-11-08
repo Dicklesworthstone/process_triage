@@ -849,10 +849,14 @@ mod plan_options {
             let evidence = &candidate["goal_resources"];
             assert_eq!(evidence["memory_basis"], "private_clean_plus_private_dirty");
             let private_bytes = evidence["private_memory_bytes"]
-                .as_u64().expect("selected recovery requires measured private bytes");
+                .as_u64()
+                .expect("selected recovery requires measured private bytes");
             let observed = &evidence["private_memory"];
             for field in ["pid", "start_id", "uid"] {
-                assert_eq!(observed["identity"][field], candidate["action_target"][field]);
+                assert_eq!(
+                    observed["identity"][field],
+                    candidate["action_target"][field]
+                );
             }
             let clean = observed["private_clean_bytes"].as_u64().unwrap();
             let dirty = observed["private_dirty_bytes"].as_u64().unwrap();
@@ -2135,18 +2139,27 @@ fn plan_deep_adds_network_evidence() {
         let host_cpu = &output["system_state"]["cpu_usage"];
         if host_cpu.is_null() {
             assert!(candidate["cpu_host_percent"].is_null());
-            assert!(output["system_state"]["pressure"]["unavailable"]
-                .as_array().unwrap().iter().any(|source| source["source"] == "cpu_usage"),
-                "an unavailable host CPU interval must retain its reason");
+            assert!(
+                output["system_state"]["pressure"]["unavailable"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|source| source["source"] == "cpu_usage"),
+                "an unavailable host CPU interval must retain its reason"
+            );
         } else {
             let total = host_cpu["total_ticks"].as_u64().unwrap();
             assert!(total > 0);
             assert!(host_cpu["logical_cpus"].as_u64().unwrap() > 0);
             assert!(host_cpu["busy_ticks"].as_u64().unwrap() <= total);
-            assert!(host_cpu["window_seconds"].as_f64().unwrap()
-                >= activity["cpu_window_seconds"].as_f64().unwrap());
-            assert_eq!(candidate["cpu_host_percent"].as_f64(),
-                Some(100.0 * (activity["cpu_ticks"].as_u64().unwrap() as f64 / total as f64)));
+            assert!(
+                host_cpu["window_seconds"].as_f64().unwrap()
+                    >= activity["cpu_window_seconds"].as_f64().unwrap()
+            );
+            assert_eq!(
+                candidate["cpu_host_percent"].as_f64(),
+                Some(100.0 * (activity["cpu_ticks"].as_u64().unwrap() as f64 / total as f64))
+            );
         }
         assert_eq!(
             candidate["blast_radius"]["cpu_pct"],

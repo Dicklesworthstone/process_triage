@@ -25,13 +25,434 @@
 //! - forever (forever stop)
 
 use crate::action::prechecks::{SupervisorAction, SupervisorInfo};
+use crate::action::ActionError;
+use crate::decision::Action;
+use crate::plan::{ActionRouting, PlanAction};
 #[cfg(target_os = "linux")]
 use crate::supervision::ContainerSupervisionResult;
 use crate::supervision::{AppSupervisionResult, AppSupervisorType};
+#[cfg(target_os = "linux")]
+use pt_common::IdentityQuality;
+use pt_common::ProcessIdentity;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, trace, warn};
+
+/// A read-only observation of one process in the current user's systemd service.
+/// Persist the manager's invocation and cgroup together with the process birth;
+/// a unit name or PID alone cannot authorize a later restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SystemdUserServiceBinding {
+    pub target: ProcessIdentity,
+    pub unit: String,
+    pub control_group: String,
+    pub invocation_id: String,
+}
+
+impl SystemdUserServiceBinding {
+    /// Structural consistency only. This observation must be revalidated against
+    /// both procfs and the user manager immediately before an actual command.
+    pub fn matches_target(&self, target: &ProcessIdentity) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.target == *target
+                && target.quality == IdentityQuality::Full
+                && target.pid.0 > 1
+                // SAFETY: geteuid only reads the caller's credentials.
+                && target.uid == unsafe { libc::geteuid() }
+                && user_service_at_path(&self.control_group, target.uid)
+                    == Some(self.unit.as_str())
+                && valid_invocation_id(&self.invocation_id)
+                && !protected_restart_unit(&self.unit)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = target;
+            false
+        }
+    }
+
+    pub fn display_command(&self) -> String {
+        format!(
+            "systemctl --user --no-ask-password --job-mode=fail try-restart -- {}",
+            self.unit
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn valid_invocation_id(value: &str) -> bool {
+    value.len() == 32
+        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && value.bytes().any(|byte| byte != b'0')
+}
+
+/// Only a literal leaf service below this exact user's manager is eligible.
+/// Reject container placement, scopes, the manager itself, delegated children,
+/// another user's manager and ambiguous paths before invoking systemctl.
+#[cfg(target_os = "linux")]
+fn user_service_at_path(path: &str, uid: u32) -> Option<&str> {
+    let prefix = format!("/user.slice/user-{uid}.slice/user@{uid}.service/");
+    let tail = path.strip_prefix(&prefix)?;
+    let mut components = tail.rsplit('/');
+    let unit = components.next()?;
+    if !crate::collect::systemd::is_literal_service_unit(unit)
+        || components.any(|component| {
+            !component.ends_with(".slice")
+                || component.len() <= ".slice".len()
+                || component.starts_with('.')
+                || !component
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_.@:-".contains(&byte))
+        })
+    {
+        return None;
+    }
+    Some(unit)
+}
+
+#[cfg(target_os = "linux")]
+fn protected_restart_unit(unit: &str) -> bool {
+    let command = unit.trim_end_matches(".service");
+    SupervisorActionRunner::new().is_protected_unit(unit)
+        || crate::collect::protected::builtin_protection_match(command, command).is_some()
+        || crate::collect::protected::builtin_force_review_match(command).is_some()
+}
+
+/// Discover one supported supervisor route without changing service state.
+/// Ordinary processes are rejected from cgroup placement before any subprocess.
+pub fn discover_systemd_user_restart(
+    target: &ProcessIdentity,
+) -> Result<Option<SystemdUserServiceBinding>, ActionError> {
+    discover_systemd_user_restart_with_budget(target, Duration::from_secs(2))
+}
+
+fn discover_systemd_user_restart_with_budget(
+    target: &ProcessIdentity,
+    budget: Duration,
+) -> Result<Option<SystemdUserServiceBinding>, ActionError> {
+    #[cfg(target_os = "linux")]
+    {
+        let started = Instant::now();
+        // SAFETY: geteuid only reads the caller's credentials.
+        if target.uid != unsafe { libc::geteuid() } || target.pid.0 <= 1 {
+            return Ok(None);
+        }
+        let Some(path) = crate::collect::collect_cgroup_details(target.pid.0)
+            .and_then(|details| details.unified_path)
+        else {
+            return Ok(None);
+        };
+        let Some(unit) = user_service_at_path(&path, target.uid) else {
+            return Ok(None);
+        };
+        if protected_restart_unit(unit) {
+            return Ok(None);
+        }
+        ensure_restart_subject(target)?;
+        if super::dispatch::ensure_exclusive_cgroup(target.pid.0)? != path {
+            return Err(ActionError::IdentityMismatch);
+        }
+        let state = crate::collect::systemd::query_systemd_user_service(
+            unit,
+            target.uid,
+            remaining_budget(started, budget)?,
+        )
+        .map_err(ActionError::Failed)?;
+        let binding = binding_from_service_state(target, &path, &state)?;
+        // Bracket manager IPC with a second incarnation/placement observation.
+        ensure_restart_subject(target)?;
+        if super::dispatch::ensure_exclusive_cgroup(target.pid.0)? != path {
+            return Err(ActionError::IdentityMismatch);
+        }
+        remaining_budget(started, budget)?;
+        Ok(Some(binding))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (target, budget);
+        Ok(None)
+    }
+}
+
+/// Revalidate an already reviewed route; a newly detected different invocation
+/// or service is not a substitute for the binding saved in the plan.
+pub fn validate_systemd_user_restart(
+    target: &ProcessIdentity,
+    binding: &SystemdUserServiceBinding,
+    budget: Duration,
+) -> Result<(), ActionError> {
+    if !binding.matches_target(target) {
+        return Err(ActionError::Failed(
+            "restart binding does not match the complete target and current user manager"
+                .to_string(),
+        ));
+    }
+    let current = discover_systemd_user_restart_with_budget(target, budget)?;
+    if current.as_ref() != Some(binding) {
+        return Err(ActionError::Failed(
+            "systemd service identity, invocation or cgroup changed since planning".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// A supervisor binding cannot turn a direct or zombie-parent action into a
+/// service operation. In particular, hand-edited plans must name the route.
+pub(crate) fn restart_binding_for_action(
+    action: &PlanAction,
+) -> Result<&SystemdUserServiceBinding, ActionError> {
+    let binding = action.supervisor_restart.as_ref().ok_or_else(|| {
+        ActionError::Failed("restart requires a recorded supervisor binding".to_string())
+    })?;
+    if action.action != Action::Restart
+        || action.routing != ActionRouting::Supervisor
+        || action.original_zombie_target.is_some()
+        || !binding.matches_target(&action.target)
+    {
+        return Err(ActionError::Failed(
+            "invalid supervisor restart route or target binding".to_string(),
+        ));
+    }
+    Ok(binding)
+}
+
+#[cfg(target_os = "linux")]
+fn remaining_budget(started: Instant, budget: Duration) -> Result<Duration, ActionError> {
+    budget
+        .checked_sub(started.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or(ActionError::Timeout)
+}
+
+#[cfg(target_os = "linux")]
+fn binding_from_service_state(
+    target: &ProcessIdentity,
+    path: &str,
+    state: &crate::collect::systemd::SystemdUserServiceState,
+) -> Result<SystemdUserServiceBinding, ActionError> {
+    let binding = SystemdUserServiceBinding {
+        target: target.clone(),
+        unit: state.unit.clone(),
+        control_group: state.control_group.clone(),
+        invocation_id: state.invocation_id.clone(),
+    };
+    if state.main_pid != target.pid.0
+        || state.control_group != path
+        || !binding.matches_target(target)
+    {
+        return Err(ActionError::Failed(
+            "manager MainPID, invocation or cgroup does not match this service process".to_string(),
+        ));
+    }
+    Ok(binding)
+}
+
+/// Mandatory protections also apply to callers using CompositeActionRunner
+/// directly. Policy, session, data-loss and intent gates still run in apply.
+#[cfg(target_os = "linux")]
+fn ensure_restart_subject(target: &ProcessIdentity) -> Result<(), ActionError> {
+    super::signal::ensure_action_pid_namespace()?;
+    let pid = target.pid.0;
+    if pid <= 1 || crate::collect::protected::live_invoker_chain_pids().contains(&pid) {
+        return Err(ActionError::Failed(
+            "refusing restart of init, pt or an invoking process".to_string(),
+        ));
+    }
+    let current =
+        super::dispatch::read_cgroup_identity(pid).ok_or(ActionError::IdentityMismatch)?;
+    if target.quality != IdentityQuality::Full || !target.matches(&current) {
+        return Err(ActionError::IdentityMismatch);
+    }
+    // SAFETY: geteuid only reads the caller's credentials.
+    let uid = unsafe { libc::geteuid() };
+    let credentials = crate::collect::proc_parsers::parse_proc_status(pid)
+        .ok_or(ActionError::IdentityMismatch)?;
+    if target.uid != uid
+        || [
+            credentials.ruid,
+            credentials.euid,
+            credentials.suid,
+            credentials.fsuid,
+        ]
+        .iter()
+        .any(|owner| *owner != uid)
+    {
+        return Err(ActionError::PermissionDenied);
+    }
+    let stat = crate::collect::proc_parsers::read_required_proc_stat(pid)
+        .map_err(|error| ActionError::Failed(error.to_string()))?;
+    if matches!(stat.state, 'Z' | 'X' | 'x') {
+        return Err(ActionError::Failed(
+            "dead processes require a reaping remedy, not a service restart".to_string(),
+        ));
+    }
+    let raw_stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .map_err(|error| ActionError::Failed(format!("TTY evidence unavailable: {error}")))?;
+    if super::prechecks::parse_proc_tty(pid, &raw_stat).map_err(ActionError::Failed)? {
+        return Err(ActionError::Failed(
+            "interactive services are not eligible for bounded restart".to_string(),
+        ));
+    }
+    let cmd = crate::collect::proc_parsers::parse_proc_cmdline(pid)
+        .ok_or_else(|| ActionError::Failed("restart command evidence unavailable".to_string()))?;
+    if crate::collect::protected::builtin_protection_match(&stat.comm, &cmd).is_some()
+        || crate::collect::protected::builtin_force_review_match(&cmd).is_some()
+        || crate::collect::protected::live_service_ancestor(pid).is_some()
+    {
+        return Err(ActionError::Failed(
+            "refusing restart of protected infrastructure or an agent".to_string(),
+        ));
+    }
+    let fuse = super::prechecks::fuse_action_precheck(
+        crate::collect::protected::holds_fuse_device(pid),
+        Action::Restart,
+    );
+    if let super::prechecks::PreCheckResult::Blocked { reason, .. } = fuse {
+        return Err(ActionError::Failed(reason));
+    }
+    let supervision = crate::supervision::detect_supervision(pid).map_err(|error| {
+        ActionError::Failed(format!("supervision evidence unavailable: {error}"))
+    })?;
+    if crate::supervision::is_human_supervised(&supervision) {
+        return Err(ActionError::Failed(
+            "human, agent, IDE or IPC supervision blocks service restart".to_string(),
+        ));
+    }
+    let after = super::dispatch::read_cgroup_identity(pid).ok_or(ActionError::IdentityMismatch)?;
+    if !target.matches(&after) {
+        return Err(ActionError::IdentityMismatch);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn execute_systemd_user_restart(
+    action: &PlanAction,
+    on_submission: impl FnOnce(),
+) -> Result<(), ActionError> {
+    let binding = restart_binding_for_action(action)?;
+    let started = Instant::now();
+    let budget = Duration::from_millis(action.timeouts.execute_ms.min(120_000));
+    validate_systemd_user_restart(&action.target, binding, remaining_budget(started, budget)?)?;
+    let remaining = remaining_budget(started, budget)?;
+    if remaining <= Duration::from_millis(600) {
+        return Err(ActionError::Timeout);
+    }
+    on_submission();
+    crate::collect::systemd::run_user_systemctl(
+        action.target.uid,
+        &["--job-mode=fail", "try-restart", "--", &binding.unit],
+        remaining,
+    )
+    .map_err(|error| {
+        ActionError::Failed(format!(
+            "systemd --user restart was not confirmed: {error}; a submitted manager job may \
+             still be pending or have changed the service; inspect the unit before retrying"
+        ))
+    })?;
+    if remaining_budget(started, budget).is_err() {
+        return Err(ActionError::Failed(
+            "restart command exceeded its budget after submission; the manager job may still \
+             be pending; inspect the unit before retrying"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_restarted_identity(
+    binding: &SystemdUserServiceBinding,
+    state: &crate::collect::systemd::SystemdUserServiceState,
+    replacement: &ProcessIdentity,
+    original_now: Option<&ProcessIdentity>,
+) -> Result<(), ActionError> {
+    if state.unit != binding.unit
+        || state.control_group != binding.control_group
+        || !valid_invocation_id(&state.invocation_id)
+        || state
+            .invocation_id
+            .eq_ignore_ascii_case(&binding.invocation_id)
+        || state.main_pid == binding.target.pid.0
+        || replacement.pid.0 != state.main_pid
+        || replacement.uid != binding.target.uid
+        || replacement.quality != IdentityQuality::Full
+        || replacement.start_id == binding.target.start_id
+        || original_now.is_some_and(|current| binding.target.matches(current))
+    {
+        return Err(ActionError::Failed(
+            "restart has not produced a new live MainPID and invocation in the bound service"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn observed_restart_identity(pid: u32) -> Result<Option<ProcessIdentity>, ActionError> {
+    if let Some(identity) = super::dispatch::read_cgroup_identity(pid) {
+        return Ok(Some(identity));
+    }
+    match std::fs::symlink_metadata(format!("/proc/{pid}")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        _ => Err(ActionError::Failed(format!(
+            "cannot establish the current incarnation or exit of PID {pid}"
+        ))),
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn verify_systemd_user_restart(action: &PlanAction) -> Result<(), ActionError> {
+    let binding = restart_binding_for_action(action)?;
+    let started = Instant::now();
+    let budget = Duration::from_millis(action.timeouts.verify_ms.min(120_000));
+    let mut last_error = "no replacement service observation".to_string();
+    loop {
+        let remaining = match remaining_budget(started, budget) {
+            Ok(remaining) if remaining > Duration::from_millis(600) => remaining,
+            _ => {
+                return Err(ActionError::Failed(format!(
+                    "restart verification budget exhausted: {last_error}; the manager job may \
+                     still be pending; inspect the unit before retrying"
+                )))
+            }
+        };
+        let observe = || -> Result<(), ActionError> {
+            let state = crate::collect::systemd::query_systemd_user_service(
+                &binding.unit,
+                action.target.uid,
+                remaining,
+            )
+            .map_err(ActionError::Failed)?;
+            let replacement =
+                observed_restart_identity(state.main_pid)?.ok_or(ActionError::ProcessNotFound)?;
+            let original_now = observed_restart_identity(binding.target.pid.0)?;
+            verify_restarted_identity(binding, &state, &replacement, original_now.as_ref())?;
+            ensure_restart_subject(&replacement)?;
+            if super::dispatch::ensure_exclusive_cgroup(replacement.pid.0)? != binding.control_group
+            {
+                return Err(ActionError::IdentityMismatch);
+            }
+            let after = observed_restart_identity(replacement.pid.0)?
+                .ok_or(ActionError::IdentityMismatch)?;
+            if !replacement.matches(&after) {
+                return Err(ActionError::IdentityMismatch);
+            }
+            remaining_budget(started, budget)?;
+            Ok(())
+        };
+        match observe() {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = error.to_string(),
+        }
+        let remaining = remaining_budget(started, budget).unwrap_or_default();
+        std::thread::sleep(remaining.min(Duration::from_millis(50)));
+    }
+}
 
 /// Errors from supervisor action execution.
 #[derive(Debug, Error)]
@@ -1072,6 +1493,207 @@ pub fn plan_action_from_supervisor_info(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    mod user_restart {
+        use super::*;
+        use crate::collect::systemd::SystemdUserServiceState;
+        use pt_common::StartId;
+
+        fn binding() -> SystemdUserServiceBinding {
+            // SAFETY: geteuid only reads the test process's credentials.
+            let uid = unsafe { libc::geteuid() };
+            SystemdUserServiceBinding {
+                target: ProcessIdentity::full(
+                    12345,
+                    StartId::from_linux("restart-proof", 100, 12345),
+                    uid,
+                    Some(12345),
+                    Some(12345),
+                    IdentityQuality::Full,
+                ),
+                unit: "worker-proof.service".to_string(),
+                control_group: format!(
+                    "/user.slice/user-{uid}.slice/user@{uid}.service/worker-proof.service"
+                ),
+                invocation_id: "1234567890abcdef1234567890abcdef".to_string(),
+            }
+        }
+
+        fn state(binding: &SystemdUserServiceBinding) -> SystemdUserServiceState {
+            SystemdUserServiceState {
+                unit: binding.unit.clone(),
+                main_pid: binding.target.pid.0,
+                control_group: binding.control_group.clone(),
+                invocation_id: binding.invocation_id.clone(),
+            }
+        }
+
+        fn action(binding: &SystemdUserServiceBinding) -> PlanAction {
+            serde_json::from_value(serde_json::json!({
+                "action_id": "user-restart-proof",
+                "target": binding.target,
+                "action": "restart",
+                "order": 0,
+                "stage": 0,
+                "timeouts": {"preflight_ms": 5000, "execute_ms": 30000, "verify_ms": 10000},
+                "pre_checks": [],
+                "rationale": {},
+                "on_success": [],
+                "on_failure": [],
+                "blocked": false,
+                "routing": "supervisor",
+                "supervisor_restart": binding,
+            }))
+            .expect("complete supervisor plan fixture")
+        }
+
+        #[test]
+        fn binding_requires_exact_current_user_leaf_and_full_incarnation() {
+            let valid = binding();
+            assert!(valid.matches_target(&valid.target));
+            let uid = valid.target.uid;
+            for path in [
+                "/system.slice/worker-proof.service".to_string(),
+                format!("/user.slice/user-{uid}.slice/user@{uid}.service"),
+                format!("/user.slice/user-{uid}.slice/user@{uid}.service/init.scope"),
+                format!("{}/child", valid.control_group),
+                format!("/user.slice/user-{uid}.slice/user@{uid}.service/../worker-proof.service"),
+                format!("/user.slice/user-{uid}.slice/user@{uid}.service//worker-proof.service"),
+                format!(
+                    "/user.slice/user-{}.slice/user@{}.service/worker-proof.service",
+                    uid + 1,
+                    uid + 1
+                ),
+            ] {
+                let mut changed = valid.clone();
+                changed.control_group = path;
+                assert!(
+                    !changed.matches_target(&valid.target),
+                    "{}",
+                    changed.control_group
+                );
+            }
+            for case in 0..7 {
+                let mut changed = valid.clone();
+                match case {
+                    0 => changed.target.start_id = StartId::from_linux("restart-proof", 101, 12345),
+                    1 => changed.target.uid = uid + 1,
+                    2 => changed.target.quality = IdentityQuality::NoBootId,
+                    3 => changed.target.sid = Some(54321),
+                    4 => changed.invocation_id = "00000000000000000000000000000000".into(),
+                    5 => changed.invocation_id = "not-an-invocation".into(),
+                    _ => changed.unit = "*.service".into(),
+                }
+                assert!(!changed.matches_target(&valid.target), "case {case}");
+            }
+        }
+
+        #[test]
+        fn manager_binding_rejects_alias_pid_cgroup_and_invocation_mismatches() {
+            let binding = binding();
+            let ready = state(&binding);
+            assert_eq!(
+                binding_from_service_state(&binding.target, &binding.control_group, &ready)
+                    .unwrap(),
+                binding
+            );
+            for case in 0..4 {
+                let mut changed = ready.clone();
+                match case {
+                    0 => changed.main_pid += 1,
+                    1 => changed.unit = "alias.service".into(),
+                    2 => changed.control_group.push_str("/child"),
+                    _ => changed.invocation_id.clear(),
+                }
+                assert!(
+                    binding_from_service_state(&binding.target, &binding.control_group, &changed)
+                        .is_err(),
+                    "case {case}"
+                );
+            }
+        }
+
+        #[test]
+        fn verification_requires_new_invocation_live_replacement_and_original_exit() {
+            let binding = binding();
+            let replacement = ProcessIdentity::full(
+                23456,
+                StartId::from_linux("restart-proof", 200, 23456),
+                binding.target.uid,
+                Some(23456),
+                Some(23456),
+                IdentityQuality::Full,
+            );
+            let mut ready = state(&binding);
+            ready.main_pid = replacement.pid.0;
+            ready.invocation_id = "abcdef0123456789abcdef0123456789".to_string();
+            verify_restarted_identity(&binding, &ready, &replacement, None).unwrap();
+            assert!(verify_restarted_identity(
+                &binding,
+                &ready,
+                &replacement,
+                Some(&binding.target)
+            )
+            .is_err());
+            for case in 0..8 {
+                let mut changed = ready.clone();
+                let mut process = replacement.clone();
+                match case {
+                    0 => changed.invocation_id = binding.invocation_id.clone(),
+                    1 => changed.invocation_id = binding.invocation_id.to_uppercase(),
+                    2 => changed.main_pid = binding.target.pid.0,
+                    3 => changed.control_group.push_str("/other"),
+                    4 => process.uid += 1,
+                    5 => process.start_id = binding.target.start_id.clone(),
+                    6 => process.quality = IdentityQuality::NoBootId,
+                    _ => changed.unit = "other.service".into(),
+                }
+                assert!(
+                    verify_restarted_identity(&binding, &changed, &process, None).is_err(),
+                    "case {case}"
+                );
+            }
+        }
+
+        #[test]
+        fn supervisor_route_cannot_be_smuggled_into_direct_or_zombie_actions() {
+            let binding = binding();
+            let valid = action(&binding);
+            restart_binding_for_action(&valid).unwrap();
+            for case in 0..6 {
+                let mut changed = valid.clone();
+                match case {
+                    0 => changed.routing = ActionRouting::Direct,
+                    1 => changed.routing = ActionRouting::ZombieToParent,
+                    2 => changed.original_zombie_target = Some(binding.target.clone()),
+                    3 => changed.action = Action::Kill,
+                    4 => changed.supervisor_restart = None,
+                    _ => changed.target.start_id = StartId::from_linux("restart-proof", 101, 12345),
+                }
+                let submitted = std::cell::Cell::new(false);
+                assert!(
+                    execute_systemd_user_restart(&changed, || submitted.set(true)).is_err(),
+                    "case {case}"
+                );
+                assert!(
+                    !submitted.get(),
+                    "invalid route submitted a manager command"
+                );
+            }
+        }
+
+        #[test]
+        fn zero_execution_and_verification_budgets_never_submit_or_report_success() {
+            let mut action = action(&binding());
+            action.timeouts.execute_ms = 0;
+            action.timeouts.verify_ms = 0;
+            let submitted = std::cell::Cell::new(false);
+            assert!(execute_systemd_user_restart(&action, || submitted.set(true)).is_err());
+            assert!(!submitted.get());
+            assert!(verify_systemd_user_restart(&action).is_err());
+        }
+    }
 
     #[test]
     fn test_supervisor_type_display() {

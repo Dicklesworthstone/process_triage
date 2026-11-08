@@ -1296,6 +1296,7 @@ mod tests {
                     ticks: killed_at as u64 * clock_hz(),
                 }),
                 time_ms: Some(50),
+                supervisor_restart: None,
             };
             (
                 action,

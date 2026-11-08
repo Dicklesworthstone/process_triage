@@ -922,7 +922,11 @@ is unchanged.
 | **GitHub Actions** | `GITHUB_ACTIONS`, `GITHUB_WORKFLOW` env | 0.95 |
 | **tmux/screen** | `TMUX` or `STY` env | 0.30 |
 
-Supervision is reported per candidate in the plan (`supervisor`); for a process supervised by a systemd service it gives the unit, the manager (`system` or `user`) and the `systemctl [--user] restart <unit>` command. Processes classified as systemd services or container workloads are protected outright, and robot mode requires a human for anything supervised by an agent, IDE or CI job (failing closed when it cannot tell). Verified terminal-pane ancestry is treated as a user workload even inside the mux service's cgroup. A nohup/disown detector (SIGHUP in `SigIgn`, `nohup.out`) exists in the library but is not used in scoring yet.
+Supervision is reported per candidate in the plan (`supervisor`). System services, container workloads and unsupported user services remain protected. Robot mode requires a human for anything supervised by an agent, IDE or CI job, and refuses when that evidence is unavailable. Verified terminal-pane ancestry is treated as a user workload even inside the mux service's cgroup. A nohup/disown detector (SIGHUP in `SigIgn`, `nohup.out`) exists in the library but is not used in scoring yet.
+
+**Executable user-service restart:** On Linux, planning can select `restart` for an isolated service belonging to the current user's systemd manager. This initial route requires `Type=simple` or `Type=exec`, `DefaultDependencies=no`, `Slice=-.slice`, exactly one live main process, no descendant cgroups, and no dependencies, hooks or manager actions that could expand the operation to other units. The unavoidable root-slice start dependency is checked separately. Ordinary services with broader dependency graphs remain protected.
+
+The plan persists `supervisor_restart` with the target incarnation, unit, cgroup and invocation ID. Apply repeats identity, ownership, policy, session, data-loss, agent/IPC and unit-scope checks, then runs `systemctl --user --no-ask-password --job-mode=fail try-restart -- <unit>` against the explicit current-user bus. Verification requires a new running main process and invocation in that same service; disappearance of the original PID is insufficient. Restarts consume destructive-action budgets, including attempts where a timed-out client may already have submitted a manager job. The TUI shows the service command before execution. Broader systemd units and other supervisor adapters are not executable through this route.
 
 ---
 
@@ -970,24 +974,17 @@ Process identity is tracked via a SHA-256 hash of `(pid, uid, comm, cmd)`, produ
 
 ## Respawn Loop Detection
 
-> **Status:** `pt agent verify --check-respawn` reports whether killed processes came back. The loop tracker and utility discount described below are library-only.
+Successful kills observed by `agent apply`, `agent verify`, or interactive execution can now teach later planning runs that a workload keeps returning. History is stored in `respawn_history.json` under the process-triage data directory. An event requires a replacement with the same UID and exact normalized command, a verified live parent incarnation, and a birth after the recorded execution. Failed, skipped and dry-run actions do not teach the tracker. Repeated verification of one execution records it only once.
 
-Killing a supervised process that immediately restarts is pointless. `pt` tracks kill-respawn cycles and adjusts its recommendations:
+Two or more replacements born within 30 seconds of their respective kills, during a one-hour history window, establish a loop. Subsequent planning, snapshots, explanations, watch output and TUI refreshes report the loop and named spawner. Another raw child-kill recommendation becomes `review` before the executable plan and resource-goal selection are finalized. This changes action advice without changing the process's class probabilities. New observations also produce an inbox review notice; they do not authorize stopping or disabling a parent or service.
 
-```
-Kill → respawn in 2s → Kill → respawn in 2s → Kill → respawn in 2s
-                     ↓
-         "Respawn loop detected (3 cycles in 60s)"
-         Recommendation: systemctl stop <unit> instead
-```
-
-After detecting a loop (2+ respawns within 30 seconds of each kill, within a 1-hour window), `pt` discounts the kill action's utility:
+The history summary exposes the loop tracker's utility multiplier for explanation:
 
 ```
 utility_multiplier = 1.0 - 0.8 * min(loop_count / 5, 1.0)
 ```
 
-At 5+ loops, kill utility drops to 20% of baseline. The recommendation escalates from "kill" to "stop supervisor" to "disable supervisor" as the loop count increases.
+At five loops the reported multiplier is 0.2. The command path conservatively requests spawner review instead of applying that number as a new probability or silently modifying the loss matrix. Parent PID reuse, a different command, an incomplete census or corrupt history cannot supply loop evidence. Interactive execution takes one immediate census and rechecks saved outcomes on refresh; a replacement born after the last observation requires a later refresh or `pt agent verify --session <id> --check-respawn`.
 
 ---
 
@@ -1181,7 +1178,7 @@ When you run `pt agent plan --format json`, the output is a deterministic, resum
 
 **Key design choices:**
 - **IDs are deterministic** (FNV-1a 64-bit hashes, not UUIDs); the same inputs always produce the same plan
-- **Zombie routing**: Z-state processes are routed to their parent for `restart` (forcing reap), not killed directly (restart is not executable yet, so apply reports these as failed)
+- **Zombie routing**: Z-state processes use a separately bound parent-reaping notification and verification. This route is distinct from a service restart and never restarts the parent service merely to reap a child.
 - **D-state handling**: Processes in uninterruptible sleep get `confidence: "low"` with diagnostic fields (wchan, I/O counters, D-state duration)
 - **Pre-checks**: Every action lists safety checks that must pass before execution (identity verification, protection check, session safety, data-loss gate, supervisor check); `agent apply` always runs at least the checks pt generates for that action type, whatever the plan file says
 
@@ -1621,7 +1618,7 @@ cargo run -p pt-core -- run
 - **No Windows native**: Windows support is via WSL2 only.
 - **Uncalibrated posterior**: the posterior is deliberately conservative and not yet calibrated against labeled outcomes, so `kill` recommendations are rare; most candidates come back as `pause` or `review`. Robot mode gates on the posterior only (no conformal gate is applied yet).
 - **Cross-host dependencies**: Fleet planning and confirmed apply preserve host-local safety and the exact pooled selection. They do not yet coordinate service dependencies or establish that stopping processes on different hosts is jointly safe.
-- **No automatic recovery or restart**: `pt` reports failed actions but does not retry or roll back, and the `restart` action is not executable yet. Supervised services are protected; stop them through their supervisor.
+- **No automatic retry or rollback**: `pt` reports failed actions and requires a fresh reviewed action to retry. Explicit restart supports only the isolated current-user systemd services described above. A timed-out manager command may still have an outstanding job; inspect the service before retrying. Other supervised workloads remain protected.
 - **Library-only modules**: many advanced models and collectors in the workspace (see [Experimental Library Models](#experimental-library-models)) are tested but not wired into commands yet.
 
 ---

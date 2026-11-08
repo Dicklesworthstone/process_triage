@@ -12,6 +12,7 @@
 //! D-state processes may ignore SIGKILL while waiting on kernel I/O. The planner
 //! marks any kill-like actions as low-confidence and surfaces diagnostics.
 
+use crate::action::supervisor::SystemdUserServiceBinding;
 use crate::collect::ProcessState;
 use crate::config::Policy;
 use crate::decision::{Action, DecisionOutcome, SprtBoundary};
@@ -43,6 +44,8 @@ pub struct DecisionCandidate {
     pub parent_identity: Option<ProcessIdentity>,
     /// D-state diagnostics if process is in uninterruptible sleep.
     pub d_state_diagnostics: Option<DStateDiagnostics>,
+    /// Observed current-user service route for a non-zombie restart.
+    pub supervisor_restart: Option<SystemdUserServiceBinding>,
 }
 
 /// Diagnostics for D-state (uninterruptible sleep) processes.
@@ -105,6 +108,9 @@ pub struct PlanAction {
     /// D-state diagnostics if targeting a D-state process.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub d_state_diagnostics: Option<DStateDiagnostics>,
+    /// Exact user-manager service binding observed during planning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_restart: Option<SystemdUserServiceBinding>,
 }
 
 fn is_direct_routing(routing: &ActionRouting) -> bool {
@@ -155,6 +161,8 @@ pub enum ActionRouting {
     /// Direct action on the target process.
     #[default]
     Direct,
+    /// Restart through the explicitly recorded current-user service manager.
+    Supervisor,
     /// Zombie: routed to parent process.
     ZombieToParent,
     /// Zombie: routed to supervisor (systemd, docker, etc.).
@@ -237,10 +245,13 @@ pub fn generate_plan(bundle: &DecisionBundle) -> Plan {
             continue;
         }
 
-        // The runner supports Restart only for ZombieToParent routing. An
-        // unsupported direct restart is not an explicit gate refusal; those
-        // candidates were counted above before any executable action is built.
-        if candidate.decision.optimal_action == Action::Restart {
+        // An unsupported restart never becomes executable. A typed binding is
+        // an observation, not authorization; apply revalidates all live gates.
+        let supervisor_restart = candidate
+            .supervisor_restart
+            .as_ref()
+            .filter(|binding| binding.matches_target(&candidate.identity));
+        if candidate.decision.optimal_action == Action::Restart && supervisor_restart.is_none() {
             continue;
         }
 
@@ -279,7 +290,7 @@ pub fn generate_plan(bundle: &DecisionBundle) -> Plan {
             };
 
             // Determine confidence and routing for D-state
-            let (confidence, routing, d_state_diag) = if is_d_state {
+            let (confidence, mut routing, d_state_diag) = if is_d_state {
                 let confidence = if action == Action::Kill || action == Action::Restart {
                     ActionConfidence::Low
                 } else {
@@ -293,6 +304,9 @@ pub fn generate_plan(bundle: &DecisionBundle) -> Plan {
             } else {
                 (ActionConfidence::Normal, ActionRouting::Direct, None)
             };
+            if action == Action::Restart && supervisor_restart.is_some() {
+                routing = ActionRouting::Supervisor;
+            }
 
             let mut pre_checks = pre_checks_for(action);
             // Add state verification only for actions likely to fail in D-state
@@ -306,7 +320,15 @@ pub fn generate_plan(bundle: &DecisionBundle) -> Plan {
                 action,
                 order: 0,
                 stage,
-                timeouts: ActionTimeouts::default(),
+                timeouts: if routing == ActionRouting::Supervisor {
+                    ActionTimeouts {
+                        preflight_ms: 5_000,
+                        execute_ms: 30_000,
+                        verify_ms: 10_000,
+                    }
+                } else {
+                    ActionTimeouts::default()
+                },
                 pre_checks,
                 rationale,
                 on_success: vec![],
@@ -323,6 +345,11 @@ pub fn generate_plan(bundle: &DecisionBundle) -> Plan {
                 confidence,
                 original_zombie_target: None,
                 d_state_diagnostics: d_state_diag,
+                supervisor_restart: if action == Action::Restart {
+                    supervisor_restart.cloned()
+                } else {
+                    None
+                },
             });
         }
     }
@@ -431,6 +458,7 @@ fn plan_zombie_actions(candidate: &DecisionCandidate, policy: &Policy) -> Option
         confidence: ActionConfidence::Normal,
         original_zombie_target: Some(candidate.identity.clone()),
         d_state_diagnostics: None,
+        supervisor_restart: None,
     }])
 }
 
@@ -689,7 +717,66 @@ mod tests {
             process_state: None,
             parent_identity: None,
             d_state_diagnostics: None,
+            supervisor_restart: None,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restart_plan_persists_only_an_exact_supported_supervisor_route() {
+        let mut input = candidate(12345, Action::Restart, 10.0, 1.0);
+        // SAFETY: geteuid only reads the test process's credentials.
+        let uid = unsafe { libc::geteuid() };
+        input.identity.uid = uid;
+        let binding = SystemdUserServiceBinding {
+            target: input.identity.clone(),
+            unit: "worker-proof.service".into(),
+            control_group: format!(
+                "/user.slice/user-{uid}.slice/user@{uid}.service/worker-proof.service"
+            ),
+            invocation_id: "1234567890abcdef1234567890abcdef".into(),
+        };
+        input.supervisor_restart = Some(binding.clone());
+        let mut bundle = DecisionBundle {
+            session_id: SessionId("pt-20260115-120000-abcd".into()),
+            policy: Policy::default(),
+            candidates: vec![input],
+            generated_at: Some("2026-01-15T12:00:00Z".into()),
+        };
+        let plan = generate_plan(&bundle);
+        assert_eq!(plan.actions.len(), 1);
+        assert_eq!(plan.actions[0].routing, ActionRouting::Supervisor);
+        assert_eq!(plan.actions[0].supervisor_restart, Some(binding.clone()));
+        assert!(plan.actions[0]
+            .pre_checks
+            .contains(&PreCheck::CheckSupervisor));
+        assert!(plan.actions[0]
+            .pre_checks
+            .contains(&PreCheck::CheckDataLossGate));
+        let restored: Plan = serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+        assert_eq!(
+            restored.actions[0].supervisor_restart,
+            Some(binding.clone())
+        );
+
+        bundle.candidates[0].supervisor_restart = None;
+        assert!(generate_plan(&bundle).actions.is_empty());
+        let mut mismatched = binding.clone();
+        mismatched.target.start_id = pt_common::StartId("different-birth".into());
+        bundle.candidates[0].supervisor_restart = Some(mismatched);
+        assert!(generate_plan(&bundle).actions.is_empty());
+
+        bundle.candidates[0].supervisor_restart = Some(binding);
+        bundle.candidates[0].process_state = Some(ProcessState::Zombie);
+        bundle.candidates[0].parent_identity = Some(identity(23456));
+        let zombie = generate_plan(&bundle);
+        assert_eq!(zombie.actions[0].routing, ActionRouting::ZombieToParent);
+        assert!(zombie.actions[0].supervisor_restart.is_none());
+
+        let mut legacy = serde_json::to_value(&zombie.actions[0]).unwrap();
+        legacy.as_object_mut().unwrap().remove("supervisor_restart");
+        let parsed: PlanAction = serde_json::from_value(legacy).unwrap();
+        assert!(parsed.supervisor_restart.is_none());
     }
 
     #[test]

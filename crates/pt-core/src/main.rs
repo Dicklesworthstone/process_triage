@@ -2429,10 +2429,12 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
                 };
                 let scan_result =
                     quick_scan(&scan_options).map_err(|e| format!("scan failed: {}", e))?;
+                observe_saved_tui_respawns(&handle_r, &scan_result)?;
                 let protected_filter = ProtectedFilter::from_guardrails(&policy_scan_r.guardrails)
                     .map_err(|e| format!("filter error: {}", e))?;
-                let filter_result = protected_filter.filter_scan_result(&scan_result);
                 let mut scorer = scorer_r.clone();
+                let filter_result =
+                    filter_planning_scan(&protected_filter, &scan_result, &mut scorer);
                 scorer.decisions = decisions_r
                     .lock()
                     .map_err(|_| "decision store lock poisoned".to_string())?
@@ -2587,6 +2589,7 @@ struct PlanCandidateInput {
     cmd: String,
     blocked_reasons: Vec<String>,
     parent_identity: Option<ProcessIdentity>,
+    supervisor_restart: Option<pt_core::action::SystemdUserServiceBinding>,
 }
 
 #[cfg(feature = "ui")]
@@ -2601,6 +2604,7 @@ impl PlanCandidateInput {
             process_state: Some(self.process_state),
             parent_identity: self.parent_identity.clone(),
             d_state_diagnostics: None,
+            supervisor_restart: self.supervisor_restart.clone(),
         }
     }
 }
@@ -2676,7 +2680,7 @@ fn capture_recent_io_baselines<'a>(
 fn build_tui_data_from_live_scan(
     global: &GlobalOpts,
     args: &RunArgs,
-    scorer: Scorer,
+    mut scorer: Scorer,
     policy: &pt_core::config::Policy,
     session_id: &SessionId,
 ) -> Result<TuiBuildOutput, String> {
@@ -2690,7 +2694,7 @@ fn build_tui_data_from_live_scan(
 
     let protected_filter = ProtectedFilter::from_guardrails(&policy.guardrails)
         .map_err(|e| format!("protected filter error: {}", e))?;
-    let filter_result = protected_filter.filter_scan_result(&scan_result);
+    let filter_result = filter_planning_scan(&protected_filter, &scan_result, &mut scorer);
     score_tui_rows(
         &filter_result.passed,
         &scan_result.processes,
@@ -2785,11 +2789,11 @@ fn build_plan_from_selection(
     let planned_kills = plan
         .actions
         .iter()
-        .filter(|action| action.action == Action::Kill && !action.blocked)
+        .filter(|action| action_uses_kill_budget(action) && !action.blocked)
         .count();
     if planned_kills > policy.guardrails.max_kills_per_run as usize {
         return Err(format!(
-            "selected {planned_kills} kills exceed the per-run policy limit {}; select fewer processes",
+            "selected {planned_kills} kills/restarts exceed the per-run policy limit {}; select fewer processes",
             policy.guardrails.max_kills_per_run,
         ));
     }
@@ -2828,6 +2832,7 @@ fn write_plan_to_session(handle: &SessionHandle, plan: &Plan) -> Result<PathBuf,
                 || previous.action != action.action
                 || previous.blocked != action.blocked
                 || previous.routing != action.routing
+                || previous.supervisor_restart != action.supervisor_restart
             {
                 return Err(format!(
                     "interactive action {} conflicts with its saved binding",
@@ -2903,6 +2908,14 @@ fn acquire_execution_policy(
     Ok((lock, enforcer))
 }
 
+/// Restart stops a live service and consumes the same destructive-action budget
+/// as a kill. A zombie's parent-reaping notification does not stop its parent.
+fn action_uses_kill_budget(action: &PlanAction) -> bool {
+    action.action == Action::Kill
+        || (action.action == Action::Restart
+            && action.routing == pt_core::plan::ActionRouting::Supervisor)
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn check_execution_policy(
     enforcer: &pt_core::decision::PolicyEnforcer,
@@ -2929,7 +2942,15 @@ fn check_execution_policy(
         });
     candidate.has_known_signature = action.rationale.has_known_signature.unwrap_or(false);
     Ok((
-        enforcer.check_action(&candidate, action.action, robot),
+        enforcer.check_action_with_supervisor_restart(
+            &candidate,
+            action.action,
+            robot,
+            action.supervisor_restart.as_ref().filter(|binding| {
+                action.routing == pt_core::plan::ActionRouting::Supervisor
+                    && binding.matches_target(&process_identity_from_record(proc))
+            }),
+        ),
         proc.clone(),
     ))
 }
@@ -3133,6 +3154,7 @@ fn capture_action_execution_evidence(
     Ok(serde_json::json!({
         "action": action.action,
         "target": action.target,
+        "supervisor_restart": action.supervisor_restart,
         "command": process.cmd,
         "parent_pid": process.ppid.0,
         "parent_identity": parent_identity,
@@ -3255,7 +3277,33 @@ fn execute_tui_plan_selection(
             .update_state(SessionState::Executing)
             .map_err(|error| format!("persist interactive execution state: {error}"))?;
         let (result, evidence) = execute_plan_actions(handle, policy, selection, state)?;
-        write_outcomes_from_execution(handle, selection, &result, &evidence)?;
+        let executions = write_outcomes_from_execution(handle, selection, &result, &evidence)?;
+        if executions
+            .iter()
+            .any(|execution| execution.action == Some(Action::Kill))
+        {
+            let scan = quick_scan(&QuickScanOptions {
+                pids: vec![],
+                include_kernel_threads: false,
+                timeout: Some(Duration::from_secs(5)),
+                progress: None,
+            })
+            .map_err(|error| format!("post-execution census failed: {error}"));
+            observe_tui_respawns(
+                handle,
+                selection,
+                &executions,
+                scan.as_ref().map_err(Clone::clone),
+                chrono::Utc::now(),
+                "interactive_post_execution",
+            )
+            .map_err(|error| {
+                format!(
+                    "Actions saved: {} succeeded, {} failed; respawn observation failed: {error}",
+                    result.summary.actions_succeeded, result.summary.actions_failed,
+                )
+            })?;
+        }
         if result.summary.actions_failed > 0 || result.outcomes.iter().any(|o| o.details.is_some())
         {
             let error = result
@@ -3363,7 +3411,7 @@ fn execute_plan_actions(
             }
             let mut single = plan.clone();
             single.actions = vec![action.clone()];
-            if action.action == Action::Kill && !action.blocked {
+            if action_uses_kill_budget(action) && !action.blocked {
                 let tree_check = quick_scan(&QuickScanOptions {
                     pids: vec![],
                     include_kernel_threads: false,
@@ -3400,7 +3448,8 @@ fn execute_plan_actions(
             }
             runner.evidence.borrow_mut().take();
             runner.runner.take_kill_signal_delivered();
-            let accounting_started = action.action == Action::Kill && !action.blocked;
+            runner.runner.take_supervisor_restart_attempted();
+            let accounting_started = action_uses_kill_budget(action) && !action.blocked;
             if accounting_started {
                 if let Err(error) = enforcer.begin_kill_accounting() {
                     outcomes.push(pt_core::action::ActionResult {
@@ -3418,8 +3467,14 @@ fn execute_plan_actions(
             let result = match executor.execute_plan(&single) {
                 Ok(result) => result,
                 Err(error) => {
+                    let may_have_stopped_target = runner.runner.take_kill_signal_delivered()
+                        | runner.runner.take_supervisor_restart_attempted();
                     let accounting_error = accounting_started
-                        .then(|| enforcer.finish_kill_accounting(false).err())
+                        .then(|| {
+                            enforcer
+                                .finish_kill_accounting(may_have_stopped_target)
+                                .err()
+                        })
                         .flatten();
                     outcomes.push(pt_core::action::ActionResult {
                         action_id: action.action_id.clone(),
@@ -3436,6 +3491,7 @@ fn execute_plan_actions(
                 execution_evidence.insert(action.action_id.clone(), evidence.clone());
             }
             let kill_signal_delivered = runner.runner.take_kill_signal_delivered();
+            let supervisor_restart_attempted = runner.runner.take_supervisor_restart_attempted();
             if let Some(fields) = execution_evidence
                 .get_mut(&action.action_id)
                 .and_then(serde_json::Value::as_object_mut)
@@ -3444,14 +3500,24 @@ fn execute_plan_actions(
                     "kill_signal_delivered".to_string(),
                     serde_json::Value::Bool(kill_signal_delivered),
                 );
+                fields.insert(
+                    "supervisor_restart_attempted".to_string(),
+                    serde_json::Value::Bool(supervisor_restart_attempted),
+                );
             }
             let accounting_error = accounting_started
-                .then(|| enforcer.finish_kill_accounting(kill_signal_delivered).err())
+                .then(|| {
+                    enforcer
+                        .finish_kill_accounting(
+                            kill_signal_delivered || supervisor_restart_attempted,
+                        )
+                        .err()
+                })
                 .flatten();
             for mut outcome in result.outcomes {
                 if let Some(error) = &accounting_error {
                     outcome.details = Some(format!(
-                        "kill delivery={kill_signal_delivered}, but its accounting completion could not be persisted: {error}"
+                        "kill delivery={kill_signal_delivered}, restart attempted={supervisor_restart_attempted}, but accounting completion could not be persisted: {error}"
                     ));
                     outcomes.push(outcome);
                     return Ok((execution_result(outcomes), execution_evidence));
@@ -3523,7 +3589,7 @@ fn write_outcomes_from_execution(
     plan: &Plan,
     result: &pt_core::action::ExecutionResult,
     execution_evidence: &HashMap<String, serde_json::Value>,
-) -> Result<(), String> {
+) -> Result<Vec<pt_core::verify::SavedActionOutcome>, String> {
     use pt_core::action::ActionStatus;
 
     let mut by_id: HashMap<String, u32> = HashMap::new();
@@ -3574,7 +3640,123 @@ fn write_outcomes_from_execution(
         format!(
             "{error}; actual execution results: {actual}; session failure state error: {state_error:?}"
         )
+    })?;
+    successful_goal_action_outcomes(plan, &outcomes).map_err(|error| {
+        let actual = serde_json::json!({"summary": result.summary, "outcomes": outcomes});
+        format!(
+            "cannot bind saved interactive execution evidence: {error}; saved results: {actual}"
+        )
     })
+}
+
+/// Observe successful interactive kills with a complete census. A missing
+/// replacement is only an observation at this instant, not proof against a
+/// later respawn. Refresh can reuse its census without another scan or sleep.
+#[cfg(feature = "ui")]
+fn observe_tui_respawns(
+    handle: &SessionHandle,
+    plan: &Plan,
+    executions: &[pt_core::verify::SavedActionOutcome],
+    scan: Result<&ScanResult, String>,
+    observed_at: chrono::DateTime<chrono::Utc>,
+    source: &str,
+) -> Result<RespawnHistoryUpdate, String> {
+    let (current, census_error) = match scan {
+        Ok(scan) if scan.metadata.warnings.is_empty() => (Some(scan.processes.as_slice()), None),
+        Ok(scan) => (
+            None,
+            Some(format!(
+                "respawn observation requires a complete census: {}",
+                scan.metadata.warnings.join("; ")
+            )),
+        ),
+        Err(error) => (None, Some(error)),
+    };
+    let mut update = if plan.session_id == handle.id.0 {
+        let data_dir = handle.dir.parent().and_then(Path::parent);
+        record_respawn_history_in_data_dir(
+            data_dir,
+            &handle.id,
+            plan,
+            executions,
+            current,
+            observed_at,
+        )
+    } else {
+        RespawnHistoryUpdate {
+            errors: vec!["interactive respawn plan belongs to a different session".to_string()],
+            ..Default::default()
+        }
+    };
+    if let Some(error) = census_error {
+        update.errors.push(error);
+    }
+    let artifact = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "session_id": handle.id.0,
+        "observed_at": observed_at,
+        "source": source,
+        "observation_scope": "single_complete_process_census",
+        "limitation": "A replacement that starts after this census is not yet observable.",
+        "respawn_history": &update,
+    });
+    let path = handle.dir.join("action/respawn_observation.json");
+    pt_core::session::write_json_pretty(&path, &artifact).map_err(|error| {
+        format!(
+            "cannot persist interactive respawn observation {}: {error}; observation: {artifact}",
+            path.display()
+        )
+    })?;
+    if !update.errors.is_empty() {
+        return Err(update.errors.join("; "));
+    }
+    Ok(update)
+}
+
+/// A later manual refresh may be the first census to contain a replacement.
+/// Read the merged canonical plan, since earlier selections remain in the log.
+#[cfg(feature = "ui")]
+fn observe_saved_tui_respawns(handle: &SessionHandle, scan: &ScanResult) -> Result<(), String> {
+    let outcomes_path = handle.dir.join("action/outcomes.jsonl");
+    let content = match std::fs::read_to_string(&outcomes_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "cannot read interactive execution outcomes: {error}"
+            ))
+        }
+    };
+    let saved = parse_action_outcomes(&content)
+        .map_err(|error| format!("cannot parse interactive execution outcomes: {error}"))?;
+    if !saved.iter().any(|execution| execution.status == "success") {
+        return Ok(());
+    }
+    let plan_content = std::fs::read_to_string(handle.dir.join("decision/plan.json"))
+        .map_err(|error| format!("cannot read canonical interactive plan: {error}"))?;
+    let plan = parse_agent_plan(&plan_content)
+        .map_err(|error| format!("cannot parse canonical interactive plan: {error}"))?;
+    let executions = executed_plan_actions(&plan, &saved)
+        .map_err(|error| format!("cannot bind interactive execution outcomes: {error}"))?;
+    if !executions
+        .iter()
+        .any(|(action, _)| action.action == Action::Kill)
+    {
+        return Ok(());
+    }
+    let executions: Vec<_> = executions
+        .into_iter()
+        .map(|(_, execution)| execution.clone())
+        .collect();
+    observe_tui_respawns(
+        handle,
+        &plan,
+        &executions,
+        Ok(scan),
+        chrono::Utc::now(),
+        "interactive_refresh",
+    )
+    .map(|_| ())
 }
 
 #[cfg(feature = "ui")]
@@ -3659,7 +3841,7 @@ fn compute_probe_advice(
         let Ok(inputs) = prepare_pressure_decision(
             &score.posterior.posterior,
             policy,
-            &candidate_feasibility(proc),
+            &candidate_feasibility(proc, &score),
             &pressure.for_process(proc, score.activity.as_ref()),
         ) else {
             continue;
@@ -4088,11 +4270,13 @@ fn sync_tui_recommendations(
         let action = candidate["recommended_action"].as_str().unwrap_or("review");
         row.classification = match action {
             "kill" => "KILL",
+            "restart" if candidate["supervisor_restart"].is_object() => "RESTART",
             "keep" => "SPARE",
             _ => "REVIEW",
         }
         .to_string();
-        row.selected = action == "kill";
+        row.selected = action == "kill"
+            || (action == "restart" && candidate["supervisor_restart"].is_object());
         if action == "review" {
             let reason = candidate["action_rationale"]
                 .as_str()
@@ -4284,7 +4468,7 @@ fn build_tui_rows(
         let posterior_result = &score.posterior;
         let cpu_percent = process_cpu_percent(proc, score.activity.as_ref());
         let cpu_host_percent = pressure.cpu_goal_percent(proc, score.activity.as_ref());
-        let feasibility = candidate_feasibility(proc);
+        let feasibility = candidate_feasibility(proc, &score);
         let inputs = match prepare_pressure_decision(
             &posterior_result.posterior,
             &decision_policy,
@@ -4361,6 +4545,7 @@ fn build_tui_rows(
 
         let classification = match advice.action {
             "kill" => "KILL",
+            "restart" if score.supervisor_restart.is_some() => "RESTART",
             "keep" => "SPARE",
             _ => "REVIEW",
         };
@@ -4435,6 +4620,7 @@ fn build_tui_rows(
                 cmd: proc.cmd.clone(),
                 blocked_reasons,
                 parent_identity: parent.map(process_identity_from_record),
+                supervisor_restart: scorer.supervisor_restart_for(proc).cloned(),
             },
         );
 
@@ -4445,7 +4631,7 @@ fn build_tui_rows(
             runtime,
             memory,
             command: proc.cmd.clone(),
-            selected: classification == "KILL",
+            selected: matches!(classification, "KILL" | "RESTART"),
             galaxy_brain: Some(galaxy_brain),
             why_summary: Some(ledger.why_summary.clone()),
             top_evidence: ledger.top_evidence.clone(),
@@ -4477,6 +4663,8 @@ fn build_tui_rows(
                 "uid": proc.uid,
                 "recommended_action": recommendation,
                 "action_rationale": rationale,
+                "supervisor_restart": scorer.supervisor_restart_for(proc),
+                "supervisor_restart_unavailable": scorer.supervisor_restart_unavailable_for(proc),
                 "memory_mb": memory_mb,
                 "cpu_percent": cpu_percent,
                 "cpu_host_percent": cpu_host_percent,
@@ -4885,7 +5073,9 @@ fn resource_goal_from_target(
         Metric::Cpu => {
             let target_pct = target.value * 100.0;
             if !target_pct.is_finite() || target_pct > 100.0 {
-                return Err("CPU goal percentage must be between 0 and 100% of host capacity".to_string());
+                return Err(
+                    "CPU goal percentage must be between 0 and 100% of host capacity".to_string(),
+                );
             }
             let desired = match target.comparator {
                 Comparator::ReduceBelow => {
@@ -5115,7 +5305,9 @@ fn attach_goal_resource_observations(
             .as_ref()
             .and_then(|identity| resources.private_memory_bytes(identity).ok());
         let private_memory = private_memory_bytes.and(
-            identity.as_ref().and_then(|identity| resources.private_memory.get(&identity.pid.0)),
+            identity
+                .as_ref()
+                .and_then(|identity| resources.private_memory.get(&identity.pid.0)),
         );
         candidate["goal_resources"] = serde_json::json!({
             "fd_count": identity.as_ref().and_then(|identity| resources.fd_count(identity)),
@@ -5626,6 +5818,7 @@ mod executable_goal_tests {
                     confidence: ActionConfidence::Normal,
                     original_zombie_target: None,
                     d_state_diagnostics: None,
+                    supervisor_restart: None,
                 }
             })
             .collect();
@@ -6513,14 +6706,8 @@ mod executable_goal_tests {
         // Large display footprints cannot increase either measured contribution.
         candidates[0]["memory_mb"] = serde_json::json!(1_000_000);
         candidates[1]["memory_mb"] = serde_json::json!(1_000_000);
-        let preliminary = build_goal_plan_from_candidates(
-            goal_str,
-            &goal,
-            0.0,
-            &candidates,
-            &resources,
-        )
-        .unwrap();
+        let preliminary =
+            build_goal_plan_from_candidates(goal_str, &goal, 0.0, &candidates, &resources).unwrap();
         assert!(preliminary.result.feasible);
 
         // A one-kill budget leaves only the first executable action. The
@@ -6604,10 +6791,7 @@ mod executable_goal_tests {
         for missing in [f64::NAN, f64::INFINITY, -1.0, 800.0] {
             let error =
                 build_resource_goals(&goal, missing, &GoalResourceSnapshot::default()).unwrap_err();
-            assert!(
-                error.contains("measured host CPU window"),
-                "{error}"
-            );
+            assert!(error.contains("measured host CPU window"), "{error}");
         }
         let (goals, _) =
             build_resource_goals(&goal, 100.0, &GoalResourceSnapshot::default()).unwrap();
@@ -10885,6 +11069,8 @@ fn apply_process_tree_safety(
     let pid_of = |c: &serde_json::Value| c.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
     let is_kill = |c: &serde_json::Value| {
         c.get("recommended_action").and_then(|v| v.as_str()) == Some("kill")
+            || (c.get("recommended_action").and_then(|v| v.as_str()) == Some("restart")
+                && c["supervisor_restart"].is_object())
     };
     let mut kill_set: HashSet<u32> = candidates
         .iter()
@@ -11012,7 +11198,11 @@ fn apply_planned_kill_budget(
     let kill_indices: Vec<usize> = candidates
         .iter()
         .enumerate()
-        .filter(|(_, candidate)| candidate["recommended_action"].as_str() == Some("kill"))
+        .filter(|(_, candidate)| {
+            candidate["recommended_action"].as_str() == Some("kill")
+                || (candidate["recommended_action"].as_str() == Some("restart")
+                    && candidate["supervisor_restart"].is_object())
+        })
         .map(|(index, _)| index)
         .collect();
 
@@ -11078,7 +11268,7 @@ fn apply_planned_kill_budget(
                 object.insert(
                     "action_rationale".to_string(),
                     serde_json::json!(format!(
-                        "Kill downgraded to review: final plan is limited to {limit} kills{previous_rationale}"
+                        "Action downgraded to review: final plan is limited to {limit} kills/restarts{previous_rationale}"
                     )),
                 );
                 object.insert(
@@ -14835,6 +15025,7 @@ mod process_tree_safety_tests {
                             cmd: process.cmd.clone(),
                             blocked_reasons: Vec::new(),
                             parent_identity: None,
+                            supervisor_restart: None,
                         },
                     );
                     fixture.rows.push(ProcessRow {
@@ -14914,9 +15105,7 @@ mod process_tree_safety_tests {
             let resources =
                 fixture.measured_private_memory(&[(100, 1024 * 1024), (200, 1000 * 1024 * 1024)]);
             fixture.policy.guardrails.max_kills_per_run = 1;
-            let output = fixture
-                .optimize("free 100MB RAM", 0.0, &resources)
-                .unwrap();
+            let output = fixture.optimize("free 100MB RAM", 0.0, &resources).unwrap();
             assert!(output.result.feasible);
             assert_eq!(output.selected_pids, [200]);
             assert_eq!(
@@ -14945,9 +15134,7 @@ mod process_tree_safety_tests {
             ]);
             let resources = fixture
                 .measured_private_memory(&[(100, 1000 * 1024 * 1024), (200, 100 * 1024 * 1024)]);
-            let output = fixture
-                .optimize("free 50MB RAM", 0.0, &resources)
-                .unwrap();
+            let output = fixture.optimize("free 50MB RAM", 0.0, &resources).unwrap();
             assert!(output.result.feasible);
             assert_eq!(output.selected_pids, [200]);
             assert_eq!(fixture.candidates[&100]["recommended_action"], "review");
@@ -14965,9 +15152,7 @@ mod process_tree_safety_tests {
             ]);
             let resources = fixture
                 .measured_private_memory(&[(100, 1000 * 1024 * 1024), (200, 100 * 1024 * 1024)]);
-            let output = fixture
-                .optimize("free 100MB RAM", 0.0, &resources)
-                .unwrap();
+            let output = fixture.optimize("free 100MB RAM", 0.0, &resources).unwrap();
             assert_eq!(output.selected_pids, [200]);
             assert_eq!(
                 fixture.candidates[&100]["tree_safety"]["rule"],
@@ -15058,6 +15243,7 @@ mod process_tree_safety_tests {
                 process_state: Some(process.state),
                 parent_identity: None,
                 d_state_diagnostics: None,
+                supervisor_restart: None,
             },
         )]
         .into_iter()
@@ -15078,6 +15264,7 @@ mod process_tree_safety_tests {
             status: "success".to_string(),
             action: Some(action.action),
             target: Some(action.target.clone()),
+            supervisor_restart: None,
             command: Some(process.cmd.clone()),
             parent_pid: Some(10),
             parent_identity: Some(process_identity_from_record(&parent)),
@@ -15131,6 +15318,285 @@ mod process_tree_safety_tests {
         let mut invalid = payload;
         invalid["target"]["uid"] = serde_json::json!(1001);
         assert!(super::successful_goal_action_outcomes(&plan, &[invalid]).is_err());
+    }
+
+    #[cfg(all(feature = "ui", unix))]
+    fn tui_respawn_fixture(
+        label: &str,
+    ) -> (
+        std::path::PathBuf,
+        pt_core::session::SessionHandle,
+        pt_core::plan::Plan,
+        pt_core::verify::SavedActionOutcome,
+        pt_core::collect::ScanResult,
+    ) {
+        use pt_core::session::{SessionManifest, SessionMode, SessionStore};
+        use pt_core::verify::{ExecutionClock, SavedActionOutcome};
+
+        // Canonical execution/census fixtures exercise persistence, not live kills.
+        let directory = retained_outcome_fixture(label);
+        let session = pt_common::SessionId::new();
+        let handle = SessionStore::at_data_dir(&directory)
+            .create(&SessionManifest::new(
+                &session,
+                None,
+                SessionMode::Interactive,
+                None,
+            ))
+            .unwrap();
+        let timestamp = chrono::Utc::now().timestamp();
+        let executed_at = chrono::DateTime::from_timestamp(timestamp - 2, 0).unwrap();
+        let target = rec(100, 10, "sleep 600", ProcessState::Sleeping);
+        let parent = rec(10, 1, "bash respawner.sh", ProcessState::Sleeping);
+        let action: pt_core::plan::PlanAction = serde_json::from_value(serde_json::json!({
+            "action_id": "tui-respawn-kill",
+            "target": process_identity_from_record(&target),
+            "action": "kill",
+            "order": 0,
+            "stage": 0,
+            "timeouts": {"preflight_ms": 2000, "execute_ms": 10000, "verify_ms": 5000},
+            "pre_checks": [],
+            "rationale": {},
+            "on_success": [],
+            "on_failure": [],
+            "blocked": false,
+        }))
+        .unwrap();
+        let execution = SavedActionOutcome {
+            action_id: action.action_id.clone(),
+            pid: target.pid.0,
+            status: "success".to_string(),
+            action: Some(action.action),
+            target: Some(action.target.clone()),
+            command: Some(target.cmd),
+            parent_pid: Some(parent.pid.0),
+            parent_identity: Some(process_identity_from_record(&parent)),
+            executed_at: Some(executed_at),
+            execution_clock: Some(ExecutionClock {
+                boot_id: "b".to_string(),
+                ticks: 1000,
+            }),
+            time_ms: Some(1),
+            supervisor_restart: None,
+        };
+        let plan = pt_core::plan::Plan {
+            plan_id: "tui-respawn-fixture".to_string(),
+            session_id: session.0,
+            generated_at: executed_at.to_rfc3339(),
+            policy_id: None,
+            policy_version: "fixture".to_string(),
+            pre_toggled: Vec::new(),
+            gates_summary: pt_core::plan::GatesSummary {
+                total_candidates: 1,
+                blocked_candidates: 0,
+                pre_toggled_actions: 0,
+            },
+            actions: vec![action],
+        };
+        let mut replacement = rec(200, 10, "sleep 600", ProcessState::Sleeping);
+        // SAFETY: sysconf only reads the host's clock configuration.
+        let hz = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).unwrap();
+        replacement.start_id = StartId::from_linux("b", 1000 + hz, 200);
+        replacement.start_time_unix = timestamp - 1;
+        let scan = pt_core::collect::ScanResult {
+            processes: vec![replacement, parent],
+            metadata: pt_core::collect::ScanMetadata {
+                scan_type: "fixture".to_string(),
+                platform: std::env::consts::OS.to_string(),
+                boot_id: Some("b".to_string()),
+                started_at: chrono::Utc::now().to_rfc3339(),
+                duration_ms: 0,
+                process_count: 2,
+                warnings: Vec::new(),
+            },
+        };
+        super::write_plan_to_session(&handle, &plan).unwrap();
+        (directory, handle, plan, execution, scan)
+    }
+
+    #[cfg(all(feature = "ui", unix))]
+    #[test]
+    fn tui_execution_writer_returns_only_bound_successful_evidence() {
+        use pt_core::action::{ActionResult, ActionStatus};
+
+        let (_, handle, mut plan, execution, _) = tui_respawn_fixture("tui-canonical-evidence");
+        let mut blocked = plan.actions[0].clone();
+        blocked.action_id = "blocked-attempt".to_string();
+        blocked.target =
+            process_identity_from_record(&rec(300, 10, "sleep 600", ProcessState::Sleeping));
+        blocked.blocked = true;
+        plan.actions.push(blocked);
+        let result = super::execution_result(vec![
+            ActionResult {
+                action_id: execution.action_id.clone(),
+                status: ActionStatus::Success,
+                time_ms: 1,
+                details: None,
+            },
+            ActionResult {
+                action_id: "blocked-attempt".to_string(),
+                status: ActionStatus::PreCheckBlocked {
+                    check: pt_core::plan::PreCheck::VerifyIdentity,
+                    reason: "fixture refusal".to_string(),
+                },
+                time_ms: 0,
+                details: None,
+            },
+        ]);
+        let evidence: std::collections::HashMap<_, _> = [
+            (
+                execution.action_id.clone(),
+                serde_json::to_value(&execution).unwrap(),
+            ),
+            (
+                "blocked-attempt".to_string(),
+                serde_json::to_value(&execution).unwrap(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let returned =
+            super::write_outcomes_from_execution(&handle, &plan, &result, &evidence).unwrap();
+        assert_eq!(returned.len(), 1);
+        assert_eq!(returned[0].action_id, execution.action_id);
+        assert!(returned[0]
+            .target
+            .as_ref()
+            .unwrap()
+            .matches(&plan.actions[0].target));
+        assert_eq!(returned[0].parent_identity, execution.parent_identity);
+        assert_eq!(returned[0].executed_at, execution.executed_at);
+        let saved = pt_core::verify::parse_action_outcomes(
+            &std::fs::read_to_string(handle.dir.join("action/outcomes.jsonl")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved.len(), 2);
+        assert_eq!(saved[0].status, "success");
+        assert_eq!(saved[1].status, "precheck_blocked");
+        assert!(
+            saved[1].target.is_none(),
+            "refusal must not inherit stale runner evidence"
+        );
+
+        let mut forged_evidence = evidence;
+        forged_evidence.get_mut(&execution.action_id).unwrap()["target"]["uid"] =
+            serde_json::json!(1001);
+        let error = super::write_outcomes_from_execution(&handle, &plan, &result, &forged_evidence)
+            .unwrap_err();
+        assert!(error.contains("cannot bind saved interactive execution evidence"));
+        assert_eq!(result.outcomes[0].status, ActionStatus::Success);
+        let saved = pt_core::verify::parse_action_outcomes(
+            &std::fs::read_to_string(handle.dir.join("action/outcomes.jsonl")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            saved[0].status, "success",
+            "later binding errors cannot rewrite the original result"
+        );
+    }
+
+    #[cfg(all(feature = "ui", unix))]
+    #[test]
+    fn tui_respawn_refresh_records_delayed_birth_and_rejects_incomplete_census() {
+        use pt_core::decision::respawn_loop::RespawnHistoryStore;
+        use pt_core::inbox::InboxStore;
+
+        let (directory, handle, plan, execution, scan) = tui_respawn_fixture("tui-respawn-refresh");
+        super::append_action_outcomes(
+            &handle.dir.join("action"),
+            &[serde_json::to_value(&execution).unwrap()],
+        )
+        .unwrap();
+        let before = std::fs::read(handle.dir.join("action/outcomes.jsonl")).unwrap();
+        let mut early = scan.clone();
+        early.processes.retain(|process| process.pid.0 == 10);
+        early.metadata.process_count = early.processes.len();
+        let observed = super::observe_tui_respawns(
+            &handle,
+            &plan,
+            std::slice::from_ref(&execution),
+            Ok(&early),
+            chrono::Utc::now(),
+            "interactive_post_execution",
+        )
+        .unwrap();
+        assert!(observed.observations_available);
+        assert_eq!(observed.new_events, 0);
+
+        let mut partial = scan.clone();
+        partial
+            .metadata
+            .warnings
+            .push("fixture: one process was unreadable".to_string());
+        let error = super::observe_saved_tui_respawns(&handle, &partial).unwrap_err();
+        assert!(error.contains("complete census"));
+        let artifact: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(handle.dir.join("action/respawn_observation.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(artifact["respawn_history"]["observations_available"], false);
+        assert_eq!(artifact["respawn_history"]["new_events"], 0);
+        assert_eq!(
+            RespawnHistoryStore::from_data_dir(&directory)
+                .load(chrono::Utc::now())
+                .unwrap()
+                .event_count(),
+            0
+        );
+
+        super::observe_saved_tui_respawns(&handle, &scan).unwrap();
+        let artifact: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(handle.dir.join("action/respawn_observation.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(artifact["source"], "interactive_refresh");
+        assert_eq!(artifact["respawn_history"]["new_events"], 1);
+        assert_eq!(
+            artifact["respawn_history"]["events"][0]["summary"]["parent"]["pid"],
+            10
+        );
+        super::observe_saved_tui_respawns(&handle, &scan).unwrap();
+        assert_eq!(
+            RespawnHistoryStore::from_data_dir(&directory)
+                .load(chrono::Utc::now())
+                .unwrap()
+                .event_count(),
+            1
+        );
+        assert_eq!(
+            InboxStore::from_data_dir(&directory).list().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            std::fs::read(handle.dir.join("action/outcomes.jsonl")).unwrap(),
+            before
+        );
+    }
+
+    #[cfg(all(feature = "ui", unix))]
+    #[test]
+    fn tui_respawn_observation_persistence_failure_keeps_execution_truth() {
+        let (_, handle, plan, execution, scan) = tui_respawn_fixture("tui-respawn-write-failure");
+        super::append_action_outcomes(
+            &handle.dir.join("action"),
+            &[serde_json::to_value(&execution).unwrap()],
+        )
+        .unwrap();
+        let outcomes = handle.dir.join("action/outcomes.jsonl");
+        let before = std::fs::read(&outcomes).unwrap();
+        std::fs::create_dir(handle.dir.join("action/respawn_observation.json")).unwrap();
+        let error = super::observe_tui_respawns(
+            &handle,
+            &plan,
+            &[execution],
+            Ok(&scan),
+            chrono::Utc::now(),
+            "interactive_post_execution",
+        )
+        .err()
+        .expect("observation destination is a directory");
+        assert!(error.contains("cannot persist interactive respawn observation"));
+        assert_eq!(std::fs::read(outcomes).unwrap(), before);
     }
 
     fn retained_outcome_fixture(label: &str) -> std::path::PathBuf {
@@ -15267,6 +15733,7 @@ mod process_tree_safety_tests {
                         process_state: Some(process.state),
                         parent_identity: None,
                         d_state_diagnostics: None,
+                        supervisor_restart: None,
                     },
                 )
             })
@@ -15351,6 +15818,7 @@ mod process_tree_safety_tests {
                         cmd: process.cmd,
                         blocked_reasons: Vec::new(),
                         parent_identity: None,
+                        supervisor_restart: None,
                     },
                 )
             })
@@ -15413,6 +15881,7 @@ mod process_tree_safety_tests {
                         cmd: process.cmd.clone(),
                         blocked_reasons: Vec::new(),
                         parent_identity: None,
+                        supervisor_restart: None,
                     },
                 )
             })
@@ -15528,6 +15997,51 @@ mod process_tree_safety_tests {
     }
 
     #[test]
+    fn supervisor_restarts_share_kill_limits_but_parent_nudges_do_not() {
+        let mut policy = pt_core::config::Policy::default();
+        policy.guardrails.max_kills_per_run = 1;
+        let processes = vec![
+            rec(100, 4000, "sleep 600", ProcessState::Sleeping),
+            rec(200, 4000, "sleep 600", ProcessState::Sleeping),
+            rec(300, 4000, "sleep 600", ProcessState::Zombie),
+        ];
+        let binding = pt_core::action::SystemdUserServiceBinding {
+            target: process_identity_from_record(&processes[0]),
+            unit: "worker.service".to_string(),
+            control_group: "/user.slice/user-1000.slice/user@1000.service/worker.service"
+                .to_string(),
+            invocation_id: "1234567890abcdef1234567890abcdef".to_string(),
+        };
+        let mut candidates = [
+            serde_json::json!({
+                "pid": 100, "recommended_action": "restart", "supervisor_restart": binding,
+            }),
+            cand(200),
+            serde_json::json!({"pid": 300, "recommended_action": "restart"}),
+        ];
+        apply_planned_kill_budget(
+            &mut candidates.iter_mut().collect::<Vec<_>>(),
+            &processes,
+            &policy,
+            false,
+        );
+        assert_eq!(candidates[0]["recommended_action"], "restart");
+        assert_eq!(candidates[1]["recommended_action"], "review");
+        assert_eq!(candidates[1]["plan_budget"]["limit"], 1);
+        assert_eq!(candidates[2]["recommended_action"], "restart");
+
+        let mut with_child = processes;
+        with_child.push(rec(101, 100, "sleep 600", ProcessState::Sleeping));
+        apply_process_tree_safety(
+            &mut candidates.iter_mut().collect::<Vec<_>>(),
+            &with_child,
+            true,
+        );
+        assert_eq!(candidates[0]["recommended_action"], "review");
+        assert_eq!(candidates[0]["tree_safety"]["rule"], "live_child");
+    }
+
+    #[test]
     fn planned_kill_budget_selects_children_before_higher_ranked_parents() {
         let processes = vec![
             rec(100, 1, "sh", ProcessState::Sleeping),
@@ -15606,6 +16120,7 @@ mod process_tree_safety_tests {
                         process_state: Some(process.state),
                         parent_identity: None,
                         d_state_diagnostics: None,
+                        supervisor_restart: None,
                     },
                 )
             })
@@ -15686,6 +16201,7 @@ mod process_tree_safety_tests {
                         parent_identity: (pid == 300)
                             .then(|| process_identity_from_record(&parent)),
                         d_state_diagnostics: None,
+                        supervisor_restart: None,
                     },
                 )
             })
@@ -16476,6 +16992,7 @@ mod process_tree_safety_tests {
                     cmd: process.cmd.clone(),
                     blocked_reasons: Vec::new(),
                     parent_identity: None,
+                    supervisor_restart: None,
                 },
             )]);
             let plan =
@@ -16623,6 +17140,7 @@ mod process_tree_safety_tests {
                         process_state: Some(record.state),
                         parent_identity: None,
                         d_state_diagnostics: None,
+                        supervisor_restart: None,
                     },
                 )
             })
@@ -17301,6 +17819,7 @@ mod tui_learning_tests {
             confidence: ActionConfidence::Normal,
             original_zombie_target: None,
             d_state_diagnostics: None,
+            supervisor_restart: None,
         }
     }
 
@@ -18434,7 +18953,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
 
     // Persist compact artifacts when we have a scan result.
     if let Some(ref scan_result) = scan_result {
-        let filter_result = protected_filter.filter_scan_result(scan_result);
+        let filter_result = filter_planning_scan(&protected_filter, scan_result, &mut scorer);
         let min_age = policy.guardrails.min_process_age_seconds;
         let plan_eligible: Vec<&ProcessRecord> = filter_result
             .passed
@@ -18473,7 +18992,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
             let inputs = match prepare_pressure_decision(
                 posterior,
                 &decision_policy,
-                &candidate_feasibility(proc),
+                &candidate_feasibility(proc, &score),
                 &pressure.for_process(proc, score.activity.as_ref()),
             ) {
                 Ok(inputs) => inputs,
@@ -18538,6 +19057,8 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                 "recommended_action": advice.action,
                 "action_rationale": advice.rationale,
                 "respawn_history": score.respawn_history,
+                "supervisor_restart": score.supervisor_restart,
+                "supervisor_restart_unavailable": score.supervisor_restart_unavailable,
             }));
             persisted_inference_records.push(PersistedInference {
                 pid: proc.pid.0,
@@ -18650,6 +19171,8 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                         "cpu_lifetime_percent": p.cpu_percent,
                         "activity": activity,
                         "respawn_history": scorer.respawn_history_for(p),
+                        "supervisor_restart": scorer.supervisor_restart_for(p),
+                        "supervisor_restart_unavailable": scorer.supervisor_restart_unavailable_for(p),
                         "responsible_unit": responsible_unit_summary(
                             responsible_units.as_ref().and_then(|table| table.unit_for(p)),
                         ),
@@ -19948,8 +20471,38 @@ fn print_responsible_units(table: &ResponsibleUnitTable) {
     }
 }
 
-fn candidate_feasibility(proc: &ProcessRecord) -> ActionFeasibility {
-    pt_core::action::planning_action_feasibility(&process_identity_from_record(proc), proc.state)
+fn filter_planning_scan(
+    filter: &ProtectedFilter,
+    scan: &ScanResult,
+    scorer: &mut Scorer,
+) -> pt_core::collect::protected::FilterResult {
+    // Missing ancestors cannot establish a safe service route. Ordinary
+    // protection remains in force when the full census was incomplete.
+    scorer.collect_supervisor_restarts(if scan.metadata.warnings.is_empty() {
+        &scan.processes
+    } else {
+        &[]
+    });
+    filter.filter_scan_result_with_restarts(scan, |process| scorer.supervisor_restart_for(process))
+}
+
+fn candidate_feasibility(
+    proc: &ProcessRecord,
+    score: &pt_core::scoring::ProcessScore<'_>,
+) -> ActionFeasibility {
+    let mut feasibility = pt_core::action::planning_action_feasibility_with_restart(
+        &process_identity_from_record(proc),
+        proc.state,
+        score.supervisor_restart.as_ref(),
+    );
+    if let Some(reason) = &score.supervisor_restart_unavailable {
+        for disabled in &mut feasibility.disabled {
+            if disabled.action == Action::Restart {
+                disabled.reason = reason.clone();
+            }
+        }
+    }
+    feasibility
 }
 
 fn candidate_recommendation(
@@ -20050,7 +20603,12 @@ fn candidate_recommendation(
         #[cfg(not(target_os = "linux"))]
         provenance_confidence_penalty: None,
     };
-    let policy_result = enforcer.check_action(&candidate, decision.optimal_action, robot);
+    let policy_result = enforcer.check_action_with_supervisor_restart(
+        &candidate,
+        decision.optimal_action,
+        robot,
+        score.supervisor_restart.as_ref(),
+    );
     let mut action = match decision.optimal_action {
         Action::Keep => "keep",
         Action::Renice => "renice",
@@ -20106,9 +20664,13 @@ fn candidate_recommendation(
             rationale = format!("Downgraded to review: {reason}; {rationale}");
         }
     }
-    if action == "restart" && !proc.state.is_zombie() {
+    if action == "restart" && !proc.state.is_zombie() && score.supervisor_restart.is_none() {
         action = "review";
         rationale = "Restart requires a supported supervisor adapter".to_string();
+    } else if action == "restart" {
+        if let Some(binding) = &score.supervisor_restart {
+            rationale = format!("{rationale}; {}", binding.display_command());
+        }
     }
     if action == "kill" {
         if let Some(history) = score
@@ -20720,7 +21282,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     };
 
     // Apply filter BEFORE inference loop to remove protected processes
-    let filter_result = protected_filter.filter_scan_result(&scan_result);
+    let filter_result = filter_planning_scan(&protected_filter, &scan_result, &mut scorer);
     let protected_filtered_count = filter_result.filtered.len();
     let total_scanned = filter_result.total_before;
     // Why processes were not evaluated: count per protection rule (no command lines).
@@ -20940,7 +21502,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
 
         // Apply state-based feasibility constraints so decisioning does not
         // recommend fundamentally invalid actions (e.g., kill for zombie/D-state).
-        let feasibility = candidate_feasibility(proc);
+        let feasibility = candidate_feasibility(proc, &score);
 
         // The action and any further-probe advice use the same process-specific
         // loss model and evidence-only eligibility for destructive actions.
@@ -21187,6 +21749,8 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             "cpu_host_percent": pressure.cpu_goal_percent(proc, activity.as_ref()),
             "activity": activity,
             "respawn_history": scorer.respawn_history_for(proc),
+            "supervisor_restart": scorer.supervisor_restart_for(proc),
+            "supervisor_restart_unavailable": scorer.supervisor_restart_unavailable_for(proc),
             "resource_observation": resource_observation,
             "score": score,
             "classification": ledger.classification.label(),
@@ -21410,6 +21974,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 process_state: Some(proc.state),
                 parent_identity: parent.map(process_identity_from_record),
                 d_state_diagnostics: None,
+                supervisor_restart: scorer.supervisor_restart_for(proc).cloned(),
             },
         );
         all_candidates.push((
@@ -21500,7 +22065,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     let mut goal_selected: Option<HashSet<u32>> = None;
     let mut parsed_goal: Option<Goal> = None;
     let mut goal_resources = GoalResourceSnapshot::default();
-// The host counter interval includes all work, including kernel activity and
+    // The host counter interval includes all work, including kernel activity and
     // processes outside the visible census. Candidate filters constrain actions;
     // they never shrink the host utilization baseline or change percentage units.
     // NaN is an internal unknown marker; CPU reduce-below conversion rejects
@@ -22500,6 +23065,7 @@ fn collect_explain_provenance(
         Err(e) => {
             eprintln!("agent explain: warning: provenance scan failed: {e}");
             scorer.collect_respawn_history(None, &[], chrono::Utc::now());
+            scorer.collect_supervisor_restarts(&[]);
             scorer.collect_provenance(&targets.iter().collect::<Vec<_>>());
             return;
         }
@@ -22515,8 +23081,15 @@ fn collect_explain_provenance(
         return;
     }
     let passed = match protected {
-        Some(filter) => filter.filter_scan_result(&population).passed,
-        None => population.processes,
+        Some(filter) => filter_planning_scan(filter, &population, scorer).passed,
+        None => {
+            scorer.collect_supervisor_restarts(if population.metadata.warnings.is_empty() {
+                &population.processes
+            } else {
+                &[]
+            });
+            population.processes
+        }
     };
     let mut set: Vec<&ProcessRecord> = passed
         .iter()
@@ -22593,6 +23166,8 @@ fn build_process_explanation(
         "cpu_lifetime_percent": proc.cpu_percent,
         "activity": activity,
         "respawn_history": score.respawn_history,
+        "supervisor_restart": score.supervisor_restart,
+        "supervisor_restart_unavailable": score.supervisor_restart_unavailable,
         "classification": ledger.classification.label(),
         "confidence": ledger.confidence.label(),
         "why_summary": ledger.why_summary,
@@ -22876,12 +23451,7 @@ fn first_precheck_block(
 ) -> Option<(pt_core::plan::PreCheck, String)> {
     // The plan's pre-checks plus the ones pt requires for this action type: a plan
     // cannot opt out of protection or session-safety checks.
-    let results = provider.run_checks_for_action(
-        &pt_core::plan::effective_pre_checks(action),
-        action.target.pid.0,
-        action.target.sid,
-        action.action,
-    );
+    let results = provider.run_checks_for_plan(action);
     for result in results {
         if let pt_core::action::prechecks::PreCheckResult::Blocked { check, reason } = result {
             return Some((check, reason));
@@ -23115,6 +23685,25 @@ fn record_respawn_history(
     current: Option<&[ProcessRecord]>,
     observed_at: chrono::DateTime<chrono::Utc>,
 ) -> RespawnHistoryUpdate {
+    let data_dir = resolve_data_dir_for_lock();
+    record_respawn_history_in_data_dir(
+        data_dir.as_deref(),
+        session_id,
+        plan,
+        executions,
+        current,
+        observed_at,
+    )
+}
+
+fn record_respawn_history_in_data_dir(
+    data_dir: Option<&Path>,
+    session_id: &SessionId,
+    plan: &Plan,
+    executions: &[pt_core::verify::SavedActionOutcome],
+    current: Option<&[ProcessRecord]>,
+    observed_at: chrono::DateTime<chrono::Utc>,
+) -> RespawnHistoryUpdate {
     use pt_core::decision::respawn_loop::RespawnHistoryStore;
     use pt_core::inbox::{InboxItem, InboxStore};
 
@@ -23140,14 +23729,14 @@ fn record_respawn_history(
     {
         return update;
     }
-    let Some(data_dir) = resolve_data_dir_for_lock() else {
+    let Some(data_dir) = data_dir else {
         update
             .errors
             .push("cannot resolve the respawn-history data directory".to_string());
         return update;
     };
-    let store = RespawnHistoryStore::from_data_dir(&data_dir);
-    let inbox = InboxStore::from_data_dir(&data_dir);
+    let store = RespawnHistoryStore::from_data_dir(data_dir);
+    let inbox = InboxStore::from_data_dir(data_dir);
     for (action, execution) in executed {
         if action.action != Action::Kill {
             continue;
@@ -23570,6 +24159,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             serde_json::json!({
                 "pid": action.target.pid.0,
                 "recommended_action": action.action,
+                "supervisor_restart": action.supervisor_restart,
             })
         })
         .collect();
@@ -23620,7 +24210,13 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             .map(|proc| proc.cmd.clone())
             .unwrap_or_else(|| format!("pid {}", pid));
 
-        let memory_expected = if matches!(action.action, Action::Kill | Action::Restart) {
+        let service_restart = action.action == Action::Restart
+            && action.routing == pt_core::plan::ActionRouting::Supervisor;
+        let memory_expected = if service_restart {
+            // A replacement remains resident. The original process footprint
+            // does not establish how much memory a restart will reclaim.
+            None
+        } else if matches!(action.action, Action::Kill | Action::Restart) {
             action
                 .rationale
                 .memory_mb
@@ -23642,7 +24238,9 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         };
 
         #[cfg(target_os = "linux")]
-        let fd_expected = if matches!(action.action, Action::Kill | Action::Restart) {
+        let fd_expected = if service_restart {
+            None
+        } else if matches!(action.action, Action::Kill | Action::Restart) {
             before_proc
                 .and_then(observed_process_fd_count)
                 .map(|count| count as f64)
@@ -23925,7 +24523,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 memory_mb: action.rationale.memory_mb,
                 has_known_signature: action.rationale.has_known_signature.unwrap_or(false),
                 category: action.rationale.category.clone(),
-                is_kill_action: action.action == Action::Kill,
+                is_kill_action: action_uses_kill_budget(action),
                 has_policy_snapshot,
                 is_supervised: supervised,
             };
@@ -24166,7 +24764,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     continue;
                 }
                 let mut tree_reason = tree_refusals.get(&action.target.pid.0).cloned();
-                if action.action == Action::Kill && tree_reason.is_none() {
+                if action_uses_kill_budget(action) && tree_reason.is_none() {
                     // A selected child's action may have failed, or a new child
                     // may have appeared. Refuse the parent while any live child
                     // remains, even if that child was in the original kill set.
@@ -24305,7 +24903,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     memory_mb: Some(current_rss_bytes as f64 / (1024.0 * 1024.0)),
                     has_known_signature: action.rationale.has_known_signature.unwrap_or(false),
                     category: action.rationale.category.clone(),
-                    is_kill_action: action.action == Action::Kill,
+                    is_kill_action: action_uses_kill_budget(action),
                     has_policy_snapshot,
                     is_supervised: supervised,
                 };
@@ -24340,7 +24938,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     continue;
                 }
 
-                if action.action == Action::Kill {
+                if action_uses_kill_budget(action) {
                     if let Err(error) = enforcer.begin_kill_accounting() {
                         accounting_error = Some(error.to_string());
                         blocked_by_prechecks += 1;
@@ -24358,7 +24956,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 {
                     Ok(evidence) => evidence,
                     Err(error) => {
-                        if action.action == Action::Kill {
+                        if action_uses_kill_budget(action) {
                             if let Err(error) = enforcer.finish_kill_accounting(false) {
                                 accounting_error = Some(error.to_string());
                             }
@@ -24388,14 +24986,19 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 // pidfd (bound to the verified process) or kill(2) with re-verify.
                 let signal_path = action_runner.take_signal_path();
                 let kill_signal_delivered = action_runner.take_kill_signal_delivered();
-                if action.action == Action::Kill && kill_signal_delivered {
+                let supervisor_restart_attempted =
+                    action_runner.take_supervisor_restart_attempted();
+                execution_evidence["supervisor_restart_attempted"] =
+                    serde_json::json!(supervisor_restart_attempted);
+                let may_have_stopped_target = kill_signal_delivered || supervisor_restart_attempted;
+                if action_uses_kill_budget(action) && may_have_stopped_target {
                     checker.record_action(current_rss_bytes, true);
                     if let Some(recorded) = &recorded_checker {
                         recorded.record_action(current_rss_bytes, true);
                     }
                 }
-                if action.action == Action::Kill {
-                    if let Err(error) = enforcer.finish_kill_accounting(kill_signal_delivered) {
+                if action_uses_kill_budget(action) {
+                    if let Err(error) = enforcer.finish_kill_accounting(may_have_stopped_target) {
                         accounting_error = Some(error.to_string());
                     }
                 }
@@ -24410,7 +25013,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                                 "signal_path": signal_path,
                                 "rate_limit_recorded": false,
                                 "kill_signal_delivered": kill_signal_delivered,
-                                "error": format!("kill signal delivered, but budget persistence failed: {error}"),
+                                "error": format!("destructive action completed, but budget persistence failed: {error}"),
                             });
                             if let (Some(fields), Some(evidence)) =
                                 (outcome.as_object_mut(), execution_evidence.as_object())
@@ -27740,7 +28343,7 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
                 return ExitCode::InternalError;
             }
         };
-        let filtered = protected_filter.filter_scan_result(&scan_result);
+        let filtered = filter_planning_scan(&protected_filter, &scan_result, &mut scorer);
 
         let decision_policy = policy.clone();
 
@@ -27905,7 +28508,7 @@ fn evaluate_watch_candidate(
     let inputs = prepare_pressure_decision(
         &score.posterior.posterior,
         policy,
-        &candidate_feasibility(proc),
+        &candidate_feasibility(proc, &score),
         &pressure.for_process(proc, score.activity.as_ref()),
     )
     .ok()?;
@@ -27965,6 +28568,8 @@ fn evaluate_watch_candidate(
             "action_target": action_target,
             "activity": score.activity,
             "respawn_history": score.respawn_history,
+            "supervisor_restart": score.supervisor_restart,
+            "supervisor_restart_unavailable": score.supervisor_restart_unavailable,
             "cpu_percent": process_cpu_percent(proc, score.activity.as_ref()),
             "cpu_lifetime_percent": proc.cpu_percent,
             "probability_basis": probability_basis,

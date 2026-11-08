@@ -36,6 +36,307 @@ const SIGNAL_PATH: &str = "pidfd";
 #[cfg(target_os = "macos")]
 const SIGNAL_PATH: &str = "kill";
 
+/// This opt-in acceptance case needs an actual unprivileged user manager. It
+/// creates exactly one disposable, explicitly isolated service and retains the
+/// real CLI plan/apply/verify artifacts. Run through the existing E2E runner on
+/// a systemd user host; absence of that host is not a passing acceptance result.
+#[cfg(target_os = "linux")]
+mod systemd_user_restart_acceptance {
+    use super::*;
+    use pt_core::collect::tool_runner::{ToolConfig, ToolOutput, ToolRunner};
+    use std::io::Write;
+
+    fn manager_command(program: &str, args: &[&str]) -> Result<ToolOutput, String> {
+        // SAFETY: geteuid only reads the fixture caller's credentials.
+        let uid = unsafe { libc::geteuid() };
+        let mut command = vec![
+            format!("XDG_RUNTIME_DIR=/run/user/{uid}"),
+            format!("DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus"),
+            program.to_string(),
+            "--user".to_string(),
+            "--no-ask-password".to_string(),
+        ];
+        command.extend(args.iter().map(|argument| (*argument).to_string()));
+        ToolRunner::new(ToolConfig {
+            use_nice: false,
+            use_ionice: false,
+            budget_ms: 15_000,
+            ..ToolConfig::default()
+        })
+        .run_tool(
+            "/usr/bin/env",
+            &command.iter().map(String::as_str).collect::<Vec<_>>(),
+            Some(Duration::from_secs(10)),
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    struct OwnedService(String);
+    impl Drop for OwnedService {
+        fn drop(&mut self) {
+            match manager_command("/usr/bin/systemctl", &["stop", "--", &self.0]) {
+                Ok(output) if output.success() => {}
+                output => eprintln!("owned service cleanup {}: {output:?}", self.0),
+            }
+        }
+    }
+
+    fn run_cli(log_dir: &Path, step: &str, data: &Path, config: &Path, args: &[&str]) -> Value {
+        let started = std::time::Instant::now();
+        let output = cargo_bin_cmd!("pt-core")
+            .timeout(Duration::from_secs(120))
+            .env("PT_SKIP_GLOBAL_LOCK", "1")
+            .env("PROCESS_TRIAGE_DATA", data)
+            .env("PROCESS_TRIAGE_CONFIG", config)
+            .env("PROCESS_TRIAGE_RETENTION", "off")
+            .args(args)
+            .output()
+            .expect("run actual supervisor CLI step");
+        fs::write(log_dir.join(format!("{step}.stdout.json")), &output.stdout).unwrap();
+        fs::write(log_dir.join(format!("{step}.stderr.jsonl")), &output.stderr).unwrap();
+        let record = serde_json::json!({
+            "step": step, "command": "pt-core", "args": args,
+            "exit_code": output.status.code(), "elapsed_ms": started.elapsed().as_millis(),
+            "stdout_sha256": pt_bundle::FileEntry::compute_checksum(&output.stdout),
+            "stderr_sha256": pt_bundle::FileEntry::compute_checksum(&output.stderr),
+        });
+        let mut log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_dir.join("steps.jsonl"))
+            .unwrap();
+        writeln!(log, "{record}").unwrap();
+        eprintln!("{record}");
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "{step}: {error}; stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })
+    }
+
+    #[test]
+    #[ignore = "requires a live unprivileged systemd --user manager; execute explicitly on a user-systemd E2E host"]
+    fn isolated_user_service_plan_apply_verify_and_stale_binding_refusal() {
+        // SAFETY: geteuid only reads the fixture caller's credentials.
+        let uid = unsafe { libc::geteuid() };
+        assert_ne!(
+            uid, 0,
+            "run this fixture as the owner of an unprivileged user manager"
+        );
+        assert!(
+            Path::new(&format!("/run/user/{uid}/bus")).exists(),
+            "no user manager bus; acceptance is unavailable"
+        );
+        let data = TempDir::new().unwrap().keep();
+        let config = TempDir::new().unwrap().keep();
+        let unit = format!("pt-restart-e2e-{}.service", uuid::Uuid::new_v4().simple());
+        let log_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-logs/e2e/supervisor_restart")
+            .join(&unit);
+        fs::create_dir_all(&log_dir).unwrap();
+        fs::write(
+            log_dir.join("environment.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "host": fs::read_to_string("/proc/sys/kernel/hostname").unwrap(),
+                "pt_version": env!("CARGO_PKG_VERSION"),
+                "git_sha": option_env!("VERGEN_GIT_SHA").unwrap_or("unavailable"),
+                "uid": uid, "unit": unit, "data_dir": data, "config_dir": config,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Explicit fixture economics exercise routing, not model calibration.
+        // Built-in protection and actual session/data-loss checks stay enabled.
+        let mut policy = Policy::default();
+        policy.robot_mode.enabled = true;
+        policy.robot_mode.min_posterior = 0.0;
+        policy.robot_mode.require_human_for_supervised = false;
+        policy.guardrails.min_process_age_seconds = 0;
+        policy.data_loss_gates.block_if_recent_io_seconds = Some(1);
+        policy.fdr_control.enabled = false;
+        for row in [
+            &mut policy.loss_matrix.useful,
+            &mut policy.loss_matrix.useful_bad,
+            &mut policy.loss_matrix.abandoned,
+            &mut policy.loss_matrix.zombie,
+        ] {
+            row.keep = 1000.0;
+            row.kill = 1000.0;
+            row.pause = Some(1000.0);
+            row.throttle = Some(1000.0);
+            row.renice = Some(1000.0);
+            row.restart = Some(0.0);
+        }
+        fs::write(
+            config.join("policy.json"),
+            serde_json::to_vec_pretty(&policy).unwrap(),
+        )
+        .unwrap();
+        let launched = manager_command(
+            "/usr/bin/systemd-run",
+            &[
+                "--unit",
+                &unit,
+                "--collect",
+                "--slice=-.slice",
+                "--property=Type=exec",
+                "--property=DefaultDependencies=no",
+                "--property=KillMode=control-group",
+                "--property=TimeoutStopSec=2s",
+                "--property=StandardOutput=null",
+                "--property=StandardError=null",
+                "--",
+                "/bin/sleep",
+                "300",
+            ],
+        )
+        .expect("launch isolated disposable service");
+        fs::write(
+            log_dir.join("systemd-run.json"),
+            serde_json::to_vec_pretty(&launched).unwrap(),
+        )
+        .unwrap();
+        assert!(launched.success(), "{}", launched.stderr_str());
+        let _owned_service = OwnedService(unit.clone());
+        let main = manager_command(
+            "/usr/bin/systemctl",
+            &["show", "--property=MainPID", "--value", "--", &unit],
+        )
+        .unwrap();
+        assert!(main.success(), "{}", main.stderr_str());
+        let pid: u32 = main.stdout_str().trim().parse().unwrap();
+        let original = live_identity(pid);
+        let binding = pt_core::action::discover_systemd_user_restart(&original)
+            .unwrap()
+            .expect("eligible isolated service");
+        fs::write(
+            log_dir.join("before.json"),
+            serde_json::to_vec_pretty(&binding).unwrap(),
+        )
+        .unwrap();
+        let document = run_cli(
+            &log_dir,
+            "plan",
+            &data,
+            &config,
+            &[
+                "--format",
+                "json",
+                "agent",
+                "plan",
+                "--pids",
+                &pid.to_string(),
+                "--min-age",
+                "0",
+                "--max-candidates",
+                "1",
+            ],
+        );
+        let plan: Plan = serde_json::from_value(document.clone()).expect("actual canonical plan");
+        assert_eq!(plan.actions.len(), 1, "{document}");
+        assert_eq!(plan.actions[0].action, Action::Restart);
+        assert_eq!(plan.actions[0].routing, ActionRouting::Supervisor);
+        assert_eq!(plan.actions[0].supervisor_restart, Some(binding.clone()));
+        let session = plan.session_id.as_str();
+        let target = format!("{pid}:{}", original.start_id.0);
+        let handle = SessionStore::at_data_dir(&data)
+            .open(&SessionId::parse(session).unwrap())
+            .unwrap();
+        let plan_path = handle.dir.join("decision/plan.json");
+        let saved_plan = fs::read(&plan_path).unwrap();
+        let mut changed: Value = serde_json::from_slice(&saved_plan).unwrap();
+        changed["actions"][0]["supervisor_restart"]["invocation_id"] =
+            Value::String("abcdef0123456789abcdef0123456789".into());
+        fs::write(&plan_path, serde_json::to_vec_pretty(&changed).unwrap()).unwrap();
+        let (status, refused) = apply(&data, &config, session, &target);
+        fs::write(
+            log_dir.join("stale-binding-apply.json"),
+            serde_json::to_vec_pretty(&refused).unwrap(),
+        )
+        .unwrap();
+        assert_ne!(status, "success");
+        assert_eq!(
+            pt_core::action::discover_systemd_user_restart(&original).unwrap(),
+            Some(binding.clone())
+        );
+        fs::write(&plan_path, saved_plan).unwrap();
+
+        let (status, applied) = apply(&data, &config, session, &target);
+        fs::write(
+            log_dir.join("apply.json"),
+            serde_json::to_vec_pretty(&applied).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status, "success", "{applied}");
+        assert_eq!(
+            applied["outcomes"][0]["supervisor_restart"],
+            serde_json::to_value(&binding).unwrap()
+        );
+        let main = manager_command(
+            "/usr/bin/systemctl",
+            &["show", "--property=MainPID", "--value", "--", &unit],
+        )
+        .unwrap();
+        let replacement = live_identity(main.stdout_str().trim().parse().unwrap());
+        assert_ne!(replacement.pid, original.pid);
+        assert_ne!(replacement.start_id, original.start_id);
+        let after = pt_core::action::discover_systemd_user_restart(&replacement)
+            .unwrap()
+            .unwrap();
+        assert_ne!(after.invocation_id, binding.invocation_id);
+        assert_eq!(after.unit, binding.unit);
+        let verified = run_cli(
+            &log_dir,
+            "verify",
+            &data,
+            &config,
+            &["--format", "json", "agent", "verify", "--session", session],
+        );
+        assert_eq!(
+            verified["action_outcomes"][0]["outcome"], "confirmed_effect",
+            "{verified}"
+        );
+        assert_eq!(
+            verified["action_outcomes"][0]["actual"],
+            "supervisor_restart_verified"
+        );
+        assert_eq!(verified["action_outcomes"][0]["verified"], true);
+        assert!(verified["action_outcomes"][0]["expected_resources_freed"].is_null());
+        assert_eq!(
+            pt_core::action::discover_systemd_user_restart(&replacement).unwrap(),
+            Some(after)
+        );
+
+        let ordinary = ForeignTarget::spawn("sleep 301");
+        let unsupervised = run_cli(
+            &log_dir,
+            "unsupervised_plan",
+            &data,
+            &config,
+            &[
+                "--format",
+                "json",
+                "agent",
+                "plan",
+                "--pids",
+                &ordinary.pid.to_string(),
+                "--min-age",
+                "0",
+                "--max-candidates",
+                "1",
+            ],
+        );
+        let unsupervised_plan: Plan = serde_json::from_value(unsupervised).unwrap();
+        assert!(unsupervised_plan
+            .actions
+            .iter()
+            .all(|action| action.action != Action::Restart));
+        fs::write(log_dir.join("result.txt"), "PASS: live plan, stale-binding refusal, restart, replacement verification, and unsupported ordinary process\n").unwrap();
+    }
+}
+
 /// A target process in a foreign session and not its leader: how a process left
 /// behind by a terminal looks. (pt's own session and session leaders are protected by
 /// the session-safety pre-check, which apply always runs.) `sh` leads the new session,
@@ -303,6 +604,7 @@ fn plan_action(action: Action, identity: &ProcessIdentity) -> PlanAction {
         confidence: ActionConfidence::Normal,
         original_zombie_target: None,
         d_state_diagnostics: None,
+        supervisor_restart: None,
     }
 }
 

@@ -195,6 +195,7 @@ fn test_session_lifecycle_persistence_nomock() {
                 process_state: None,
                 parent_identity: None,
                 d_state_diagnostics: None,
+                supervisor_restart: None,
             }],
             generated_at: Some(Utc::now().to_rfc3339()),
         };
@@ -241,6 +242,7 @@ fn test_verify_plan_with_real_process_nomock() {
             process_state: Some(record.state),
             parent_identity: None,
             d_state_diagnostics: None,
+            supervisor_restart: None,
         }],
     };
     let plan = generate_plan(&bundle);
@@ -259,6 +261,7 @@ fn test_verify_plan_with_real_process_nomock() {
         executed_at: Some(Utc::now()),
         execution_clock: capture_execution_clock(),
         time_ms: None,
+        supervisor_restart: None,
     };
     let report_running = verify_plan(
         &plan,

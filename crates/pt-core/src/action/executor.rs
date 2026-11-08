@@ -202,6 +202,19 @@ impl<'a> ActionExecutor<'a> {
             return (ActionStatus::Skipped, None);
         }
 
+        if action.routing == crate::plan::ActionRouting::Supervisor
+            || action.supervisor_restart.is_some()
+        {
+            if let Err(error) = super::supervisor::restart_binding_for_action(action) {
+                return outcome_from_error(error);
+            }
+            if self.pre_check_provider.is_none() {
+                return outcome_from_error(ActionError::Failed(
+                    "supervisor restart requires the live plan-aware safety prechecks".to_string(),
+                ));
+            }
+        }
+
         // The plan's pre-checks plus the ones pt requires for this action type.
         let pre_checks = crate::plan::effective_pre_checks(action);
 
@@ -225,9 +238,7 @@ impl<'a> ActionExecutor<'a> {
 
         // Run other pre-checks (protected, data-loss, supervisor, session safety)
         if let Some(provider) = self.pre_check_provider {
-            let pid = action.target.pid.0;
-            let sid = action.target.sid;
-            let results = provider.run_checks_for_action(&pre_checks, pid, sid, action.action);
+            let results = provider.run_checks_for_plan(action);
 
             // If any pre-check fails, block the action
             for result in results {
@@ -379,6 +390,7 @@ mod tests {
                 process_state: None,
                 parent_identity: None,
                 d_state_diagnostics: None,
+                supervisor_restart: None,
             }],
             generated_at: Some("2026-01-15T12:00:00Z".to_string()),
         };
@@ -394,6 +406,55 @@ mod tests {
         let executor = ActionExecutor::new(&runner, &identity_provider, dir.path().join("lock"));
         let result = executor.execute_plan(&plan).expect("execute");
         assert_eq!(result.outcomes[0].status, ActionStatus::IdentityMismatch);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervisor_restart_cannot_bypass_plan_aware_prechecks() {
+        struct CountingRunner(std::cell::Cell<bool>);
+        impl ActionRunner for CountingRunner {
+            fn execute(&self, _: &PlanAction) -> Result<(), ActionError> {
+                self.0.set(true);
+                Ok(())
+            }
+            fn verify(&self, _: &PlanAction) -> Result<(), ActionError> {
+                Ok(())
+            }
+        }
+        let mut plan = make_plan();
+        let action = &mut plan.actions[0];
+        action.action = crate::decision::Action::Restart;
+        action.routing = crate::plan::ActionRouting::Supervisor;
+        // SAFETY: geteuid only reads the test process's credentials.
+        let uid = unsafe { libc::geteuid() };
+        action.target.uid = uid;
+        action.supervisor_restart = Some(crate::action::SystemdUserServiceBinding {
+            target: action.target.clone(),
+            unit: "worker-proof.service".into(),
+            control_group: format!(
+                "/user.slice/user-{uid}.slice/user@{uid}.service/worker-proof.service"
+            ),
+            invocation_id: "1234567890abcdef1234567890abcdef".into(),
+        });
+        let identities = StaticIdentityProvider::default().with_identity(action.target.clone());
+        let runner = CountingRunner(std::cell::Cell::new(false));
+        let dir = tempdir().unwrap();
+        let executor = ActionExecutor::new(&runner, &identities, dir.path().join("restart.lock"));
+        let result = executor.execute_plan(&plan).unwrap();
+        assert_eq!(result.outcomes[0].status, ActionStatus::Failed);
+        assert!(!runner.0.get());
+
+        let provider = crate::action::NoopPreCheckProvider;
+        let executor = executor.with_pre_check_provider(&provider);
+        let result = executor.execute_plan(&plan).unwrap();
+        assert!(matches!(
+            result.outcomes[0].status,
+            ActionStatus::PreCheckBlocked {
+                check: PreCheck::CheckSupervisor,
+                ..
+            }
+        ));
+        assert!(!runner.0.get());
     }
 
     #[test]
