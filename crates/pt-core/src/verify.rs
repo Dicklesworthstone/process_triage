@@ -5,6 +5,7 @@
 
 pub mod relief;
 pub mod relief_store;
+pub mod resource_prediction;
 
 use crate::collect::{ProcessRecord, ProcessState};
 use crate::decision::Action;

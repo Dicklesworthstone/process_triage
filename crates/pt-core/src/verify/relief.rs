@@ -9,6 +9,10 @@
 //! <https://man7.org/linux/man-pages/man5/proc_stat.5.html>. In particular, CPU
 //! `full` is undefined at host scope and iowait counters can regress.
 
+use super::resource_prediction::{
+    attach_prediction_comparison, ResourcePredictionSnapshot, RunResourcePredictionComparison,
+    ValidatedResourcePredictions,
+};
 use super::{ExecutionClock, SavedActionOutcome};
 use crate::collect::pressure::{
     read_pressure_snapshot, PressureSnapshot, PressureWindow, PsiLine, PsiResource, StallFractions,
@@ -142,6 +146,9 @@ pub struct ResourceDelta {
     pub comparable: bool,
     /// CPU-normalized comparisons require the same observed online capacity.
     pub cpu_capacity_comparable: bool,
+    /// Common capacity of the validated execution windows; legacy evidence may lack it.
+    #[serde(default)]
+    pub observed_logical_cpus: Option<u32>,
     pub before_at_ms: Option<u64>,
     pub after_at_ms: Option<u64>,
     pub interval_ms: Option<f64>,
@@ -159,6 +166,8 @@ pub struct ResourceDelta {
     pub memory_pressure: PsiResourceDelta,
     pub io_pressure: PsiResourceDelta,
     pub binding: Option<ResourceEvidenceBinding>,
+    #[serde(default)]
+    pub prediction_comparison: Option<RunResourcePredictionComparison>,
     pub unavailable: Vec<Unavailable>,
     pub limitations: Vec<String>,
 }
@@ -903,10 +912,11 @@ pub fn compare_resource_windows(
     ResourceDelta {
         scope: "host".into(), attribution: "observed_host_change_not_per_action_recovery".into(),
         delta_convention: "after_minus_before".into(), comparable, cpu_capacity_comparable,
+        observed_logical_cpus: cpu_capacity_comparable.then_some(capacity).flatten(),
         before_at_ms: before_point.map(|point| point.sampled_at_ms), after_at_ms: after_point.map(|point| point.sampled_at_ms), interval_ms,
         before_window, after_window, available_memory_bytes, swap_used_bytes, allocated_file_handles,
         load1, load5, load15, load_ratio, cpu, cpu_pressure, memory_pressure, io_pressure,
-        binding: None, unavailable: errors,
+        binding: None, prediction_comparison: None, unavailable: errors,
         limitations: vec![
             "Host changes can include unrelated workloads, caches, reclaim and changing capacity; they are not causal proof of per-action recovery.".into(),
             "The observation duration is a settle opportunity, not proof that the system reached a stable state.".into(),
@@ -985,6 +995,8 @@ pub struct ResourceObservationArtifact {
     pub plan_sha256: String,
     pub run_id: String,
     pub actions: Vec<ResourceActionBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_predictions: Option<ResourcePredictionSnapshot>,
     pub before: ResourceObservationWindow,
     pub after: ResourceObservationWindow,
 }
@@ -1013,6 +1025,7 @@ pub fn replay_resource_artifact(
     current_plan_sha256: &str,
     saved_outcomes: &[SavedActionOutcome],
     current_observation: &ResourceObservation,
+    predictions: Option<&ValidatedResourcePredictions>,
 ) -> Result<ResourceDelta, String> {
     let valid_digest =
         |digest: &str| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit());
@@ -1146,6 +1159,13 @@ pub fn replay_resource_artifact(
         execution_clock_resolution_ns: 1_000_000_000u64.div_ceil(hz),
         timing_validation: "execution_tick_interval_overlaps_inter_window_gap".into(),
     });
+    attach_prediction_comparison(
+        &mut report,
+        artifact.resource_predictions.as_ref(),
+        predictions,
+        plan,
+        &artifact.actions,
+    );
     report.limitations.push("Saved execution timestamps and target identities bind this apply run; boot-clock ordering is validated only to USER_HZ tick precision, not atomically within a tick. Wall-clock future checks use the host observation's millisecond resolution.".into());
     report.limitations.push("This is the historical observation window for the named apply run and bound action IDs, not a fresh verify-time measurement or an aggregate over every plan action.".into());
     Ok(report)
@@ -1574,6 +1594,7 @@ mod tests {
             plan_sha256: plan_digest(&plan),
             run_id: RUN.into(),
             actions: vec![ResourceActionBinding::from_saved(&saved).unwrap()],
+            resource_predictions: None,
             before,
             after,
         };
@@ -1590,9 +1611,15 @@ mod tests {
         let (artifact, plan, mut saved, current) = artifact_fixture();
         let restored: ResourceObservationArtifact =
             serde_json::from_slice(&serde_json::to_vec(&artifact).unwrap()).unwrap();
-        let report =
-            replay_resource_artifact(&restored, &plan, &plan_digest(&plan), &saved, &current)
-                .unwrap();
+        let report = replay_resource_artifact(
+            &restored,
+            &plan,
+            &plan_digest(&plan),
+            &saved,
+            &current,
+            None,
+        )
+        .unwrap();
         assert_eq!(report.available_memory_bytes.delta, Some(1_000_000.0));
         let binding = report.binding.unwrap();
         assert_eq!(binding.run_id, RUN);
@@ -1602,8 +1629,15 @@ mod tests {
         skipped.executed_at = None;
         saved.push(skipped);
         assert!(
-            replay_resource_artifact(&artifact, &plan, &plan_digest(&plan), &saved, &current)
-                .is_ok(),
+            replay_resource_artifact(
+                &artifact,
+                &plan,
+                &plan_digest(&plan),
+                &saved,
+                &current,
+                None
+            )
+            .is_ok(),
             "a resume skip must not erase the actual prior execution"
         );
     }
@@ -1624,16 +1658,29 @@ mod tests {
         current.monotonic_end_ns = Some(2_500_950_000);
         saved[0].executed_at = DateTime::<Utc>::from_timestamp(2, 500_500_000);
         artifact.actions[0] = ResourceActionBinding::from_saved(&saved[0]).unwrap();
-        let report =
-            replay_resource_artifact(&artifact, &plan, &plan_digest(&plan), &saved, &current)
-                .expect("a later observation in the same millisecond is not a future execution");
+        let report = replay_resource_artifact(
+            &artifact,
+            &plan,
+            &plan_digest(&plan),
+            &saved,
+            &current,
+            None,
+        )
+        .expect("a later observation in the same millisecond is not a future execution");
         assert!(report.comparable);
         assert!(report.cpu.busy_percent.delta.is_none());
         saved[0].executed_at = DateTime::<Utc>::from_timestamp_millis(2501);
         artifact.actions[0] = ResourceActionBinding::from_saved(&saved[0]).unwrap();
         assert!(
-            replay_resource_artifact(&artifact, &plan, &plan_digest(&plan), &saved, &current,)
-                .is_err(),
+            replay_resource_artifact(
+                &artifact,
+                &plan,
+                &plan_digest(&plan),
+                &saved,
+                &current,
+                None
+            )
+            .is_err(),
             "the next millisecond remains in the future"
         );
     }
@@ -1648,7 +1695,8 @@ mod tests {
             &changed_plan,
             &plan_digest(&changed_plan),
             &saved,
-            &current
+            &current,
+            None,
         )
         .is_err());
         let mut wrong_session = artifact.clone();
@@ -1658,7 +1706,8 @@ mod tests {
             &plan,
             &plan_digest(&plan),
             &saved,
-            &current
+            &current,
+            None,
         )
         .is_err());
         let mut latest = saved.clone();
@@ -1666,16 +1715,26 @@ mod tests {
         newer.executed_at = DateTime::<Utc>::from_timestamp_millis(2600);
         newer.execution_clock.as_mut().unwrap().ticks = 260;
         latest.push(newer);
-        assert!(
-            replay_resource_artifact(&artifact, &plan, &plan_digest(&plan), &latest, &current)
-                .is_err()
-        );
+        assert!(replay_resource_artifact(
+            &artifact,
+            &plan,
+            &plan_digest(&plan),
+            &latest,
+            &current,
+            None
+        )
+        .is_err());
         let mut new_boot = current.clone();
         new_boot.boot_id = Some(OTHER_BOOT.into());
-        assert!(
-            replay_resource_artifact(&artifact, &plan, &plan_digest(&plan), &saved, &new_boot)
-                .is_err()
-        );
+        assert!(replay_resource_artifact(
+            &artifact,
+            &plan,
+            &plan_digest(&plan),
+            &saved,
+            &new_boot,
+            None
+        )
+        .is_err());
         let mut missing_clock = saved.clone();
         missing_clock[0].execution_clock = None;
         assert!(replay_resource_artifact(
@@ -1683,12 +1742,13 @@ mod tests {
             &plan,
             &plan_digest(&plan),
             &missing_clock,
-            &current
+            &current,
+            None,
         )
         .is_err());
         let mut changed_clock = saved.clone();
         changed_clock[0].execution_clock.as_mut().unwrap().ticks = 251;
-        assert!(replay_resource_artifact(&artifact, &plan, &plan_digest(&plan), &changed_clock, &current).is_err(),
+        assert!(replay_resource_artifact(&artifact, &plan, &plan_digest(&plan), &changed_clock, &current, None).is_err(),
             "an edited clock inside the same gap must not replace the original bound execution clock");
         let mut dry_run = saved[0].clone();
         dry_run.status = "dry_run".into();
@@ -1710,7 +1770,8 @@ mod tests {
             &larger_plan,
             &plan_digest(&larger_plan),
             &saved,
-            &current
+            &current,
+            None,
         )
         .is_err());
     }
@@ -1720,9 +1781,15 @@ mod tests {
         let (mut artifact, plan, mut saved, current) = artifact_fixture();
         saved[0].status = "failed".into();
         artifact.actions[0] = ResourceActionBinding::from_saved(&saved[0]).unwrap();
-        let report =
-            replay_resource_artifact(&artifact, &plan, &plan_digest(&plan), &saved, &current)
-                .unwrap();
+        let report = replay_resource_artifact(
+            &artifact,
+            &plan,
+            &plan_digest(&plan),
+            &saved,
+            &current,
+            None,
+        )
+        .unwrap();
         assert_eq!(artifact.actions[0].status, "failed");
         assert!(
             report.comparable,
@@ -1742,9 +1809,15 @@ mod tests {
         saved[0].executed_at = DateTime::<Utc>::from_timestamp_millis(2007);
         saved[0].execution_clock.as_mut().unwrap().ticks = 200; // [2000ms, 2010ms)
         artifact.actions[0] = ResourceActionBinding::from_saved(&saved[0]).unwrap();
-        let report =
-            replay_resource_artifact(&artifact, &plan, &plan_digest(&plan), &saved, &current)
-                .unwrap();
+        let report = replay_resource_artifact(
+            &artifact,
+            &plan,
+            &plan_digest(&plan),
+            &saved,
+            &current,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             report.binding.unwrap().execution_clock_resolution_ns,
             10_000_000
@@ -1758,7 +1831,8 @@ mod tests {
                 &plan,
                 &plan_digest(&plan),
                 &saved,
-                &current
+                &current,
+                None,
             )
             .is_err());
         }

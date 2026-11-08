@@ -710,10 +710,27 @@ clocks, and current boot still match. `resource_runs.reports` preserves distinct
 valid runs; `resource_delta` is populated only when exactly one run is valid.
 Missing or rejected artifacts do not imply that the action itself failed.
 
+The saved plan's `resource_predictions` binds each forecast to its action ID,
+action kind, full target identity, and original observation time. Kill forecasts
+retain the measured private-memory counters, process and enclosing host CPU
+ticks, and any descriptor census collected during planning. Apply and verify
+reuse those exact predictions; they never reconstruct them from RSS, lifetime
+CPU percentages, or a fresh reading taken after approval. Older plans without
+this evidence keep their predictions unknown.
+
+Each valid run exposes `resource_delta.prediction_comparison`: the expected
+recovery for successful, identity-bound executions, the observed host change,
+and their difference. Repeated stages for one process incarnation receive
+resource credit once. Missing forecasts or an unsupported action kind leave
+the complete prediction unknown, with the known Kill subtotal reported
+separately. A failed or skipped action contributes no predicted recovery to
+that execution window. CPU comparisons use fractions of whole-host capacity;
+positive comparison deltas mean improvement. These comparisons describe host
+associations and do not establish which action caused the change.
+
 Goal progress also distinguishes unknown measurements and predictions from
-observed zero. CPU observations are host busy fractions; the old lifetime CPU
-forecast is no longer used. Missing per-action CPU or exclusive port-ownership
-forecasts keep comparisons unavailable while preserving real observations.
+observed zero. Missing per-action CPU or exclusive port-ownership forecasts
+keep comparisons unavailable while preserving real observations.
 Unreadable process or socket censuses cannot appear as freed descriptors or
 ports. Descriptor counts cover observed processes, port observations cover the
 observer's network namespace, and host allocated file handles are a separate

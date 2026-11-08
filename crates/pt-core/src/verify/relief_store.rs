@@ -10,6 +10,7 @@ use super::relief::{
     ResourceObservationArtifact, ResourceObservationWindow, MAX_RESOURCE_WINDOW_MS,
     RESOURCE_OBSERVATION_SCHEMA_VERSION,
 };
+use super::resource_prediction::ValidatedResourcePredictions;
 use super::SavedActionOutcome;
 use crate::collect::pressure::Unavailable;
 use crate::plan::Plan;
@@ -39,6 +40,7 @@ pub struct ResourceRun {
     plan_sha256: String,
     settle_ms: u64,
     enabled: bool,
+    predictions: Option<ValidatedResourcePredictions>,
 }
 
 impl ResourceRun {
@@ -251,14 +253,22 @@ pub fn begin_resource_run(
     plan: &Plan,
     plan_sha256: &str,
     settle_ms: u64,
+    predictions: Option<&ValidatedResourcePredictions>,
 ) -> ResourceRun {
-    begin_resource_run_with(
+    let mut run = begin_resource_run_with(
         action_dir,
         plan,
         plan_sha256,
         settle_ms,
         |duration, sample| collect_resource_window(duration, sample),
-    )
+    );
+    if let Some(predictions) = predictions {
+        match predictions.snapshot().validate(plan) {
+            Ok(predictions) => run.predictions = Some(predictions),
+            Err(reason) => missing(&mut run.unavailable, "resource_predictions", reason),
+        }
+    }
+    run
 }
 
 fn begin_resource_run_with(
@@ -281,6 +291,7 @@ fn begin_resource_run_with(
         plan_sha256: plan_sha256.to_string(),
         settle_ms,
         enabled: true,
+        predictions: None,
     };
     if !valid_digest(plan_sha256) || settle_ms > MAX_RESOURCE_WINDOW_MS {
         missing(
@@ -436,6 +447,10 @@ fn finish_resource_run_with(
         plan_sha256: run.plan_sha256.clone(),
         run_id: run.run_id.clone(),
         actions,
+        resource_predictions: run
+            .predictions
+            .as_ref()
+            .map(|predictions| predictions.snapshot().clone()),
         before: before.clone(),
         after,
     };
@@ -449,6 +464,7 @@ fn finish_resource_run_with(
         &run.plan_sha256,
         saved_outcomes,
         &observe_current(),
+        run.predictions.as_ref(),
     ) {
         Ok(delta) => result.resource_delta = Some(delta),
         Err(reason) => missing(&mut result.unavailable, "resource_replay", reason),
@@ -480,6 +496,7 @@ pub fn load_resource_runs(
     current_plan_sha256: &str,
     saved_outcomes: &[SavedActionOutcome],
     current_observation: &ResourceObservation,
+    predictions: Option<&ValidatedResourcePredictions>,
 ) -> ResourceReplayReport {
     let mut report = ResourceReplayReport::default();
     if !valid_digest(current_plan_sha256) {
@@ -633,6 +650,7 @@ pub fn load_resource_runs(
             current_plan_sha256,
             saved_outcomes,
             current_observation,
+            predictions,
         ) {
             Ok(delta) => report.reports.push(delta),
             Err(reason) => reject(&mut report, &name, reason),
@@ -740,6 +758,7 @@ mod tests {
             plan_sha256: digest.into(),
             run_id: run_id.into(),
             actions: vec![ResourceActionBinding::from_saved(saved).unwrap()],
+            resource_predictions: None,
             before: window(start, Duration::ZERO),
             after: window(end, Duration::ZERO),
         }
@@ -845,7 +864,14 @@ mod tests {
             persisted,
             "existing runs must not be overwritten"
         );
-        let replay = load_resource_runs(&action_dir, &plan, &digest, &[saved], &observation(5000));
+        let replay = load_resource_runs(
+            &action_dir,
+            &plan,
+            &digest,
+            &[saved],
+            &observation(5000),
+            None,
+        );
         assert_eq!(replay.reports.len(), 1);
         assert!(replay.rejected.is_empty());
         assert_eq!(
@@ -860,6 +886,123 @@ mod tests {
         assert_eq!(samples.len(), 2);
         assert_eq!(samples[0]["phase"], "before");
         assert_eq!(samples[1]["phase"], "after");
+    }
+
+    #[test]
+    fn saved_predictions_survive_apply_resume_replay_without_later_recalculation() {
+        use crate::decision::Action;
+        use crate::verify::resource_prediction::{
+            ActionResourcePrediction, PrivateMemoryPrediction, ResourcePredictionSnapshot,
+            RESOURCE_PREDICTION_SCHEMA_VERSION,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let (mut plan, mut saved, _) = fixture();
+        plan.actions[0].action = Action::Kill;
+        saved.action = Some(Action::Kill);
+        let snapshot = ResourcePredictionSnapshot {
+            schema_version: RESOURCE_PREDICTION_SCHEMA_VERSION,
+            session_id: plan.session_id.clone(),
+            plan_id: plan.plan_id.clone(),
+            generated_at: "1970-01-01T00:00:01Z".into(),
+            actions: vec![ActionResourcePrediction {
+                action_id: plan.actions[0].action_id.clone(),
+                action: Action::Kill,
+                target: plan.actions[0].target.clone(),
+                memory: Some(PrivateMemoryPrediction::new(40, 60, Some(9000), 900).unwrap()),
+                cpu: None,
+                file_descriptors: None,
+                unavailable: Vec::new(),
+            }],
+        };
+        let predictions = snapshot.validate(&plan).unwrap();
+        let mut canonical = serde_json::to_value(&plan).unwrap();
+        canonical["resource_predictions"] = serde_json::to_value(&snapshot).unwrap();
+        let digest = format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&canonical).unwrap())
+        );
+        let mut run =
+            begin_resource_run_with(temp.path(), &plan, &digest, 0, |duration, callback| {
+                let measured = window(1000, duration);
+                stream(&measured, callback);
+                Ok(measured)
+            });
+        run.predictions = Some(predictions.clone());
+        let report = finish_resource_run_with(
+            run,
+            &plan,
+            std::slice::from_ref(&saved),
+            |duration, callback| {
+                let measured = window(3000, duration);
+                stream(&measured, callback);
+                Ok(measured)
+            },
+            || observation(4000),
+        );
+        let stored: ResourceObservationArtifact =
+            serde_json::from_slice(&fs::read(report.artifact_path.unwrap()).unwrap()).unwrap();
+        assert_eq!(stored.resource_predictions.as_ref(), Some(&snapshot));
+        let comparison = report
+            .resource_delta
+            .as_ref()
+            .unwrap()
+            .prediction_comparison
+            .as_ref()
+            .unwrap();
+        assert_eq!(comparison.memory.predicted, Some(100.0));
+        assert_eq!(comparison.memory.observed, Some(2_000_000.0));
+        assert_eq!(comparison.cpu.predicted, None);
+
+        let mut resume_skip = saved.clone();
+        resume_skip.status = "already_completed".into();
+        resume_skip.executed_at = None;
+        let outcomes = [saved, resume_skip];
+        let replay = load_resource_runs(
+            temp.path(),
+            &plan,
+            &digest,
+            &outcomes,
+            &observation(5000),
+            Some(&predictions),
+        );
+        assert_eq!(replay.reports.len(), 1);
+        let comparison = replay.reports[0].prediction_comparison.as_ref().unwrap();
+        assert_eq!(comparison.memory.predicted, Some(100.0));
+        assert_eq!(comparison.unique_targets, 1);
+
+        let mut changed = snapshot;
+        changed.actions[0].memory =
+            Some(PrivateMemoryPrediction::new(4000, 6000, None, 900).unwrap());
+        let changed = changed.validate(&plan).unwrap();
+        let replay = load_resource_runs(
+            temp.path(),
+            &plan,
+            &digest,
+            &outcomes,
+            &observation(5000),
+            Some(&changed),
+        );
+        assert_eq!(
+            replay.reports.len(),
+            1,
+            "valid original host observations survive a forecast mismatch"
+        );
+        assert!(replay.reports[0].prediction_comparison.is_none());
+        assert!(replay.reports[0]
+            .unavailable
+            .iter()
+            .any(|item| item.source == "resource_predictions"));
+        let wrong_hash = "b".repeat(64);
+        let rejected = load_resource_runs(
+            temp.path(),
+            &plan,
+            &wrong_hash,
+            &outcomes,
+            &observation(5000),
+            Some(&predictions),
+        );
+        assert!(rejected.reports.is_empty());
+        assert_eq!(rejected.rejected.len(), 1);
     }
 
     #[test]
@@ -1105,7 +1248,14 @@ mod tests {
         )
         .unwrap();
         let saved = vec![first.clone(), second];
-        let report = load_resource_runs(temp.path(), &plan, &digest, &saved, &observation(8000));
+        let report = load_resource_runs(
+            temp.path(),
+            &plan,
+            &digest,
+            &saved,
+            &observation(8000),
+            None,
+        );
         assert_eq!(report.reports.len(), 2);
         assert_eq!(report.rejected.len(), 1);
         let mut ids: Vec<_> = report
@@ -1121,7 +1271,14 @@ mod tests {
         retry.executed_at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(7500);
         retry.execution_clock.as_mut().unwrap().ticks = 750;
         latest.push(retry);
-        let stale = load_resource_runs(temp.path(), &plan, &digest, &latest, &observation(8000));
+        let stale = load_resource_runs(
+            temp.path(),
+            &plan,
+            &digest,
+            &latest,
+            &observation(8000),
+            None,
+        );
         assert_eq!(stale.reports.len(), 1);
         assert_eq!(
             stale.reports[0].binding.as_ref().unwrap().action_ids,
@@ -1155,6 +1312,7 @@ mod tests {
             &digest,
             std::slice::from_ref(&saved),
             &observation(4000),
+            None,
         );
         assert!(report.reports.is_empty());
         assert_eq!(report.rejected.len(), 3);
@@ -1175,7 +1333,14 @@ mod tests {
             let name = format!("{ARTIFACT_PREFIX}{}{ARTIFACT_SUFFIX}", uuid::Uuid::new_v4());
             fs::write(many.path().join(name), b"{}").unwrap();
         }
-        let report = load_resource_runs(many.path(), &plan, &digest, &[saved], &observation(4000));
+        let report = load_resource_runs(
+            many.path(),
+            &plan,
+            &digest,
+            &[saved],
+            &observation(4000),
+            None,
+        );
         assert!(report.reports.is_empty());
         assert!(report
             .unavailable
@@ -1208,7 +1373,14 @@ mod tests {
             .unavailable
             .iter()
             .any(|item| item.source == "resource_samples"));
-        let replay = load_resource_runs(&action_dir, &plan, &digest, &[saved], &observation(4000));
+        let replay = load_resource_runs(
+            &action_dir,
+            &plan,
+            &digest,
+            &[saved],
+            &observation(4000),
+            None,
+        );
         assert!(replay.reports.is_empty());
         assert_eq!(replay.rejected.len(), 1);
         assert!(replay.rejected[0].reason.contains("symlinks"));

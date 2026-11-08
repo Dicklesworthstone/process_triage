@@ -94,6 +94,10 @@ use pt_core::verify::relief::{capture_resource_observation, ResourceDelta, DEFAU
 use pt_core::verify::relief_store::{
     begin_resource_run, finish_resource_run, load_resource_runs, ResourceRun, ResourceRunResult,
 };
+use pt_core::verify::resource_prediction::{
+    ActionResourcePrediction, FileDescriptorPrediction, HostCpuPrediction, PrivateMemoryPrediction,
+    ResourcePredictionSnapshot, ValidatedResourcePredictions, RESOURCE_PREDICTION_SCHEMA_VERSION,
+};
 #[cfg(test)]
 use pt_core::verify::verify_plan;
 use pt_core::verify::{
@@ -5351,6 +5355,134 @@ fn expected_private_memory_for_kills(plan: &Plan, resources: &GoalResourceSnapsh
         })
 }
 
+/// Collection completion times, retained separately because a late private
+/// memory read must not masquerade as the earlier CPU or descriptor sample.
+#[derive(Clone, Copy, Default)]
+struct PlanningResourceTimes {
+    activity_unix_ms: i64,
+    private_memory_unix_ms: Option<i64>,
+    descriptors_unix_ms: Option<i64>,
+}
+
+fn build_resource_predictions(
+    plan: &Plan,
+    resources: &GoalResourceSnapshot,
+    pressure: &PlanningPressure,
+    times: PlanningResourceTimes,
+    mut activity_for: impl FnMut(&ProcessIdentity) -> Option<pt_core::collect::ProcessActivity>,
+) -> Result<ResourcePredictionSnapshot, String> {
+    let mut predictions = Vec::new();
+    for action in plan
+        .actions
+        .iter()
+        .filter(|action| !action.blocked && action.action != Action::Keep)
+    {
+        let mut prediction = ActionResourcePrediction {
+            action_id: action.action_id.clone(),
+            action: action.action,
+            target: action.target.clone(),
+            memory: None,
+            cpu: None,
+            file_descriptors: None,
+            unavailable: Vec::new(),
+        };
+        if action.action != Action::Kill {
+            prediction
+                .unavailable
+                .push("resource recovery is not predicted for this action kind".into());
+            predictions.push(prediction);
+            continue;
+        }
+        let memory = resources
+            .private_memory_bytes(&action.target)
+            .and_then(|_| {
+                let observed = &resources.private_memory[&action.target.pid.0];
+                PrivateMemoryPrediction::new(
+                    observed.private_clean_bytes,
+                    observed.private_dirty_bytes,
+                    observed.private_hugetlb_bytes,
+                    times
+                        .private_memory_unix_ms
+                        .ok_or("private-memory observation time is unavailable")?,
+                )
+            });
+        match memory {
+            Ok(memory) => prediction.memory = Some(memory),
+            Err(error) => prediction.unavailable.push(format!("memory: {error}")),
+        }
+        let activity = activity_for(&action.target).filter(|sample| {
+            sample.pid == action.target.pid.0
+                && sample.start_id == action.target.start_id
+                && sample.uid == action.target.uid
+                && sample.source == "procfs_window"
+                && sample.cpu_error.is_none()
+                && sample.requested_window_ms > 0
+        });
+        let cpu = pressure
+            .cpu_usage
+            .as_ref()
+            .zip(activity.as_ref())
+            .and_then(|(host, sample)| {
+                Some(HostCpuPrediction::from_window(
+                    sample.cpu_ticks?,
+                    sample.cpu_window_seconds?,
+                    host,
+                    times.activity_unix_ms,
+                ))
+            });
+        match cpu {
+            Some(Ok(cpu)) => prediction.cpu = Some(cpu),
+            Some(Err(error)) => prediction.unavailable.push(format!("cpu: {error}")),
+            None => prediction.unavailable.push(
+                "cpu: matching process ticks and enclosing host window were not observed".into(),
+            ),
+        }
+        prediction.file_descriptors = resources
+            .fd_count(&action.target)
+            .zip(times.descriptors_unix_ms)
+            .map(|(count, observed_at_unix_ms)| FileDescriptorPrediction {
+                count,
+                observed_at_unix_ms,
+            });
+        if prediction.file_descriptors.is_none() {
+            prediction.unavailable.push(
+                "file_descriptors: matching planning-time descriptor census was not observed"
+                    .into(),
+            );
+        }
+        prediction.unavailable.push(
+            "ports: exclusive release in the observer network namespace is not established".into(),
+        );
+        predictions.push(prediction);
+    }
+    let snapshot = ResourcePredictionSnapshot {
+        schema_version: RESOURCE_PREDICTION_SCHEMA_VERSION,
+        session_id: plan.session_id.clone(),
+        plan_id: plan.plan_id.clone(),
+        generated_at: chrono::Utc::now().to_rfc3339(),
+        actions: predictions,
+    };
+    snapshot.validate(plan)?;
+    Ok(snapshot)
+}
+
+/// Forecasts come only from the canonical saved document. Older plans keep
+/// their predictions unknown; current process readings never backfill them.
+fn saved_resource_predictions(
+    document: &serde_json::Value,
+    plan: &Plan,
+) -> Result<Option<ValidatedResourcePredictions>, String> {
+    let Some(value) = document
+        .get("resource_predictions")
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(None);
+    };
+    let snapshot: ResourcePredictionSnapshot = serde_json::from_value(value.clone())
+        .map_err(|error| format!("invalid saved resource predictions: {error}"))?;
+    snapshot.validate(plan).map(Some)
+}
+
 fn build_goal_plan_from_candidates(
     _goal_str: &str,
     goal: &Goal,
@@ -6325,6 +6457,212 @@ mod executable_goal_tests {
             expected_private_memory_for_kills(&plan, &resources),
             Some(2 * MIB)
         );
+    }
+
+    fn prediction_activity(identity: &ProcessIdentity) -> pt_core::collect::ProcessActivity {
+        pt_core::collect::ProcessActivity {
+            pid: identity.pid.0,
+            start_id: identity.start_id.clone(),
+            uid: identity.uid,
+            source: "procfs_window".into(),
+            requested_window_ms: 500,
+            cpu_percent: Some(400.0),
+            cpu_ticks: Some(250),
+            cpu_window_seconds: Some(0.5),
+            io_window_seconds: None,
+            read_bytes_per_second: None,
+            write_bytes_per_second: None,
+            io_active: None,
+            cpu_error: None,
+            io_error: None,
+            pressure: None,
+        }
+    }
+
+    #[test]
+    fn saved_resource_forecasts_preserve_planning_counters_through_apply() {
+        let (_, mut plan) = fixture(&[(100, 9000, 400.0)]);
+        let mut resources = memory_resources(&plan, &[(100, MIB + MIB / 2)]);
+        resources
+            .private_memory
+            .get_mut(&100)
+            .unwrap()
+            .private_hugetlb_bytes = Some(1000 * MIB);
+        resources.processes.insert(
+            100,
+            ProcessGoalResources {
+                identity: plan.actions[0].target.clone(),
+                fd_count: 19,
+            },
+        );
+        let pressure = PlanningPressure {
+            cpu_usage: Some(pt_core::collect::pressure::HostCpuWindow {
+                total_ticks: 1000,
+                busy_ticks: 700,
+                logical_cpus: 8,
+                window_seconds: 1.0,
+            }),
+            ..Default::default()
+        };
+        let snapshot = build_resource_predictions(
+            &plan,
+            &resources,
+            &pressure,
+            PlanningResourceTimes {
+                activity_unix_ms: 1000,
+                private_memory_unix_ms: Some(2000),
+                descriptors_unix_ms: Some(1500),
+            },
+            |identity| Some(prediction_activity(identity)),
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot.actions[0]
+                .memory
+                .as_ref()
+                .unwrap()
+                .observed_at_unix_ms,
+            2000
+        );
+        assert_eq!(
+            snapshot.actions[0]
+                .cpu
+                .as_ref()
+                .unwrap()
+                .observed_at_unix_ms,
+            1000
+        );
+        assert_eq!(
+            snapshot.actions[0]
+                .file_descriptors
+                .as_ref()
+                .unwrap()
+                .observed_at_unix_ms,
+            1500
+        );
+
+        // A later display footprint or measurement is not the saved forecast.
+        plan.actions[0].rationale.memory_mb = Some(50_000.0);
+        resources.private_memory.clear();
+        resources.processes.clear();
+        let mut document = serde_json::to_value(&plan).unwrap();
+        document["resource_predictions"] = serde_json::to_value(&snapshot).unwrap();
+        let canonical = serde_json::to_string(&document).unwrap();
+        let parsed_plan = parse_agent_plan(&canonical).unwrap();
+        let parsed_document = serde_json::from_str(&canonical).unwrap();
+        let saved = saved_resource_predictions(&parsed_document, &parsed_plan)
+            .unwrap()
+            .unwrap();
+        let expected = ExpectedGoalContribution::from_saved(
+            &parsed_plan.actions[0],
+            Some(&saved),
+            "worker".into(),
+        );
+        assert_eq!(expected.memory_bytes, Some((MIB + MIB / 2) as f64));
+        assert_eq!(expected.cpu_host_fraction, Some(0.25));
+        assert_eq!(expected.file_descriptors, Some(19.0));
+        assert_eq!(expected.ports, None);
+        assert_eq!(saved.snapshot(), &snapshot);
+    }
+
+    #[test]
+    fn resource_forecasts_reject_missing_or_changed_planning_evidence() {
+        let (_, plan) = fixture(&[(100, 9000, 400.0)]);
+        let mut resources = memory_resources(&plan, &[(100, MIB)]);
+        resources.private_memory.get_mut(&100).unwrap().identity.uid += 1;
+        resources.processes.insert(
+            100,
+            ProcessGoalResources {
+                identity: resources.private_memory[&100].identity.clone(),
+                fd_count: 900,
+            },
+        );
+        let pressure = PlanningPressure::default();
+        let snapshot = build_resource_predictions(
+            &plan,
+            &resources,
+            &pressure,
+            PlanningResourceTimes {
+                activity_unix_ms: 1000,
+                private_memory_unix_ms: Some(1000),
+                descriptors_unix_ms: Some(1000),
+            },
+            |identity| {
+                let mut activity = prediction_activity(identity);
+                activity.source = "ps_lifetime_fallback".into();
+                Some(activity)
+            },
+        )
+        .unwrap();
+        let prediction = &snapshot.actions[0];
+        assert!(prediction.memory.is_none());
+        assert!(prediction.cpu.is_none());
+        assert!(prediction.file_descriptors.is_none());
+        assert!(prediction
+            .unavailable
+            .iter()
+            .any(|reason| reason.starts_with("memory:")));
+        assert!(prediction
+            .unavailable
+            .iter()
+            .any(|reason| reason.starts_with("cpu:")));
+
+        let legacy = serde_json::to_value(&plan).unwrap();
+        assert!(saved_resource_predictions(&legacy, &plan)
+            .unwrap()
+            .is_none());
+        let expected =
+            ExpectedGoalContribution::from_saved(&plan.actions[0], None, "legacy".into());
+        assert!(expected.memory_bytes.is_none());
+        assert!(expected.cpu_host_fraction.is_none());
+        assert!(expected.file_descriptors.is_none());
+        let mut malformed = legacy;
+        malformed["resource_predictions"] = serde_json::json!({"schema_version": 999});
+        assert!(saved_resource_predictions(&malformed, &plan).is_err());
+    }
+
+    #[test]
+    fn planning_forecasts_follow_final_routed_target_and_action_kind() {
+        let (_, mut plan) = fixture(&[(100, 1, 0.0), (200, 10000, 0.0), (300, 20000, 0.0)]);
+        plan.actions[0].routing = ActionRouting::ZombieToParent;
+        plan.actions[0].original_zombie_target = Some(plan.actions[1].target.clone());
+        plan.actions[1].blocked = true;
+        plan.actions[2].action = Action::Pause;
+        let resources =
+            memory_resources(&plan, &[(100, MIB), (200, 10000 * MIB), (300, 20000 * MIB)]);
+        let snapshot = build_resource_predictions(
+            &plan,
+            &resources,
+            &PlanningPressure::default(),
+            PlanningResourceTimes {
+                private_memory_unix_ms: Some(1000),
+                ..Default::default()
+            },
+            |_| None,
+        )
+        .unwrap();
+        assert_eq!(snapshot.actions.len(), 2);
+        assert_eq!(snapshot.actions[0].target, plan.actions[0].target);
+        assert_eq!(snapshot.actions[0].memory.as_ref().unwrap().bytes, MIB);
+        assert_eq!(snapshot.actions[1].action, Action::Pause);
+        assert!(snapshot.actions[1].memory.is_none());
+
+        let saved = snapshot.validate(&plan).unwrap();
+        for change in ["uid", "birth", "group", "action"] {
+            let mut changed = plan.actions[0].clone();
+            match change {
+                "uid" => changed.target.uid += 1,
+                "birth" => changed.target.start_id.0.push_str("-reused"),
+                "group" => changed.target.pgid = Some(999),
+                "action" => changed.action = Action::Restart,
+                _ => unreachable!(),
+            }
+            let expected =
+                ExpectedGoalContribution::from_saved(&changed, Some(&saved), change.into());
+            assert!(expected.memory_bytes.is_none(), "{change}");
+            assert!(expected.cpu_host_fraction.is_none(), "{change}");
+            assert!(expected.file_descriptors.is_none(), "{change}");
+        }
     }
 
     #[test]
@@ -22065,6 +22403,10 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     let mut goal_selected: Option<HashSet<u32>> = None;
     let mut parsed_goal: Option<Goal> = None;
     let mut goal_resources = GoalResourceSnapshot::default();
+    let mut resource_times = PlanningResourceTimes {
+        activity_unix_ms: activity_observed_at_ms,
+        ..Default::default()
+    };
     // The host counter interval includes all work, including kernel activity and
     // processes outside the visible census. Candidate filters constrain actions;
     // they never shrink the host utilization baseline or change percentage units.
@@ -22075,6 +22417,9 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         match parse_goal(goal_str) {
             Ok(goal) => {
                 goal_resources = GoalResourceSnapshot::collect(&goal, &scan_result.processes);
+                let observed_at = chrono::Utc::now().timestamp_millis();
+                resource_times.private_memory_unix_ms = Some(observed_at);
+                resource_times.descriptors_unix_ms = Some(observed_at);
                 attach_goal_resource_observations(&mut candidates, &goal_resources);
                 // Goal ranking influences the kill budget, but only the final
                 // executable plan below can substantiate a recovery forecast.
@@ -22283,6 +22628,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 port: None,
             });
             let measured = GoalResourceSnapshot::collect(&memory_goal, &targets);
+            resource_times.private_memory_unix_ms = Some(chrono::Utc::now().timestamp_millis());
             goal_resources.private_memory = measured.private_memory;
             goal_resources.warnings.extend(measured.warnings);
             attach_goal_resource_observations(&mut candidates, &goal_resources);
@@ -22290,6 +22636,31 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     }
     let expected_memory_freed_gb = expected_private_memory_for_kills(&action_plan, &goal_resources)
         .map(|bytes| bytes as f64 / (1024.0 * 1024.0 * 1024.0));
+    let processes_by_pid: HashMap<u32, &ProcessRecord> = scan_result
+        .processes
+        .iter()
+        .map(|process| (process.pid.0, process))
+        .collect();
+    let resource_predictions = match build_resource_predictions(
+        &action_plan,
+        &goal_resources,
+        &pressure,
+        resource_times,
+        |identity| {
+            processes_by_pid
+                .get(&identity.pid.0)
+                .filter(|process| {
+                    process.start_id == identity.start_id && process.uid == identity.uid
+                })
+                .and_then(|process| scorer.activity_for(process))
+        },
+    ) {
+        Ok(predictions) => predictions,
+        Err(error) => {
+            eprintln!("agent plan: cannot bind resource forecasts to the executable plan: {error}");
+            return ExitCode::InternalError;
+        }
+    };
     let mut review_candidates: Vec<u32> = Vec::new();
     let mut spare_candidates: Vec<u32> = Vec::new();
     // Goal-selected processes whose own recommendation is not `kill` (policy block,
@@ -22478,6 +22849,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         "goal": goal_value,
         "goal_progress": goal_progress,
         "goal_summary": goal_summary,
+        "resource_predictions": resource_predictions,
         "candidates": candidates,
         "recommendations": recommendations,
         "recommended": recommended,
@@ -23632,6 +24004,30 @@ struct ExpectedGoalContribution {
     label: String,
 }
 
+impl ExpectedGoalContribution {
+    fn from_saved(
+        action: &PlanAction,
+        predictions: Option<&ValidatedResourcePredictions>,
+        label: String,
+    ) -> Self {
+        let prediction = predictions.and_then(|predictions| predictions.for_action(action));
+        Self {
+            memory_bytes: prediction
+                .and_then(|prediction| prediction.memory.as_ref())
+                .map(|memory| memory.bytes as f64),
+            cpu_host_fraction: prediction
+                .and_then(|prediction| prediction.cpu.as_ref())
+                .map(|cpu| cpu.host_fraction),
+            // A planning holder census is not proof of exclusive port release.
+            ports: None,
+            file_descriptors: prediction
+                .and_then(|prediction| prediction.file_descriptors.as_ref())
+                .map(|descriptors| descriptors.count as f64),
+            label,
+        }
+    }
+}
+
 fn successful_goal_action_outcomes(
     plan: &Plan,
     outcomes: &[serde_json::Value],
@@ -23949,6 +24345,15 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         return ExitCode::InternalError;
     }
 
+    let (resource_predictions, resource_prediction_error) =
+        match saved_resource_predictions(&saved_document, &plan) {
+            Ok(predictions) => (predictions, None),
+            Err(error) => {
+                eprintln!("agent apply: resource comparisons unavailable: {error}");
+                (None, Some(error))
+            }
+        };
+
     // Resume only executions bound to this canonical action and target identity.
     let completed_action_ids: std::collections::HashSet<String> = if args.resume {
         let outcomes_path = handle.dir.join("action").join("outcomes.jsonl");
@@ -24210,55 +24615,9 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             .map(|proc| proc.cmd.clone())
             .unwrap_or_else(|| format!("pid {}", pid));
 
-        let service_restart = action.action == Action::Restart
-            && action.routing == pt_core::plan::ActionRouting::Supervisor;
-        let memory_expected = if service_restart {
-            // A replacement remains resident. The original process footprint
-            // does not establish how much memory a restart will reclaim.
-            None
-        } else if matches!(action.action, Action::Kill | Action::Restart) {
-            action
-                .rationale
-                .memory_mb
-                .filter(|value| value.is_finite() && *value >= 0.0)
-                .map(|value| value * 1_048_576.0)
-                .filter(|value| value.is_finite())
-        } else {
-            Some(0.0)
-        };
-        // No current per-action CPU window predicts a host-capacity fraction.
-        // Lifetime process averages (in cores) cannot be compared to host busy %.
-        let cpu_expected = None;
-        let port_expected = if matches!(action.action, Action::Kill | Action::Restart) {
-            // A process socket count does not prove exclusive ownership in this
-            // observer's network namespace, so it is not a port-release forecast.
-            None
-        } else {
-            Some(0.0)
-        };
-
-        #[cfg(target_os = "linux")]
-        let fd_expected = if service_restart {
-            None
-        } else if matches!(action.action, Action::Kill | Action::Restart) {
-            before_proc
-                .and_then(observed_process_fd_count)
-                .map(|count| count as f64)
-        } else {
-            Some(0.0)
-        };
-        #[cfg(not(target_os = "linux"))]
-        let fd_expected = None;
-
         expected_by_action.insert(
             action.action_id.clone(),
-            ExpectedGoalContribution {
-                memory_bytes: memory_expected,
-                cpu_host_fraction: cpu_expected,
-                ports: port_expected,
-                file_descriptors: fd_expected,
-                label,
-            },
+            ExpectedGoalContribution::from_saved(action, resource_predictions.as_ref(), label),
         );
     }
 
@@ -24637,7 +24996,16 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 &plan,
                 &plan_sha256,
                 initial_settle_ms,
+                resource_predictions.as_ref(),
             );
+            if let Some(error) = &resource_prediction_error {
+                observations
+                    .unavailable
+                    .push(pt_core::collect::pressure::Unavailable {
+                        source: "resource_predictions".to_string(),
+                        reason: error.clone(),
+                    });
+            }
             if initial_settle_ms < requested_settle_ms {
                 observations.unavailable.push(pt_core::collect::pressure::Unavailable {
                     source: "operation_timeout".to_string(),
@@ -25204,6 +25572,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     let mut cpu_action_outcomes = Vec::new();
     let mut port_action_outcomes = Vec::new();
     let mut fd_action_outcomes = Vec::new();
+    let mut credited_kill_targets = HashSet::new();
     for action in &actions_to_apply {
         let execution = execution_by_action.get(action.action_id.as_str()).copied();
         let success = execution.is_some();
@@ -25217,13 +25586,45 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         // Only a positive observed match can support a respawn diagnosis.
         let respawn_detected = respawn_observation == Some(true);
 
-        let expected = expected_by_action
+        let mut expected = expected_by_action
             .get(&action.action_id)
             .cloned()
             .unwrap_or_else(|| ExpectedGoalContribution {
                 label: format!("pid {}", action.target.pid.0),
                 ..Default::default()
             });
+        // Reuse the bound run's aggregate checks: individually valid forecasts
+        // can still disagree about timing, counters, or whole-host CPU capacity.
+        // The original per-action evidence remains in resource_predictions.
+        let comparison = resource_observation
+            .as_ref()
+            .and_then(|run| run.resource_delta.as_ref())
+            .and_then(|delta| delta.prediction_comparison.as_ref());
+        if comparison.is_none_or(|comparison| !comparison.memory.complete) {
+            expected.memory_bytes = None;
+        }
+        if comparison.is_none_or(|comparison| !comparison.cpu.comparable) {
+            expected.cpu_host_fraction = None;
+        }
+        if comparison.is_none_or(|comparison| !comparison.file_descriptors.complete) {
+            // Goal progress has a process-FD census; resource_delta's host
+            // file-handle metric cannot provide that separate observation.
+            expected.file_descriptors = None;
+        }
+        if success
+            && action.action == Action::Kill
+            && !credited_kill_targets.insert((
+                action.target.pid.0,
+                action.target.start_id.clone(),
+                action.target.uid,
+            ))
+        {
+            // Repeated successful stages cannot reclaim one incarnation twice.
+            // Missing evidence remains unknown even when suppressing duplicates.
+            expected.memory_bytes = expected.memory_bytes.map(|_| 0.0);
+            expected.cpu_host_fraction = expected.cpu_host_fraction.map(|_| 0.0);
+            expected.file_descriptors = expected.file_descriptors.map(|_| 0.0);
+        }
 
         let action_pid = action.target.pid.0;
         memory_action_outcomes.push(GoalActionOutcome {
@@ -25301,13 +25702,17 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         "after": after_snapshot,
         "planning_only": planning_only,
         "execution_evidence_error": goal_evidence_error,
+        "resource_prediction_error": resource_prediction_error,
+        "resource_predictions": resource_predictions.as_ref().map(|predictions| predictions.snapshot()),
         "after_scan_error": after_scan_error,
         "scope": "host_observations_not_per_action_causal_relief",
         "units": {"memory": "bytes", "cpu": "host_busy_fraction", "ports": "observer_network_namespace", "file_descriptors": "observed_process_census_fd_entries"},
         "prediction_notes": [
-            "Per-action CPU relief has no comparable current host-capacity forecast; lifetime process CPU is not a substitute.",
+            "Forecasts retain the exact planning-time evidence for successful saved actions; execution never substitutes current readings, RSS, or lifetime CPU.",
+            "CPU predictions are measured fractions of whole-host capacity. Private-memory predictions use Private_Clean plus Private_Dirty and exclude shared pages and huge-TLB pools.",
+            "CPU comparison additionally requires the observed online capacity to match the original planning window.",
             "Port-release forecasts require exclusive ownership in the observer network namespace and remain unavailable without it.",
-            "Planned RSS is a footprint estimate, not uniquely reclaimable host memory."
+            "A host-wide before/after change is an association, not a causal per-action recovery measurement. Unsupported actions or missing forecasts keep the complete comparison unknown."
         ],
         "metrics": {
             "memory": goal_report_json(&memory_report, planning_only),
@@ -25579,6 +25984,17 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
         );
         return ExitCode::InternalError;
     }
+    let (resource_predictions, resource_prediction_error) =
+        match serde_json::from_str::<serde_json::Value>(&plan_content)
+            .map_err(|error| error.to_string())
+            .and_then(|document| saved_resource_predictions(&document, &plan))
+        {
+            Ok(predictions) => (predictions, None),
+            Err(error) => {
+                eprintln!("agent verify: resource comparisons unavailable: {error}");
+                (None, Some(error))
+            }
+        };
     let outcomes_path = handle.dir.join("action/outcomes.jsonl");
     let outcomes_content = match std::fs::read_to_string(&outcomes_path) {
         Ok(content) => content,
@@ -25707,14 +26123,25 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
     let verify_path = verify_dir.join("verifications.json");
     let current_resource_observation = capture_resource_observation();
     let plan_sha256 = format!("{:x}", Sha256::digest(plan_content.as_bytes()));
-    let resource_runs = load_resource_runs(
+    let mut resource_runs = load_resource_runs(
         &verify_dir,
         &plan,
         &plan_sha256,
         &saved_outcomes,
         &current_resource_observation,
+        resource_predictions.as_ref(),
     );
+    if let Some(error) = &resource_prediction_error {
+        resource_runs
+            .unavailable
+            .push(pt_core::collect::pressure::Unavailable {
+                source: "resource_predictions".to_string(),
+                reason: error.clone(),
+            });
+    }
     let mut verification_output = serde_json::to_value(&report).unwrap_or_default();
+    verification_output["resource_prediction_error"] =
+        serde_json::json!(&resource_prediction_error);
     let respawn_history_update = record_respawn_history(
         &sid,
         &plan,

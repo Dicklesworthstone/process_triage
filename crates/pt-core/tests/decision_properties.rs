@@ -3309,7 +3309,7 @@ proptest! {
         prop_assert!(report.discrepancy.is_some_and(f64::is_finite));
     }
 
-    /// Missing predictions cannot erase measurements or invent a comparison.
+    /// Missing successful predictions cannot erase measurements or invent a comparison.
     #[test]
     fn goal_progress_unknown_prediction_preserves_observed_cpu(
         before_cpu in 0.0f64..1.0,
@@ -3335,12 +3335,19 @@ proptest! {
         let report = measure_progress(
             GoalMetric::Cpu, None, &before, &after, outcomes, &ProgressConfig::default(), None,
         );
-        prop_assert_eq!(report.expected_progress, None);
         prop_assert_eq!(report.observed_progress, Some(before_cpu - after_cpu));
-        prop_assert_eq!(report.discrepancy, None);
-        prop_assert_eq!(report.discrepancy_fraction, None);
-        prop_assert_eq!(report.classification, pt_core::decision::goal_progress::DiscrepancyClass::Unavailable);
-        prop_assert!(report.suspected_causes.is_empty());
+        if succeeded {
+            prop_assert_eq!(report.expected_progress, None);
+            prop_assert_eq!(report.discrepancy, None);
+            prop_assert_eq!(report.discrepancy_fraction, None);
+            prop_assert_eq!(report.classification, pt_core::decision::goal_progress::DiscrepancyClass::Unavailable);
+            prop_assert!(report.suspected_causes.is_empty());
+        } else {
+            prop_assert_eq!(report.expected_progress, Some(0.0));
+            prop_assert_eq!(report.discrepancy, Some(before_cpu - after_cpu));
+            prop_assert!(report.discrepancy_fraction.is_some_and(f64::is_finite));
+            prop_assert!(report.action_outcomes.iter().all(|action| !action.success));
+        }
     }
 
     // ── Escalation properties ───────────────────────────────────────

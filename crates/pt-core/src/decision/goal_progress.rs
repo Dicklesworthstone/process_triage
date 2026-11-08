@@ -209,15 +209,20 @@ pub fn measure_progress(
     }
 }
 
+/// Compare the observed run with forecasts for actions that actually succeeded.
+/// Failed/skipped attempts stay in the report and diagnostics, but neither
+/// contribute recovery nor make a complete successful-action forecast unknown.
 fn compute_expected_total(outcomes: &[ActionOutcome]) -> Result<f64, &'static str> {
     if outcomes
         .iter()
+        .filter(|action| action.success)
         .any(|action| action.expected_contribution.is_none())
     {
         return Err("Expected contribution is unavailable for one or more actions");
     }
     if outcomes
         .iter()
+        .filter(|action| action.success)
         .filter_map(|action| action.expected_contribution)
         .any(|value| !value.is_finite() || value < 0.0)
     {
@@ -225,6 +230,7 @@ fn compute_expected_total(outcomes: &[ActionOutcome]) -> Result<f64, &'static st
     }
     let total: f64 = outcomes
         .iter()
+        .filter(|action| action.success)
         .filter_map(|action| action.expected_contribution)
         .sum();
     if !total.is_finite() {
@@ -444,7 +450,7 @@ mod tests {
             None,
             &make_before(),
             &after,
-            make_outcomes(1_000_000_000.0, false, false),
+            make_outcomes(1_000_000_000.0, true, false),
             &ProgressConfig::default(),
             None,
         );
@@ -515,7 +521,7 @@ mod tests {
 
     #[test]
     fn unavailable_prediction_preserves_real_cpu_reduction_without_comparison() {
-        let mut outcomes = make_outcomes(0.0, false, true);
+        let mut outcomes = make_outcomes(0.0, true, true);
         outcomes[0].expected_contribution = None;
         let report = measure_progress(
             GoalMetric::Cpu,
@@ -718,7 +724,7 @@ mod tests {
                     Some(3000),
                     &before,
                     &after,
-                    make_outcomes(5.0, false, true),
+                    make_outcomes(5.0, true, true),
                     &ProgressConfig::default(),
                     None,
                 );
@@ -866,7 +872,7 @@ mod tests {
                 None,
                 &make_before(),
                 &make_after_good(),
-                make_outcomes(expected, false, true),
+                make_outcomes(expected, true, true),
                 &ProgressConfig::default(),
                 None,
             );
@@ -877,8 +883,8 @@ mod tests {
             assert_eq!(report.classification, DiscrepancyClass::Unavailable);
             assert!(report.suspected_causes.is_empty());
         }
-        let mut outcomes = make_outcomes(f64::MAX, false, true);
-        outcomes.extend(make_outcomes(f64::MAX, false, true));
+        let mut outcomes = make_outcomes(f64::MAX, true, true);
+        outcomes.extend(make_outcomes(f64::MAX, true, true));
         let report = measure_progress(
             GoalMetric::Memory,
             None,
@@ -925,6 +931,53 @@ mod tests {
             assert_eq!(report.classification, DiscrepancyClass::Unavailable);
             assert!(report.suspected_causes.is_empty());
         }
+    }
+
+    #[test]
+    fn unsuccessful_forecasts_do_not_inflate_or_null_successful_recovery() {
+        for failed_prediction in [None, Some(1_000_000_000.0), Some(f64::NAN), Some(-1.0)] {
+            let mut outcomes = make_outcomes(100.0, true, true);
+            let mut failed = make_outcomes(0.0, false, false).remove(0);
+            failed.pid = 5678;
+            failed.expected_contribution = failed_prediction;
+            outcomes.push(failed);
+            assert_eq!(compute_expected_total(&outcomes), Ok(100.0));
+            let after = MetricSnapshot {
+                available_memory_bytes: make_before().available_memory_bytes,
+                ..make_after_good()
+            };
+            let report = measure_progress(
+                GoalMetric::Memory,
+                None,
+                &make_before(),
+                &after,
+                outcomes,
+                &ProgressConfig::default(),
+                None,
+            );
+            assert_eq!(report.expected_progress, Some(100.0));
+            assert_eq!(report.action_outcomes.len(), 2);
+            assert!(!report.action_outcomes[1].success);
+            assert!(report
+                .suspected_causes
+                .iter()
+                .any(|cause| cause.cause.contains("failed")));
+            assert!(report
+                .suspected_causes
+                .iter()
+                .any(|cause| cause.cause.contains("respawn")));
+        }
+        let mut unknown_success = make_outcomes(0.0, true, false);
+        unknown_success[0].expected_contribution = None;
+        assert!(compute_expected_total(&unknown_success).is_err());
+    }
+
+    #[test]
+    fn no_successful_actions_have_zero_expected_recovery_even_with_missing_forecasts() {
+        let mut outcomes = make_outcomes(1000.0, false, false);
+        outcomes[0].expected_contribution = None;
+        assert_eq!(compute_expected_total(&outcomes), Ok(0.0));
+        assert_eq!(compute_expected_total(&[]), Ok(0.0));
     }
 
     #[test]
