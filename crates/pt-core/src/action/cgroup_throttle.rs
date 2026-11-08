@@ -14,6 +14,8 @@ use crate::plan::PlanAction;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::sync::Mutex;
 use tracing::{debug, info};
 
 /// Default maximum CPU bandwidth (25% of one core).
@@ -201,11 +203,174 @@ pub struct ThrottleResult {
 #[derive(Debug)]
 pub struct CpuThrottleActionRunner {
     config: CpuThrottleConfig,
+    /// Keep verification bound to the action, process and controller that were
+    /// actually used, including changes before verification starts.
+    #[cfg(target_os = "linux")]
+    applied: Mutex<Option<AppliedThrottle>>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct AppliedThrottle {
+    action_id: String,
+    identity: pt_common::ProcessIdentity,
+    limit: CpuBandwidthLimit,
+    scope: ThrottleScope,
+}
+
+#[cfg(target_os = "linux")]
+impl AppliedThrottle {
+    fn check_action(&self, action: &PlanAction) -> Result<(), ActionError> {
+        if self.action_id != action.action_id
+            || self.identity != action.target
+            || action.action != Action::Throttle
+        {
+            return Err(ActionError::IdentityMismatch);
+        }
+        Ok(())
+    }
+
+    fn verify_limit(
+        &self,
+        config: &CpuThrottleConfig,
+        mut revalidate: impl FnMut() -> Result<(), ActionError>,
+    ) -> Result<(), ActionError> {
+        revalidate()?;
+        self.scope.check_directories()?;
+        let directory = self.scope.controller().pinned_directory();
+        let observed = read_cpu_limit(&directory, self.scope.is_v2());
+        let repeated = read_cpu_limit(&directory, self.scope.is_v2());
+        revalidate()?;
+        self.scope.check_directories()?;
+        let observed = observed?;
+        if repeated? != observed {
+            return Err(ActionError::Failed(
+                "CPU limits changed during throttle verification".to_string(),
+            ));
+        }
+        if observed != self.limit {
+            return Err(ActionError::Failed(
+                "CPU bandwidth differs from the executed throttle cap".to_string(),
+            ));
+        }
+        if !quota_within_limit(observed.quota_us, observed.period_us, config)? {
+            return Err(ActionError::Failed(
+                "CPU bandwidth remains above the requested throttle cap".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Pin the selected controller and, on hybrid hosts, the unified cgroup whose
+/// isolation also authorized the action. Neither pathname may name a new group.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct ThrottleScope {
+    unified: ThrottleCgroup,
+    cpu_v1: Option<ThrottleCgroup>,
+}
+
+#[cfg(target_os = "linux")]
+impl ThrottleScope {
+    fn controller(&self) -> &ThrottleCgroup {
+        self.cpu_v1.as_ref().unwrap_or(&self.unified)
+    }
+
+    fn is_v2(&self) -> bool {
+        self.cpu_v1.is_none()
+    }
+
+    fn check_current_paths(
+        &self,
+        unified_path: &str,
+        v1_cpu_path: Option<&str>,
+    ) -> Result<(), ActionError> {
+        self.unified.check_current_path(unified_path)?;
+        match (&self.cpu_v1, v1_cpu_path) {
+            (Some(original), Some(current)) => original.check_current_path(current),
+            (None, None) => Ok(()),
+            _ => Err(ActionError::Failed(
+                "CPU controller hierarchy changed since throttle execution".to_string(),
+            )),
+        }
+    }
+
+    fn check_directories(&self) -> Result<(), ActionError> {
+        self.check_current_paths(
+            &self.unified.cgroup_path,
+            self.cpu_v1.as_ref().map(|group| group.cgroup_path.as_str()),
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct ThrottleCgroup {
+    cgroup_path: String,
+    directory: PathBuf,
+    handle: fs::File,
+}
+
+#[cfg(target_os = "linux")]
+impl ThrottleCgroup {
+    fn open(cgroup_path: String, directory: PathBuf) -> Result<Self, ActionError> {
+        let handle = fs::File::open(&directory).map_err(|error| {
+            ActionError::Failed(format!(
+                "cannot open throttle cgroup {}: {error}",
+                directory.display()
+            ))
+        })?;
+        let group = Self {
+            cgroup_path,
+            directory,
+            handle,
+        };
+        group.check_current_path(&group.cgroup_path)?;
+        Ok(group)
+    }
+
+    fn pinned_directory(&self) -> PathBuf {
+        use std::os::fd::AsRawFd;
+        PathBuf::from(format!("/proc/self/fd/{}", self.handle.as_raw_fd()))
+    }
+
+    fn check_current_path(&self, current_path: &str) -> Result<(), ActionError> {
+        use std::os::unix::fs::MetadataExt;
+        if current_path != self.cgroup_path {
+            return Err(ActionError::Failed(
+                "target cgroup changed since throttle execution".to_string(),
+            ));
+        }
+        let original = self.handle.metadata().map_err(|error| {
+            ActionError::Failed(format!("cannot inspect pinned throttle cgroup: {error}"))
+        })?;
+        let current = fs::symlink_metadata(&self.directory).map_err(|error| {
+            ActionError::Failed(format!(
+                "cannot inspect throttle cgroup {}: {error}",
+                self.directory.display()
+            ))
+        })?;
+        if !original.is_dir()
+            || !current.is_dir()
+            || original.dev() != current.dev()
+            || original.ino() != current.ino()
+        {
+            return Err(ActionError::Failed(
+                "throttle cgroup directory changed since execution".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl CpuThrottleActionRunner {
     pub fn new(config: CpuThrottleConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            #[cfg(target_os = "linux")]
+            applied: Mutex::new(None),
+        }
     }
 
     pub fn with_defaults() -> Self {
@@ -214,7 +379,7 @@ impl CpuThrottleActionRunner {
 
     /// Execute a throttle action on a process.
     #[cfg(target_os = "linux")]
-    fn execute_throttle(&self, action: &PlanAction) -> Result<(), ActionError> {
+    fn execute_throttle(&self, action: &PlanAction) -> Result<AppliedThrottle, ActionError> {
         self.config.validated_limit()?;
         let pid = action.target.pid.0;
         let checked_path = super::dispatch::ensure_cgroup_target(&action.target)?;
@@ -241,16 +406,27 @@ impl CpuThrottleActionRunner {
             .flatten();
         let v1_directory = v1_path.map(|path| PathBuf::from(format!("/sys/fs/cgroup/cpu{path}")));
         let (directory, is_v2) = select_cpu_controller(&v2_directory, v1_directory.as_deref())?;
-        self.apply_throttle_at(&directory, is_v2, || {
-            self.revalidate_membership(
-                action,
-                &checked_path,
-                if is_v2 {
-                    None
-                } else {
-                    v1_path.map(String::as_str)
-                },
-            )
+        let scope = ThrottleScope {
+            unified: ThrottleCgroup::open(checked_path, v2_directory)?,
+            cpu_v1: if is_v2 {
+                None
+            } else {
+                let path = v1_path.ok_or_else(|| {
+                    ActionError::Failed("selected v1 CPU membership is missing".to_string())
+                })?;
+                Some(ThrottleCgroup::open(path.clone(), directory)?)
+            },
+        };
+        let limit = self.apply_throttle_at(
+            &scope.controller().pinned_directory(),
+            scope.is_v2(),
+            || self.revalidate_membership(action, &scope),
+        )?;
+        Ok(AppliedThrottle {
+            action_id: action.action_id.clone(),
+            identity: action.target.clone(),
+            limit,
+            scope,
         })
     }
 
@@ -259,29 +435,29 @@ impl CpuThrottleActionRunner {
     fn revalidate_membership(
         &self,
         action: &PlanAction,
-        unified_path: &str,
-        v1_cpu_path: Option<&str>,
+        scope: &ThrottleScope,
     ) -> Result<(), ActionError> {
-        if super::dispatch::ensure_cgroup_target(&action.target)? != unified_path {
-            return Err(ActionError::Failed(
-                "refusing throttle after cgroup membership changed".to_string(),
-            ));
-        }
-        if let Some(expected) = v1_cpu_path {
+        let unified_path = super::dispatch::ensure_cgroup_target(&action.target)?;
+        scope.unified.check_current_path(&unified_path)?;
+        if let Some(expected) = &scope.cpu_v1 {
             let details = collect_cgroup_details(action.target.pid.0).ok_or_else(|| {
                 ActionError::Failed("cannot revalidate CPU controller membership".to_string())
             })?;
-            if details.v1_paths.get("cpu").map(String::as_str) != Some(expected) {
+            if details.unified_path.as_deref() != Some(unified_path.as_str()) {
                 return Err(ActionError::Failed(
-                    "refusing throttle after v1 CPU membership changed".to_string(),
+                    "refusing throttle after unified cgroup membership changed".to_string(),
                 ));
             }
+            scope.check_current_paths(
+                &unified_path,
+                details.v1_paths.get("cpu").map(String::as_str),
+            )?;
             super::dispatch::ensure_exclusive_cgroup_path(
                 action.target.pid.0,
-                Path::new(&format!("/sys/fs/cgroup/cpu{expected}")),
+                &expected.pinned_directory(),
             )?;
         }
-        Ok(())
+        scope.check_directories()
     }
 
     /// Tighten a controller without increasing a pre-existing bandwidth limit.
@@ -293,7 +469,7 @@ impl CpuThrottleActionRunner {
         directory: &Path,
         is_v2: bool,
         revalidate: impl Fn() -> Result<(), ActionError>,
-    ) -> Result<(), ActionError> {
+    ) -> Result<CpuBandwidthLimit, ActionError> {
         let maximum = self.config.validated_limit()?;
         revalidate()?;
         let current = read_cpu_limit(directory, is_v2)?;
@@ -340,54 +516,25 @@ impl CpuThrottleActionRunner {
             is_v2,
             "CPU bandwidth cap verified"
         );
-        Ok(())
+        Ok(observed)
     }
 
-    /// Verify the live CPU bandwidth is no greater than the requested maximum.
+    /// Verify the exact cap and controller retained by the successful execution.
     #[cfg(target_os = "linux")]
     fn verify_throttle(&self, action: &PlanAction) -> Result<(), ActionError> {
-        let pid = action.target.pid.0;
-        let checked_path = super::dispatch::ensure_cgroup_target(&action.target)?;
-
-        // Re-collect cgroup details to verify
-        let cgroup_details = collect_cgroup_details(pid).ok_or_else(|| {
+        let applied = self.applied.lock().map_err(|_| {
+            ActionError::Failed("throttle execution record is unavailable".to_string())
+        })?;
+        let record = applied.as_ref().ok_or_else(|| {
             ActionError::Failed(format!(
-                "failed to read cgroup for verification, pid {}",
-                pid
+                "cannot verify throttle without an executed request for {}",
+                action.action_id
             ))
         })?;
-
-        if cgroup_details.unified_path.as_deref() != Some(checked_path.as_str()) {
-            return Err(ActionError::Failed(
-                "cannot verify throttle after cgroup membership changed".to_string(),
-            ));
-        }
-        let v2_directory = PathBuf::from(format!("/sys/fs/cgroup{checked_path}"));
-        let v1_path = self
-            .config
-            .fallback_to_v1
-            .then(|| cgroup_details.v1_paths.get("cpu"))
-            .flatten();
-        let v1_directory = v1_path.map(|path| PathBuf::from(format!("/sys/fs/cgroup/cpu{path}")));
-        let (directory, is_v2) = select_cpu_controller(&v2_directory, v1_directory.as_deref())?;
-        let v1_path = if is_v2 {
-            None
-        } else {
-            v1_path.map(String::as_str)
-        };
-        self.revalidate_membership(action, &checked_path, v1_path)?;
-        let observed = read_cpu_limit(&directory, is_v2)?;
-        if !quota_within_limit(observed.quota_us, observed.period_us, &self.config)? {
-            return Err(ActionError::Failed(
-                "CPU bandwidth remains above the requested throttle cap".to_string(),
-            ));
-        }
-        if read_cpu_limit(&directory, is_v2)? != observed {
-            return Err(ActionError::Failed(
-                "CPU limits changed during throttle verification".to_string(),
-            ));
-        }
-        self.revalidate_membership(action, &checked_path, v1_path)
+        record.check_action(action)?;
+        record.verify_limit(&self.config, || {
+            self.revalidate_membership(action, &record.scope)
+        })
     }
 
     /// Capture reversal metadata before applying throttle.
@@ -521,8 +668,17 @@ impl CpuThrottleActionRunner {
 #[cfg(target_os = "linux")]
 impl ActionRunner for CpuThrottleActionRunner {
     fn execute(&self, action: &PlanAction) -> Result<(), ActionError> {
+        let mut applied = self.applied.lock().map_err(|_| {
+            ActionError::Failed("throttle execution record is unavailable".to_string())
+        })?;
+        // A failed or unrelated attempt must not leave an older success
+        // available for verification.
+        *applied = None;
         match action.action {
-            Action::Throttle => self.execute_throttle(action),
+            Action::Throttle => {
+                *applied = Some(self.execute_throttle(action)?);
+                Ok(())
+            }
             Action::Keep => Ok(()),
             Action::Pause
             | Action::Resume
@@ -541,17 +697,8 @@ impl ActionRunner for CpuThrottleActionRunner {
 
     fn verify(&self, action: &PlanAction) -> Result<(), ActionError> {
         match action.action {
-            Action::Throttle => self.verify_throttle(action),
             Action::Keep => Ok(()),
-            Action::Pause
-            | Action::Resume
-            | Action::Kill
-            | Action::Renice
-            | Action::Restart
-            | Action::Freeze
-            | Action::Unfreeze
-            | Action::Quarantine
-            | Action::Unquarantine => Ok(()),
+            _ => self.verify_throttle(action),
         }
     }
 }
@@ -819,6 +966,8 @@ mod tests {
     fn runner_can_be_created() {
         let runner = CpuThrottleActionRunner::with_defaults();
         assert_eq!(runner.config.target_fraction, DEFAULT_THROTTLE_FRACTION);
+        #[cfg(target_os = "linux")]
+        assert!(runner.applied.lock().unwrap().is_none());
     }
 
     #[cfg(target_os = "linux")]
@@ -827,25 +976,391 @@ mod tests {
 
         fn controller_fixture(is_v2: bool, quota: &str, period: &str) -> tempfile::TempDir {
             let fixture = tempfile::tempdir().unwrap();
-            if is_v2 {
-                fs::write(
-                    fixture.path().join("cpu.max"),
-                    format!("{quota} {period}\n"),
-                )
-                .unwrap();
-            } else {
-                fs::write(
-                    fixture.path().join("cpu.cfs_quota_us"),
-                    format!("{quota}\n"),
-                )
-                .unwrap();
-                fs::write(
-                    fixture.path().join("cpu.cfs_period_us"),
-                    format!("{period}\n"),
-                )
-                .unwrap();
-            }
+            write_controller_files(fixture.path(), is_v2, quota, period);
             fixture
+        }
+
+        fn write_controller_files(directory: &Path, is_v2: bool, quota: &str, period: &str) {
+            if is_v2 {
+                fs::write(directory.join("cpu.max"), format!("{quota} {period}\n")).unwrap();
+            } else {
+                fs::write(directory.join("cpu.cfs_quota_us"), format!("{quota}\n")).unwrap();
+                fs::write(directory.join("cpu.cfs_period_us"), format!("{period}\n")).unwrap();
+            }
+        }
+
+        fn throttle_action() -> PlanAction {
+            PlanAction {
+                action_id: "test-throttle-request".to_string(),
+                target: pt_common::ProcessIdentity::new(
+                    123,
+                    pt_common::StartId("test-boot:456:123".to_string()),
+                    1000,
+                ),
+                action: Action::Throttle,
+                order: 0,
+                stage: 0,
+                timeouts: Default::default(),
+                pre_checks: vec![],
+                rationale: crate::plan::ActionRationale {
+                    expected_loss: None,
+                    expected_recovery: None,
+                    expected_recovery_stddev: None,
+                    posterior_odds_abandoned_vs_useful: None,
+                    sprt_boundary: None,
+                    posterior: None,
+                    memory_mb: None,
+                    has_known_signature: None,
+                    category: None,
+                },
+                on_success: vec![],
+                on_failure: vec![],
+                blocked: false,
+                routing: Default::default(),
+                confidence: Default::default(),
+                original_zombie_target: None,
+                d_state_diagnostics: None,
+            }
+        }
+
+        fn throttle_scope_fixture(
+            directory: &Path,
+            is_v2: bool,
+            quota: &str,
+            period: &str,
+        ) -> ThrottleScope {
+            let unified_directory = directory.join("unified");
+            fs::create_dir(&unified_directory).unwrap();
+            let cpu_v1 = if is_v2 {
+                write_controller_files(&unified_directory, true, quota, period);
+                None
+            } else {
+                let cpu_directory = directory.join("cpu-v1");
+                fs::create_dir(&cpu_directory).unwrap();
+                write_controller_files(&cpu_directory, false, quota, period);
+                Some(ThrottleCgroup::open("/executed-cpu".to_string(), cpu_directory).unwrap())
+            };
+            ThrottleScope {
+                unified: ThrottleCgroup::open("/executed".to_string(), unified_directory).unwrap(),
+                cpu_v1,
+            }
+        }
+
+        fn applied_throttle_fixture(
+            directory: &Path,
+            is_v2: bool,
+            quota: &str,
+            period: &str,
+        ) -> AppliedThrottle {
+            let scope = throttle_scope_fixture(directory, is_v2, quota, period);
+            let runner = CpuThrottleActionRunner::with_defaults();
+            let limit = runner
+                .apply_throttle_at(&scope.controller().pinned_directory(), is_v2, || {
+                    scope.check_directories()
+                })
+                .unwrap();
+            let action = throttle_action();
+            AppliedThrottle {
+                action_id: action.action_id,
+                identity: action.target,
+                limit,
+                scope,
+            }
+        }
+
+        #[test]
+        fn throttle_verification_requires_an_executed_request() {
+            let runner = CpuThrottleActionRunner::with_defaults();
+            let action = throttle_action();
+            assert!(runner
+                .verify(&action)
+                .unwrap_err()
+                .to_string()
+                .contains("without an executed request"));
+        }
+
+        #[test]
+        fn throttle_receipt_requires_the_entire_planned_action() {
+            let action = throttle_action();
+            let directory = tempfile::tempdir().unwrap();
+            let record = applied_throttle_fixture(directory.path(), true, "max", "100000");
+            record.check_action(&action).unwrap();
+            for field in [
+                "action_id",
+                "action_kind",
+                "birth",
+                "pid",
+                "uid",
+                "pgid",
+                "sid",
+                "quality",
+            ] {
+                let mut changed = action.clone();
+                match field {
+                    "action_id" => changed.action_id.push_str("-different"),
+                    "action_kind" => changed.action = Action::Freeze,
+                    "birth" => changed.target.start_id.0.push_str("-different"),
+                    "pid" => changed.target.pid.0 += 1,
+                    "uid" => changed.target.uid += 1,
+                    "pgid" => changed.target.pgid = Some(234),
+                    "sid" => changed.target.sid = Some(345),
+                    "quality" => changed.target.quality = pt_common::IdentityQuality::PidOnly,
+                    _ => unreachable!(),
+                }
+                assert!(
+                    matches!(
+                        record.check_action(&changed),
+                        Err(ActionError::IdentityMismatch)
+                    ),
+                    "accepted mismatched {field}"
+                );
+            }
+        }
+
+        #[test]
+        fn failed_throttle_execution_clears_the_previous_receipt() {
+            for failure in [
+                "protected_target",
+                "invalid_configuration",
+                "unsupported_action",
+            ] {
+                let mut runner = CpuThrottleActionRunner::with_defaults();
+                let original = throttle_action();
+                let directory = tempfile::tempdir().unwrap();
+                *runner.applied.lock().unwrap() = Some(applied_throttle_fixture(
+                    directory.path(),
+                    true,
+                    "max",
+                    "100000",
+                ));
+                let mut action = original.clone();
+                match failure {
+                    // These attempts fail before any cgroup write.
+                    "protected_target" => action.target.pid.0 = 1,
+                    "invalid_configuration" => runner.config.target_fraction = f64::NAN,
+                    "unsupported_action" => action.action = Action::Renice,
+                    _ => unreachable!(),
+                }
+                assert!(runner.execute(&action).is_err(), "accepted {failure}");
+                assert!(runner.applied.lock().unwrap().is_none());
+                assert!(runner
+                    .verify(&original)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("without an executed request"));
+            }
+        }
+
+        #[test]
+        fn throttle_receipt_verifies_the_selected_limit_in_both_hierarchies() {
+            for is_v2 in [true, false] {
+                for (quota, period) in [
+                    (if is_v2 { "max" } else { "-1" }, "100000"),
+                    ("10000", "100000"),
+                    ("20000", "200000"),
+                    ("50000", "200000"),
+                ] {
+                    let directory = tempfile::tempdir().unwrap();
+                    let record = applied_throttle_fixture(directory.path(), is_v2, quota, period);
+                    record
+                        .verify_limit(&CpuThrottleConfig::default(), || {
+                            record.scope.check_current_paths(
+                                "/executed",
+                                (!is_v2).then_some("/executed-cpu"),
+                            )
+                        })
+                        .unwrap();
+                    if quota == "max" || quota == "-1" {
+                        assert_eq!(
+                            record.limit,
+                            CpuBandwidthLimit::new(25_000, 100_000).unwrap()
+                        );
+                    } else {
+                        // A stricter or equivalent pre-existing cap is the
+                        // exact selected value, not the configured default.
+                        assert_eq!(record.limit, parse_cpu_limit(quota, period, is_v2).unwrap());
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn throttle_receipt_rejects_a_changed_limit_even_when_it_meets_the_cap() {
+            for is_v2 in [true, false] {
+                for (quota, period) in [("10000", "100000"), ("50000", "200000")] {
+                    let directory = tempfile::tempdir().unwrap();
+                    let record =
+                        applied_throttle_fixture(directory.path(), is_v2, "25000", "100000");
+                    write_controller_files(
+                        &record.scope.controller().directory,
+                        is_v2,
+                        quota,
+                        period,
+                    );
+                    assert!(matches!(
+                        record.verify_limit(&CpuThrottleConfig::default(), || Ok(())),
+                        Err(ActionError::Failed(reason)) if reason.contains("differs from the executed")
+                    ));
+                }
+            }
+        }
+
+        #[test]
+        fn throttle_scope_rejects_migration_before_or_during_verification() {
+            for is_v2 in [true, false] {
+                for change_unified in [true, false] {
+                    if is_v2 && !change_unified {
+                        continue;
+                    }
+                    for before_verification in [true, false] {
+                        let directory = tempfile::tempdir().unwrap();
+                        let record =
+                            applied_throttle_fixture(directory.path(), is_v2, "25000", "100000");
+                        let mut observations = 0;
+                        let result = record.verify_limit(&CpuThrottleConfig::default(), || {
+                            observations += 1;
+                            let moved = before_verification || observations == 2;
+                            record.scope.check_current_paths(
+                                if moved && change_unified {
+                                    "/moved"
+                                } else {
+                                    "/executed"
+                                },
+                                (!is_v2).then_some(if moved && !change_unified {
+                                    "/moved-cpu"
+                                } else {
+                                    "/executed-cpu"
+                                }),
+                            )
+                        });
+                        assert!(matches!(
+                            result,
+                            Err(ActionError::Failed(reason)) if reason.contains("target cgroup changed")
+                        ));
+                        assert_eq!(observations, if before_verification { 1 } else { 2 });
+                    }
+                }
+                for failure_check in [1, 2] {
+                    let directory = tempfile::tempdir().unwrap();
+                    let record =
+                        applied_throttle_fixture(directory.path(), is_v2, "25000", "100000");
+                    let mut observations = 0;
+                    let result = record.verify_limit(&CpuThrottleConfig::default(), || {
+                        observations += 1;
+                        if observations == failure_check {
+                            Err(ActionError::IdentityMismatch)
+                        } else {
+                            Ok(())
+                        }
+                    });
+                    assert!(matches!(result, Err(ActionError::IdentityMismatch)));
+                }
+            }
+        }
+
+        #[test]
+        fn throttle_scope_rejects_replaced_controller_and_unified_directories() {
+            for (is_v2, replace_unified) in [(true, true), (false, false), (false, true)] {
+                for before_verification in [true, false] {
+                    let directory = tempfile::tempdir().unwrap();
+                    let record =
+                        applied_throttle_fixture(directory.path(), is_v2, "25000", "100000");
+                    let group = if replace_unified {
+                        &record.scope.unified
+                    } else {
+                        record.scope.controller()
+                    };
+                    let previous = group.directory.with_extension("previous");
+                    let replace = || {
+                        fs::rename(&group.directory, &previous).unwrap();
+                        fs::create_dir(&group.directory).unwrap();
+                        // A matching cap on the replacement cannot establish
+                        // continuity with the group used during execution.
+                        write_controller_files(&group.directory, is_v2, "25000", "100000");
+                    };
+                    if before_verification {
+                        replace();
+                    }
+                    let mut observations = 0;
+                    let result = record.verify_limit(&CpuThrottleConfig::default(), || {
+                        observations += 1;
+                        if !before_verification && observations == 2 {
+                            replace();
+                        }
+                        Ok(())
+                    });
+                    assert!(matches!(
+                        result,
+                        Err(ActionError::Failed(reason)) if reason.contains("directory changed")
+                    ));
+                }
+            }
+        }
+
+        #[test]
+        fn throttle_write_stays_on_the_pinned_controller_during_path_replacement() {
+            for is_v2 in [true, false] {
+                let directory = tempfile::tempdir().unwrap();
+                let unlimited = if is_v2 { "max" } else { "-1" };
+                let scope = throttle_scope_fixture(directory.path(), is_v2, unlimited, "100000");
+                let controller = scope.controller();
+                let previous = controller.directory.with_extension("previous");
+                let observations = std::cell::Cell::new(0);
+                let runner = CpuThrottleActionRunner::with_defaults();
+                let result =
+                    runner.apply_throttle_at(&controller.pinned_directory(), is_v2, || {
+                        scope.check_directories()?;
+                        observations.set(observations.get() + 1);
+                        if observations.get() == 2 {
+                            // Replacement after the final pre-write guard must not
+                            // redirect the ensuing write into the new directory.
+                            fs::rename(&controller.directory, &previous).unwrap();
+                            fs::create_dir(&controller.directory).unwrap();
+                            write_controller_files(
+                                &controller.directory,
+                                is_v2,
+                                unlimited,
+                                "100000",
+                            );
+                        }
+                        Ok(())
+                    });
+                assert!(matches!(
+                    result,
+                    Err(ActionError::Failed(reason)) if reason.contains("directory changed")
+                ));
+                assert_eq!(read_cpu_limit(&previous, is_v2).unwrap().quota_us, 25_000);
+                assert_eq!(
+                    read_cpu_limit(&controller.directory, is_v2)
+                        .unwrap()
+                        .quota_us,
+                    -1
+                );
+            }
+        }
+
+        #[test]
+        fn throttle_v1_verification_never_switches_to_a_new_v2_controller() {
+            let directory = tempfile::tempdir().unwrap();
+            let record = applied_throttle_fixture(directory.path(), false, "-1", "100000");
+            write_controller_files(&record.scope.unified.directory, true, "10000", "100000");
+            record
+                .verify_limit(&CpuThrottleConfig::default(), || {
+                    record
+                        .scope
+                        .check_current_paths("/executed", Some("/executed-cpu"))
+                })
+                .unwrap();
+            write_controller_files(
+                &record.scope.controller().directory,
+                false,
+                "50000",
+                "100000",
+            );
+            assert!(matches!(
+                record.verify_limit(&CpuThrottleConfig::default(), || Ok(())),
+                Err(ActionError::Failed(reason)) if reason.contains("differs from the executed")
+            ));
         }
 
         #[test]
