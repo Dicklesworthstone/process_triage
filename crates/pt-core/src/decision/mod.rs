@@ -34,6 +34,7 @@ pub mod pressure_regime;
 pub mod provenance_explanation;
 pub mod provenance_scoring;
 pub mod rate_limit;
+pub mod relief;
 pub mod respawn_loop;
 pub mod robot_constraints;
 pub mod sequential;

@@ -887,7 +887,7 @@ The daemon polls every 60 seconds by default, increasing to 30 seconds under a m
 | Memory utilization | > 85% used | 3 consecutive ticks |
 | Graded memory / PSI pressure | ≥ 80% used or memory PSI ≥ 20%; emergency at ≥ 95% used or PSI ≥ 60% | 2 consecutive observed readings |
 
-When a trigger fires, the daemon requests the normal pressure-conditioned `agent plan` and posts the result to the inbox (`pt-core agent inbox`) and as a desktop notification. Simultaneous pressure diagnoses share one planning request. Every request still respects the global action lock and the escalation cooldown (300 seconds by default). Deferred or failed pressure requests remain pending; a pressure episode is acknowledged only after its review request is stored and readable. It never acts on its own.
+When a trigger fires, the daemon requests the normal pressure-conditioned `agent plan` and posts the result to the inbox (`pt-core agent inbox`) and as a desktop notification. Pressure, sustained-load, and graded-memory triggers request `--goal relieve` in both quick and deep planning, limiting executable suggestions to the next eligible remediation tier. An orphan-only trigger retains ordinary triage planning. Simultaneous pressure diagnoses share one planning request. Every request still respects the global action lock and the escalation cooldown (300 seconds by default). Deferred or failed pressure requests remain pending; a pressure episode is acknowledged only after its review request is stored and readable. It never acts on its own.
 
 Pressure diagnoses retain their kind and severity in the inbox, including when no safe action candidates exist. A delivered warning can escalate to critical once; a deferred critical upgrade is sent only while fresh evidence still supports it. Three consecutive observed recovery readings end an episode. Missing sensors and daemon restarts interrupt confirmation and recovery streaks without declaring recovery. OOM counter increments remain known incidents until delivery, even if the next sensor read fails. Counter resets never become new OOM incidents or evidence of swap recovery.
 
@@ -1066,6 +1066,24 @@ Many incidents come from host configuration, not from any one process. `pt docto
 Exit code: 0 when nothing needs attention, 1 when there is a warning or critical finding (the severity is in `worst`). Not yet covered: multiplexer hygiene, a policy section for thresholds, macOS.
 
 ---
+
+## Pressure Relief Goals
+
+Use a pressure goal to select the next available remediation tier from the final executable recommendations:
+
+```bash
+pt agent plan --goal relieve --format json
+pt agent plan --goal cpu-pressure --format json
+pt agent plan --goal mem-pressure --format json
+pt agent plan --goal io-pressure --format json
+pt run --goal relieve
+```
+
+These goals require `load_aware.enabled: true` in the policy (already enabled by the `server` and `paranoid` presets) and positive, observed process attribution from the pressure model. Existing candidate filters still apply. To also review pressure remedies for useful processes that fall below the usual intervention-probability filter, explicitly add `--min-posterior 0` to `agent plan`; this changes candidate coverage while preserving action policy, protection, identity, and execution gates.
+
+The selector chooses one tier per plan: **renice/throttle**, then **pause/freeze**, then **termination already justified by evidence-only inference**. Within a tier it ranks modeled relief relative to expected loss. Later tiers remain visible as alternatives and require a fresh plan. The saved plan retains the exact original action IDs, full process identities, staged prerequisites, and child-before-parent execution order. Tree safety is checked again after narrowing the selection. Missing observations, final policy refusals, unavailable routes, or absent resource-specific relief produce no executable fallback actions.
+
+`goal_summary` identifies the selected tier and PIDs, modeled relief in `heuristic_loss_units`, exclusions, and alternatives. It is included in brief and minimal JSON/TOON output; text and TUI output also show the relief summary. `achievable` and `goal_achievable` are `null`: this model does not establish a physical PSI or resource-recovery target. Reversible remedies currently receive CPU relief credit only, and unknown I/O attribution cannot support an I/O remedy. Measure the result with the normal verification workflow, then generate a new plan before proceeding to another tier. Pressure goals cannot be combined with numeric resource goals in one expression.
 
 ## Goal-Based Kill Set Selection
 

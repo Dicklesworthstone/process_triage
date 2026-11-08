@@ -3,11 +3,15 @@
 //! Parses human-readable goal strings like "free 4GB RAM" or "release port 3000"
 //! into structured goal ASTs for the goal-oriented optimizer.
 
+use super::relief::ReliefGoal;
 use serde::{Deserialize, Serialize};
 
 /// A parsed resource goal.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Goal {
+    /// Choose the least disruptive available tier of pressure remedies.
+    /// This is an observed-pressure request, not a quantitative resource target.
+    Relieve(ReliefGoal),
     /// A single resource target.
     Target(ResourceTarget),
     /// Conjunction: all sub-goals must be met.
@@ -20,6 +24,7 @@ impl Goal {
     /// Canonical string representation for telemetry/caching.
     pub fn canonical(&self) -> String {
         match self {
+            Goal::Relieve(scope) => scope.canonical().to_string(),
             Goal::Target(t) => t.canonical(),
             Goal::And(goals) => {
                 let parts: Vec<String> = goals.iter().map(|g| g.canonical()).collect();
@@ -109,7 +114,7 @@ impl std::fmt::Display for GoalParseError {
         match self {
             Self::EmptyInput => write!(f, "Empty goal string"),
             Self::UnrecognizedFormat(s) => {
-                write!(f, "Unrecognized goal format: \"{}\". Try: \"free 4GB RAM\", \"reduce CPU below 50%\", \"release port 3000\", \"free 100 FDs\"", s)
+                write!(f, "Unrecognized goal format: \"{}\". Try: \"relieve\", \"cpu-pressure\", \"mem-pressure\", \"io-pressure\", \"free 4GB RAM\", \"reduce CPU below 50%\", \"release port 3000\", \"free 100 FDs\"", s)
             }
             Self::InvalidUnit(u) => write!(f, "Invalid unit: \"{}\". Use: B, KB, MB, GB, TB", u),
             Self::InvalidNumber(n) => write!(f, "Invalid number: \"{}\"", n),
@@ -122,6 +127,7 @@ impl std::fmt::Display for GoalParseError {
 /// Parse a goal string into a structured Goal.
 ///
 /// Supported formats:
+/// - "relieve", "cpu-pressure", "mem-pressure", "io-pressure"
 /// - "free 4GB RAM"
 /// - "free 500MB memory"
 /// - "reduce CPU below 50%"
@@ -136,6 +142,17 @@ pub fn parse_goal(input: &str) -> Result<Goal, GoalParseError> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err(GoalParseError::EmptyInput);
+    }
+
+    let relief = match trimmed.to_ascii_lowercase().as_str() {
+        "relieve" => Some(ReliefGoal::All),
+        "cpu-pressure" => Some(ReliefGoal::Cpu),
+        "mem-pressure" => Some(ReliefGoal::Memory),
+        "io-pressure" => Some(ReliefGoal::Io),
+        _ => None,
+    };
+    if let Some(scope) = relief {
+        return Ok(Goal::Relieve(scope));
     }
 
     // Check for composition.
@@ -328,6 +345,33 @@ fn parse_memory_amount(s: &str) -> Result<f64, GoalParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pressure_goals_round_trip_without_implying_resource_targets() {
+        for (input, scope) in [
+            ("relieve", ReliefGoal::All),
+            ("cpu-pressure", ReliefGoal::Cpu),
+            ("mem-pressure", ReliefGoal::Memory),
+            ("io-pressure", ReliefGoal::Io),
+        ] {
+            let goal = Goal::Relieve(scope);
+            assert_eq!(
+                parse_goal(&format!("  {}  ", input.to_ascii_uppercase())),
+                Ok(goal.clone())
+            );
+            assert_eq!(parse_goal(&goal.canonical()), Ok(goal.clone()));
+            let encoded = serde_json::to_string(&goal).unwrap();
+            assert_eq!(serde_json::from_str::<Goal>(&encoded).unwrap(), goal);
+        }
+        for input in [
+            "relieve AND free 4GB RAM",
+            "cpu-pressure OR free 10% CPU",
+            "relieve extra",
+            "io-pressure 10%",
+        ] {
+            assert!(parse_goal(input).is_err(), "{input}");
+        }
+    }
 
     #[test]
     fn test_free_memory() {

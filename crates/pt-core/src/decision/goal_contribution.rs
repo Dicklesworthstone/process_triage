@@ -129,6 +129,9 @@ fn requested_resources(
     ports: &mut BTreeMap<u16, PortGoalResources>,
 ) {
     match goal {
+        // Relief consumes the already-collected pressure decomposition. It
+        // must not invent a memory/FD target or trigger unrelated deep probes.
+        Goal::Relieve(_) => {}
         Goal::Target(target) => match target.metric {
             Metric::FileDescriptors => *need_fds = true,
             Metric::Memory => *need_memory = true,

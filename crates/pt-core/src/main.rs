@@ -434,7 +434,10 @@ struct RunArgs {
     min_age: Option<u64>,
 
     /// Resource recovery goal for goal-oriented optimization
-    #[arg(long, help = "Resource recovery goal, e.g. 'free 4GB RAM'")]
+    #[arg(
+        long,
+        help = "Resource goal (e.g. 'free 4GB RAM') or pressure relief: relieve, cpu-pressure, mem-pressure, io-pressure"
+    )]
     goal: Option<String>,
 
     /// TUI color theme (overrides environment detection)
@@ -1160,7 +1163,10 @@ struct AgentPlanArgs {
     since_time: Option<String>,
 
     /// Resource recovery goal for goal-oriented optimization
-    #[arg(long, help = "Resource recovery goal, e.g. 'free 4GB RAM'")]
+    #[arg(
+        long,
+        help = "Resource goal (e.g. 'free 4GB RAM') or pressure relief: relieve, cpu-pressure, mem-pressure, io-pressure"
+    )]
     goal: Option<String>,
 
     /// Minimal JSON output (PIDs, scores, and recommendations only)
@@ -1231,6 +1237,7 @@ use pt_core::decision::{
         optimize_greedy, optimize_ilp, OptCandidate, OptimizationResult, ResourceGoal,
     },
     goal_parser::{parse_goal, Comparator, Goal, Metric, ResourceTarget},
+    relief::{select_relief_plan, ReliefGoal, ReliefPlan},
     ConstraintChecker, RobotCandidate, RuntimeRobotConstraints,
 };
 use pt_core::plan::{Plan, PlanAction};
@@ -4687,6 +4694,21 @@ fn finalize_tui_goal_selection(
 
 #[cfg(feature = "ui")]
 fn tui_goal_summary(goal_str: &str, output: &GoalPlanOutput) -> Vec<String> {
+    if let Some(relief) = &output.relief {
+        return vec![
+            format!("Goal: {goal_str}"),
+            format!(
+                "{} remedies in the next available tier",
+                relief.selected_pids.len()
+            ),
+            format!(
+                "Modeled relief: {:.3} heuristic loss units",
+                relief.total_modeled_relief
+            ),
+            "Pressure recovery is unknown until measured after applying the plan".to_string(),
+            "Later tiers require a fresh plan; no automatic escalation".to_string(),
+        ];
+    }
     let mut lines = vec![
         format!("Goal: {goal_str}"),
         format!(
@@ -4971,6 +4993,7 @@ fn build_tui_rows(
                 "pid": proc.pid.0,
                 "start_id": proc.start_id,
                 "uid": proc.uid,
+                "state": proc.state.to_string(),
                 "recommended_action": recommendation,
                 "action_rationale": rationale,
                 "supervisor_restart": scorer.supervisor_restart_for(proc),
@@ -5363,6 +5386,9 @@ struct GoalPlanOutput {
     strategy: String,
     warnings: Vec<String>,
     resource_observations: serde_json::Value,
+    /// Pressure relief has no physical attainment target. Its report replaces
+    /// the quantitative optimizer summary rather than claiming an achievement.
+    relief: Option<ReliefPlan>,
 }
 
 fn resource_goal_from_target(
@@ -5463,6 +5489,12 @@ fn build_resource_goals(
     let mut warnings = Vec::new();
     let mut goals = Vec::new();
     match goal {
+        Goal::Relieve(_) => {
+            return Err(format!(
+                "pressure relief requires an executable plan; use agent plan --goal {} or run --goal {}",
+                goal.canonical(), goal.canonical()
+            ));
+        }
         Goal::Target(t) => {
             let (g, mut w) = resource_goal_from_target(t, current_cpu_pct, resources)?;
             warnings.append(&mut w);
@@ -5634,6 +5666,7 @@ fn attach_goal_resource_observations(
 
 fn goal_requests_metric(goal: &Goal, metric: Metric) -> bool {
     match goal {
+        Goal::Relieve(_) => false,
         Goal::Target(target) => target.metric == metric,
         Goal::And(parts) | Goal::Or(parts) => {
             parts.iter().any(|part| goal_requests_metric(part, metric))
@@ -5924,6 +5957,7 @@ fn build_goal_plan_from_candidates(
                 strategy: "or_best".to_string(),
                 warnings,
                 resource_observations,
+                relief: None,
             });
         }
         _ => build_resource_goals(goal, current_cpu_pct, resources)?,
@@ -5950,10 +5984,19 @@ fn build_goal_plan_from_candidates(
         strategy: "and".to_string(),
         warnings,
         resource_observations,
+        relief: None,
     })
 }
 
 fn goal_summary_json(goal_str: &str, goal: &Goal, output: &GoalPlanOutput) -> serde_json::Value {
+    if let Some(relief) = &output.relief {
+        let mut summary = serde_json::to_value(relief).expect("finite relief plan");
+        summary["goal"] = serde_json::json!(goal_str);
+        summary["parsed"] = serde_json::json!(goal.canonical());
+        summary["achievable"] = serde_json::Value::Null;
+        summary["execution_scope"] = serde_json::json!("selected_pressure_remedies");
+        return summary;
+    }
     let targets: Vec<serde_json::Value> = output
         .goals
         .iter()
@@ -5994,6 +6037,21 @@ fn goal_summary_json(goal_str: &str, goal: &Goal, output: &GoalPlanOutput) -> se
         "warnings": output.warnings,
         "resource_observations": output.resource_observations,
     })
+}
+
+fn pressure_goal_summary_text(summary: &serde_json::Value) -> Option<String> {
+    let tier = summary.get("selected_tier")?;
+    let goal = summary["parsed"].as_str().unwrap_or("relieve");
+    let Some(tier) = tier.as_str() else {
+        return Some(format!(
+            "Pressure relief ({goal}): no eligible remedies in the saved plan; pressure recovery is unverified."
+        ));
+    };
+    let count = summary["selected_pids"].as_array().map_or(0, Vec::len);
+    let modeled = summary["total_modeled_relief"].as_f64().unwrap_or(0.0);
+    Some(format!(
+        "Pressure relief ({goal}): {count} processes in the {tier} tier, {modeled:.3} heuristic loss units of modeled relief. Pressure recovery is unverified; later tiers require a new plan."
+    ))
 }
 
 /// Recompute the forecast after all budgets, routing and output filters.
@@ -6135,6 +6193,147 @@ fn constrain_plan_to_goal_selection(
     }
 }
 
+/// Bind pressure selection to the exact executable action IDs. Independent
+/// advice and later tiers stay visible, but apply can execute only this tier.
+fn relief_candidate_target(candidate: &serde_json::Value) -> Option<ProcessIdentity> {
+    let target: ProcessIdentity =
+        serde_json::from_value(candidate["action_target"].clone()).ok()?;
+    let source = goal_candidate_identity(candidate)?;
+    source.matches(&target).then_some(target)
+}
+
+fn constrain_plan_to_relief_selection(
+    plan: &mut Plan,
+    candidates: &mut [serde_json::Value],
+    relief: &ReliefPlan,
+) {
+    let ranks: HashMap<&str, usize> = relief
+        .selected_action_ids
+        .iter()
+        .enumerate()
+        .map(|(rank, id)| (id.as_str(), rank))
+        .collect();
+    let targets: HashSet<_> = relief.selected_targets.iter().collect();
+    plan.actions.retain(|action| {
+        !action.blocked
+            && ranks.contains_key(action.action_id.as_str())
+            && targets.contains(&action.target)
+    });
+    // Preserve the canonical planner's child-before-parent and staged ordering.
+    // Relief priority ranks describe alternatives, not a new execution order.
+    for (order, action) in plan.actions.iter_mut().enumerate() {
+        action.order = order as u32;
+    }
+    let retained_ids: HashSet<_> = plan
+        .actions
+        .iter()
+        .map(|action| action.action_id.as_str())
+        .collect();
+    plan.pre_toggled
+        .retain(|id| retained_ids.contains(id.as_str()));
+    plan.gates_summary.pre_toggled_actions = plan.pre_toggled.len();
+
+    for candidate in candidates {
+        let identity = relief_candidate_target(candidate);
+        let rank = identity.as_ref().and_then(|identity| {
+            relief
+                .selected_targets
+                .iter()
+                .position(|target| target == identity)
+        });
+        candidate["goal_selected"] = serde_json::json!(rank.is_some());
+        candidate["plan_action_ids"] = serde_json::json!(plan
+            .actions
+            .iter()
+            .filter(|action| identity.as_ref() == Some(&action.target))
+            .map(|action| &action.action_id)
+            .collect::<Vec<_>>());
+        if let Some(fields) = candidate.as_object_mut() {
+            fields.remove("goal_rank");
+            if let Some(rank) = rank {
+                fields.insert("goal_rank".to_string(), serde_json::json!(rank));
+                fields.remove("goal_exclusion_reason");
+            } else {
+                fields.remove("action_target");
+                fields.insert(
+                    "goal_exclusion_reason".to_string(),
+                    serde_json::json!("not_selected_for_current_relief_tier"),
+                );
+            }
+        }
+    }
+}
+
+/// A subset of otherwise safe kills may leave a live child behind. Repeat the
+/// same tree checks after tier selection, without promoting any recommendation.
+/// Removing an identity bounds the retries by the original candidate count.
+fn finalize_relief_action_plan(
+    scope: ReliefGoal,
+    candidates: &mut [serde_json::Value],
+    plan: &mut Plan,
+    population: &[ProcessRecord],
+    builtin_protection: bool,
+) -> GoalPlanOutput {
+    loop {
+        let relief = select_relief_plan(scope, candidates, plan, None);
+        let selected: HashSet<_> = relief.selected_targets.iter().collect();
+        let mut selected_candidates: Vec<_> = candidates
+            .iter()
+            .filter(|candidate| {
+                relief_candidate_target(candidate)
+                    .as_ref()
+                    .is_some_and(|identity| selected.contains(identity))
+            })
+            .cloned()
+            .collect();
+        let mut selected_refs: Vec<_> = selected_candidates.iter_mut().collect();
+        apply_process_tree_safety(&mut selected_refs, population, builtin_protection);
+        let refused: HashMap<_, _> = selected_candidates
+            .into_iter()
+            .filter(|candidate| candidate["recommended_action"].as_str() == Some("review"))
+            .filter_map(|candidate| Some((relief_candidate_target(&candidate)?, candidate)))
+            .collect();
+        if !refused.is_empty() {
+            plan.actions
+                .retain(|action| !refused.contains_key(&action.target));
+            plan.gates_summary.blocked_candidates += refused.len();
+            for candidate in candidates.iter_mut() {
+                if let Some(refusal) =
+                    relief_candidate_target(candidate).and_then(|identity| refused.get(&identity))
+                {
+                    *candidate = refusal.clone();
+                }
+            }
+            continue;
+        }
+        constrain_plan_to_relief_selection(plan, candidates, &relief);
+        return GoalPlanOutput {
+            goals: Vec::new(),
+            // There is no numerical resource target in this mode. Consumers
+            // render `relief` instead of these quantitative optimizer fields.
+            result: OptimizationResult {
+                selected: Vec::new(),
+                total_loss: relief
+                    .remediation_ladder
+                    .iter()
+                    .map(|step| step.expected_loss)
+                    .sum(),
+                total_contributions: Vec::new(),
+                goal_achievement: Vec::new(),
+                feasible: false,
+                algorithm: "pressure_relief_tiers".to_string(),
+                alternatives: Vec::new(),
+                log_events: Vec::new(),
+            },
+            selected_pids: relief.selected_pids.clone(),
+            strategy: "next_relief_tier".to_string(),
+            warnings: Vec::new(),
+            resource_observations: serde_json::Value::Null,
+            relief: Some(relief),
+        };
+    }
+}
+
 /// Selecting fewer kills can invalidate a parent's earlier live-child gate.
 /// Recheck that exact selection and exclude refused parents before optimizing
 /// again. Each retry removes an eligible identity, so this terminates even when
@@ -6152,6 +6351,15 @@ fn finalize_goal_action_plan(
         constrain_plan_to_goal_selection(plan, candidates, &[]);
         return Err("a valid resource goal is required before selecting actions".to_string());
     };
+    if let Goal::Relieve(scope) = goal {
+        return Ok(finalize_relief_action_plan(
+            *scope,
+            candidates,
+            plan,
+            population,
+            builtin_protection,
+        ));
+    }
     loop {
         let output = match build_goal_plan_from_executable_actions(
             &goal.canonical(),
@@ -6278,6 +6486,209 @@ mod executable_goal_tests {
             actions,
         };
         (candidates, plan)
+    }
+
+    fn relief_fixture(rows: &[(u32, Action, [f64; 3])]) -> (Vec<serde_json::Value>, Plan) {
+        let numeric_rows: Vec<_> = rows.iter().map(|(pid, _, _)| (*pid, 1, 0.0)).collect();
+        let (mut candidates, mut plan) = fixture(&numeric_rows);
+        for ((candidate, entry), (_, action, costs)) in
+            candidates.iter_mut().zip(&mut plan.actions).zip(rows)
+        {
+            entry.action = *action;
+            entry.action_id = format!("{}-{action:?}", entry.target.pid.0);
+            entry.target.pgid = Some(50);
+            entry.target.sid = Some(40);
+            candidate["action_target"] = serde_json::json!(&entry.target);
+            candidate["state"] = serde_json::json!("S");
+            candidate["recommended_action"] = serde_json::json!(action);
+            let total: f64 = costs.iter().sum();
+            candidate["pressure_decision"] = serde_json::json!({
+                "enabled": true, "applied": true, "status": "applied", "scope": "process",
+                "chosen_action": action, "evidence_only_action": action,
+                "severity": {"cpu": 0.5, "memory": 0.5, "io": 0.5},
+                "shares": {"cpu": 0.25, "memory": 0.25, "io": 0.25},
+                "modeled_pressure_relief": total,
+                "actions": [
+                    {"action": "keep", "pressure_cost": total,
+                     "pressure_by_resource": {"cpu": costs[0], "memory": costs[1], "io": costs[2]}},
+                    {"action": action, "pressure_cost": 0.0, "adjusted_loss": 1.0, "eligible": true,
+                     "pressure_by_resource": {"cpu": 0.0, "memory": 0.0, "io": 0.0}}
+                ]
+            });
+        }
+        plan.pre_toggled = plan
+            .actions
+            .iter()
+            .map(|entry| entry.action_id.clone())
+            .collect();
+        (candidates, plan)
+    }
+
+    fn relief_population() -> Vec<ProcessRecord> {
+        [(100, 1), (200, 100)]
+            .into_iter()
+            .map(|(pid, ppid)| ProcessRecord {
+                pid: pt_common::ProcessId(pid),
+                ppid: pt_common::ProcessId(ppid),
+                uid: 1000,
+                user: "test".to_string(),
+                pgid: Some(50),
+                sid: Some(40),
+                start_id: StartId::from_linux("goal-test", 1, pid),
+                comm: "worker".to_string(),
+                cmd: "worker".to_string(),
+                state: ProcessState::Sleeping,
+                cpu_percent: 0.0,
+                rss_bytes: 0,
+                vsz_bytes: 0,
+                tty: None,
+                start_time_unix: 0,
+                elapsed: Duration::from_secs(7200),
+                source: "fixture".to_string(),
+                container_info: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pressure_goal_saves_only_the_next_reversible_tier() {
+        let (mut candidates, mut plan) = relief_fixture(&[
+            (100, Action::Kill, [9.0, 0.0, 0.0]),
+            (200, Action::Renice, [1.0, 0.0, 0.0]),
+            (300, Action::Pause, [2.0, 0.0, 0.0]),
+        ]);
+        let goal = parse_goal("relieve").unwrap();
+        let output = finalize_goal_action_plan(
+            Some(&goal),
+            f64::NAN,
+            &mut candidates,
+            &mut plan,
+            &GoalResourceSnapshot::default(),
+            &[],
+            false,
+        )
+        .unwrap();
+        let saved: Plan = serde_json::from_value(serde_json::to_value(&plan).unwrap()).unwrap();
+        assert_eq!(output.selected_pids, [200]);
+        assert_eq!(saved.actions.len(), 1);
+        assert_eq!(saved.actions[0].action, Action::Renice);
+        assert_eq!(saved.actions[0].target.pgid, Some(50));
+        assert_eq!(saved.pre_toggled, ["200-Renice"]);
+        assert_eq!(saved.gates_summary.pre_toggled_actions, 1);
+        assert_eq!(candidates[1]["goal_selected"], true);
+        assert_eq!(
+            candidates[1]["plan_action_ids"],
+            serde_json::json!(["200-Renice"])
+        );
+        for index in [0, 2] {
+            assert_eq!(candidates[index]["goal_selected"], false);
+            assert!(candidates[index].get("action_target").is_none());
+            assert_eq!(candidates[index]["plan_action_ids"], serde_json::json!([]));
+        }
+        let summary = goal_summary_json("relieve", &goal, &output);
+        assert_eq!(summary["selected_tier"], "deprioritize");
+        assert_eq!(summary["total_modeled_relief"], 1.0);
+        assert!(summary["achievable"].is_null());
+        assert!(summary["goal_achievable"].is_null());
+        assert_eq!(summary["execution_scope"], "selected_pressure_remedies");
+        let text = pressure_goal_summary_text(&summary).unwrap();
+        assert!(text.contains("1 processes in the deprioritize tier"));
+        assert!(text.contains("recovery is unverified"));
+        assert_eq!(summary["alternatives"].as_array().unwrap().len(), 2);
+        assert!(summary["alternatives"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tier| tier["requires_new_plan"] == true));
+    }
+
+    #[test]
+    fn pressure_priority_preserves_canonical_child_before_parent_execution() {
+        let (mut candidates, mut plan) = relief_fixture(&[
+            (200, Action::Kill, [1.0, 0.0, 0.0]),
+            (100, Action::Kill, [9.0, 0.0, 0.0]),
+        ]);
+        let output = finalize_relief_action_plan(
+            ReliefGoal::Cpu,
+            &mut candidates,
+            &mut plan,
+            &relief_population(),
+            true,
+        );
+        assert_eq!(
+            output.selected_pids,
+            [100, 200],
+            "priority still ranks higher relief first"
+        );
+        let saved: Plan = serde_json::from_value(serde_json::to_value(&plan).unwrap()).unwrap();
+        assert_eq!(
+            saved
+                .actions
+                .iter()
+                .map(|action| action.target.pid.0)
+                .collect::<Vec<_>>(),
+            [200, 100],
+            "executable plan retains the dependency order"
+        );
+        assert_eq!(
+            saved
+                .actions
+                .iter()
+                .map(|action| action.order)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert_eq!(saved.pre_toggled, ["200-Kill", "100-Kill"]);
+    }
+
+    #[test]
+    fn pressure_subset_rechecks_tree_safety_without_crediting_another_resource() {
+        let (mut candidates, mut plan) = relief_fixture(&[
+            (100, Action::Kill, [0.0, 4.0, 0.0]),
+            (200, Action::Kill, [3.0, 0.0, 0.0]),
+        ]);
+        let output = finalize_relief_action_plan(
+            ReliefGoal::Memory,
+            &mut candidates,
+            &mut plan,
+            &relief_population(),
+            true,
+        );
+        assert!(output.selected_pids.is_empty());
+        assert_empty_saved_goal_plan(&plan, &candidates);
+        assert_eq!(candidates[0]["recommended_action"], "review");
+        assert_eq!(candidates[0]["tree_safety"]["rule"], "live_child");
+        assert_eq!(plan.gates_summary.blocked_candidates, 1);
+        assert_eq!(
+            output.relief.unwrap().status,
+            pt_core::decision::relief::ReliefStatus::NoEligibleRemedies
+        );
+    }
+
+    #[test]
+    fn unavailable_pressure_model_leaves_no_executable_goal_actions() {
+        let (mut candidates, mut plan) = relief_fixture(&[(100, Action::Kill, [1.0, 0.0, 0.0])]);
+        candidates[0]["pressure_decision"]["applied"] = serde_json::json!(false);
+        let goal = parse_goal("cpu-pressure").unwrap();
+        let output = finalize_goal_action_plan(
+            Some(&goal),
+            90.0,
+            &mut candidates,
+            &mut plan,
+            &GoalResourceSnapshot::default(),
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_empty_saved_goal_plan(&plan, &candidates);
+        let summary = goal_summary_json("cpu-pressure", &goal, &output);
+        assert_eq!(summary["status"], "no_eligible_remedies");
+        assert_eq!(summary["total_modeled_relief"], 0.0);
+        assert!(summary["achievable"].is_null());
+        assert!(summary["selected_tier"].is_null());
+        assert!(pressure_goal_summary_text(&summary)
+            .unwrap()
+            .contains("no eligible remedies"));
     }
 
     const MIB: u64 = 1024 * 1024;
@@ -14845,10 +15256,17 @@ struct DaemonEscalationResult {
 #[cfg(feature = "daemon")]
 fn run_daemon_escalation(
     global: &GlobalOpts,
-    _triggers: &[pt_core::daemon::triggers::FiredTrigger],
+    triggers: &[pt_core::daemon::triggers::FiredTrigger],
     esc_config: &pt_core::daemon::escalation::EscalationConfig,
 ) -> Result<DaemonEscalationResult, String> {
-    let quick = run_daemon_plan(global, None, false, esc_config.max_deep_scan_targets)?;
+    let pressure_relief = daemon_requests_pressure_relief(triggers);
+    let quick = run_daemon_plan(
+        global,
+        None,
+        false,
+        esc_config.max_deep_scan_targets,
+        pressure_relief,
+    )?;
     if quick.candidates_found == 0 {
         return Ok(quick);
     }
@@ -14858,6 +15276,7 @@ fn run_daemon_escalation(
         Some(&quick.session_id),
         true,
         esc_config.max_deep_scan_targets,
+        pressure_relief,
     ) {
         Ok(deep) => Ok(deep),
         Err(err) => {
@@ -14871,16 +15290,31 @@ fn run_daemon_escalation(
 }
 
 #[cfg(feature = "daemon")]
+fn daemon_requests_pressure_relief(triggers: &[pt_core::daemon::triggers::FiredTrigger]) -> bool {
+    use pt_core::daemon::triggers::TriggerKind;
+    triggers.iter().any(|trigger| {
+        matches!(
+            trigger.kind,
+            TriggerKind::PressureRegime | TriggerKind::MemoryPressure | TriggerKind::SustainedLoad
+        )
+    })
+}
+
+#[cfg(feature = "daemon")]
 fn run_daemon_plan(
     global: &GlobalOpts,
     session_id: Option<&str>,
     deep: bool,
     max_candidates: u32,
+    pressure_relief: bool,
 ) -> Result<DaemonEscalationResult, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut cmd = std::process::Command::new(exe);
     cmd.args(["--format", "json", "agent", "plan", "--max-candidates"])
         .arg(max_candidates.to_string());
+    if pressure_relief {
+        cmd.args(["--goal", "relieve"]);
+    }
     if deep {
         cmd.arg("--deep");
     }
@@ -21295,6 +21729,7 @@ mod planning_pressure_tests {
 
 fn goal_requires_cpu_baseline(goal: &Goal) -> bool {
     match goal {
+        Goal::Relieve(_) => false,
         Goal::Target(target) => {
             matches!(target.metric, Metric::Cpu)
                 && matches!(target.comparator, Comparator::ReduceBelow)
@@ -23221,43 +23656,45 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     if let Some(goal_str) = args.goal.as_deref() {
         match parse_goal(goal_str) {
             Ok(goal) => {
-                goal_resources = GoalResourceSnapshot::collect(&goal, &scan_result.processes);
-                let observed_at = chrono::Utc::now().timestamp_millis();
-                resource_times.private_memory_unix_ms = Some(observed_at);
-                resource_times.descriptors_unix_ms = Some(observed_at);
-                attach_goal_resource_observations(&mut candidates, &goal_resources);
-                // Goal ranking influences the kill budget, but only the final
-                // executable plan below can substantiate a recovery forecast.
-                match build_goal_plan_from_candidates(
-                    goal_str,
-                    &goal,
-                    total_cpu_pct_for_goal,
-                    &candidates,
-                    &goal_resources,
-                ) {
-                    Ok(goal_output) => {
-                        let selected_rank: HashMap<u32, usize> = goal_output
-                            .selected_pids
-                            .iter()
-                            .enumerate()
-                            .map(|(rank, &pid)| (pid, rank))
-                            .collect();
+                if !matches!(&goal, Goal::Relieve(_)) {
+                    goal_resources = GoalResourceSnapshot::collect(&goal, &scan_result.processes);
+                    let observed_at = chrono::Utc::now().timestamp_millis();
+                    resource_times.private_memory_unix_ms = Some(observed_at);
+                    resource_times.descriptors_unix_ms = Some(observed_at);
+                    attach_goal_resource_observations(&mut candidates, &goal_resources);
+                    // Goal ranking influences the kill budget, but only the final
+                    // executable plan below can substantiate a recovery forecast.
+                    match build_goal_plan_from_candidates(
+                        goal_str,
+                        &goal,
+                        total_cpu_pct_for_goal,
+                        &candidates,
+                        &goal_resources,
+                    ) {
+                        Ok(goal_output) => {
+                            let selected_rank: HashMap<u32, usize> = goal_output
+                                .selected_pids
+                                .iter()
+                                .enumerate()
+                                .map(|(rank, &pid)| (pid, rank))
+                                .collect();
 
-                        candidates.sort_by_key(|candidate| {
-                            let pid = candidate
-                                .get("pid")
-                                .and_then(|value| value.as_u64())
-                                .and_then(|pid| u32::try_from(pid).ok());
-                            pid.and_then(|pid| selected_rank.get(&pid).copied())
-                                .unwrap_or(usize::MAX)
-                        });
-                    }
-                    Err(err) => {
-                        goal_summary = Some(serde_json::json!({
-                            "goal": goal_str,
-                            "parsed": goal.canonical(),
-                            "error": err,
-                        }));
+                            candidates.sort_by_key(|candidate| {
+                                let pid = candidate
+                                    .get("pid")
+                                    .and_then(|value| value.as_u64())
+                                    .and_then(|pid| u32::try_from(pid).ok());
+                                pid.and_then(|pid| selected_rank.get(&pid).copied())
+                                    .unwrap_or(usize::MAX)
+                            });
+                        }
+                        Err(err) => {
+                            goal_summary = Some(serde_json::json!({
+                                "goal": goal_str,
+                                "parsed": goal.canonical(),
+                                "error": err,
+                            }));
+                        }
                     }
                 }
                 parsed_goal = Some(goal);
@@ -23328,7 +23765,12 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             }
         }
         if let Some(summary) = goal_summary.as_mut() {
-            summary["execution_scope"] = serde_json::json!("selected_direct_kills");
+            summary["execution_scope"] =
+                serde_json::json!(if matches!(parsed_goal, Some(Goal::Relieve(_))) {
+                    "selected_pressure_remedies"
+                } else {
+                    "selected_direct_kills"
+                });
         }
     }
     let returned_pids: HashSet<u32> = candidates
@@ -23484,7 +23926,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         } else if action == "keep" {
             spare_candidates.push(pid);
         }
-        if selected_by_goal && action != "kill" {
+        if selected_by_goal && action != "kill" && !matches!(parsed_goal, Some(Goal::Relieve(_))) {
             goal_selected_needing_review.push(pid);
         }
     }
@@ -23772,6 +24214,9 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             expected_memory_freed_gb,
         );
         println!("{}", narrative);
+        if let Some(text) = goal_summary.as_ref().and_then(pressure_goal_summary_text) {
+            println!("\n{text}");
+        }
         if let Some(comparison) = &differential {
             println!("\n{}", agent_plan_differential_summary(comparison));
         }
@@ -23798,6 +24243,8 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                             "score": c["score"],
                             "rec": c["recommendation"],
                             "why": rationale,
+                            "goal_selected": c["goal_selected"],
+                            "action_ids": c["plan_action_ids"],
                         })
                     })
                     .collect();
@@ -23831,6 +24278,9 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             } else {
                 plan_output.clone()
             };
+            if let Some(goal) = &goal_summary {
+                output_json["goal_summary"] = goal.clone();
+            }
             if let Some(comparison) = &differential {
                 output_json["differential"] = comparison.clone();
             }
@@ -23857,6 +24307,8 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                             "s": c["score"],
                             "r": c["recommendation"],
                             "w": rationale,
+                            "goal_selected": c["goal_selected"],
+                            "action_ids": c["plan_action_ids"],
                         })
                     })
                     .collect();
@@ -23889,6 +24341,9 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             } else {
                 plan_output.clone()
             };
+            if let Some(goal) = &goal_summary {
+                output_json["goal_summary"] = goal.clone();
+            }
             if let Some(comparison) = &differential {
                 output_json["differential"] = comparison.clone();
             }
@@ -23908,6 +24363,9 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 kill_candidates.len(),
                 review_candidates.len()
             );
+            if let Some(text) = goal_summary.as_ref().and_then(pressure_goal_summary_text) {
+                println!("{text}");
+            }
             if let Some(comparison) = &differential {
                 println!("{}", agent_plan_differential_summary(comparison));
             }
@@ -23922,6 +24380,9 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             println!("- Candidates identified: {}", candidates.len());
             println!("- Kill recommendations: {}", kill_candidates.len());
             println!("- Review recommendations: {}", review_candidates.len());
+            if let Some(text) = goal_summary.as_ref().and_then(pressure_goal_summary_text) {
+                println!("\n{text}");
+            }
             if let Some(comparison) = &differential {
                 println!("\n{}", agent_plan_differential_summary(comparison));
             }
