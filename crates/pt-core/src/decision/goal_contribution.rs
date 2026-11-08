@@ -19,6 +19,22 @@ pub struct ProcessGoalResources {
     pub fd_count: u64,
 }
 
+/// Private resident pages observed for one process incarnation. Ordinary
+/// private bytes are `Private_Clean + Private_Dirty` from Linux smaps_rollup.
+/// This is a footprint forecast, not a guarantee that MemAvailable will rise
+/// by that amount after exit: clean file pages may remain cached, allocations
+/// can change, and other work or a respawn can consume the released capacity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessPrivateMemory {
+    pub identity: ProcessIdentity,
+    pub private_clean_bytes: u64,
+    pub private_dirty_bytes: u64,
+    /// Huge-TLB pages return to a separate pool. Retain this observation but
+    /// never credit it toward an ordinary RAM goal. None means not reported.
+    #[serde(default)]
+    pub private_hugetlb_bytes: Option<u64>,
+}
+
 /// Observed holders of sockets bound to a requested port in this network
 /// namespace, within the mounted procfs view. `None` means that census could not
 /// be completed; `Some([])` means no bound sockets were observed.
@@ -35,6 +51,9 @@ pub struct PortGoalResources {
 pub struct GoalResourceSnapshot {
     pub processes: BTreeMap<u32, ProcessGoalResources>,
     pub ports: BTreeMap<u16, PortGoalResources>,
+    /// Separate from descriptor observations so a memory-only collection never
+    /// manufactures a zero descriptor count. Other goals leave this map empty.
+    pub private_memory: BTreeMap<u32, ProcessPrivateMemory>,
     pub warnings: Vec<String>,
 }
 
@@ -43,21 +62,30 @@ impl GoalResourceSnapshot {
     /// goals incur no descriptor or socket-table work here.
     pub fn collect(goal: &Goal, population: &[ProcessRecord]) -> Self {
         let mut need_fds = false;
+        let mut need_memory = false;
         let mut ports = BTreeMap::new();
-        requested_resources(goal, &mut need_fds, &mut ports);
-        if !need_fds && ports.is_empty() {
+        requested_resources(goal, &mut need_fds, &mut need_memory, &mut ports);
+        if !need_fds && !need_memory && ports.is_empty() {
             return Self::default();
         }
         #[cfg(target_os = "linux")]
         {
-            collect_linux_goal_resources(population, need_fds, ports)
+            collect_linux_goal_resources(population, need_fds, need_memory, ports)
         }
         #[cfg(not(target_os = "linux"))]
         {
             let _ = population;
+            let mut warnings = Vec::new();
+            if need_fds || !ports.is_empty() {
+                warnings.push("fd_and_port_goal_measurements_unavailable_on_this_platform".into());
+            }
+            if need_memory {
+                warnings
+                    .push("private_memory_goal_measurements_unavailable_on_this_platform".into());
+            }
             Self {
                 ports,
-                warnings: vec!["fd_and_port_goal_measurements_unavailable_on_this_platform".into()],
+                warnings,
                 ..Self::default()
             }
         }
@@ -70,16 +98,40 @@ impl GoalResourceSnapshot {
             .filter(|observed| observed.identity.matches(identity))
             .map(|observed| observed.fd_count)
     }
+
+    /// Identity-bound ordinary private bytes, with no RSS, shared-page, swap or
+    /// huge-TLB fallback. Absence is an error, never an observed zero.
+    pub fn private_memory_bytes(&self, identity: &ProcessIdentity) -> Result<u64, String> {
+        let observed = self
+            .private_memory
+            .get(&identity.pid.0)
+            .ok_or_else(|| format!("private memory was not observed for pid {}", identity.pid.0))?;
+        if !identity.can_safely_revalidate()
+            || !observed.identity.can_safely_revalidate()
+            || !observed.identity.matches(identity)
+        {
+            return Err(format!(
+                "private-memory identity differs for pid {}",
+                identity.pid.0
+            ));
+        }
+        observed
+            .private_clean_bytes
+            .checked_add(observed.private_dirty_bytes)
+            .ok_or_else(|| "private-memory byte total overflows u64".into())
+    }
 }
 
 fn requested_resources(
     goal: &Goal,
     need_fds: &mut bool,
+    need_memory: &mut bool,
     ports: &mut BTreeMap<u16, PortGoalResources>,
 ) {
     match goal {
         Goal::Target(target) => match target.metric {
             Metric::FileDescriptors => *need_fds = true,
+            Metric::Memory => *need_memory = true,
             Metric::Port => {
                 if let Some(port) = target.port {
                     ports.entry(port).or_default();
@@ -89,10 +141,182 @@ fn requested_resources(
         },
         Goal::And(parts) | Goal::Or(parts) => {
             for part in parts {
-                requested_resources(part, need_fds, ports);
+                requested_resources(part, need_fds, need_memory, ports);
             }
         }
     }
+}
+
+/// Parse only the private resident fields used by the forecast. Unknown fields
+/// (including RSS, PSS and Swap) do not substitute for missing private fields.
+#[cfg(any(target_os = "linux", test))]
+fn parse_private_memory_fields(contents: &str) -> Result<(u64, u64, Option<u64>), String> {
+    let mut clean = None;
+    let mut dirty = None;
+    let mut hugetlb = None;
+    for line in contents.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            if ["Private_Clean", "Private_Dirty", "Private_Hugetlb"]
+                .iter()
+                .any(|key| line.trim_start().starts_with(key))
+            {
+                return Err("private-memory field is missing its colon".into());
+            }
+            continue;
+        };
+        let slot = match key.trim() {
+            "Private_Clean" => &mut clean,
+            "Private_Dirty" => &mut dirty,
+            "Private_Hugetlb" => &mut hugetlb,
+            _ => continue,
+        };
+        if slot.is_some() {
+            return Err(format!("duplicate {} field", key.trim()));
+        }
+        let mut fields = value.split_whitespace();
+        let count = fields
+            .next()
+            .ok_or_else(|| format!("{} is missing a count", key.trim()))?;
+        if count.is_empty() || !count.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(format!("{} has an invalid unsigned count", key.trim()));
+        }
+        if fields.next() != Some("kB") || fields.next().is_some() {
+            return Err(format!(
+                "{} must contain exactly a count and kB unit",
+                key.trim()
+            ));
+        }
+        let bytes = count
+            .parse::<u64>()
+            .ok()
+            .and_then(|count| count.checked_mul(1024))
+            .ok_or_else(|| format!("{} byte count overflows u64", key.trim()))?;
+        *slot = Some(bytes);
+    }
+    let clean = clean.ok_or("Private_Clean was not observed")?;
+    let dirty = dirty.ok_or("Private_Dirty was not observed")?;
+    clean
+        .checked_add(dirty)
+        .ok_or("private-memory byte total overflows u64")?;
+    Ok((clean, dirty, hugetlb))
+}
+
+/// A pinned proc directory prevents a reused numeric PID from redirecting the
+/// smaps read to a new process between the identity checks.
+#[cfg(target_os = "linux")]
+struct GoalProcDirectory {
+    handle: std::fs::File,
+}
+
+#[cfg(target_os = "linux")]
+impl GoalProcDirectory {
+    fn open(pid: u32) -> Result<Self, String> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(format!("/proc/{pid}"))
+            .map_err(|error| format!("cannot pin /proc/{pid}: {error}"))?;
+        Ok(Self { handle })
+    }
+
+    fn read(&self, name: &str) -> Result<String, String> {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        const MAX_PROC_FIELD_BYTES: u64 = 64 * 1024;
+        let path = format!("/proc/self/fd/{}/{}", self.handle.as_raw_fd(), name);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|error| format!("cannot read pinned {name}: {error}"))?;
+        let mut content = String::new();
+        file.take(MAX_PROC_FIELD_BYTES + 1)
+            .read_to_string(&mut content)
+            .map_err(|error| format!("cannot read pinned {name}: {error}"))?;
+        if content.len() as u64 > MAX_PROC_FIELD_BYTES {
+            return Err(format!("pinned {name} exceeds the observation size limit"));
+        }
+        Ok(content)
+    }
+
+    fn identity(&self, pid: u32, boot_id: &str) -> Result<ProcessIdentity, String> {
+        let stat = self.read("stat")?;
+        let open = stat.find('(').ok_or("stat command is missing")?;
+        let close = stat
+            .rfind(')')
+            .filter(|close| *close > open)
+            .ok_or("stat command is malformed")?;
+        let raw_pid = stat[..open].trim();
+        if raw_pid.is_empty() || !raw_pid.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err("stat PID is invalid".into());
+        }
+        let observed_pid = raw_pid.parse::<u32>().map_err(|_| "stat PID is invalid")?;
+        if observed_pid != pid {
+            return Err("stat PID differs from the requested process".into());
+        }
+        let raw_start_ticks = stat[close + 1..]
+            .split_whitespace()
+            .nth(19)
+            .ok_or("stat birth ticks are missing")?;
+        if !raw_start_ticks.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err("stat birth ticks are invalid".into());
+        }
+        let start_ticks = raw_start_ticks
+            .parse::<u64>()
+            .map_err(|_| "stat birth ticks are invalid")?;
+        let status = self.read("status")?;
+        if status
+            .lines()
+            .filter(|line| line.starts_with("Uid:"))
+            .count()
+            != 1
+        {
+            return Err("process UID field is missing or duplicated".into());
+        }
+        if status
+            .lines()
+            .find_map(|line| line.strip_prefix("Uid:"))
+            .is_some_and(|uids| {
+                uids.split_whitespace()
+                    .any(|uid| !uid.bytes().all(|byte| byte.is_ascii_digit()))
+            })
+        {
+            return Err("process UID field is invalid".into());
+        }
+        let uid = goal_uid_from_status(&status).ok_or("process UID is unavailable")?;
+        Ok(ProcessIdentity::new(
+            pid,
+            pt_common::StartId::from_linux(boot_id, start_ticks, pid),
+            uid,
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_private_memory(
+    expected: &ProcessIdentity,
+    boot_id: &str,
+) -> Result<ProcessPrivateMemory, String> {
+    let directory = GoalProcDirectory::open(expected.pid.0)?;
+    let before = directory.identity(expected.pid.0, boot_id)?;
+    if !expected.can_safely_revalidate() || !expected.matches(&before) {
+        return Err("process identity changed before private-memory observation".into());
+    }
+    let contents = directory.read("smaps_rollup")?;
+    let (private_clean_bytes, private_dirty_bytes, private_hugetlb_bytes) =
+        parse_private_memory_fields(&contents)?;
+    let after = directory.identity(expected.pid.0, boot_id)?;
+    if !expected.matches(&after) {
+        return Err("process identity changed during private-memory observation".into());
+    }
+    Ok(ProcessPrivateMemory {
+        identity: before,
+        private_clean_bytes,
+        private_dirty_bytes,
+        private_hugetlb_bytes,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -265,6 +489,7 @@ fn read_goal_descriptors(
 fn collect_linux_goal_resources(
     population: &[ProcessRecord],
     need_fds: bool,
+    need_memory: bool,
     ports: BTreeMap<u16, PortGoalResources>,
 ) -> GoalResourceSnapshot {
     let mut snapshot = GoalResourceSnapshot {
@@ -280,6 +505,26 @@ fn collect_linux_goal_resources(
             return snapshot;
         }
     };
+    if need_memory {
+        for process in population {
+            let identity =
+                ProcessIdentity::new(process.pid.0, process.start_id.clone(), process.uid);
+            match read_private_memory(&identity, &boot_id) {
+                Ok(memory) => {
+                    snapshot.private_memory.insert(process.pid.0, memory);
+                }
+                Err(error) => snapshot.warnings.push(format!(
+                    "private_memory_unavailable_for_pid_{}: {error}",
+                    process.pid.0
+                )),
+            }
+        }
+    }
+    // The memory path has no dependency on descriptor permissions, socket
+    // tables or a complete process census. Do not enter that path unnecessarily.
+    if !need_fds && snapshot.ports.is_empty() {
+        return snapshot;
+    }
     let inspect_sockets = !snapshot.ports.is_empty();
     let bindings = if inspect_sockets {
         match collect_port_bindings(&snapshot.ports) {
@@ -408,7 +653,9 @@ pub struct ContributionCandidate {
     pub pid: u32,
     /// RSS bytes.
     pub rss_bytes: u64,
-    /// USS bytes (if known).
+    /// Observed ordinary private resident bytes (if known), excluding swap and
+    /// huge-TLB pages. RSS is not a substitute for this measurement.
+    #[serde(default)]
     pub uss_bytes: Option<u64>,
     /// CPU fraction (0.0 to 1.0+).
     pub cpu_frac: f64,
@@ -447,24 +694,38 @@ pub struct ContributionFactor {
     pub explanation: String,
 }
 
-/// Estimate memory contribution from killing a process.
+/// Forecast memory contribution from an observed private resident footprint.
+///
+/// No positive credit is available without an observation. Even with one, the
+/// footprint is not a guaranteed host-memory delta or a calibrated confidence
+/// interval: clean pages can stay cached and concurrent allocations can change.
 pub fn estimate_memory_contribution(candidate: &ContributionCandidate) -> GoalContribution {
-    // Base: use USS if available (true private memory), else RSS.
-    let base_bytes = candidate.uss_bytes.unwrap_or(candidate.rss_bytes) as f64;
-
-    let mut factors = Vec::new();
-    let mut multiplier = 1.0;
-
-    // Shared memory discount: RSS includes shared pages.
-    if candidate.uss_bytes.is_none() && candidate.has_shared_memory {
-        let shared_discount = 0.6; // Assume 40% shared.
-        multiplier *= shared_discount;
-        factors.push(ContributionFactor {
-            name: "shared_memory".to_string(),
-            multiplier: shared_discount,
-            explanation: "RSS includes shared pages; estimated 40% shared".to_string(),
-        });
+    let unavailable = |explanation: &str| GoalContribution {
+        expected: 0.0,
+        low: 0.0,
+        high: 0.0,
+        confidence: 0.0,
+        factors: vec![ContributionFactor {
+            name: "memory_forecast_unavailable".into(),
+            multiplier: 0.0,
+            explanation: explanation.into(),
+        }],
+    };
+    let Some(private_bytes) = candidate.uss_bytes else {
+        return unavailable("Private resident memory was not observed; RSS and guessed shared-page fractions provide no memory-goal credit");
+    };
+    if !candidate.respawn_probability.is_finite()
+        || !(0.0..=1.0).contains(&candidate.respawn_probability)
+    {
+        return unavailable("Respawn probability is not a finite value between zero and one");
     }
+    let base_bytes = private_bytes as f64;
+    let mut factors = vec![ContributionFactor {
+        name: "private_resident_footprint".into(),
+        multiplier: 1.0,
+        explanation: "Observed private resident footprint; excludes shared pages, swap and huge-TLB memory. This is a forecast, not guaranteed host RAM recovery or a calibrated confidence interval".into(),
+    }];
+    let mut multiplier = 1.0;
 
     // Respawn discount: if process respawns, memory isn't permanently freed.
     if candidate.respawn_probability > 0.0 {
@@ -482,27 +743,11 @@ pub fn estimate_memory_contribution(candidate: &ContributionCandidate) -> GoalCo
 
     let expected = base_bytes * multiplier;
 
-    // Uncertainty: wider when USS unknown or respawn likely.
-    let uncertainty_factor = if candidate.uss_bytes.is_some() {
-        0.1
-    } else {
-        0.3
-    };
-    let low = expected * (1.0 - uncertainty_factor);
-    let high = base_bytes * (1.0 + uncertainty_factor * 0.5); // High can exceed expected
-
-    let confidence = if candidate.uss_bytes.is_some() {
-        0.9
-    } else {
-        0.6
-    };
-    let confidence = confidence * (1.0 - candidate.respawn_probability * 0.5);
-
     GoalContribution {
         expected,
-        low: low.max(0.0),
-        high,
-        confidence: confidence.clamp(0.0, 1.0),
+        low: 0.0,
+        high: base_bytes,
+        confidence: 0.0,
         factors,
     }
 }
@@ -631,7 +876,215 @@ mod tests {
         let snapshot = GoalResourceSnapshot::collect(&goal, &[]);
         assert!(snapshot.processes.is_empty());
         assert!(snapshot.ports.is_empty());
+        assert!(snapshot.private_memory.is_empty());
+        #[cfg(target_os = "linux")]
         assert!(snapshot.warnings.is_empty());
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(
+            snapshot.warnings,
+            ["private_memory_goal_measurements_unavailable_on_this_platform"]
+        );
+    }
+
+    fn private_memory_identity(pid: u32) -> ProcessIdentity {
+        ProcessIdentity::new(
+            pid,
+            pt_common::StartId::from_linux("test-boot", 1234, pid),
+            1000,
+        )
+    }
+
+    #[test]
+    fn private_memory_requires_observed_fields_and_excludes_other_memory() {
+        let (clean, dirty, hugetlb) = parse_private_memory_fields(
+            "00000000-ffffffff ---p 00000000 00:00 0 [rollup]\n\
+             Rss: 1048576 kB\nPss: 999999 kB\n\
+             Private_Clean: 64 kB\nPrivate_Dirty: 512 kB\n\
+             Shared_Clean: 123456 kB\nSwap: 999999 kB\nPrivate_Hugetlb: 2048 kB\n",
+        )
+        .unwrap();
+        assert_eq!(
+            (clean, dirty, hugetlb),
+            (64 * 1024, 512 * 1024, Some(2048 * 1024))
+        );
+        let identity = private_memory_identity(42);
+        let mut snapshot = GoalResourceSnapshot::default();
+        snapshot.private_memory.insert(
+            42,
+            ProcessPrivateMemory {
+                identity: identity.clone(),
+                private_clean_bytes: clean,
+                private_dirty_bytes: dirty,
+                private_hugetlb_bytes: hugetlb,
+            },
+        );
+        assert_eq!(
+            snapshot.private_memory_bytes(&identity).unwrap(),
+            576 * 1024
+        );
+        assert_eq!(
+            snapshot.fd_count(&identity),
+            None,
+            "memory is not a descriptor count"
+        );
+        assert!(snapshot
+            .private_memory_bytes(&private_memory_identity(43))
+            .is_err());
+        let mut wrong = identity.clone();
+        wrong.uid += 1;
+        assert!(snapshot.private_memory_bytes(&wrong).is_err());
+        wrong = identity.clone();
+        wrong.start_id = pt_common::StartId::from_linux("test-boot", 1235, 42);
+        assert!(snapshot.private_memory_bytes(&wrong).is_err());
+        snapshot
+            .private_memory
+            .get_mut(&42)
+            .unwrap()
+            .identity
+            .quality = pt_common::IdentityQuality::PidOnly;
+        assert!(
+            snapshot.private_memory_bytes(&identity).is_err(),
+            "PID-only observed evidence cannot grant credit"
+        );
+
+        let fields = parse_private_memory_fields(
+            "Private_Clean: 0 kB\nPrivate_Dirty: 0 kB\nPrivate_Hugetlb: 2048 kB\nSwap: 4096 kB\n",
+        )
+        .unwrap();
+        assert_eq!(fields, (0, 0, Some(2048 * 1024)));
+        assert_eq!(
+            parse_private_memory_fields("Private_Clean: 0 kB\nPrivate_Dirty: 1 kB\n").unwrap(),
+            (0, 1024, None)
+        );
+    }
+
+    #[test]
+    fn private_memory_parser_rejects_missing_malformed_duplicate_and_overflow_fields() {
+        for bad in [
+            "", "Rss: 1024 kB\nPss: 512 kB\n", "Private_Clean: 1 kB\n",
+            "Private_Dirty: 1 kB\n", "Private_Clean: 1 kB\nPrivate_Clean: 1 kB\nPrivate_Dirty: 2 kB\n",
+            "Private_Clean: 1 kB\nPrivate_Dirty: 2 kB\nPrivate_Dirty: 2 kB\n",
+            "Private_Clean: 1 kB\nPrivate_Dirty: 2 kB\nPrivate_Hugetlb: 0 kB\nPrivate_Hugetlb: 0 kB\n",
+            "Private_Clean: 18446744073709551616 kB\nPrivate_Dirty: 0 kB\n",
+            "Private_Clean: 18014398509481984 kB\nPrivate_Dirty: 0 kB\n",
+            "Private_Clean: 18014398509481983 kB\nPrivate_Dirty: 1 kB\n",
+            "Private_Clean: 0 kB\nPrivate_Dirty: 0 kB\nPrivate_Hugetlb: 18014398509481984 kB\n",
+            "Private_Clean 1 kB\nPrivate_Dirty: 0 kB\n",
+        ] {
+            assert!(parse_private_memory_fields(bad).is_err(), "{bad:?}");
+        }
+        for field in ["Private_Clean", "Private_Dirty", "Private_Hugetlb"] {
+            for bad_value in [
+                "",
+                "1",
+                "-1 kB",
+                "+1 kB",
+                "1.0 kB",
+                "0x10 kB",
+                "NaN kB",
+                "1 KB",
+                "1 KiB",
+                "1 bytes",
+                "1 kB trailing",
+            ] {
+                let mut input = String::new();
+                for key in ["Private_Clean", "Private_Dirty", "Private_Hugetlb"] {
+                    input.push_str(&format!(
+                        "{key}: {}\n",
+                        if key == field { bad_value } else { "0 kB" }
+                    ));
+                }
+                assert!(parse_private_memory_fields(&input).is_err(), "{input:?}");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_memory_uses_live_proc_identity_and_never_scan_rss() {
+        // Use the mounted procfs view, just as quick_scan does. A container can
+        // mount a procfs instance whose PID namespace differs from getpid().
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+        let pid = stat
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+        let mut scan = crate::collect::quick_scan(&crate::collect::QuickScanOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .expect("scan the owned test process");
+        let process = scan
+            .processes
+            .iter_mut()
+            .find(|process| process.pid.0 == pid)
+            .unwrap();
+        // A bogus scan footprint must not be substituted for the kernel's
+        // separate, identity-bound private-page observation.
+        process.rss_bytes = u64::MAX;
+        let identity = ProcessIdentity::new(pid, process.start_id.clone(), process.uid);
+        let population = vec![process.clone()];
+        let goal = super::super::goal_parser::parse_goal("free 1MB RAM").unwrap();
+        let snapshot = GoalResourceSnapshot::collect(&goal, &population);
+        let bytes = snapshot
+            .private_memory_bytes(&identity)
+            .unwrap_or_else(|error| panic!("{error}: {:?}", snapshot.warnings));
+        assert!(bytes > 0 && bytes < u64::MAX);
+        assert!(snapshot.processes.is_empty());
+        assert!(snapshot.ports.is_empty());
+        assert!(snapshot.warnings.is_empty(), "{:?}", snapshot.warnings);
+
+        for change in ["uid", "start"] {
+            let mut changed = population[0].clone();
+            if change == "uid" {
+                changed.uid = changed.uid.wrapping_add(1);
+            } else {
+                changed.start_id = pt_common::StartId("wrong-incarnation".into());
+            }
+            let rejected = GoalResourceSnapshot::collect(&goal, &[changed]);
+            assert!(rejected.private_memory.is_empty());
+            assert!(rejected
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("identity changed before")));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinned_proc_reader_retains_its_directory_and_rejects_truncated_identity() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let original = temporary.path().join("process");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::write(
+            original.join("smaps_rollup"),
+            "Private_Clean: 1 kB\nPrivate_Dirty: 2 kB\n",
+        )
+        .unwrap();
+        let pinned = GoalProcDirectory {
+            handle: std::fs::File::open(&original).unwrap(),
+        };
+        std::fs::rename(&original, temporary.path().join("old-process")).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        std::fs::write(
+            original.join("smaps_rollup"),
+            "Private_Clean: 999 kB\nPrivate_Dirty: 999 kB\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parse_private_memory_fields(&pinned.read("smaps_rollup").unwrap()).unwrap(),
+            (1024, 2048, None)
+        );
+        let old = temporary.path().join("old-process");
+        std::fs::write(old.join("stat"), "42 (worker) S 1 0\n").unwrap();
+        std::fs::write(old.join("status"), "Uid:\t1000\t1000\t1000\t1000\n").unwrap();
+        assert!(pinned
+            .identity(42, "test-boot")
+            .unwrap_err()
+            .contains("birth ticks"));
+        assert!(pinned.read("absent").is_err());
     }
 
     #[cfg(target_os = "linux")]
@@ -722,10 +1175,11 @@ mod tests {
     fn test_memory_basic() {
         let c = make_candidate();
         let contrib = estimate_memory_contribution(&c);
-        assert!(contrib.expected > 0.0);
-        assert!(contrib.low < contrib.expected);
-        assert!(contrib.high > contrib.expected);
-        assert!(contrib.confidence > 0.5);
+        assert_eq!(contrib.expected, 0.0);
+        assert_eq!(contrib.low, 0.0);
+        assert_eq!(contrib.high, 0.0);
+        assert_eq!(contrib.confidence, 0.0);
+        assert_eq!(contrib.factors[0].name, "memory_forecast_unavailable");
     }
 
     #[test]
@@ -736,34 +1190,52 @@ mod tests {
         };
         let contrib = estimate_memory_contribution(&c);
         // Should use USS, not RSS.
-        assert!((contrib.expected - 500_000_000.0).abs() < 100_000_000.0);
-        assert!(contrib.confidence > 0.8); // Higher confidence with USS.
+        assert_eq!(contrib.expected, 500_000_000.0);
+        assert_eq!(contrib.high, 500_000_000.0);
+        assert_eq!(contrib.low, 0.0); // Private footprint is not guaranteed host relief.
+        assert_eq!(contrib.confidence, 0.0); // No calibrated recovery model.
     }
 
     #[test]
-    fn test_memory_shared_discount() {
+    fn test_memory_does_not_guess_shared_memory_from_rss() {
         let c = ContributionCandidate {
             has_shared_memory: true,
             ..make_candidate()
         };
         let contrib = estimate_memory_contribution(&c);
-        // Should be discounted below RSS.
-        assert!(contrib.expected < 1_000_000_000.0);
-        assert!(
-            contrib.factors.iter().any(|f| f.name == "shared_memory"),
-            "Should have shared_memory factor"
+        assert_eq!(contrib.expected, 0.0);
+        let observed = estimate_memory_contribution(&ContributionCandidate {
+            uss_bytes: Some(1234),
+            ..c
+        });
+        assert_eq!(
+            observed.expected, 1234.0,
+            "observed private memory needs no shared-page guess"
         );
     }
 
     #[test]
     fn test_memory_respawn_discount() {
         let c = ContributionCandidate {
+            uss_bytes: Some(1_000_000_000),
             respawn_probability: 0.8,
             ..make_candidate()
         };
         let contrib = estimate_memory_contribution(&c);
-        assert!(contrib.expected < 300_000_000.0); // 1GB * (1-0.8) = 200MB
-        assert!(contrib.confidence < 0.7);
+        assert!((contrib.expected - 200_000_000.0).abs() < 1e-6);
+        assert_eq!(contrib.high, 1_000_000_000.0);
+        assert_eq!(contrib.low, 0.0);
+        for invalid in [f64::NAN, f64::INFINITY, -0.1, 1.1] {
+            let invalid_forecast = estimate_memory_contribution(&ContributionCandidate {
+                respawn_probability: invalid,
+                ..c.clone()
+            });
+            assert_eq!(invalid_forecast.expected, 0.0);
+            assert_eq!(
+                invalid_forecast.factors[0].name,
+                "memory_forecast_unavailable"
+            );
+        }
     }
 
     #[test]

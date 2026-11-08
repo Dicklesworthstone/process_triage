@@ -846,9 +846,30 @@ mod plan_options {
                 }),
                 "goal recovery has no matching executable kill: {candidate}"
             );
-            projected_memory_mb += candidate["memory_mb"].as_u64().expect("memory MB") as f64;
+            let evidence = &candidate["goal_resources"];
+            assert_eq!(evidence["memory_basis"], "private_clean_plus_private_dirty");
+            let private_bytes = evidence["private_memory_bytes"]
+                .as_u64().expect("selected recovery requires measured private bytes");
+            let observed = &evidence["private_memory"];
+            for field in ["pid", "start_id", "uid"] {
+                assert_eq!(observed["identity"][field], candidate["action_target"][field]);
+            }
+            let clean = observed["private_clean_bytes"].as_u64().unwrap();
+            let dirty = observed["private_dirty_bytes"].as_u64().unwrap();
+            assert_eq!(clean.checked_add(dirty), Some(private_bytes));
+            projected_memory_mb += private_bytes as f64 / (1024.0 * 1024.0);
         }
         for candidate in &candidates {
+            let evidence = &candidate["goal_resources"];
+            assert_eq!(evidence["memory_basis"], "private_clean_plus_private_dirty");
+            if evidence["private_memory_bytes"].is_null() {
+                assert!(evidence["private_memory"].is_null(), "{candidate}");
+            } else {
+                let identity = &evidence["private_memory"]["identity"];
+                assert_eq!(identity["pid"], candidate["pid"]);
+                assert_eq!(identity["start_id"], candidate["start_id"]);
+                assert_eq!(identity["uid"], candidate["uid"]);
+            }
             let selected_for_goal = selected.contains(&candidate["pid"]);
             assert_eq!(
                 candidate["goal_selected"].as_bool(),
@@ -865,8 +886,58 @@ mod plan_options {
             .expect("projected memory recovery");
         assert!(
             (reported_recovery - projected_memory_mb).abs() < 1e-6,
-            "reported {reported_recovery} MB from {projected_memory_mb} executable MB"
+            "reported {reported_recovery} MiB from {projected_memory_mb} measured private MiB"
         );
+        let measurement = &json["goal_summary"]["resource_observations"]["memory"];
+        assert_eq!(measurement["basis"], "private_clean_plus_private_dirty");
+        assert_eq!(measurement["source"], "proc_pid_smaps_rollup");
+        assert_eq!(measurement["unit"], "MiB");
+        assert_eq!(measurement["guaranteed_recovery"], false);
+
+        let mut measured_kill_bytes = Some(0_u64);
+        let mut seen_targets = std::collections::BTreeSet::new();
+        for action in actions
+            .iter()
+            .filter(|action| action["action"] == "kill" && action["blocked"] == false)
+        {
+            let target = &action["target"];
+            let identity = (
+                target["pid"].as_u64().unwrap(),
+                target["start_id"].as_str().unwrap(),
+                target["uid"].as_u64().unwrap(),
+            );
+            if !seen_targets.insert(identity) {
+                continue;
+            }
+            let private_bytes = candidates.iter().find_map(|candidate| {
+                let evidence = &candidate["goal_resources"];
+                let measured_identity = &evidence["private_memory"]["identity"];
+                ["pid", "start_id", "uid"]
+                    .iter()
+                    .all(|field| measured_identity[*field] == target[*field])
+                    .then(|| evidence["private_memory_bytes"].as_u64())
+                    .flatten()
+            });
+            measured_kill_bytes =
+                measured_kill_bytes.and_then(|total| total.checked_add(private_bytes?));
+        }
+        let recommendations = &json["recommendations"];
+        match measured_kill_bytes {
+            Some(bytes) => {
+                let expected_gib = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+                assert_eq!(
+                    recommendations["expected_memory_freed_gb"],
+                    (expected_gib * 100.0).round() / 100.0
+                );
+            }
+            None => assert!(recommendations["expected_memory_freed_gb"].is_null()),
+        }
+        assert_eq!(
+            recommendations["expected_memory_basis"],
+            "private_clean_plus_private_dirty"
+        );
+        assert_eq!(recommendations["expected_memory_unit"], "GiB");
+        assert_eq!(recommendations["expected_memory_is_guaranteed"], false);
     }
 
     #[test]

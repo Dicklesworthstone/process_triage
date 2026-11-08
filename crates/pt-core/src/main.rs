@@ -5023,16 +5023,16 @@ fn build_opt_candidates_for_goals(
             // These contributions estimate termination recovery. Review and
             // reversible remedies must not supply a kill-set resource budget.
             let blocked = !action.eq_ignore_ascii_case("kill");
-            let memory_mb = candidate
-                .get("memory_mb")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as f64;
             let cpu_pct = candidate
                 .get("cpu_host_percent")
                 .and_then(|v| v.as_f64())
                 .filter(|value| value.is_finite() && (0.0..=100.0).contains(value))
                 .unwrap_or(0.0);
             let identity = goal_candidate_identity(candidate);
+            let memory_mb = identity
+                .as_ref()
+                .and_then(|identity| resources.private_memory_bytes(identity).ok())
+                .map_or(0.0, |bytes| bytes as f64 / (1024.0 * 1024.0));
 
             let contributions: Vec<f64> = goals
                 .iter()
@@ -5111,14 +5111,52 @@ fn attach_goal_resource_observations(
 ) {
     for candidate in candidates {
         let identity = goal_candidate_identity(candidate);
+        let private_memory_bytes = identity
+            .as_ref()
+            .and_then(|identity| resources.private_memory_bytes(identity).ok());
+        let private_memory = private_memory_bytes.and(
+            identity.as_ref().and_then(|identity| resources.private_memory.get(&identity.pid.0)),
+        );
         candidate["goal_resources"] = serde_json::json!({
             "fd_count": identity.as_ref().and_then(|identity| resources.fd_count(identity)),
+            "memory_basis": "private_clean_plus_private_dirty",
+            "private_memory_bytes": private_memory_bytes,
+            "private_memory": private_memory,
             "bound_ports": resources.ports.iter().filter_map(|(port, observed)| {
                 observed.holders.as_ref().filter(|holders| identity.as_ref().is_some_and(|identity|
                     holders.iter().any(|holder| holder.matches(identity)))).map(|_| *port)
             }).collect::<Vec<_>>(),
         });
     }
+}
+
+fn goal_requests_metric(goal: &Goal, metric: Metric) -> bool {
+    match goal {
+        Goal::Target(target) => target.metric == metric,
+        Goal::And(parts) | Goal::Or(parts) => {
+            parts.iter().any(|part| goal_requests_metric(part, metric))
+        }
+    }
+}
+
+/// A complete private-footprint estimate for the actual executable kill
+/// targets. Missing observations stay unknown, and repeated stages for one
+/// process incarnation cannot claim its pages more than once.
+fn expected_private_memory_for_kills(plan: &Plan, resources: &GoalResourceSnapshot) -> Option<u64> {
+    let mut seen = HashSet::new();
+    plan.actions
+        .iter()
+        .filter(|action| action.action == Action::Kill && !action.blocked)
+        .filter(|action| {
+            seen.insert((
+                action.target.pid.0,
+                action.target.start_id.clone(),
+                action.target.uid,
+            ))
+        })
+        .try_fold(0_u64, |total, action| {
+            total.checked_add(resources.private_memory_bytes(&action.target).ok()?)
+        })
 }
 
 fn build_goal_plan_from_candidates(
@@ -5129,12 +5167,24 @@ fn build_goal_plan_from_candidates(
     resources: &GoalResourceSnapshot,
 ) -> Result<GoalPlanOutput, String> {
     let mut warnings = resources.warnings.clone();
-    let requests_cpu = match goal {
-        Goal::Target(target) => target.metric == Metric::Cpu,
-        Goal::And(parts) | Goal::Or(parts) => parts
+    let requests_cpu = goal_requests_metric(goal, Metric::Cpu);
+    let requests_memory = goal_requests_metric(goal, Metric::Memory);
+    if requests_memory {
+        let unavailable = candidates
             .iter()
-            .any(|part| matches!(part, Goal::Target(target) if target.metric == Metric::Cpu)),
-    };
+            .filter(|candidate| {
+                candidate["recommended_action"].as_str() == Some("kill")
+                    && goal_candidate_identity(candidate)
+                        .and_then(|identity| resources.private_memory_bytes(&identity).ok())
+                        .is_none()
+            })
+            .count();
+        if unavailable > 0 {
+            warnings.push(format!(
+                "private_memory_contribution_unavailable_for_{unavailable}_candidates"
+            ));
+        }
+    }
     if requests_cpu {
         let unavailable = candidates
             .iter()
@@ -5158,6 +5208,14 @@ fn build_goal_plan_from_candidates(
         "port_scope": "current_network_namespace",
         "process_scope": "mounted_procfs",
         "ports": resources.ports,
+        "memory": requests_memory.then(|| serde_json::json!({
+            "basis": "private_clean_plus_private_dirty",
+            "source": "proc_pid_smaps_rollup",
+            "unit": "MiB",
+            "observed_processes": resources.private_memory.len(),
+            "excludes": ["shared_pages", "swap", "private_hugetlb"],
+            "guaranteed_recovery": false,
+        })),
         "cpu": requests_cpu.then(|| serde_json::json!({
             "basis": "proc_stat_tick_window",
             "unit": "percent_of_host_capacity",
@@ -5515,7 +5573,9 @@ fn finalize_goal_action_plan(
 mod executable_goal_tests {
     use super::*;
     use pt_common::StartId;
-    use pt_core::decision::goal_contribution::{PortGoalResources, ProcessGoalResources};
+    use pt_core::decision::goal_contribution::{
+        PortGoalResources, ProcessGoalResources, ProcessPrivateMemory,
+    };
     use pt_core::plan::{
         ActionConfidence, ActionRationale, ActionRouting, ActionTimeouts, GatesSummary, PlanAction,
     };
@@ -5587,6 +5647,36 @@ mod executable_goal_tests {
             actions,
         };
         (candidates, plan)
+    }
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// Supply explicit private-page observations independently of candidate RSS.
+    fn memory_resources(plan: &Plan, measurements: &[(u32, u64)]) -> GoalResourceSnapshot {
+        GoalResourceSnapshot {
+            private_memory: measurements
+                .iter()
+                .map(|&(pid, private_bytes)| {
+                    let identity = plan
+                        .actions
+                        .iter()
+                        .find(|action| action.target.pid.0 == pid)
+                        .expect("fixture has the measured process identity")
+                        .target
+                        .clone();
+                    (
+                        pid,
+                        ProcessPrivateMemory {
+                            identity,
+                            private_clean_bytes: 0,
+                            private_dirty_bytes: private_bytes,
+                            private_hugetlb_bytes: None,
+                        },
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        }
     }
 
     fn assert_empty_saved_goal_plan(plan: &Plan, candidates: &[serde_json::Value]) {
@@ -5668,7 +5758,7 @@ mod executable_goal_tests {
                         },
                     )]
                     .into(),
-                    ..Default::default()
+                    ..memory_resources(&plan, &[(100, 1000 * MIB)])
                 };
                 let output = finalize_goal_action_plan(
                     Some(&goal),
@@ -5755,6 +5845,7 @@ mod executable_goal_tests {
         let goal_str = "free 100MB RAM";
         let goal = parse_goal(goal_str).unwrap();
         let (mut candidates, mut plan) = fixture(&[(100, 1000, 90.0), (200, 10, 10.0)]);
+        let resources = memory_resources(&plan, &[(100, 1000 * MIB), (200, 10 * MIB)]);
         plan.actions[0].stage = 1;
         let mut pause = plan.actions[0].clone();
         pause.action = Action::Pause;
@@ -5775,7 +5866,7 @@ mod executable_goal_tests {
             100.0,
             &mut candidates,
             &mut plan,
-            &GoalResourceSnapshot::default(),
+            &resources,
             &[],
             false,
         )
@@ -5804,6 +5895,7 @@ mod executable_goal_tests {
         let goal_str = "free 100MB RAM";
         let goal = parse_goal(goal_str).unwrap();
         let (mut candidates, mut plan) = fixture(&[(100, 1000, 90.0), (200, 100, 10.0)]);
+        let resources = memory_resources(&plan, &[(100, 1000 * MIB), (200, 100 * MIB)]);
         let population: Vec<_> = [(100, 1), (200, 100)]
             .into_iter()
             .map(|(pid, ppid)| ProcessRecord {
@@ -5834,7 +5926,7 @@ mod executable_goal_tests {
             100.0,
             &mut candidates,
             &mut plan,
-            &GoalResourceSnapshot::default(),
+            &resources,
             &population,
             true,
         )
@@ -5853,20 +5945,315 @@ mod executable_goal_tests {
     fn preliminary_goal_excludes_review_and_non_kill_remedies() {
         let goal = parse_goal("free 100MB RAM").unwrap();
         for action in ["keep", "review", "pause", "renice", "restart", "freeze", ""] {
-            let (mut candidates, _) = fixture(&[(100, 1000, 90.0), (200, 10, 10.0)]);
+            let (mut candidates, plan) = fixture(&[(100, 1000, 90.0), (200, 10, 10.0)]);
+            let resources = memory_resources(&plan, &[(100, 1000 * MIB), (200, 10 * MIB)]);
             candidates[0]["recommended_action"] = serde_json::json!(action);
             let output = build_goal_plan_from_candidates(
                 "free 100MB RAM",
                 &goal,
                 100.0,
                 &candidates,
-                &GoalResourceSnapshot::default(),
+                &resources,
             )
             .unwrap();
             assert!(!output.result.feasible, "action={action}");
             assert_eq!(output.selected_pids, vec![200], "action={action}");
             assert_eq!(output.result.total_contributions, vec![10.0]);
         }
+    }
+
+    #[test]
+    fn memory_goal_credits_private_pages_without_rss_or_hugetlb() {
+        let goal_str = "free 2MB RAM";
+        let goal = parse_goal(goal_str).unwrap();
+        let (mut candidates, plan) = fixture(&[(100, 8192, 0.0)]);
+        let mut resources = memory_resources(&plan, &[(100, MIB)]);
+        let observed = resources.private_memory.get_mut(&100).unwrap();
+        observed.private_clean_bytes = MIB / 4;
+        observed.private_dirty_bytes = 3 * MIB / 4;
+        observed.private_hugetlb_bytes = Some(4096 * MIB);
+        attach_goal_resource_observations(&mut candidates, &resources);
+        let output = build_goal_plan_from_executable_actions(
+            goal_str,
+            &goal,
+            0.0,
+            &mut candidates,
+            &plan,
+            &resources,
+        )
+        .unwrap();
+        assert!(!output.result.feasible);
+        assert_eq!(output.result.total_contributions, [1.0]);
+        assert_eq!(output.result.goal_achievement[0].shortfall, 1.0);
+        assert_eq!(candidates[0]["memory_mb"], 8192);
+        let evidence = &candidates[0]["goal_resources"];
+        assert_eq!(evidence["memory_basis"], "private_clean_plus_private_dirty");
+        assert_eq!(evidence["private_memory_bytes"], MIB);
+        assert_eq!(
+            evidence["private_memory"]["identity"],
+            serde_json::json!(plan.actions[0].target)
+        );
+        assert_eq!(evidence["private_memory"]["private_clean_bytes"], MIB / 4);
+        assert_eq!(
+            evidence["private_memory"]["private_dirty_bytes"],
+            3 * MIB / 4
+        );
+        assert_eq!(
+            evidence["private_memory"]["private_hugetlb_bytes"],
+            4096 * MIB
+        );
+        let summary = goal_summary_json(goal_str, &goal, &output);
+        let measurement = &summary["resource_observations"]["memory"];
+        assert_eq!(measurement["basis"], "private_clean_plus_private_dirty");
+        assert_eq!(measurement["source"], "proc_pid_smaps_rollup");
+        assert_eq!(measurement["unit"], "MiB");
+        assert_eq!(measurement["guaranteed_recovery"], false);
+        assert_eq!(
+            measurement["excludes"],
+            serde_json::json!(["shared_pages", "swap", "private_hugetlb"])
+        );
+    }
+
+    #[test]
+    fn memory_goal_preserves_fractional_mib_from_measured_bytes() {
+        let goal_str = "free 1.5MB RAM";
+        let goal = parse_goal(goal_str).unwrap();
+        // The display is rounded to whole MiB; recovery keeps the measured bytes.
+        let (mut candidates, plan) = fixture(&[(100, 1, 0.0)]);
+        let resources = memory_resources(&plan, &[(100, MIB + MIB / 2)]);
+        attach_goal_resource_observations(&mut candidates, &resources);
+        let output = build_goal_plan_from_executable_actions(
+            goal_str,
+            &goal,
+            0.0,
+            &mut candidates,
+            &plan,
+            &resources,
+        )
+        .unwrap();
+        assert!(output.result.feasible);
+        assert_eq!(output.selected_pids, [100]);
+        assert_eq!(output.result.total_contributions, [1.5]);
+        assert_eq!(output.result.goal_achievement[0].shortfall, 0.0);
+        assert_eq!(
+            candidates[0]["goal_resources"]["private_memory_bytes"],
+            MIB + MIB / 2
+        );
+        assert!(
+            candidates[0]["goal_resources"]["private_memory"]["private_hugetlb_bytes"].is_null()
+        );
+    }
+
+    #[test]
+    fn memory_goal_requires_available_matching_private_measurements() {
+        let goal_str = "free 100MB RAM";
+        let goal = parse_goal(goal_str).unwrap();
+        for case in ["missing", "uid", "start_id", "overflow"] {
+            let (mut candidates, plan) = fixture(&[(100, 8192, 0.0)]);
+            let mut resources = memory_resources(&plan, &[(100, 1000 * MIB)]);
+            match case {
+                "missing" => resources.private_memory.clear(),
+                "uid" => resources.private_memory.get_mut(&100).unwrap().identity.uid += 1,
+                "start_id" => resources
+                    .private_memory
+                    .get_mut(&100)
+                    .unwrap()
+                    .identity
+                    .start_id
+                    .0
+                    .push_str("-reused"),
+                "overflow" => {
+                    let measured = resources.private_memory.get_mut(&100).unwrap();
+                    measured.private_clean_bytes = u64::MAX;
+                    measured.private_dirty_bytes = 1;
+                }
+                _ => unreachable!(),
+            }
+            attach_goal_resource_observations(&mut candidates, &resources);
+            let output = build_goal_plan_from_executable_actions(
+                goal_str,
+                &goal,
+                0.0,
+                &mut candidates,
+                &plan,
+                &resources,
+            )
+            .unwrap();
+            assert!(!output.result.feasible, "{case}");
+            assert!(output.selected_pids.is_empty(), "{case}");
+            assert_eq!(output.result.total_contributions, [0.0], "{case}");
+            assert!(
+                candidates[0]["goal_resources"]["private_memory_bytes"].is_null(),
+                "{case}"
+            );
+            assert!(
+                candidates[0]["goal_resources"]["private_memory"].is_null(),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn kill_memory_forecast_counts_unique_actual_unblocked_targets() {
+        let (_, mut plan) = fixture(&[
+            (100, 1000, 0.0),
+            (200, 2000, 0.0),
+            (300, 4000, 0.0),
+            (400, 8000, 0.0),
+        ]);
+        let mut resources = memory_resources(
+            &plan,
+            &[
+                (100, MIB + MIB / 2),
+                (200, MIB / 2),
+                (300, 4000 * MIB),
+                (400, 8000 * MIB),
+            ],
+        );
+        resources
+            .private_memory
+            .get_mut(&100)
+            .unwrap()
+            .private_hugetlb_bytes = Some(1000 * MIB);
+        // The parent actually receiving the kill supplies the footprint, even
+        // when the original zombie has a much larger observed allocation.
+        plan.actions[1].routing = ActionRouting::ZombieToParent;
+        plan.actions[1].original_zombie_target = Some(plan.actions[2].target.clone());
+        plan.actions[2].blocked = true;
+        plan.actions[3].action = Action::Pause;
+        let mut repeated = plan.actions[0].clone();
+        repeated.action_id = "repeated-stage-100".to_string();
+        repeated.stage = 1;
+        repeated.target.pgid = Some(1234);
+        repeated.target.sid = Some(5678);
+        plan.actions.push(repeated);
+
+        assert_eq!(
+            expected_private_memory_for_kills(&plan, &resources),
+            Some(2 * MIB)
+        );
+    }
+
+    #[test]
+    fn kill_memory_forecast_without_executable_kills_is_zero() {
+        let (_, mut plan) = fixture(&[(100, 1000, 0.0)]);
+        let resources = GoalResourceSnapshot::default();
+        plan.actions[0].blocked = true;
+        assert_eq!(
+            expected_private_memory_for_kills(&plan, &resources),
+            Some(0)
+        );
+        plan.actions[0].blocked = false;
+        plan.actions[0].action = Action::Pause;
+        assert_eq!(
+            expected_private_memory_for_kills(&plan, &resources),
+            Some(0)
+        );
+        plan.actions.clear();
+        assert_eq!(
+            expected_private_memory_for_kills(&plan, &resources),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn kill_memory_forecast_requires_every_measured_identity() {
+        for case in [
+            "missing",
+            "uid",
+            "start_id",
+            "field_overflow",
+            "total_overflow",
+        ] {
+            let (_, plan) = fixture(&[(100, 1000, 0.0), (200, 2000, 0.0)]);
+            let mut resources = memory_resources(&plan, &[(100, MIB), (200, 2 * MIB)]);
+            match case {
+                "missing" => {
+                    resources.private_memory.remove(&200);
+                }
+                "uid" => resources.private_memory.get_mut(&200).unwrap().identity.uid += 1,
+                "start_id" => resources
+                    .private_memory
+                    .get_mut(&200)
+                    .unwrap()
+                    .identity
+                    .start_id
+                    .0
+                    .push_str("-reused"),
+                "field_overflow" => {
+                    let observed = resources.private_memory.get_mut(&200).unwrap();
+                    observed.private_clean_bytes = u64::MAX;
+                    observed.private_dirty_bytes = 1;
+                }
+                "total_overflow" => {
+                    resources
+                        .private_memory
+                        .get_mut(&100)
+                        .unwrap()
+                        .private_dirty_bytes = u64::MAX;
+                    resources
+                        .private_memory
+                        .get_mut(&200)
+                        .unwrap()
+                        .private_dirty_bytes = 1;
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                expected_private_memory_for_kills(&plan, &resources),
+                None,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_inventory_cannot_claim_memory_recovery_from_large_rss() {
+        let pid = u32::MAX;
+        let result = ScanResult {
+            processes: vec![ProcessRecord {
+                pid: pt_common::ProcessId(pid),
+                ppid: pt_common::ProcessId(1),
+                uid: 1000,
+                user: "test".to_string(),
+                pgid: None,
+                sid: None,
+                start_id: StartId::from_linux("goal-test", 1, pid),
+                comm: "unavailable-worker".to_string(),
+                cmd: "unavailable-worker".to_string(),
+                state: ProcessState::Sleeping,
+                cpu_percent: 0.0,
+                rss_bytes: 1024 * 1024 * MIB,
+                vsz_bytes: 1024 * 1024 * MIB,
+                tty: None,
+                start_time_unix: 0,
+                elapsed: Duration::from_secs(7200),
+                source: "fixture".to_string(),
+                container_info: None,
+            }],
+            metadata: pt_core::collect::ScanMetadata {
+                scan_type: "quick".to_string(),
+                platform: std::env::consts::OS.to_string(),
+                boot_id: None,
+                started_at: "1970-01-01T00:00:00Z".to_string(),
+                duration_ms: 1,
+                process_count: 1,
+                warnings: Vec::new(),
+            },
+        };
+        let goal_str = "free 100MB RAM";
+        let advisory =
+            build_goal_advisory_from_scan(goal_str, &parse_goal(goal_str).unwrap(), &result);
+        assert_eq!(advisory["basis"], "inventory_without_action_selection");
+        assert_eq!(advisory["achievements"][0]["achieved"], 0.0);
+        assert_eq!(advisory["achievements"][0]["shortfall"], 100.0);
+        assert_eq!(advisory["achievements"][0]["met"], false);
+        assert!(advisory["observed_resources"]["private_memory_bytes"].is_null());
+        assert!(advisory["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning == "scan_only_no_action_selection"));
     }
 
     #[test]
@@ -6122,12 +6509,16 @@ mod executable_goal_tests {
         let goal_str = "free 100MB RAM";
         let goal = parse_goal(goal_str).unwrap();
         let (mut candidates, mut plan) = fixture(&[(100, 60, 0.0), (200, 60, 0.0)]);
+        let resources = memory_resources(&plan, &[(100, 60 * MIB), (200, 60 * MIB)]);
+        // Large display footprints cannot increase either measured contribution.
+        candidates[0]["memory_mb"] = serde_json::json!(1_000_000);
+        candidates[1]["memory_mb"] = serde_json::json!(1_000_000);
         let preliminary = build_goal_plan_from_candidates(
             goal_str,
             &goal,
             0.0,
             &candidates,
-            &GoalResourceSnapshot::default(),
+            &resources,
         )
         .unwrap();
         assert!(preliminary.result.feasible);
@@ -6141,7 +6532,7 @@ mod executable_goal_tests {
             0.0,
             &mut candidates,
             &plan,
-            &GoalResourceSnapshot::default(),
+            &resources,
         )
         .unwrap();
         let summary = goal_summary_json(goal_str, &goal, &output);
@@ -6161,7 +6552,7 @@ mod executable_goal_tests {
             0.0,
             &mut candidates,
             &plan,
-            &GoalResourceSnapshot::default(),
+            &resources,
         )
         .unwrap();
         assert!(!output.result.feasible);
@@ -6175,6 +6566,7 @@ mod executable_goal_tests {
         let goal = parse_goal(goal_str).unwrap();
         for case in 0..8 {
             let (mut candidates, mut plan) = fixture(&[(100, 1000, 0.0)]);
+            let resources = memory_resources(&plan, &[(100, 1000 * MIB)]);
             match case {
                 0 => candidates[0]["start_id"] = serde_json::json!("reused-pid"),
                 1 => plan.actions[0].target.start_id = StartId("reused-pid".to_string()),
@@ -6192,7 +6584,7 @@ mod executable_goal_tests {
                 0.0,
                 &mut candidates,
                 &plan,
-                &GoalResourceSnapshot::default(),
+                &resources,
             )
             .unwrap();
             assert!(!output.result.feasible, "case={case}");
@@ -6225,14 +6617,15 @@ mod executable_goal_tests {
         assert!(!goal_requires_cpu_baseline(&memory));
         assert!(build_resource_goals(&memory, f64::NAN, &GoalResourceSnapshot::default()).is_ok());
 
-        let (candidates, _) = fixture(&[(100, 1000, 0.0)]);
+        let (candidates, plan) = fixture(&[(100, 1000, 0.0)]);
+        let resources = memory_resources(&plan, &[(100, 1000 * MIB)]);
         let alternative = Goal::Or(vec![goal.clone(), memory.clone()]);
         let output = build_goal_plan_from_candidates(
             "CPU or memory",
             &alternative,
             f64::NAN,
             &candidates,
-            &GoalResourceSnapshot::default(),
+            &resources,
         )
         .unwrap();
         assert!(output.result.feasible);
@@ -6358,11 +6751,6 @@ fn build_goal_advisory_from_scan(
     goal: &Goal,
     result: &ScanResult,
 ) -> serde_json::Value {
-    let total_mem_mb: f64 = result
-        .processes
-        .iter()
-        .map(|p| p.rss_bytes as f64 / (1024.0 * 1024.0))
-        .sum();
     // A one-shot inventory has no host or per-process counter interval. Lifetime
     // percentages cannot establish current utilization or attainable CPU relief.
     let total_cpu_pct = f64::NAN;
@@ -6379,15 +6767,24 @@ fn build_goal_advisory_from_scan(
         }
     };
     warnings.extend(resources.warnings.iter().cloned());
+    warnings.push("scan_only_no_action_selection".to_string());
+    let observed_private_memory_bytes = if resources.private_memory.is_empty() {
+        None
+    } else {
+        resources
+            .private_memory
+            .values()
+            .try_fold(0_u64, |total, observed| {
+                total.checked_add(resources.private_memory_bytes(&observed.identity).ok()?)
+            })
+    };
 
     let achievements: Vec<serde_json::Value> = goals
         .iter()
         .map(|g| {
-            let achieved = match g.resource.as_str() {
-                "memory_mb" => total_mem_mb,
-                "cpu_pct" => 0.0,
-                _ => 0.0,
-            };
+            // A process inventory has selected no policy-eligible action. Its
+            // footprint cannot be reported as an achieved recovery goal.
+            let achieved = 0.0_f64;
             serde_json::json!({
                 "resource": g.resource,
                 "target": g.target,
@@ -6401,6 +6798,14 @@ fn build_goal_advisory_from_scan(
     serde_json::json!({
         "goal": goal_str,
         "parsed": goal.canonical(),
+        "basis": "inventory_without_action_selection",
+        "observed_resources": {
+            "memory_basis": "private_clean_plus_private_dirty",
+            "private_memory_bytes": observed_private_memory_bytes,
+            "private_memory_processes": resources.private_memory.len(),
+            "census_processes": result.processes.len(),
+            "guaranteed_recovery": false,
+        },
         "achievements": achievements,
         "warnings": warnings,
     })
@@ -14372,7 +14777,7 @@ mod process_tree_safety_tests {
     mod tui_goals {
         use super::rec;
         use crate::*;
-        use pt_core::decision::goal_contribution::PortGoalResources;
+        use pt_core::decision::goal_contribution::{PortGoalResources, ProcessPrivateMemory};
         use pt_core::inference::ClassScores;
 
         struct Fixture {
@@ -14455,6 +14860,26 @@ mod process_tree_safety_tests {
                 fixture
             }
 
+            fn measured_private_memory(&self, measurements: &[(u32, u64)]) -> GoalResourceSnapshot {
+                GoalResourceSnapshot {
+                    private_memory: measurements
+                        .iter()
+                        .map(|&(pid, bytes)| {
+                            (
+                                pid,
+                                ProcessPrivateMemory {
+                                    identity: self.inputs[&pid].identity.clone(),
+                                    private_clean_bytes: 0,
+                                    private_dirty_bytes: bytes,
+                                    private_hugetlb_bytes: None,
+                                },
+                            )
+                        })
+                        .collect(),
+                    ..Default::default()
+                }
+            }
+
             fn optimize(
                 &mut self,
                 goal: &str,
@@ -14486,9 +14911,11 @@ mod process_tree_safety_tests {
                 (100, 1, 1, ProcessState::Sleeping),
                 (200, 1, 1000, ProcessState::Sleeping),
             ]);
+            let resources =
+                fixture.measured_private_memory(&[(100, 1024 * 1024), (200, 1000 * 1024 * 1024)]);
             fixture.policy.guardrails.max_kills_per_run = 1;
             let output = fixture
-                .optimize("free 100MB RAM", 0.0, &GoalResourceSnapshot::default())
+                .optimize("free 100MB RAM", 0.0, &resources)
                 .unwrap();
             assert!(output.result.feasible);
             assert_eq!(output.selected_pids, [200]);
@@ -14516,8 +14943,10 @@ mod process_tree_safety_tests {
                 (100, 1, 1000, ProcessState::Zombie),
                 (200, 1, 100, ProcessState::Sleeping),
             ]);
+            let resources = fixture
+                .measured_private_memory(&[(100, 1000 * 1024 * 1024), (200, 100 * 1024 * 1024)]);
             let output = fixture
-                .optimize("free 50MB RAM", 0.0, &GoalResourceSnapshot::default())
+                .optimize("free 50MB RAM", 0.0, &resources)
                 .unwrap();
             assert!(output.result.feasible);
             assert_eq!(output.selected_pids, [200]);
@@ -14534,8 +14963,10 @@ mod process_tree_safety_tests {
                 (100, 1, 1000, ProcessState::Sleeping),
                 (200, 100, 100, ProcessState::Sleeping),
             ]);
+            let resources = fixture
+                .measured_private_memory(&[(100, 1000 * 1024 * 1024), (200, 100 * 1024 * 1024)]);
             let output = fixture
-                .optimize("free 100MB RAM", 0.0, &GoalResourceSnapshot::default())
+                .optimize("free 100MB RAM", 0.0, &resources)
                 .unwrap();
             assert_eq!(output.selected_pids, [200]);
             assert_eq!(
@@ -14546,6 +14977,19 @@ mod process_tree_safety_tests {
             let plan = fixture.executable(&[100, 200]);
             assert_eq!(plan.actions.len(), 1);
             assert_eq!(plan.actions[0].target.pid.0, 200);
+        }
+
+        #[test]
+        fn missing_private_memory_does_not_select_tui_rss_for_recovery() {
+            let mut fixture = Fixture::new(&[(100, 1, 8192, ProcessState::Sleeping)]);
+            let output = fixture
+                .optimize("free 50MB RAM", 0.0, &GoalResourceSnapshot::default())
+                .unwrap();
+            assert!(!output.result.feasible);
+            assert!(output.selected_pids.is_empty());
+            assert_eq!(output.result.total_contributions, [0.0]);
+            assert!(fixture.rows.iter().all(|row| !row.selected));
+            assert!(fixture.executable(&output.selected_pids).actions.is_empty());
         }
 
         #[test]
@@ -17715,7 +18159,7 @@ fn generate_narrative_summary(
     kill_candidates: &[u32],
     review_candidates: &[u32],
     total_scanned: usize,
-    expected_memory_freed_gb: f64,
+    expected_memory_freed_gb: Option<f64>,
 ) -> String {
     let mut output = String::new();
 
@@ -17742,11 +18186,15 @@ fn generate_narrative_summary(
 
     // Recommendations summary
     if !kill_candidates.is_empty() {
+        let memory = expected_memory_freed_gb.map_or_else(
+            || "private-memory recovery estimate unavailable".to_string(),
+            |gib| format!("{gib:.2} GiB measured private footprint; recovery is a forecast"),
+        );
         output.push_str(&format!(
-            "KILL RECOMMENDED: {} process{} ({:.2} GB memory recoverable)\n",
+            "KILL RECOMMENDED: {} process{} ({})\n",
             kill_candidates.len(),
             if kill_candidates.len() == 1 { "" } else { "es" },
-            expected_memory_freed_gb
+            memory
         ));
     }
     if !review_candidates.is_empty() {
@@ -21240,9 +21688,45 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         .map(|action| action.target.pid.0)
         .collect();
     let executable_kill_pids: HashSet<u32> = kill_candidates.iter().copied().collect();
+    if !parsed_goal
+        .as_ref()
+        .is_some_and(|goal| goal_requests_metric(goal, Metric::Memory))
+    {
+        // Plans without a memory goal need only measure their final kill
+        // targets. Memory-goal plans retain the exact evidence used to select
+        // their actions so the top-level estimate agrees with the forecast.
+        let targets: Vec<ProcessRecord> = scan_result
+            .processes
+            .iter()
+            .filter(|process| {
+                executable_kill_pids.contains(&process.pid.0)
+                    && action_plan.actions.iter().any(|action| {
+                        action.action == Action::Kill
+                            && !action.blocked
+                            && action.target.pid == process.pid
+                            && action.target.start_id == process.start_id
+                            && action.target.uid == process.uid
+                    })
+            })
+            .cloned()
+            .collect();
+        if !targets.is_empty() {
+            let memory_goal = Goal::Target(ResourceTarget {
+                metric: Metric::Memory,
+                value: 0.0,
+                comparator: Comparator::FreeAtLeast,
+                port: None,
+            });
+            let measured = GoalResourceSnapshot::collect(&memory_goal, &targets);
+            goal_resources.private_memory = measured.private_memory;
+            goal_resources.warnings.extend(measured.warnings);
+            attach_goal_resource_observations(&mut candidates, &goal_resources);
+        }
+    }
+    let expected_memory_freed_gb = expected_private_memory_for_kills(&action_plan, &goal_resources)
+        .map(|bytes| bytes as f64 / (1024.0 * 1024.0 * 1024.0));
     let mut review_candidates: Vec<u32> = Vec::new();
     let mut spare_candidates: Vec<u32> = Vec::new();
-    let mut expected_memory_freed_bytes: u64 = 0;
     // Goal-selected processes whose own recommendation is not `kill` (policy block,
     // agent force-review, tree safety, or simply not confident enough) need a human:
     // a goal must never bypass per-candidate safety.
@@ -21250,14 +21734,11 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     for candidate in &candidates {
         let pid = candidate["pid"].as_u64().unwrap_or(0) as u32;
         let action = candidate["recommended_action"].as_str().unwrap_or("");
-        let memory_mb = candidate["memory_mb"].as_u64().unwrap_or(0);
         let selected_by_goal = goal_selected
             .as_ref()
             .map(|selected| selected.contains(&pid))
             .unwrap_or(false);
-        if action == "kill" && executable_kill_pids.contains(&pid) {
-            expected_memory_freed_bytes += memory_mb * 1024 * 1024;
-        } else if action == "review" {
+        if action == "review" {
             review_candidates.push(pid);
         } else if action == "keep" {
             spare_candidates.push(pid);
@@ -21266,7 +21747,6 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             goal_selected_needing_review.push(pid);
         }
     }
-    let expected_memory_freed_gb = (expected_memory_freed_bytes as f64) / 1024.0 / 1024.0 / 1024.0;
 
     // Collect host information
     let host_info = collect_host_info();
@@ -21346,7 +21826,20 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         "kill_set": kill_candidates,
         "review_set": review_candidates,
         "spare_set": spare_candidates,
-        "expected_memory_freed_gb": (expected_memory_freed_gb * 100.0).round() / 100.0,
+        "expected_memory_freed_gb": expected_memory_freed_gb.map(|gib| (gib * 100.0).round() / 100.0),
+        "expected_memory_basis": "private_clean_plus_private_dirty",
+        "expected_memory_unit": "GiB",
+        "expected_memory_is_guaranteed": false,
+        "memory_observations": goal_resources.private_memory.values().filter(|observed| {
+            action_plan.actions.iter().any(|action| {
+                action.action == Action::Kill && !action.blocked
+                    && observed.identity.matches(&action.target)
+                    && goal_resources.private_memory_bytes(&action.target).is_ok()
+            })
+        }).collect::<Vec<_>>(),
+        "memory_observation_warnings": goal_resources.warnings.iter().filter(|warning| {
+            warning.starts_with("private_memory") || warning.as_str() == "goal_resource_identity_unavailable"
+        }).collect::<Vec<_>>(),
         "kill_set_fdr_estimate": kill_set_fdr_estimate,
     });
     if let Some(goal) = &goal_summary {
