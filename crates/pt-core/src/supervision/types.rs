@@ -24,6 +24,14 @@ pub enum SupervisorCategory {
     Other,
 }
 
+impl SupervisorCategory {
+    /// Human and automation workflows require confirmation even when an
+    /// independent orchestrator signal has higher confidence.
+    pub fn requires_human_confirmation(self) -> bool {
+        self != Self::Orchestrator
+    }
+}
+
 impl std::fmt::Display for SupervisorCategory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
@@ -55,6 +63,10 @@ pub struct AncestryEntry {
 pub struct SupervisionResult {
     /// Whether the process is supervised.
     pub is_supervised: bool,
+    /// Whether any observed ancestor requires human confirmation, independently
+    /// of the nearest supervisor retained for diagnostics.
+    #[serde(default)]
+    pub human_supervised: bool,
     /// The supervisor type if detected.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supervisor_type: Option<SupervisorCategory>,
@@ -81,6 +93,7 @@ impl SupervisionResult {
     pub fn not_supervised(ancestry_chain: Vec<AncestryEntry>) -> Self {
         Self {
             is_supervised: false,
+            human_supervised: false,
             supervisor_type: None,
             supervisor_name: None,
             supervisor_pid: None,
@@ -103,6 +116,7 @@ impl SupervisionResult {
     ) -> Self {
         Self {
             is_supervised: true,
+            human_supervised: supervisor_type.requires_human_confirmation(),
             supervisor_type: Some(supervisor_type),
             supervisor_name: Some(supervisor_name),
             supervisor_pid: Some(supervisor_pid),

@@ -172,21 +172,25 @@ impl CombinedResult {
 /// Returns true if supervision should require human confirmation.
 ///
 /// We treat AI agents, IDEs, CI, and terminal multiplexers as human-supervised
-/// contexts that should never be auto-acted on in robot mode.
+/// contexts that should never be auto-acted on in robot mode. The primary
+/// supervisor is only a diagnostic ranking: a stronger or equal-confidence
+/// orchestrator cannot cancel independent evidence requiring confirmation.
 pub fn is_human_supervised(result: &CombinedResult) -> bool {
-    if !result.is_supervised {
-        return false;
-    }
-
-    match result.supervisor_type {
-        Some(SupervisorCategory::Agent)
-        | Some(SupervisorCategory::Ide)
-        | Some(SupervisorCategory::Ci)
-        | Some(SupervisorCategory::Terminal)
-        | Some(SupervisorCategory::Other)
-        | None => true,
-        Some(SupervisorCategory::Orchestrator) => false,
-    }
+    let requires_confirmation = |supervised: bool, category: Option<SupervisorCategory>| {
+        supervised && category.is_none_or(SupervisorCategory::requires_human_confirmation)
+    };
+    requires_confirmation(result.is_supervised, result.supervisor_type)
+        || result.ancestry.as_ref().is_some_and(|ancestry| {
+            ancestry.human_supervised
+                || requires_confirmation(ancestry.is_supervised, ancestry.supervisor_type)
+        })
+        || result.environ.as_ref().is_some_and(|environ| {
+            environ.human_supervised
+                || requires_confirmation(environ.is_supervised, environ.category)
+        })
+        || result.ipc.as_ref().is_some_and(|ipc| {
+            ipc.human_supervised || requires_confirmation(ipc.is_supervised, ipc.category)
+        })
 }
 
 /// Combined supervision detector using all available methods.
@@ -381,6 +385,112 @@ mod tests {
         assert!(!result.is_supervised);
         assert!(result.supervisor_name.is_none());
         assert!(result.evidence.is_empty());
+    }
+
+    fn combined_orchestrator() -> CombinedResult {
+        let mut result = CombinedResult::not_supervised();
+        result.is_supervised = true;
+        result.supervisor_name = Some("systemd".to_string());
+        result.supervisor_type = Some(SupervisorCategory::Orchestrator);
+        result.confidence = 0.95;
+        result.ancestry = Some(SupervisionResult::supervised_by_ancestry(
+            SupervisorCategory::Orchestrator,
+            "systemd".to_string(),
+            pt_common::ProcessId(1),
+            1,
+            0.95,
+            Vec::new(),
+            Vec::new(),
+        ));
+        result
+    }
+
+    #[test]
+    fn human_signals_survive_stronger_and_equal_orchestrator_evidence() {
+        for (name, value) in [
+            ("CLAUDECODE", "1"),
+            ("CODEX_SESSION_ID", "owned-session"),
+            ("VSCODE_PID", "42"),
+            ("CI", "true"),
+            ("TMUX", "/tmp/tmux-1000/default,42,0"),
+        ] {
+            let environment = std::collections::HashMap::from([(
+                name.to_string(),
+                value.to_string(),
+            )]);
+            let mut result = combined_orchestrator();
+            result.environ = Some(EnvironAnalyzer::new().analyze_env(&environment));
+            assert!(
+                is_human_supervised(&result),
+                "independent {name} evidence cannot be canceled: {result:?}"
+            );
+            assert_eq!(result.supervisor_type, Some(SupervisorCategory::Orchestrator));
+            assert_eq!(result.confidence, 0.95);
+        }
+    }
+
+    #[test]
+    fn human_ipc_survives_an_orchestrator_environment() {
+        let mut result = combined_orchestrator();
+        let environment = std::collections::HashMap::from([(
+            "XPC_SERVICE_NAME".to_string(),
+            "com.example.service".to_string(),
+        )]);
+        result.environ = Some(EnvironAnalyzer::new().analyze_env(&environment));
+        result.ipc = Some(IpcAnalyzer::new().analyze_sockets(&[
+            "/run/user/1000/systemd/private".to_string(),
+            "/tmp/tmux-1000/default".to_string(),
+        ]));
+        assert!(is_human_supervised(&result));
+        assert_eq!(
+            result.ipc.as_ref().unwrap().category,
+            Some(SupervisorCategory::Orchestrator)
+        );
+        assert_eq!(result.supervisor_type, Some(SupervisorCategory::Orchestrator));
+    }
+
+    #[test]
+    fn legacy_ancestry_human_categories_remain_protected() {
+        let ancestry = SupervisionResult::supervised_by_ancestry(
+            SupervisorCategory::Agent,
+            "claude".to_string(),
+            pt_common::ProcessId(42),
+            1,
+            0.95,
+            Vec::new(),
+            vec![AncestryEntry {
+                pid: pt_common::ProcessId(42),
+                comm: "claude".to_string(),
+                cmdline: None,
+            }],
+        );
+        let mut encoded = serde_json::to_value(ancestry).unwrap();
+        encoded.as_object_mut().unwrap().remove("human_supervised");
+        let decoded: SupervisionResult = serde_json::from_value(encoded).unwrap();
+        assert!(!decoded.human_supervised);
+        let mut result = combined_orchestrator();
+        result.ancestry = Some(decoded);
+        assert!(is_human_supervised(&result));
+    }
+
+    #[test]
+    fn pure_orchestrators_preserve_supervisor_aware_routing() {
+        let mut result = combined_orchestrator();
+        let environment = std::collections::HashMap::from([(
+            "XPC_SERVICE_NAME".to_string(),
+            "com.example.service".to_string(),
+        )]);
+        result.environ = Some(EnvironAnalyzer::new().analyze_env(&environment));
+        result.ipc = Some(
+            IpcAnalyzer::new().analyze_sockets(&["/run/user/1000/systemd/private".to_string()]),
+        );
+        assert!(!is_human_supervised(&result));
+        assert!(!is_human_supervised(&CombinedResult::not_supervised()));
+
+        // A positive supervision result with no classified category still needs
+        // confirmation; aggregation must not turn incomplete evidence into permission.
+        result.supervisor_type = None;
+        assert!(is_human_supervised(&result));
     }
 
     #[cfg(target_os = "linux")]

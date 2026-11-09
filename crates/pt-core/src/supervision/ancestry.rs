@@ -232,6 +232,7 @@ impl AncestryAnalyzer {
             return Err(AncestryError::ProcessNotFound(pid));
         }
         let mut ancestry_chain = Vec::new();
+        let mut result = SupervisionResult::not_supervised(Vec::new());
         let mut current_pid = pid;
         let mut visited = std::collections::HashSet::new();
         let mut depth = 0u32;
@@ -268,36 +269,47 @@ impl AncestryAnalyzer {
                 cmdline,
             });
 
-            // Check for supervisor match (skip the first entry - that's the process itself)
+            // Keep the nearest match for diagnostics, but an orchestrator can
+            // itself be running inside an agent, IDE, CI or terminal workflow.
+            // Continue until human supervision is found or the root is observed.
             if depth > 0 {
                 let matches = self.config.database.find_matches(&comm);
                 if let Some(pattern) = matches.first() {
-                    // Found a supervisor in ancestry
-                    let evidence = vec![SupervisionEvidence {
-                        evidence_type: EvidenceType::Ancestry,
-                        description: format!(
-                            "Ancestor PID {} ({}) matches supervisor pattern '{}'",
-                            current_pid, comm, pattern.name
-                        ),
-                        weight: pattern.confidence_weight,
-                    }];
-
-                    return Ok(SupervisionResult::supervised_by_ancestry(
-                        pattern.category,
-                        pattern.name.clone(),
-                        ProcessId(current_pid),
-                        depth,
-                        pattern.confidence_weight,
-                        evidence,
-                        ancestry_chain,
-                    ));
+                    if !result.is_supervised {
+                        result = SupervisionResult::supervised_by_ancestry(
+                            pattern.category,
+                            pattern.name.clone(),
+                            ProcessId(current_pid),
+                            depth,
+                            pattern.confidence_weight,
+                            Vec::new(),
+                            Vec::new(),
+                        );
+                    }
+                    for pattern in matches {
+                        result.human_supervised |= pattern.category.requires_human_confirmation();
+                        result.evidence.push(SupervisionEvidence {
+                            evidence_type: EvidenceType::Ancestry,
+                            description: format!(
+                                "Ancestor PID {} ({}) matches supervisor pattern '{}'",
+                                current_pid, comm, pattern.name
+                            ),
+                            weight: pattern.confidence_weight,
+                        });
+                    }
+                    if result.human_supervised {
+                        result.ancestry_chain = ancestry_chain;
+                        return Ok(result);
+                    }
                 }
             }
 
-            // Move to parent
+            // Move to parent. An orchestrator match alone cannot establish the
+            // absence of a human supervisor above an unreadable/truncated chain.
             let ppid = stat.ppid;
             if ppid == 0 {
-                return Ok(SupervisionResult::not_supervised(ancestry_chain));
+                result.ancestry_chain = ancestry_chain;
+                return Ok(result);
             }
             if ppid == current_pid {
                 return Err(AncestryError::LoopDetected(current_pid));
@@ -461,6 +473,157 @@ mod tests {
         assert!(!result.is_supervised);
         assert_eq!(result.ancestry_chain.len(), 1);
         assert_eq!(result.ancestry_chain[0].pid.0, 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    struct OwnedSupervisorTree {
+        root: std::process::Child,
+        target: u32,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl OwnedSupervisorTree {
+        fn spawn() -> Self {
+            use std::io::BufRead;
+            use std::os::unix::process::CommandExt;
+            use std::process::{Command, Stdio};
+
+            let mut command = Command::new("/bin/sh");
+            command
+                .args([
+                    "-c",
+                    r#"set -eu
+printf '%s' claude > /proc/self/comm
+/bin/sh -c '
+set -eu
+printf "%s" systemd > /proc/self/comm
+/bin/sleep 60 &
+target=$!
+printf "%s\n" "$target"
+wait "$target"
+' &
+wait "$!"
+"#,
+                ])
+                .env_clear()
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            // SAFETY: setsid is async-signal-safe and creates a group containing
+            // only this owned fixture tree, so cleanup cannot signal the runner.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
+            let mut tree = Self {
+                root: command.spawn().expect("spawn owned supervisor tree"),
+                target: 0,
+            };
+            let stdout = tree.root.stdout.take().expect("owned tree output");
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                let mut line = String::new();
+                let result = std::io::BufReader::new(stdout)
+                    .read_line(&mut line)
+                    .map(|_| line);
+                let _ = sender.send(result);
+            });
+            let line = receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("owned tree must report its target promptly")
+                .expect("read owned target PID");
+            reader.join().expect("target reader");
+            tree.target = line.trim().parse().expect("owned target PID");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let stat = read_stat(tree.target).expect("owned target stays alive");
+                if stat.comm == "sleep" {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "owned target must finish exec before supervision is observed"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            tree
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for OwnedSupervisorTree {
+        fn drop(&mut self) {
+            // SAFETY: spawn created this exclusive process group and its leader
+            // remains our unreaped child. Every member is an owned test process.
+            unsafe {
+                libc::kill(-(self.root.id() as libc::pid_t), libc::SIGKILL);
+            }
+            let _ = self.root.wait();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inner_orchestrator_cannot_hide_an_outer_agent() {
+        use crate::action::prechecks::{
+            LivePreCheckConfig, LivePreCheckProvider, PreCheckProvider, PreCheckResult,
+        };
+        use crate::plan::PreCheck;
+        use crate::supervision::{detect_supervision, is_human_supervised, SupervisorCategory};
+
+        let tree = OwnedSupervisorTree::spawn();
+        let inner_pid = read_stat(tree.target).unwrap().ppid;
+        let inner = read_stat(inner_pid).unwrap();
+        assert_eq!(inner.comm, "systemd");
+        assert_eq!(inner.ppid, tree.root.id());
+        assert_eq!(read_stat(tree.root.id()).unwrap().comm, "claude");
+
+        let result = AncestryAnalyzer::new().analyze(tree.target).unwrap();
+        assert_eq!(result.supervisor_name.as_deref(), Some("systemd"));
+        assert_eq!(result.supervisor_type, Some(SupervisorCategory::Orchestrator));
+        assert_eq!(result.supervisor_pid, Some(ProcessId(inner_pid)));
+        assert_eq!(result.depth, Some(1));
+        assert!(result.human_supervised);
+        assert_eq!(result.ancestry_chain.last().unwrap().pid.0, tree.root.id());
+        assert!(result
+            .evidence
+            .iter()
+            .any(|entry| entry.description.contains("claude")));
+
+        let combined = detect_supervision(tree.target).unwrap();
+        assert_eq!(
+            combined.supervisor_type,
+            Some(SupervisorCategory::Orchestrator)
+        );
+        assert!(is_human_supervised(&combined));
+        let provider = LivePreCheckProvider::new(None, LivePreCheckConfig::default());
+        assert!(matches!(
+            provider.check_agent_supervision(tree.target),
+            PreCheckResult::Blocked {
+                check: PreCheck::CheckAgentSupervision,
+                ..
+            }
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn orchestrator_match_cannot_authorize_a_truncated_ancestry() {
+        let tree = OwnedSupervisorTree::spawn();
+        let mut analyzer = AncestryAnalyzer::with_config(AncestryConfig {
+            max_depth: 2,
+            include_cmdline: false,
+            ..AncestryConfig::default()
+        });
+        assert!(matches!(
+            analyzer.analyze(tree.target),
+            Err(AncestryError::DepthLimit { pid, depth: 2 }) if pid == tree.target
+        ));
     }
 
     #[cfg(target_os = "linux")]

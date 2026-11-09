@@ -75,6 +75,9 @@ impl EnvPattern {
 pub struct EnvironResult {
     /// Whether supervision was detected via environment.
     pub is_supervised: bool,
+    /// Whether any matching variable identifies a human-supervised context,
+    /// independently of the highest-confidence diagnostic match.
+    pub human_supervised: bool,
     /// Detected supervisor name (if any).
     pub supervisor_name: Option<String>,
     /// Detected supervisor category (if any).
@@ -92,6 +95,7 @@ impl EnvironResult {
     pub fn not_supervised() -> Self {
         Self {
             is_supervised: false,
+            human_supervised: false,
             supervisor_name: None,
             category: None,
             confidence: 0.0,
@@ -110,6 +114,7 @@ impl EnvironResult {
     ) -> Self {
         Self {
             is_supervised: true,
+            human_supervised: category.requires_human_confirmation(),
             supervisor_name: Some(name),
             category: Some(category),
             confidence,
@@ -470,13 +475,17 @@ impl EnvironAnalyzer {
             .map(|(p, v)| (p.var_name.clone(), v.clone()))
             .collect();
 
-        EnvironResult::supervised(
+        let mut result = EnvironResult::supervised(
             best.0.supervisor_name.clone(),
             best.0.category,
             best.0.confidence,
             evidence,
             matched_vars,
-        )
+        );
+        result.human_supervised = matches
+            .iter()
+            .any(|(pattern, _)| pattern.category.requires_human_confirmation());
+        result
     }
 }
 
@@ -672,6 +681,46 @@ mod tests {
         assert!(result.is_supervised);
         assert_eq!(result.supervisor_name, Some("launchd".to_string()));
         assert_eq!(result.category, Some(SupervisorCategory::Orchestrator));
+    }
+
+    #[test]
+    fn launchd_environment_cannot_mask_human_supervision() {
+        let analyzer = EnvironAnalyzer::new();
+        for (name, value) in [
+            ("CLAUDECODE", "1"),
+            ("CODEX_SESSION_ID", "owned-session"),
+            ("VSCODE_PID", "12345"),
+            ("CI", "true"),
+            ("TMUX", "/tmp/tmux-1000/default,42,0"),
+        ] {
+            let env = HashMap::from([
+                ("XPC_SERVICE_NAME".to_string(), "com.example.service".to_string()),
+                (name.to_string(), value.to_string()),
+            ]);
+            let result = analyzer.analyze_env(&env);
+            assert_eq!(
+                result.category,
+                Some(SupervisorCategory::Orchestrator),
+                "the existing strongest diagnostic match must be retained for {name}"
+            );
+            assert_eq!(result.supervisor_name.as_deref(), Some("launchd"));
+            assert_eq!(result.confidence, 0.95);
+            assert!(
+                result.human_supervised,
+                "{name} must still require confirmation: {result:?}"
+            );
+            assert_eq!(result.matched_vars.len(), 2);
+            assert_eq!(result.evidence.len(), 2);
+        }
+
+        let env = HashMap::from([(
+            "XPC_SERVICE_NAME".to_string(),
+            "com.example.service".to_string(),
+        )]);
+        let orchestrator = analyzer.analyze_env(&env);
+        assert!(orchestrator.is_supervised);
+        assert!(!orchestrator.human_supervised);
+        assert!(!analyzer.analyze_env(&HashMap::new()).human_supervised);
     }
 
     #[test]

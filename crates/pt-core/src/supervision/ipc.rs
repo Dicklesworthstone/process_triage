@@ -111,6 +111,9 @@ impl IpcPattern {
 pub struct IpcResult {
     /// Whether supervision was detected via IPC.
     pub is_supervised: bool,
+    /// Whether any matched socket identifies a human-supervised context,
+    /// independently of the highest-confidence diagnostic match.
+    pub human_supervised: bool,
     /// Detected supervisor name (if any).
     pub supervisor_name: Option<String>,
     /// Detected supervisor category (if any).
@@ -128,6 +131,7 @@ impl IpcResult {
     pub fn not_supervised() -> Self {
         Self {
             is_supervised: false,
+            human_supervised: false,
             supervisor_name: None,
             category: None,
             confidence: 0.0,
@@ -146,6 +150,7 @@ impl IpcResult {
     ) -> Self {
         Self {
             is_supervised: true,
+            human_supervised: category.requires_human_confirmation(),
             supervisor_name: Some(name),
             category: Some(category),
             confidence,
@@ -613,10 +618,12 @@ impl IpcAnalyzer {
         let mut best_match: Option<(&IpcPattern, &str)> = None;
         let mut all_evidence = Vec::new();
         let mut matched_sockets = Vec::new();
+        let mut human_supervised = false;
 
         for socket in sockets {
             let matches = self.database.find_matches(socket);
             for pattern in matches {
+                human_supervised |= pattern.category.requires_human_confirmation();
                 all_evidence.push(SupervisionEvidence {
                     evidence_type: EvidenceType::Socket,
                     description: format!(
@@ -639,13 +646,15 @@ impl IpcAnalyzer {
         }
 
         if let Some((pattern, _)) = best_match {
-            IpcResult::supervised(
+            let mut result = IpcResult::supervised(
                 pattern.supervisor_name.clone(),
                 pattern.category,
                 pattern.confidence,
                 all_evidence,
                 matched_sockets,
-            )
+            );
+            result.human_supervised = human_supervised;
+            result
         } else {
             IpcResult::not_supervised()
         }
@@ -962,6 +971,30 @@ mod tests {
         assert!(result.is_supervised);
         assert_eq!(result.supervisor_name, Some("vscode".to_string()));
         assert_eq!(result.category, Some(SupervisorCategory::Ide));
+    }
+
+    #[test]
+    fn orchestrator_socket_cannot_mask_human_supervision() {
+        let analyzer = IpcAnalyzer::new();
+        let systemd = "/run/user/1000/systemd/private".to_string();
+        let tmux = "/tmp/tmux-1000/default".to_string();
+        for sockets in [
+            vec![systemd.clone(), tmux.clone()],
+            vec![tmux, systemd.clone()],
+        ] {
+            let result = analyzer.analyze_sockets(&sockets);
+            assert_eq!(result.category, Some(SupervisorCategory::Orchestrator));
+            assert_eq!(result.supervisor_name.as_deref(), Some("systemd"));
+            assert_eq!(result.confidence, 0.60);
+            assert!(result.human_supervised, "{result:?}");
+            assert_eq!(result.matched_sockets.len(), 2);
+            assert_eq!(result.evidence.len(), 2);
+        }
+
+        let orchestrator = analyzer.analyze_sockets(&[systemd]);
+        assert!(orchestrator.is_supervised);
+        assert!(!orchestrator.human_supervised);
+        assert!(!analyzer.analyze_sockets(&[]).human_supervised);
     }
 
     #[test]
