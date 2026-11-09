@@ -1,6 +1,6 @@
 //! MCP tool implementations.
 //!
-//! Each tool maps to a pt operation: scan, explain, history, signatures, capabilities.
+//! Tools expose scanning, planning, explanations and explicit human feedback.
 
 use crate::collect::protected::{ProtectedFilter, ProtectedMatch};
 #[cfg(target_os = "linux")]
@@ -370,6 +370,68 @@ fn plan_command_args(params: &serde_json::Value) -> Result<Vec<String>, String> 
     Ok(args)
 }
 
+/// Translate an explicit human verdict to the existing learning command. The
+/// confirmation is separate from the verdict so a model's recommendation cannot
+/// silently become its own training label.
+fn label_command_args(params: &serde_json::Value) -> Result<Vec<String>, String> {
+    let object = params
+        .as_object()
+        .ok_or_else(|| "pt_label arguments must be an object".to_string())?;
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "pid" | "cmd" | "comm" | "verdict" | "confirmed_by_user"
+        ) {
+            return Err(format!("unknown pt_label argument: {key}"));
+        }
+    }
+    if params.get("confirmed_by_user").and_then(|v| v.as_bool()) != Some(true) {
+        return Err("pt_label requires confirmed_by_user=true for an explicit human verdict; do not label model recommendations automatically".to_string());
+    }
+    let verdict = match params.get("verdict").and_then(|v| v.as_str()) {
+        Some("kill") => "--kill",
+        Some("spare") => "--spare",
+        _ => return Err("verdict must be kill or spare".to_string()),
+    };
+    let mut args = vec![
+        "agent".to_string(),
+        "label".to_string(),
+        "--format".to_string(),
+        "json".to_string(),
+    ];
+    match (params.get("pid"), params.get("cmd")) {
+        (Some(value), None) => {
+            if params.get("comm").is_some() {
+                return Err("comm is only valid with cmd".to_string());
+            }
+            let pid = value
+                .as_u64()
+                .and_then(|pid| u32::try_from(pid).ok())
+                .filter(|pid| *pid > 0)
+                .ok_or_else(|| "pid must be an integer between 1 and 4294967295".to_string())?;
+            args.extend(["--pid".to_string(), pid.to_string()]);
+        }
+        (None, Some(value)) => {
+            let cmd = value
+                .as_str()
+                .filter(|cmd| !cmd.trim().is_empty() && !cmd.contains('\0'))
+                .ok_or_else(|| "cmd must be a nonempty string without NUL bytes".to_string())?;
+            // An equals argument keeps leading dashes and shell syntax as data.
+            args.push(format!("--cmd={cmd}"));
+            if let Some(value) = params.get("comm") {
+                let comm = value
+                    .as_str()
+                    .filter(|comm| !comm.trim().is_empty() && !comm.contains('\0'))
+                    .ok_or_else(|| "comm must be a nonempty string without NUL bytes".to_string())?;
+                args.push(format!("--comm={comm}"));
+            }
+        }
+        _ => return Err("pt_label requires exactly one of pid or cmd".to_string()),
+    }
+    args.push(verdict.to_string());
+    Ok(args)
+}
+
 /// Build the list of available MCP tool definitions.
 pub fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
@@ -469,6 +531,58 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "pt_label".to_string(),
+            description: "Record an explicitly user-confirmed kill/spare verdict using \
+                          the same durable learning and shadow-label path as pt agent label. \
+                          Updates future recommendations; never signals a process. \
+                          Do not record model recommendations or accepted defaults as human verdicts. \
+                          Each successful call adds one observation; do not retry a successful call."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pid": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": u32::MAX,
+                        "description": "Live process to label; records an identity-bound shadow verdict"
+                    },
+                    "cmd": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Command pattern to label instead of pid; does not invent a shadow process identity"
+                    },
+                    "comm": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Process name for cmd; defaults to the basename of the first command word"
+                    },
+                    "verdict": {
+                        "type": "string",
+                        "enum": ["kill", "spare"],
+                        "description": "The human's explicit verdict; kill is a label and does not terminate anything"
+                    },
+                    "confirmed_by_user": {
+                        "type": "boolean",
+                        "const": true,
+                        "description": "Must be true only after the user explicitly chose this verdict"
+                    }
+                },
+                "required": ["verdict", "confirmed_by_user"],
+                "oneOf": [
+                    {
+                        "required": ["pid"],
+                        "not": {"anyOf": [{"required": ["cmd"]}, {"required": ["comm"]}]}
+                    },
+                    {
+                        "required": ["cmd"],
+                        "not": {"required": ["pid"]}
+                    }
+                ],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
             name: "pt_signatures".to_string(),
             description: "List available process signatures (built-in and user-defined)."
                 .to_string(),
@@ -509,6 +623,7 @@ pub fn call_tool(name: &str, params: &serde_json::Value) -> Result<Vec<ToolConte
         "pt_scan" => tool_scan(params),
         "pt_explain" => tool_explain(params),
         "pt_plan" => tool_plan(params),
+        "pt_label" => tool_label(params),
         "pt_history" => tool_history(params),
         "pt_signatures" => tool_signatures(params),
         "pt_capabilities" => tool_capabilities(params),
@@ -693,6 +808,7 @@ fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
                 })
                 .unwrap_or_default();
             let prior_source = score.as_ref().map(|s| s.prior_source.clone());
+            let learned_prior = score.as_ref().and_then(|s| s.learned_prior.clone());
             let desktop_app = score.as_ref().and_then(|s| s.desktop_app.clone());
             let desktop_app_credited = score.as_ref().is_some_and(|s| s.desktop_app_credited);
             let posterior = score.map(|s| s.posterior.posterior);
@@ -727,6 +843,7 @@ fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
                 "suspicion_score": posterior.map(|s| s.suspicion_score()),
                 "protected": evaluator.protection(p),
                 "prior_source": prior_source,
+                "learned_prior": learned_prior,
                 "desktop_app": desktop_app,
                 "desktop_app_credited": desktop_app_credited,
                 "evidence": evidence_terms,
@@ -773,6 +890,43 @@ fn tool_plan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
         let tail: String = stderr.lines().rev().take(5).collect::<Vec<_>>().join("\n");
         return Err(format!(
             "agent plan failed (exit {:?}): {tail}",
+            output.status.code()
+        ));
+    }
+    Ok(vec![ToolContent {
+        content_type: "text".to_string(),
+        text: stdout,
+    }])
+}
+
+/// Persist through the shipped CLI so MCP uses the same locking, decay,
+/// generalization rules and identity-bound shadow events as explicit CLI labels.
+fn tool_label(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
+    let args = label_command_args(params)?;
+    let config = crate::config::resolve_config_dir(&crate::mcp::config_options())
+        .map_err(|error| format!("cannot resolve label config directory: {error}"))?;
+    let exe = std::env::current_exe().map_err(|e| format!("cannot locate pt-core: {e}"))?;
+    let output = std::process::Command::new(&exe)
+        .arg("--config")
+        .arg(config)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("failed to run agent label: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    if !output.status.success() || serde_json::from_str::<serde_json::Value>(&stdout).is_err() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let tail = stderr
+            .lines()
+            .rev()
+            .take(5)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(format!(
+            "agent label failed (exit {:?}): {tail}",
             output.status.code()
         ));
     }
@@ -1385,9 +1539,106 @@ mod tests {
     }
 
     #[test]
+    fn label_arguments_preserve_literal_commands_and_explicit_verdicts() {
+        assert_eq!(
+            label_command_args(&serde_json::json!({
+                "pid": 123,
+                "verdict": "spare",
+                "confirmed_by_user": true,
+            }))
+            .unwrap(),
+            ["agent", "label", "--format", "json", "--pid", "123", "--spare"]
+        );
+        let command = "--keep; $(touch /tmp/pt-label-must-not-execute) 'two words'";
+        assert_eq!(
+            label_command_args(&serde_json::json!({
+                "cmd": command,
+                "comm": "--literal",
+                "verdict": "kill",
+                "confirmed_by_user": true,
+            }))
+            .unwrap(),
+            vec![
+                "agent".to_string(),
+                "label".to_string(),
+                "--format".to_string(),
+                "json".to_string(),
+                format!("--cmd={command}"),
+                "--comm=--literal".to_string(),
+                "--kill".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn label_rejects_unconfirmed_or_ambiguous_feedback_before_spawning() {
+        for arguments in [
+            serde_json::json!(null),
+            serde_json::json!([]),
+            serde_json::json!({"pid": 1, "verdict": "kill"}),
+            serde_json::json!({"pid": 1, "verdict": "kill", "confirmed_by_user": false}),
+            serde_json::json!({"pid": 1, "verdict": "kill", "confirmed_by_user": "true"}),
+            serde_json::json!({"pid": 1, "verdict": "review", "confirmed_by_user": true}),
+            serde_json::json!({"pid": 1, "verdict": null, "confirmed_by_user": true}),
+            serde_json::json!({"pid": 1, "cmd": "sleep 1", "verdict": "kill", "confirmed_by_user": true}),
+            serde_json::json!({"pid": 1, "comm": "sleep", "verdict": "kill", "confirmed_by_user": true}),
+            serde_json::json!({"verdict": "spare", "confirmed_by_user": true}),
+            serde_json::json!({"cmd": "", "verdict": "spare", "confirmed_by_user": true}),
+            serde_json::json!({"cmd": " \t", "verdict": "spare", "confirmed_by_user": true}),
+            serde_json::json!({"cmd": "sleep\0", "verdict": "spare", "confirmed_by_user": true}),
+            serde_json::json!({"cmd": "sleep 1", "comm": "", "verdict": "spare", "confirmed_by_user": true}),
+            serde_json::json!({"cmd": "sleep 1", "comm": null, "verdict": "spare", "confirmed_by_user": true}),
+            serde_json::json!({"cmd": "sleep 1", "verdict": "spare", "confirmed_by_user": true, "apply": true}),
+        ] {
+            assert!(call_tool("pt_label", &arguments).is_err(), "{arguments}");
+        }
+        for pid in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(u64::MAX),
+            serde_json::json!(0.5),
+            serde_json::json!("123"),
+            serde_json::Value::Null,
+        ] {
+            let error = call_tool(
+                "pt_label",
+                &serde_json::json!({
+                    "pid": pid,
+                    "verdict": "kill",
+                    "confirmed_by_user": true,
+                }),
+            )
+            .unwrap_err();
+            assert!(error.contains("pid"), "{error}");
+        }
+    }
+
+    #[test]
+    fn label_schema_requires_a_human_verdict_and_one_target() {
+        let definitions = tool_definitions();
+        let label = definitions
+            .iter()
+            .find(|tool| tool.name == "pt_label")
+            .unwrap();
+        let schema = &label.input_schema;
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["verdict", "confirmed_by_user"])
+        );
+        assert_eq!(schema["properties"]["confirmed_by_user"]["const"], true);
+        assert_eq!(
+            schema["properties"]["verdict"]["enum"],
+            serde_json::json!(["kill", "spare"])
+        );
+        assert_eq!(schema["oneOf"].as_array().unwrap().len(), 2);
+        assert_eq!(schema["additionalProperties"], false);
+        assert!(label.description.contains("never signals"));
+    }
+
+    #[test]
     fn tool_definitions_count() {
         let defs = tool_definitions();
-        assert_eq!(defs.len(), 6);
+        assert_eq!(defs.len(), 7);
     }
 
     #[test]

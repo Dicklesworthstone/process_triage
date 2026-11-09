@@ -208,8 +208,8 @@ fn tools_list_returns_all_tools() {
     let tools = result["tools"].as_array().unwrap();
     assert_eq!(
         tools.len(),
-        6,
-        "expected 6 tools (scan, explain, plan, history, signatures, capabilities)"
+        7,
+        "expected 7 tools (scan, explain, plan, label, history, signatures, capabilities)"
     );
 }
 
@@ -276,6 +276,8 @@ fn tools_list_includes_expected_tools() {
         .collect();
     assert!(names.contains(&"pt_scan"));
     assert!(names.contains(&"pt_explain"));
+    assert!(names.contains(&"pt_plan"));
+    assert!(names.contains(&"pt_label"));
     assert!(names.contains(&"pt_history"));
     assert!(names.contains(&"pt_signatures"));
     assert!(names.contains(&"pt_capabilities"));
@@ -850,7 +852,7 @@ fn full_mcp_conversation_flow() {
     let resp = send_rpc(&mut s, 2, "tools/list", serde_json::json!({}));
     let result = assert_success(&resp);
     let tools = result["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 6);
+    assert_eq!(tools.len(), 7);
 
     // 4. List resources
     let resp = send_rpc(&mut s, 3, "resources/list", serde_json::json!({}));
@@ -1672,4 +1674,199 @@ fn actual_mcp_deep_scan_preserves_live_snapshot_and_default_age_candidates() {
         }
     }
     assert!(child.0.try_wait().expect("fixture status").is_none());
+}
+
+fn call_actual_mcp_label(
+    config: &std::path::Path,
+    data: &std::path::Path,
+    fallback: &std::path::Path,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    use assert_cmd::cargo::cargo_bin_cmd;
+
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 81,
+        "method": "tools/call",
+        "params": {"name": "pt_label", "arguments": arguments},
+    });
+    let output = cargo_bin_cmd!("pt-core")
+        .env_remove("PT_CONFIG_DIR")
+        .env_remove("PT_SKIP_GLOBAL_LOCK")
+        .env("PROCESS_TRIAGE_CONFIG", fallback)
+        .env("PROCESS_TRIAGE_DATA", data)
+        .env("PROCESS_TRIAGE_RETENTION", "off")
+        .arg("--config")
+        .arg(config)
+        .arg("mcp")
+        .write_stdin(format!("{request}\n"))
+        .timeout(std::time::Duration::from_secs(60))
+        .output()
+        .expect("run actual MCP label");
+    assert!(output.status.success(), "{output:?}");
+    let response: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("MCP JSON-RPC response");
+    assert_eq!(response["id"], 81);
+    assert!(response["error"].is_null(), "{response}");
+    response["result"].clone()
+}
+
+#[test]
+fn actual_mcp_labels_require_confirmation_and_use_the_servers_store() {
+    let config = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let fallback = tempfile::tempdir().unwrap();
+    let marker = data.path().join("must-not-execute");
+    let command = format!("node /srv/reviewed.js; touch {}", marker.display());
+    let arguments = serde_json::json!({
+        "cmd": command,
+        "comm": "node",
+        "verdict": "spare",
+    });
+    let denied = call_actual_mcp_label(
+        config.path(),
+        data.path(),
+        fallback.path(),
+        arguments.clone(),
+    );
+    assert_eq!(denied["isError"], true, "{denied}");
+    assert!(denied["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("confirmed_by_user"));
+    assert!(!config.path().join("decisions.json").exists());
+    assert!(!data.path().join("shadow").exists());
+
+    let mut confirmed = arguments;
+    confirmed["confirmed_by_user"] = serde_json::json!(true);
+    let result = call_actual_mcp_label(
+        config.path(),
+        data.path(),
+        fallback.path(),
+        confirmed,
+    );
+    assert_eq!(result["isError"], false, "{result}");
+    let label: serde_json::Value =
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(label["verdict"], "spare");
+    assert_eq!(label["learned_prior"]["spare"], 1);
+    assert_eq!(label["shadow_label"]["recorded"], false);
+    assert!(!data.path().join("shadow").exists());
+    assert!(!fallback.path().join("decisions.json").exists());
+    assert!(!marker.exists(), "command text must never be executed");
+
+    let store = pt_core::decision::decision_store::DecisionStore::load(config.path()).unwrap();
+    let prior = store
+        .learned_prior("node", &command, &pt_core::config::Priors::default())
+        .expect("MCP verdict persisted in the CLI learning store");
+    assert_eq!(prior.kill, 0);
+    assert_eq!(prior.spare, 1);
+    assert_eq!(prior.specificity, "exact");
+}
+
+#[cfg(unix)]
+#[test]
+fn actual_mcp_live_labels_preserve_processes_and_record_shadow_identity() {
+    use pt_telemetry::shadow::{EventType, Observation};
+
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let config = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let fallback = tempfile::tempdir().unwrap();
+    let mut target = ChildGuard(std::process::Command::new("sleep").arg("631").spawn().unwrap());
+    let pid = target.0.id();
+    let mut identity = None;
+    for verdict in ["kill", "spare"] {
+        let result = call_actual_mcp_label(
+            config.path(),
+            data.path(),
+            fallback.path(),
+            serde_json::json!({
+                "pid": pid,
+                "verdict": verdict,
+                "confirmed_by_user": true,
+            }),
+        );
+        assert_eq!(result["isError"], false, "{result}");
+        let label: serde_json::Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(label["verdict"], verdict);
+        assert_eq!(label["shadow_label"]["recorded"], true);
+        let observed = label["shadow_label"]["identity_hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        if let Some(expected) = &identity {
+            assert_eq!(expected, &observed);
+        }
+        identity = Some(observed);
+        assert!(
+            target.0.try_wait().unwrap().is_none(),
+            "labels never signal targets"
+        );
+    }
+    assert!(!fallback.path().join("decisions.json").exists());
+    let mut observations = Vec::<Observation>::new();
+    let hot = data.path().join(format!("shadow/hot/pid_{pid}"));
+    for entry in std::fs::read_dir(hot).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|extension| extension.to_str()) == Some("json") {
+            let batch: Vec<Observation> =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            observations.extend(batch);
+        }
+    }
+    observations.sort_by_key(|observation| observation.timestamp);
+    assert_eq!(observations.len(), 2);
+    for (observation, verdict) in observations.iter().zip(["kill", "spare"]) {
+        assert_eq!(observation.pid, pid);
+        assert_eq!(Some(&observation.identity_hash), identity.as_ref());
+        assert_eq!(observation.events.len(), 1);
+        assert_eq!(observation.events[0].event_type, EventType::HumanVerdict);
+        let details: serde_json::Value =
+            serde_json::from_str(observation.events[0].details.as_deref().unwrap()).unwrap();
+        assert_eq!(details["verdict"], verdict);
+        assert_eq!(observation.belief.recommendation, "human_verdict");
+    }
+    let calibration =
+        pt_core::calibrate::validation::ValidationEngine::from_shadow_observations(
+            &observations,
+            0.5,
+        );
+    assert!(
+        calibration.records().is_empty(),
+        "labels cannot invent predictions"
+    );
+
+    let failed_config = tempfile::tempdir().unwrap();
+    let failed_data = tempfile::tempdir().unwrap();
+    std::fs::write(failed_data.path().join("shadow"), "preserve this file").unwrap();
+    let failed = call_actual_mcp_label(
+        failed_config.path(),
+        failed_data.path(),
+        fallback.path(),
+        serde_json::json!({
+            "pid": pid,
+            "verdict": "kill",
+            "confirmed_by_user": true,
+        }),
+    );
+    assert_eq!(failed["isError"], true, "{failed}");
+    assert!(failed["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("learned prior unchanged"));
+    assert!(!failed_config.path().join("decisions.json").exists());
+    assert_eq!(
+        std::fs::read_to_string(failed_data.path().join("shadow")).unwrap(),
+        "preserve this file"
+    );
+    assert!(target.0.try_wait().unwrap().is_none());
 }

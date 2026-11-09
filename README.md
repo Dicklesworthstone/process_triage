@@ -218,12 +218,21 @@ Available tools:
 
 - `pt_plan`: the same engine, protections and output as `pt agent plan --format json`.
 - `pt_scan`: a process listing with signature-match scores.
-- `pt_explain`: a PID's evidence.
+- `pt_explain`: a PID's evidence, including the learned-prior contribution.
+- `pt_label`: persist an explicitly user-confirmed kill/spare verdict through the same learning and shadow-label path as `pt agent label`; never sends a signal.
 - `pt_history`: recent sessions.
 - `pt_signatures`
 - `pt_capabilities`
 
 AI agents can use these to query process state, run scans, and make triage decisions without CLI parsing.
+
+For feedback, call `pt_label` with exactly one of `pid` or `cmd`, a `verdict` of `"kill"` or `"spare"`, and `confirmed_by_user: true` only after the user explicitly chose that verdict. For example:
+
+```json
+{"name":"pt_label","arguments":{"cmd":"node /srv/my-app/server.js","verdict":"spare","confirmed_by_user":true}}
+```
+
+The verdict updates future recommendations; a kill label does not terminate the process. Live PID labels also record an identity-bound shadow event, while command-only labels cannot supply a calibration outcome for a particular process. Model recommendations and defaults accepted in a batch are not human labels. Each successful call adds one observation, so do not retry a successful call.
 
 ### Learning Tutorials
 
