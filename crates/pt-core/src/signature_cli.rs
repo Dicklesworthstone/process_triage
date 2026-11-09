@@ -233,25 +233,79 @@ fn legacy_read_dir_in(
         .map(Path::to_path_buf)
 }
 
-/// Load user signatures from a config directory
-pub fn load_user_signatures(config_dir: &Path) -> Option<SignatureSchema> {
-    let path = readable_config_file(config_dir, user_signatures_path);
-    if path.exists() {
-        match std::fs::read_to_string(&path) {
-            Ok(content) => match SignatureSchema::from_json(&content) {
-                Ok(schema) => Some(schema),
-                Err(e) => {
-                    eprintln!("Warning: Failed to load user signatures: {}", e);
-                    None
+/// Load user signatures, distinguishing an absent optional file from unreadable
+/// or invalid configuration. Only a genuinely absent default file permits the
+/// legacy-location fallback; a failed read must not silently select another model.
+pub fn try_load_user_signatures(
+    config_dir: &Path,
+) -> Result<Option<SignatureSchema>, std::io::Error> {
+    try_load_user_signatures_in(
+        config_dir,
+        &crate::config::default_config_dir(),
+        crate::config::legacy_signature_config_dir().as_deref(),
+    )
+}
+
+fn try_load_user_signatures_in(
+    config_dir: &Path,
+    default_dir: &Path,
+    legacy_dir: Option<&Path>,
+) -> Result<Option<SignatureSchema>, std::io::Error> {
+    if let Some(schema) = read_user_signatures(&user_signatures_path(config_dir))? {
+        return Ok(Some(schema));
+    }
+    match legacy_read_dir_in(config_dir, default_dir, legacy_dir) {
+        Some(legacy) => read_user_signatures(&user_signatures_path(&legacy)),
+        None => Ok(None),
+    }
+}
+
+fn read_user_signatures(path: &Path) -> Result<Option<SignatureSchema>, std::io::Error> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) => {
+            // A dangling configured symlink is a broken model input, not an
+            // absent optional file that may be replaced with defaults.
+            let error = if error.kind() == std::io::ErrorKind::NotFound {
+                match std::fs::symlink_metadata(path) {
+                    Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(None);
+                    }
+                    Err(metadata_error) => metadata_error,
+                    Ok(_) => error,
                 }
-            },
-            Err(e) => {
-                eprintln!("Warning: Failed to read user signatures: {}", e);
-                None
-            }
+            } else {
+                error
+            };
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to read user signatures at {}: {error}",
+                    path.display()
+                ),
+            ));
         }
-    } else {
-        None
+    };
+    SignatureSchema::from_json(&content).map(Some).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "failed to parse user signatures at {}: {error}",
+                path.display()
+            ),
+        )
+    })
+}
+
+/// Load optional signatures for best-effort read-only displays. Callers that
+/// evaluate a complete model or save changes must use [`try_load_user_signatures`].
+pub fn load_user_signatures(config_dir: &Path) -> Option<SignatureSchema> {
+    match try_load_user_signatures(config_dir) {
+        Ok(schema) => schema,
+        Err(error) => {
+            eprintln!("Warning: {error}");
+            None
+        }
     }
 }
 
@@ -592,11 +646,18 @@ fn run_signature_add(
     };
 
     // Load or create user schema
-    let mut schema = load_user_signatures(config_dir).unwrap_or_else(|| SignatureSchema {
-        schema_version: SIG_SCHEMA_VERSION,
-        signatures: Vec::new(),
-        metadata: None,
-    });
+    let mut schema = match try_load_user_signatures(config_dir) {
+        Ok(Some(schema)) => schema,
+        Ok(None) => SignatureSchema {
+            schema_version: SIG_SCHEMA_VERSION,
+            signatures: Vec::new(),
+            metadata: None,
+        },
+        Err(error) => {
+            eprintln!("Cannot update user signatures: {error}");
+            return ExitCode::ArgsError;
+        }
+    };
 
     // Check for duplicate
     if schema.signatures.iter().any(|s| s.name == name) {
@@ -654,10 +715,14 @@ fn run_signature_remove(
     let session_id = SessionId::new();
 
     // Load user signatures
-    let mut schema = match load_user_signatures(config_dir) {
-        Some(s) => s,
-        None => {
+    let mut schema = match try_load_user_signatures(config_dir) {
+        Ok(Some(schema)) => schema,
+        Ok(None) => {
             eprintln!("No user signatures file found");
+            return ExitCode::ArgsError;
+        }
+        Err(error) => {
+            eprintln!("Cannot update user signatures: {error}");
             return ExitCode::ArgsError;
         }
     };
@@ -1019,11 +1084,18 @@ fn run_signature_import(
     }
 
     // Load existing user signatures for merge
-    let existing = load_user_signatures(config_dir).unwrap_or_else(|| SignatureSchema {
-        schema_version: SIG_SCHEMA_VERSION,
-        signatures: Vec::new(),
-        metadata: None,
-    });
+    let existing = match try_load_user_signatures(config_dir) {
+        Ok(Some(schema)) => schema,
+        Ok(None) => SignatureSchema {
+            schema_version: SIG_SCHEMA_VERSION,
+            signatures: Vec::new(),
+            metadata: None,
+        },
+        Err(error) => {
+            eprintln!("Cannot update user signatures: {error}");
+            return ExitCode::ArgsError;
+        }
+    };
 
     let existing_names: std::collections::HashSet<String> =
         existing.signatures.iter().map(|s| s.name.clone()).collect();
@@ -1579,6 +1651,126 @@ mod tests {
         let loaded = load_user_signatures(&config_dir).expect("load");
         assert_eq!(loaded.signatures, schema.signatures);
         assert!(!loaded.signatures[0].priors.is_empty());
+    }
+
+    fn signature_test_evidence_dir() -> PathBuf {
+        let directory =
+            std::env::temp_dir().join(format!("pt-signature-load-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).expect("signature evidence directory");
+        eprintln!("retained signature evidence: {}", directory.display());
+        directory
+    }
+
+    #[test]
+    fn strict_signature_loading_falls_back_only_for_a_missing_default_file() {
+        let root = signature_test_evidence_dir();
+        let default_dir = root.join("default");
+        let legacy_dir = root.join("legacy");
+        let override_dir = root.join("override");
+        let load = |directory: &Path| {
+            try_load_user_signatures_in(directory, &default_dir, Some(&legacy_dir))
+        };
+        assert!(load(&default_dir).unwrap().is_none());
+
+        let schema = test_schema(&["legacy-useful"]);
+        save_user_signatures(&legacy_dir, &schema).unwrap();
+        assert_eq!(
+            load(&default_dir).unwrap().unwrap().signatures,
+            schema.signatures
+        );
+        assert!(load(&override_dir).unwrap().is_none());
+
+        std::fs::create_dir(&default_dir).unwrap();
+        let invalid = b"{ interrupted signature save";
+        std::fs::write(user_signatures_path(&default_dir), invalid).unwrap();
+        let error = load(&default_dir).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("signatures.json"));
+        assert_eq!(
+            std::fs::read(user_signatures_path(&default_dir)).unwrap(),
+            invalid.as_slice()
+        );
+
+        // A directory is unreadable as signature JSON even under a root test
+        // runner, unlike a chmod-only permission fixture. Do not select legacy.
+        let unreadable_dir = root.join("unreadable");
+        std::fs::create_dir_all(user_signatures_path(&unreadable_dir)).unwrap();
+        assert!(try_load_user_signatures_in(
+            &unreadable_dir,
+            &unreadable_dir,
+            Some(&legacy_dir),
+        )
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_signature_link_cannot_silently_select_legacy_signatures() {
+        let root = signature_test_evidence_dir();
+        let default_dir = root.join("default");
+        let legacy_dir = root.join("legacy");
+        std::fs::create_dir(&default_dir).unwrap();
+        save_user_signatures(&legacy_dir, &test_schema(&["legacy-useful"])).unwrap();
+        let target = root.join("missing-signatures.json");
+        let path = user_signatures_path(&default_dir);
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(try_load_user_signatures_in(
+            &default_dir,
+            &default_dir,
+            Some(&legacy_dir),
+        )
+        .is_err());
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn signature_updates_preserve_an_invalid_existing_file() {
+        let root = signature_test_evidence_dir();
+        let original = b"{ interrupted signature save";
+        let destination = user_signatures_path(&root);
+        std::fs::write(&destination, original).unwrap();
+        assert_eq!(
+            run_signature_add(
+                &OutputFormat::Json,
+                &root,
+                "new-signature",
+                SupervisorCategory::Agent,
+                &["^new-signature$".to_string()],
+                &[],
+                &[],
+                0.8,
+                None,
+                100,
+                None,
+            ),
+            ExitCode::ArgsError
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), original.as_slice());
+
+        let source = root.join("import.json");
+        let mut schema = test_schema(&["imported-signature"]);
+        schema.signatures[0].patterns.process_names = vec!["^imported-signature$".to_string()];
+        std::fs::write(&source, serde_json::to_vec(&schema).unwrap()).unwrap();
+        assert_eq!(
+            run_signature_import(
+                &OutputFormat::Json,
+                &root,
+                source.to_str().unwrap(),
+                false,
+                None,
+            ),
+            ExitCode::ArgsError
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), original.as_slice());
+        assert_eq!(
+            run_signature_remove(&OutputFormat::Json, &root, "legacy-useful", true),
+            ExitCode::ArgsError
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), original.as_slice());
     }
 
     /// Before GH #18, macOS kept user signatures in `~/Library/Application Support`;

@@ -209,7 +209,7 @@ fn load_priors(
 
     // Try config directory
     let default_path = config_dir.join("priors.json");
-    if default_path.exists() {
+    if optional_config_file_present(&default_path)? {
         let (priors, hash) = load_priors_from_file(&default_path)?;
         return Ok((priors, Some(default_path), Some(hash)));
     }
@@ -231,13 +231,26 @@ fn load_policy(
 
     // Try config directory
     let default_path = config_dir.join("policy.json");
-    if default_path.exists() {
+    if optional_config_file_present(&default_path)? {
         let (policy, hash) = load_policy_from_file(&default_path)?;
         return Ok((policy, Some(default_path), Some(hash)));
     }
 
     // Fall back to defaults
     Ok((Policy::default(), None, None))
+}
+
+/// Only a missing optional file selects defaults. Inspect the directory entry
+/// itself so a dangling symlink still reaches the loader and reports its error.
+fn optional_config_file_present(path: &std::path::Path) -> Result<bool, ConfigError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(ConfigError::IoError {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 /// Load priors from a specific file.
@@ -333,5 +346,91 @@ mod tests {
         let snapshot = config.snapshot();
         let json = serde_json::to_string(&snapshot);
         assert!(json.is_ok());
+    }
+
+    #[test]
+    fn missing_optional_config_uses_defaults_but_explicit_paths_still_fail() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        for config_dir in [directory.clone(), directory.join("not-created")] {
+            let config = load_config(&ConfigOptions {
+                config_dir: Some(config_dir),
+                ..ConfigOptions::default()
+            })
+            .unwrap();
+            assert!(config.priors_path.is_none());
+            assert!(config.policy_path.is_none());
+            assert!(config.priors_hash.is_none());
+            assert!(config.policy_hash.is_none());
+        }
+        for name in ["priors.json", "policy.json"] {
+            let path = directory.join(name);
+            let options = ConfigOptions {
+                config_dir: Some(directory.clone()),
+                priors_path: (name == "priors.json").then(|| path.clone()),
+                policy_path: (name == "policy.json").then(|| path.clone()),
+            };
+            assert!(matches!(
+                load_config(&options),
+                Err(ConfigError::IoError { path: failed, source })
+                    if failed == path && source.kind() == std::io::ErrorKind::NotFound
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_optional_config_links_are_errors_not_defaults() {
+        for name in ["priors.json", "policy.json"] {
+            let directory = tempfile::tempdir().unwrap().keep();
+            let path = directory.join(name);
+            std::os::unix::fs::symlink(directory.join("missing-target"), &path).unwrap();
+            let options = ConfigOptions {
+                config_dir: Some(directory),
+                ..ConfigOptions::default()
+            };
+            assert!(matches!(
+                load_config(&options),
+                Err(ConfigError::IoError { path: failed, source })
+                    if failed == path && source.kind() == std::io::ErrorKind::NotFound
+            ));
+            assert!(std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        }
+    }
+
+    #[test]
+    fn invalid_config_file_types_and_parent_metadata_errors_are_preserved() {
+        for name in ["priors.json", "policy.json"] {
+            let directory = tempfile::tempdir().unwrap().keep();
+            let path = directory.join(name);
+            std::fs::create_dir(&path).unwrap();
+            let options = ConfigOptions {
+                config_dir: Some(directory),
+                ..ConfigOptions::default()
+            };
+            assert!(matches!(
+                load_config(&options),
+                Err(ConfigError::IoError { path: failed, .. }) if failed == path
+            ));
+            assert!(path.is_dir());
+        }
+
+        let directory = tempfile::tempdir().unwrap().keep();
+        let config_dir = directory.join("config-is-a-file");
+        std::fs::write(&config_dir, "retained config fixture").unwrap();
+        let options = ConfigOptions {
+            config_dir: Some(config_dir.clone()),
+            ..ConfigOptions::default()
+        };
+        assert!(matches!(
+            load_config(&options),
+            Err(ConfigError::IoError { path, .. }) if path == config_dir.join("priors.json")
+        ));
+        assert_eq!(
+            std::fs::read_to_string(config_dir).unwrap(),
+            "retained config fixture"
+        );
     }
 }

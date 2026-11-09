@@ -51,18 +51,22 @@ pub use provenance::{
 pub const DESKTOP_APP_FEATURE: &str = "desktop_app_session";
 
 /// Built-in signatures plus the user signatures in `config_dir` (see
-/// [`crate::signature_cli::user_signatures_path`]), and a warning per user signature
-/// that could not be added.
+/// [`crate::signature_cli::user_signatures_path`]), with warnings for unreadable
+/// files and user signatures that could not be added.
 pub fn load_signature_database(config_dir: &Path) -> (SignatureDatabase, Vec<String>) {
     let mut db = SignatureDatabase::with_defaults();
     let mut warnings = Vec::new();
-    if let Some(schema) = crate::signature_cli::load_user_signatures(config_dir) {
-        for signature in schema.signatures {
-            let name = signature.name.clone();
-            if let Err(err) = db.add(signature) {
-                warnings.push(format!("skipping invalid user signature '{name}': {err}"));
+    match crate::signature_cli::try_load_user_signatures(config_dir) {
+        Ok(Some(schema)) => {
+            for signature in schema.signatures {
+                let name = signature.name.clone();
+                if let Err(err) = db.add(signature) {
+                    warnings.push(format!("skipping invalid user signature '{name}': {err}"));
+                }
             }
         }
+        Ok(None) => {}
+        Err(error) => warnings.push(format!("ignoring unreadable user signatures: {error}")),
     }
     (db, warnings)
 }
@@ -334,6 +338,7 @@ pub struct Scorer {
     pub decisions: DecisionStore,
     pub signatures: SignatureDatabase,
     pub fast_path: FastPathConfig,
+    evaluation_time: Option<chrono::DateTime<chrono::Utc>>,
     activity_window: Option<Duration>,
     activity: BTreeMap<u32, ProcessActivity>,
     respawn_history: BTreeMap<u32, (pt_common::StartId, u32, RespawnLoopSummary)>,
@@ -361,6 +366,7 @@ impl Scorer {
             decisions,
             signatures,
             fast_path,
+            evaluation_time: None,
             activity_window: None,
             activity: BTreeMap::new(),
             respawn_history: BTreeMap::new(),
@@ -368,6 +374,13 @@ impl Scorer {
             #[cfg(target_os = "linux")]
             provenance: None,
         }
+    }
+
+    /// Freeze learned-verdict decay for a paired evaluation. Live constructors
+    /// leave this unset and continue using the current time for every score.
+    pub fn with_evaluation_time(mut self, evaluated_at: chrono::DateTime<chrono::Utc>) -> Self {
+        self.evaluation_time = Some(evaluated_at);
+        self
     }
 
     /// The scorer for a loaded configuration: its priors and fast-path policy, the
@@ -704,9 +717,12 @@ impl Scorer {
                 });
         let prior_signature = gated_match.as_ref().or(signature.as_ref());
 
-        let learned_prior = self
-            .decisions
-            .learned_prior(&proc.comm, &proc.cmd, &self.priors);
+        let learned_prior = self.decisions.learned_prior_at(
+            &proc.comm,
+            &proc.cmd,
+            &self.priors,
+            self.evaluation_time.unwrap_or_else(chrono::Utc::now),
+        );
         let learned_overrides = learned_prior
             .as_ref()
             .map(|learned| DecisionStore::overrides_for(learned, &self.priors));
@@ -1394,6 +1410,69 @@ mod tests {
     }
 
     const FOUR_DAYS: Duration = Duration::from_secs(4 * 24 * 3600);
+
+    #[test]
+    fn configuration_returns_signature_load_failures_in_model_warnings() {
+        let directory =
+            std::env::temp_dir().join(format!("pt-scorer-signatures-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        eprintln!("retained scorer signature evidence: {}", directory.display());
+        let config = crate::config::load_config(&crate::config::ConfigOptions {
+            config_dir: Some(directory.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        let (_, warnings) = Scorer::from_config(&config);
+        assert!(warnings.is_empty(), "absent optional signatures: {warnings:?}");
+
+        std::fs::write(directory.join("signatures.json"), b"{ broken JSON").unwrap();
+        let (scorer, warnings) = Scorer::from_config(&config);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("failed to parse user signatures"));
+        assert!(warnings[0].contains("signatures.json"));
+        assert_eq!(
+            scorer.signatures.signatures().len(),
+            SignatureDatabase::with_defaults().signatures().len()
+        );
+
+        let unreadable = directory.join("unreadable");
+        std::fs::create_dir_all(unreadable.join("signatures.json")).unwrap();
+        let (_, warnings) = load_signature_database(&unreadable);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("failed to read user signatures"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_model_files_return_warnings_instead_of_empty_models() {
+        let directory =
+            std::env::temp_dir().join(format!("pt-scorer-broken-links-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        eprintln!("retained model link evidence: {}", directory.display());
+        for file in ["signatures.json", "decisions.json"] {
+            let config_dir = directory.join(file);
+            std::fs::create_dir(&config_dir).unwrap();
+            let target = config_dir.join("missing-target.json");
+            let path = config_dir.join(file);
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+            let config = crate::config::load_config(&crate::config::ConfigOptions {
+                config_dir: Some(config_dir.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+            let (_, warnings) = Scorer::from_config(&config);
+            assert_eq!(warnings.len(), 1, "{file}: {warnings:?}");
+            assert!(warnings[0].contains(file), "{warnings:?}");
+            if file == "decisions.json" {
+                assert!(DecisionStore::load(&config_dir).is_err());
+            }
+            assert!(std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert!(!target.exists());
+        }
+    }
 
     #[test]
     fn recorded_observations_preserve_activity_and_desktop_after_cache_changes() {

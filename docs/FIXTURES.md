@@ -138,6 +138,57 @@ manifest and redaction checks above. Raw collector capture/injection, redacted
 decision equivalence, and full `agent plan` action parity remain acceptance
 work for `bd-l3s5.1` and related replay beads.
 
+## Reviewed captures and paired score evaluation
+
+Create a private review template from a captured census:
+
+```bash
+pt-core replay label-template --snapshot /private/path/scan.json \
+  --output /private/path/scan.labels.json --host-id dev-box --split holdout
+```
+
+The template retains every process identity and leaves every verdict unknown.
+Review the capture independently and fill in explicit useful/abandoned judgments
+with the required reviewer, timestamp, and rationale. An abandoned judgment here
+labels the model's combined abandoned-or-zombie event; it does not authorize an
+action. Keep unknown rows in the document. Neither regex matches, current model
+recommendations, successful kills, nor disappearing PIDs supply labels.
+
+The review document binds to the complete capture with a stable SHA-256 digest.
+Evaluation rejects a different capture, changed identities, duplicate entries,
+and missing census rows. Review files contain raw process details and use private,
+non-overwriting creation just like captures.
+
+Compare two configurations against the same observations and reviewed labels:
+
+```bash
+pt-core --config /private/candidate-config replay evaluate \
+  --snapshot /private/path/scan.json --labels /private/path/scan.labels.json \
+  --baseline-config /private/incumbent-config --format json
+```
+
+Both models use the production scorer in the same invocation. The report keeps
+the complete population, label coverage, and both models' protection/unavailable
+outcomes. Paired metrics use the same labeled processes scored by both models;
+coverage losses remain visible when a changed policy excludes a difficult case.
+Unreadable or invalid learned-verdict and user-signature inputs are rejected so
+an incomplete model cannot silently replace either configuration.
+The existing calibration sample-support requirements remain in force, and
+insufficient support is reported without fabricated metrics. Lower Brier score
+and log loss indicate better probability predictions on the evaluated labels.
+
+The host identifier and training/holdout split are declarations supplied by the
+reviewer. A single-capture comparison does not establish that a model's training
+data excluded that host. Record the split honestly and retain the model and
+capture fingerprints when comparing results across hosts. Both configurations
+evaluate learned-prior decay at one shared timestamp. This command does not
+reconstruct historical model state or write labels into the learned decision
+store.
+
+These are score-level comparisons. They do not measure final KILL/REVIEW
+precision, zombie-routing quality, or a false-kill guarantee; those require the
+full production decision replay and independent fleet corpus described above.
+
 ## Provenance Fixtures
 
 Canonical provenance fixtures now live in the `pt-core` fixture domain:

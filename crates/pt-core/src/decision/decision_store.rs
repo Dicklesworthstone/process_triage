@@ -229,8 +229,20 @@ pub struct DecisionStore {
 fn read_entries(path: &Path) -> Result<BTreeMap<String, PatternCounts>, DecisionStoreError> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
         Err(source) => {
+            // A dangling configured symlink must not erase the learned model
+            // by masquerading as an absent optional file.
+            let source = if source.kind() == std::io::ErrorKind::NotFound {
+                match std::fs::symlink_metadata(path) {
+                    Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(BTreeMap::new());
+                    }
+                    Err(metadata_error) => metadata_error,
+                    Ok(_) => source,
+                }
+            } else {
+                source
+            };
             return Err(DecisionStoreError::Io {
                 path: path.to_path_buf(),
                 source,
@@ -403,6 +415,13 @@ impl DecisionStore {
         self.entries.is_empty()
     }
 
+    /// Snapshot the loaded counts for evaluation provenance without rereading
+    /// the file or including its location. Pending verdicts are already reflected
+    /// in these entries; callers must not publish their private command patterns.
+    pub(crate) fn evaluation_snapshot(&self) -> Result<serde_json::Value, serde_json::Error> {
+        serde_json::to_value(&self.entries)
+    }
+
     /// Pattern keys for a process, most specific first.
     pub fn pattern_keys(comm: &str, cmdline: &str) -> Vec<String> {
         let normalizer = CommandNormalizer::new();
@@ -472,7 +491,7 @@ impl DecisionStore {
         self.learned_prior_at(comm, cmdline, global, chrono::Utc::now())
     }
 
-    fn learned_prior_at(
+    pub(crate) fn learned_prior_at(
         &self,
         comm: &str,
         cmdline: &str,

@@ -339,6 +339,9 @@ enum Commands {
     /// Scan processes, record observations, or replay recorded scores (no actions)
     Scan(ScanArgs),
 
+    /// Review recorded processes and compare scoring configurations without actions
+    Replay(ReplayArgs),
+
     /// Full deep scan with all available probes
     DeepScan(DeepScanArgs),
 
@@ -510,6 +513,40 @@ struct ScanArgs {
         ]
     )]
     replay_scores: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+struct ReplayArgs {
+    #[command(subcommand)]
+    command: ReplayCommands,
+}
+
+#[derive(Subcommand, Debug)]
+enum ReplayCommands {
+    /// Create a private review document with every captured identity left unlabeled
+    LabelTemplate {
+        #[arg(long, value_name = "PATH")]
+        snapshot: PathBuf,
+        /// New private destination; existing files and symlinks are refused
+        #[arg(long, value_name = "PATH")]
+        output: PathBuf,
+        /// Operator-supplied host identifier for the review cohort
+        #[arg(long, value_name = "NAME")]
+        host_id: String,
+        /// Declared dataset split; this does not prove a host was held out of training
+        #[arg(long, default_value = "holdout", value_parser = ["training", "holdout"])]
+        split: String,
+    },
+    /// Compare an incumbent and the current --config using the same reviewed capture
+    Evaluate {
+        #[arg(long, value_name = "PATH")]
+        snapshot: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        labels: PathBuf,
+        /// Existing configuration directory for the incumbent model
+        #[arg(long, value_name = "DIR")]
+        baseline_config: PathBuf,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -2060,6 +2097,7 @@ fn main() {
         }
         Some(Commands::Run(args)) => run_interactive(&cli.global, &args),
         Some(Commands::Scan(args)) => run_scan(&cli.global, &args),
+        Some(Commands::Replay(args)) => run_replay(&cli.global, &args),
         Some(Commands::DeepScan(args)) => run_deep_scan(&cli.global, &args),
         Some(Commands::Diff(args)) => run_diff(&cli.global, &args),
         Some(Commands::Query(args)) => run_query(&cli.global, &args),
@@ -5517,6 +5555,195 @@ fn run_replay_scores(global: &GlobalOpts, path: &std::path::Path) -> ExitCode {
                 println!("- {limitation}");
             }
         }
+    }
+    ExitCode::Clean
+}
+
+fn replay_evaluation_error(error: pt_core::replay::ReplayEvaluationError) -> ExitCode {
+    eprintln!("replay: {error}");
+    match error {
+        pt_core::replay::ReplayEvaluationError::Io(_)
+        | pt_core::replay::ReplayEvaluationError::Replay(pt_core::replay::ReplayError::Io(_)) => {
+            ExitCode::IoError
+        }
+        _ => ExitCode::ArgsError,
+    }
+}
+
+fn run_replay(global: &GlobalOpts, args: &ReplayArgs) -> ExitCode {
+    use pt_core::replay::{
+        evaluate_pair, make_review_template, read_review_labels, ReviewSplit,
+    };
+
+    let snapshot_path = match &args.command {
+        ReplayCommands::LabelTemplate { snapshot, .. }
+        | ReplayCommands::Evaluate { snapshot, .. } => snapshot,
+    };
+    let snapshot = match pt_core::replay::load_snapshot(snapshot_path) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return replay_evaluation_error(error.into()),
+    };
+    let (output, summary) = match &args.command {
+        ReplayCommands::LabelTemplate {
+            output,
+            host_id,
+            split,
+            ..
+        } => {
+            let split = match split.as_str() {
+                "training" => ReviewSplit::Training,
+                "holdout" => ReviewSplit::Holdout,
+                _ => {
+                    eprintln!("replay: split must be training or holdout");
+                    return ExitCode::ArgsError;
+                }
+            };
+            let labels = match make_review_template(&snapshot, host_id, split) {
+                Ok(labels) => labels,
+                Err(error) => return replay_evaluation_error(error),
+            };
+            if let Err(error) = labels.save_new_private(output) {
+                return replay_evaluation_error(error);
+            }
+            let summary = format!(
+                "Created private review template {} with {} unlabeled process identities.\n\
+                 Fill in independent verdicts and their reviewer, timestamp, and rationale; \
+                 retain unknown rows.",
+                output.display(),
+                labels.processes.len()
+            );
+            (
+                serde_json::json!({
+                    "schema_version": SCHEMA_VERSION,
+                    "command": "replay label-template",
+                    "review_template": {
+                        "path": output,
+                        "snapshot_sha256": labels.snapshot_sha256,
+                        "host_id": labels.host_id,
+                        "split": labels.split,
+                        "population_size": labels.processes.len(),
+                        "reviewed_count": 0,
+                    },
+                }),
+                summary,
+            )
+        }
+        ReplayCommands::Evaluate {
+            labels,
+            baseline_config,
+            ..
+        } => {
+            if !baseline_config.is_dir() {
+                eprintln!(
+                    "replay: baseline configuration directory does not exist or is inaccessible: {}",
+                    baseline_config.display()
+                );
+                return ExitCode::ArgsError;
+            }
+            if let Some(path) = global.config.as_ref().filter(|path| !Path::new(path).is_dir()) {
+                eprintln!("replay: candidate configuration directory is inaccessible: {path}");
+                return ExitCode::ArgsError;
+            }
+            let labels = match read_review_labels(labels) {
+                Ok(labels) => labels,
+                Err(error) => return replay_evaluation_error(error),
+            };
+            let baseline = match load_config(&ConfigOptions {
+                config_dir: Some(baseline_config.clone()),
+                ..Default::default()
+            }) {
+                Ok(config) => config,
+                Err(error) => return output_config_error(global, &error),
+            };
+            let candidate = match load_config(&ConfigOptions {
+                config_dir: global.config.as_ref().map(PathBuf::from),
+                ..Default::default()
+            }) {
+                Ok(config) => config,
+                Err(error) => return output_config_error(global, &error),
+            };
+            let (baseline_scorer, baseline_warnings) = Scorer::from_config(&baseline);
+            let (candidate_scorer, candidate_warnings) = Scorer::from_config(&candidate);
+            // An incomplete model must not silently become a different incumbent.
+            if !baseline_warnings.is_empty() || !candidate_warnings.is_empty() {
+                for warning in baseline_warnings {
+                    eprintln!("replay: baseline model could not be loaded completely: {warning}");
+                }
+                for warning in candidate_warnings {
+                    eprintln!("replay: candidate model could not be loaded completely: {warning}");
+                }
+                return ExitCode::ArgsError;
+            }
+            let report = match evaluate_pair(
+                &snapshot,
+                &labels,
+                &baseline_scorer,
+                &baseline.policy,
+                &candidate_scorer,
+                &candidate.policy,
+            ) {
+                Ok(report) => report,
+                Err(error) => return replay_evaluation_error(error),
+            };
+            let coverage = &report.coverage;
+            let mut summary = format!(
+                "Paired score evaluation for {} ({:?}): {} captured, {} reviewed, {} unlabeled.\n\
+                 Common scored sample: {}; baseline-only: {}; candidate-only: {}; neither: {}.",
+                report.host_id,
+                report.split,
+                coverage.population_size,
+                coverage.reviewed_count,
+                coverage.unlabeled_count,
+                coverage.paired_count,
+                coverage.baseline_only_count,
+                coverage.candidate_only_count,
+                coverage.neither_scored_count
+            );
+            if let Some(metrics) = &report.paired_metrics {
+                summary.push_str(&format!(
+                    "\nBrier: {:.6} -> {:.6} (candidate minus baseline {:+.6}).\n\
+                     Log loss: {:.6} -> {:.6} (candidate minus baseline {:+.6}).",
+                    metrics.baseline.brier_score,
+                    metrics.candidate.brier_score,
+                    metrics.candidate_minus_baseline.brier_score,
+                    metrics.baseline.log_loss,
+                    metrics.candidate.log_loss,
+                    metrics.candidate_minus_baseline.log_loss
+                ));
+            }
+            if let Some(reason) = &report.metrics_unavailable_reason {
+                summary.push_str(&format!("\nMetrics unavailable: {reason}"));
+            }
+            for note in report.warnings.iter().chain(report.limitations.iter()) {
+                summary.push_str(&format!("\n- {note}"));
+            }
+            (
+                serde_json::json!({
+                    "schema_version": SCHEMA_VERSION,
+                    "command": "replay evaluate",
+                    "baseline_config": baseline.config_dir,
+                    "candidate_config": candidate.config_dir,
+                    "comparison": report,
+                }),
+                summary,
+            )
+        }
+    };
+    match global.format {
+        OutputFormat::Json | OutputFormat::Toon => {
+            println!("{}", format_structured_output(global, output));
+        }
+        OutputFormat::Jsonl => {
+            match serde_json::to_string(&global.process_output_value(output)) {
+                Ok(line) => println!("{line}"),
+                Err(error) => {
+                    eprintln!("replay: cannot serialize output: {error}");
+                    return ExitCode::InternalError;
+                }
+            }
+        }
+        OutputFormat::Exitcode => {}
+        _ => println!("{summary}"),
     }
     ExitCode::Clean
 }

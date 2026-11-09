@@ -413,6 +413,127 @@ mod replay_recording {
             .stderr(predicate::str::contains("--record-replay-window-ms"));
         assert!(!path.exists());
     }
+
+    #[test]
+    fn reviewed_capture_cli_preserves_unknowns_and_compares_explicit_configurations() {
+        let case = CaptureCase::new();
+        let snapshot_path = case.root.join("review-source.json");
+        let captured = case.record(&snapshot_path);
+        let labels_path = case.root.join("review-labels.json");
+        case.command()
+            .args(["replay", "label-template", "--snapshot"])
+            .arg(&snapshot_path)
+            .arg("--output")
+            .arg(&labels_path)
+            .args(["--host-id", "owned-cli-fixture", "--split", "holdout"])
+            .assert()
+            .success();
+        let original = std::fs::read(&labels_path).expect("private review template");
+        let labels: serde_json::Value =
+            serde_json::from_slice(&original).expect("review template JSON");
+        let rows = labels["processes"].as_array().expect("complete review census");
+        let inventory = captured["scan"]["processes"].as_array().unwrap();
+        assert_eq!(rows.len(), inventory.len());
+        assert_eq!(labels["host_id"], "owned-cli-fixture");
+        assert_eq!(labels["split"], "holdout");
+        for process in inventory {
+            let row = rows.iter().find(|row| row["pid"] == process["pid"]).unwrap();
+            assert_eq!(row["start_id"], process["start_id"]);
+            assert_eq!(row["uid"], process["uid"]);
+            assert_eq!(row["cmd"], process["cmd"]);
+            for field in ["verdict", "reviewer", "reviewed_at", "rationale"] {
+                assert!(row.get(field).is_some_and(serde_json::Value::is_null));
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&labels_path).unwrap().permissions().mode() & 0o077,
+                0
+            );
+        }
+
+        // Creating a second template must preserve the reviewer's existing work.
+        case.command()
+            .args(["replay", "label-template", "--snapshot"])
+            .arg(&snapshot_path)
+            .arg("--output")
+            .arg(&labels_path)
+            .args(["--host-id", "owned-cli-fixture", "--split", "holdout"])
+            .assert()
+            .failure();
+        assert_eq!(std::fs::read(&labels_path).unwrap(), original);
+
+        let baseline_config = case.root.join("baseline-config");
+        std::fs::create_dir(&baseline_config).unwrap();
+        let mut policy = pt_core::config::Policy::default();
+        policy.guardrails.min_process_age_seconds = u64::MAX;
+        case.write_policy(&policy);
+        let output = case.command()
+            .args(["replay", "evaluate", "--snapshot"])
+            .arg(&snapshot_path)
+            .arg("--labels")
+            .arg(&labels_path)
+            .arg("--baseline-config")
+            .arg(&baseline_config)
+            .args(["--format", "jsonl"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let text = String::from_utf8(output).unwrap();
+        assert_eq!(text.lines().count(), 1, "comparison JSONL is one complete record");
+        let output: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(output["command"], "replay evaluate");
+        let comparison = &output["comparison"];
+        assert_eq!(comparison["scoring_only"], true);
+        assert_eq!(comparison["snapshot_sha256"], labels["snapshot_sha256"]);
+        assert_eq!(comparison["coverage"]["population_size"], rows.len());
+        assert_eq!(comparison["coverage"]["reviewed_count"], 0);
+        assert_eq!(comparison["coverage"]["unlabeled_count"], rows.len());
+        assert!(comparison["paired_metrics"].is_null());
+        assert!(comparison["metrics_unavailable_reason"].is_string());
+        assert_ne!(
+            comparison["baseline"]["configuration_sha256"],
+            comparison["candidate"]["configuration_sha256"]
+        );
+        assert!(comparison.get("actions").is_none());
+
+        // Omitting a hard-to-score process must fail, not shrink the denominator.
+        let mut incomplete = labels;
+        incomplete["processes"].as_array_mut().unwrap().pop();
+        let incomplete_path = case.root.join("incomplete-review.json");
+        std::fs::write(&incomplete_path, serde_json::to_vec(&incomplete).unwrap()).unwrap();
+        case.command()
+            .args(["replay", "evaluate", "--snapshot"])
+            .arg(&snapshot_path)
+            .arg("--labels")
+            .arg(&incomplete_path)
+            .arg("--baseline-config")
+            .arg(&baseline_config)
+            .assert()
+            .failure();
+        assert_eq!(std::fs::read(&labels_path).unwrap(), original);
+
+        // An unreadable incumbent must not silently become a built-in-only model.
+        let signatures_path = baseline_config.join("signatures.json");
+        let corrupt_signatures = b"{ incomplete signature configuration";
+        std::fs::write(&signatures_path, corrupt_signatures).unwrap();
+        case.command()
+            .args(["replay", "evaluate", "--snapshot"])
+            .arg(&snapshot_path)
+            .arg("--labels")
+            .arg(&labels_path)
+            .arg("--baseline-config")
+            .arg(&baseline_config)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("baseline model could not be loaded completely"));
+        assert_eq!(std::fs::read(&signatures_path).unwrap(), corrupt_signatures);
+        assert_eq!(std::fs::read(&labels_path).unwrap(), original);
+    }
 }
 
 // ============================================================================

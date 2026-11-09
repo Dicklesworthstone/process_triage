@@ -45,8 +45,16 @@
 //! let snapshot = scenarios::mixed_workload();
 //! ```
 
+pub mod evaluation;
 pub mod scenarios;
 pub mod snapshot;
+
+pub use evaluation::{
+    evaluate_pair, make_review_template, read_review_labels, EvaluationCoverage,
+    EvaluationSide, PairedEvaluationReport, PairedProbabilityMetrics, PairedProcessScore,
+    ProbabilityMetricDelta, ProbabilityMetrics, ProcessReview, ReplayEvaluationError,
+    ReviewLabels, ReviewSplit, ReviewVerdict,
+};
 
 pub use snapshot::{
     capture_snapshot, load_snapshot, record_snapshot, replay_inference, replay_scores,
