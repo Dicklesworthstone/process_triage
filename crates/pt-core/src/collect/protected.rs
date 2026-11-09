@@ -565,21 +565,42 @@ impl ProtectedFilter {
     pub fn filter_scan_result_with_restarts<'a>(
         &self,
         scan_result: &ScanResult,
-        mut restart: impl FnMut(&ProcessRecord) -> Option<&'a crate::action::SystemdUserServiceBinding>,
+        restart: impl FnMut(&ProcessRecord) -> Option<&'a crate::action::SystemdUserServiceBinding>,
     ) -> FilterResult {
-        let total_before = scan_result.processes.len();
-        let mut passed = Vec::with_capacity(total_before);
-        let mut filtered = Vec::new();
         let invoker_chain = if self.builtin {
             invoker_chain_pids(&scan_result.processes)
         } else {
             HashSet::new()
         };
-        let by_pid: std::collections::HashMap<u32, &ProcessRecord> =
-            scan_result.processes.iter().map(|p| (p.pid.0, p)).collect();
+        self.filter_with_observations(
+            &scan_result.processes,
+            &invoker_chain,
+            |record| super::cgroup::read_cgroup_role(record.pid.0),
+            restart,
+        )
+    }
 
-        for record in &scan_result.processes {
-            let protection = if invoker_chain.contains(&record.pid.0) {
+    /// Apply the same filter to explicitly supplied observations. The role
+    /// callback and invoker chain may come from a recorded census; this method
+    /// does not read cgroups or discover the current process's ancestors.
+    ///
+    /// Recorded scoring must pass no restart bindings: admitting a service for
+    /// execution still requires the live, same-user capability check.
+    pub fn filter_with_observations<'a>(
+        &self,
+        processes: &[ProcessRecord],
+        invoker_chain: &HashSet<u32>,
+        mut role_for: impl FnMut(&ProcessRecord) -> super::cgroup::CgroupRole,
+        mut restart: impl FnMut(&ProcessRecord) -> Option<&'a crate::action::SystemdUserServiceBinding>,
+    ) -> FilterResult {
+        let total_before = processes.len();
+        let mut passed = Vec::with_capacity(total_before);
+        let mut filtered = Vec::new();
+        let by_pid: std::collections::HashMap<u32, &ProcessRecord> =
+            processes.iter().map(|p| (p.pid.0, p)).collect();
+
+        for record in processes {
+            let protection = if self.builtin && invoker_chain.contains(&record.pid.0) {
                 Some(ProtectedMatch {
                     pid: record.pid.0,
                     comm: record.comm.clone(),
@@ -598,7 +619,7 @@ impl ProtectedFilter {
                         && binding.matches_target(&binding.target)
                 });
                 let role = if self.builtin {
-                    super::cgroup::read_cgroup_role(record.pid.0)
+                    role_for(record)
                 } else {
                     super::cgroup::CgroupRole::Unknown
                 };

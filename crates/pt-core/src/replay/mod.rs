@@ -1,8 +1,13 @@
 //! Process replay and simulation mode.
 //!
-//! Provides the ability to record live scan snapshots and replay them through
-//! the inference/decision pipeline for deterministic testing, demonstration,
-//! and bug reproduction.
+//! Provides private live snapshots and shared-scoring replay for regression
+//! analysis without inspecting the replay machine's processes. The shipped
+//! `scan --record-replay` / `scan --replay-scores` commands preserve the census
+//! denominator and reject incomplete scoring context. Replay scores do not
+//! authorize actions or establish full production decision parity.
+//!
+//! The older `replay_inference` API below remains an unconstrained mathematical
+//! demonstration, not the production decision or protection path.
 //!
 //! # Recording
 //!
@@ -44,8 +49,10 @@ pub mod scenarios;
 pub mod snapshot;
 
 pub use snapshot::{
-    load_snapshot, record_snapshot, replay_inference, DeepSignalRecord, ReplayError,
-    ReplayInferenceResult, ReplayMetadata, ReplaySnapshot, SystemContext,
+    capture_snapshot, load_snapshot, record_snapshot, replay_inference, replay_scores,
+    DeepSignalRecord, ReplayError, ReplayInferenceResult, ReplayMetadata, ReplayProcessInputs,
+    ReplayScoreResult, ReplayScoreStatus, ReplayScoringContext, ReplayScoringReport, ReplaySnapshot,
+    SystemContext,
 };
 
 pub use scenarios::{ci_build, dev_machine, memory_leak, mixed_workload, stuck_tests, zombie_tree};

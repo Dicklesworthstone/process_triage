@@ -291,7 +291,7 @@ const MAX_HISTORY_BYTES: usize = 8 * 1024 * 1024;
 ///
 /// This is evidence for reviewing the spawner, never permission to kill it or
 /// disable a service. Supervisor actions still require their own fresh binding.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RespawnLoopSummary {
     pub identity_key: String,
     pub uid: u32,

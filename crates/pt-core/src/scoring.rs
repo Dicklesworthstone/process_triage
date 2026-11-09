@@ -21,6 +21,7 @@
 //! probabilities and full evidence ledger are retained, including when the most
 //! likely class agrees with the signature.
 
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
@@ -280,6 +281,50 @@ pub struct ProcessScore<'a> {
     /// Provenance adjustment, when the scorer collected provenance.
     #[cfg(target_os = "linux")]
     pub provenance: Option<ProvenanceScoreAdjustment>,
+}
+
+/// Observations consumed by the shared scorer, bound to one process incarnation.
+///
+/// These contain derived provenance evidence, not raw collector inputs. Keeping
+/// them explicit lets a recorded scan use the production scoring path without
+/// consulting the replay machine's PIDs, cgroups, activity or resource graph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScoringObservations {
+    pub pid: u32,
+    pub start_id: pt_common::StartId,
+    pub uid: u32,
+    // Explicit null is meaningful; omitted fields are incomplete recordings.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub pgid: Option<u32>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub sid: Option<u32>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub desktop_app: Option<String>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub activity: Option<ProcessActivity>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub respawn_history: Option<RespawnLoopSummary>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub supervisor_restart: Option<SystemdUserServiceBinding>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub supervisor_restart_unavailable: Option<String>,
+    #[cfg(target_os = "linux")]
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub provenance: Option<ProvenanceScoreAdjustment>,
+}
+
+impl ScoringObservations {
+    pub fn matches_record(&self, process: &ProcessRecord) -> bool {
+        self.pid == process.pid.0
+            && self.start_id == process.start_id
+            && self.uid == process.uid
+            && self.pgid == process.pgid
+            && self.sid == process.sid
+            && self
+                .activity
+                .as_ref()
+                .is_none_or(|activity| activity.matches_record(process))
+    }
 }
 
 /// Scores processes the same way on every surface. See the module docs.
@@ -556,15 +601,64 @@ impl Scorer {
         self.score_with_desktop(proc, evidence, desktop_app_unit_for(proc))
     }
 
+    /// Retain the exact observations this scorer would use for a process.
+    /// Desktop placement is supplied explicitly; this method performs no I/O.
+    pub fn recorded_observations(
+        &self,
+        process: &ProcessRecord,
+        desktop_app: Option<String>,
+    ) -> ScoringObservations {
+        ScoringObservations {
+            pid: process.pid.0,
+            start_id: process.start_id.clone(),
+            uid: process.uid,
+            pgid: process.pgid,
+            sid: process.sid,
+            desktop_app,
+            activity: self.activity_for(process),
+            respawn_history: self.respawn_history_for(process).cloned(),
+            supervisor_restart: self.supervisor_restart_for(process).cloned(),
+            supervisor_restart_unavailable: self
+                .supervisor_restart_unavailable_for(process)
+                .map(str::to_string),
+            #[cfg(target_os = "linux")]
+            provenance: self
+                .provenance
+                .as_ref()
+                .filter(|bundle| bundle.lineages.contains_key(&process.pid.0))
+                .map(|bundle| derive_provenance_adjustment(process.pid.0, bundle)),
+        }
+    }
+
     fn score_with_desktop(
         &self,
         proc: &ProcessRecord,
-        mut evidence: Evidence,
+        evidence: Evidence,
         desktop_app: Option<String>,
     ) -> Option<ProcessScore<'_>> {
+        self.score_recorded(
+            proc,
+            evidence,
+            self.recorded_observations(proc, desktop_app),
+        )
+    }
+
+    /// Score captured observations through the same implementation as live
+    /// scoring. No collector is called and no live PID is inspected here.
+    /// Priors, signatures and human verdicts come from this scorer's configuration.
+    pub fn score_recorded(
+        &self,
+        proc: &ProcessRecord,
+        mut evidence: Evidence,
+        observations: ScoringObservations,
+    ) -> Option<ProcessScore<'_>> {
+        if !observations.matches_record(proc) {
+            return None;
+        }
         let pid = proc.pid.0;
-        let activity = self.activity_for(proc);
-        let respawn_history = self.respawn_history_for(proc).cloned();
+        let desktop_app = observations.desktop_app;
+        let activity = observations.activity;
+        let respawn_history = observations.respawn_history;
         if let Some(activity) = &activity {
             evidence.cpu = activity.cpu_percent.map(|percent| CpuEvidence::Fraction {
                 occupancy: (percent / 100.0).clamp(0.0, 1.0),
@@ -673,30 +767,25 @@ impl Scorer {
         #[cfg(target_os = "linux")]
         // Only processes the provenance was collected for: an empty lineage would read
         // as "nothing depends on it" and push toward abandoned.
-        let provenance = self
-            .provenance
-            .as_ref()
-            .filter(|bundle| bundle.lineages.contains_key(&pid))
-            .map(|bundle| {
-                let mut adjustment = derive_provenance_adjustment(pid, bundle);
-                // The base `orphan` term already carries "reparented to init"; counting the
-                // lineage's orphaned verdict again double-counts one fact under naive Bayes.
-                // Keep it only when it adds information (lineage sees an orphan that the
-                // base check does not, e.g. reparented to a user subreaper).
-                if proc.is_orphan() {
-                    adjustment
-                        .evidence_terms
-                        .retain(|t| t.feature != "provenance_ownership_orphaned");
-                }
-                // Desktop-application ownership is the more specific ownership fact.
-                if desktop_app.is_some() {
-                    adjustment
-                        .evidence_terms
-                        .retain(|t| !t.feature.starts_with("provenance_ownership_"));
-                }
-                provenance::apply_adjustment(pid, &adjustment, &mut posterior, &mut ledger);
+        let provenance = observations.provenance.map(|mut adjustment| {
+            // The base `orphan` term already carries "reparented to init"; counting the
+            // lineage's orphaned verdict again double-counts one fact under naive Bayes.
+            // Keep it only when it adds information (lineage sees an orphan that the
+            // base check does not, e.g. reparented to a user subreaper).
+            if proc.is_orphan() {
                 adjustment
-            });
+                    .evidence_terms
+                    .retain(|t| t.feature != "provenance_ownership_orphaned");
+            }
+            // Desktop-application ownership is the more specific ownership fact.
+            if desktop_app.is_some() {
+                adjustment
+                    .evidence_terms
+                    .retain(|t| !t.feature.starts_with("provenance_ownership_"));
+            }
+            provenance::apply_adjustment(pid, &adjustment, &mut posterior, &mut ledger);
+            adjustment
+        });
 
         if let Some(unit) = desktop_app.as_deref() {
             let line = match abandon_signature.as_deref() {
@@ -793,10 +882,8 @@ impl Scorer {
             signature_age_weight,
             learned_prior,
             respawn_history,
-            supervisor_restart: self.supervisor_restart_for(proc).cloned(),
-            supervisor_restart_unavailable: self
-                .supervisor_restart_unavailable_for(proc)
-                .map(str::to_string),
+            supervisor_restart: observations.supervisor_restart,
+            supervisor_restart_unavailable: observations.supervisor_restart_unavailable,
             fast_path_used: false,
             fast_path_skip_reason,
             desktop_app,
@@ -838,7 +925,7 @@ mod provenance {
     }
 
     /// Provenance-derived evidence terms and confidence caveats for one process.
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
     pub struct ProvenanceScoreAdjustment {
         pub evidence_terms: Vec<EvidenceTerm>,
         pub evidence_completeness: f64,
@@ -1307,6 +1394,80 @@ mod tests {
     }
 
     const FOUR_DAYS: Duration = Duration::from_secs(4 * 24 * 3600);
+
+    #[test]
+    fn recorded_observations_preserve_activity_and_desktop_after_cache_changes() {
+        let process = record(5100, "slack", "/usr/lib/slack/slack", FOUR_DAYS);
+        let mut measured = scorer(SignatureDatabase::new());
+        measured.activity_window = Some(Duration::from_millis(500));
+        measured.activity.insert(process.pid.0, sampled_idle(&process));
+        let desktop = Some("app-recorded-slack.scope".to_string());
+        let observations = measured.recorded_observations(&process, desktop.clone());
+        let expected = measured
+            .score_with_desktop(&process, Evidence::from_snapshot(&process), desktop)
+            .unwrap()
+            .ledger;
+        let json = serde_json::to_vec(&observations).unwrap();
+        let restored: ScoringObservations = serde_json::from_slice(&json).unwrap();
+
+        measured.activity_window = None;
+        measured.activity.clear();
+        let actual = measured
+            .score_recorded(&process, Evidence::from_snapshot(&process), restored)
+            .unwrap();
+        assert_eq!(actual.ledger, expected);
+        assert_eq!(actual.activity.unwrap().cpu_percent, Some(0.0));
+        assert!(actual.desktop_app_credited);
+        assert_eq!(
+            actual.desktop_app.as_deref(),
+            Some("app-recorded-slack.scope")
+        );
+    }
+
+    #[test]
+    fn recorded_observations_reject_omitted_nullable_fields() {
+        let process = record(5102, "worker", "worker --job", FOUR_DAYS);
+        let observations =
+            scorer(SignatureDatabase::new()).recorded_observations(&process, None);
+        let serialized = serde_json::to_value(&observations).unwrap();
+        // Null is a recorded absence, but an omitted field is not an observation.
+        let complete: ScoringObservations = serde_json::from_value(serialized.clone()).unwrap();
+        assert!(complete.matches_record(&process));
+        for field in serialized.as_object().unwrap().keys() {
+            let mut incomplete = serialized.clone();
+            incomplete.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<ScoringObservations>(incomplete).is_err(),
+                "missing {field} must not silently become an absent observation"
+            );
+        }
+    }
+
+    #[test]
+    fn recorded_observations_reject_another_incarnation_or_job_group() {
+        let process = record(5101, "worker", "worker --job", FOUR_DAYS);
+        let measured = scorer(SignatureDatabase::new());
+        let observations = measured.recorded_observations(&process, None);
+        for field in ["pid", "start_id", "uid", "pgid", "sid"] {
+            let mut changed = observations.clone();
+            match field {
+                "pid" => changed.pid += 1,
+                "start_id" => {
+                    changed.start_id = StartId::from_linux("different-boot", 1, process.pid.0);
+                }
+                "uid" => changed.uid += 1,
+                "pgid" => changed.pgid = Some(99),
+                "sid" => changed.sid = Some(99),
+                _ => unreachable!(),
+            }
+            assert!(
+                measured
+                    .score_recorded(&process, Evidence::from_snapshot(&process), changed)
+                    .is_none(),
+                "{field} must not inherit recorded scoring inputs"
+            );
+        }
+    }
 
     #[cfg(unix)]
     #[test]
@@ -2400,6 +2561,57 @@ mod provenance_tests {
         assert!(features.contains(&"provenance_ownership_supervised"));
         assert!(features.contains(&"provenance_active_listener"));
         assert!(adjustment.evidence_completeness >= 0.8);
+    }
+
+    #[test]
+    fn recorded_scoring_preserves_provenance_without_the_live_resource_graph() {
+        let process = crate::mock_process::MockProcessBuilder::new()
+            .pid(200)
+            .ppid(2)
+            .comm("worker")
+            .cmd("worker --serve")
+            .elapsed(Duration::from_secs(7200))
+            .build();
+        let mut measured = Scorer::new(
+            Priors::default(),
+            DecisionStore::default(),
+            SignatureDatabase::new(),
+            FastPathConfig::disabled(),
+        );
+        measured.provenance = Some(ProvenanceInferenceBundle {
+            resource_graph: SharedResourceGraph::from_evidence(&[(
+                process.pid.0,
+                vec![listener_ev(process.pid.0, 8080)],
+            )]),
+            lineages: HashMap::from([(process.pid.0, lineage(process.pid.0, 2, None))]),
+            children: HashMap::new(),
+        });
+        let observations = measured.recorded_observations(&process, None);
+        let expected = measured
+            .score_with_desktop(&process, Evidence::from_snapshot(&process), None)
+            .unwrap()
+            .ledger;
+        let restored: ScoringObservations =
+            serde_json::from_value(serde_json::to_value(&observations).unwrap()).unwrap();
+
+        measured.provenance = None;
+        let without = measured
+            .score_with_desktop(&process, Evidence::from_snapshot(&process), None)
+            .unwrap();
+        assert!(!without
+            .posterior
+            .evidence_terms
+            .iter()
+            .any(|term| term.feature.starts_with("provenance_")));
+        let replayed = measured
+            .score_recorded(&process, Evidence::from_snapshot(&process), restored)
+            .unwrap();
+        assert_eq!(replayed.ledger, expected);
+        assert!(replayed
+            .posterior
+            .evidence_terms
+            .iter()
+            .any(|term| term.feature == "provenance_active_listener"));
     }
 
     #[test]

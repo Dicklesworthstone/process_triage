@@ -336,7 +336,7 @@ enum Commands {
     /// Interactive golden path: scan → infer → plan → TUI approval → staged apply
     Run(RunArgs),
 
-    /// Quick multi-sample scan only (no inference or action)
+    /// Scan processes, record observations, or replay recorded scores (no actions)
     Scan(ScanArgs),
 
     /// Full deep scan with all available probes
@@ -481,10 +481,35 @@ struct ScanArgs {
     #[arg(long)]
     goal: Option<String>,
 
-    /// Record this quick scan as a private ReplaySnapshot (contains raw command lines).
+    /// Record this quick scan and scoring observations privately (contains raw commands).
     /// The destination must not exist. Redact and review before sharing.
     #[arg(long, value_name = "PATH", conflicts_with = "deep")]
     record_replay: Option<PathBuf>,
+
+    /// Activity window for replay recording in milliseconds (default: 500; 0 uses lifetime CPU).
+    #[arg(
+        long,
+        requires = "record_replay",
+        value_parser = clap::value_parser!(u64).range(0..=60_000)
+    )]
+    record_replay_window_ms: Option<u64>,
+
+    /// Score a recorded census with current configuration, without inspecting live processes.
+    /// Requires scoring observations from --record-replay. Never authorizes actions.
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with_all = [
+            "deep",
+            "record_replay",
+            "record_replay_window_ms",
+            "goal",
+            "include_kernel_threads",
+            "samples",
+            "interval"
+        ]
+    )]
+    replay_scores: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -5216,6 +5241,10 @@ impl Drop for SessionLifecycle {
 }
 
 fn run_scan(global: &GlobalOpts, args: &ScanArgs) -> ExitCode {
+    if let Some(path) = &args.replay_scores {
+        return run_replay_scores(global, path);
+    }
+
     let ctx = LogContext::new(
         pt_core::logging::generate_run_id(),
         pt_core::logging::get_host_id(),
@@ -5238,6 +5267,17 @@ fn run_scan(global: &GlobalOpts, args: &ScanArgs) -> ExitCode {
             },
         );
     }
+
+    // Recording adds activity and provenance probes. Serialize those probes
+    // with other scans, while ordinary scans and offline replay stay read-only.
+    let _recording_lock = if args.record_replay.is_some() {
+        match acquire_global_lock(global, "scan record-replay") {
+            Ok(lock) => lock,
+            Err(code) => return code,
+        }
+    } else {
+        None
+    };
 
     let progress = progress_emitter(global);
 
@@ -5275,8 +5315,26 @@ fn run_scan(global: &GlobalOpts, args: &ScanArgs) -> ExitCode {
             };
 
             if let Some(path) = &args.record_replay {
-                let recording = pt_core::replay::record_snapshot(&result, None)
-                    .and_then(|snapshot| snapshot.save_new_private(path));
+                let config_options = ConfigOptions {
+                    config_dir: global.config.as_ref().map(PathBuf::from),
+                    ..Default::default()
+                };
+                let config = match load_config(&config_options) {
+                    Ok(config) => config,
+                    Err(error) => return output_config_error(global, &error),
+                };
+                let (mut scorer, warnings) = pt_core::scoring::Scorer::from_config(&config);
+                for warning in warnings {
+                    eprintln!("scan: replay recording warning: {warning}");
+                }
+                let recording = pt_core::replay::capture_snapshot(
+                    &result,
+                    None,
+                    &mut scorer,
+                    &config.policy,
+                    std::time::Duration::from_millis(args.record_replay_window_ms.unwrap_or(500)),
+                )
+                .and_then(|snapshot| snapshot.save_new_private(path));
                 if let Err(err) = recording {
                     eprintln!(
                         "scan: replay recording failed at {}: {}",
@@ -5365,6 +5423,102 @@ fn run_scan(global: &GlobalOpts, args: &ScanArgs) -> ExitCode {
             ExitCode::InternalError
         }
     }
+}
+
+fn run_replay_scores(global: &GlobalOpts, path: &std::path::Path) -> ExitCode {
+    let snapshot = match pt_core::replay::load_snapshot(path) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            eprintln!("scan: replay scores failed at {}: {error}", path.display());
+            return match error {
+                pt_core::replay::ReplayError::Io(_) => ExitCode::IoError,
+                _ => ExitCode::ArgsError,
+            };
+        }
+    };
+    let config_options = ConfigOptions {
+        config_dir: global.config.as_ref().map(PathBuf::from),
+        ..Default::default()
+    };
+    let config = match load_config(&config_options) {
+        Ok(config) => config,
+        Err(error) => return output_config_error(global, &error),
+    };
+    let (scorer, warnings) = pt_core::scoring::Scorer::from_config(&config);
+    for warning in warnings {
+        eprintln!("scan: replay scores warning: {warning}");
+    }
+    let report = match pt_core::replay::replay_scores(&snapshot, &scorer, &config.policy) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("scan: replay scores failed at {}: {error}", path.display());
+            return ExitCode::ArgsError;
+        }
+    };
+
+    match global.format {
+        OutputFormat::Json | OutputFormat::Toon | OutputFormat::Jsonl => {
+            let output = serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "command": "scan replay-scores",
+                "replay": report,
+            });
+            if matches!(global.format, OutputFormat::Jsonl) {
+                let output = global.process_output_value(output);
+                match serde_json::to_string(&output) {
+                    Ok(line) => println!("{line}"),
+                    Err(error) => {
+                        eprintln!("scan: cannot serialize replay scores: {error}");
+                        return ExitCode::InternalError;
+                    }
+                }
+            } else {
+                println!("{}", format_structured_output(global, output));
+            }
+        }
+        OutputFormat::Exitcode => {}
+        OutputFormat::Summary => {
+            println!(
+                "Replay {}: {} processes; {} scored, {} protected, {} too young, {} unavailable",
+                report.snapshot_name,
+                report.population_size,
+                report.scored_count,
+                report.protected_count,
+                report.too_young_count,
+                report.unavailable_count
+            );
+            println!("Scoring only under current configuration; no actions are authorized.");
+        }
+        _ => {
+            println!("# Replay Scores: {}", report.snapshot_name);
+            println!();
+            println!(
+                "Population: {}; scored: {}; protected: {}; too young: {}; unavailable: {}",
+                report.population_size,
+                report.scored_count,
+                report.protected_count,
+                report.too_young_count,
+                report.unavailable_count
+            );
+            println!();
+            println!("| PID | Status | Command |");
+            println!("| --- | --- | --- |");
+            for row in report.processes.iter().take(20) {
+                println!("| {} | {:?} | {} |", row.pid, row.status, row.comm);
+            }
+            if report.processes.len() > 20 {
+                println!(
+                    "... and {} more; use --format json for the complete report.",
+                    report.processes.len() - 20
+                );
+            }
+            println!();
+            for limitation in &report.limitations {
+                println!("- {limitation}");
+            }
+        }
+    }
+    ExitCode::Clean
 }
 
 fn bytes_to_human(bytes: u64) -> String {

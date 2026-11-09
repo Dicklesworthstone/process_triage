@@ -1,18 +1,24 @@
 //! Core snapshot types, recording, loading, and replay.
 
-use crate::collect::{ProcessRecord, ProcessState, ScanMetadata, ScanResult};
+use crate::collect::cgroup::CgroupRole;
+use crate::collect::protected::{ProtectedFilter, ProtectedMatch};
+use crate::collect::{ProcessRecord, ScanMetadata, ScanResult};
 use crate::config::priors::Priors;
 use crate::config::Policy;
 use crate::decision::expected_loss::{Action, ActionFeasibility};
 use crate::decision::myopic_policy::compute_loss_table;
-use crate::inference::posterior::{compute_posterior, ClassScores, CpuEvidence, Evidence};
+use crate::inference::posterior::{compute_posterior, ClassScores, Evidence};
+use crate::inference::EvidenceLedger;
+use crate::scoring::{Scorer, ScoringObservations};
+use pt_common::{IdentityQuality, ProcessIdentity};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
+use std::time::Duration;
 use thiserror::Error;
 
 /// Schema version for replay snapshot files.
-pub const REPLAY_SCHEMA_VERSION: &str = "1.0.0";
+pub const REPLAY_SCHEMA_VERSION: &str = "1.1.0";
 
 /// Errors that can occur during replay operations.
 #[derive(Debug, Error)]
@@ -31,12 +37,17 @@ pub enum ReplayError {
 
     #[error("inference error for PID {pid}: {message}")]
     Inference { pid: u32, message: String },
+
+    #[error("incomplete or incompatible replay scoring context: {0}")]
+    ScoringContext(String),
 }
 
 // ── Snapshot types ──────────────────────────────────────────────────────
 
-/// Complete replay snapshot containing all data needed to replay through
-/// the inference/decision pipeline.
+/// A recorded process census with optional explicit scoring observations.
+///
+/// Inventory-only snapshots support mathematical demonstrations. Shared scoring
+/// requires the complete context produced by `capture_snapshot`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplaySnapshot {
     /// Schema version for compatibility checking.
@@ -61,6 +72,76 @@ pub struct ReplaySnapshot {
     /// Optional deep signal data per PID.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub deep_signals: HashMap<u32, DeepSignalRecord>,
+
+    /// Explicit observations for shared scoring. Older inventory-only snapshots
+    /// remain loadable, but cannot be used by `replay_scores`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scoring_context: Option<ReplayScoringContext>,
+}
+
+/// Observations captured for one process, including explicitly unavailable data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayProcessInputs {
+    pub identity: ProcessIdentity,
+    pub cgroup_role: Option<CgroupRole>,
+    pub observations: Option<ScoringObservations>,
+    pub unavailable_reason: Option<String>,
+}
+
+/// A complete inventory of scoring observations for one recorded census.
+///
+/// Protected and young processes retain rows but may have no expensive probes.
+/// A later, broader policy cannot turn those missing probes into idle evidence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayScoringContext {
+    pub schema_version: u32,
+    pub platform: String,
+    pub requested_window_ms: u64,
+    pub invoker_chain: BTreeSet<u32>,
+    pub processes: BTreeMap<u32, ReplayProcessInputs>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayScoreStatus {
+    Scored,
+    Protected,
+    TooYoung,
+    Unavailable,
+}
+
+/// One retained denominator row. No action recommendation is generated.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReplayScoreResult {
+    pub pid: u32,
+    pub start_id: String,
+    pub uid: u32,
+    pub comm: String,
+    pub status: ReplayScoreStatus,
+    pub reason: Option<String>,
+    pub protection: Option<ProtectedMatch>,
+    pub posterior: Option<ClassScores>,
+    pub ledger: Option<EvidenceLedger>,
+    pub prior_source: Option<String>,
+    pub signature: Option<String>,
+}
+
+/// Shared-scoring output, deliberately separate from an executable plan.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReplayScoringReport {
+    pub snapshot_name: String,
+    pub recorded_at: String,
+    pub evaluated_at: String,
+    pub scoring_only: bool,
+    pub configuration_scope: &'static str,
+    pub requested_window_ms: u64,
+    pub population_size: usize,
+    pub scored_count: usize,
+    pub protected_count: usize,
+    pub too_young_count: usize,
+    pub unavailable_count: usize,
+    pub processes: Vec<ReplayScoreResult>,
+    pub limitations: Vec<String>,
 }
 
 /// System context at time of snapshot creation.
@@ -188,6 +269,343 @@ pub fn record_snapshot(
         },
         processes: scan.processes.clone(),
         deep_signals: HashMap::new(),
+        scoring_context: None,
+    })
+}
+
+fn snapshot_identity(process: &ProcessRecord) -> ProcessIdentity {
+    let quality = if process.start_id.0.starts_with("unknown:")
+        || process.start_id.0.starts_with("synthetic:")
+    {
+        IdentityQuality::NoBootId
+    } else {
+        IdentityQuality::Full
+    };
+    ProcessIdentity::full(
+        process.pid.0,
+        process.start_id.clone(),
+        process.uid,
+        process.pgid,
+        process.sid,
+        quality,
+    )
+}
+
+/// Capture the inputs used by shared scoring without executing process actions.
+///
+/// Placement is collected once per record. Expensive activity/provenance probes
+/// run only for the capture policy's eligible population, with one shared window.
+/// Identity checks bracket observation collection; failed and unprobed rows are
+/// retained explicitly. The resulting file is private and still needs redaction.
+pub fn capture_snapshot(
+    scan: &ScanResult,
+    name: Option<&str>,
+    scorer: &mut Scorer,
+    policy: &Policy,
+    window: Duration,
+) -> Result<ReplaySnapshot, ReplayError> {
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (scan, name, scorer, policy, window);
+        Err(ReplayError::ScoringContext(
+            "identity-bound capture is unsupported on this platform".to_string(),
+        ))
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use crate::action::{IdentityProvider, LiveIdentityProvider};
+
+        let mut snapshot = record_snapshot(scan, name)?;
+        if scan.metadata.platform != std::env::consts::OS {
+            return Err(ReplayError::ScoringContext(
+                "capture platform differs from the scan platform".to_string(),
+            ));
+        }
+        let filter = ProtectedFilter::from_guardrails(&policy.guardrails)
+            .map_err(|error| ReplayError::ScoringContext(error.to_string()))?;
+        let provider = LiveIdentityProvider::new();
+        let invoker_chain = crate::collect::protected::invoker_chain_pids(&scan.processes);
+        let mut inputs = BTreeMap::new();
+        for process in &scan.processes {
+            let identity = snapshot_identity(process);
+            let mut input = ReplayProcessInputs {
+                identity,
+                cgroup_role: None,
+                observations: None,
+                unavailable_reason: None,
+            };
+            if !matches!(provider.revalidate(&input.identity), Ok(true)) {
+                input.unavailable_reason =
+                    Some("process identity was unavailable before capture".to_string());
+            } else {
+                let role = crate::collect::read_cgroup_role(process.pid.0);
+                if matches!(provider.revalidate(&input.identity), Ok(true)) {
+                    input.cgroup_role = Some(role);
+                } else {
+                    input.unavailable_reason =
+                        Some("process identity changed during placement capture".to_string());
+                }
+            }
+            if inputs.insert(process.pid.0, input).is_some() {
+                return Err(ReplayError::ScoringContext(format!(
+                    "duplicate PID {} in recorded census",
+                    process.pid.0
+                )));
+            }
+        }
+        let filtered = filter.filter_with_observations(
+            &scan.processes,
+            &invoker_chain,
+            |process| {
+                inputs
+                    .get(&process.pid.0)
+                    .and_then(|input| input.cgroup_role)
+                    .unwrap_or(CgroupRole::Unknown)
+            },
+            |_| None,
+        );
+        let passed: HashSet<u32> = filtered.passed.iter().map(|process| process.pid.0).collect();
+        let eligible: Vec<&ProcessRecord> = scan
+            .processes
+            .iter()
+            .filter(|process| {
+                passed.contains(&process.pid.0)
+                    && process.pid.0 > 1
+                    && process.elapsed.as_secs() >= policy.guardrails.min_process_age_seconds
+                    && inputs
+                        .get(&process.pid.0)
+                        .is_some_and(|input| input.cgroup_role.is_some())
+            })
+            .collect();
+
+        scorer.collect_activity(&eligible, window);
+        scorer.collect_provenance(&eligible);
+        let eligible_pids: HashSet<u32> = eligible.iter().map(|process| process.pid.0).collect();
+        for process in &scan.processes {
+            let input = inputs
+                .get_mut(&process.pid.0)
+                .expect("each census identity was inserted");
+            if input.cgroup_role.is_none() {
+                continue;
+            }
+            if !eligible_pids.contains(&process.pid.0) {
+                input.unavailable_reason = Some(
+                    "scoring probes were not collected for this capture-policy-protected or young process"
+                        .to_string(),
+                );
+                continue;
+            }
+            let desktop = crate::scoring::desktop_app_unit_for(process);
+            let observations = scorer.recorded_observations(process, desktop);
+            if matches!(provider.revalidate(&input.identity), Ok(true)) {
+                input.observations = Some(observations);
+            } else {
+                input.cgroup_role = None;
+                input.unavailable_reason =
+                    Some("process identity changed during scoring capture".to_string());
+            }
+        }
+        snapshot.scoring_context = Some(ReplayScoringContext {
+            schema_version: 1,
+            platform: std::env::consts::OS.to_string(),
+            requested_window_ms: u64::try_from(window.as_millis()).unwrap_or(u64::MAX),
+            invoker_chain: invoker_chain.into_iter().collect(),
+            processes: inputs,
+        });
+        Ok(snapshot)
+    }
+}
+
+/// Reject omitted context instead of treating a recording as fresh live data.
+/// Explicit capture failures are valid rows; they stay unavailable in the report.
+fn validate_scoring_context(snapshot: &ReplaySnapshot) -> Result<&ReplayScoringContext, ReplayError> {
+    let context = snapshot.scoring_context.as_ref().ok_or_else(|| {
+        ReplayError::ScoringContext(
+            "inventory-only snapshot; capture again with scan --record-replay".to_string(),
+        )
+    })?;
+    if context.schema_version != 1
+        || context.platform != std::env::consts::OS
+        || snapshot.context.platform != context.platform
+    {
+        return Err(ReplayError::ScoringContext(
+            "scoring context version or platform does not match this evaluator".to_string(),
+        ));
+    }
+    if context.processes.len() != snapshot.processes.len()
+        || snapshot.scan_metadata.process_count != snapshot.processes.len()
+    {
+        return Err(ReplayError::ScoringContext(
+            "scoring context must retain exactly the complete recorded census".to_string(),
+        ));
+    }
+    let mut seen = HashSet::new();
+    for process in &snapshot.processes {
+        if !seen.insert(process.pid.0) {
+            return Err(ReplayError::ScoringContext(format!(
+                "duplicate PID {} in recorded census",
+                process.pid.0
+            )));
+        }
+        let input = context.processes.get(&process.pid.0).ok_or_else(|| {
+            ReplayError::ScoringContext(format!("missing context for PID {}", process.pid.0))
+        })?;
+        if input.identity != snapshot_identity(process) {
+            return Err(ReplayError::ScoringContext(format!(
+                "recorded context belongs to a different incarnation of PID {}",
+                process.pid.0
+            )));
+        }
+        let Some(observations) = &input.observations else {
+            if input
+                .unavailable_reason
+                .as_ref()
+                .is_none_or(|reason| reason.trim().is_empty())
+            {
+                return Err(ReplayError::ScoringContext(format!(
+                    "missing scoring observations without an explanation for PID {}",
+                    process.pid.0
+                )));
+            }
+            continue;
+        };
+        if input.cgroup_role.is_none()
+            || input.unavailable_reason.is_some()
+            || !observations.matches_record(process)
+        {
+            return Err(ReplayError::ScoringContext(format!(
+                "invalid scoring observations for PID {}",
+                process.pid.0
+            )));
+        }
+        match (&observations.activity, context.requested_window_ms) {
+            (None, 0) => {}
+            (Some(activity), window)
+                if window > 0 && activity.requested_window_ms == window => {}
+            _ => {
+                return Err(ReplayError::ScoringContext(format!(
+                    "missing or inconsistent activity window for PID {}",
+                    process.pid.0
+                )));
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if observations.provenance.is_none() {
+            return Err(ReplayError::ScoringContext(format!(
+                "missing captured provenance for PID {}",
+                process.pid.0
+            )));
+        }
+    }
+    Ok(context)
+}
+
+/// Replay captured inputs through the production scorer and protection filter.
+///
+/// All processes retain rows, including protected, young and unavailable ones.
+/// This evaluates current priors/signatures/human verdicts at the current time;
+/// it is not a historical action decision, a calibrated quality metric, or a plan.
+/// No live process, cgroup, service manager or activity collector is consulted.
+pub fn replay_scores(
+    snapshot: &ReplaySnapshot,
+    scorer: &Scorer,
+    policy: &Policy,
+) -> Result<ReplayScoringReport, ReplayError> {
+    let context = validate_scoring_context(snapshot)?;
+    let filter = ProtectedFilter::from_guardrails(&policy.guardrails)
+        .map_err(|error| ReplayError::ScoringContext(error.to_string()))?;
+    let invoker_chain = context.invoker_chain.iter().copied().collect();
+    let filtered = filter.filter_with_observations(
+        &snapshot.processes,
+        &invoker_chain,
+        |process| {
+            context.processes[&process.pid.0]
+                .cgroup_role
+                .unwrap_or(CgroupRole::Unknown)
+        },
+        |_| None,
+    );
+    let mut protected: HashMap<u32, ProtectedMatch> = filtered
+        .filtered
+        .into_iter()
+        .map(|entry| (entry.pid, entry))
+        .collect();
+    let mut processes = Vec::with_capacity(snapshot.processes.len());
+    for process in &snapshot.processes {
+        let input = &context.processes[&process.pid.0];
+        let mut row = ReplayScoreResult {
+            pid: process.pid.0,
+            start_id: process.start_id.to_string(),
+            uid: process.uid,
+            comm: process.comm.clone(),
+            status: ReplayScoreStatus::Unavailable,
+            reason: input.unavailable_reason.clone(),
+            protection: None,
+            posterior: None,
+            ledger: None,
+            prior_source: None,
+            signature: None,
+        };
+        if input.cgroup_role.is_none() {
+            // An identity failure cannot supply even an apparent safe placement.
+            processes.push(row);
+            continue;
+        }
+        if let Some(protection) = protected.remove(&process.pid.0) {
+            row.status = ReplayScoreStatus::Protected;
+            row.reason = protection.notes.clone();
+            row.protection = Some(protection);
+        } else if process.pid.0 <= 1
+            || process.elapsed.as_secs() < policy.guardrails.min_process_age_seconds
+        {
+            row.status = ReplayScoreStatus::TooYoung;
+            row.reason = Some("not eligible under the current minimum-age/identity policy".to_string());
+        } else if let Some(observations) = &input.observations {
+            match scorer.score_recorded(
+                process,
+                build_evidence(process, snapshot.deep_signals.get(&process.pid.0)),
+                observations.clone(),
+            ) {
+                Some(score) => {
+                    row.status = ReplayScoreStatus::Scored;
+                    row.reason = None;
+                    row.posterior = Some(score.posterior.posterior);
+                    row.prior_source = Some(score.prior_source);
+                    row.signature = score.signature.map(|matched| matched.signature.name.clone());
+                    row.ledger = Some(score.ledger);
+                }
+                None => {
+                    row.reason =
+                        Some("shared scorer could not compute a valid posterior".to_string());
+                }
+            }
+        }
+        processes.push(row);
+    }
+    let count = |status| processes.iter().filter(|row| row.status == status).count();
+    Ok(ReplayScoringReport {
+        snapshot_name: snapshot.name.clone(),
+        recorded_at: snapshot.context.recorded_at.clone(),
+        evaluated_at: chrono::Utc::now().to_rfc3339(),
+        scoring_only: true,
+        configuration_scope: "current_configuration_and_current_learned_verdict_decay",
+        requested_window_ms: context.requested_window_ms,
+        population_size: snapshot.processes.len(),
+        scored_count: count(ReplayScoreStatus::Scored),
+        protected_count: count(ReplayScoreStatus::Protected),
+        too_young_count: count(ReplayScoreStatus::TooYoung),
+        unavailable_count: count(ReplayScoreStatus::Unavailable),
+        processes,
+        limitations: vec![
+            "Scoring only: no action decisions, tree safety, live prechecks, kill/review metrics or execution."
+                .to_string(),
+            "Current configured priors, signatures and learned-verdict decay are evaluated; historical configuration is not reconstructed."
+                .to_string(),
+            "Stored placement and derived provenance terms are replayed; raw collectors and provenance classifiers are not rerun."
+                .to_string(),
+            "Supervisor restart eligibility requires fresh live validation; services remain protected during scoring replay."
+                .to_string(),
+        ],
     })
 }
 
@@ -288,6 +706,11 @@ impl ReplaySnapshot {
             proc.user = "user".to_string();
         }
 
+        // Hashing commands destroys signature/learned-pattern fidelity, and the
+        // derived context can retain paths and service names. Never preserve a
+        // partially anonymized context that could be mistaken for faithful replay.
+        self.scoring_context = None;
+
         // Hash hostname
         if let Some(ref h) = self.context.hostname_hash {
             let mut hasher = DefaultHasher::new();
@@ -299,11 +722,12 @@ impl ReplaySnapshot {
 
 // ── Replay inference ────────────────────────────────────────────────────
 
-/// Replay a snapshot through the inference/decision pipeline.
+/// Mathematical simulation of a snapshot with an unconstrained action set.
 ///
-/// For each process in the snapshot, constructs evidence, computes the
-/// posterior, and determines the recommended action. Returns deterministic
-/// results that can be compared against expected outcomes.
+/// This older demonstration API does not implement production protection,
+/// signatures, learned priors or final action safety. Its actions cannot be used
+/// as executable recommendations or production decision-quality measurements.
+/// Use `replay_scores` for captured observations and the shared production scorer.
 pub fn replay_inference(
     snapshot: &ReplaySnapshot,
     priors: &Priors,
@@ -352,36 +776,12 @@ pub fn replay_inference(
     Ok(results)
 }
 
-/// Build Evidence struct from a ProcessRecord and optional deep signals.
+/// Use the same snapshot evidence mapping as live scoring.
 fn build_evidence(proc: &ProcessRecord, deep: Option<&DeepSignalRecord>) -> Evidence {
-    let cpu = if proc.cpu_percent >= 0.0 {
-        Some(CpuEvidence::Fraction {
-            occupancy: (proc.cpu_percent / 100.0).clamp(0.0, 1.0),
-        })
-    } else {
-        None
-    };
-
-    let state_flag = match proc.state {
-        ProcessState::Running => Some(0),
-        ProcessState::Sleeping => Some(1),
-        ProcessState::DiskSleep => Some(2),
-        ProcessState::Zombie => Some(3),
-        ProcessState::Stopped => Some(4),
-        ProcessState::Idle => Some(5),
-        _ => None,
-    };
-
     Evidence {
-        cpu,
-        runtime_seconds: Some(proc.elapsed.as_secs_f64()),
-        orphan: Some(proc.is_orphan()),
-        tty: Some(proc.has_tty()),
-        net: deep.and_then(|d| d.net_active),
-        io_active: deep.and_then(|d| d.io_active),
-        state_flag,
-        command_category: None,
-        queue_saturated: None,
+        net: deep.and_then(|signal| signal.net_active),
+        io_active: deep.and_then(|signal| signal.io_active),
+        ..Evidence::from_snapshot(proc)
     }
 }
 
@@ -441,6 +841,255 @@ mod tests {
     use super::*;
     use crate::mock_process::{MockProcessBuilder, MockScanBuilder};
     use std::time::Duration;
+
+    fn replay_scorer() -> Scorer {
+        Scorer::new(
+            Priors::default(),
+            crate::decision::decision_store::DecisionStore::default(),
+            crate::supervision::signature::SignatureDatabase::with_defaults(),
+            crate::inference::FastPathConfig::disabled(),
+        )
+    }
+
+    fn scoring_fixture(processes: Vec<ProcessRecord>, scorer: &Scorer) -> ReplaySnapshot {
+        let scan = MockScanBuilder::new()
+            .platform(std::env::consts::OS)
+            .with_processes(processes)
+            .build();
+        let mut snapshot = record_snapshot(&scan, Some("scoring-fixture")).unwrap();
+        let inputs = snapshot
+            .processes
+            .iter()
+            .map(|process| {
+                let observations = scorer.recorded_observations(process, None);
+                #[cfg(target_os = "linux")]
+                let observations = {
+                    let mut observations = observations;
+                    observations.provenance = Some(crate::scoring::derive_provenance_adjustment(
+                        process.pid.0,
+                        &crate::scoring::ProvenanceInferenceBundle {
+                            resource_graph: crate::collect::SharedResourceGraph::default(),
+                            lineages: HashMap::new(),
+                            children: HashMap::new(),
+                        },
+                    ));
+                    observations
+                };
+                (
+                    process.pid.0,
+                    ReplayProcessInputs {
+                        identity: snapshot_identity(process),
+                        cgroup_role: Some(CgroupRole::LoginSession),
+                        observations: Some(observations),
+                        unavailable_reason: None,
+                    },
+                )
+            })
+            .collect();
+        snapshot.scoring_context = Some(ReplayScoringContext {
+            schema_version: 1,
+            platform: std::env::consts::OS.to_string(),
+            requested_window_ms: 0,
+            invoker_chain: BTreeSet::new(),
+            processes: inputs,
+        });
+        snapshot
+    }
+
+    fn scoring_process(pid: u32, comm: &str, age: u64) -> ProcessRecord {
+        MockProcessBuilder::new()
+            .pid(pid)
+            .ppid(7)
+            .uid(1000)
+            .user("alice")
+            .comm(comm)
+            .cmd(format!("{comm} --job"))
+            .elapsed_secs(age)
+            .build()
+    }
+
+    #[test]
+    fn scoring_replay_retains_protected_young_and_unavailable_denominators() {
+        let scorer = replay_scorer();
+        let mut policy = Policy::default();
+        policy.guardrails.min_process_age_seconds = 60;
+        let mut snapshot = scoring_fixture(
+            vec![
+                scoring_process(101, "worker", 7200),
+                scoring_process(102, "sshd", 7200),
+                scoring_process(103, "worker-young", 0),
+                scoring_process(104, "worker-unavailable", 7200),
+                scoring_process(105, "worker-invoker", 7200),
+            ],
+            &scorer,
+        );
+        let context = snapshot.scoring_context.as_mut().unwrap();
+        context.invoker_chain.insert(105);
+        let unavailable = context.processes.get_mut(&104).unwrap();
+        unavailable.cgroup_role = None;
+        unavailable.observations = None;
+        unavailable.unavailable_reason = Some("identity changed during capture".to_string());
+
+        let restored: ReplaySnapshot =
+            serde_json::from_slice(&serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        let report = replay_scores(&restored, &scorer, &policy).unwrap();
+        assert_eq!(report.population_size, 5);
+        assert_eq!(report.scored_count, 1);
+        assert_eq!(report.protected_count, 2);
+        assert_eq!(report.too_young_count, 1);
+        assert_eq!(report.unavailable_count, 1);
+        assert_eq!(report.processes.len(), 5);
+        assert!(report.processes[0].ledger.is_some());
+        assert!(report.processes[1..].iter().all(|row| row.posterior.is_none()));
+        assert!(report.scoring_only);
+        assert!(!serde_json::to_string(&report)
+            .unwrap()
+            .contains("\"recommended_action\""));
+    }
+
+    #[test]
+    fn scoring_replay_uses_shared_signature_and_human_prior_precedence() {
+        use crate::decision::decision_store::Verdict;
+        use crate::supervision::signature::{SignatureDatabase, SignaturePriors, SupervisorSignature};
+        use crate::supervision::SupervisorCategory;
+
+        let mut signatures = SignatureDatabase::new();
+        signatures
+            .add(
+                SupervisorSignature::new("recorded-worker", SupervisorCategory::Other)
+                    .with_process_patterns(vec!["^worker$"])
+                    .with_priors(SignaturePriors::likely_abandoned()),
+            )
+            .unwrap();
+        let mut scorer = replay_scorer();
+        scorer.signatures = signatures;
+        let snapshot = scoring_fixture(vec![scoring_process(201, "worker", 7200)], &scorer);
+        let policy = Policy::default();
+        let signed = replay_scores(&snapshot, &scorer, &policy).unwrap();
+        assert_eq!(signed.processes[0].prior_source.as_deref(), Some("signature"));
+        assert_eq!(
+            signed.processes[0].signature.as_deref(),
+            Some("recorded-worker")
+        );
+        for _ in 0..12 {
+            scorer.decisions.record("worker", "worker --job", Verdict::Spare);
+        }
+        let learned = replay_scores(&snapshot, &scorer, &policy).unwrap();
+        assert_eq!(learned.processes[0].prior_source.as_deref(), Some("user"));
+        assert!(
+            learned.processes[0].posterior.unwrap().abandonment_probability()
+                < signed.processes[0].posterior.unwrap().abandonment_probability()
+        );
+    }
+
+    #[test]
+    fn scoring_replay_rejects_incomplete_stale_and_wrong_platform_context() {
+        let scorer = replay_scorer();
+        let policy = Policy::default();
+        let original = scoring_fixture(vec![scoring_process(301, "worker", 7200)], &scorer);
+        let rejects = |snapshot: &ReplaySnapshot| {
+            assert!(matches!(
+                replay_scores(snapshot, &scorer, &policy),
+                Err(ReplayError::ScoringContext(_))
+            ));
+        };
+
+        let mut changed = original.clone();
+        changed.scoring_context = None;
+        rejects(&changed);
+
+        let mut changed = original.clone();
+        changed.scoring_context.as_mut().unwrap().processes.remove(&301);
+        rejects(&changed);
+
+        let mut changed = original.clone();
+        changed
+            .scoring_context
+            .as_mut()
+            .unwrap()
+            .processes
+            .get_mut(&301)
+            .unwrap()
+            .identity
+            .uid += 1;
+        rejects(&changed);
+
+        let mut changed = original.clone();
+        changed.scoring_context.as_mut().unwrap().requested_window_ms = 500;
+        rejects(&changed);
+
+        let mut changed = original.clone();
+        changed.scoring_context.as_mut().unwrap().platform = "another-platform".to_string();
+        rejects(&changed);
+
+        let mut changed = original.clone();
+        changed
+            .scoring_context
+            .as_mut()
+            .unwrap()
+            .processes
+            .get_mut(&301)
+            .unwrap()
+            .observations = None;
+        rejects(&changed);
+
+        #[cfg(target_os = "linux")]
+        {
+            let mut changed = original.clone();
+            changed
+                .scoring_context
+                .as_mut()
+                .unwrap()
+                .processes
+                .get_mut(&301)
+                .unwrap()
+                .observations
+                .as_mut()
+                .unwrap()
+                .provenance = None;
+            rejects(&changed);
+        }
+
+        let mut changed = original;
+        changed.anonymize();
+        assert!(changed.scoring_context.is_none());
+        rejects(&changed);
+    }
+
+    #[test]
+    fn broader_replay_policy_cannot_invent_uncollected_scoring_inputs() {
+        let scorer = replay_scorer();
+        let mut snapshot = scoring_fixture(vec![scoring_process(401, "worker", 10)], &scorer);
+        let input = snapshot
+            .scoring_context
+            .as_mut()
+            .unwrap()
+            .processes
+            .get_mut(&401)
+            .unwrap();
+        input.observations = None;
+        input.unavailable_reason = Some("not sampled under capture policy".to_string());
+        let mut policy = Policy::default();
+        let excluded = replay_scores(&snapshot, &scorer, &policy).unwrap();
+        assert_eq!(excluded.too_young_count, 1);
+        policy.guardrails.min_process_age_seconds = 0;
+        let broadened = replay_scores(&snapshot, &scorer, &policy).unwrap();
+        assert_eq!(broadened.population_size, 1);
+        assert_eq!(broadened.unavailable_count, 1);
+        assert_eq!(broadened.scored_count, 0);
+    }
+
+    #[test]
+    fn replay_snapshot_evidence_keeps_zero_age_and_dead_state_semantics() {
+        let process = MockProcessBuilder::new()
+            .pid(501)
+            .elapsed_secs(0)
+            .state(crate::collect::ProcessState::Dead)
+            .build();
+        let evidence = build_evidence(&process, None);
+        assert_eq!(evidence.runtime_seconds, None);
+        assert_eq!(evidence.state_flag, Some(6));
+    }
 
     #[test]
     fn test_record_and_load_snapshot() {

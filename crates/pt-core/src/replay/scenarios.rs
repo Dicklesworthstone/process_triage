@@ -116,6 +116,7 @@ fn build_scenario(
         },
         processes,
         deep_signals,
+        scoring_context: None,
     }
 }
 

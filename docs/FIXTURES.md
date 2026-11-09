@@ -66,33 +66,77 @@ The capture tool normalizes common sensitive values in metadata:
 Fixtures themselves must already be redacted; the manifest validator enforces redaction for
 metadata fields (`source.command`, `source.paths`).
 
-## Private live replay recordings
+## Private live replay recordings and scoring
 
-`pt-core scan --record-replay PATH` connects the quick scan to the existing
-`pt_core::replay::ReplaySnapshot` recorder. For example:
+Record a live census and its scoring observations, then evaluate that recording
+without inspecting the replay machine's processes:
 
 ```bash
 nice -n 19 pt-core scan --format json --record-replay /private/path/scan.json
+pt-core scan --replay-scores /private/path/scan.json --format json
 ```
 
-The snapshot contains the exact inventory from that one scan, including raw
-command lines and identities. It is a **private recording, not a redacted
-fixture**. The destination must be new: an existing file or symlink is refused.
-On Unix it is created with at most owner read/write permissions. If writing
-fails, the command fails and retains any partial file for inspection. No process
-action is executed. Deep scans cannot use this option.
+Recording uses one shared 500 ms activity window by default. Set
+`--record-replay-window-ms 0` to use lifetime CPU observations without waiting
+for an activity window, or choose a window up to 60,000 ms. This option requires
+`--record-replay`. Expensive activity and provenance probes are collected only
+for processes eligible under the capture's policy. The complete unfiltered
+inventory is retained, including protected, young, and unavailable processes.
+Placement and scoring observations are checked against process identities
+during capture. Deep scans cannot use this option.
 
-The native `load_snapshot` and `ReplaySnapshot::to_scan_result` consumers read
-this format; no second replay format is introduced. The integration regressions
-in `cli_formats::replay_recording` compare the recorded and restored inventory
-with the same live command's JSON, and check existing-file/symlink preservation
-and unsupported deep-scan refusal.
+The snapshot contains raw commands, identities, placement, activity, and derived
+provenance scoring inputs. It is a **private recording, not a redacted fixture**.
+The destination must be new: an existing file or symlink is refused. On Unix it
+is created with at most owner read/write permissions. If writing fails, the
+command fails and retains any partial file for inspection. Neither recording nor
+scoring replay executes process actions.
+
+### What scoring replay evaluates
+
+`--replay-scores` uses the same scorer and protection rules as production, with
+the recorded observations supplied explicitly. It does not read live PIDs,
+cgroups, service managers, or activity counters. Use `--config DIR` to select
+the configuration to evaluate; current priors, signatures, human verdicts, and
+their current decay are applied. Historical configuration and the original
+evaluation time are not reconstructed.
+
+The JSON report is under `replay`. It includes `population_size`, counts for
+`scored`, `protected`, `too_young`, and `unavailable`, and one row in
+`processes` for every captured process. Scored rows include the posterior,
+evidence ledger, prior source, and matched signature. The four status counts sum
+to the retained population. Selecting a broader policy later does not manufacture
+observations for processes that were not probed during capture: those rows stay
+unavailable when their recorded inputs are insufficient. JSONL emits the full
+report as one JSON line.
+
+Replay requires a complete, identity-consistent scoring context from the same
+operating system. Inventory-only snapshots still load through `load_snapshot`
+and `ReplaySnapshot::to_scan_result`, but are rejected by `--replay-scores`.
+Incomplete or mismatched context is rejected rather than replaced by live data.
+The `anonymize` helper discards scoring context because hashing commands changes
+signature matching and cannot establish faithful scoring equivalence.
+
+### Scope and regression coverage
+
+This command is explicitly **scoring only**. It does not generate action
+recommendations, apply tree safety or live execution prechecks, authorize
+supervisor restarts, or claim kill/review accuracy. Services still require fresh
+live restart eligibility, so replay does not waive their placement protection.
+Derived provenance terms are replayed; raw collectors and provenance classifiers
+are not rerun.
+
+The CLI regressions in `cli_formats::replay_recording` cover the exact live
+inventory, private permissions, existing-file/symlink preservation, offline
+scoring, complete population accounting, current-policy reevaluation, JSONL,
+and refusal of unsupported or incomplete inputs. Core regressions cover shared
+scoring, signature and human-prior precedence, identity matching, and omitted
+observations.
 
 Redact and review recordings before sharing or committing them, then use the
-manifest and redaction checks above. This seam does not capture raw `/proc`
-collector inputs, inject collectors, prove redacted decision equivalence, or
-establish `agent plan` replay parity. Those remain acceptance work for
-`bd-l3s5.1`; a snapshot-loader test alone does not complete that Bead.
+manifest and redaction checks above. Raw collector capture/injection, redacted
+decision equivalence, and full `agent plan` action parity remain acceptance
+work for `bd-l3s5.1` and related replay beads.
 
 ## Provenance Fixtures
 
