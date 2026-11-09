@@ -22,7 +22,7 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -203,6 +203,10 @@ pub struct ToolSpec {
 
     /// Override max output (None = use default).
     pub max_output: Option<usize>,
+
+    /// Explicit environment additions after clearing inherited variables.
+    /// Callers must select only the variables their command requires.
+    pub env: BTreeMap<String, String>,
 }
 
 impl ToolSpec {
@@ -215,6 +219,7 @@ impl ToolSpec {
             working_dir: None,
             timeout: None,
             max_output: None,
+            env: BTreeMap::new(),
         }
     }
 
@@ -239,6 +244,12 @@ impl ToolSpec {
     /// Set custom max output.
     pub fn with_max_output(mut self, max_output: usize) -> Self {
         self.max_output = Some(max_output);
+        self
+    }
+
+    /// Add one literal environment value without inheriting the parent environment.
+    pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.insert(key.into(), value.into());
         self
     }
 }
@@ -310,6 +321,7 @@ impl ToolRunner {
             max_output: None,
             stdin: None,
             working_dir: None,
+            env: BTreeMap::new(),
         };
         self.run(&spec)
     }
@@ -368,7 +380,7 @@ impl ToolRunner {
         let start = Instant::now();
 
         // Build command
-        let mut command = match self.build_command(&spec.command, &spec.args) {
+        let mut command = match self.build_command(spec) {
             Ok(mut cmd) => {
                 if let Some(ref dir) = spec.working_dir {
                     cmd.current_dir(dir);
@@ -549,7 +561,8 @@ impl ToolRunner {
     }
 
     /// Build the command with nice/ionice wrappers if configured.
-    fn build_command(&self, cmd: &str, args: &[String]) -> Result<Command, ToolError> {
+    fn build_command(&self, spec: &ToolSpec) -> Result<Command, ToolError> {
+        let cmd = &spec.command;
         let mut command;
 
         #[cfg(unix)]
@@ -573,7 +586,7 @@ impl ToolRunner {
             command = Command::new(cmd);
         }
 
-        command.args(args);
+        command.args(&spec.args);
 
         // Clear environment variables that could affect behavior
         command.env_clear();
@@ -584,6 +597,7 @@ impl ToolRunner {
         }
         command.env("LC_ALL", "C");
         command.env("LANG", "C");
+        command.envs(&spec.env);
 
         Ok(command)
     }
@@ -990,6 +1004,33 @@ mod tests {
             .use_nice(false)
             .budget_ms(60000) // 60s budget for tests
             .build()
+    }
+
+    #[test]
+    fn explicit_environment_preserves_literal_values_without_broad_inheritance() {
+        let runner = test_runner();
+        let default_spec = ToolSpec::new("systemctl", vec!["--user".into()]);
+        let default_command = runner.build_command(&default_spec).unwrap();
+        assert!(default_command.get_envs().all(|(key, _)| {
+            matches!(key.to_str(), Some("PATH" | "LC_ALL" | "LANG"))
+        }));
+
+        let spec = default_spec
+            .with_env("XDG_RUNTIME_DIR", "/run/user/1000")
+            .with_env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/bus $literal%name")
+            .with_env("HOME", "/home/user with spaces");
+        let command = runner.build_command(&spec).unwrap();
+        for (key, value) in &spec.env {
+            let actual = command
+                .get_envs()
+                .find(|(name, _)| *name == std::ffi::OsStr::new(key))
+                .and_then(|(_, value)| value);
+            assert_eq!(actual, Some(std::ffi::OsStr::new(value)));
+        }
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [std::ffi::OsStr::new("--user")]
+        );
     }
 
     #[test]

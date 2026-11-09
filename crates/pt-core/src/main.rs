@@ -1760,6 +1760,16 @@ enum DaemonCommands {
     Stop,
     /// Check daemon status
     Status,
+    /// Install a per-user monitoring service (use --dry-run to preview)
+    Install {
+        /// Enable and start monitoring; the installed daemon only generates review plans
+        #[arg(long)]
+        activate: bool,
+    },
+    /// Inspect the installed service definition and service-manager state
+    ServiceStatus,
+    /// Disable, stop, and remove the verified managed service definition
+    Uninstall,
 }
 
 #[derive(Args, Debug)]
@@ -13248,8 +13258,101 @@ fn run_daemon(global: &GlobalOpts, args: &DaemonArgs) -> ExitCode {
         Some(DaemonCommands::Start { foreground }) => run_daemon_start(global, *foreground),
         Some(DaemonCommands::Stop) => run_daemon_stop(global),
         Some(DaemonCommands::Status) => run_daemon_status(global),
+        Some(DaemonCommands::Install { activate }) => run_daemon_service(global, |service| {
+            service.install(*activate, global.dry_run)
+        }),
+        Some(DaemonCommands::ServiceStatus) => {
+            run_daemon_service(global, |service| service.status())
+        }
+        Some(DaemonCommands::Uninstall) => {
+            run_daemon_service(global, |service| service.uninstall(global.dry_run))
+        }
         None => run_daemon_start(global, true),
     }
+}
+
+#[cfg(feature = "daemon")]
+fn run_daemon_service<F>(global: &GlobalOpts, operation: F) -> ExitCode
+where
+    F: FnOnce(
+        &pt_core::daemon::service::ServiceDefinition,
+    ) -> Result<
+        pt_core::daemon::service::ServiceReport,
+        pt_core::daemon::service::ServiceError,
+    >,
+{
+    use pt_core::daemon::service::{ServiceDefinition, ServiceError};
+
+    let result = ServiceDefinition::for_current_user(&resolve_config_dir(global))
+        .and_then(|service| operation(&service));
+    let report = match result {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("daemon service: {error}");
+            return match error {
+                ServiceError::Invalid(_) | ServiceError::Unmanaged { .. } => ExitCode::ArgsError,
+                ServiceError::Io { .. } | ServiceError::Manager { .. } => ExitCode::IoError,
+            };
+        }
+    };
+    let exit_code = if report.operation == "service-status" && !report.manager_succeeded() {
+        ExitCode::IoError
+    } else {
+        ExitCode::Clean
+    };
+    match global.format {
+        OutputFormat::Json | OutputFormat::Toon | OutputFormat::Jsonl => {
+            let response = serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "command": format!("daemon {}", report.operation),
+                "service": report,
+            });
+            if matches!(global.format, OutputFormat::Jsonl) {
+                match serde_json::to_string(&global.process_output_value(response)) {
+                    Ok(line) => println!("{line}"),
+                    Err(error) => {
+                        eprintln!("daemon service: cannot serialize result: {error}");
+                        return ExitCode::InternalError;
+                    }
+                }
+            } else {
+                println!("{}", format_structured_output(global, response));
+            }
+        }
+        OutputFormat::Exitcode => {}
+        _ => {
+            println!(
+                "Daemon service {}{}: {} (installed: {}, changed: {})",
+                report.operation,
+                if report.dry_run { " preview" } else { "" },
+                report.path.display(),
+                report.installed,
+                report.changed
+            );
+            if !matches!(global.format, OutputFormat::Summary) {
+                if let Some(definition) = &report.definition {
+                    println!("\n{definition}");
+                }
+                for command in &report.commands {
+                    println!("Manager argv: {} {:?}", command.program, command.args);
+                }
+                for result in &report.results {
+                    println!(
+                        "Manager exit {:?} (timed out: {}, truncated: {}):\n{}{}",
+                        result.exit_code,
+                        result.timed_out,
+                        result.truncated,
+                        result.stdout,
+                        result.stderr
+                    );
+                }
+            }
+            for note in &report.notes {
+                println!("{note}");
+            }
+        }
+    }
+    exit_code
 }
 
 #[cfg(feature = "daemon")]
@@ -15797,6 +15900,63 @@ mod daemon_pressure_tests {
     use pt_core::daemon::{process_tick, DaemonConfig, DaemonState};
     use pt_core::decision::mem_pressure::{MemorySignals, PressureMode};
 
+    #[test]
+    fn daemon_service_cli_requires_explicit_activation() {
+        let install = Cli::try_parse_from(["pt-core", "daemon", "install"]).unwrap();
+        assert!(matches!(
+            install.command,
+            Some(Commands::Daemon(DaemonArgs {
+                command: Some(DaemonCommands::Install { activate: false })
+            }))
+        ));
+        let preview =
+            Cli::try_parse_from(["pt-core", "--dry-run", "daemon", "install", "--activate"])
+                .unwrap();
+        assert!(preview.global.dry_run);
+        assert!(matches!(
+            preview.command,
+            Some(Commands::Daemon(DaemonArgs {
+                command: Some(DaemonCommands::Install { activate: true })
+            }))
+        ));
+        for command in ["service-status", "uninstall"] {
+            assert!(Cli::try_parse_from(["pt-core", "daemon", command]).is_ok());
+        }
+    }
+
+    #[test]
+    fn daemon_dry_run_survives_config_reload_and_child_invocations() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let config_path = directory.join("daemon.json");
+        let cli = Cli::try_parse_from([
+            "pt-core",
+            "--config",
+            directory.to_str().unwrap(),
+            "--dry-run",
+            "daemon",
+            "start",
+            "--foreground",
+        ])
+        .unwrap();
+        let mut config = DaemonConfig::default();
+        config.escalation.allow_auto_mitigation = true;
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        assert!(!load_daemon_config(&cli.global).0.escalation.allow_auto_mitigation);
+        // The reload path calls the same loader, including the legacy schema.
+        std::fs::write(&config_path, r#"{"auto_mitigate":{"enabled":true}}"#).unwrap();
+        assert!(!load_daemon_config(&cli.global).0.escalation.allow_auto_mitigation);
+        let mut child = std::process::Command::new("pt-core");
+        apply_daemon_global_args(&mut child, &cli.global);
+        assert_eq!(
+            child.get_args().collect::<Vec<_>>(),
+            [
+                std::ffi::OsStr::new("--config"),
+                directory.as_os_str(),
+                std::ffi::OsStr::new("--dry-run")
+            ]
+        );
+    }
+
     fn critical_io_trigger() -> pt_core::daemon::triggers::FiredTrigger {
         pt_core::daemon::triggers::FiredTrigger {
             kind: pt_core::daemon::triggers::TriggerKind::PressureRegime,
@@ -16107,6 +16267,9 @@ fn apply_daemon_global_args(cmd: &mut std::process::Command, global: &GlobalOpts
     if let Some(dir) = &global.config {
         cmd.arg("--config").arg(dir);
     }
+    if global.dry_run {
+        cmd.arg("--dry-run");
+    }
 }
 
 #[cfg(feature = "daemon")]
@@ -16137,7 +16300,10 @@ fn load_daemon_config(global: &GlobalOpts) -> (pt_core::daemon::DaemonConfig, bo
         Err(_) => return (pt_core::daemon::DaemonConfig::default(), true),
     };
 
-    if let Ok(config) = serde_json::from_str::<pt_core::daemon::DaemonConfig>(&content) {
+    if let Ok(mut config) = serde_json::from_str::<pt_core::daemon::DaemonConfig>(&content) {
+        if global.dry_run {
+            config.escalation.allow_auto_mitigation = false;
+        }
         return (config, true);
     }
 
@@ -16263,6 +16429,9 @@ fn load_daemon_config(global: &GlobalOpts) -> (pt_core::daemon::DaemonConfig, bo
         }
     }
 
+    if global.dry_run {
+        config.escalation.allow_auto_mitigation = false;
+    }
     (config, enabled)
 }
 

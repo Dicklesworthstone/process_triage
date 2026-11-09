@@ -229,124 +229,96 @@ struct CooldownManager {
 
 ### Linux: systemd User Service
 
-**Service Unit**: `~/.config/systemd/user/ptd.service`
+`pt-core daemon install` writes `ptd.service` under
+`$XDG_CONFIG_HOME/systemd/user`, or `~/.config/systemd/user` when that variable is
+unset. Installation alone writes the definition; activation requires
+`--activate`. Existing manager enablement is preserved.
 
-```ini
-[Unit]
-Description=Process Triage Dormant Daemon
-Documentation=man:ptd(1)
-After=default.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/pt-core daemon
-Restart=on-failure
-RestartSec=30
-Nice=19
-IOSchedulingClass=idle
-MemoryMax=50M
-CPUQuota=5%
-
-# Watchdog: daemon must respond within 60s
-WatchdogSec=60
-
-# Environment
-Environment=PT_DAEMON_MODE=1
-
-[Install]
-WantedBy=default.target
-```
-
-**Timer Unit** (alternative to always-running): `~/.config/systemd/user/ptd.timer`
-
-```ini
-[Unit]
-Description=Process Triage periodic check
-
-[Timer]
-OnBootSec=5min
-OnUnitActiveSec=1min
-AccuracySec=10s
-
-[Install]
-WantedBy=timers.target
-```
-
-**Commands**:
 ```bash
-# Enable and start
-systemctl --user enable ptd.service
-systemctl --user start ptd.service
+# Inspect the exact definition and manager argument arrays without changing anything
+pt-core --config "$HOME/.config/process_triage" --dry-run daemon install --activate
 
-# Check status
-systemctl --user status ptd.service
+# Write the definition without starting the daemon
+pt-core --config "$HOME/.config/process_triage" daemon install
+
+# Enable monitoring now and at subsequent user logins
+pt-core --config "$HOME/.config/process_triage" daemon install --activate
+
+# Inspect the definition and the manager's observed state
+pt-core daemon service-status
+
+# Inspect the daemon's own PID, pressure state, and persisted monitoring status
+pt-core daemon status
 
 # View logs
 journalctl --user -u ptd.service -f
+
+# Preview, then stop/disable the service and remove its verified definition
+pt-core --dry-run daemon uninstall
+pt-core daemon uninstall
 ```
+
+The generated unit runs the absolute path of the installing `pt-core` executable
+in the foreground, with an explicit absolute configuration directory:
+
+```text
+/absolute/path/pt-core --config /absolute/config --dry-run daemon start --foreground
+```
+
+`--dry-run` is part of the installed command even when installation is activated.
+The daemon generates review plans; that flag disables automatic mitigation in
+both initial configuration and subsequent reloads, and propagates to children.
+The service uses `Restart=on-failure`, a 30-second restart delay, and idle I/O and
+CPU scheduling priority. Its internal overhead controls manage sampling. A
+watchdog is not configured because the daemon does not implement `sd_notify`.
+
+Arguments are individually quoted. The `ExecStart=:` prefix disables systemd
+environment-variable substitution and `%%` preserves literal percent signs in
+paths. See [systemd.service command lines](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html)
+and [systemd unit syntax](https://www.freedesktop.org/software/systemd/man/latest/systemd.syntax.html).
 
 ### macOS: launchd Agent
 
-**Plist**: `~/Library/LaunchAgents/com.processtriage.ptd.plist`
+The same commands write
+`~/Library/LaunchAgents/com.processtriage.ptd.plist`. The plist uses a literal,
+XML-escaped `ProgramArguments` array for the same foreground, review-only
+command. New definitions contain `Disabled=true`; explicit activation enables
+and bootstraps the agent in `gui/<current-user-id>`. If that managed agent is
+already loaded, activation uses non-force `kickstart`, preserving a running
+daemon. Restart after an unsuccessful exit is throttled to 30 seconds.
 
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.processtriage.ptd</string>
+This is a user launch agent and requires the user's graphical login session.
+Manager enablement persists separately from the plist, so the definition's
+`Disabled` key alone does not establish current status. `daemon service-status`
+shows the actual `launchctl print` output and whether the managed definition
+could be verified. An absent service is distinguished from a missing GUI domain
+or an inaccessible manager. See Apple's
+[launchd job guide](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html)
+and [launchd.plist reference](https://github.com/apple-oss-distributions/launchd/blob/main/man/launchd.plist.5).
 
-    <key>ProgramArguments</key>
-    <array>
-        <string>/usr/local/bin/pt-core</string>
-        <string>daemon</string>
-    </array>
+### Ownership, failures, and upgrades
 
-    <key>RunAtLoad</key>
-    <true/>
+Installation uses exclusive file creation and private permissions. Symlinks,
+foreign definitions, writable-by-others files, and locally edited managed
+definitions are refused. A managed fingerprint detects edits; it is not an
+authentication boundary against the owning user. Activation and removal also
+verify the manager's loaded definition path. Linux unit drop-ins are refused,
+including those discovered after reloading the manager.
 
-    <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
+Repeating an identical installation is safe. A changed executable or config
+path requires inspecting and uninstalling the old definition before installing
+the new one. The existing service definition therefore remains inspectable when
+a binary has moved. User configuration and daemon history survive uninstall.
 
-    <key>Nice</key>
-    <integer>19</integer>
-
-    <key>LowPriorityIO</key>
-    <true/>
-
-    <key>ProcessType</key>
-    <string>Background</string>
-
-    <key>StandardOutPath</key>
-    <string>/tmp/ptd.out.log</string>
-
-    <key>StandardErrorPath</key>
-    <string>/tmp/ptd.err.log</string>
-
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PT_DAEMON_MODE</key>
-        <string>1</string>
-    </dict>
-</dict>
-</plist>
-```
-
-**Commands**:
-```bash
-# Load and start
-launchctl load ~/Library/LaunchAgents/com.processtriage.ptd.plist
-
-# Unload
-launchctl unload ~/Library/LaunchAgents/com.processtriage.ptd.plist
-
-# Check status
-launchctl list | grep processtriage
-```
+Manager commands use literal argument arrays, a 15-second timeout, and bounded
+output. Failure diagnostics retain the command, exit status, stdout, and stderr.
+Failed activation retains the definition for diagnosis. Failed deactivation
+retains the definition rather than forgetting a service that may still be
+running; a final reload failure after removal is reported. `--dry-run` performs
+no writes or manager calls and reports planned commands and conditional steps.
+Pure definition/command tests and retained-directory file tests cover these
+contracts; real service-manager activation must be validated on Linux and macOS
+hosts before claiming deployment evidence.
 
 ---
 

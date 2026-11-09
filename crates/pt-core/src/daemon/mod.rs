@@ -8,12 +8,13 @@
 //!   items, respects per-user lock contention.
 //! - **Core loop**: tick-based event loop with overhead budgeting.
 //!
-//! This module is intentionally *library-only*. The actual daemon binary /
-//! systemd integration lives in CLI/service layer code.
+//! The CLI owns the running event loop. [`service`] provides inspectable,
+//! per-user systemd and launchd installation with explicit activation.
 
 pub mod escalation;
 #[cfg(feature = "metrics")]
 pub mod metrics;
+pub mod service;
 pub mod triggers;
 
 use chrono::Utc;
