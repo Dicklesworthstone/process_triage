@@ -9,7 +9,7 @@
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -717,64 +717,74 @@ pub fn ssh_scan_host(host: &str, config: &SshScanConfig) -> HostScanResult {
 
 /// Scan multiple hosts in parallel via SSH.
 ///
-/// Uses a thread pool with configurable concurrency. Results are collected
-/// and returned in the same order as the input hosts.
+/// A bounded worker pool takes the next host whenever a connection finishes, so
+/// one slow host cannot strand the other slots behind a batch barrier. Results
+/// remain in input order. When continuation is disabled, a failed result stops
+/// new dispatch immediately; already running hosts still finish and are retained.
 pub fn ssh_scan_fleet(hosts: &[String], config: &SshScanConfig) -> FleetScanResult {
+    ssh_scan_fleet_with(hosts, config, ssh_scan_host)
+}
+
+fn ssh_scan_fleet_with<F>(hosts: &[String], config: &SshScanConfig, scan_host: F) -> FleetScanResult
+where
+    F: Fn(&str, &SshScanConfig) -> HostScanResult + Sync,
+{
     let start = std::time::Instant::now();
-    let results: Arc<Mutex<Vec<(usize, HostScanResult)>>> = Arc::new(Mutex::new(Vec::new()));
-    let aborted = Arc::new(Mutex::new(false));
+    let results = Mutex::new(Vec::with_capacity(hosts.len()));
+    // Both assignment and failure publication use this lock. A worker cannot
+    // take another host after a failure has stopped dispatch.
+    let dispatch = Mutex::new((0_usize, false));
     let parallel = config.parallel.clamp(1, super::apply::MAX_FLEET_PARALLEL);
 
-    // Process hosts in batches of `parallel`
-    let chunks: Vec<Vec<(usize, &String)>> = hosts
-        .iter()
-        .enumerate()
-        .collect::<Vec<_>>()
-        .chunks(parallel)
-        .map(|chunk| chunk.to_vec())
-        .collect();
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..parallel.min(hosts.len()))
+            .map(|_| {
+                let results = &results;
+                let dispatch = &dispatch;
+                let scan_host = &scan_host;
+                scope.spawn(move || loop {
+                    let index = {
+                        let mut work = dispatch.lock().expect("dispatch lock poisoned");
+                        let (next, stopped) = &mut *work;
+                        if *stopped || *next >= hosts.len() {
+                            break;
+                        }
+                        let index = *next;
+                        *next += 1;
+                        index
+                    };
 
-    for chunk in chunks {
-        // Check if aborted
-        if !config.continue_on_error && *aborted.lock().expect("lock poisoned") {
-            break;
-        }
-
-        let handles: Vec<_> = chunk
-            .into_iter()
-            .map(|(idx, host)| {
-                let host = host.clone();
-                let config = config.clone();
-                let results = Arc::clone(&results);
-                let aborted = Arc::clone(&aborted);
-
-                std::thread::spawn(move || {
-                    if !config.continue_on_error && *aborted.lock().expect("lock poisoned") {
-                        return;
-                    }
-
-                    let result = ssh_scan_host(&host, &config);
-
+                    let host_started = std::time::Instant::now();
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        scan_host(&hosts[index], config)
+                    }))
+                    .unwrap_or_else(|_| HostScanResult {
+                        host: hosts[index].clone(),
+                        success: false,
+                        plan: None,
+                        error: Some(
+                            "fleet scan worker panicked while reading the remote plan".into(),
+                        ),
+                        duration_ms: host_started.elapsed().as_millis() as u64,
+                        provenance: None,
+                    });
                     if !result.success && !config.continue_on_error {
-                        *aborted.lock().expect("lock poisoned") = true;
+                        dispatch.lock().expect("dispatch lock poisoned").1 = true;
                     }
-
-                    results.lock().expect("lock poisoned").push((idx, result));
+                    results
+                        .lock()
+                        .expect("results lock poisoned")
+                        .push((index, result));
                 })
             })
             .collect();
-
         for handle in handles {
             let _ = handle.join();
         }
-    }
+    });
 
-    let collected = Arc::try_unwrap(results)
-        .expect("Arc has multiple owners")
-        .into_inner()
-        .expect("lock poisoned");
+    let collected = results.into_inner().expect("results lock poisoned");
     let results = complete_scan_results(hosts, collected);
-
     let successful = results.iter().filter(|r| r.success).count();
     let failed = results.iter().filter(|r| !r.success).count();
 
@@ -1500,6 +1510,233 @@ mod tests {
         assert_eq!(restored.total_hosts, 2);
         assert_eq!(restored.successful, 1);
         assert_eq!(restored.failed, 1);
+    }
+
+    fn completed_scan(host: &str) -> HostScanResult {
+        HostScanResult {
+            host: host.to_string(),
+            success: true,
+            plan: Some(RemotePlan::default()),
+            error: None,
+            duration_ms: 0,
+            provenance: None,
+        }
+    }
+
+    #[test]
+    fn fleet_scan_refills_a_slot_before_the_slow_host_finishes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+
+        let hosts = ["slow", "fast", "later"].map(str::to_string);
+        let config = SshScanConfig {
+            parallel: 2,
+            ..SshScanConfig::default()
+        };
+        let (slow_started, wait_for_slow) = mpsc::channel();
+        let wait_for_slow = Mutex::new(wait_for_slow);
+        let (later_started, release_slow) = mpsc::channel();
+        let release_slow = Mutex::new(release_slow);
+        let slow_finished = AtomicBool::new(false);
+
+        let result = ssh_scan_fleet_with(&hosts, &config, |host, _| {
+            match host {
+                "slow" => {
+                    slow_started.send(()).unwrap();
+                    release_slow
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("later host must start while the first host is still running");
+                    slow_finished.store(true, Ordering::SeqCst);
+                }
+                "fast" => {
+                    wait_for_slow
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("both initial connections must start");
+                }
+                "later" => {
+                    assert!(!slow_finished.load(Ordering::SeqCst));
+                    later_started.send(()).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            completed_scan(host)
+        });
+
+        assert_eq!(result.successful, 3);
+        assert_eq!(result.failed, 0);
+        assert!(slow_finished.load(Ordering::SeqCst));
+        assert_eq!(
+            result
+                .results
+                .iter()
+                .map(|result| result.host.as_str())
+                .collect::<Vec<_>>(),
+            hosts.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn fleet_scan_bounds_active_workers_and_keeps_every_result_in_host_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{mpsc, Condvar};
+
+        let hosts: Vec<_> = (0..9).map(|index| format!("host-{index}")).collect();
+        let config = SshScanConfig {
+            parallel: 3,
+            ..SshScanConfig::default()
+        };
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let gate = (Mutex::new(false), Condvar::new());
+        let (started, observed_starts) = mpsc::channel();
+
+        let (initial_starts, extra_start, result) = std::thread::scope(|scope| {
+            let run = scope.spawn(|| {
+                ssh_scan_fleet_with(&hosts, &config, |host, _| {
+                    let concurrent = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(concurrent, Ordering::SeqCst);
+                    started.send(host.to_string()).unwrap();
+                    let mut released = gate.0.lock().unwrap();
+                    while !*released {
+                        released = gate.1.wait(released).unwrap();
+                    }
+                    drop(released);
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    completed_scan(host)
+                })
+            });
+            let initial_starts: Vec<_> = (0..3)
+                .map(|_| observed_starts.recv_timeout(Duration::from_secs(10)))
+                .collect();
+            let extra_start = observed_starts.try_recv();
+            // Always release workers before asserting, including on a failed
+            // start observation, so a scheduler regression cannot hang this test.
+            *gate.0.lock().unwrap() = true;
+            gate.1.notify_all();
+            (initial_starts, extra_start, run.join().unwrap())
+        });
+
+        assert!(initial_starts.iter().all(Result::is_ok));
+        assert!(matches!(extra_start, Err(mpsc::TryRecvError::Empty)));
+        assert_eq!(peak.load(Ordering::SeqCst), 3);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(result.total_hosts, hosts.len());
+        assert_eq!(result.successful, hosts.len());
+        assert_eq!(result.failed, 0);
+        assert_eq!(
+            result
+                .results
+                .iter()
+                .map(|result| result.host.as_str())
+                .collect::<Vec<_>>(),
+            hosts.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn fleet_scan_failure_stops_new_hosts_and_retains_in_flight_results() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{mpsc, Condvar};
+
+        let hosts = ["failed", "in-flight", "not-started", "also-not-started"].map(str::to_string);
+        let config = SshScanConfig {
+            parallel: 2,
+            continue_on_error: false,
+            ..SshScanConfig::default()
+        };
+        let attempts = AtomicUsize::new(0);
+        let gate = (Mutex::new(false), Condvar::new());
+        let (started, observed_starts) = mpsc::channel();
+
+        let (initial_starts, result) = std::thread::scope(|scope| {
+            let run = scope.spawn(|| {
+                ssh_scan_fleet_with(&hosts, &config, |host, _| {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    started.send(host.to_string()).unwrap();
+                    let mut released = gate.0.lock().unwrap();
+                    while !*released {
+                        released = gate.1.wait(released).unwrap();
+                    }
+                    drop(released);
+                    HostScanResult {
+                        host: host.to_string(),
+                        success: false,
+                        plan: None,
+                        error: Some(format!("observed scan failure on {host}")),
+                        duration_ms: 1,
+                        provenance: None,
+                    }
+                })
+            });
+            let initial_starts: Vec<_> = (0..2)
+                .map(|_| observed_starts.recv_timeout(Duration::from_secs(10)))
+                .collect();
+            *gate.0.lock().unwrap() = true;
+            gate.1.notify_all();
+            (initial_starts, run.join().unwrap())
+        });
+
+        assert!(initial_starts.iter().all(Result::is_ok));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(result.total_hosts, 4);
+        assert_eq!(result.failed, 4);
+        for (index, host) in hosts.iter().enumerate() {
+            let row = &result.results[index];
+            assert_eq!(&row.host, host);
+            assert!(!row.success);
+            assert!(row.plan.is_none());
+            if index < 2 {
+                assert_eq!(row.error, Some(format!("observed scan failure on {host}")));
+            } else {
+                assert!(row.error.as_deref().unwrap().contains("dispatch stopped"));
+            }
+        }
+    }
+
+    #[test]
+    fn fleet_scan_continues_after_errors_and_panics_with_zero_parallel_setting() {
+        let hosts = ["first", "failed", "panicked", "last"].map(str::to_string);
+        let config = SshScanConfig {
+            parallel: 0,
+            continue_on_error: true,
+            ..SshScanConfig::default()
+        };
+        let attempts = Mutex::new(Vec::new());
+        let result = ssh_scan_fleet_with(&hosts, &config, |host, _| {
+            attempts.lock().unwrap().push(host.to_string());
+            match host {
+                "panicked" => panic!("scan task failed unexpectedly"),
+                "failed" => HostScanResult {
+                    host: host.to_string(),
+                    success: false,
+                    plan: None,
+                    error: Some("remote connection failed".into()),
+                    duration_ms: 1,
+                    provenance: None,
+                },
+                _ => completed_scan(host),
+            }
+        });
+
+        assert_eq!(*attempts.lock().unwrap(), hosts.to_vec());
+        assert_eq!(result.total_hosts, 4);
+        assert_eq!(result.successful, 2);
+        assert_eq!(result.failed, 2);
+        assert!(result.results[0].success);
+        assert!(result.results[3].success);
+        assert_eq!(
+            result.results[1].error.as_deref(),
+            Some("remote connection failed")
+        );
+        assert!(result.results[2]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("panicked"));
     }
 
     #[test]
