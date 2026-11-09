@@ -89,7 +89,7 @@ pub fn compute_metrics(
 
     // Validate probabilities
     for d in data {
-        if d.predicted < 0.0 || d.predicted > 1.0 {
+        if !d.predicted.is_finite() || !(0.0..=1.0).contains(&d.predicted) {
             return Err(CalibrationError::InvalidProbability(d.predicted));
         }
     }
@@ -223,12 +223,24 @@ fn auc_roc(data: &[CalibrationData]) -> f64 {
     let mut prev_tp = 0.0;
     let mut prev_fp = 0.0;
 
-    for d in sorted {
-        if d.actual {
-            tp += 1.0;
-        } else {
-            fp += 1.0;
+    let mut index = 0;
+    while index < sorted.len() {
+        // One threshold admits every observation with this probability.
+        // Advancing once per row would rank tied labels by input order instead
+        // of giving tied positive/negative pairs their half-credit.
+        let probability = sorted[index].predicted;
+        let mut end = index + 1;
+        while end < sorted.len() && sorted[end].predicted == probability {
+            end += 1;
         }
+        for datum in &sorted[index..end] {
+            if datum.actual {
+                tp += 1.0;
+            } else {
+                fp += 1.0;
+            }
+        }
+        index = end;
         // Add trapezoid area
         auc += (fp - prev_fp) * (tp + prev_tp) / 2.0;
         prev_tp = tp;
@@ -313,6 +325,77 @@ mod tests {
         let data = make_data(&[(0.9, true), (0.8, true), (0.3, false), (0.2, false)]);
         let auc = auc_roc(&data);
         assert!((auc - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn tied_predictions_have_half_auc_in_every_census_order() {
+        let data = make_data(&[
+            (0.5, false),
+            (0.5, false),
+            (0.5, false),
+            (0.5, false),
+            (0.5, false),
+            (0.5, true),
+            (0.5, true),
+            (0.5, true),
+            (0.5, true),
+            (0.5, true),
+        ]);
+        let reversed = data.iter().rev().cloned().collect::<Vec<_>>();
+        for mut ordered in [data, reversed] {
+            for rotation in 0..ordered.len() {
+                let metrics = compute_metrics(&ordered, 0.5).unwrap();
+                assert!(
+                    (metrics.auc_roc - 0.5).abs() < 1e-12,
+                    "indistinguishable scores must have AUC 0.5 at rotation {rotation}"
+                );
+                ordered.rotate_left(1);
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_ties_match_pairwise_auc_independently_of_input_order() {
+        let data = make_data(&[
+            (0.9, true),
+            (0.7, true),
+            (0.7, true),
+            (0.4, true),
+            (0.1, true),
+            (0.8, false),
+            (0.7, false),
+            (0.7, false),
+            (0.2, false),
+            (0.1, false),
+        ]);
+        // Across the 25 positive/negative pairs, these positives earn
+        // 5 + 3 + 3 + 2 + 0.5 wins, counting each tied pair as half a win.
+        let expected = 13.5 / 25.0;
+        let reversed = data.iter().rev().cloned().collect::<Vec<_>>();
+        for mut ordered in [data, reversed] {
+            for rotation in 0..ordered.len() {
+                let metrics = compute_metrics(&ordered, 0.5).unwrap();
+                assert!(
+                    (metrics.auc_roc - expected).abs() < 1e-12,
+                    "mixed ties must retain pairwise AUC at rotation {rotation}"
+                );
+                ordered.rotate_left(1);
+            }
+        }
+    }
+
+    #[test]
+    fn compute_metrics_rejects_nonfinite_and_out_of_range_probabilities() {
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, 1.1] {
+            let mut data = make_data(&[(0.5, true); 10]);
+            data[4].predicted = invalid;
+            match compute_metrics(&data, 0.5) {
+                Err(CalibrationError::InvalidProbability(value)) => {
+                    assert!(value == invalid || (value.is_nan() && invalid.is_nan()));
+                }
+                result => panic!("expected invalid probability {invalid:?}, got {result:?}"),
+            }
+        }
     }
 
     #[test]
