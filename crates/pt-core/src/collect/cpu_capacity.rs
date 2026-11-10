@@ -141,14 +141,28 @@ pub fn compute_cpu_capacity(pid: u32, cgroup_details: Option<&CgroupDetails>) ->
 
     // 3) Extract quota cores from cgroup details
     if let Some(cgroup) = cgroup_details {
+        capacity
+            .provenance
+            .warnings
+            .extend(cgroup.provenance.warnings.iter().cloned());
         if let Some(ref cpu_limits) = cgroup.cpu_limits {
+            if let Some(path) = &cpu_limits.effective_limit_path {
+                capacity.provenance.paths_tried.push(path.clone());
+            }
             if let Some(eff_cores) = cpu_limits.effective_cores {
-                capacity.quota_cores = Some(eff_cores);
-                capacity.provenance.quota_source = match cpu_limits.source {
-                    super::cgroup::CpuLimitSource::CgroupV2CpuMax => QuotaSource::CgroupV2CpuMax,
-                    super::cgroup::CpuLimitSource::CgroupV1Cfs => QuotaSource::CgroupV1Cfs,
-                    super::cgroup::CpuLimitSource::None => QuotaSource::None,
-                };
+                if eff_cores.is_finite() && eff_cores > 0.0 {
+                    capacity.quota_cores = Some(eff_cores);
+                    capacity.provenance.quota_source = match cpu_limits.source {
+                        super::cgroup::CpuLimitSource::CgroupV2CpuMax => QuotaSource::CgroupV2CpuMax,
+                        super::cgroup::CpuLimitSource::CgroupV1Cfs => QuotaSource::CgroupV1Cfs,
+                        super::cgroup::CpuLimitSource::None => QuotaSource::None,
+                    };
+                } else {
+                    capacity
+                        .provenance
+                        .warnings
+                        .push("invalid observed CPU quota".into());
+                }
             }
         }
     }

@@ -13,6 +13,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::path::{Path, PathBuf};
 
 /// Comprehensive cgroup information for a process.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -66,18 +67,28 @@ pub enum CgroupVersion {
 /// CPU resource limits from cgroup.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CpuLimits {
-    /// CPU quota in microseconds per period (None = unlimited).
+    /// Most restrictive observed CPU quota in microseconds per period.
+    /// None means no finite quota was observed, not that hidden ancestors are unlimited.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quota_us: Option<i64>,
 
-    /// CPU period in microseconds.
+    /// Period of the most restrictive observed quota, in microseconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub period_us: Option<u64>,
 
-    /// Effective CPU limit as fraction of one core (quota/period).
-    /// E.g., 0.5 = half a core, 2.0 = two cores worth.
+    /// Minimum quota/period across the visible cgroup hierarchy. This is a
+    /// capacity ceiling shared with siblings, not a guaranteed CPU allocation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_cores: Option<f64>,
+
+    /// Controller file that supplied the reported quota and period.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_limit_path: Option<String>,
+
+    /// All quota files in the visible hierarchy were successfully observed.
+    /// Ancestors hidden by a namespace or subtree mount remain unobservable.
+    #[serde(default)]
+    pub quota_hierarchy_complete: bool,
 
     /// CPU shares (relative weight, v1 only).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -267,73 +278,259 @@ fn extract_systemd_info(details: &mut CgroupDetails, path: &str) {
     }
 }
 
-/// Collect CPU limits from cgroup filesystem.
+/// A membership path resolved through the reader's actual cgroup mount view.
+/// Walking parents must stop at mount_point, including when it is a subtree mount.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CgroupMount {
+    pub(crate) directory: PathBuf,
+    pub(crate) mount_point: PathBuf,
+    pub(crate) mount_root: PathBuf,
+}
+
+fn checked_cgroup_path(value: &str) -> Result<PathBuf, String> {
+    if !value.starts_with('/')
+        || value.contains('\0')
+        || value.ends_with(" (deleted)")
+        || value.split('/').any(|part| matches!(part, "." | ".."))
+    {
+        return Err(format!("invalid or inaccessible cgroup path: {value:?}"));
+    }
+    Ok(PathBuf::from(value))
+}
+
+fn decode_mount_path(value: &str) -> Result<String, String> {
+    let mut result = Vec::with_capacity(value.len());
+    let mut bytes = value.as_bytes().iter().copied();
+    while let Some(byte) = bytes.next() {
+        if byte != b'\\' {
+            result.push(byte);
+            continue;
+        }
+        let escaped = [bytes.next(), bytes.next(), bytes.next()];
+        result.push(match escaped {
+            [Some(b'0'), Some(b'4'), Some(b'0')] => b' ',
+            [Some(b'0'), Some(b'1'), Some(b'1')] => b'\t',
+            [Some(b'0'), Some(b'1'), Some(b'2')] => b'\n',
+            [Some(b'1'), Some(b'3'), Some(b'4')] => b'\\',
+            _ => return Err("invalid mountinfo path escape".into()),
+        });
+    }
+    String::from_utf8(result).map_err(|_| "mountinfo path is not UTF-8".into())
+}
+
+/// Resolve a cgroup membership without assuming /sys/fs/cgroup is the hierarchy
+/// root. Both mountinfo and membership must be read in the same reader namespace.
+/// The broadest visible mount preserves the most ancestor limits. Equally broad
+/// conflicting mounts are ambiguous, so callers report unavailable evidence.
+pub(crate) fn resolve_cgroup_mount(
+    membership: &str,
+    mountinfo: &str,
+    filesystem: &str,
+    controller: Option<&str>,
+) -> Result<CgroupMount, String> {
+    let membership = checked_cgroup_path(membership)?;
+    let mut matches = Vec::new();
+    let mut mount_points = Vec::new();
+    for line in mountinfo.lines() {
+        let Some((before, after)) = line.split_once(" - ") else {
+            continue;
+        };
+        let fields: Vec<_> = before.split_whitespace().collect();
+        let fs_fields: Vec<_> = after.split_whitespace().collect();
+        if let Some(mount_point) = fields.get(4) {
+            mount_points.push(checked_cgroup_path(&decode_mount_path(mount_point)?)?);
+        }
+        if fs_fields.first().copied() != Some(filesystem) {
+            continue;
+        }
+        if fields.len() < 6 || fs_fields.len() < 3 {
+            return Err("incomplete cgroup mountinfo entry".into());
+        }
+        if controller.is_some_and(|name| !fs_fields[2].split(',').any(|part| part == name)) {
+            continue;
+        }
+        let mount_root = checked_cgroup_path(&decode_mount_path(fields[3])?)?;
+        let mount_point = checked_cgroup_path(&decode_mount_path(fields[4])?)?;
+        let Ok(relative) = membership.strip_prefix(&mount_root) else {
+            continue;
+        };
+        matches.push(CgroupMount {
+            directory: mount_point.join(relative),
+            mount_point,
+            mount_root,
+        });
+    }
+    matches.sort_by_key(|mount| mount.mount_root.components().count());
+    let selected = matches
+        .first()
+        .ok_or("no visible cgroup mount contains this membership")?;
+    if matches.iter().skip(1).any(|other| {
+        other.mount_root.components().count() == selected.mount_root.components().count()
+            && other != selected
+    }) {
+        return Err("ambiguous cgroup mount mapping".into());
+    }
+    if mount_points
+        .iter()
+        .filter(|path| **path == selected.mount_point)
+        .count()
+        != 1
+        || mount_points.iter().any(|path| {
+            *path != selected.mount_point
+                && path.starts_with(&selected.mount_point)
+                && selected.directory.starts_with(path)
+        })
+    {
+        return Err("cgroup membership is hidden by another mount".into());
+    }
+    // A bind mount on a controller file can spoof a quota or accounting sample
+    // without hiding the directory. Reject it at every traversed ancestor.
+    const CONTROL_FILES: &[&str] = &[
+        "cpu.max",
+        "cpu.cfs_quota_us",
+        "cpu.cfs_period_us",
+        "cpu.weight",
+        "cpu.shares",
+        "cpu.stat",
+        "cpu.pressure",
+        "memory.current",
+        "memory.peak",
+        "memory.swap.current",
+        "memory.pressure",
+        "io.pressure",
+    ];
+    if mount_points.iter().any(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| CONTROL_FILES.contains(&name))
+            && path.parent().is_some_and(|parent| {
+                parent.starts_with(&selected.mount_point)
+                    && selected.directory.starts_with(parent)
+            })
+    }) {
+        return Err("cgroup controller file is hidden by another mount".into());
+    }
+    Ok(selected.clone())
+}
+
+/// Collect CPU limits from the reader's visible hierarchy, including ancestors.
 fn collect_cpu_limits(details: &mut CgroupDetails, _pid: u32) {
-    let mut limits = CpuLimits::default();
-    let provenance = &mut details.provenance;
+    match fs::read_to_string("/proc/self/mountinfo") {
+        Ok(mountinfo) => collect_cpu_limits_from_mounts(details, &mountinfo),
+        Err(error) => details
+            .provenance
+            .warnings
+            .push(format!("CPU quota mount view unavailable: {error}")),
+    }
+}
 
-    // Try cgroup v2 first
-    if let Some(ref unified_path) = details.unified_path {
-        let cgroup_root = "/sys/fs/cgroup";
-        let cpu_max_path = format!("{}{}/cpu.max", cgroup_root, unified_path);
-        provenance.limit_paths_tried.push(cpu_max_path.clone());
-
-        if let Some((quota, period)) = read_cpu_max(&cpu_max_path) {
-            limits.quota_us = quota;
-            limits.period_us = Some(period);
-            limits.source = CpuLimitSource::CgroupV2CpuMax;
-
-            if let Some(q) = quota {
-                if q > 0 {
-                    limits.effective_cores = Some(q as f64 / period as f64);
-                }
+fn collect_cpu_limits_from_mounts(details: &mut CgroupDetails, mountinfo: &str) {
+    let mut limits = None;
+    if let Some(path) = &details.unified_path {
+        match resolve_cgroup_mount(path, mountinfo, "cgroup2", None) {
+            Ok(mount) => {
+                limits = Some(read_cpu_hierarchy(&mount, true, &mut details.provenance));
             }
+            Err(error) => details.provenance.warnings.push(error),
         }
-
-        // Also try cpu.weight
-        let weight_path = format!("{}{}/cpu.weight", cgroup_root, unified_path);
-        provenance.limit_paths_tried.push(weight_path.clone());
-        if let Ok(bytes) = fs::read(&weight_path) {
-            let content = String::from_utf8_lossy(&bytes);
-            if let Ok(weight) = content.trim().parse::<u64>() {
-                limits.weight = Some(weight);
+    }
+    if limits
+        .as_ref()
+        .is_none_or(|limit| limit.source == CpuLimitSource::None)
+    {
+        if let Some(path) = details.v1_paths.get("cpu") {
+            match resolve_cgroup_mount(path, mountinfo, "cgroup", Some("cpu")) {
+                Ok(mount) => {
+                    limits = Some(read_cpu_hierarchy(&mount, false, &mut details.provenance));
+                }
+                Err(error) => details.provenance.warnings.push(error),
             }
         }
     }
+    details.cpu_limits = limits.filter(|limits| {
+        limits.source != CpuLimitSource::None || limits.shares.is_some() || limits.weight.is_some()
+    });
+}
 
-    // Try cgroup v1 if v2 didn't yield results
-    if limits.source == CpuLimitSource::None {
-        if let Some(cpu_path) = details.v1_paths.get("cpu") {
-            let cgroup_root = "/sys/fs/cgroup/cpu";
-            let quota_path = format!("{}{}/cpu.cfs_quota_us", cgroup_root, cpu_path);
-            let period_path = format!("{}{}/cpu.cfs_period_us", cgroup_root, cpu_path);
-            let shares_path = format!("{}{}/cpu.shares", cgroup_root, cpu_path);
-
-            provenance.limit_paths_tried.push(quota_path.clone());
+fn read_cpu_hierarchy(
+    mount: &CgroupMount,
+    v2: bool,
+    provenance: &mut CgroupProvenance,
+) -> CpuLimits {
+    let mut limits = CpuLimits {
+        quota_hierarchy_complete: true,
+        ..CpuLimits::default()
+    };
+    for directory in mount.directory.ancestors() {
+        if !directory.starts_with(&mount.mount_point) {
+            break;
+        }
+        let quota_file = directory.join(if v2 { "cpu.max" } else { "cpu.cfs_quota_us" });
+        let quota_path = quota_file.to_string_lossy().into_owned();
+        provenance.limit_paths_tried.push(quota_path.clone());
+        let observed = if v2 {
+            read_cpu_max(&quota_path)
+        } else {
+            let period_path = directory
+                .join("cpu.cfs_period_us")
+                .to_string_lossy()
+                .into_owned();
             provenance.limit_paths_tried.push(period_path.clone());
-
-            if let (Some(quota), Some(period)) =
-                (read_i64_file(&quota_path), read_u64_file(&period_path))
+            read_i64_file(&quota_path)
+                .zip(read_u64_file(&period_path))
+                .filter(|(quota, period)| (*quota == -1 || *quota > 0) && *period > 0)
+                .map(|(quota, period)| ((quota > 0).then_some(quota), period))
+        };
+        if let Some((quota, period)) = observed {
+            let cores = effective_cores_from_quota(quota, Some(period));
+            if limits.source == CpuLimitSource::None
+                || cores.is_some_and(|cores| limits.effective_cores.is_none_or(|old| cores < old))
             {
-                limits.quota_us = if quota < 0 { None } else { Some(quota) };
+                limits.quota_us = quota;
                 limits.period_us = Some(period);
-                limits.source = CpuLimitSource::CgroupV1Cfs;
-
-                if quota > 0 && period > 0 {
-                    limits.effective_cores = Some(quota as f64 / period as f64);
-                }
+                limits.effective_cores = cores;
+                limits.effective_limit_path = Some(quota_path);
+                limits.source = if v2 {
+                    CpuLimitSource::CgroupV2CpuMax
+                } else {
+                    CpuLimitSource::CgroupV1Cfs
+                };
             }
-
-            provenance.limit_paths_tried.push(shares_path.clone());
-            if let Some(shares) = read_u64_file(&shares_path) {
-                limits.shares = Some(shares);
+        } else {
+            // The true v2 root has no cpu.max. Missing files elsewhere may be
+            // disabled controllers, a race, or unreadable evidence, not "max".
+            let normal_root_absence = v2
+                && directory == mount.mount_point
+                && mount.mount_root == Path::new("/")
+                && fs::symlink_metadata(&quota_file)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+            if !normal_root_absence {
+                limits.quota_hierarchy_complete = false;
+                provenance.warnings.push(format!(
+                    "CPU quota unavailable or malformed: {}",
+                    quota_file.display()
+                ));
             }
         }
     }
-
-    if limits.source != CpuLimitSource::None || limits.shares.is_some() || limits.weight.is_some() {
-        details.cpu_limits = Some(limits);
+    if mount.mount_root != Path::new("/") {
+        limits.quota_hierarchy_complete = false;
+        provenance.warnings.push(format!(
+            "CPU quota ancestors above {} are outside the visible mount",
+            mount.mount_root.display()
+        ));
     }
+    let relative_file = mount
+        .directory
+        .join(if v2 { "cpu.weight" } else { "cpu.shares" });
+    let relative_path = relative_file.to_string_lossy().into_owned();
+    provenance.limit_paths_tried.push(relative_path.clone());
+    if v2 {
+        limits.weight = read_u64_file(&relative_path).filter(|weight| (1..=10_000).contains(weight));
+    } else {
+        limits.shares = read_u64_file(&relative_path);
+    }
+    limits
 }
 
 /// Collect memory limits from cgroup filesystem.
@@ -412,21 +609,25 @@ fn collect_memory_limits(details: &mut CgroupDetails, _pid: u32) {
 
 /// Read cpu.max file (v2 format: "quota period" or "max period").
 fn read_cpu_max(path: &str) -> Option<(Option<i64>, u64)> {
-    let bytes = fs::read(path).ok()?;
-    let content = String::from_utf8_lossy(&bytes);
-    let parts: Vec<&str> = content.split_whitespace().collect();
-    if parts.len() < 2 {
+    parse_cpu_max(&fs::read_to_string(path).ok()?)
+}
+
+fn parse_cpu_max(content: &str) -> Option<(Option<i64>, u64)> {
+    let mut parts = content.split_whitespace();
+    let quota = parts.next()?;
+    let quota = if quota == "max" {
+        None
+    } else {
+        Some(quota.parse::<i64>().ok().filter(|quota| *quota > 0)?)
+    };
+    let period = parts
+        .next()?
+        .parse::<u64>()
+        .ok()
+        .filter(|period| *period > 0)?;
+    if parts.next().is_some() {
         return None;
     }
-
-    let quota = if parts[0] == "max" {
-        None // Unlimited
-    } else {
-        parts[0].parse::<i64>().ok()
-    };
-
-    let period = parts[1].parse::<u64>().ok()?;
-
     Some((quota, period))
 }
 
@@ -1266,30 +1467,229 @@ mod tests {
 
     #[test]
     fn test_read_cpu_max_limited() {
-        // This would require a mock filesystem or temp files for true testing
-        // Here we just test the parsing logic with a helper
-        let content = "50000 100000";
-        let parts: Vec<&str> = content.split_whitespace().collect();
-        let quota = parts[0].parse::<i64>().ok();
-        let period = parts[1].parse::<u64>().ok();
-
-        assert_eq!(quota, Some(50000));
-        assert_eq!(period, Some(100000));
+        assert_eq!(parse_cpu_max("50000 100000\n"), Some((Some(50000), 100000)));
     }
 
     #[test]
     fn test_read_cpu_max_unlimited() {
-        let content = "max 100000";
-        let parts: Vec<&str> = content.split_whitespace().collect();
-        let quota = if parts[0] == "max" {
-            None
-        } else {
-            parts[0].parse::<i64>().ok()
-        };
-        let period = parts[1].parse::<u64>().ok();
+        assert_eq!(parse_cpu_max("max 100000\n"), Some((None, 100000)));
+    }
 
-        assert_eq!(quota, None);
-        assert_eq!(period, Some(100000));
+    #[test]
+    fn cpu_max_rejects_malformed_limits_instead_of_reporting_unlimited() {
+        for content in [
+            "",
+            "max",
+            "garbage 100000",
+            "-1 100000",
+            "0 100000",
+            "50000 0",
+            "max 0",
+            "50000 -1",
+            "50000 100000 extra",
+            "9223372036854775808 100000",
+        ] {
+            assert_eq!(parse_cpu_max(content), None, "{content:?}");
+        }
+    }
+
+    #[test]
+    fn cgroup_mount_resolution_uses_visible_roots_and_controller_identity() {
+        let mounts = concat!(
+            "21 1 0:20 /slice /delegated rw - cgroup2 cgroup rw\n",
+            "22 1 0:20 / /sys/cgroup\\040view rw - cgroup2 cgroup rw\n",
+            "23 1 0:21 / /legacy/cpuacct rw - cgroup cgroup rw,cpuacct\n",
+            "24 1 0:22 /slice /legacy/cpu rw - cgroup cgroup rw,cpu,cpuacct\n",
+        );
+        let unified = resolve_cgroup_mount("/slice/job", mounts, "cgroup2", None).unwrap();
+        assert_eq!(unified.directory, Path::new("/sys/cgroup view/slice/job"));
+        assert_eq!(unified.mount_root, Path::new("/"));
+        let legacy = resolve_cgroup_mount("/slice/job", mounts, "cgroup", Some("cpu")).unwrap();
+        assert_eq!(legacy.directory, Path::new("/legacy/cpu/job"));
+        assert_eq!(legacy.mount_point, Path::new("/legacy/cpu"));
+        assert_eq!(legacy.mount_root, Path::new("/slice"));
+        assert!(resolve_cgroup_mount("/slice-other/job", mounts, "cgroup", Some("cpu")).is_err());
+    }
+
+    #[test]
+    fn cgroup_mount_resolution_refuses_escaping_deleted_and_ambiguous_paths() {
+        let mount = "21 1 0:20 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n";
+        for membership in [
+            "relative",
+            "/../slice",
+            "/slice/../job",
+            "/slice/./job",
+            "/job (deleted)",
+        ] {
+            assert!(resolve_cgroup_mount(membership, mount, "cgroup2", None).is_err());
+        }
+        let ambiguous = format!("{mount}22 1 0:21 / /other rw - cgroup2 cgroup rw\n");
+        assert!(resolve_cgroup_mount("/job", &ambiguous, "cgroup2", None).is_err());
+        for replacement in [
+            "22 21 0:21 / /sys/fs/cgroup/job rw - tmpfs tmpfs rw\n",
+            "22 21 0:20 /different /sys/fs/cgroup/job rw - cgroup2 cgroup rw\n",
+            "22 1 0:21 / /sys/fs/cgroup rw - tmpfs tmpfs rw\n",
+            "22 21 0:21 /source /sys/fs/cgroup/cpu.max rw - ext4 /dev/sda rw\n",
+            "22 21 0:21 /source /sys/fs/cgroup/job/cpu.max rw - ext4 /dev/sda rw\n",
+            "22 21 0:21 /source /sys/fs/cgroup/job/child/memory.current rw - ext4 /dev/sda rw\n",
+        ] {
+            let hidden = format!("{mount}{replacement}");
+            assert!(resolve_cgroup_mount("/job/child", &hidden, "cgroup2", None).is_err());
+        }
+        assert!(resolve_cgroup_mount(
+            "/job",
+            "21 1 0:20 / /bad\\099path rw - cgroup2 cgroup rw",
+            "cgroup2",
+            None,
+        )
+        .is_err());
+    }
+
+    fn cpu_fixture_mount(root: &Path, membership: &str, mount_root: &str, v2: bool) -> String {
+        let escaped = root
+            .to_str()
+            .unwrap()
+            .replace('\\', "\\134")
+            .replace(' ', "\\040");
+        let (filesystem, options) = if v2 {
+            ("cgroup2", "rw")
+        } else {
+            ("cgroup", "rw,cpu,cpuacct")
+        };
+        let mountinfo =
+            format!("21 1 0:20 {mount_root} {escaped} rw - {filesystem} cgroup {options}\n");
+        assert!(
+            resolve_cgroup_mount(membership, &mountinfo, filesystem, (!v2).then_some("cpu"))
+                .is_ok()
+        );
+        mountinfo
+    }
+
+    #[test]
+    fn cpu_capacity_inherits_parent_quota_through_unlimited_leaf() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        fs::create_dir_all(root.join("slice/job")).unwrap();
+        fs::write(root.join("slice/cpu.max"), "50000 100000\n").unwrap();
+        fs::write(root.join("slice/job/cpu.max"), "max 100000\n").unwrap();
+        fs::write(root.join("slice/job/cpu.weight"), "123\n").unwrap();
+        let mountinfo = cpu_fixture_mount(root, "/slice/job", "/", true);
+        let mut details = collect_cgroup_from_content("0::/slice/job\n", "fixture", None).unwrap();
+        collect_cpu_limits_from_mounts(&mut details, &mountinfo);
+        let limits = details.cpu_limits.as_ref().unwrap();
+        assert_eq!(limits.effective_cores, Some(0.5));
+        assert_eq!(limits.quota_us, Some(50000));
+        assert_eq!(limits.period_us, Some(100000));
+        assert_eq!(limits.weight, Some(123));
+        assert!(limits.quota_hierarchy_complete);
+        assert_eq!(
+            limits.effective_limit_path.as_deref(),
+            root.join("slice/cpu.max").to_str()
+        );
+        let capacity =
+            super::super::cpu_capacity::compute_cpu_capacity(std::process::id(), Some(&details));
+        assert_eq!(capacity.quota_cores, Some(0.5));
+        assert_eq!(capacity.n_eff_cores, 0.5);
+        assert_eq!(
+            capacity.provenance.quota_source,
+            super::super::cpu_capacity::QuotaSource::CgroupV2CpuMax
+        );
+    }
+
+    #[test]
+    fn cpu_hierarchy_selects_minimum_ratio_not_smallest_raw_quota() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        fs::create_dir_all(root.join("slice/job")).unwrap();
+        fs::write(root.join("slice/cpu.max"), "80000 100000\n").unwrap();
+        fs::write(root.join("slice/job/cpu.max"), "10000 10000\n").unwrap();
+        let mountinfo = cpu_fixture_mount(root, "/slice/job", "/", true);
+        let mut details = collect_cgroup_from_content("0::/slice/job\n", "fixture", None).unwrap();
+        collect_cpu_limits_from_mounts(&mut details, &mountinfo);
+        assert_eq!(
+            details.cpu_limits.as_ref().unwrap().effective_cores,
+            Some(0.8)
+        );
+        fs::write(root.join("slice/job/cpu.max"), "2500 10000\n").unwrap();
+        collect_cpu_limits_from_mounts(&mut details, &mountinfo);
+        assert_eq!(
+            details.cpu_limits.as_ref().unwrap().effective_cores,
+            Some(0.25)
+        );
+        assert_eq!(details.cpu_limits.as_ref().unwrap().period_us, Some(10000));
+    }
+
+    #[test]
+    fn cpu_hierarchy_does_not_treat_unreadable_or_malformed_ancestors_as_max() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        fs::create_dir_all(root.join("slice/job")).unwrap();
+        fs::write(root.join("slice/job/cpu.max"), "10000 100000\n").unwrap();
+        let mountinfo = cpu_fixture_mount(root, "/slice/job", "/", true);
+        let mut details = collect_cgroup_from_content("0::/slice/job\n", "fixture", None).unwrap();
+        for ancestor in [None, Some("nonsense 100000\n"), Some("10000 0\n")] {
+            if let Some(value) = ancestor {
+                fs::write(root.join("slice/cpu.max"), value).unwrap();
+            }
+            collect_cpu_limits_from_mounts(&mut details, &mountinfo);
+            let limits = details.cpu_limits.as_ref().unwrap();
+            assert_eq!(limits.effective_cores, Some(0.1));
+            assert!(!limits.quota_hierarchy_complete);
+            assert!(details
+                .provenance
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("slice/cpu.max")));
+        }
+    }
+
+    #[test]
+    fn cpu_hierarchy_honors_subtree_root_without_reading_above_mount() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("mounted");
+        fs::create_dir_all(root.join("job")).unwrap();
+        fs::write(fixture.path().join("cpu.max"), "1 100000\n").unwrap();
+        fs::write(root.join("cpu.max"), "20000 100000\n").unwrap();
+        fs::write(root.join("job/cpu.max"), "max 100000\n").unwrap();
+        let mountinfo = cpu_fixture_mount(&root, "/slice/job", "/slice", true);
+        let mut details = collect_cgroup_from_content("0::/slice/job\n", "fixture", None).unwrap();
+        collect_cpu_limits_from_mounts(&mut details, &mountinfo);
+        let limits = details.cpu_limits.as_ref().unwrap();
+        assert_eq!(limits.effective_cores, Some(0.2));
+        assert!(!limits.quota_hierarchy_complete);
+        assert!(!details.provenance.limit_paths_tried.contains(
+            &fixture.path().join("cpu.max").to_string_lossy().into_owned()
+        ));
+        assert!(details
+            .provenance
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("outside the visible mount")));
+    }
+
+    #[test]
+    fn cpu_hierarchy_reads_v1_ancestors_and_keeps_leaf_shares() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        fs::create_dir_all(root.join("slice/job")).unwrap();
+        for (path, quota, period) in [
+            ("", "-1", "100000"),
+            ("slice", "30000", "100000"),
+            ("slice/job", "-1", "10000"),
+        ] {
+            fs::write(root.join(path).join("cpu.cfs_quota_us"), quota).unwrap();
+            fs::write(root.join(path).join("cpu.cfs_period_us"), period).unwrap();
+        }
+        fs::write(root.join("slice/job/cpu.shares"), "512\n").unwrap();
+        let mountinfo = cpu_fixture_mount(root, "/slice/job", "/", false);
+        let mut details =
+            collect_cgroup_from_content("5:cpu,cpuacct:/slice/job\n", "fixture", None).unwrap();
+        collect_cpu_limits_from_mounts(&mut details, &mountinfo);
+        let limits = details.cpu_limits.as_ref().unwrap();
+        assert_eq!(limits.effective_cores, Some(0.3));
+        assert_eq!(limits.source, CpuLimitSource::CgroupV1Cfs);
+        assert_eq!(limits.shares, Some(512));
+        assert!(limits.quota_hierarchy_complete);
     }
 
     #[test]
