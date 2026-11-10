@@ -15,14 +15,14 @@ use super::types::{ProcessRecord, ProcessState, ScanMetadata, ScanResult};
 use crate::events::{event_names, Phase, ProgressEmitter, ProgressEvent};
 use pt_common::{ProcessId, StartId};
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader, Read};
-use std::process::{Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+#[cfg(unix)]
+use std::io::Read;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use thiserror::Error;
-use tracing::{debug, span, Level};
+use tracing::{debug, span, warn, Level};
 
 /// Options for quick scan operation.
 #[derive(Clone, Default)]
@@ -70,36 +70,183 @@ pub enum QuickScanError {
     UnsupportedPlatform(String),
 }
 
-/// Cancellation and signalling share this lock. The caller must cancel before
-/// reaping its owned child, so a delayed timeout can never signal a recycled PID.
-struct PsTimeoutGuard(Arc<Mutex<bool>>);
+/// Own the collector until it has been reaped. Every error path terminates the
+/// same child; no timer can outlive that ownership and signal a recycled PID.
+struct PsChildGuard(Option<Child>);
 
-impl Drop for PsTimeoutGuard {
-    fn drop(&mut self) {
-        *self.0.lock().unwrap_or_else(|error| error.into_inner()) = true;
+impl PsChildGuard {
+    fn finish(mut self, started: Instant, timeout: Duration) -> Result<ExitStatus, QuickScanError> {
+        loop {
+            check_ps_deadline(started, timeout)?;
+            if let Some(status) = self.0.as_mut().expect("owned ps child").try_wait()? {
+                // try_wait has reaped this incarnation. Drop must never signal it.
+                let _ = self.0.take();
+                return Ok(status);
+            }
+            wait_for_ps_progress(started, timeout);
+        }
     }
 }
 
-fn start_ps_watchdog(pid: u32, timeout: Duration, timed_out: Arc<AtomicBool>) -> PsTimeoutGuard {
-    let finished = Arc::new(Mutex::new(false));
-    let watchdog_finished = finished.clone();
-    thread::spawn(move || {
-        thread::sleep(timeout);
-        let finished = watchdog_finished
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if !*finished {
-            timed_out.store(true, Ordering::Relaxed);
-            debug!("Quick scan timed out, killing ps process {}", pid);
-            #[cfg(unix)]
-            // SAFETY: cancellation must take this same lock before the caller
-            // can reap its owned child; the PID is still pinned while signalling.
-            unsafe {
-                libc::kill(pid as i32, libc::SIGKILL);
+impl Drop for PsChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => {}
+                Err(error) => {
+                    // In particular, ECHILD no longer proves that our numeric
+                    // PID is pinned. Never signal after losing child ownership.
+                    warn!(pid = child.id(), %error, "cannot establish collector ownership for cleanup");
+                    return;
+                }
+            }
+            // The unreaped child pins its PID until wait, even if it has exited.
+            // A process stuck in uninterruptible kernel I/O may not die promptly
+            // after SIGKILL. Reap off the caller so cleanup cannot defeat the
+            // scan's deadline. Healthy scans create no background threads.
+            let pid = child.id();
+            if let Err(error) = child.kill() {
+                warn!(pid, %error, "cannot terminate failed collector");
+            }
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            if let Err(error) = thread::Builder::new()
+                .name("pt-ps-reaper".to_string())
+                .spawn(move || {
+                    let _ = child.wait();
+                })
+            {
+                warn!(pid, %error, "cannot start collector reaper; cleanup remains unverified");
             }
         }
-    });
-    PsTimeoutGuard(finished)
+    }
+}
+
+fn check_ps_deadline(started: Instant, timeout: Duration) -> Result<(), QuickScanError> {
+    if started.elapsed() >= timeout {
+        Err(QuickScanError::Timeout(timeout))
+    } else {
+        Ok(())
+    }
+}
+
+fn wait_for_ps_progress(started: Instant, timeout: Duration) {
+    thread::sleep(Duration::from_millis(5).min(timeout.saturating_sub(started.elapsed())));
+}
+
+#[cfg(unix)]
+fn nonblocking_ps_pipe(pipe: &impl std::os::fd::AsRawFd) -> std::io::Result<()> {
+    let fd = pipe.as_raw_fd();
+    // SAFETY: the borrowed pipe owns a valid descriptor throughout both calls.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the same valid, borrowed descriptor is still owned by the pipe.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Read both pipes without waiting on either one. An inherited pipe can remain
+/// open after the collector exits, so EOF and process termination share one
+/// deadline rather than relying on a kill to unblock a blocking reader.
+#[cfg(unix)]
+fn read_ps_output(
+    mut stdout: std::process::ChildStdout,
+    mut stderr: std::process::ChildStderr,
+    started: Instant,
+    timeout: Duration,
+    mut on_line: impl FnMut(&str),
+) -> Result<Vec<u8>, QuickScanError> {
+    nonblocking_ps_pipe(&stdout)?;
+    nonblocking_ps_pipe(&stderr)?;
+    const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
+    let mut diagnostics = Vec::new();
+    let mut line = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    let mut stdout_done = false;
+    let mut stderr_done = false;
+    while !stdout_done || !stderr_done {
+        check_ps_deadline(started, timeout)?;
+        let mut progressed = false;
+        if !stdout_done {
+            match stdout.read(&mut buffer) {
+                Ok(0) => {
+                    stdout_done = true;
+                    progressed = true;
+                    if !line.is_empty() {
+                        on_line(ps_output_line(&line)?);
+                    }
+                }
+                Ok(count) => {
+                    progressed = true;
+                    for segment in buffer[..count].split_inclusive(|byte| *byte == b'\n') {
+                        line.extend_from_slice(segment);
+                        if segment.last() == Some(&b'\n') {
+                            line.pop();
+                            if line.last() == Some(&b'\r') {
+                                line.pop();
+                            }
+                            on_line(ps_output_line(&line)?);
+                            line.clear();
+                        }
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if !stderr_done {
+            match stderr.read(&mut buffer) {
+                Ok(0) => {
+                    stderr_done = true;
+                    progressed = true;
+                }
+                Ok(count) => {
+                    progressed = true;
+                    let retained = count.min(MAX_DIAGNOSTIC_BYTES - diagnostics.len());
+                    diagnostics.extend_from_slice(&buffer[..retained]);
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if !progressed {
+            wait_for_ps_progress(started, timeout);
+        }
+    }
+    Ok(diagnostics)
+}
+
+#[cfg(not(unix))]
+fn read_ps_output(
+    _stdout: std::process::ChildStdout,
+    _stderr: std::process::ChildStderr,
+    _started: Instant,
+    _timeout: Duration,
+    _on_line: impl FnMut(&str),
+) -> Result<Vec<u8>, QuickScanError> {
+    Err(QuickScanError::UnsupportedPlatform(
+        "bounded process collection requires Unix pipes".to_string(),
+    ))
+}
+
+#[cfg(unix)]
+fn ps_output_line(bytes: &[u8]) -> Result<&str, QuickScanError> {
+    std::str::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error).into())
 }
 
 /// A procfs mount from an ancestor PID namespace can assign unrelated processes
@@ -180,34 +327,40 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
     let mut cmd = build_ps_command(&platform, options)?;
 
     // Execute and capture output
-    let mut child = cmd
+    let child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| QuickScanError::CommandFailed(e.to_string()))?;
 
+    scan_ps_child(child, options, &platform, &boot_id, start)
+}
+
+/// The actual collector lifecycle, separated from command construction so tests
+/// can exercise pipe/exit failures with owned subprocesses without changing PATH.
+fn scan_ps_child(
+    mut child: Child,
+    options: &QuickScanOptions,
+    platform: &str,
+    boot_id: &str,
+    start: Instant,
+) -> Result<ScanResult, QuickScanError> {
     let pid = child.id();
-    let collector_pid = collector_pid_for_scan(&platform, pid);
+    let collector_pid = collector_pid_for_scan(platform, pid);
     // `ps` takes well under a second on a healthy host; the generous default only
     // matters on CPU-starved hosts (the ones most in need of triage), where 10 s
     // made the whole plan fail (ts2 under load, pt at nice 19).
     let timeout = options.timeout.unwrap_or(Duration::from_secs(30));
-    let timed_out = Arc::new(AtomicBool::new(false));
-    let guard = start_ps_watchdog(pid, timeout, timed_out.clone());
-
-    let stdout = child
-        .stdout
-        .take()
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    // Install cleanup before any operation that can fail, including missing
+    // pipes, nonblocking setup, UTF-8 decoding and line parsing.
+    let child = PsChildGuard(Some(child));
+    let stdout = stdout
         .ok_or_else(|| QuickScanError::CommandFailed("Failed to capture stdout".to_string()))?;
-    let stderr = child
-        .stderr
-        .take()
+    let stderr = stderr
         .ok_or_else(|| QuickScanError::CommandFailed("Failed to capture stderr".to_string()))?;
-    // Drain diagnostics concurrently: a full stderr pipe must not block ps while
-    // this thread waits for another stdout line. Retain a bounded diagnostic prefix.
-    let stderr_reader = thread::spawn(move || drain_ps_stderr(stderr));
 
-    let reader = BufReader::new(stdout);
     let mut processes = Vec::new();
     let mut warnings = Vec::new();
     let requested_pids: HashSet<u32> = options.pids.iter().copied().collect();
@@ -215,8 +368,8 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
     let mut selection_error = None;
 
     // Parse output
-    let lines = reader.lines();
     let mut header_checked = false;
+    let mut line_num = 0usize;
 
     let mut processed = 0usize;
     const PROGRESS_STEP: usize = 200;
@@ -228,33 +381,33 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
         None
     };
 
-    for (line_num, line_result) in lines.enumerate() {
-        let line = line_result?;
+    let stderr = read_ps_output(stdout, stderr, start, timeout, |line| {
+        line_num += 1;
         if line.trim().is_empty() {
-            continue;
+            return;
         }
 
         if !header_checked {
             header_checked = true;
-            if is_header_line(&line) {
-                continue;
+            if is_header_line(line) {
+                return;
             }
         }
 
-        match parse_ps_line_with_timing(&line, &platform, &boot_id, None, clock.as_ref()) {
+        match parse_ps_line_with_timing(line, platform, boot_id, None, clock.as_ref()) {
             Ok(record) => {
                 if !requested_pids.is_empty() {
                     if !requested_pids.contains(&record.pid.0) {
                         selection_error =
                             Some(format!("ps returned unrequested PID {}", record.pid.0));
-                        continue;
+                        return;
                     }
                     if !returned_pids.insert(record.pid.0) {
                         selection_error = Some(format!(
                             "ps returned requested PID {} more than once",
                             record.pid.0
                         ));
-                        continue;
+                        return;
                     }
                 }
                 // Filter kernel threads if not requested AND not targeting specific PIDs.
@@ -270,12 +423,12 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
                         comm = %record.comm,
                         "Filtered kernel thread from scan"
                     );
-                    continue;
+                    return;
                 }
                 processes.push(record);
             }
             Err(e) => {
-                warnings.push(format!("Line {}: {}", line_num + 1, e));
+                warnings.push(format!("Line {}: {}", line_num, e));
             }
         }
 
@@ -289,7 +442,7 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
                 );
             }
         }
-    }
+    })?;
 
     // ps exits before the snapshot can be sampled. Leaving its own row in the
     // inventory would make every complete CPU baseline unavailable. Its PID is
@@ -297,25 +450,12 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
     // bind that handle to a row. Preserve all uncertain or explicitly requested rows.
     omit_owned_collector(&mut processes, collector_pid, !options.pids.is_empty());
 
-    // Cancellation waits for any in-progress check/signal before allowing reap.
-    drop(guard);
-
-    // Wait for child process to avoid leaving zombies
-    let exit_status = child.wait()?;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| QuickScanError::CommandFailed("ps stderr reader panicked".to_string()))??;
+    // EOF is not process completion: a collector can close its pipes and then
+    // stall. Retain the same deadline until the owned child is actually reaped.
+    let exit_status = child.finish(start, timeout)?;
 
     let duration = start.elapsed();
     let process_count = processes.len();
-
-    if timed_out.load(Ordering::Relaxed) {
-        debug!(
-            duration_ms = duration.as_millis(),
-            process_count, "Quick scan timed out"
-        );
-        return Err(QuickScanError::Timeout(timeout));
-    }
 
     validate_ps_exit(
         exit_status,
@@ -346,25 +486,14 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
         processes,
         metadata: ScanMetadata {
             scan_type: "quick".to_string(),
-            platform,
-            boot_id,
+            platform: platform.to_string(),
+            boot_id: boot_id.to_string(),
             started_at: chrono::Utc::now().to_rfc3339(),
             duration_ms: duration.as_millis() as u64,
             process_count,
             warnings,
         },
     })
-}
-
-fn drain_ps_stderr(mut stderr: impl Read) -> std::io::Result<Vec<u8>> {
-    const MAX_DIAGNOSTIC_BYTES: u64 = 16 * 1024;
-    let mut diagnostics = Vec::new();
-    stderr
-        .by_ref()
-        .take(MAX_DIAGNOSTIC_BYTES)
-        .read_to_end(&mut diagnostics)?;
-    std::io::copy(&mut stderr, &mut std::io::sink())?;
-    Ok(diagnostics)
 }
 
 fn validate_ps_exit(
@@ -1256,28 +1385,59 @@ mod tests {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn live_watchdog_timeout_kills_only_the_owned_child() {
-        use std::os::unix::process::ExitStatusExt;
+    fn spawn_ps_fixture(script: &str) -> Child {
+        Command::new("sh")
+            .args(["-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn owned collector fixture")
+    }
 
-        let mut target = OwnedScanChild::spawn();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn assert_collector_reaped(pid: u32) {
+        let started = Instant::now();
+        loop {
+            // SAFETY: signal 0 only checks existence; it never signals a process.
+            if unsafe { libc::kill(pid as i32, 0) } < 0
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                return;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "collector {pid} must terminate and be reaped after a failed scan"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn live_collector_timeout_kills_only_the_owned_child() {
         let mut survivor = OwnedScanChild::spawn();
         let options = QuickScanOptions {
             pids: vec![survivor.pid()],
             ..Default::default()
         };
         let before = quick_scan(&options).expect("live survivor before timeout");
-        let timed_out = Arc::new(AtomicBool::new(false));
-        let guard = start_ps_watchdog(target.pid(), Duration::from_millis(100), timed_out.clone());
+        let target = spawn_ps_fixture("exec sleep 5");
+        let target_pid = target.id();
         let start = Instant::now();
-        while !timed_out.load(Ordering::Relaxed) && start.elapsed() < Duration::from_secs(2) {
-            thread::sleep(Duration::from_millis(5));
-        }
-        // Join the signal's critical section before reaping the owned target.
-        drop(guard);
-        assert!(timed_out.load(Ordering::Relaxed), "watchdog must fire");
-        let status = target.0.wait().expect("reap timed-out owned child");
-        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        let result = scan_ps_child(
+            target,
+            &QuickScanOptions {
+                timeout: Some(Duration::from_millis(100)),
+                ..Default::default()
+            },
+            &detect_platform(),
+            &read_boot_id(),
+            start,
+        );
+        assert!(matches!(result, Err(QuickScanError::Timeout(_))));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_collector_reaped(target_pid);
         assert!(survivor.0.try_wait().expect("survivor status").is_none());
         let after = quick_scan(&options).expect("live survivor after timeout");
         assert_eq!(before.processes.len(), 1);
@@ -1286,9 +1446,8 @@ mod tests {
         assert_eq!(before.processes[0].uid, after.processes[0].uid);
         crate::test_log!(
             INFO,
-            "actual owned watchdog timeout",
-            target_pid = target.pid(),
-            signal = status.signal().unwrap(),
+            "actual collector timeout and cleanup",
+            target_pid = target_pid,
             survivor_pid = survivor.pid(),
             survivor_start_id = after.processes[0].start_id.0.as_str(),
             survivor_uid = after.processes[0].uid
@@ -1297,22 +1456,17 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn live_cancelled_watchdog_leaves_owned_children_alive() {
+    fn live_successful_collection_leaves_owned_children_alive() {
         let mut target = OwnedScanChild::spawn();
         let mut survivor = OwnedScanChild::spawn();
         let options = QuickScanOptions {
             pids: vec![target.pid(), survivor.pid()],
             ..Default::default()
         };
-        let before = quick_scan(&options).expect("live children before cancellation");
-        let timed_out = Arc::new(AtomicBool::new(false));
-        let guard = start_ps_watchdog(target.pid(), Duration::from_millis(100), timed_out.clone());
-        drop(guard);
-        thread::sleep(Duration::from_millis(200));
-        assert!(!timed_out.load(Ordering::Relaxed));
+        let before = quick_scan(&options).expect("live children before collector completion");
         assert!(target.0.try_wait().expect("target status").is_none());
         assert!(survivor.0.try_wait().expect("survivor status").is_none());
-        let after = quick_scan(&options).expect("live children after cancellation");
+        let after = quick_scan(&options).expect("live children after collector completion");
         assert_eq!(before.processes.len(), 2);
         assert_eq!(after.processes.len(), 2);
         for record in &before.processes {
@@ -1326,11 +1480,90 @@ mod tests {
         }
         crate::test_log!(
             INFO,
-            "actual owned watchdog cancellation",
+            "actual collector completion preserves unrelated children",
             target_pid = target.pid(),
             survivor_pid = survivor.pid(),
             survivor_uid = after.processes[0].uid
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn live_collector_deadline_covers_closed_and_inherited_pipes() {
+        for script in [
+            "exec 1>&-; exec sleep 5",
+            "exec 1>&-; exec 2>&-; exec sleep 5",
+            "exec 2>&-; exec sleep 5",
+            // The collector exits promptly, but its descendant owns both pipes
+            // until its bounded sleep ends. Killing the collector cannot close them.
+            "sleep 5 & exit 0",
+        ] {
+            let child = spawn_ps_fixture(script);
+            let pid = child.id();
+            let start = Instant::now();
+            let result = scan_ps_child(
+                child,
+                &QuickScanOptions {
+                    timeout: Some(Duration::from_millis(100)),
+                    ..Default::default()
+                },
+                &detect_platform(),
+                &read_boot_id(),
+                start,
+            );
+            assert!(
+                matches!(result, Err(QuickScanError::Timeout(_))),
+                "{script}: {result:?}"
+            );
+            assert!(start.elapsed() < Duration::from_secs(2), "{script}");
+            assert_collector_reaped(pid);
+            crate::test_log!(
+                INFO,
+                "actual collector pipe timeout",
+                script = script,
+                pid = pid
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn live_collector_read_and_setup_errors_terminate_and_reap_the_child() {
+        let malformed = spawn_ps_fixture("printf '\\377\\n'; exec sleep 5");
+        let pid = malformed.id();
+        let result = scan_ps_child(
+            malformed,
+            &QuickScanOptions::default(),
+            &detect_platform(),
+            &read_boot_id(),
+            Instant::now(),
+        );
+        assert!(matches!(
+            result,
+            Err(QuickScanError::IoError(ref error))
+                if error.kind() == std::io::ErrorKind::InvalidData
+        ));
+        assert_collector_reaped(pid);
+
+        let missing_pipe = Command::new("sleep")
+            .arg("5")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn collector without stdout capture");
+        let pid = missing_pipe.id();
+        let result = scan_ps_child(
+            missing_pipe,
+            &QuickScanOptions::default(),
+            &detect_platform(),
+            &read_boot_id(),
+            Instant::now(),
+        );
+        assert!(matches!(
+            result,
+            Err(QuickScanError::CommandFailed(ref reason)) if reason.contains("stdout")
+        ));
+        assert_collector_reaped(pid);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1471,27 +1704,56 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn stderr_drain_handles_more_than_a_pipe_and_bounds_diagnostics() {
+        let started = Instant::now();
+        let timeout = Duration::from_secs(5);
         let mut child = Command::new("sh")
             .args(["-c", "head -c 131072 /dev/zero >&2; printf ready; exit 2"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn actual diagnostic producer");
+        let stdout = child.stdout.take().expect("stdout pipe");
         let stderr = child.stderr.take().expect("stderr pipe");
-        let reader = thread::spawn(move || drain_ps_stderr(stderr));
-        let mut stdout = Vec::new();
-        child
-            .stdout
-            .take()
-            .unwrap()
-            .read_to_end(&mut stdout)
-            .unwrap();
-        let status = child.wait().expect("reap diagnostic producer");
-        let diagnostics = reader.join().unwrap().expect("drain diagnostics");
-        assert_eq!(stdout, b"ready");
+        let child = PsChildGuard(Some(child));
+        let mut lines = Vec::new();
+        let diagnostics = read_ps_output(stdout, stderr, started, timeout, |line| {
+            lines.push(line.to_string());
+        })
+        .expect("drain diagnostics alongside stdout");
+        let status = child
+            .finish(started, timeout)
+            .expect("reap diagnostic producer");
+        assert_eq!(lines, ["ready"]);
         assert_eq!(diagnostics.len(), 16 * 1024);
         assert_eq!(status.code(), Some(2));
         assert!(validate_ps_exit(status, true, 0, 0, &diagnostics).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ps_pipe_reader_preserves_split_utf8_crlf_and_final_line() {
+        let started = Instant::now();
+        let timeout = Duration::from_secs(5);
+        let mut child = Command::new("sh")
+            .args([
+                "-c",
+                "printf 'one\\r\\n\\303'; sleep 0.05; printf '\\251\\ntail'",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn segmented output producer");
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let child = PsChildGuard(Some(child));
+        let mut lines = Vec::new();
+        let diagnostics = read_ps_output(stdout, stderr, started, timeout, |line| {
+            lines.push(line.to_string());
+        })
+        .expect("read complete UTF-8 lines across pipe writes");
+        assert!(child.finish(started, timeout).unwrap().success());
+        assert_eq!(lines, ["one", "é", "tail"]);
+        assert!(diagnostics.is_empty());
     }
 
     #[test]
