@@ -481,6 +481,15 @@ fn read_cpu_hierarchy(
                 .map(|(quota, period)| ((quota > 0).then_some(quota), period))
         };
         if let Some((quota, period)) = observed {
+            // cpu.max never exists on the true v2 root. Its presence at a
+            // visible root proves a namespace boundary even if mountinfo says "/".
+            if v2 && directory == mount.mount_point && mount.mount_root == Path::new("/") {
+                limits.quota_hierarchy_complete = false;
+                provenance.warnings.push(format!(
+                    "CPU quota ancestors above namespace root {} are outside the visible mount",
+                    directory.display()
+                ));
+            }
             let cores = effective_cores_from_quota(quota, Some(period));
             if limits.source == CpuLimitSource::None
                 || cores.is_some_and(|cores| limits.effective_cores.is_none_or(|old| cores < old))
@@ -1640,6 +1649,35 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("slice/cpu.max")));
+        }
+    }
+
+    #[test]
+    fn cpu_hierarchy_marks_namespace_root_incomplete_with_root_mount_path() {
+        for (root_quota, leaf_quota, expected_cores, expected_path) in [
+            ("20000 100000\n", "max 100000\n", 0.2, "cpu.max"),
+            ("max 100000\n", "10000 100000\n", 0.1, "job/cpu.max"),
+        ] {
+            let fixture = tempfile::tempdir().unwrap();
+            let root = fixture.path();
+            fs::create_dir_all(root.join("job")).unwrap();
+            fs::write(root.join("cpu.max"), root_quota).unwrap();
+            fs::write(root.join("job/cpu.max"), leaf_quota).unwrap();
+            // A cgroup namespace rewrites its non-global root to "/" in
+            // mountinfo, while the root still has its own cpu.max controller file.
+            let mountinfo = cpu_fixture_mount(root, "/job", "/", true);
+            let mut details = collect_cgroup_from_content("0::/job\n", "fixture", None).unwrap();
+            collect_cpu_limits_from_mounts(&mut details, &mountinfo);
+            let limits = details.cpu_limits.as_ref().unwrap();
+            assert_eq!(limits.effective_cores, Some(expected_cores));
+            assert_eq!(
+                limits.effective_limit_path.as_deref(),
+                root.join(expected_path).to_str()
+            );
+            assert!(!limits.quota_hierarchy_complete);
+            assert!(details.provenance.warnings.iter().any(|warning| {
+                warning.contains("namespace root") && warning.contains("outside the visible mount")
+            }));
         }
     }
 
