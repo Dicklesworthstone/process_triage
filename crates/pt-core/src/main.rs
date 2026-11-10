@@ -22964,7 +22964,7 @@ fn candidate_recommendation(
     #[cfg(target_os = "linux")]
     let critical_files = if destructive && evidence_refusal.is_none() {
         subject
-            .and_then(|subject| pt_core::collect::parse_fd(subject.pid.0).ok())
+            .and_then(|subject| pt_core::collect::parse_fd(subject.pid.0))
             .map(|fd| fd.critical_writes)
             .unwrap_or_default()
     } else {
@@ -24166,7 +24166,8 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             })
             .collect();
 
-        // Build candidate JSON (action tracking moved to after sorting)
+        // Build candidate JSON in bounded chunks to avoid macro recursion limits.
+        // Action tracking happens after sorting.
         let mut candidate = serde_json::json!({
             "pid": proc.pid.0,
             "ppid": proc.ppid.0,
@@ -24195,6 +24196,8 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             "resource_observation": resource_observation,
             "score": score,
             "classification": ledger.classification.label(),
+        });
+        let mut candidate_details = serde_json::json!({
             "posterior": {
                 "useful": posterior.useful,
                 "useful_bad": posterior.useful_bad,
@@ -24258,6 +24261,14 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             "policy": policy_value,
             "responsible_unit": responsible_unit_summary(responsible_units.unit_for(proc)),
         });
+        candidate
+            .as_object_mut()
+            .expect("candidate was constructed as a JSON object")
+            .append(
+                candidate_details
+                    .as_object_mut()
+                    .expect("candidate details were constructed as a JSON object"),
+            );
 
         #[cfg(target_os = "linux")]
         if args.deep {
