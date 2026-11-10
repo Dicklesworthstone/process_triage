@@ -1489,14 +1489,11 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn live_collector_deadline_covers_closed_and_inherited_pipes() {
+    fn live_collector_deadline_covers_closed_pipes() {
         for script in [
             "exec 1>&-; exec sleep 5",
             "exec 1>&-; exec 2>&-; exec sleep 5",
             "exec 2>&-; exec sleep 5",
-            // The collector exits promptly, but its descendant owns both pipes
-            // until its bounded sleep ends. Killing the collector cannot close them.
-            "sleep 5 & exit 0",
         ] {
             let child = spawn_ps_fixture(script);
             let pid = child.id();
@@ -1524,6 +1521,81 @@ mod tests {
                 pid = pid
             );
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn live_collector_deadline_covers_inherited_pipes() {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+
+        let (stdout_reader, stdout_writer) = UnixStream::pair().expect("collector stdout pair");
+        let (stderr_reader, stderr_writer) = UnixStream::pair().expect("collector stderr pair");
+        let holder_stdout = stdout_writer.try_clone().expect("shared stdout writer");
+        let holder_stderr = stderr_writer.try_clone().expect("shared stderr writer");
+        // Keep the pipe holder as our own child so the test can kill and reap it,
+        // including when an assertion fails. A shell background job would orphan it.
+        let mut holder = OwnedScanChild(
+            Command::new("sleep")
+                .arg("300")
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(OwnedFd::from(holder_stdout)))
+                .stderr(Stdio::from(OwnedFd::from(holder_stderr)))
+                .spawn()
+                .expect("spawn owned pipe holder"),
+        );
+        let mut collector = PsChildGuard(Some(
+            Command::new("sh")
+                .args(["-c", "exit 0"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(OwnedFd::from(stdout_writer)))
+                .stderr(Stdio::from(OwnedFd::from(stderr_writer)))
+                .spawn()
+                .expect("spawn exiting collector"),
+        ));
+        let child = collector.0.as_mut().expect("owned collector");
+        child.stdout = Some(std::process::ChildStdout::from(OwnedFd::from(
+            stdout_reader,
+        )));
+        child.stderr = Some(std::process::ChildStderr::from(OwnedFd::from(
+            stderr_reader,
+        )));
+        // Establish the exited-child state rather than relying on shell startup
+        // completing within the short scan deadline under a loaded test runner.
+        let wait_started = Instant::now();
+        loop {
+            if let Some(status) = child.try_wait().expect("wait for exiting collector") {
+                assert!(status.success());
+                break;
+            }
+            assert!(
+                wait_started.elapsed() < Duration::from_secs(5),
+                "collector fixture must exit before the scan"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let start = Instant::now();
+        let result = scan_ps_child(
+            collector.0.take().expect("owned collector"),
+            &QuickScanOptions {
+                timeout: Some(Duration::from_millis(100)),
+                ..Default::default()
+            },
+            &detect_platform(),
+            &read_boot_id(),
+            start,
+        );
+        assert!(matches!(result, Err(QuickScanError::Timeout(_))));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(
+            holder
+                .0
+                .try_wait()
+                .expect("owned pipe holder status")
+                .is_none(),
+            "collector cleanup must leave the independently owned pipe holder alive"
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
