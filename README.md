@@ -624,6 +624,11 @@ count. Credit is limited to that process, even if it belongs to a larger agent,
 build, or cgroup. RSS/system RAM provides a memory share, not an estimate of
 unique reclaimable pages; reversible actions receive no memory or I/O relief
 credit. I/O attribution remains unavailable without a comparable denominator.
+Per-process CPU occupancy also respects the tightest visible cgroup-v1 or
+cgroup-v2 ancestor quota, comparing quota/period ratios and reporting the
+controller path that supplies the limit. This is a shared ceiling, not a
+guarantee of CPU time for each member. Hidden or unreadable hierarchy levels
+retain explicit warnings; host-wide percentages still use host capacity.
 Missing observations are reported as unavailable, and disabled, zero-pressure,
 or wholly unattributable cases preserve the evidence-only decision. Reports
 separate base loss, modeled pressure cost, excluded actions, and unavailable
@@ -659,8 +664,24 @@ Candidates and watch events include a compact `responsible_unit` summary; full
 membership is emitted only once in the top-level table. Snapshots also retain
 the table in `scan/responsible_units.json`. These are workload diagnostics:
 single-process actions still receive only their own resource credit and pass
-the existing action gates. Per-cgroup usage counters and PSI, verified pane IDs,
-and automatic group actions are not implemented by this member-sum report.
+the existing action gates.
+
+On Linux, cgroup-backed units also include `cgroup_usage`: kernel
+`memory.current`, `memory.peak`, `memory.swap.current`, cumulative `cpu.stat`
+accounting, and CPU/memory/I/O PSI with both `some` and available `full` lines.
+These readings cover the **whole cgroup subtree**, including members outside
+the scan, and stay separate from the observed-member sums. Subtrees can overlap;
+their charged memory is neither additive across units nor an estimate of private
+reclaimable memory. A single CPU counter reading is not a CPU rate.
+
+Collection reads at most 256 distinct cgroups once each, resolves the visible
+cgroup-v2 mount, pins its physical directory, and checks a census process's
+birth, owner, placement, and cgroup namespace around the read. The reader's boot
+and namespace bindings are retained. Changed identities, ambiguous mounts,
+foreign namespaces, missing controllers, and malformed metrics remain unknown
+with reasons; observed zero remains zero. Tree-only groups have no exclusive
+kernel accounting scope. Verified pane IDs and automatic group actions remain
+unimplemented.
 
 #### Resource trends from saved observations
 

@@ -19,8 +19,8 @@ use pt_core::capabilities::{get_capabilities, ToolCapability};
 use pt_core::collect::pressure::{pressure_window, PressureSnapshot, PressureWindow};
 use pt_core::collect::protected::ProtectedFilter;
 use pt_core::collect::responsible_units::{
-    attribute_responsible_units, collect_cgroup_memberships, AttributionResource, ResponsibleUnit,
-    ResponsibleUnitTable,
+    attribute_responsible_units, collect_cgroup_memberships, collect_cgroup_usage,
+    AttributionResource, ResponsibleUnit, ResponsibleUnitTable,
 };
 #[cfg(target_os = "linux")]
 use pt_core::collect::ContainerRuntime;
@@ -22766,6 +22766,7 @@ fn collect_responsible_units(
         online_cpus,
         responsible_unit_rank(pressure),
     );
+    collect_cgroup_usage(&mut table, &scan.processes);
     table.unavailable.extend(
         scan.metadata
             .warnings
@@ -22785,6 +22786,7 @@ fn responsible_unit_summary(unit: Option<&ResponsibleUnit>) -> serde_json::Value
             "label": unit.label,
             "member_count": unit.member_count,
             "usage": unit.usage,
+            "cgroup_usage": unit.cgroup_usage,
             "scope": "observed_census_members",
             "group_action_authorized": false,
         })

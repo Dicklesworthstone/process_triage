@@ -15,6 +15,83 @@ use std::path::Path;
 
 const MAX_UNIT_DIAGNOSTICS: usize = 8;
 
+/// A bounded number of distinct kernel cgroups is inspected per census.
+#[cfg(target_os = "linux")]
+const MAX_CGROUP_SAMPLES: usize = 256;
+
+/// Cumulative CPU accounting from one cgroup-v2 `cpu.stat` read. These are
+/// counters, not a CPU rate; a single observation cannot establish a delta.
+#[derive(Debug, Clone, Serialize)]
+pub struct CgroupCpuAccounting {
+    pub usage_usec: u64,
+    pub user_usec: Option<u64>,
+    pub system_usec: Option<u64>,
+    pub nr_periods: Option<u64>,
+    pub nr_throttled: Option<u64>,
+    pub throttled_usec: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CgroupNamespaceIdentity {
+    pub device: u64,
+    pub inode: u64,
+}
+
+/// The physical directory and reader namespaces observed around collection.
+/// The witness binds that directory to one still-observed census incarnation;
+/// it does not claim that the census enumerated every member of the cgroup.
+#[derive(Debug, Clone, Serialize)]
+pub struct CgroupUsageBinding {
+    pub directory_device: u64,
+    pub directory_inode: u64,
+    pub mount_root: String,
+    pub mount_point: String,
+    pub mount_namespace: CgroupNamespaceIdentity,
+    pub cgroup_namespace: CgroupNamespaceIdentity,
+    pub boot_id: String,
+    pub witness: AttributionIdentity,
+}
+
+/// Kernel accounting for the entire cgroup subtree, kept separately from the
+/// observed-member sums. Subtrees may overlap and may contain unobserved users
+/// or processes: these values must not be summed or credited to a single action.
+#[derive(Debug, Clone, Serialize)]
+pub struct CgroupResourceUsage {
+    pub available: bool,
+    pub path: String,
+    pub scope: &'static str,
+    pub observed_at_ms: Option<u64>,
+    pub binding: Option<CgroupUsageBinding>,
+    pub memory_current_bytes: Option<u64>,
+    pub memory_peak_bytes: Option<u64>,
+    pub memory_swap_current_bytes: Option<u64>,
+    pub cpu_stat: Option<CgroupCpuAccounting>,
+    pub cpu_pressure: Option<super::pressure::PsiResource>,
+    pub memory_pressure: Option<super::pressure::PsiResource>,
+    pub io_pressure: Option<super::pressure::PsiResource>,
+    pub unavailable: Vec<String>,
+}
+
+impl CgroupResourceUsage {
+    fn unavailable(path: &str, reason: impl Into<String>) -> Self {
+        Self {
+            available: false,
+            path: path.to_string(),
+            scope: "cgroup_subtree",
+            observed_at_ms: None,
+            binding: None,
+            memory_current_bytes: None,
+            memory_peak_bytes: None,
+            memory_swap_current_bytes: None,
+            cpu_stat: None,
+            cpu_pressure: None,
+            memory_pressure: None,
+            io_pressure: None,
+            unavailable: vec![reason.into()],
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttributionResource {
@@ -147,6 +224,9 @@ pub struct ResponsibleUnit {
     pub member_count: usize,
     pub members: Vec<AttributionIdentity>,
     pub usage: UnitResourceUsage,
+    /// Available only for a verified cgroup-backed unit. Tree-only units have
+    /// no exclusive kernel accounting scope and keep this field null.
+    pub cgroup_usage: Option<CgroupResourceUsage>,
     pub top_processes: Vec<AttributedProcess>,
     pub unavailable: Vec<String>,
 }
@@ -175,6 +255,462 @@ impl ResponsibleUnitTable {
             .matches(process)
             .then(|| self.units.get(*index))
             .flatten()
+    }
+}
+
+/// Add read-only kernel accounting to cgroup-backed units. One pinned directory
+/// is read per distinct cgroup, even when the observed census partitions a
+/// shared subtree into several owner-specific units. No controls are written,
+/// and these subtree values never replace the process-level action evidence.
+pub fn collect_cgroup_usage(table: &mut ResponsibleUnitTable, processes: &[ProcessRecord]) {
+    #[cfg(target_os = "linux")]
+    linux_cgroup_usage::collect_from(
+        table,
+        processes,
+        Path::new("/proc"),
+        linux_cgroup_usage::verify_filesystem,
+    );
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = processes;
+        for unit in &mut table.units {
+            unit.cgroup_usage = unit.cgroup_path.as_deref().map(|path| {
+                CgroupResourceUsage::unavailable(path, "cgroup-v2 accounting requires Linux")
+            });
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod linux_cgroup_usage {
+    use super::*;
+    use crate::collect::cgroup::{resolve_cgroup_mount, CgroupMount};
+    use crate::collect::pressure::{parse_psi, PsiResource};
+    use std::fs::{self, File, OpenOptions};
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::path::PathBuf;
+
+    const MAX_CONTROL_BYTES: usize = 65_536;
+    const MAX_MOUNTINFO_BYTES: usize = 1_048_576;
+    const MAX_WITNESSES: usize = 32;
+
+    struct Context {
+        boot: String,
+        mountinfo: String,
+        mount_namespace: CgroupNamespaceIdentity,
+        cgroup_namespace: CgroupNamespaceIdentity,
+    }
+
+    struct Witness {
+        identity: AttributionIdentity,
+        binding: Binding,
+        membership: String,
+    }
+
+    fn namespace(path: &Path) -> Result<CgroupNamespaceIdentity, String> {
+        let metadata = fs::metadata(path)
+            .map_err(|error| format!("namespace {} unreadable: {error}", path.display()))?;
+        Ok(CgroupNamespaceIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    fn read_text(path: &Path, limit: usize) -> Result<String, String> {
+        let handle = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|error| format!("{} unreadable: {error}", path.display()))?;
+        if !handle
+            .metadata()
+            .map_err(|error| error.to_string())?
+            .is_file()
+        {
+            return Err(format!("{} is not a regular kernel file", path.display()));
+        }
+        let mut bytes = Vec::new();
+        handle
+            .take(limit as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("{} unreadable: {error}", path.display()))?;
+        if bytes.len() > limit {
+            return Err(format!(
+                "{} exceeds the observation size limit",
+                path.display()
+            ));
+        }
+        String::from_utf8(bytes).map_err(|_| format!("{} is not UTF-8", path.display()))
+    }
+
+    fn context(root: &Path) -> Result<Context, String> {
+        let boot = read_text(&root.join("sys/kernel/random/boot_id"), 128)?;
+        let boot = boot.trim().to_string();
+        if boot.is_empty() || boot == "unknown" {
+            return Err("boot identity unavailable".to_string());
+        }
+        Ok(Context {
+            boot,
+            mountinfo: read_text(&root.join("self/mountinfo"), MAX_MOUNTINFO_BYTES)?,
+            mount_namespace: namespace(&root.join("self/ns/mnt"))?,
+            cgroup_namespace: namespace(&root.join("self/ns/cgroup"))?,
+        })
+    }
+
+    fn live_membership(root: &Path, pid: u32) -> Result<String, String> {
+        let content = read_text(
+            &root.join(pid.to_string()).join("cgroup"),
+            MAX_CONTROL_BYTES,
+        )?;
+        let (path, source) = parse_cgroup_membership(&content)?;
+        if source != "cgroup_v2" {
+            return Err("process has no cgroup-v2 membership".to_string());
+        }
+        Ok(path)
+    }
+
+    fn witness(
+        root: &Path,
+        process: &ProcessRecord,
+        path: &str,
+        context: &Context,
+    ) -> Result<Witness, String> {
+        let (boot, ticks) = birth(process)
+            .ok_or_else(|| "census process has no precise birth identity".to_string())?;
+        if boot != context.boot {
+            return Err("census process belongs to a different boot".to_string());
+        }
+        let binding = read_binding(root, process.pid.0)?;
+        if binding.birth != ticks || binding.uid != process.uid || binding.ppid != process.ppid.0 {
+            return Err("census process identity, owner or parent changed".to_string());
+        }
+        let observed = Witness {
+            identity: AttributionIdentity::from_process(process),
+            binding,
+            membership: live_membership(root, process.pid.0)?,
+        };
+        if !Path::new(&observed.membership).starts_with(path) {
+            return Err("census process moved outside the responsible cgroup".to_string());
+        }
+        validate_witness(root, &observed, context)?;
+        Ok(observed)
+    }
+
+    fn validate_witness(root: &Path, witness: &Witness, context: &Context) -> Result<(), String> {
+        let pid = witness.identity.pid;
+        // Be conservative for processes in a different cgroup namespace. Their
+        // paths may not map to this reader's mounted hierarchy.
+        if namespace(&root.join(pid.to_string()).join("ns/cgroup"))? != context.cgroup_namespace {
+            return Err("process and reader have different cgroup namespaces".to_string());
+        }
+        if read_binding(root, pid)? != witness.binding
+            || live_membership(root, pid)? != witness.membership
+        {
+            return Err(
+                "process identity or cgroup placement changed during collection".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    fn open_directory(path: &Path) -> Result<File, String> {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|error| format!("cgroup directory {} unreadable: {error}", path.display()))
+    }
+
+    pub(super) fn verify_filesystem(handle: &File) -> Result<(), String> {
+        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: the live descriptor and writable statfs storage are valid.
+        if unsafe { libc::fstatfs(handle.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+            return Err(format!(
+                "cgroup filesystem unavailable: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: successful fstatfs initialized the structure.
+        if unsafe { stat.assume_init() }.f_type as u64 != 0x6367_7270 {
+            return Err("resolved directory is not a cgroup-v2 filesystem".to_string());
+        }
+        Ok(())
+    }
+
+    fn same_directory(handle: &File, path: &Path) -> Result<(), String> {
+        let old = handle.metadata().map_err(|error| error.to_string())?;
+        let current = open_directory(path)?
+            .metadata()
+            .map_err(|error| error.to_string())?;
+        if old.dev() != current.dev() || old.ino() != current.ino() {
+            return Err("cgroup directory was replaced during collection".to_string());
+        }
+        Ok(())
+    }
+
+    fn scalar(text: &str) -> Result<u64, String> {
+        text.trim()
+            .parse::<u64>()
+            .map_err(|_| "expected one nonnegative integer counter".to_string())
+    }
+
+    fn cpu_stat(text: &str) -> Result<CgroupCpuAccounting, String> {
+        let mut values = BTreeMap::new();
+        for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            let mut fields = line.split_whitespace();
+            let name = fields.next().ok_or("missing CPU counter name")?;
+            let value = fields
+                .next()
+                .ok_or("missing CPU counter value")?
+                .parse::<u64>()
+                .map_err(|_| "invalid CPU counter")?;
+            if fields.next().is_some() || values.insert(name, value).is_some() {
+                return Err("duplicate CPU counter or extra fields".to_string());
+            }
+        }
+        Ok(CgroupCpuAccounting {
+            usage_usec: *values.get("usage_usec").ok_or("missing usage_usec")?,
+            user_usec: values.get("user_usec").copied(),
+            system_usec: values.get("system_usec").copied(),
+            nr_periods: values.get("nr_periods").copied(),
+            nr_throttled: values.get("nr_throttled").copied(),
+            throttled_usec: values.get("throttled_usec").copied(),
+        })
+    }
+
+    fn psi(text: &str) -> Result<PsiResource, String> {
+        let mut kinds = BTreeSet::new();
+        for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            let mut fields = line.split_whitespace();
+            let kind = fields.next().ok_or("missing PSI line type")?;
+            if !matches!(kind, "some" | "full") {
+                continue;
+            }
+            if !kinds.insert(kind) {
+                return Err("duplicate PSI line".to_string());
+            }
+            let mut keys = BTreeSet::new();
+            for field in fields {
+                let (key, _) = field.split_once('=').ok_or("malformed PSI field")?;
+                if !keys.insert(key) {
+                    return Err("duplicate PSI field".to_string());
+                }
+            }
+            if ["avg10", "avg60", "avg300", "total"]
+                .iter()
+                .any(|key| !keys.contains(key))
+            {
+                return Err("missing PSI fields".to_string());
+            }
+        }
+        let parsed = parse_psi(text).ok_or("unrecognized PSI data")?;
+        if parsed.some.is_none() || (kinds.contains("full") && parsed.full.is_none()) {
+            return Err("invalid PSI stall counters".to_string());
+        }
+        for line in [parsed.some, parsed.full].into_iter().flatten() {
+            if [line.avg10, line.avg60, line.avg300]
+                .iter()
+                .any(|value| !value.is_finite() || !(0.0..=100.0).contains(value))
+            {
+                return Err("PSI percentages must be finite and in 0..=100".to_string());
+            }
+        }
+        Ok(parsed)
+    }
+
+    fn metric<T>(
+        directory: &Path,
+        name: &str,
+        parser: impl FnOnce(&str) -> Result<T, String>,
+        unavailable: &mut Vec<String>,
+    ) -> Option<T> {
+        match read_text(&directory.join(name), MAX_CONTROL_BYTES).and_then(|text| parser(&text)) {
+            Ok(value) => Some(value),
+            Err(reason) => {
+                unavailable.push(format!("{name}: {reason}"));
+                None
+            }
+        }
+    }
+
+    fn read_usage(
+        path: &str,
+        mount: &CgroupMount,
+        witness: &Witness,
+        context: &Context,
+        proc_root: &Path,
+        verify: &impl Fn(&File) -> Result<(), String>,
+    ) -> Result<CgroupResourceUsage, String> {
+        let handle = open_directory(&mount.directory)?;
+        verify(&handle)?;
+        let metadata = handle.metadata().map_err(|error| error.to_string())?;
+        let directory = PathBuf::from(format!("/proc/self/fd/{}", handle.as_raw_fd()));
+        validate_witness(proc_root, witness, context)?;
+        let mut result = CgroupResourceUsage::unavailable(path, "");
+        result.unavailable.clear();
+        result.memory_current_bytes = metric(
+            &directory,
+            "memory.current",
+            scalar,
+            &mut result.unavailable,
+        );
+        result.memory_peak_bytes =
+            metric(&directory, "memory.peak", scalar, &mut result.unavailable);
+        result.memory_swap_current_bytes = metric(
+            &directory,
+            "memory.swap.current",
+            scalar,
+            &mut result.unavailable,
+        );
+        result.cpu_stat = metric(&directory, "cpu.stat", cpu_stat, &mut result.unavailable);
+        result.cpu_pressure = metric(&directory, "cpu.pressure", psi, &mut result.unavailable);
+        result.memory_pressure =
+            metric(&directory, "memory.pressure", psi, &mut result.unavailable);
+        result.io_pressure = metric(&directory, "io.pressure", psi, &mut result.unavailable);
+        for (name, pressure) in [
+            ("cpu.pressure", result.cpu_pressure),
+            ("memory.pressure", result.memory_pressure),
+            ("io.pressure", result.io_pressure),
+        ] {
+            if pressure.is_some_and(|pressure| pressure.full.is_none()) {
+                result
+                    .unavailable
+                    .push(format!("{name}: full stall data unavailable"));
+            }
+        }
+        validate_witness(proc_root, witness, context)?;
+        same_directory(&handle, &mount.directory)?;
+        result.available = result.memory_current_bytes.is_some()
+            || result.memory_peak_bytes.is_some()
+            || result.memory_swap_current_bytes.is_some()
+            || result.cpu_stat.is_some()
+            || result.cpu_pressure.is_some()
+            || result.memory_pressure.is_some()
+            || result.io_pressure.is_some();
+        result.observed_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok());
+        result.binding = Some(CgroupUsageBinding {
+            directory_device: metadata.dev(),
+            directory_inode: metadata.ino(),
+            mount_root: mount.mount_root.to_string_lossy().into_owned(),
+            mount_point: mount.mount_point.to_string_lossy().into_owned(),
+            mount_namespace: context.mount_namespace.clone(),
+            cgroup_namespace: context.cgroup_namespace.clone(),
+            boot_id: context.boot.clone(),
+            witness: witness.identity.clone(),
+        });
+        Ok(result)
+    }
+
+    pub(super) fn collect_from(
+        table: &mut ResponsibleUnitTable,
+        processes: &[ProcessRecord],
+        proc_root: &Path,
+        verify: impl Fn(&File) -> Result<(), String>,
+    ) {
+        let mut groups: BTreeMap<&str, BTreeMap<u32, &AttributionIdentity>> = BTreeMap::new();
+        for unit in &table.units {
+            if let Some(path) = unit.cgroup_path.as_deref() {
+                let members = groups.entry(path).or_default();
+                for member in &unit.members {
+                    members.entry(member.pid).or_insert(member);
+                }
+            }
+        }
+        if groups.is_empty() {
+            return;
+        }
+        let (process_index, _) = unique_index(processes, |process| process.pid.0);
+        let before = context(proc_root);
+        let mut observations = BTreeMap::new();
+        for (index, (path, members)) in groups.iter().enumerate() {
+            let observed = (|| {
+                if index >= MAX_CGROUP_SAMPLES {
+                    return Err("distinct cgroup observation limit reached".to_string());
+                }
+                let context = before.as_ref().map_err(Clone::clone)?;
+                let mount = resolve_cgroup_mount(path, &context.mountinfo, "cgroup2", None)?;
+                let mut reasons = Vec::new();
+                for member in members.values().take(MAX_WITNESSES) {
+                    let Some(process) = process_index
+                        .get(&member.pid)
+                        .filter(|process| member.matches(process))
+                    else {
+                        continue;
+                    };
+                    match witness(proc_root, process, path, context) {
+                        Ok(witness) => {
+                            return read_usage(path, &mount, &witness, context, proc_root, &verify);
+                        }
+                        Err(reason) if reasons.len() < MAX_UNIT_DIAGNOSTICS => {
+                            reasons.push(format!("PID {}: {reason}", member.pid));
+                        }
+                        Err(_) => {}
+                    }
+                }
+                Err(format!(
+                    "no live census identity bound to this cgroup (up to {MAX_WITNESSES} checked): {}",
+                    reasons.join("; ")
+                ))
+            })();
+            observations.insert(
+                (*path).to_string(),
+                observed.unwrap_or_else(|reason| CgroupResourceUsage::unavailable(path, reason)),
+            );
+        }
+        // The mapping must still belong to the reader's original namespaces.
+        // A changed namespace or mount mapping invalidates, rather than relabels,
+        // measurements that were already read from a different physical scope.
+        let after = context(proc_root);
+        for (path, observed) in &mut observations {
+            if observed.binding.is_none() {
+                continue;
+            }
+            let valid = (|| {
+                let before = before.as_ref().map_err(Clone::clone)?;
+                let after = after.as_ref().map_err(Clone::clone)?;
+                if before.boot != after.boot
+                    || before.cgroup_namespace != after.cgroup_namespace
+                    || before.mount_namespace != after.mount_namespace
+                {
+                    return Err(
+                        "reader boot or namespace changed during cgroup collection".to_string()
+                    );
+                }
+                let old = resolve_cgroup_mount(path, &before.mountinfo, "cgroup2", None)?;
+                let new = resolve_cgroup_mount(path, &after.mountinfo, "cgroup2", None)?;
+                if old.directory != new.directory
+                    || old.mount_root != new.mount_root
+                    || old.mount_point != new.mount_point
+                {
+                    return Err("cgroup mount mapping changed during collection".to_string());
+                }
+                Ok(())
+            })();
+            if let Err(reason) = valid {
+                *observed = CgroupResourceUsage::unavailable(path, reason);
+            }
+        }
+        let unavailable = observations
+            .values()
+            .filter(|value| !value.available)
+            .count();
+        if unavailable > 0 {
+            table.unavailable.push(format!(
+                "kernel cgroup accounting unavailable for {unavailable}/{} distinct responsible cgroups",
+                observations.len()
+            ));
+        }
+        for unit in &mut table.units {
+            unit.cgroup_usage = unit
+                .cgroup_path
+                .as_ref()
+                .and_then(|path| observations.get(path).cloned());
+        }
     }
 }
 
@@ -813,6 +1349,7 @@ pub fn attribute_responsible_units(
                     .map(|index| measurements[*index].identity.clone())
                     .collect(),
                 usage,
+                cgroup_usage: None,
                 top_processes,
                 unavailable,
             }
@@ -874,7 +1411,8 @@ pub fn attribute_responsible_units(
             "RSS is summed process residency, not unique reclaimable memory; swap is reported separately.",
             "Ranking uses observed subtotals with coverage, not invented complete totals for unmeasured members.",
             "CPU and I/O totals require the caller's shared measurement window; lifetime CPU is never aggregated.",
-            "Per-cgroup CPU usage deltas, memory.current and PSI are not measured by this member-sum report.",
+            "Kernel cgroup observations cover whole subtrees, can overlap other units, and are separate from member sums and single-process relief credit.",
+            "Cgroup cpu.stat values are cumulative counters, not observed CPU rates; memory.current is charged memory, not private reclaimable pages.",
             "Terminal subtrees are inferred from observed mux/TTY ancestry, not a multiplexer pane-ID query.",
         ],
         lookup,
@@ -1587,6 +2125,290 @@ mod tests {
         assert!(result.units.is_empty());
         assert_eq!(result.attributed_processes, 0);
         assert_eq!(result.sampling_window_ms, None);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn telemetry_fixture(processes: &[ProcessRecord]) -> tempfile::TempDir {
+        let fixture = tempfile::tempdir().unwrap();
+        let proc_root = fixture.path().join("proc");
+        let mount_point = fixture.path().join("cgroup");
+        let directory = mount_point.join(AGENT_SCOPE.trim_start_matches('/'));
+        std::fs::create_dir_all(proc_root.join("sys/kernel/random")).unwrap();
+        std::fs::create_dir_all(proc_root.join("self/ns")).unwrap();
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(proc_root.join("sys/kernel/random/boot_id"), "boot\n").unwrap();
+        std::fs::write(proc_root.join("self/ns/cgroup"), "namespace fixture").unwrap();
+        std::fs::write(proc_root.join("self/ns/mnt"), "mount namespace fixture").unwrap();
+        std::fs::write(
+            proc_root.join("self/mountinfo"),
+            format!(
+                "42 25 0:27 / {} rw - cgroup2 cgroup rw\n",
+                mount_point.display()
+            ),
+        )
+        .unwrap();
+        for process in processes {
+            write_proc_fixture(&proc_root, process, birth(process).unwrap().1, process.uid);
+            let namespace = proc_root.join(process.pid.0.to_string()).join("ns");
+            std::fs::create_dir_all(&namespace).unwrap();
+            std::fs::hard_link(proc_root.join("self/ns/cgroup"), namespace.join("cgroup")).unwrap();
+        }
+        for (name, value) in [
+            ("memory.current", "1048576\n"),
+            ("memory.peak", "2097152\n"),
+            ("memory.swap.current", "0\n"),
+            ("cpu.stat", "usage_usec 1500000\nuser_usec 1200000\nsystem_usec 300000\nnr_periods 12\nnr_throttled 2\nthrottled_usec 50\n"),
+            ("cpu.pressure", "some avg10=10.50 avg60=8.00 avg300=1.00 total=100000\nfull avg10=2.50 avg60=1.00 avg300=0.50 total=25000\n"),
+            ("memory.pressure", "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"),
+            ("io.pressure", "some avg10=1.00 avg60=0.50 avg300=0.10 total=12500\n"),
+        ] {
+            std::fs::write(directory.join(name), value).unwrap();
+        }
+        fixture
+    }
+
+    #[cfg(target_os = "linux")]
+    fn telemetry_table(root: &Path, processes: &[ProcessRecord]) -> ResponsibleUnitTable {
+        let groups = collect_cgroup_memberships_from(processes, &root.join("proc"));
+        table(processes, &[], &groups)
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn cgroup_kernel_accounting_is_separate_from_member_totals_and_preserves_zero() {
+        let processes = vec![
+            process(100, 1, "worker", 100),
+            process(101, 100, "child", 101),
+        ];
+        let fixture = telemetry_fixture(&processes);
+        let mut observed = telemetry_table(fixture.path(), &processes);
+        linux_cgroup_usage::collect_from(
+            &mut observed,
+            &processes,
+            &fixture.path().join("proc"),
+            |_| Ok(()),
+        );
+        assert_eq!(observed.units.len(), 1);
+        let unit = &observed.units[0];
+        assert_eq!(unit.usage.rss_bytes.value, Some(201.0 * 1024.0));
+        assert_eq!(unit.usage.cpu_cores.value, None);
+        let kernel = unit.cgroup_usage.as_ref().unwrap();
+        assert!(kernel.available);
+        assert_eq!(kernel.scope, "cgroup_subtree");
+        assert_eq!(kernel.memory_current_bytes, Some(1_048_576));
+        assert_eq!(kernel.memory_peak_bytes, Some(2_097_152));
+        assert_eq!(kernel.memory_swap_current_bytes, Some(0));
+        assert_eq!(kernel.cpu_stat.as_ref().unwrap().usage_usec, 1_500_000);
+        assert_eq!(kernel.cpu_stat.as_ref().unwrap().nr_throttled, Some(2));
+        assert_eq!(kernel.cpu_pressure.unwrap().some.unwrap().avg10, 10.5);
+        assert_eq!(kernel.cpu_pressure.unwrap().full.unwrap().total_us, 25_000);
+        assert_eq!(kernel.memory_pressure.unwrap().some.unwrap().total_us, 0);
+        assert_eq!(kernel.io_pressure.unwrap().full, None);
+        assert!(kernel
+            .unavailable
+            .iter()
+            .any(|reason| reason.contains("io.pressure: full stall")));
+        assert_eq!(kernel.binding.as_ref().unwrap().witness.pid, 100);
+        assert_eq!(kernel.binding.as_ref().unwrap().boot_id, "boot");
+        assert!(kernel.observed_at_ms.is_some());
+        let serialized = serde_json::to_value(unit).unwrap();
+        assert_eq!(serialized["cgroup_usage"]["memory_swap_current_bytes"], 0);
+        assert!(serialized["cgroup_usage"].get("cpu_cores").is_none());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn shared_cgroup_is_read_once_without_combining_owner_specific_member_totals() {
+        let mut processes = vec![
+            process(100, 1, "worker", 100),
+            process(101, 1, "worker", 101),
+        ];
+        processes[1].uid = 2000;
+        let fixture = telemetry_fixture(&processes);
+        let mut observed = telemetry_table(fixture.path(), &processes);
+        assert_eq!(observed.units.len(), 2);
+        let reads = std::cell::Cell::new(0);
+        linux_cgroup_usage::collect_from(
+            &mut observed,
+            &processes,
+            &fixture.path().join("proc"),
+            |_| {
+                reads.set(reads.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(reads.get(), 1, "one physical subtree must be sampled once");
+        for unit in &observed.units {
+            assert_eq!(unit.member_count, 1);
+            let kernel = unit.cgroup_usage.as_ref().unwrap();
+            assert_eq!(kernel.scope, "cgroup_subtree");
+            assert_eq!(kernel.memory_current_bytes, Some(1_048_576));
+            assert_ne!(unit.usage.rss_bytes.value, Some(1_048_576.0));
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn malformed_or_missing_cgroup_metrics_stay_unknown_without_losing_valid_sensors() {
+        let processes = vec![process(100, 1, "worker", 100)];
+        let fixture = telemetry_fixture(&processes);
+        let directory = fixture
+            .path()
+            .join("cgroup")
+            .join(AGENT_SCOPE.trim_start_matches('/'));
+        std::fs::write(directory.join("memory.current"), "max\n").unwrap();
+        std::fs::write(directory.join("cpu.stat"), "usage_usec 2\nusage_usec 3\n").unwrap();
+        std::fs::write(
+            directory.join("cpu.pressure"),
+            "some avg10=NaN avg60=0 avg300=0 total=0\n",
+        )
+        .unwrap();
+        std::fs::rename(
+            directory.join("io.pressure"),
+            directory.join("saved-io.pressure"),
+        )
+        .unwrap();
+        let mut observed = telemetry_table(fixture.path(), &processes);
+        linux_cgroup_usage::collect_from(
+            &mut observed,
+            &processes,
+            &fixture.path().join("proc"),
+            |_| Ok(()),
+        );
+        let kernel = observed.units[0].cgroup_usage.as_ref().unwrap();
+        assert!(kernel.available, "known memory sensors remain useful");
+        assert_eq!(kernel.memory_current_bytes, None);
+        assert_eq!(kernel.memory_peak_bytes, Some(2_097_152));
+        assert_eq!(kernel.memory_swap_current_bytes, Some(0));
+        assert!(kernel.cpu_stat.is_none());
+        assert!(kernel.cpu_pressure.is_none());
+        assert!(kernel.io_pressure.is_none());
+        assert!(kernel.memory_pressure.is_some());
+        for name in ["memory.current", "cpu.stat", "cpu.pressure", "io.pressure"] {
+            assert!(
+                kernel
+                    .unavailable
+                    .iter()
+                    .any(|reason| reason.starts_with(name)),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn cgroup_telemetry_refuses_reuse_owner_parent_placement_boot_and_namespace_changes() {
+        let processes = vec![process(100, 1, "worker", 100)];
+        for change in [
+            "birth",
+            "owner",
+            "parent",
+            "placement",
+            "boot",
+            "namespace",
+            "v1",
+        ] {
+            let fixture = telemetry_fixture(&processes);
+            let proc_root = fixture.path().join("proc");
+            let mut observed = telemetry_table(fixture.path(), &processes);
+            match change {
+                "birth" => write_proc_fixture(&proc_root, &processes[0], 101, 1000),
+                "owner" => write_proc_fixture(&proc_root, &processes[0], 100, 2000),
+                "parent" => {
+                    let mut replacement = processes[0].clone();
+                    replacement.ppid = ProcessId(2);
+                    write_proc_fixture(&proc_root, &replacement, 100, 1000);
+                }
+                "placement" => {
+                    std::fs::write(proc_root.join("100/cgroup"), "0::/other.scope\n").unwrap()
+                }
+                "boot" => {
+                    std::fs::write(proc_root.join("sys/kernel/random/boot_id"), "other-boot\n")
+                        .unwrap()
+                }
+                "namespace" => {
+                    let ns = proc_root.join("100/ns/cgroup");
+                    std::fs::rename(&ns, ns.with_extension("previous")).unwrap();
+                    std::fs::write(ns, "different namespace").unwrap();
+                }
+                "v1" => std::fs::write(
+                    proc_root.join("100/cgroup"),
+                    format!("7:name=systemd:{AGENT_SCOPE}\n"),
+                )
+                .unwrap(),
+                _ => unreachable!(),
+            }
+            linux_cgroup_usage::collect_from(&mut observed, &processes, &proc_root, |_| Ok(()));
+            let kernel = observed.units[0].cgroup_usage.as_ref().unwrap();
+            assert!(!kernel.available, "{change}");
+            assert!(kernel.binding.is_none(), "{change}");
+            assert_eq!(kernel.memory_current_bytes, None, "{change}");
+            assert!(!kernel.unavailable.is_empty(), "{change}");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn replacing_the_pinned_cgroup_directory_cannot_relabel_old_measurements() {
+        let processes = vec![process(100, 1, "worker", 100)];
+        let fixture = telemetry_fixture(&processes);
+        let directory = fixture
+            .path()
+            .join("cgroup")
+            .join(AGENT_SCOPE.trim_start_matches('/'));
+        let mut observed = telemetry_table(fixture.path(), &processes);
+        linux_cgroup_usage::collect_from(
+            &mut observed,
+            &processes,
+            &fixture.path().join("proc"),
+            |_| {
+                std::fs::rename(&directory, directory.with_extension("previous")).unwrap();
+                std::fs::create_dir_all(&directory).unwrap();
+                std::fs::write(directory.join("memory.current"), "999\n").unwrap();
+                Ok(())
+            },
+        );
+        let kernel = observed.units[0].cgroup_usage.as_ref().unwrap();
+        assert!(!kernel.available);
+        assert_eq!(kernel.memory_current_bytes, None);
+        assert!(kernel
+            .unavailable
+            .iter()
+            .any(|reason| reason.contains("directory was replaced")));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn cgroup_usage_resolves_a_visible_subtree_mount_and_rejects_fake_live_filesystems() {
+        let processes = vec![process(100, 1, "worker", 100)];
+        let fixture = telemetry_fixture(&processes);
+        let proc_root = fixture.path().join("proc");
+        let mount_point = fixture.path().join("cgroup/user.slice");
+        std::fs::write(
+            proc_root.join("self/mountinfo"),
+            format!(
+                "42 25 0:27 /user.slice {} rw - cgroup2 cgroup rw\n",
+                mount_point.display()
+            ),
+        )
+        .unwrap();
+        let mut observed = telemetry_table(fixture.path(), &processes);
+        linux_cgroup_usage::collect_from(&mut observed, &processes, &proc_root, |_| Ok(()));
+        let kernel = observed.units[0].cgroup_usage.as_ref().unwrap();
+        assert_eq!(kernel.memory_current_bytes, Some(1_048_576));
+        assert_eq!(kernel.binding.as_ref().unwrap().mount_root, "/user.slice");
+        linux_cgroup_usage::collect_from(
+            &mut observed,
+            &processes,
+            &proc_root,
+            linux_cgroup_usage::verify_filesystem,
+        );
+        let kernel = observed.units[0].cgroup_usage.as_ref().unwrap();
+        assert!(!kernel.available);
+        assert!(kernel
+            .unavailable
+            .iter()
+            .any(|reason| reason.contains("not a cgroup-v2 filesystem")));
     }
 
     proptest! {

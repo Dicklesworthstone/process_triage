@@ -153,7 +153,9 @@ pub fn compute_cpu_capacity(pid: u32, cgroup_details: Option<&CgroupDetails>) ->
                 if eff_cores.is_finite() && eff_cores > 0.0 {
                     capacity.quota_cores = Some(eff_cores);
                     capacity.provenance.quota_source = match cpu_limits.source {
-                        super::cgroup::CpuLimitSource::CgroupV2CpuMax => QuotaSource::CgroupV2CpuMax,
+                        super::cgroup::CpuLimitSource::CgroupV2CpuMax => {
+                            QuotaSource::CgroupV2CpuMax
+                        }
                         super::cgroup::CpuLimitSource::CgroupV1Cfs => QuotaSource::CgroupV1Cfs,
                         super::cgroup::CpuLimitSource::None => QuotaSource::None,
                     };

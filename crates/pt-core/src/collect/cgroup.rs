@@ -404,8 +404,7 @@ pub(crate) fn resolve_cgroup_mount(
             .and_then(|name| name.to_str())
             .is_some_and(|name| CONTROL_FILES.contains(&name))
             && path.parent().is_some_and(|parent| {
-                parent.starts_with(&selected.mount_point)
-                    && selected.directory.starts_with(parent)
+                parent.starts_with(&selected.mount_point) && selected.directory.starts_with(parent)
             })
     }) {
         return Err("cgroup controller file is hidden by another mount".into());
@@ -526,7 +525,8 @@ fn read_cpu_hierarchy(
     let relative_path = relative_file.to_string_lossy().into_owned();
     provenance.limit_paths_tried.push(relative_path.clone());
     if v2 {
-        limits.weight = read_u64_file(&relative_path).filter(|weight| (1..=10_000).contains(weight));
+        limits.weight =
+            read_u64_file(&relative_path).filter(|weight| (1..=10_000).contains(weight));
     } else {
         limits.shares = read_u64_file(&relative_path);
     }
@@ -1540,7 +1540,7 @@ mod tests {
             "/job",
             "21 1 0:20 / /bad\\099path rw - cgroup2 cgroup rw",
             "cgroup2",
-            None,
+            None
         )
         .is_err());
     }
@@ -1658,7 +1658,11 @@ mod tests {
         assert_eq!(limits.effective_cores, Some(0.2));
         assert!(!limits.quota_hierarchy_complete);
         assert!(!details.provenance.limit_paths_tried.contains(
-            &fixture.path().join("cpu.max").to_string_lossy().into_owned()
+            &fixture
+                .path()
+                .join("cpu.max")
+                .to_string_lossy()
+                .into_owned()
         ));
         assert!(details
             .provenance
