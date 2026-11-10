@@ -1137,7 +1137,7 @@ pub fn attribute_responsible_units(
     let mut state = vec![0u8; records.len()];
     let mut cyclic = vec![false; records.len()];
     for start in 0..records.len() {
-        let mut chain = Vec::new();
+        let mut chain: Vec<usize> = Vec::new();
         let mut current = Some(start);
         while let Some(index) = current {
             if state[index] == 2 {

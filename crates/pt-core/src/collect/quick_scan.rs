@@ -342,7 +342,7 @@ fn scan_ps_child(
     mut child: Child,
     options: &QuickScanOptions,
     platform: &str,
-    boot_id: &str,
+    boot_id: &Option<String>,
     start: Instant,
 ) -> Result<ScanResult, QuickScanError> {
     let pid = child.id();
@@ -487,7 +487,7 @@ fn scan_ps_child(
         metadata: ScanMetadata {
             scan_type: "quick".to_string(),
             platform: platform.to_string(),
-            boot_id: boot_id.to_string(),
+            boot_id: boot_id.clone(),
             started_at: chrono::Utc::now().to_rfc3339(),
             duration_ms: duration.as_millis() as u64,
             process_count,
