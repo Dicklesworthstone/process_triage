@@ -92,7 +92,16 @@ Minimal, low-cost signals collected every 30-60 seconds:
 | Memory pressure | `/proc/meminfo` (MemAvailable) | ~1 syscall |
 | PSI stall times | `/proc/pressure/{cpu,memory,io}` | ~3 syscalls |
 | Process count | `/proc` directory entry count | ~1 syscall |
-| Orphan count | PIDs with PPID=1 (sampled) | ~100 syscalls |
+| Orphan count | Unsupervised PID-1 adoptees in login/transient workloads (Linux) | One stat read per PID; cgroup + identity recheck for possible adoptees |
+
+The orphan trigger excludes service/container placement and processes that lead
+their own session (falling back to process-group leadership only when the session
+ID is unavailable). It requires unchanged birth and lineage
+across the placement read. An incomplete, unreadable or unsupported census is
+`null` in tick JSON and `NaN` in the `pt_orphan_count` metric; it interrupts the
+sustained-trigger window without supplying a zero to the EWMA. A readable empty
+census produces an observed zero. Old daemon state must establish a fresh
+placement-aware orphan window before it can trigger a plan.
 
 ### Data Structures
 
@@ -107,7 +116,7 @@ struct DormantSample {
     psi_mem_some_total_us: u64,
     psi_io_some_total_us: u64,
     process_count: u32,
-    orphan_count_estimate: u32,
+    orphan_count_estimate: Option<u32>,
 }
 ```
 

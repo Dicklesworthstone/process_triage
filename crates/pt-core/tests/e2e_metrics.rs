@@ -207,7 +207,7 @@ mod metric_values {
             memory_total_mb: 16000,
             swap_used_mb: 200,
             process_count: 450,
-            orphan_count: 12,
+            orphan_count: Some(12),
             pressure: None,
             pressure_observed_at: None,
         };
@@ -303,7 +303,7 @@ mod metric_values {
             memory_total_mb: 8000,
             swap_used_mb: 0,
             process_count: 100,
-            orphan_count: 0,
+            orphan_count: Some(0),
             pressure: None,
             pressure_observed_at: None,
         };

@@ -21,7 +21,7 @@ fn tick(
         memory_total_mb,
         swap_used_mb: 0,
         process_count: 512,
-        orphan_count,
+        orphan_count: Some(orphan_count),
         pressure: None,
         pressure_observed_at: None,
     }

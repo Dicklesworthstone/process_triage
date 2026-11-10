@@ -150,7 +150,11 @@ pub struct TickMetrics {
     pub memory_total_mb: u64,
     pub swap_used_mb: u64,
     pub process_count: u32,
-    pub orphan_count: u32,
+    /// Observed, unsupervised PID-1 adoptees that retained another job's session
+    /// or process group. None means the census is incomplete or unsupported,
+    /// never an observed zero. Existing numeric telemetry remains readable.
+    #[serde(default)]
+    pub orphan_count: Option<u32>,
     /// The actual pressure reading, including unavailable sensors. Older callers
     /// without a reading cannot supply CPU capacity or memory-pressure recovery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -560,10 +564,26 @@ mod tests {
             memory_total_mb: 8192,
             swap_used_mb: 0,
             process_count: 200,
-            orphan_count: orphans,
+            orphan_count: Some(orphans),
             pressure: None,
             pressure_observed_at: None,
         }
+    }
+
+    #[test]
+    fn orphan_count_serialization_distinguishes_unknown_from_observed_zero() {
+        let mut tick = test_metrics(1.0, 2000, 0);
+        let value = serde_json::to_value(&tick).unwrap();
+        assert_eq!(value["orphan_count"], serde_json::json!(0));
+        let restored: TickMetrics = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.orphan_count, Some(0));
+
+        tick.orphan_count = None;
+        let mut value = serde_json::to_value(&tick).unwrap();
+        assert!(value["orphan_count"].is_null());
+        value.as_object_mut().unwrap().remove("orphan_count");
+        let absent: TickMetrics = serde_json::from_value(value).unwrap();
+        assert_eq!(absent.orphan_count, None);
     }
 
     #[test]

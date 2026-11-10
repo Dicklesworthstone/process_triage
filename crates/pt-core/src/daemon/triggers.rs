@@ -313,6 +313,11 @@ pub struct TriggerState {
     pub memory_ewma: f64,
     /// EWMA of orphan count.
     pub orphan_ewma: f64,
+    /// Only complete, placement-aware observations advance the orphan EWMA.
+    #[serde(default)]
+    pub orphan_observed_ticks: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orphan_unavailable_reason: Option<String>,
 
     /// Consecutive ticks load has exceeded threshold.
     pub load_sustained: u32,
@@ -340,6 +345,8 @@ impl TriggerState {
             load_unavailable_reason: None,
             memory_ewma: 0.0,
             orphan_ewma: 0.0,
+            orphan_observed_ticks: 0,
+            orphan_unavailable_reason: None,
             load_sustained: 0,
             memory_sustained: 0,
             orphan_sustained: 0,
@@ -613,22 +620,41 @@ pub fn evaluate_triggers(
     }
 
     // --- Orphan trigger ---
-    let orphan_f = metrics.orphan_count as f64;
-    state.orphan_ewma = ewma(state.orphan_ewma, orphan_f, alpha, state.total_ticks);
+    if let Some(count) = metrics.orphan_count {
+        if state.orphan_observed_ticks == 0 {
+            // Older saved state counted all PID-1 children, including healthy
+            // services. It cannot establish a sustained orphan observation.
+            state.orphan_sustained = 0;
+        }
+        state.orphan_observed_ticks = state.orphan_observed_ticks.saturating_add(1);
+        state.orphan_unavailable_reason = None;
+        state.orphan_ewma = ewma(
+            state.orphan_ewma,
+            f64::from(count),
+            alpha,
+            state.orphan_observed_ticks,
+        );
+    } else {
+        state.orphan_unavailable_reason =
+            Some("complete placement-aware orphan census unavailable".to_string());
+    }
 
     if state.orphan_cooldown > 0 {
         state.orphan_cooldown -= 1;
         state.orphan_sustained = 0;
-    } else if metrics.orphan_count > config.orphan_threshold {
-        state.orphan_sustained += 1;
+    } else if let Some(count) = metrics
+        .orphan_count
+        .filter(|count| *count > config.orphan_threshold)
+    {
+        state.orphan_sustained = state.orphan_sustained.saturating_add(1);
         if state.orphan_sustained >= config.sustained_ticks {
             fired.push(FiredTrigger {
                 kind: TriggerKind::OrphanSpike,
                 description: format!(
-                    "orphans={} > threshold={} for {} ticks",
-                    metrics.orphan_count, config.orphan_threshold, state.orphan_sustained,
+                    "observed unsupervised orphans={} > threshold={} for {} ticks",
+                    count, config.orphan_threshold, state.orphan_sustained,
                 ),
-                current_value: Some(orphan_f),
+                current_value: Some(f64::from(count)),
                 ewma_value: Some(state.orphan_ewma),
                 threshold: Some(config.orphan_threshold as f64),
                 sustained_ticks: state.orphan_sustained,
@@ -640,6 +666,8 @@ pub fn evaluate_triggers(
             state.orphan_sustained = 0;
         }
     } else {
+        // Unknown evidence interrupts a sustained breach, retaining the last
+        // valid EWMA instead of manufacturing a zero/recovery observation.
         state.orphan_sustained = 0;
     }
 
@@ -704,7 +732,7 @@ mod tests {
             memory_total_mb: mem_total,
             swap_used_mb: 0,
             process_count: 200,
-            orphan_count: orphans,
+            orphan_count: Some(orphans),
             pressure: Some(pressure(load, 2)),
             pressure_observed_at: None,
         }
@@ -1402,6 +1430,93 @@ mod tests {
         let mut state = TriggerState::new(&config);
 
         let fired = evaluate_triggers(&config, &mut state, &metrics(1.0, 2000, 8192, 50));
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].kind, TriggerKind::OrphanSpike);
+    }
+
+    #[test]
+    fn unknown_orphan_census_never_initializes_or_dilutes_the_observed_ewma() {
+        let config = cfg(3, 2);
+        let mut state = TriggerState::new(&config);
+        let high = metrics(1.0, 2000, 8192, 50);
+        let mut unknown = high.clone();
+        unknown.orphan_count = None;
+
+        for _ in 0..5 {
+            assert!(evaluate_triggers(&config, &mut state, &unknown).is_empty());
+        }
+        assert_eq!(state.orphan_observed_ticks, 0);
+        assert_eq!(state.orphan_ewma, 0.0);
+        assert!(state.orphan_unavailable_reason.is_some());
+        for _ in 0..2 {
+            assert!(evaluate_triggers(&config, &mut state, &high).is_empty());
+        }
+        assert_eq!(state.orphan_ewma, 50.0);
+        assert_eq!(state.orphan_sustained, 2);
+        assert!(state.orphan_unavailable_reason.is_none());
+
+        assert!(evaluate_triggers(&config, &mut state, &unknown).is_empty());
+        assert_eq!(state.orphan_sustained, 0);
+        assert_eq!(state.orphan_observed_ticks, 2);
+        assert_eq!(state.orphan_ewma, 50.0);
+        for _ in 0..2 {
+            assert!(evaluate_triggers(&config, &mut state, &high).is_empty());
+        }
+        let fired = evaluate_triggers(&config, &mut state, &high);
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].kind, TriggerKind::OrphanSpike);
+        assert_eq!(fired[0].current_value, Some(50.0));
+
+        for remaining in (0..2).rev() {
+            assert!(evaluate_triggers(&config, &mut state, &unknown).is_empty());
+            assert_eq!(state.orphan_cooldown, remaining);
+            assert_eq!(state.orphan_sustained, 0);
+            assert_eq!(state.orphan_ewma, 50.0);
+        }
+        // A real zero does update the observation series and is distinct from
+        // the unknown ticks above.
+        let zero = metrics(1.0, 2000, 8192, 0);
+        assert!(evaluate_triggers(&config, &mut state, &zero).is_empty());
+        assert!(state.orphan_ewma < 50.0);
+        assert!(state.orphan_unavailable_reason.is_none());
+    }
+
+    #[test]
+    fn legacy_pid1_counter_state_requires_fresh_orphan_observations() {
+        let config = cfg(3, 2);
+        let high = metrics(1.0, 2000, 8192, 50);
+        for cooldown in [0, 1] {
+            let mut old = TriggerState::new(&config);
+            old.orphan_sustained = 2;
+            old.orphan_ewma = 200.0;
+            old.orphan_cooldown = cooldown;
+            let mut value = serde_json::to_value(&old).unwrap();
+            value
+                .as_object_mut()
+                .unwrap()
+                .remove("orphan_observed_ticks");
+            let mut restored: TriggerState = serde_json::from_value(value).unwrap();
+            if cooldown > 0 {
+                assert!(evaluate_triggers(&config, &mut restored, &high).is_empty());
+                assert_eq!(restored.orphan_cooldown, 0);
+                assert_eq!(restored.orphan_sustained, 0);
+            }
+            for observed in 1..3 {
+                assert!(evaluate_triggers(&config, &mut restored, &high).is_empty());
+                assert_eq!(restored.orphan_sustained, observed);
+                assert_eq!(restored.orphan_ewma, 50.0);
+            }
+            assert_eq!(evaluate_triggers(&config, &mut restored, &high).len(), 1);
+        }
+
+        // New-format state preserves its placement-aware observation sequence.
+        let mut current = TriggerState::new(&config);
+        for _ in 0..2 {
+            assert!(evaluate_triggers(&config, &mut current, &high).is_empty());
+        }
+        let saved = serde_json::to_string(&current).unwrap();
+        let mut restored: TriggerState = serde_json::from_str(&saved).unwrap();
+        let fired = evaluate_triggers(&config, &mut restored, &high);
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].kind, TriggerKind::OrphanSpike);
     }

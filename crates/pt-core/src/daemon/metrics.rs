@@ -28,8 +28,8 @@
 //! - `pt_build_info` — version, commit, build date
 
 use prometheus::{
-    Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts,
-    Registry, TextEncoder,
+    Encoder, Gauge, GaugeVec, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec,
+    Opts, Registry, TextEncoder,
 };
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -89,7 +89,7 @@ pub struct DaemonMetrics {
     pub memory_total_mb: IntGauge,
     pub swap_used_mb: IntGauge,
     pub process_count: IntGauge,
-    pub orphan_count: IntGauge,
+    pub orphan_count: Gauge,
     pub candidates_current: IntGaugeVec,
 
     // Histograms
@@ -163,7 +163,11 @@ impl DaemonMetrics {
         let process_count = IntGauge::new("pt_process_count", "Total process count")?;
         registry.register(Box::new(process_count.clone()))?;
 
-        let orphan_count = IntGauge::new("pt_orphan_count", "Orphaned process count")?;
+        let orphan_count = Gauge::new(
+            "pt_orphan_count",
+            "Observed unsupervised orphan count (NaN when unavailable)",
+        )?;
+        orphan_count.set(f64::NAN);
         registry.register(Box::new(orphan_count.clone()))?;
 
         let candidates_current = IntGaugeVec::new(
@@ -244,7 +248,8 @@ impl DaemonMetrics {
             .set(tick_metrics.memory_total_mb as i64);
         self.swap_used_mb.set(tick_metrics.swap_used_mb as i64);
         self.process_count.set(tick_metrics.process_count as i64);
-        self.orphan_count.set(tick_metrics.orphan_count as i64);
+        self.orphan_count
+            .set(tick_metrics.orphan_count.map(f64::from).unwrap_or(f64::NAN));
     }
 
     /// Record a completed scan.
@@ -455,7 +460,7 @@ mod tests {
             memory_total_mb: 8000,
             swap_used_mb: 100,
             process_count: 300,
-            orphan_count: 5,
+            orphan_count: Some(5),
             pressure: None,
             pressure_observed_at: None,
         };
@@ -479,6 +484,15 @@ mod tests {
         assert!(output.contains("pt_memory_used_mb 4000"));
         assert!(output.contains("pt_process_count 300"));
         assert!(output.contains("pt_orphan_count 5"));
+
+        let mut unknown = tick;
+        unknown.orphan_count = None;
+        metrics.update_from_tick(&unknown, &state);
+        assert!(metrics.orphan_count.get().is_nan());
+        assert!(metrics.render().unwrap().contains("pt_orphan_count NaN"));
+        unknown.orphan_count = Some(0);
+        metrics.update_from_tick(&unknown, &state);
+        assert_eq!(metrics.orphan_count.get(), 0.0);
     }
 
     #[test]

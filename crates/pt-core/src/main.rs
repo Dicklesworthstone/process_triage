@@ -15861,7 +15861,7 @@ fn collect_daemon_metrics() -> pt_core::daemon::TickMetrics {
 fn daemon_metrics_from_pressure(
     pressure: pt_core::collect::pressure::PressureSnapshot,
     process_count: u32,
-    orphan_count: u32,
+    orphan_count: Option<u32>,
 ) -> pt_core::daemon::TickMetrics {
     let load_avg_1 = pressure.load.map(|load| load.one).unwrap_or(0.0);
     let load_avg_5 = pressure.load.map(|load| load.five).unwrap_or(0.0);
@@ -16072,7 +16072,7 @@ mod daemon_pressure_tests {
         )
         .unwrap();
         let pressure = pt_core::collect::pressure::read_pressure_snapshot_from(fixture.path(), 4);
-        let mut metrics = daemon_metrics_from_pressure(pressure, 42, 0);
+        let mut metrics = daemon_metrics_from_pressure(pressure, 42, Some(0));
         let config = DaemonConfig::default();
         let mut state = DaemonState::new();
         let mut triggers = pt_core::daemon::triggers::TriggerState::new(&config.triggers);
@@ -16183,44 +16183,355 @@ mod daemon_pressure_tests {
 }
 
 #[cfg(all(feature = "daemon", target_os = "linux"))]
-fn collect_orphan_count() -> u32 {
-    let mut count = 0u32;
-    let entries = match std::fs::read_dir("/proc") {
-        Ok(entries) => entries,
-        Err(_) => return 0,
-    };
+fn collect_orphan_count() -> Option<u32> {
+    collect_orphan_count_from(Path::new("/proc"), |path| std::fs::read_to_string(path))
+}
 
-    for entry in entries.flatten() {
+/// A cheap, conservative census, not an action authorization. A PID-1 child is
+/// counted only when it retained another job's session/group and its placement
+/// establishes a user workload rather than a service or container. Unavailable
+/// evidence invalidates the count; it must not look like observed recovery.
+#[cfg(all(feature = "daemon", target_os = "linux"))]
+fn collect_orphan_count_from(
+    proc_root: &Path,
+    mut read: impl FnMut(&Path) -> std::io::Result<String>,
+) -> Option<u32> {
+    use pt_core::collect::cgroup::CgroupRole;
+
+    let mut count = 0u32;
+    let entries = std::fs::read_dir(proc_root).ok()?;
+
+    for entry in entries {
+        let entry = entry.ok()?;
         let file_name = entry.file_name();
-        let pid_str = match file_name.to_str() {
-            Some(name) if name.chars().all(|c| c.is_ascii_digit()) => name,
-            _ => continue,
+        let Some(pid) = file_name.to_str().and_then(|name| name.parse::<u32>().ok()) else {
+            continue;
         };
-        let stat_path = format!("/proc/{}/stat", pid_str);
-        let stat = match std::fs::read_to_string(stat_path) {
-            Ok(stat) => stat,
-            Err(_) => continue,
+        if pid <= 1 {
+            continue;
+        }
+        let stat_path = entry.path().join("stat");
+        let before = match read(&stat_path) {
+            Ok(stat) => daemon_orphan_identity(pid, &stat)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
         };
-        let end = match stat.rfind(')') {
-            Some(pos) => pos,
-            None => continue,
+        let (ppid, pgid, sid, _) = before;
+        if ppid != 1 {
+            continue;
+        }
+        let own_leader = if sid != 0 {
+            sid == pid
+        } else if pgid != 0 {
+            pgid == pid
+        } else {
+            return None;
         };
-        let rest = match stat.get(end + 2..) {
-            Some(rest) => rest,
-            None => continue,
+        if own_leader {
+            continue;
+        }
+        if before.3 == 0 {
+            return None;
+        }
+
+        // Bind placement to the same birth and parent/session before counting.
+        // An exited process contributes nothing; a replacement is not evidence
+        // about the process whose placement we just inspected.
+        let membership = read(&entry.path().join("cgroup"));
+        let after = match read(&stat_path) {
+            Ok(stat) => daemon_orphan_identity(pid, &stat)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
         };
-        let mut parts = rest.split_whitespace();
-        let _state = parts.next();
-        let ppid = match parts.next() {
-            Some(ppid) => ppid,
-            None => continue,
-        };
-        if ppid == "1" {
-            count = count.saturating_add(1);
+        if before != after {
+            return None;
+        }
+        match daemon_orphan_cgroup_role(&membership.ok()?)? {
+            CgroupRole::LoginSession | CgroupRole::TransientScope => {
+                count = count.saturating_add(1);
+            }
+            CgroupRole::SystemService | CgroupRole::UserService | CgroupRole::Container => {}
+            CgroupRole::Unknown => return None,
         }
     }
 
-    count
+    Some(count)
+}
+
+#[cfg(all(feature = "daemon", target_os = "linux"))]
+fn daemon_orphan_identity(pid: u32, stat: &str) -> Option<(u32, u32, u32, u64)> {
+    let (recorded_pid, _) = stat.split_once(" (")?;
+    if recorded_pid.parse::<u32>().ok()? != pid {
+        return None;
+    }
+    let mut fields = stat.get(stat.rfind(')')? + 1..)?.split_whitespace();
+    if fields.next()?.len() != 1 {
+        return None;
+    }
+    let ppid = fields.next()?.parse().ok()?;
+    let pgid = fields.next()?.parse().ok()?;
+    let sid = fields.next()?.parse().ok()?;
+    // After session (field 6), starttime (field 22) is 16 fields ahead.
+    let start_ticks = fields.nth(15)?.parse().ok()?;
+    Some((ppid, pgid, sid, start_ticks))
+}
+
+#[cfg(all(feature = "daemon", target_os = "linux"))]
+fn daemon_orphan_cgroup_role(content: &str) -> Option<pt_core::collect::cgroup::CgroupRole> {
+    let mut unified = None;
+    let mut systemd = None;
+    for line in content.lines().filter(|line| !line.is_empty()) {
+        let mut fields = line.splitn(3, ':');
+        let hierarchy = fields.next()?.parse::<u32>().ok()?;
+        let controllers = fields.next()?;
+        let path = fields.next()?;
+        if !path.starts_with('/') || path.split('/').any(|part| matches!(part, "." | "..")) {
+            return None;
+        }
+        let slot = if hierarchy == 0 && controllers.is_empty() {
+            &mut unified
+        } else if controllers.split(',').any(|name| name == "name=systemd") {
+            &mut systemd
+        } else {
+            continue;
+        };
+        if slot.is_some_and(|previous| previous != path) {
+            return None;
+        }
+        *slot = Some(path);
+    }
+    unified
+        .or(systemd)
+        .map(pt_core::collect::cgroup::classify_cgroup_path)
+}
+
+#[cfg(all(test, feature = "daemon", target_os = "linux"))]
+mod daemon_orphan_tests {
+    use super::*;
+    use pt_core::collect::pressure::PressureSnapshot;
+    use pt_core::daemon::triggers::{evaluate_triggers, TriggerConfig, TriggerKind, TriggerState};
+
+    const SESSION: &str = "0::/user.slice/user-1000.slice/session-7.scope\n";
+
+    fn stat(pid: u32, ppid: u32, pgid: u32, sid: u32, birth: u64) -> String {
+        // Linux stat fields 3..22, including a comm containing parentheses/spaces.
+        let mut fields = vec!["0".to_string(); 20];
+        fields[0] = "S".to_string();
+        fields[1] = ppid.to_string();
+        fields[2] = pgid.to_string();
+        fields[3] = sid.to_string();
+        fields[19] = birth.to_string();
+        format!("{pid} (work(er) name) {}\n", fields.join(" "))
+    }
+
+    fn process(root: &Path, pid: u32, ppid: u32, pgid: u32, sid: u32, membership: &str) {
+        let directory = root.join(pid.to_string());
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("stat"), stat(pid, ppid, pgid, sid, 123)).unwrap();
+        std::fs::write(directory.join("cgroup"), membership).unwrap();
+    }
+
+    fn count(root: &Path) -> Option<u32> {
+        collect_orphan_count_from(root, |path| std::fs::read_to_string(path))
+    }
+
+    #[test]
+    fn daemon_orphan_census_feeds_trigger_without_service_false_positives() {
+        let root = tempfile::tempdir().unwrap();
+        // These non-leader service workers used to exceed the default threshold.
+        for pid in 200..224 {
+            process(
+                root.path(),
+                pid,
+                1,
+                100,
+                100,
+                "0::/system.slice/postgres.service\n",
+            );
+        }
+        process(
+            root.path(),
+            300,
+            1,
+            100,
+            100,
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/editor.service\n",
+        );
+        process(
+            root.path(),
+            301,
+            1,
+            100,
+            100,
+            "0::/system.slice/docker-abcd.scope\n",
+        );
+        // Session leaders are not inferred orphans even without known placement.
+        process(root.path(), 302, 1, 302, 302, "0::/\n");
+        // Early kernel tasks may legitimately start at tick zero. Their
+        // non-adopted placement must not invalidate the workload census.
+        let kernel = root.path().join("2");
+        std::fs::create_dir(&kernel).unwrap();
+        std::fs::write(kernel.join("stat"), stat(2, 0, 0, 0, 0)).unwrap();
+        assert_eq!(count(root.path()), Some(0));
+
+        let config = TriggerConfig {
+            orphan_threshold: 0,
+            sustained_ticks: 1,
+            ..Default::default()
+        };
+        let mut state = TriggerState::new(&config);
+        let pressure = PressureSnapshot {
+            sampled_at_ms: 1000,
+            cpus: 0,
+            cpu: None,
+            memory: None,
+            io: None,
+            irq: None,
+            load: None,
+            meminfo: None,
+            vmstat: None,
+            file_handles: None,
+            unavailable: Vec::new(),
+        };
+        let metrics = daemon_metrics_from_pressure(pressure.clone(), 28, count(root.path()));
+        assert!(evaluate_triggers(&config, &mut state, &metrics).is_empty());
+
+        process(root.path(), 400, 1, 100, 100, SESSION);
+        process(
+            root.path(),
+            401,
+            1,
+            100,
+            100,
+            "7:name=systemd:/user.slice/user-1000.slice/user@1000.service/app.slice/run-job.scope\n",
+        );
+        process(root.path(), 402, 400, 100, 100, SESSION);
+        assert_eq!(count(root.path()), Some(2));
+        let metrics = daemon_metrics_from_pressure(pressure, 31, count(root.path()));
+        let fired = evaluate_triggers(&config, &mut state, &metrics);
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].kind, TriggerKind::OrphanSpike);
+        assert_eq!(fired[0].current_value, Some(2.0));
+    }
+
+    #[test]
+    fn incomplete_or_ambiguous_placement_is_not_a_zero_or_partial_count() {
+        for membership in [
+            "",
+            "malformed",
+            "0::/\n",
+            "0::/user.slice/session-7.scope\n0::/system.slice/other.service\n",
+            "0::/user.slice/../session-7.scope\n",
+            "2:cpu:/unclassified\n",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            process(root.path(), 100, 1, 42, 42, SESSION);
+            process(root.path(), 101, 1, 42, 42, membership);
+            assert_eq!(count(root.path()), None, "{membership:?}");
+        }
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("100")).unwrap();
+        std::fs::write(root.path().join("100/stat"), stat(100, 1, 42, 42, 123)).unwrap();
+        // A missing cgroup file for a still-present process is unknown evidence.
+        assert_eq!(count(root.path()), None);
+        assert_eq!(count(&root.path().join("missing-proc")), None);
+    }
+
+    #[test]
+    fn vanished_process_is_skipped_but_unreadable_stat_is_unavailable() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("100")).unwrap();
+        process(root.path(), 101, 1, 42, 42, SESSION);
+        assert_eq!(count(root.path()), Some(1));
+
+        std::fs::create_dir(root.path().join("100/stat")).unwrap();
+        assert_eq!(count(root.path()), None);
+        let result = collect_orphan_count_from(root.path(), |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        });
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn orphan_census_rejects_replacement_and_changed_lineage() {
+        let root = tempfile::tempdir().unwrap();
+        process(root.path(), 100, 1, 42, 42, SESSION);
+        for changed in [
+            stat(100, 1, 42, 42, 124),
+            stat(100, 2, 42, 42, 123),
+            stat(100, 1, 43, 42, 123),
+            stat(100, 1, 42, 43, 123),
+            stat(101, 1, 42, 42, 123),
+        ] {
+            let mut stat_reads = 0;
+            let result = collect_orphan_count_from(root.path(), |path| {
+                if path.ends_with("stat") {
+                    stat_reads += 1;
+                    if stat_reads == 2 {
+                        return Ok(changed.clone());
+                    }
+                }
+                std::fs::read_to_string(path)
+            });
+            assert_eq!(result, None, "{changed}");
+        }
+
+        let mut stat_reads = 0;
+        let result = collect_orphan_count_from(root.path(), |path| {
+            if path.ends_with("stat") {
+                stat_reads += 1;
+                if stat_reads == 2 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+                }
+            }
+            std::fs::read_to_string(path)
+        });
+        assert_eq!(result, Some(0), "exited before placement was bound");
+    }
+
+    #[test]
+    fn orphan_census_validates_stat_and_requires_known_leadership() {
+        assert_eq!(
+            daemon_orphan_identity(100, &stat(100, 1, 42, 42, 123)),
+            Some((1, 42, 42, 123))
+        );
+        assert!(daemon_orphan_identity(100, "100 (worker) S 1 42 42").is_none());
+        assert!(daemon_orphan_identity(100, &stat(101, 1, 42, 42, 123)).is_none());
+        let root = tempfile::tempdir().unwrap();
+        process(root.path(), 100, 1, 0, 0, SESSION);
+        assert_eq!(count(root.path()), None);
+        let missing_birth = tempfile::tempdir().unwrap();
+        process(missing_birth.path(), 100, 1, 42, 42, SESSION);
+        std::fs::write(
+            missing_birth.path().join("100/stat"),
+            stat(100, 1, 42, 42, 0),
+        )
+        .unwrap();
+        assert_eq!(count(missing_birth.path()), None);
+    }
+
+    #[test]
+    fn inherited_session_wins_over_group_leadership_with_group_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        process(root.path(), 100, 1, 100, 42, SESSION);
+        assert_eq!(
+            count(root.path()),
+            Some(1),
+            "retained the dead parent's session"
+        );
+        process(root.path(), 101, 1, 101, 0, SESSION);
+        assert_eq!(
+            count(root.path()),
+            Some(1),
+            "own group when session is unavailable"
+        );
+        process(root.path(), 102, 1, 42, 0, SESSION);
+        assert_eq!(
+            count(root.path()),
+            Some(2),
+            "inherited group when session is unavailable"
+        );
+    }
 }
 
 #[cfg(all(feature = "daemon", target_os = "linux"))]
@@ -16235,8 +16546,8 @@ fn current_rss_mb() -> Option<u64> {
 }
 
 #[cfg(all(feature = "daemon", not(target_os = "linux")))]
-fn collect_orphan_count() -> u32 {
-    0
+fn collect_orphan_count() -> Option<u32> {
+    None
 }
 
 #[cfg(all(feature = "daemon", not(target_os = "linux")))]
