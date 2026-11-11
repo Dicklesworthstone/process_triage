@@ -318,6 +318,10 @@ fn get_action_cost(
             action,
             class: class_name,
         }),
+        Action::CapMemory => row.cap_memory.ok_or(DecisionError::MissingLoss {
+            action,
+            class: class_name,
+        }),
         Action::Quarantine | Action::Unquarantine => {
             row.throttle.ok_or(DecisionError::MissingLoss {
                 action,
@@ -584,7 +588,7 @@ fn build_rationale(belief: &BeliefState, action: Action, table: &[ActionLossBrea
             "High confidence ({:.1}%) in {} state. Selected {} with {}.",
             most_likely_prob * 100.0,
             most_likely,
-            format!("{:?}", action).to_lowercase(),
+            action.as_str(),
             loss_info
         )
     } else if entropy < 1.0 {
@@ -593,7 +597,7 @@ fn build_rationale(belief: &BeliefState, action: Action, table: &[ActionLossBrea
             "Moderate confidence (most likely: {} at {:.1}%). Selected {} with {} to minimize expected loss.",
             most_likely,
             most_likely_prob * 100.0,
-            format!("{:?}", action).to_lowercase(),
+            action.as_str(),
             loss_info
         )
     } else {
@@ -601,7 +605,7 @@ fn build_rationale(belief: &BeliefState, action: Action, table: &[ActionLossBrea
         format!(
             "High uncertainty (entropy: {:.2} nats). Selected {} with {} as the safest action under uncertainty.",
             entropy,
-            format!("{:?}", action).to_lowercase(),
+            action.as_str(),
             loss_info
         )
     }
@@ -618,6 +622,7 @@ mod tests {
         // L(action, class) = loss incurred by taking `action` when true state is `class`.
         LossMatrix {
             useful: LossRow {
+                cap_memory: None,
                 // For a USEFUL process:
                 keep: 0.0,           // Keeping is correct (no loss)
                 pause: Some(0.3),    // Pausing useful = moderate cost
@@ -627,6 +632,7 @@ mod tests {
                 restart: Some(0.8),  // Restarting useful = high cost
             },
             useful_bad: LossRow {
+                cap_memory: None,
                 // For a USEFUL_BAD process (running but misbehaving):
                 keep: 0.5,           // Keeping has cost (it's misbehaving)
                 pause: Some(0.2),    // Pausing can help investigate
@@ -636,6 +642,7 @@ mod tests {
                 restart: Some(0.4),  // Restarting might fix it
             },
             abandoned: LossRow {
+                cap_memory: None,
                 // For an ABANDONED process:
                 keep: 1.0,           // Keeping wastes resources (high loss)
                 pause: Some(0.5),    // Pausing is okay but doesn't free resources
@@ -645,6 +652,7 @@ mod tests {
                 restart: Some(0.2),  // Restarting cleans up
             },
             zombie: LossRow {
+                cap_memory: None,
                 // For a ZOMBIE process:
                 keep: 1.0,           // Keeping wastes resources
                 pause: Some(0.7),    // Pausing a zombie does nothing
@@ -915,6 +923,7 @@ mod tests {
     #[test]
     fn get_action_cost_keep() {
         let row = LossRow {
+            cap_memory: None,
             keep: 0.0,
             pause: Some(0.3),
             throttle: Some(0.2),
@@ -928,6 +937,7 @@ mod tests {
     #[test]
     fn get_action_cost_freeze_uses_pause() {
         let row = LossRow {
+            cap_memory: None,
             keep: 0.0,
             pause: Some(0.3),
             throttle: Some(0.2),
@@ -942,6 +952,7 @@ mod tests {
     #[test]
     fn get_action_cost_unfreeze_uses_pause() {
         let row = LossRow {
+            cap_memory: None,
             keep: 0.0,
             pause: Some(0.5),
             throttle: Some(0.2),
@@ -956,6 +967,7 @@ mod tests {
     #[test]
     fn get_action_cost_quarantine_uses_throttle() {
         let row = LossRow {
+            cap_memory: None,
             keep: 0.0,
             pause: Some(0.3),
             throttle: Some(0.2),
@@ -970,6 +982,7 @@ mod tests {
     #[test]
     fn get_action_cost_unquarantine_uses_throttle() {
         let row = LossRow {
+            cap_memory: None,
             keep: 0.0,
             pause: Some(0.3),
             throttle: Some(0.4),
@@ -984,6 +997,7 @@ mod tests {
     #[test]
     fn get_action_cost_missing_pause_errors() {
         let row = LossRow {
+            cap_memory: None,
             keep: 0.0,
             pause: None,
             throttle: Some(0.2),
@@ -998,6 +1012,7 @@ mod tests {
     #[test]
     fn get_action_cost_missing_throttle_errors() {
         let row = LossRow {
+            cap_memory: None,
             keep: 0.0,
             pause: Some(0.3),
             throttle: None,
@@ -1012,6 +1027,7 @@ mod tests {
     #[test]
     fn get_action_cost_missing_restart_errors() {
         let row = LossRow {
+            cap_memory: None,
             keep: 0.0,
             pause: Some(0.3),
             throttle: Some(0.2),

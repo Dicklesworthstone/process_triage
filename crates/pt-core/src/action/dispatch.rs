@@ -17,6 +17,8 @@ use super::cgroup_throttle::CpuThrottleActionRunner;
 use super::cpuset_quarantine::CpusetQuarantineActionRunner;
 #[cfg(target_os = "linux")]
 use super::freeze::FreezeActionRunner;
+#[cfg(target_os = "linux")]
+use super::memory_cap::MemoryCapActionRunner;
 
 /// Dispatches actions to the appropriate runner implementation.
 #[derive(Debug)]
@@ -29,6 +31,8 @@ pub struct CompositeActionRunner {
     freeze: FreezeActionRunner,
     #[cfg(target_os = "linux")]
     throttle: CpuThrottleActionRunner,
+    #[cfg(target_os = "linux")]
+    memory_cap: MemoryCapActionRunner,
     #[cfg(target_os = "linux")]
     quarantine: CpusetQuarantineActionRunner,
 }
@@ -46,6 +50,8 @@ impl CompositeActionRunner {
             #[cfg(target_os = "linux")]
             throttle: CpuThrottleActionRunner::with_defaults(),
             #[cfg(target_os = "linux")]
+            memory_cap: MemoryCapActionRunner::with_defaults(),
+            #[cfg(target_os = "linux")]
             quarantine: CpusetQuarantineActionRunner::with_defaults(),
         }
     }
@@ -59,6 +65,9 @@ impl CompositeActionRunner {
             runner.renice = runner.renice.with_reversal_journal(Arc::clone(&journal));
             runner.freeze = runner.freeze.with_reversal_journal(Arc::clone(&journal));
             runner.throttle = runner.throttle.with_reversal_journal(Arc::clone(&journal));
+            runner.memory_cap = runner
+                .memory_cap
+                .with_reversal_journal(Arc::clone(&journal));
             runner.quarantine = runner.quarantine.with_reversal_journal(journal);
             runner
         }
@@ -164,6 +173,7 @@ pub fn planning_action_feasibility_with_restart(
             Action::Freeze,
             Action::Unfreeze,
             Action::Throttle,
+            Action::CapMemory,
             Action::Quarantine,
             Action::Unquarantine,
         ] {
@@ -194,6 +204,14 @@ pub fn planning_action_feasibility_with_restart(
         // for a dead child. Its direct interventions are already excluded.
         if !state.is_zombie() {
             feasibility = feasibility.merge(&cgroup_action_feasibility(target));
+            if feasibility.is_allowed(Action::CapMemory) {
+                if let Err(error) = super::memory_cap::plan_memory_cap(target) {
+                    feasibility.disabled.push(DisabledAction {
+                        action: Action::CapMemory,
+                        reason: error.to_string(),
+                    });
+                }
+            }
         }
     }
     #[cfg(not(target_os = "linux"))]
@@ -212,6 +230,7 @@ fn unavailable_cgroup_actions(reason: String) -> ActionFeasibility {
             Action::Freeze,
             Action::Unfreeze,
             Action::Throttle,
+            Action::CapMemory,
             Action::Quarantine,
             Action::Unquarantine,
         ]
@@ -531,6 +550,8 @@ impl ActionRunner for CompositeActionRunner {
             #[cfg(target_os = "linux")]
             Action::Throttle => self.throttle.execute(action),
             #[cfg(target_os = "linux")]
+            Action::CapMemory => self.memory_cap.execute(action),
+            #[cfg(target_os = "linux")]
             Action::Quarantine | Action::Unquarantine => self.quarantine.execute(action),
             // A zombie's remedy targets its parent: nudge it to reap. (A real
             // restart of the parent needs supervisor support, bd-qr40.6.)
@@ -551,6 +572,7 @@ impl ActionRunner for CompositeActionRunner {
             Action::Freeze
             | Action::Unfreeze
             | Action::Throttle
+            | Action::CapMemory
             | Action::Quarantine
             | Action::Unquarantine => Err(ActionError::Failed(
                 "action not supported on this platform".to_string(),
@@ -567,6 +589,8 @@ impl ActionRunner for CompositeActionRunner {
             Action::Freeze | Action::Unfreeze => self.freeze.verify(action),
             #[cfg(target_os = "linux")]
             Action::Throttle => self.throttle.verify(action),
+            #[cfg(target_os = "linux")]
+            Action::CapMemory => self.memory_cap.verify(action),
             #[cfg(target_os = "linux")]
             Action::Quarantine | Action::Unquarantine => self.quarantine.verify(action),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -585,6 +609,7 @@ impl ActionRunner for CompositeActionRunner {
             Action::Freeze
             | Action::Unfreeze
             | Action::Throttle
+            | Action::CapMemory
             | Action::Quarantine
             | Action::Unquarantine => Ok(()),
         }
@@ -643,6 +668,7 @@ mod tests {
                 parent_identity: None,
                 d_state_diagnostics: None,
                 supervisor_restart: None,
+                memory_cap: None,
             }],
             generated_at: Some("2026-01-15T12:00:00Z".to_string()),
         };

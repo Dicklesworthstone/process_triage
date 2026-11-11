@@ -46,6 +46,8 @@ pub struct DecisionCandidate {
     pub d_state_diagnostics: Option<DStateDiagnostics>,
     /// Observed current-user service route for a non-zombie restart.
     pub supervisor_restart: Option<SystemdUserServiceBinding>,
+    /// Exact observed leaf-cgroup cap; missing or invalid evidence disables it.
+    pub memory_cap: Option<crate::action::memory_cap::MemoryCapPlan>,
 }
 
 /// Diagnostics for D-state (uninterruptible sleep) processes.
@@ -111,6 +113,9 @@ pub struct PlanAction {
     /// Exact user-manager service binding observed during planning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supervisor_restart: Option<SystemdUserServiceBinding>,
+    /// Bound cgroup identity and exact memory.high bytes observed at planning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_cap: Option<crate::action::memory_cap::MemoryCapPlan>,
 }
 
 fn is_direct_routing(routing: &ActionRouting) -> bool {
@@ -255,6 +260,25 @@ pub fn generate_plan(bundle: &DecisionBundle) -> Plan {
             continue;
         }
 
+        let memory_cap = candidate
+            .memory_cap
+            .as_ref()
+            .filter(|cap| cap.validate(&candidate.identity).is_ok());
+        if candidate.decision.optimal_action == Action::CapMemory
+            && (memory_cap.is_none()
+                || !matches!(
+                    candidate.process_state,
+                    Some(
+                        ProcessState::Running
+                            | ProcessState::Sleeping
+                            | ProcessState::Stopped
+                            | ProcessState::Idle
+                    )
+                ))
+        {
+            continue;
+        }
+
         // Check for D-state - mark as low-confidence
         let is_d_state = candidate.process_state == Some(ProcessState::DiskSleep);
 
@@ -269,7 +293,20 @@ pub fn generate_plan(bundle: &DecisionBundle) -> Plan {
         }
 
         for (action, stage) in action_sequence {
-            let action_id = action_id_for(action, &candidate.identity, stage);
+            let action_id = if action == Action::CapMemory {
+                // A different limit or cgroup observation is a different action,
+                // even when the process incarnation has not changed.
+                let binding = serde_json::to_vec(memory_cap.expect("validated cap binding"))
+                    .expect("memory cap contains serializable integer observations");
+                let key = format!(
+                    "{}:{:016x}",
+                    action_id_for(action, &candidate.identity, stage),
+                    fnv1a64(&binding)
+                );
+                format!("act-{:016x}", fnv1a64(key.as_bytes()))
+            } else {
+                action_id_for(action, &candidate.identity, stage)
+            };
             pre_toggled.push(action_id.clone());
 
             let expected_loss = loss_for_action(&candidate.decision, action);
@@ -347,6 +384,11 @@ pub fn generate_plan(bundle: &DecisionBundle) -> Plan {
                 d_state_diagnostics: d_state_diag,
                 supervisor_restart: if action == Action::Restart {
                     supervisor_restart.cloned()
+                } else {
+                    None
+                },
+                memory_cap: if action == Action::CapMemory {
+                    memory_cap.cloned()
                 } else {
                     None
                 },
@@ -459,6 +501,7 @@ fn plan_zombie_actions(candidate: &DecisionCandidate, policy: &Policy) -> Option
         original_zombie_target: Some(candidate.identity.clone()),
         d_state_diagnostics: None,
         supervisor_restart: None,
+        memory_cap: None,
     }])
 }
 
@@ -490,6 +533,7 @@ fn pre_checks_for(action: Action) -> Vec<PreCheck> {
         }
         Action::Pause
         | Action::Throttle
+        | Action::CapMemory
         | Action::Renice
         | Action::Freeze
         | Action::Unfreeze
@@ -581,6 +625,7 @@ fn action_str(action: Action) -> &'static str {
         Action::Pause => "pause",
         Action::Resume => "resume",
         Action::Throttle => "throttle",
+        Action::CapMemory => "cap_memory",
         Action::Restart => "restart",
         Action::Kill => "kill",
         Action::Freeze => "freeze",
@@ -632,6 +677,7 @@ fn action_tier(action: Action) -> u8 {
         Action::Pause => 1,
         Action::Resume => 1, // Same tier as Pause (reversible)
         Action::Throttle => 1,
+        Action::CapMemory => 1,
         Action::Freeze => 1,       // Reversible via Unfreeze
         Action::Unfreeze => 1,     // Same tier as Freeze (reversible)
         Action::Quarantine => 1,   // Reversible via Unquarantine
@@ -718,6 +764,143 @@ mod tests {
             parent_identity: None,
             d_state_diagnostics: None,
             supervisor_restart: None,
+            memory_cap: None,
+        }
+    }
+
+    fn memory_cap_candidate(pid: u32) -> DecisionCandidate {
+        let boot = "11111111-2222-4333-8444-555555555555";
+        let mut input = candidate(pid, Action::CapMemory, 1.0, 0.95);
+        input.identity.start_id = StartId::from_linux(boot, 100, pid);
+        input.process_state = Some(ProcessState::Sleeping);
+        input.memory_cap = Some(crate::action::memory_cap::MemoryCapPlan {
+            target: input.identity.clone(),
+            scope: crate::action::reversal::ReversalScope {
+                cgroup_path: "/user.slice/owned/workload".into(),
+                device: 1,
+                inode: 2,
+                mount_id: 3,
+                boot_id: boot.into(),
+                mount_namespace_device: 4,
+                mount_namespace_inode: 5,
+                cgroup_namespace_device: 6,
+                cgroup_namespace_inode: 7,
+            },
+            limit_bytes: 180 * 1024 * 1024,
+            observed_high_bytes: None,
+            observed_current_bytes: 200 * 1024 * 1024,
+            observed_low_bytes: 0,
+            observed_min_bytes: 0,
+            page_size_bytes: 4096,
+        });
+        input
+    }
+
+    #[test]
+    fn memory_cap_plan_preserves_exact_limit_scope_and_identity() {
+        let input = memory_cap_candidate(123);
+        let binding = input.memory_cap.clone().unwrap();
+        binding.validate(&input.identity).unwrap();
+        let mut bundle = DecisionBundle {
+            session_id: SessionId("pt-20260115-120000-abcd".into()),
+            policy: Policy::default(),
+            candidates: vec![input],
+            generated_at: Some("2026-01-15T12:00:00Z".into()),
+        };
+        let plan = generate_plan(&bundle);
+        assert_eq!(plan.actions.len(), 1);
+        let action = &plan.actions[0];
+        assert_eq!(action.action, Action::CapMemory);
+        assert_eq!(action.routing, ActionRouting::Direct);
+        assert_eq!(action.memory_cap.as_ref(), Some(&binding));
+        assert!(action.pre_checks.contains(&PreCheck::VerifyIdentity));
+        assert!(action.pre_checks.contains(&PreCheck::CheckNotProtected));
+        assert!(action.pre_checks.contains(&PreCheck::CheckSupervisor));
+        assert!(action.pre_checks.contains(&PreCheck::CheckAgentSupervision));
+        let serialized = serde_json::to_value(&plan).unwrap();
+        assert_eq!(serialized["actions"][0]["action"], "cap_memory");
+        assert_eq!(
+            serialized["actions"][0]["memory_cap"]["limit_bytes"],
+            180 * 1024 * 1024
+        );
+        let restored: Plan = serde_json::from_value(serialized).unwrap();
+        assert_eq!(restored.actions[0].memory_cap.as_ref(), Some(&binding));
+        assert_eq!(
+            generate_plan(&bundle).actions[0].action_id,
+            action.action_id
+        );
+
+        // Changing a valid cap is a new approved action, not a replay of the old ID.
+        let cap = bundle.candidates[0].memory_cap.as_mut().unwrap();
+        cap.observed_current_bytes = 220 * 1024 * 1024;
+        cap.limit_bytes = 198 * 1024 * 1024;
+        let changed = generate_plan(&bundle);
+        assert_eq!(changed.actions.len(), 1);
+        assert_ne!(changed.actions[0].action_id, action.action_id);
+        bundle.candidates[0]
+            .memory_cap
+            .as_mut()
+            .unwrap()
+            .scope
+            .inode += 1;
+        let rebound = generate_plan(&bundle);
+        assert_eq!(rebound.actions.len(), 1);
+        assert_ne!(rebound.actions[0].action_id, changed.actions[0].action_id);
+
+        bundle.candidates[0].decision = decision_with_action(Action::Pause, 1.0, 0.9);
+        let paused = generate_plan(&bundle);
+        assert_eq!(paused.actions.len(), 1);
+        assert!(paused.actions[0].memory_cap.is_none());
+        assert!(serde_json::to_value(&paused.actions[0])
+            .unwrap()
+            .get("memory_cap")
+            .is_none());
+    }
+
+    #[test]
+    fn memory_cap_plan_omits_unbound_modified_and_unsafe_candidates() {
+        let valid = memory_cap_candidate(123);
+        let mut invalid = Vec::new();
+        let mut missing = valid.clone();
+        missing.memory_cap = None;
+        invalid.push(missing);
+        let mut rebound = valid.clone();
+        rebound.memory_cap.as_mut().unwrap().target.uid += 1;
+        invalid.push(rebound);
+        let mut modified = valid.clone();
+        modified.memory_cap.as_mut().unwrap().limit_bytes += 4096;
+        invalid.push(modified);
+        let mut unsafe_scope = valid.clone();
+        unsafe_scope.memory_cap.as_mut().unwrap().scope.cgroup_path = "/".into();
+        invalid.push(unsafe_scope);
+        let mut blocked = valid.clone();
+        blocked.blocked_reasons.push("protected process".into());
+        invalid.push(blocked);
+        for state in [
+            None,
+            Some(ProcessState::DiskSleep),
+            Some(ProcessState::Zombie),
+            Some(ProcessState::Dead),
+            Some(ProcessState::Unknown),
+        ] {
+            let mut unsafe_state = valid.clone();
+            unsafe_state.process_state = state;
+            invalid.push(unsafe_state);
+        }
+        for input in invalid {
+            let bundle = DecisionBundle {
+                session_id: SessionId("pt-20260115-120000-abcd".into()),
+                policy: Policy::default(),
+                candidates: vec![input],
+                generated_at: Some("2026-01-15T12:00:00Z".into()),
+            };
+            let plan = generate_plan(&bundle);
+            assert!(
+                plan.actions.is_empty(),
+                "accepted {:?}",
+                bundle.candidates[0]
+            );
+            assert!(plan.pre_toggled.is_empty());
         }
     }
 

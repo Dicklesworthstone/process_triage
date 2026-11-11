@@ -571,6 +571,7 @@ fn loss_for_action_state(
         Action::Pause | Action::Resume => row.pause.unwrap_or(0.0),
         Action::Freeze | Action::Unfreeze => row.pause.unwrap_or(0.0),
         Action::Throttle => row.throttle.unwrap_or(0.0),
+        Action::CapMemory => row.cap_memory.unwrap_or(f64::INFINITY),
         Action::Quarantine | Action::Unquarantine => row.throttle.unwrap_or(0.0),
         Action::Restart => row.restart.unwrap_or(0.0),
         Action::Kill => row.kill,

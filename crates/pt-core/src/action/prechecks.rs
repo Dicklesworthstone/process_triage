@@ -2568,6 +2568,7 @@ mod tests {
             Action::Pause,
             Action::Freeze,
             Action::Throttle,
+            Action::CapMemory,
             Action::Quarantine,
             Action::Renice,
             Action::Restart,

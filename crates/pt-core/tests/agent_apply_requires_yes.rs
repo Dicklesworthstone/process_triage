@@ -125,6 +125,7 @@ fn agent_apply_requires_yes_flag() {
                 confidence: ActionConfidence::Normal,
                 original_zombie_target: None,
                 d_state_diagnostics: None,
+                memory_cap: None,
                 supervisor_restart: None,
             }],
             pre_toggled: Vec::new(),

@@ -265,6 +265,9 @@ fn loss_for_action_class(action: Action, row: &LossRow) -> Result<f64, DroError>
         Action::Renice => row.renice.ok_or_else(|| DroError::InvalidPosterior {
             message: format!("missing renice loss for action {action:?}"),
         }),
+        Action::CapMemory => row.cap_memory.ok_or_else(|| DroError::InvalidPosterior {
+            message: format!("missing cap_memory loss for action {action:?}"),
+        }),
         Action::Restart => row.restart.ok_or_else(|| DroError::InvalidPosterior {
             message: format!("missing restart loss for action {action:?}"),
         }),
@@ -360,7 +363,7 @@ fn tie_break_rank(action: Action) -> u8 {
         Action::Keep => 0,
         Action::Renice => 1,
         Action::Pause | Action::Resume | Action::Freeze | Action::Unfreeze => 2,
-        Action::Quarantine | Action::Unquarantine | Action::Throttle => 3,
+        Action::Quarantine | Action::Unquarantine | Action::Throttle | Action::CapMemory => 3,
         Action::Restart => 4,
         Action::Kill => 5,
     }
@@ -494,6 +497,7 @@ mod tests {
     fn test_loss_matrix() -> LossMatrix {
         LossMatrix {
             useful: LossRow {
+                cap_memory: None,
                 keep: 0.0,
                 pause: Some(5.0),
                 throttle: Some(8.0),
@@ -502,6 +506,7 @@ mod tests {
                 restart: Some(60.0),
             },
             useful_bad: LossRow {
+                cap_memory: None,
                 keep: 10.0,
                 pause: Some(6.0),
                 throttle: Some(8.0),
@@ -510,6 +515,7 @@ mod tests {
                 restart: Some(12.0),
             },
             abandoned: LossRow {
+                cap_memory: None,
                 keep: 30.0,
                 pause: Some(15.0),
                 throttle: Some(10.0),
@@ -518,6 +524,7 @@ mod tests {
                 restart: Some(8.0),
             },
             zombie: LossRow {
+                cap_memory: None,
                 keep: 50.0,
                 pause: Some(20.0),
                 throttle: Some(15.0),
@@ -974,6 +981,7 @@ mod tests {
     #[test]
     fn dro_resume_has_no_loss() {
         let row = LossRow {
+            cap_memory: None,
             keep: 0.0,
             pause: Some(5.0),
             throttle: Some(8.0),
@@ -988,6 +996,7 @@ mod tests {
     #[test]
     fn dro_unfreeze_has_no_loss() {
         let row = LossRow {
+            cap_memory: None,
             keep: 0.0,
             pause: Some(5.0),
             throttle: Some(8.0),
@@ -1002,6 +1011,7 @@ mod tests {
     #[test]
     fn dro_unquarantine_has_no_loss() {
         let row = LossRow {
+            cap_memory: None,
             keep: 0.0,
             pause: Some(5.0),
             throttle: Some(8.0),
@@ -1016,6 +1026,7 @@ mod tests {
     #[test]
     fn dro_missing_pause_loss() {
         let row = LossRow {
+            cap_memory: None,
             keep: 0.0,
             pause: None,
             throttle: None,
@@ -1030,6 +1041,7 @@ mod tests {
     #[test]
     fn dro_missing_renice_loss() {
         let row = LossRow {
+            cap_memory: None,
             keep: 0.0,
             pause: Some(5.0),
             throttle: Some(8.0),
@@ -1044,6 +1056,7 @@ mod tests {
     #[test]
     fn dro_missing_restart_loss() {
         let row = LossRow {
+            cap_memory: None,
             keep: 0.0,
             pause: Some(5.0),
             throttle: Some(8.0),
@@ -1058,6 +1071,7 @@ mod tests {
     #[test]
     fn dro_missing_throttle_loss() {
         let row = LossRow {
+            cap_memory: None,
             keep: 0.0,
             pause: Some(5.0),
             throttle: None,
@@ -1329,6 +1343,7 @@ mod tests {
     fn dro_keep_lipschitz_with_uniform_keep_losses() {
         let loss_matrix = LossMatrix {
             useful: LossRow {
+                cap_memory: None,
                 keep: 0.0,
                 pause: Some(5.0),
                 throttle: Some(8.0),
@@ -1337,6 +1352,7 @@ mod tests {
                 restart: Some(60.0),
             },
             useful_bad: LossRow {
+                cap_memory: None,
                 keep: 0.0, // Same as useful
                 pause: Some(6.0),
                 throttle: Some(8.0),
@@ -1345,6 +1361,7 @@ mod tests {
                 restart: Some(12.0),
             },
             abandoned: LossRow {
+                cap_memory: None,
                 keep: 0.0, // Same
                 pause: Some(15.0),
                 throttle: Some(10.0),
@@ -1353,6 +1370,7 @@ mod tests {
                 restart: Some(8.0),
             },
             zombie: LossRow {
+                cap_memory: None,
                 keep: 0.0, // Same
                 pause: Some(20.0),
                 throttle: Some(15.0),

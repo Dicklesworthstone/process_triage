@@ -701,7 +701,8 @@ impl ActionRunner for CpusetQuarantineActionRunner {
             | Action::Restart
             | Action::Freeze
             | Action::Unfreeze
-            | Action::Throttle => Err(ActionError::Failed(format!(
+            | Action::Throttle
+            | Action::CapMemory => Err(ActionError::Failed(format!(
                 "{:?} is not a quarantine action",
                 action.action
             ))),
@@ -722,7 +723,8 @@ impl ActionRunner for CpusetQuarantineActionRunner {
             | Action::Restart
             | Action::Freeze
             | Action::Unfreeze
-            | Action::Throttle => Ok(()),
+            | Action::Throttle
+            | Action::CapMemory => Ok(()),
         }
     }
 }
@@ -1399,6 +1401,7 @@ mod tests {
                 original_zombie_target: None,
                 d_state_diagnostics: None,
                 supervisor_restart: None,
+                memory_cap: None,
             }
         }
 

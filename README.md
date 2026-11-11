@@ -109,7 +109,7 @@ Every process on your system passes through a five-stage pipeline:
 
 **Infer** computes a 4-class posterior (useful, useful-but-bad, abandoned, zombie) by naive Bayes over CPU occupancy, age, orphan status, controlling terminal and kernel state, with each term clipped and tempered so no single signal dominates. On Linux, lineage and shared-resource evidence add terms; signature matches and your own past verdicts (`pt agent label`, TUI kills) set the prior. The TUI also uses deep network/I/O evidence when it collects it.
 
-**Decide** picks the action with the lowest expected loss under the policy's loss matrix, among the actions feasible for the process state, then applies protection, supervision and policy enforcement. Rather than a binary kill/spare, it evaluates Keep, Renice, Pause, Freeze, Throttle, Quarantine, Restart and Kill.
+**Decide** picks the action with the lowest expected loss under the policy's loss matrix, among the actions feasible for the process state, then applies protection, supervision and policy enforcement. It evaluates Keep, Renice, Pause, Freeze, Throttle, CapMemory, Quarantine, Restart and Kill.
 
 **Act** re-verifies identity (exact start time; a pidfd on Linux) and runs live pre-checks immediately before each signal, then escalates SIGTERM → SIGKILL. Renice, pause/resume and kill run on Linux and macOS; freeze, throttle and quarantine are Linux-only and refused unless the target owns its cgroup. Failures are reported; there is no automatic rollback.
 
@@ -151,6 +151,7 @@ Most tools only know "kill" or "don't kill." `pt` evaluates 8 possible actions r
 | **Pause** | `SIGSTOP` (resume: `SIGCONT`) | Yes | Linux, macOS |
 | **Freeze** | cgroup v2 freezer | Yes | Linux, if the target owns its cgroup |
 | **Throttle** | cgroup CPU quota | Durable session receipt on v2 | Linux, in an exclusive leaf |
+| **CapMemory** | cgroup v2 `memory.high` soft limit | Durable session receipt | Linux 6.16+, in an existing owned exclusive leaf; agent workflow |
 | **Quarantine** | cpuset controller | Explicit prior metadata | Linux, in an exclusive leaf |
 | **Restart** | via the supervisor | Partial | not executable yet (planned, e.g. for a zombie's parent); apply reports it as failed |
 | **Kill** | SIGTERM → SIGKILL | No | Linux, macOS |
@@ -185,6 +186,7 @@ The interactive TUI is built on **ftui** (an Elm-style Model-View-Update framewo
 - **Responsive layout**: adapts to terminal width with breakpoints at 80/120/200 columns (single-panel, two-pane, three-pane)
 - **Process table**: sortable by score, age, CPU, memory, with live filtering via search input
 - **Detail panel**: expanded evidence view for the selected process including Bayes factors, evidence term glyphs, and decision rationale
+- **Plan preview**: the canonical staged remedy, actual target PID, confidence, routing and live prechecks; parent-directed zombie remedies stay attached to the zombie's row
 - **Command palette**: fuzzy-searchable action palette for power users
 - **Inline mode** (`pt run --inline`): confines the UI to a bottom region, preserving terminal scrollback above
 
@@ -621,7 +623,8 @@ Add this section to a complete policy to use the default heuristic model:
       "kappa": 1.0,
       "renice_cpu_relief": 0.5,
       "pause_cpu_relief": 1.0,
-      "throttle_cpu_relief": 0.5
+      "throttle_cpu_relief": 0.5,
+      "cap_memory_relief": 0.1
     }
   }
 }
@@ -630,8 +633,9 @@ Add this section to a complete policy to use the default heuristic model:
 CPU attribution uses a fresh measurement window and the observed online CPU
 count. Credit is limited to that process, even if it belongs to a larger agent,
 build, or cgroup. RSS/system RAM provides a memory share, not an estimate of
-unique reclaimable pages; reversible actions receive no memory or I/O relief
-credit. I/O attribution remains unavailable without a comparable denominator.
+unique reclaimable pages. A feasible, identity-bound `cap_memory` action can
+receive the configured memory relief fraction; other reversible actions receive
+no memory relief credit. I/O attribution remains unavailable without a comparable denominator.
 Per-process CPU occupancy also respects the tightest visible cgroup-v1 or
 cgroup-v2 ancestor quota, comparing quota/period ratios and reporting the
 controller path that supplies the limit. This is a shared ceiling, not a
@@ -1165,9 +1169,46 @@ pt run --goal relieve
 
 These goals require `load_aware.enabled: true` in the policy (already enabled by the `server` and `paranoid` presets) and positive, observed process attribution from the pressure model. Existing candidate filters still apply. To also review pressure remedies for useful processes that fall below the usual intervention-probability filter, explicitly add `--min-posterior 0` to `agent plan`; this changes candidate coverage while preserving action policy, protection, identity, and execution gates.
 
-The selector chooses one tier per plan: **renice/throttle**, then **pause/freeze**, then **termination already justified by evidence-only inference**. Within a tier it ranks modeled relief relative to expected loss. Later tiers remain visible as alternatives and require a fresh plan. The saved plan retains the exact original action IDs, full process identities, staged prerequisites, and child-before-parent execution order. Tree safety is checked again after narrowing the selection. Missing observations, final policy refusals, unavailable routes, or absent resource-specific relief produce no executable fallback actions.
+The selector chooses one tier per plan: **renice/throttle/memory cap**, then **pause/freeze**, then **termination already justified by evidence-only inference**. Within a tier it ranks modeled relief relative to expected loss. Later tiers remain visible as alternatives and require a fresh plan. The saved plan retains the exact original action IDs, full process identities, staged prerequisites, and child-before-parent execution order. A memory cap must also retain the exact proposed limit and original cgroup binding. Tree safety is checked again after narrowing the selection. Missing observations, final policy refusals, unavailable routes, or absent resource-specific relief produce no executable fallback actions.
 
-`goal_summary` identifies the selected tier and PIDs, modeled relief in `heuristic_loss_units`, exclusions, and alternatives. It is included in brief and minimal JSON/TOON output; text and TUI output also show the relief summary. `achievable` and `goal_achievable` are `null`: this model does not establish a physical PSI or resource-recovery target. Reversible remedies currently receive CPU relief credit only, and unknown I/O attribution cannot support an I/O remedy. Measure the result with the normal verification workflow, then generate a new plan before proceeding to another tier. Pressure goals cannot be combined with numeric resource goals in one expression.
+`goal_summary` identifies the selected tier and PIDs, modeled relief in `heuristic_loss_units`, exclusions, and alternatives. It is included in brief and minimal JSON/TOON output; text and TUI output also show the relief summary. `achievable` and `goal_achievable` are `null`: this model does not establish a physical PSI or resource-recovery target. Memory caps receive only memory relief credit, and unknown I/O attribution cannot support an I/O remedy. No cap is credited toward numeric RAM-recovery goals. Measure the result with the normal verification workflow, then generate a new plan before proceeding to another tier. Pressure goals cannot be combined with numeric resource goals in one expression.
+
+### Reversible memory pressure relief
+
+`cap_memory` lowers the existing cgroup-v2 `memory.high` soft limit without
+terminating or migrating the process. It requires Linux 6.16 or newer, an
+existing leaf owned by the target user, exactly one process in that leaf, and
+read/write access to the controller. Unsupported or shared groups remain
+unavailable; `pt` does not create a leaf automatically.
+
+The planner saves the full process identity, boot, namespaces, mount and cgroup
+directory identity, current charge and protections, original `memory.high`, and
+the exact proposed byte limit. The limit is at least 90% of the observed charge,
+rounded upward to a page, at least 64 MiB, and never below `memory.low` or
+`memory.min`. It must actually tighten the existing limit. Apply refuses a
+changed scope, membership, original limit or protections, and refuses charge
+growth that would make the planned limit lower than 90% of current charge.
+
+Use the saved agent workflow to review and apply a cap:
+
+```bash
+pt agent plan --goal mem-pressure --min-posterior 0 --format json
+pt agent apply --session <id> --yes
+pt agent verify --session <id>
+pt agent undo --session <id> --action-id <action-id> --confirm
+```
+
+The policy must enable pressure-aware decisions, and all normal protections and
+action gates still apply. The default evidence-only loss matrix does not choose
+this new action over Keep. TUI execution does not offer memory caps because it
+does not capture the durable, saved-plan receipt required for their restoration.
+
+The write uses `O_NONBLOCK` to avoid synchronous reclaim by the controller writer;
+it does not impose a strict deadline on every filesystem or journal operation.
+`memory.high` is a soft reclaim/throttling boundary, and memory use can exceed it.
+Successful verification confirms the configured limit; it does not imply that
+bytes were freed. Post-apply observations report actual resource changes
+separately. This action never writes `memory.max`, `memory.low`, or `memory.min`.
 
 ## Goal-Based Kill Set Selection
 
@@ -1513,9 +1554,9 @@ not implemented.
 ### Restoring a recorded control
 
 `agent apply` records durable undo receipts for Linux **Renice** and cgroup-v2
-**Freeze, Unfreeze, Throttle, and Quarantine** actions. Each receipt saves the
+**Freeze, Unfreeze, Throttle, CapMemory, and Quarantine** actions. Each receipt saves the
 original state before changing it: every thread's priority for Renice, or the
-freezer request, CPU quota and period, or requested cpuset for cgroup controls.
+freezer request, CPU quota and period, memory soft limit, or requested cpuset for cgroup controls.
 Receipts are bound to the complete saved plan, action ID and process incarnation. Priority receipts also
 bind the PID namespace and each thread's birth time and owner; cgroup receipts
 bind the boot, namespaces, mount and cgroup directory identity.
@@ -1548,6 +1589,11 @@ empty assignment that inherits CPUs from the parent. It checks that effective
 CPUs remain nonempty and, for an explicit assignment, within the restored set.
 It never writes the effective CPU list or replaces inherited intent with a
 fixed snapshot of the parent's CPUs.
+
+Memory-cap undo restores the original `memory.high` byte value or `max` only
+while the same exclusive scope and expected current limit remain present. A
+finite original value must still respect the current `memory.low` and
+`memory.min` protections. An unrelated controller change prevents restoration.
 
 Renice restoration checks every live thread against the receipt and restores
 each thread's own previous nice value. New or reused threads, unreadable evidence,
@@ -1588,7 +1634,7 @@ receipts. Cleanup uses the execution lock so it cannot remove a session while
 an action is preparing the state needed for undo.
 
 This command currently covers Linux thread priorities and cgroup-v2 freezer,
-CPU bandwidth, and cpuset controls from `agent apply`. Hybrid v1 throttling and
+CPU bandwidth, memory soft limits, and cpuset controls from `agent apply`. Hybrid v1 throttling and
 quarantine record that durable undo is unsupported. Pause/resume, service restart,
 macOS Renice, and TUI actions do not capture these receipts; TUI control writes
 still respect existing receipt ownership. A bare Unquarantine action cannot

@@ -367,6 +367,7 @@ fn make_pause_action(pid: u32, pgid: Option<u32>, action_id: &str) -> PlanAction
         confidence: ActionConfidence::Normal,
         original_zombie_target: None,
         d_state_diagnostics: None,
+        memory_cap: None,
         supervisor_restart: None,
     }
 }
@@ -395,6 +396,7 @@ fn make_resume_action(pid: u32, pgid: Option<u32>, action_id: &str) -> PlanActio
         confidence: ActionConfidence::Normal,
         original_zombie_target: None,
         d_state_diagnostics: None,
+        memory_cap: None,
         supervisor_restart: None,
     }
 }
@@ -423,6 +425,7 @@ fn make_renice_action(pid: u32, action_id: &str) -> PlanAction {
         confidence: ActionConfidence::Normal,
         original_zombie_target: None,
         d_state_diagnostics: None,
+        memory_cap: None,
         supervisor_restart: None,
     }
 }
@@ -455,6 +458,7 @@ fn make_kill_action(pid: u32, action_id: &str, pre_checks: Vec<PreCheck>) -> Pla
         confidence: ActionConfidence::Normal,
         original_zombie_target: None,
         d_state_diagnostics: None,
+        memory_cap: None,
         supervisor_restart: None,
     }
 }
@@ -1412,6 +1416,7 @@ mod cgroup_throttle_action {
             confidence: ActionConfidence::Normal,
             original_zombie_target: None,
             d_state_diagnostics: None,
+            memory_cap: None,
             supervisor_restart: None,
         }
     }
@@ -1660,6 +1665,7 @@ mod cgroup_quarantine_undo {
             confidence: ActionConfidence::Normal,
             original_zombie_target: None,
             d_state_diagnostics: None,
+            memory_cap: None,
             supervisor_restart: None,
         };
         let data = tempdir().unwrap();
@@ -1880,6 +1886,7 @@ mod cgroup_freeze_action {
             confidence: ActionConfidence::Normal,
             original_zombie_target: None,
             d_state_diagnostics: None,
+            memory_cap: None,
             supervisor_restart: None,
         }
     }
@@ -1901,6 +1908,7 @@ mod cgroup_freeze_action {
             confidence: ActionConfidence::Normal,
             original_zombie_target: None,
             d_state_diagnostics: None,
+            memory_cap: None,
             supervisor_restart: None,
         }
     }

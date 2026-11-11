@@ -644,6 +644,9 @@ impl ActionRunner for SignalActionRunner {
                     "throttle requires cgroup support".to_string(),
                 ))
             }
+            Action::CapMemory => Err(ActionError::Failed(
+                "memory cap requires a planned cgroup-v2 memory.high operation".to_string(),
+            )),
             Action::Restart => {
                 // Restart requires supervisor awareness
                 Err(ActionError::Failed(
@@ -678,6 +681,7 @@ impl ActionRunner for SignalActionRunner {
             Action::Kill => self.verify_kill(action),
             Action::Keep => Ok(()),
             Action::Throttle
+            | Action::CapMemory
             | Action::Restart
             | Action::Renice
             | Action::Freeze

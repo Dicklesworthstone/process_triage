@@ -634,21 +634,7 @@ impl ProcessTableState {
 
     /// Apply a generated plan preview to the rows.
     pub fn apply_plan_preview(&mut self, plan: &Plan) {
-        let mut by_pid: HashMap<u32, Vec<&PlanAction>> = HashMap::new();
-        for action in &plan.actions {
-            by_pid.entry(action.target.pid.0).or_default().push(action);
-        }
-        for list in by_pid.values_mut() {
-            list.sort_by_key(|a| a.stage);
-        }
-
-        for row in &mut self.rows {
-            if let Some(actions) = by_pid.get(&row.pid) {
-                row.plan_preview = build_plan_preview(actions);
-            } else {
-                row.plan_preview.clear();
-            }
-        }
+        apply_plan_preview_to_rows(&mut self.rows, plan);
     }
 
     /// Set the filter query.
@@ -891,14 +877,37 @@ impl ProcessTableState {
 // Plan preview helpers
 // ---------------------------------------------------------------------------
 
+/// Display the canonical remedy beside the process that prompted it. A zombie's
+/// parent is the actual signal target, but the remedy belongs on the zombie row.
+pub fn apply_plan_preview_to_rows(rows: &mut [ProcessRow], plan: &Plan) {
+    let mut by_pid: HashMap<u32, Vec<&PlanAction>> = HashMap::new();
+    for action in &plan.actions {
+        let subject = action
+            .original_zombie_target
+            .as_ref()
+            .unwrap_or(&action.target);
+        by_pid.entry(subject.pid.0).or_default().push(action);
+    }
+    for actions in by_pid.values_mut() {
+        actions.sort_by_key(|action| (action.order, action.stage));
+    }
+    for row in rows {
+        row.plan_preview = by_pid
+            .get(&row.pid)
+            .map(|actions| build_plan_preview(actions))
+            .unwrap_or_default();
+    }
+}
+
 fn build_plan_preview(actions: &[&PlanAction]) -> Vec<String> {
     let mut lines = Vec::new();
     for action in actions {
         let stage_label = format!("Stage {}", action.stage);
         let mut summary = format!(
-            "{}: {} ({})",
+            "{}: {} PID {} ({})",
             stage_label,
             action_label(&action.action),
+            action.target.pid.0,
             confidence_label(action.confidence)
         );
         if action.blocked {
@@ -910,6 +919,12 @@ fn build_plan_preview(actions: &[&PlanAction]) -> Vec<String> {
         lines.push(summary);
         if let Some(binding) = &action.supervisor_restart {
             lines.push(binding.display_command());
+        }
+        if let Some(cap) = &action.memory_cap {
+            lines.push(format!(
+                "memory.high = {} bytes; soft limit, reclaimed memory is measured after applying",
+                cap.limit_bytes
+            ));
         }
 
         if !action.pre_checks.is_empty() {
@@ -923,8 +938,8 @@ fn build_plan_preview(actions: &[&PlanAction]) -> Vec<String> {
     lines
 }
 
-fn action_label(action: &Action) -> String {
-    format!("{:?}", action).to_lowercase()
+fn action_label(action: &Action) -> &'static str {
+    action.as_str()
 }
 
 fn confidence_label(confidence: ActionConfidence) -> &'static str {
@@ -973,6 +988,67 @@ fn precheck_label(check: &PreCheck) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plan::{ActionRationale, ActionTimeouts, GatesSummary};
+    use pt_common::{IdentityQuality, ProcessId, ProcessIdentity, StartId};
+
+    fn preview_action(pid: u32, action: Action, order: u32, stage: u8) -> PlanAction {
+        PlanAction {
+            action_id: format!("preview-{pid}-{}-{stage}", action.as_str()),
+            target: ProcessIdentity {
+                pid: ProcessId(pid),
+                start_id: StartId::from_linux("11111111-2222-4333-8444-555555555555", 100, pid),
+                uid: 1000,
+                pgid: Some(pid),
+                sid: Some(pid),
+                quality: IdentityQuality::Full,
+            },
+            action,
+            order,
+            stage,
+            timeouts: ActionTimeouts::default(),
+            pre_checks: vec![PreCheck::VerifyIdentity],
+            rationale: ActionRationale {
+                expected_loss: None,
+                expected_recovery: None,
+                expected_recovery_stddev: None,
+                posterior_odds_abandoned_vs_useful: None,
+                sprt_boundary: None,
+                posterior: None,
+                memory_mb: None,
+                has_known_signature: None,
+                category: None,
+            },
+            on_success: Vec::new(),
+            on_failure: Vec::new(),
+            blocked: false,
+            routing: ActionRouting::Direct,
+            confidence: ActionConfidence::Normal,
+            original_zombie_target: None,
+            d_state_diagnostics: None,
+            supervisor_restart: None,
+            memory_cap: None,
+        }
+    }
+
+    fn preview_plan(actions: Vec<PlanAction>) -> Plan {
+        Plan {
+            plan_id: "preview-plan".to_string(),
+            session_id: "pt-20260115-120000-abcd".to_string(),
+            generated_at: "2026-01-15T12:00:00Z".to_string(),
+            policy_id: None,
+            policy_version: "1.0.0".to_string(),
+            pre_toggled: actions
+                .iter()
+                .map(|action| action.action_id.clone())
+                .collect(),
+            gates_summary: GatesSummary {
+                total_candidates: actions.len(),
+                blocked_candidates: 0,
+                pre_toggled_actions: actions.len(),
+            },
+            actions,
+        }
+    }
 
     fn sample_rows() -> Vec<ProcessRow> {
         vec![
@@ -1031,6 +1107,133 @@ mod tests {
                 blast_radius_risk: None,
             },
         ]
+    }
+
+    #[test]
+    fn plan_preview_keeps_zombie_remedy_on_its_subject_and_names_the_parent_target() {
+        let mut rows = sample_rows();
+        let mut reaping = preview_action(5678, Action::Restart, 1, 0);
+        reaping.original_zombie_target = Some(preview_action(1234, Action::Keep, 0, 0).target);
+        reaping.routing = ActionRouting::ZombieToParent;
+        reaping.pre_checks.push(PreCheck::CheckSupervisor);
+        let parent = preview_action(5678, Action::Throttle, 0, 0);
+
+        apply_plan_preview_to_rows(&mut rows, &preview_plan(vec![reaping, parent]));
+
+        assert_eq!(
+            rows[0].plan_preview,
+            [
+                "Stage 0: restart PID 5678 (normal) [zombie_to_parent]",
+                "Stage 0 prechecks: verify_identity, check_supervisor",
+            ]
+        );
+        assert_eq!(
+            rows[1].plan_preview,
+            [
+                "Stage 0: throttle PID 5678 (normal)",
+                "Stage 0 prechecks: verify_identity",
+            ]
+        );
+        assert!(rows[2].plan_preview.is_empty());
+    }
+
+    #[test]
+    fn plan_preview_renders_staged_actions_in_execution_order() {
+        let mut rows = sample_rows();
+        let pause = preview_action(1234, Action::Pause, 7, 0);
+        let mut kill = preview_action(1234, Action::Kill, 8, 1);
+        kill.pre_checks.push(PreCheck::CheckDataLossGate);
+        // Stored collection order must not change the sequence shown for review.
+        apply_plan_preview_to_rows(&mut rows, &preview_plan(vec![kill, pause]));
+
+        assert_eq!(
+            rows[0].plan_preview,
+            [
+                "Stage 0: pause PID 1234 (normal)",
+                "Stage 0 prechecks: verify_identity",
+                "Stage 1: kill PID 1234 (normal)",
+                "Stage 1 prechecks: verify_identity, check_data_loss_gate",
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_preview_replacement_clears_hidden_stale_rows_without_changing_selection() {
+        let mut state = ProcessTableState::new();
+        state.set_rows(sample_rows());
+        state.toggle_selection();
+        state.set_filter(Some("node".to_string()));
+        state.apply_plan_preview(&preview_plan(vec![preview_action(
+            1234,
+            Action::Kill,
+            0,
+            0,
+        )]));
+        assert!(!state.rows[0].plan_preview.is_empty());
+        assert_eq!(state.visible_rows()[0].pid, 5678);
+
+        state.apply_plan_preview(&preview_plan(vec![preview_action(
+            5678,
+            Action::Renice,
+            0,
+            0,
+        )]));
+        assert!(state.rows[0].plan_preview.is_empty());
+        assert_eq!(
+            state.rows[1].plan_preview[0],
+            "Stage 0: renice PID 5678 (normal)"
+        );
+        assert_eq!(state.get_selected(), vec![1234]);
+        assert_eq!(state.get_explicitly_selected(), vec![1234]);
+
+        state.apply_plan_preview(&preview_plan(Vec::new()));
+        assert!(state.rows.iter().all(|row| row.plan_preview.is_empty()));
+        assert_eq!(state.get_selected(), vec![1234]);
+    }
+
+    #[test]
+    fn plan_preview_displays_the_exact_soft_memory_cap_and_review_status() {
+        use crate::action::{memory_cap::MemoryCapPlan, reversal::ReversalScope};
+
+        let mut rows = sample_rows();
+        let mut action = preview_action(1234, Action::CapMemory, 0, 0);
+        action.blocked = true;
+        action.confidence = ActionConfidence::VeryLow;
+        let cap = MemoryCapPlan {
+            target: action.target.clone(),
+            scope: ReversalScope {
+                cgroup_path: "/user.slice/owned/worker".to_string(),
+                device: 1,
+                inode: 2,
+                mount_id: 3,
+                boot_id: "11111111-2222-4333-8444-555555555555".to_string(),
+                mount_namespace_device: 4,
+                mount_namespace_inode: 5,
+                cgroup_namespace_device: 6,
+                cgroup_namespace_inode: 7,
+            },
+            limit_bytes: 180 * 1024 * 1024 + 4096,
+            observed_high_bytes: Some(256 * 1024 * 1024),
+            observed_current_bytes: 200 * 1024 * 1024 + 4096,
+            observed_low_bytes: 64 * 1024 * 1024,
+            observed_min_bytes: 32 * 1024 * 1024,
+            page_size_bytes: 4096,
+        };
+        cap.validate(&action.target)
+            .expect("valid bound cap fixture");
+        action.memory_cap = Some(cap);
+
+        apply_plan_preview_to_rows(&mut rows, &preview_plan(vec![action]));
+
+        assert_eq!(
+            rows[0].plan_preview,
+            [
+                "Stage 0: cap_memory PID 1234 (very_low) [blocked]",
+                "memory.high = 188747776 bytes; soft limit, reclaimed memory is measured after applying",
+                "Stage 0 prechecks: verify_identity",
+            ]
+        );
+        assert!(rows[1..].iter().all(|row| row.plan_preview.is_empty()));
     }
 
     #[test]

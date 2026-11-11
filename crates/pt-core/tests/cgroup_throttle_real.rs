@@ -204,6 +204,7 @@ fn test_throttle_spawned_process() {
         confidence: ActionConfidence::Normal,
         original_zombie_target: None,
         d_state_diagnostics: None,
+        memory_cap: None,
         supervisor_restart: None,
     };
 
@@ -393,6 +394,7 @@ fn test_throttle_permission_denied() {
         confidence: ActionConfidence::Normal,
         original_zombie_target: None,
         d_state_diagnostics: None,
+        memory_cap: None,
         supervisor_restart: None,
     };
 
@@ -466,6 +468,7 @@ fn test_throttle_nonexistent_process() {
         confidence: ActionConfidence::Normal,
         original_zombie_target: None,
         d_state_diagnostics: None,
+        memory_cap: None,
         supervisor_restart: None,
     };
 
@@ -509,6 +512,7 @@ fn test_throttle_wrong_action_type() {
         confidence: ActionConfidence::Normal,
         original_zombie_target: None,
         d_state_diagnostics: None,
+        memory_cap: None,
         supervisor_restart: None,
     };
 
@@ -547,6 +551,7 @@ fn test_throttle_keep_action_noop() {
         confidence: ActionConfidence::Normal,
         original_zombie_target: None,
         d_state_diagnostics: None,
+        memory_cap: None,
         supervisor_restart: None,
     };
 

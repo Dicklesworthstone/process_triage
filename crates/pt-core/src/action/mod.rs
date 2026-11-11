@@ -12,6 +12,7 @@ pub mod freeze;
 mod repro_cpuset;
 
 pub mod dispatch;
+pub mod memory_cap;
 pub mod prechecks;
 pub mod recovery;
 pub mod recovery_tree;
@@ -40,6 +41,9 @@ pub use executor::{
 };
 #[cfg(target_os = "linux")]
 pub use freeze::{is_freeze_available, FreezeActionRunner, FreezeConfig};
+#[cfg(target_os = "linux")]
+pub use memory_cap::MemoryCapActionRunner;
+pub use memory_cap::{observe_memory_cap, plan_memory_cap, MemoryCapPlan, MIN_MEMORY_CAP_BYTES};
 pub use recovery::{plan_recovery, ActionFailure, FailureKind, RecoveryDecision, RetryPolicy};
 pub use renice::{
     ReniceActionRunner, ReniceConfig, ReniceResult, ReniceReversalMetadata, DEFAULT_NICE_VALUE,

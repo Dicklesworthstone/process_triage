@@ -705,6 +705,7 @@ fn cvar_action_strategy() -> impl Strategy<Value = Action> {
         Just(Action::Keep),
         Just(Action::Pause),
         Just(Action::Throttle),
+        Just(Action::CapMemory),
         Just(Action::Renice),
         Just(Action::Restart),
         Just(Action::Kill),
@@ -1673,6 +1674,7 @@ fn dro_action_strategy() -> impl Strategy<Value = Action> {
         Just(Action::Keep),
         Just(Action::Pause),
         Just(Action::Throttle),
+        Just(Action::CapMemory),
         Just(Action::Renice),
         Just(Action::Restart),
         Just(Action::Kill),
@@ -1827,10 +1829,10 @@ proptest! {
     /// is_de_escalation is asymmetric: if a→b is de-escalation, b→a is not.
     #[test]
     fn dro_de_escalation_asymmetric(
-        a_idx in 0usize..6,
-        b_idx in 0usize..6,
+        a_idx in 0usize..7,
+        b_idx in 0usize..7,
     ) {
-        let actions = [Action::Keep, Action::Renice, Action::Pause, Action::Throttle, Action::Restart, Action::Kill];
+        let actions = [Action::Keep, Action::Renice, Action::Pause, Action::Throttle, Action::CapMemory, Action::Restart, Action::Kill];
         let a = actions[a_idx];
         let b = actions[b_idx];
         if is_de_escalation(a, b) {

@@ -2767,6 +2767,7 @@ struct PlanCandidateInput {
     blocked_reasons: Vec<String>,
     parent_identity: Option<ProcessIdentity>,
     supervisor_restart: Option<pt_core::action::SystemdUserServiceBinding>,
+    memory_cap: Option<pt_core::action::memory_cap::MemoryCapPlan>,
 }
 
 #[cfg(feature = "ui")]
@@ -2782,6 +2783,7 @@ impl PlanCandidateInput {
             parent_identity: self.parent_identity.clone(),
             d_state_diagnostics: None,
             supervisor_restart: self.supervisor_restart.clone(),
+            memory_cap: self.memory_cap.clone(),
         }
     }
 }
@@ -4303,10 +4305,19 @@ fn compute_probe_advice(
         let Some(score) = scorer.score(proc, Evidence::from_snapshot(proc)) else {
             continue;
         };
+        let (mut feasibility, _) = candidate_action_capabilities(proc, &score);
+        // Match the interactive action set: TUI batches cannot persist the
+        // immutable cap plan needed for a durable apply/undo receipt.
+        feasibility
+            .disabled
+            .push(pt_core::decision::DisabledAction {
+                action: Action::CapMemory,
+                reason: "memory caps require the saved agent plan/apply/undo workflow".to_string(),
+            });
         let Ok(inputs) = prepare_pressure_decision(
             &score.posterior.posterior,
             policy,
-            &candidate_feasibility(proc, &score),
+            &feasibility,
             &pressure.for_process(proc, score.activity.as_ref()),
         ) else {
             continue;
@@ -4949,7 +4960,15 @@ fn build_tui_rows(
         let posterior_result = &score.posterior;
         let cpu_percent = process_cpu_percent(proc, score.activity.as_ref());
         let cpu_host_percent = pressure.cpu_goal_percent(proc, score.activity.as_ref());
-        let feasibility = candidate_feasibility(proc, &score);
+        let (mut feasibility, memory_cap) = candidate_action_capabilities(proc, &score);
+        // Interactive batches append to the saved plan. They do not yet retain
+        // the immutable plan binding required for a durable memory-cap receipt.
+        feasibility
+            .disabled
+            .push(pt_core::decision::DisabledAction {
+                action: Action::CapMemory,
+                reason: "memory caps require the saved agent plan/apply/undo workflow".to_string(),
+            });
         let inputs = match prepare_pressure_decision(
             &posterior_result.posterior,
             &decision_policy,
@@ -5103,6 +5122,7 @@ fn build_tui_rows(
                 blocked_reasons,
                 parent_identity: parent.map(process_identity_from_record),
                 supervisor_restart: scorer.supervisor_restart_for(proc).cloned(),
+                memory_cap: memory_cap.clone(),
             },
         );
 
@@ -5130,7 +5150,7 @@ fn build_tui_rows(
             .iter()
             .map(|entry| {
                 serde_json::json!({
-                    "action": format!("{:?}", entry.action).to_lowercase(),
+                    "action": entry.action.as_str(),
                     "loss": entry.loss,
                 })
             })
@@ -5149,6 +5169,7 @@ fn build_tui_rows(
                 "work": scorer.workload_diagnosis_for(proc),
                 "supervisor_restart": scorer.supervisor_restart_for(proc),
                 "supervisor_restart_unavailable": scorer.supervisor_restart_unavailable_for(proc),
+                "memory_cap": memory_cap,
                 "memory_mb": memory_mb,
                 "cpu_percent": cpu_percent,
                 "cpu_host_percent": cpu_host_percent,
@@ -5236,6 +5257,23 @@ fn build_tui_rows(
             &decision_policy,
         );
     }
+
+    let preview_candidates: Vec<_> = rows
+        .iter()
+        .filter_map(|row| goal_candidates.get(&row.pid).cloned())
+        .collect();
+    let preview_inputs: HashMap<_, _> = plan_candidates
+        .iter()
+        .map(|(&pid, input)| (pid, input.decision_candidate()))
+        .collect();
+    let preview_plan = build_agent_action_plan(
+        session_id,
+        &decision_policy,
+        &preview_candidates,
+        &preview_inputs,
+        chrono::Utc::now().to_rfc3339(),
+    );
+    pt_core::tui::widgets::apply_plan_preview_to_rows(&mut rows, &preview_plan);
 
     #[cfg(target_os = "linux")]
     let recent_io_baselines =
@@ -7031,6 +7069,7 @@ mod executable_goal_tests {
                     original_zombie_target: None,
                     d_state_diagnostics: None,
                     supervisor_restart: None,
+                    memory_cap: None,
                 }
             })
             .collect();
@@ -7334,8 +7373,13 @@ mod executable_goal_tests {
             ..Default::default()
         };
         for &(pid, bytes) in allocations {
-            let identity = plan.actions.iter().find(|action| action.target.pid.0 == pid)
-                .unwrap().target.clone();
+            let identity = plan
+                .actions
+                .iter()
+                .find(|action| action.target.pid.0 == pid)
+                .unwrap()
+                .target
+                .clone();
             let id = format!("8:1:{pid}");
             disk.processes.push(DiskProcessObservation {
                 identity: identity.clone(),
@@ -7369,8 +7413,17 @@ mod executable_goal_tests {
     #[test]
     fn disk_goal_uses_exclusive_allocations_on_the_selected_filesystem() {
         let goal = parse_goal("free-disk 4096B on /data").unwrap();
-        let (mut candidates, mut plan) = fixture(&[(100, 1, 0.0), (200, 1, 0.0), (300, 1, 0.0), (400, 1, 0.0)]);
-        let mut resources = disk_resources(&plan, &[(100, 4096), (200, 16 * MIB), (300, 32 * MIB), (400, 64 * MIB)]);
+        let (mut candidates, mut plan) =
+            fixture(&[(100, 1, 0.0), (200, 1, 0.0), (300, 1, 0.0), (400, 1, 0.0)]);
+        let mut resources = disk_resources(
+            &plan,
+            &[
+                (100, 4096),
+                (200, 16 * MIB),
+                (300, 32 * MIB),
+                (400, 64 * MIB),
+            ],
+        );
         let disk = resources.disk.as_mut().unwrap();
         disk.files[1].holders.push(plan.actions[2].target.clone());
         // The other holder is useful/review-only, so its own private files
@@ -7384,25 +7437,48 @@ mod executable_goal_tests {
         disk.mounts.push(other_mount);
         attach_goal_resource_observations(&mut candidates, &resources);
         let output = finalize_goal_action_plan(
-            Some(&goal), f64::NAN, &mut candidates, &mut plan, &resources, &[], false,
-        ).unwrap();
+            Some(&goal),
+            f64::NAN,
+            &mut candidates,
+            &mut plan,
+            &resources,
+            &[],
+            false,
+        )
+        .unwrap();
         assert!(output.result.feasible);
         assert_eq!(output.selected_pids, [100]);
         assert_eq!(output.result.total_contributions, [4096.0]);
         assert_eq!(plan.actions.len(), 1);
         assert_eq!(plan.actions[0].target.pid.0, 100);
-        assert_eq!(candidates[1]["goal_resources"]["disk"]["exclusive_deleted_allocated_bytes"], 0);
-        assert_eq!(candidates[3]["goal_resources"]["disk"]["exclusive_deleted_allocated_bytes"], 0);
+        assert_eq!(
+            candidates[1]["goal_resources"]["disk"]["exclusive_deleted_allocated_bytes"],
+            0
+        );
+        assert_eq!(
+            candidates[3]["goal_resources"]["disk"]["exclusive_deleted_allocated_bytes"],
+            0
+        );
         assert_eq!(candidates[2]["recommended_action"], "review");
         let summary = goal_summary_json("free-disk 4096B on /data", &goal, &output);
         assert_eq!(summary["targets"][0]["unit"], "bytes");
-        assert_eq!(summary["resource_observations"]["disk"]["guaranteed_recovery"], false);
+        assert_eq!(
+            summary["resource_observations"]["disk"]["guaranteed_recovery"],
+            false
+        );
     }
 
     #[test]
     fn disk_unknown_evidence_never_saves_unrelated_kills() {
         let goal = parse_goal("free-disk 1MB on /data").unwrap();
-        for case in ["census", "holders", "allocation", "identity", "capacity", "mount"] {
+        for case in [
+            "census",
+            "holders",
+            "allocation",
+            "identity",
+            "capacity",
+            "mount",
+        ] {
             let (mut candidates, mut plan) = fixture(&[(100, 1000, 90.0)]);
             let mut resources = disk_resources(&plan, &[(100, 10 * MIB)]);
             match case {
@@ -7415,7 +7491,13 @@ mod executable_goal_tests {
                 _ => unreachable!(),
             }
             if let Ok(output) = finalize_goal_action_plan(
-                Some(&goal), 90.0, &mut candidates, &mut plan, &resources, &[], false,
+                Some(&goal),
+                90.0,
+                &mut candidates,
+                &mut plan,
+                &resources,
+                &[],
+                false,
             ) {
                 assert!(!output.result.feasible, "{case}");
                 assert!(output.selected_pids.is_empty(), "{case}");
@@ -7460,7 +7542,10 @@ mod executable_goal_tests {
         assert!(output.result.feasible);
         assert_eq!(output.selected_pids, [100]);
         assert_eq!(output.goals[0].resource, "memory_mb");
-        assert!(output.warnings.iter().any(|warning| warning.starts_with("disk_branch_unavailable:")));
+        assert!(output
+            .warnings
+            .iter()
+            .any(|warning| warning.starts_with("disk_branch_unavailable:")));
     }
 
     #[test]
@@ -7470,30 +7555,59 @@ mod executable_goal_tests {
         let (mut candidates, mut plan) = fixture(&[(100, 1, 0.0)]);
         let mut resources = disk_resources(&plan, &[(100, 4096)]);
         let output = finalize_goal_action_plan(
-            Some(&goal), f64::NAN, &mut candidates, &mut plan, &resources, &[], false,
-        ).unwrap();
+            Some(&goal),
+            f64::NAN,
+            &mut candidates,
+            &mut plan,
+            &resources,
+            &[],
+            false,
+        )
+        .unwrap();
         let snapshot = build_resource_predictions(
-            &plan, &resources, &PlanningPressure::default(),
-            PlanningResourceTimes { disk_unix_ms: Some(1000), ..Default::default() },
+            &plan,
+            &resources,
+            &PlanningPressure::default(),
+            PlanningResourceTimes {
+                disk_unix_ms: Some(1000),
+                ..Default::default()
+            },
             |_| None,
-        ).unwrap();
+        )
+        .unwrap();
         let mut document = serde_json::to_value(&plan).unwrap();
         document["resource_predictions"] = serde_json::to_value(snapshot).unwrap();
         document["goal_summary"] = goal_summary_json(goal_str, &goal, &output);
-        let saved = saved_resource_predictions(&document, &plan).unwrap().unwrap();
+        let saved = saved_resource_predictions(&document, &plan)
+            .unwrap()
+            .unwrap();
         resources.disk.as_mut().unwrap().files[0].allocated_bytes = Some(900 * MIB);
-        let expected = ExpectedGoalContribution::from_saved(&plan.actions[0], Some(&saved), "worker".into());
+        let expected =
+            ExpectedGoalContribution::from_saved(&plan.actions[0], Some(&saved), "worker".into());
         assert_eq!(expected.disk_bytes, Some(4096.0));
-        let mount = saved_disk_goal_mount(&document, Some(&saved), &[&plan.actions[0]]).unwrap().unwrap();
+        let mount = saved_disk_goal_mount(&document, Some(&saved), &[&plan.actions[0]])
+            .unwrap()
+            .unwrap();
         assert_eq!(expected.disk_mount, Some(mount));
-        document["goal_summary"]["resource_observations"]["disk"]["mount"]["identity"]["mount_id"] = serde_json::json!(999);
+        document["goal_summary"]["resource_observations"]["disk"]["mount"]["identity"]
+            ["mount_id"] = serde_json::json!(999);
         assert!(saved_disk_goal_mount(&document, Some(&saved), &[&plan.actions[0]]).is_err());
         document.as_object_mut().unwrap().remove("goal_summary");
         assert!(saved_disk_goal_mount(&document, Some(&saved), &[&plan.actions[0]]).is_err());
-        assert!(saved_disk_goal_mount(&serde_json::json!({}), None, &[&plan.actions[0]]).unwrap().is_none());
+        assert!(
+            saved_disk_goal_mount(&serde_json::json!({}), None, &[&plan.actions[0]])
+                .unwrap()
+                .is_none()
+        );
         let mut changed_action = plan.actions[0].clone();
         changed_action.target.uid += 1;
-        assert!(ExpectedGoalContribution::from_saved(&changed_action, Some(&saved), "changed".into()).disk_bytes.is_none());
+        assert!(ExpectedGoalContribution::from_saved(
+            &changed_action,
+            Some(&saved),
+            "changed".into()
+        )
+        .disk_bytes
+        .is_none());
     }
 
     #[test]
@@ -17615,6 +17729,7 @@ mod process_tree_safety_tests {
                             blocked_reasons: Vec::new(),
                             parent_identity: None,
                             supervisor_restart: None,
+                            memory_cap: None,
                         },
                     );
                     fixture.rows.push(ProcessRow {
@@ -17833,6 +17948,7 @@ mod process_tree_safety_tests {
                 parent_identity: None,
                 d_state_diagnostics: None,
                 supervisor_restart: None,
+                memory_cap: None,
             },
         )]
         .into_iter()
@@ -18345,6 +18461,7 @@ mod process_tree_safety_tests {
                         parent_identity: None,
                         d_state_diagnostics: None,
                         supervisor_restart: None,
+                        memory_cap: None,
                     },
                 )
             })
@@ -18430,6 +18547,7 @@ mod process_tree_safety_tests {
                         blocked_reasons: Vec::new(),
                         parent_identity: None,
                         supervisor_restart: None,
+                        memory_cap: None,
                     },
                 )
             })
@@ -18493,6 +18611,7 @@ mod process_tree_safety_tests {
                         blocked_reasons: Vec::new(),
                         parent_identity: None,
                         supervisor_restart: None,
+                        memory_cap: None,
                     },
                 )
             })
@@ -18732,6 +18851,7 @@ mod process_tree_safety_tests {
                         parent_identity: None,
                         d_state_diagnostics: None,
                         supervisor_restart: None,
+                        memory_cap: None,
                     },
                 )
             })
@@ -18813,6 +18933,7 @@ mod process_tree_safety_tests {
                             .then(|| process_identity_from_record(&parent)),
                         d_state_diagnostics: None,
                         supervisor_restart: None,
+                        memory_cap: None,
                     },
                 )
             })
@@ -19749,6 +19870,7 @@ mod process_tree_safety_tests {
                     blocked_reasons: Vec::new(),
                     parent_identity: None,
                     supervisor_restart: None,
+                    memory_cap: None,
                 },
             )]);
             let plan =
@@ -19974,6 +20096,7 @@ mod process_tree_safety_tests {
                         parent_identity: None,
                         d_state_diagnostics: None,
                         supervisor_restart: None,
+                        memory_cap: None,
                     },
                 )
             })
@@ -20663,6 +20786,7 @@ mod tui_learning_tests {
             original_zombie_target: None,
             d_state_diagnostics: None,
             supervisor_restart: None,
+            memory_cap: None,
         }
     }
 
@@ -22053,10 +22177,11 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                 continue;
             };
             let posterior = &score.posterior.posterior;
+            let (feasibility, memory_cap) = candidate_action_capabilities(proc, &score);
             let inputs = match prepare_pressure_decision(
                 posterior,
                 &decision_policy,
-                &candidate_feasibility(proc, &score),
+                &feasibility,
                 &pressure.for_process(proc, score.activity.as_ref()),
             ) {
                 Ok(inputs) => inputs,
@@ -22068,6 +22193,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                     "start_id": proc.start_id,
                     "uid": proc.uid,
                     "decision": inputs.report,
+                    "memory_cap": memory_cap,
                     "responsible_unit": responsible_unit_summary(
                         responsible_units.as_ref().and_then(|table| table.unit_for(proc)),
                     ),
@@ -22125,6 +22251,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                 "work": score.work,
                 "supervisor_restart": score.supervisor_restart,
                 "supervisor_restart_unavailable": score.supervisor_restart_unavailable,
+                "memory_cap": memory_cap,
             }));
             persisted_inference_records.push(PersistedInference {
                 pid: proc.pid.0,
@@ -22645,7 +22772,7 @@ impl PlanningPressure {
             unavailable.push("CPU share requires a matching measured activity window and observed online CPU capacity".to_string());
         }
         // RSS is an observed share of resident demand, not uniquely reclaimable
-        // memory. Reversible CPU controls receive no memory-relief credit.
+        // memory. A soft cap's modeled benefit is not a measured byte recovery.
         let rss = activity
             .and_then(|sample| sample.pressure.as_ref())
             .filter(|pressure| pressure.memory_error.is_none())
@@ -22684,7 +22811,16 @@ fn candidate_pressure_relief(candidate: &serde_json::Value) -> f64 {
     if report["applied"] != true
         || !matches!(
             action,
-            Some("renice" | "pause" | "freeze" | "throttle" | "quarantine" | "kill" | "restart")
+            Some(
+                "renice"
+                    | "pause"
+                    | "freeze"
+                    | "throttle"
+                    | "cap_memory"
+                    | "quarantine"
+                    | "kill"
+                    | "restart"
+            )
         )
         || action != report["chosen_action"].as_str()
     {
@@ -23632,10 +23768,15 @@ fn filter_planning_scan(
     filter.filter_scan_result_with_restarts(scan, |process| scorer.supervisor_restart_for(process))
 }
 
-fn candidate_feasibility(
+/// Keep the exact memory controller observation that admitted the action. The
+/// saved plan must not invent a different byte limit when it is later applied.
+fn candidate_action_capabilities(
     proc: &ProcessRecord,
     score: &pt_core::scoring::ProcessScore<'_>,
-) -> ActionFeasibility {
+) -> (
+    ActionFeasibility,
+    Option<pt_core::action::memory_cap::MemoryCapPlan>,
+) {
     let mut feasibility = pt_core::action::planning_action_feasibility_with_restart(
         &process_identity_from_record(proc),
         proc.state,
@@ -23648,7 +23789,23 @@ fn candidate_feasibility(
             }
         }
     }
-    feasibility
+    let memory_cap = if feasibility.is_allowed(Action::CapMemory) {
+        match pt_core::action::memory_cap::plan_memory_cap(&process_identity_from_record(proc)) {
+            Ok(cap) => Some(cap),
+            Err(error) => {
+                feasibility
+                    .disabled
+                    .push(pt_core::decision::DisabledAction {
+                        action: Action::CapMemory,
+                        reason: format!("memory cap unavailable: {error}"),
+                    });
+                None
+            }
+        }
+    } else {
+        None
+    };
+    (feasibility, memory_cap)
 }
 
 /// Select the process whose writable-file evidence the proposed remedy needs.
@@ -23831,6 +23988,7 @@ fn candidate_recommendation(
         Action::Freeze => "freeze",
         Action::Unfreeze => "unfreeze",
         Action::Throttle => "throttle",
+        Action::CapMemory => "cap_memory",
         Action::Quarantine => "quarantine",
         Action::Unquarantine => "unquarantine",
         Action::Restart => "restart",
@@ -23932,7 +24090,14 @@ fn workload_preservation_refusal(
     if !builtin_protection
         || !matches!(
             action,
-            "kill" | "restart" | "pause" | "freeze" | "renice" | "throttle" | "quarantine"
+            "kill"
+                | "restart"
+                | "pause"
+                | "freeze"
+                | "renice"
+                | "throttle"
+                | "cap_memory"
+                | "quarantine"
         )
     {
         return None;
@@ -24768,7 +24933,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
 
         // Apply state-based feasibility constraints so decisioning does not
         // recommend fundamentally invalid actions (e.g., kill for zombie/D-state).
-        let feasibility = candidate_feasibility(proc, &score);
+        let (feasibility, memory_cap) = candidate_action_capabilities(proc, &score);
 
         // The action and any further-probe advice use the same process-specific
         // loss model and evidence-only eligibility for destructive actions.
@@ -24990,7 +25155,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             .iter()
             .map(|el| {
                 serde_json::json!({
-                    "action": format!("{:?}", el.action),
+                    "action": el.action.as_str(),
                     "loss": el.loss,
                 })
             })
@@ -25024,6 +25189,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             "work": scorer.workload_diagnosis_for(proc),
             "supervisor_restart": scorer.supervisor_restart_for(proc),
             "supervisor_restart_unavailable": scorer.supervisor_restart_unavailable_for(proc),
+            "memory_cap": memory_cap,
             "resource_observation": resource_observation,
             "score": score,
             "classification": ledger.classification.label(),
@@ -25070,7 +25236,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             },
             "reversibility": match decision_outcome.optimal_action {
                 Action::Kill | Action::Restart => "irreversible",
-                Action::Renice | Action::Pause | Action::Freeze | Action::Throttle | Action::Quarantine => "reversible",
+                Action::Renice | Action::Pause | Action::Freeze | Action::Throttle | Action::CapMemory | Action::Quarantine => "reversible",
                 Action::Resume | Action::Unfreeze | Action::Unquarantine => "reversal",
                 Action::Keep => "no_action",
             },
@@ -25258,6 +25424,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 parent_identity: parent.map(process_identity_from_record),
                 d_state_diagnostics: None,
                 supervisor_restart: scorer.supervisor_restart_for(proc).cloned(),
+                memory_cap,
             },
         );
         all_candidates.push((
@@ -27100,10 +27267,10 @@ fn saved_disk_goal_mount(
         })
         .transpose()?;
     for action in actions {
-        if let Some(disk) = predictions
+        if predictions
             .and_then(|predictions| predictions.for_action(action))
             .and_then(|prediction| prediction.disk.as_ref())
-            && mount.as_ref() != Some(&disk.mount)
+            .is_some_and(|disk| mount.as_ref() != Some(&disk.mount))
         {
             return Err("saved disk forecast and goal filesystem disagree".into());
         }
@@ -29586,6 +29753,7 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
                     | Action::Freeze
                     | Action::Unfreeze
                     | Action::Throttle
+                    | Action::CapMemory
                     | Action::Quarantine
             ) || (action.action == Action::Renice && !cfg!(target_os = "linux"))
             {
@@ -30569,12 +30737,17 @@ fn run_agent_undo(global: &GlobalOpts, args: &AgentUndoArgs) -> ExitCode {
     output["records"] = serde_json::json!(&records);
     if !matches!(
         action.action,
-        Action::Renice | Action::Freeze | Action::Unfreeze | Action::Throttle | Action::Quarantine
+        Action::Renice
+            | Action::Freeze
+            | Action::Unfreeze
+            | Action::Throttle
+            | Action::CapMemory
+            | Action::Quarantine
     ) {
         return refuse(
             output,
             "unsupported_action",
-            "durable undo currently supports Linux per-thread renice and cgroup-v2 freeze, unfreeze, CPU throttle and cpuset quarantine"
+            "durable undo currently supports Linux per-thread renice and cgroup-v2 freeze, unfreeze, CPU throttle, memory.high caps and cpuset quarantine"
                 .to_string(),
             ExitCode::PolicyBlocked,
         );
@@ -32926,10 +33099,11 @@ fn evaluate_watch_candidate(
     pressure: &PlanningPressure,
 ) -> Option<WatchEval> {
     let score = scorer.score(proc, Evidence::from_snapshot(proc))?;
+    let (feasibility, memory_cap) = candidate_action_capabilities(proc, &score);
     let inputs = prepare_pressure_decision(
         &score.posterior.posterior,
         policy,
-        &candidate_feasibility(proc, &score),
+        &feasibility,
         &pressure.for_process(proc, score.activity.as_ref()),
     )
     .ok()?;
@@ -32999,6 +33173,7 @@ fn evaluate_watch_candidate(
             "work": score.work,
             "supervisor_restart": score.supervisor_restart,
             "supervisor_restart_unavailable": score.supervisor_restart_unavailable,
+            "memory_cap": memory_cap,
             "cpu_percent": process_cpu_percent(proc, score.activity.as_ref()),
             "cpu_lifetime_percent": proc.cpu_percent,
             "probability_basis": probability_basis,
@@ -33181,6 +33356,7 @@ mod workload_diagnostics_tests {
                     parent_identity: None,
                     d_state_diagnostics: None,
                     supervisor_restart: None,
+                    memory_cap: None,
                 },
             )]);
             let plan = build_agent_action_plan(

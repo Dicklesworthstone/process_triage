@@ -185,6 +185,30 @@ pub enum ActionPostcondition {
 /// Controller observations bind both process identity and cgroup membership around
 /// their reads. Verifying a configured effect does not establish resource relief.
 pub fn observe_live_postcondition(action: &PlanAction) -> ActionPostcondition {
+    if action.action == Action::CapMemory {
+        let Some(plan) = action.memory_cap.as_ref() else {
+            return ActionPostcondition::Unavailable {
+                reason: "Memory cap has no saved limit and scope binding".to_string(),
+            };
+        };
+        return match crate::action::memory_cap::observe_memory_cap(&action.target, plan) {
+            Ok(observed) if observed == Some(plan.limit_bytes) => ActionPostcondition::Satisfied {
+                detail: format!(
+                    "The original isolated cgroup has the planned memory.high = {} bytes. This soft cap does not establish memory reclaimed or workload health",
+                    plan.limit_bytes,
+                ),
+            },
+            Ok(observed) => ActionPostcondition::NotSatisfied {
+                detail: format!(
+                    "Observed memory.high = {}, expected {} bytes in the planned cgroup",
+                    observed.map_or_else(|| "max".to_string(), |bytes| bytes.to_string()),
+                    plan.limit_bytes,
+                ),
+            },
+            Err(crate::action::ActionError::IdentityMismatch) => ActionPostcondition::IdentityChanged,
+            Err(error) => ActionPostcondition::Unavailable { reason: error.to_string() },
+        };
+    }
     if action.action == Action::Restart && action.routing == crate::plan::ActionRouting::Supervisor
     {
         #[cfg(target_os = "linux")]
@@ -725,6 +749,29 @@ pub fn parse_agent_plan(content: &str) -> Result<Plan, VerifyError> {
                 "missing target identity".to_string(),
             ));
         }
+        if action.action == Action::CapMemory {
+            let cap = action.memory_cap.as_ref().ok_or_else(|| {
+                VerifyError::InvalidPlan(
+                    "memory cap is missing its planned limit and scope".to_string(),
+                )
+            })?;
+            cap.validate(&action.target).map_err(|error| {
+                VerifyError::InvalidPlan(format!("invalid memory cap binding: {error}"))
+            })?;
+            if action.routing != crate::plan::ActionRouting::Direct
+                || action.original_zombie_target.is_some()
+                || action.supervisor_restart.is_some()
+            {
+                return Err(VerifyError::InvalidPlan(
+                    "memory cap requires a direct target without zombie or supervisor rerouting"
+                        .to_string(),
+                ));
+            }
+        } else if action.memory_cap.is_some() {
+            return Err(VerifyError::InvalidPlan(
+                "memory cap binding is attached to a different action".to_string(),
+            ));
+        }
     }
     Ok(plan)
 }
@@ -1121,7 +1168,7 @@ pub fn verify_plan_with_postconditions(
                         .and_then(|command| command.split_whitespace().next().map(str::to_string)),
                     cmd_full: command.cloned(),
                 },
-                action: format!("{:?}", action.action).to_lowercase(),
+                action: action.action.as_str().to_string(),
                 outcome: VerifyOutcome::Unsupported,
                 time_to_death_ms: None,
                 expected_resources_freed: None,
@@ -1221,6 +1268,7 @@ pub fn verify_plan_with_postconditions(
                     | Action::Freeze
                     | Action::Unfreeze
                     | Action::Throttle
+                    | Action::CapMemory
                     | Action::Quarantine,
                     Some(process),
                 ) if process.start_id != action.target.start_id
@@ -1263,6 +1311,7 @@ pub fn verify_plan_with_postconditions(
                     | Action::Freeze
                     | Action::Unfreeze
                     | Action::Throttle
+                    | Action::CapMemory
                     | Action::Quarantine,
                     Some(process),
                 ) if !matches!(
@@ -1278,6 +1327,7 @@ pub fn verify_plan_with_postconditions(
                                 Action::Freeze => "freeze_verified",
                                 Action::Unfreeze => "thaw_verified",
                                 Action::Throttle => "cpu_limit_verified",
+                                Action::CapMemory => "memory_high_verified",
                                 Action::Quarantine => "cpu_confinement_verified",
                                 _ => unreachable!(),
                             },
@@ -1290,6 +1340,7 @@ pub fn verify_plan_with_postconditions(
                                 Action::Freeze => "not_frozen",
                                 Action::Unfreeze => "still_frozen",
                                 Action::Throttle => "cpu_limit_not_adjusted",
+                                Action::CapMemory => "memory_high_not_adjusted",
                                 Action::Quarantine => "cpu_confinement_not_adjusted",
                                 _ => unreachable!(),
                             },
@@ -1316,6 +1367,7 @@ pub fn verify_plan_with_postconditions(
                                         Action::Freeze | Action::Unfreeze,
                                         RestorationValue::Freeze { .. }
                                     ) | (Action::Throttle, RestorationValue::CpuMax { .. })
+                                        | (Action::CapMemory, RestorationValue::MemoryHigh { .. })
                                         | (Action::Quarantine, RestorationValue::Cpuset { .. })
                                         | (
                                             Action::Renice,
@@ -1444,7 +1496,7 @@ pub fn verify_plan_with_postconditions(
                     .and_then(|command| command.split_whitespace().next().map(str::to_string)),
                 cmd_full: command.cloned(),
             },
-            action: format!("{:?}", action.action).to_lowercase(),
+            action: action.action.as_str().to_string(),
             outcome,
             time_to_death_ms: None,
             expected_resources_freed: if verified && action.action == Action::Kill {
@@ -1471,6 +1523,7 @@ pub fn verify_plan_with_postconditions(
                         Action::Freeze => "cgroup_freeze_requested_and_completed",
                         Action::Unfreeze => "cgroup_thaw_requested_and_completed",
                         Action::Throttle => "default_cpu_bandwidth_ceiling",
+                        Action::CapMemory => "exact_planned_memory_high_soft_cap",
                         Action::Quarantine => "nonempty_effective_cpu_confinement",
                         Action::Restart
                             if action.routing == crate::plan::ActionRouting::Supervisor =>
@@ -1593,6 +1646,7 @@ mod tests {
             original_zombie_target: None,
             d_state_diagnostics: None,
             supervisor_restart: None,
+            memory_cap: None,
         }
     }
 
@@ -1610,6 +1664,114 @@ mod tests {
                 pre_toggled_actions: 0,
             },
             actions,
+        }
+    }
+
+    fn memory_cap_action() -> PlanAction {
+        let mut action = make_action(123, Action::CapMemory);
+        let boot = "11111111-2222-4333-8444-555555555555";
+        action.target.start_id = StartId::from_linux(boot, 500, 123);
+        action.memory_cap = Some(crate::action::MemoryCapPlan {
+            target: action.target.clone(),
+            scope: crate::action::reversal::ReversalScope {
+                cgroup_path: "/owned-leaf".to_string(),
+                device: 1,
+                inode: 2,
+                mount_id: 3,
+                boot_id: boot.to_string(),
+                mount_namespace_device: 4,
+                mount_namespace_inode: 5,
+                cgroup_namespace_device: 4,
+                cgroup_namespace_inode: 6,
+            },
+            limit_bytes: 180 * 1024 * 1024,
+            observed_high_bytes: None,
+            observed_current_bytes: 200 * 1024 * 1024,
+            observed_low_bytes: 0,
+            observed_min_bytes: 0,
+            page_size_bytes: 4096,
+        });
+        action
+    }
+
+    #[test]
+    fn canonical_plan_rejects_missing_modified_and_misrouted_memory_caps() {
+        let action = memory_cap_action();
+        let valid = make_plan(vec![action]);
+        let decoded = parse_agent_plan(&serde_json::to_string(&valid).unwrap()).unwrap();
+        assert_eq!(decoded.actions[0].memory_cap, valid.actions[0].memory_cap);
+        for defect in [
+            "missing",
+            "limit",
+            "identity",
+            "route",
+            "zombie",
+            "other_action",
+        ] {
+            let mut changed = valid.clone();
+            let action = &mut changed.actions[0];
+            match defect {
+                "missing" => action.memory_cap = None,
+                "limit" => action.memory_cap.as_mut().unwrap().limit_bytes = 1,
+                "identity" => action.memory_cap.as_mut().unwrap().target.uid += 1,
+                "route" => action.routing = ActionRouting::ZombieToParent,
+                "zombie" => action.original_zombie_target = Some(action.target.clone()),
+                _ => action.action = Action::Kill,
+            }
+            let error = parse_agent_plan(&serde_json::to_string(&changed).unwrap()).unwrap_err();
+            assert!(
+                error.to_string().contains("memory cap"),
+                "{defect}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_cap_verification_distinguishes_configuration_from_memory_recovery() {
+        let action = memory_cap_action();
+        let saved = execution(&action);
+        let mut current = make_proc(123, 1000, "worker", 5, ProcessState::Sleeping);
+        current.start_id = action.target.start_id.clone();
+        let plan = make_plan(vec![action]);
+        for (observation, expected, actual) in [
+            (
+                ActionPostcondition::Satisfied {
+                    detail: "planned soft cap observed; usage may still exceed it".to_string(),
+                },
+                VerifyOutcome::ConfirmedEffect,
+                "memory_high_verified",
+            ),
+            (
+                ActionPostcondition::NotSatisfied {
+                    detail: "memory.high is now max".to_string(),
+                },
+                VerifyOutcome::EffectNotObserved,
+                "memory_high_not_adjusted",
+            ),
+            (
+                ActionPostcondition::Unavailable {
+                    reason: "cgroup changed".to_string(),
+                },
+                VerifyOutcome::Unsupported,
+                "observation_unavailable",
+            ),
+        ] {
+            let report = verify_plan_with_postconditions(
+                &plan,
+                std::slice::from_ref(&saved),
+                std::slice::from_ref(&current),
+                DateTime::from_timestamp(30, 0).unwrap(),
+                DateTime::from_timestamp(31, 0).unwrap(),
+                |_| observation.clone(),
+                None,
+            )
+            .unwrap();
+            let outcome = &report.action_outcomes[0];
+            assert_eq!(outcome.action, "cap_memory");
+            assert_eq!(outcome.outcome, expected);
+            assert_eq!(outcome.actual.as_deref(), Some(actual));
+            assert!(outcome.expected_resources_freed.is_none());
+            assert!(report.resource_summary.is_none());
         }
     }
 
@@ -1999,10 +2161,7 @@ mod tests {
 
     #[test]
     fn failed_attempts_remain_visible_without_claiming_effects_or_resource_relief() {
-        let plan = make_plan(vec![
-            make_action(123, Action::Kill),
-            make_action(456, Action::Kill),
-        ]);
+        let plan = make_plan(vec![memory_cap_action(), make_action(456, Action::Kill)]);
         for status in [
             "failed",
             "timeout",
@@ -2043,6 +2202,7 @@ mod tests {
                 assert_eq!(outcome.target.pid, action.target.pid.0);
                 assert_eq!(outcome.target.uid, action.target.uid);
                 assert_eq!(outcome.target.start_id, action.target.start_id.0);
+                assert_eq!(outcome.action, action.action.as_str());
                 assert_eq!(outcome.outcome, VerifyOutcome::Unsupported);
                 assert_eq!(outcome.actual.as_deref(), Some("failed_attempt"));
                 assert_eq!(outcome.verified, Some(false));
@@ -2055,6 +2215,7 @@ mod tests {
             }
             assert!(verified.resource_summary.is_none());
             let json = serde_json::to_value(&verified).unwrap();
+            assert_eq!(json["action_outcomes"][0]["action"], "cap_memory");
             assert_eq!(json["action_outcomes"][0]["outcome"], "unsupported");
             assert_eq!(json["action_outcomes"][0]["actual"], "failed_attempt");
             assert!(json["action_outcomes"][0].get("respawn_detected").is_none());
@@ -2676,6 +2837,7 @@ mod tests {
                     quota_us: -1,
                     period_us: 100_000,
                 },
+                Action::CapMemory => RestorationValue::MemoryHigh { limit_bytes: None },
                 Action::Unfreeze => RestorationValue::Freeze { requested: true },
                 Action::Quarantine => RestorationValue::Cpuset {
                     cpus: String::new(),
@@ -2703,6 +2865,7 @@ mod tests {
             Action::Freeze,
             Action::Unfreeze,
             Action::Throttle,
+            Action::CapMemory,
             Action::Quarantine,
         ] {
             let action = make_action(123, action_kind);
@@ -2725,7 +2888,7 @@ mod tests {
             let outcome = &result.action_outcomes[0];
             assert_eq!(outcome.outcome, VerifyOutcome::ConfirmedRestored);
             assert_eq!(outcome.verified, Some(true));
-            assert_eq!(outcome.action, format!("{action_kind:?}").to_lowercase());
+            assert_eq!(outcome.action, action_kind.as_str());
             assert_eq!(
                 outcome.expected.as_deref(),
                 Some(if action_kind == Action::Renice {

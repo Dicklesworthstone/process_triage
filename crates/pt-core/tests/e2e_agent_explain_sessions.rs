@@ -97,6 +97,7 @@ fn create_session_with_plan(_dir: &TempDir, identity: ProcessIdentity, blocked: 
             confidence: ActionConfidence::Normal,
             original_zombie_target: None,
             d_state_diagnostics: None,
+            memory_cap: None,
             supervisor_restart: None,
         }],
         pre_toggled: Vec::new(),

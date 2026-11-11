@@ -11,6 +11,7 @@ use super::renice::{ReniceReversalMetadata, ReniceThreadReversal};
 use crate::decision::Action;
 use crate::plan::{ActionRouting, PlanAction};
 use pt_common::ProcessIdentity;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -64,6 +65,10 @@ pub enum ReversalValue {
         quota_us: i64,
         period_us: u64,
     },
+    /// `None` records the kernel's unlimited `max` value.
+    MemoryHigh {
+        limit_bytes: Option<u64>,
+    },
     /// Canonical requested CPU list. Empty preserves inheritance from the
     /// parent; effective CPUs are observed afresh and are never written.
     Cpuset {
@@ -78,6 +83,7 @@ impl ReversalValue {
             (self, other),
             (Self::Freeze { .. }, Self::Freeze { .. })
                 | (Self::CpuMax { .. }, Self::CpuMax { .. })
+                | (Self::MemoryHigh { .. }, Self::MemoryHigh { .. })
                 | (Self::Cpuset { .. }, Self::Cpuset { .. })
         )
     }
@@ -105,6 +111,7 @@ impl ReversalValue {
         match self {
             Self::Freeze { .. } => "cgroup.freeze",
             Self::CpuMax { .. } => "cpu.max",
+            Self::MemoryHigh { .. } => "memory.high",
             Self::Cpuset { .. } => "cpuset.cpus",
         }
     }
@@ -123,6 +130,9 @@ impl ReversalValue {
                     quota_us.to_string()
                 }
             ),
+            Self::MemoryHigh { limit_bytes } => {
+                limit_bytes.map_or_else(|| "max".to_string(), |limit| limit.to_string())
+            }
             // A zero-byte write cannot clear a kernfs cpuset assignment.
             Self::Cpuset { cpus } => format!("{cpus}\n"),
         }
@@ -130,7 +140,7 @@ impl ReversalValue {
 }
 
 /// A pathname alone is not an identity and is never sufficient for restoration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReversalScope {
     pub cgroup_path: String,
@@ -171,6 +181,7 @@ pub enum ReversalOperation {
 pub enum RestorationValue {
     Freeze { requested: bool },
     CpuMax { quota_us: i64, period_us: u64 },
+    MemoryHigh { limit_bytes: Option<u64> },
     Cpuset { cpus: String },
     ThreadPriorities { threads: Vec<ReniceThreadReversal> },
 }
@@ -187,6 +198,7 @@ impl From<ReversalValue> for RestorationValue {
                 period_us,
             },
             ReversalValue::Cpuset { cpus } => Self::Cpuset { cpus },
+            ReversalValue::MemoryHigh { limit_bytes } => Self::MemoryHigh { limit_bytes },
         }
     }
 }
@@ -232,6 +244,8 @@ pub struct ReversalRecord {
     pub target: ProcessIdentity,
     pub routing: ActionRouting,
     pub original_zombie_target: Option<ProcessIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_cap: Option<super::memory_cap::MemoryCapPlan>,
     pub operation: ReversalOperation,
     pub status: ReversalStatus,
     pub detail: Option<String>,
@@ -254,6 +268,7 @@ impl ReversalRecord {
             || self.target != action.target
             || self.routing != action.routing
             || self.original_zombie_target != action.original_zombie_target
+            || self.memory_cap != action.memory_cap
             || action.supervisor_restart.is_some()
         {
             return Err(failed(
@@ -370,6 +385,7 @@ impl ReversalJournal {
             Action::Freeze
                 | Action::Unfreeze
                 | Action::Throttle
+                | Action::CapMemory
                 | Action::Quarantine
                 | Action::Renice
         ) {
@@ -621,6 +637,7 @@ impl ReversalJournal {
             target: action.target.clone(),
             routing: action.routing.clone(),
             original_zombie_target: action.original_zombie_target.clone(),
+            memory_cap: action.memory_cap.clone(),
             operation,
             status,
             detail: None,
@@ -788,6 +805,7 @@ fn validate_record(record: &ReversalRecord) -> Result<(), ActionError> {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         || record.restorations.len() > MAX_RESTORATIONS
         || record.routing == ActionRouting::Supervisor
+        || (record.action != Action::CapMemory && record.memory_cap.is_some())
     {
         return Err(failed("invalid or unsupported undo receipt"));
     }
@@ -814,6 +832,7 @@ fn validate_record(record: &ReversalRecord) -> Result<(), ActionError> {
                     (Action::Freeze, ReversalValue::Freeze { requested: true })
                         | (Action::Unfreeze, ReversalValue::Freeze { requested: false })
                         | (Action::Throttle, ReversalValue::CpuMax { .. })
+                        | (Action::CapMemory, ReversalValue::MemoryHigh { .. })
                         | (Action::Quarantine, ReversalValue::Cpuset { .. })
                 )
             {
@@ -853,6 +872,34 @@ fn validate_record(record: &ReversalRecord) -> Result<(), ActionError> {
                         "saved quarantine would expand the requested CPU set",
                     ));
                 }
+            }
+            if let (
+                ReversalValue::MemoryHigh {
+                    limit_bytes: before,
+                },
+                ReversalValue::MemoryHigh {
+                    limit_bytes: applied,
+                },
+            ) = (before, applied)
+            {
+                let plan = record.memory_cap.as_ref().ok_or_else(|| {
+                    failed("memory cap receipt is missing its complete planned binding")
+                })?;
+                plan.validate(&record.target)?;
+                if record.routing != ActionRouting::Direct
+                    || record.original_zombie_target.is_some()
+                    || plan.scope != *scope
+                    || plan.observed_high_bytes != *before
+                    || *applied != Some(plan.limit_bytes)
+                {
+                    return Err(failed(
+                        "memory cap receipt differs from the exact planned control",
+                    ));
+                }
+            } else if record.memory_cap.is_some() {
+                return Err(failed(
+                    "non-memory action contains an unrelated memory cap binding",
+                ));
             }
         }
         ReversalOperation::Renice {
@@ -1489,7 +1536,7 @@ fn mount_id(handle: &File) -> Result<u64, ActionError> {
 
 #[cfg(target_os = "linux")]
 impl ReversalScope {
-    fn capture(cgroup_path: &str, handle: &File) -> Result<Self, ActionError> {
+    pub(crate) fn capture(cgroup_path: &str, handle: &File) -> Result<Self, ActionError> {
         validate_cgroup_path(cgroup_path)?;
         let metadata = handle
             .metadata()
@@ -1534,6 +1581,9 @@ impl ReversalScope {
 
 #[cfg(target_os = "linux")]
 fn restore_live(record: &ReversalRecord) -> Result<bool, ActionError> {
+    if record.memory_cap.is_some() {
+        super::memory_cap::ensure_nonblocking_kernel()?;
+    }
     if let ReversalOperation::Renice { metadata, .. } = &record.operation {
         validate_renice_scope(record)?;
         let changed = super::renice::ReniceActionRunner::with_defaults()
@@ -1552,6 +1602,9 @@ fn restore_live(record: &ReversalRecord) -> Result<bool, ActionError> {
     let handle = open_directory(&directory)?;
     let pinned = pinned_directory(&handle);
     let revalidate = || -> Result<(), ActionError> {
+        if let Some(plan) = &record.memory_cap {
+            super::memory_cap::validate_live_scope(&record.target, plan)?;
+        }
         if super::dispatch::ensure_cgroup_target(&record.target)? != scope.cgroup_path {
             return Err(failed("target changed cgroup during undo"));
         }
@@ -1588,6 +1641,9 @@ fn observe_restored_control(record: &ReversalRecord) -> Result<(), ActionError> 
     let handle = open_directory(&directory)?;
     let pinned = pinned_directory(&handle);
     let revalidate = || -> Result<(), ActionError> {
+        if let Some(plan) = &record.memory_cap {
+            super::memory_cap::validate_live_scope(&record.target, plan)?;
+        }
         if super::dispatch::ensure_cgroup_target(&record.target)? != scope.cgroup_path {
             return Err(failed(
                 "target changed cgroup during restoration observation",
@@ -1676,6 +1732,13 @@ fn observe_original_control_at(
                     ));
                 }
             }
+            ReversalValue::MemoryHigh { .. } => {
+                if read_control(directory, original)? != *original {
+                    return Err(failed(
+                        "current memory.high differs from the recorded original",
+                    ));
+                }
+            }
             ReversalValue::Cpuset { cpus } => {
                 super::cpuset_quarantine::verify_cpuset_assignment(
                     directory,
@@ -1739,6 +1802,10 @@ fn needs_restore(
 
 #[cfg(target_os = "linux")]
 fn read_control(directory: &Path, kind: &ReversalValue) -> Result<ReversalValue, ActionError> {
+    if matches!(kind, ReversalValue::MemoryHigh { .. }) {
+        return super::memory_cap::read_high(directory)
+            .map(|limit_bytes| ReversalValue::MemoryHigh { limit_bytes });
+    }
     if matches!(kind, ReversalValue::Cpuset { .. }) {
         return super::cpuset_quarantine::read_cpuset_assignment(&directory.join("cpuset.cpus"))
             .map(|cpus| ReversalValue::Cpuset { cpus });
@@ -1776,6 +1843,9 @@ fn read_control(directory: &Path, kind: &ReversalValue) -> Result<ReversalValue,
             }
         }
         ReversalValue::Cpuset { .. } => unreachable!("cpuset uses its bounded CPU-list parser"),
+        ReversalValue::MemoryHigh { .. } => {
+            unreachable!("memory.high uses its bounded limit parser")
+        }
     };
     value.validate()?;
     Ok(value)
@@ -1819,8 +1889,13 @@ fn restore_control_at(
         )?;
     }
     if changed {
-        fs::write(directory.join(before.filename()), before.contents())
-            .map_err(|error| failed(format!("cannot restore controller: {error}")))?;
+        if let ReversalValue::MemoryHigh { limit_bytes } = before {
+            super::memory_cap::check_restore_floor(directory, *limit_bytes)?;
+            super::memory_cap::write_memory_high(directory, *limit_bytes)?;
+        } else {
+            fs::write(directory.join(before.filename()), before.contents())
+                .map_err(|error| failed(format!("cannot restore controller: {error}")))?;
+        }
     }
     revalidate()?;
     match before {
@@ -1845,6 +1920,16 @@ fn restore_control_at(
             revalidate()?;
             if read_control(directory, before)? != *before {
                 return Err(failed("restored CPU limit changed during verification"));
+            }
+        }
+        ReversalValue::MemoryHigh { .. } => {
+            for _ in 0..2 {
+                if read_control(directory, before)? != *before {
+                    return Err(failed(
+                        "restored memory.high does not match the saved original",
+                    ));
+                }
+                revalidate()?;
             }
         }
         ReversalValue::Cpuset { cpus } => {
@@ -1898,6 +1983,7 @@ mod tests {
             original_zombie_target: None,
             d_state_diagnostics: None,
             supervisor_restart: None,
+            memory_cap: None,
         }
     }
 
@@ -1961,6 +2047,128 @@ mod tests {
             pid_namespace_device: 1,
             pid_namespace_inode: 2,
         }
+    }
+
+    #[test]
+    fn memory_high_receipts_bind_the_exact_reviewed_limit_and_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = journal(temp.path());
+        let mut action = action(Action::CapMemory);
+        let before = ReversalValue::MemoryHigh { limit_bytes: None };
+        let applied = ReversalValue::MemoryHigh {
+            limit_bytes: Some(180 * 1024 * 1024),
+        };
+        let operation = operation(before, applied);
+        let ReversalOperation::CgroupV2 { scope, .. } = &operation else {
+            unreachable!()
+        };
+        action.memory_cap = Some(super::super::memory_cap::MemoryCapPlan {
+            target: action.target.clone(),
+            scope: scope.clone(),
+            limit_bytes: 180 * 1024 * 1024,
+            observed_high_bytes: None,
+            observed_current_bytes: 200 * 1024 * 1024,
+            observed_low_bytes: 0,
+            observed_min_bytes: 0,
+            page_size_bytes: 4096,
+        });
+        let record = journal
+            .insert(&action, operation, ReversalStatus::Verified)
+            .unwrap();
+        assert_eq!(
+            journal.inspect(&action).unwrap()[0].memory_cap,
+            action.memory_cap
+        );
+        record.check_action(&action).unwrap();
+        let mut changed_action = action.clone();
+        changed_action.memory_cap.as_mut().unwrap().limit_bytes += 4096;
+        assert!(record.check_action(&changed_action).is_err());
+        for changed in ["missing", "cap", "scope", "before", "action"] {
+            let mut changed_record = record.clone();
+            match changed {
+                "missing" => changed_record.memory_cap = None,
+                "cap" => changed_record.memory_cap.as_mut().unwrap().limit_bytes -= 4096,
+                "scope" => changed_record.memory_cap.as_mut().unwrap().scope.inode += 1,
+                "before" => {
+                    if let ReversalOperation::CgroupV2 { before, .. } =
+                        &mut changed_record.operation
+                    {
+                        *before = ReversalValue::MemoryHigh {
+                            limit_bytes: Some(190 * 1024 * 1024),
+                        };
+                    }
+                }
+                _ => changed_record.action = Action::Throttle,
+            }
+            assert!(validate_record(&changed_record).is_err(), "{changed}");
+        }
+    }
+
+    #[test]
+    fn memory_high_undo_restores_exact_limits_without_touching_hard_limits() {
+        for original in [None, Some(200 * 1024 * 1024)] {
+            let directory = tempfile::tempdir().unwrap();
+            let before = ReversalValue::MemoryHigh {
+                limit_bytes: original,
+            };
+            let applied = ReversalValue::MemoryHigh {
+                limit_bytes: Some(180 * 1024 * 1024),
+            };
+            fs::write(directory.path().join("memory.high"), applied.contents()).unwrap();
+            fs::write(directory.path().join("memory.low"), "0\n").unwrap();
+            fs::write(directory.path().join("memory.min"), "0\n").unwrap();
+            fs::write(directory.path().join("memory.max"), "250000000\n").unwrap();
+            assert!(
+                restore_control_at(directory.path(), &before, &applied, 0, true, || Ok(()))
+                    .unwrap()
+            );
+            assert_eq!(read_control(directory.path(), &before).unwrap(), before);
+            assert!(
+                !restore_control_at(directory.path(), &before, &applied, 0, false, || Ok(()))
+                    .unwrap()
+            );
+            observe_original_control_at(directory.path(), &before, || Ok(())).unwrap();
+            assert_eq!(
+                fs::read_to_string(directory.path().join("memory.max")).unwrap(),
+                "250000000\n"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_high_undo_refuses_intervening_changes_and_new_protection() {
+        let directory = tempfile::tempdir().unwrap();
+        let before = ReversalValue::MemoryHigh {
+            limit_bytes: Some(200 * 1024 * 1024),
+        };
+        let applied = ReversalValue::MemoryHigh {
+            limit_bytes: Some(180 * 1024 * 1024),
+        };
+        let high = directory.path().join("memory.high");
+        fs::write(directory.path().join("memory.low"), "0\n").unwrap();
+        fs::write(directory.path().join("memory.min"), "0\n").unwrap();
+        for external in ["max\n", "123456789\n", "broken\n"] {
+            fs::write(&high, external).unwrap();
+            assert!(
+                restore_control_at(directory.path(), &before, &applied, 0, true, || Ok(()))
+                    .is_err()
+            );
+            assert_eq!(fs::read_to_string(&high).unwrap(), external);
+        }
+        fs::write(&high, applied.contents()).unwrap();
+        fs::write(directory.path().join("memory.low"), "250000000\n").unwrap();
+        assert!(
+            restore_control_at(directory.path(), &before, &applied, 0, true, || Ok(())).is_err()
+        );
+        assert_eq!(read_control(directory.path(), &applied).unwrap(), applied);
+        fs::write(directory.path().join("memory.low"), "0\n").unwrap();
+        assert!(
+            restore_control_at(directory.path(), &before, &applied, 0, true, || Err(
+                ActionError::IdentityMismatch
+            ))
+            .is_err()
+        );
+        assert_eq!(read_control(directory.path(), &applied).unwrap(), applied);
     }
 
     #[test]

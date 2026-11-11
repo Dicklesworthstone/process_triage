@@ -391,6 +391,7 @@ mod tests {
                 parent_identity: None,
                 d_state_diagnostics: None,
                 supervisor_restart: None,
+                memory_cap: None,
             }],
             generated_at: Some("2026-01-15T12:00:00Z".to_string()),
         };
@@ -843,6 +844,7 @@ mod tests {
             Action::Pause,
             Action::Freeze,
             Action::Throttle,
+            Action::CapMemory,
             Action::Renice,
             Action::Quarantine,
         ] {

@@ -87,6 +87,11 @@ pub struct LossRow {
     #[serde(default)]
     pub throttle: Option<f64>,
 
+    /// Cost of a reversible, identity-bound cgroup `memory.high` cap.
+    /// Omitted in existing custom policies means the action is unavailable.
+    #[serde(default)]
+    pub cap_memory: Option<f64>,
+
     pub kill: f64,
 
     #[serde(default)]
@@ -102,6 +107,7 @@ impl Default for LossRow {
             keep: 0.0,
             pause: Some(0.5),
             throttle: Some(1.0),
+            cap_memory: None,
             kill: 100.0,
             restart: Some(50.0),
             renice: None,
@@ -126,6 +132,7 @@ impl Default for LossMatrix {
                 keep: 0.0,
                 pause: Some(0.5),
                 throttle: Some(1.0),
+                cap_memory: Some(0.5),
                 kill: 500.0,
                 restart: Some(10.0),
                 renice: Some(0.2),
@@ -134,6 +141,7 @@ impl Default for LossMatrix {
                 keep: 0.0,
                 pause: Some(0.3),
                 throttle: Some(0.5),
+                cap_memory: Some(0.05),
                 kill: 100.0,
                 restart: Some(5.0),
                 renice: Some(0.1),
@@ -142,6 +150,7 @@ impl Default for LossMatrix {
                 keep: 5.0,
                 pause: Some(3.5),
                 throttle: Some(4.0),
+                cap_memory: Some(5.0),
                 kill: 0.1,
                 restart: Some(4.0),
                 renice: Some(4.5),
@@ -150,6 +159,7 @@ impl Default for LossMatrix {
                 keep: 1.0,
                 pause: Some(1.0),
                 throttle: Some(1.0),
+                cap_memory: Some(1.0),
                 kill: 0.1,
                 restart: Some(0.1),
                 renice: Some(1.0),
@@ -436,7 +446,8 @@ pub struct LoadAwareDecision {
 ///
 /// The additive cost is `kappa * severity * process_share * (1 - relief)`.
 /// CPU relief is modeled only for the action's verified process scope. No
-/// reversible action is assumed to release resident memory or in-flight I/O.
+/// A verified `memory.high` cap has a small configurable memory-pressure credit;
+/// this predicts reclaim pressure, not released resident bytes or I/O completion.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct PressureLossConfig {
@@ -446,6 +457,8 @@ pub struct PressureLossConfig {
     pub pause_cpu_relief: f64,
     /// Throttle and Quarantine share a loss column and this heuristic estimate.
     pub throttle_cpu_relief: f64,
+    /// Heuristic memory-pressure relief for a verified `memory.high` cap.
+    pub cap_memory_relief: f64,
 }
 
 impl Default for PressureLossConfig {
@@ -455,6 +468,7 @@ impl Default for PressureLossConfig {
             renice_cpu_relief: 0.5,
             pause_cpu_relief: 1.0,
             throttle_cpu_relief: 0.5,
+            cap_memory_relief: 0.1,
         }
     }
 }
@@ -469,6 +483,7 @@ impl PressureLossConfig {
             ("renice_cpu_relief", self.renice_cpu_relief),
             ("pause_cpu_relief", self.pause_cpu_relief),
             ("throttle_cpu_relief", self.throttle_cpu_relief),
+            ("cap_memory_relief", self.cap_memory_relief),
         ] {
             if !value.is_finite() || !(0.0..=1.0).contains(&value) {
                 return Some((name, "must be finite and in [0, 1]"));
@@ -655,6 +670,7 @@ impl Policy {
             "keep" => Some(row.keep),
             "pause" => row.pause,
             "throttle" => row.throttle,
+            "cap_memory" => row.cap_memory,
             "kill" => Some(row.kill),
             "restart" => row.restart,
             _ => None,
@@ -1044,6 +1060,26 @@ mod tests {
         assert!((lr.kill - 100.0).abs() < f64::EPSILON);
         assert_eq!(lr.restart, Some(50.0));
         assert!(lr.renice.is_none());
+        assert!(lr.cap_memory.is_none());
+    }
+
+    #[test]
+    fn memory_cap_defaults_preserve_keep_without_pressure_and_omission_disables_it() {
+        let policy = Policy::default();
+        for (class, row) in [
+            ("useful", &policy.loss_matrix.useful),
+            ("useful_bad", &policy.loss_matrix.useful_bad),
+            ("abandoned", &policy.loss_matrix.abandoned),
+            ("zombie", &policy.loss_matrix.zombie),
+        ] {
+            assert!(row.cap_memory.unwrap() >= row.keep, "{class}");
+            assert_eq!(policy.loss(class, "cap_memory"), row.cap_memory);
+            let mut legacy = serde_json::to_value(row).unwrap();
+            legacy.as_object_mut().unwrap().remove("cap_memory");
+            let parsed: LossRow = serde_json::from_value(legacy).unwrap();
+            assert!(parsed.cap_memory.is_none());
+        }
+        assert_eq!(policy.load_aware.pressure.cap_memory_relief, 0.1);
     }
 
     #[test]

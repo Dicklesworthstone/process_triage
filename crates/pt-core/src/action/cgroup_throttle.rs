@@ -782,6 +782,7 @@ impl ActionRunner for CpuThrottleActionRunner {
             | Action::Resume
             | Action::Kill
             | Action::Renice
+            | Action::CapMemory
             | Action::Restart
             | Action::Freeze
             | Action::Unfreeze
@@ -1119,6 +1120,7 @@ mod tests {
                 original_zombie_target: None,
                 d_state_diagnostics: None,
                 supervisor_restart: None,
+                memory_cap: None,
             }
         }
 

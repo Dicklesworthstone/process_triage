@@ -168,6 +168,7 @@ pub fn prepare_pressure_decision(
             row.renice = row.renice.map(|v| v + cost(Action::Renice));
             row.pause = row.pause.map(|v| v + cost(Action::Pause));
             row.throttle = row.throttle.map(|v| v + cost(Action::Throttle));
+            row.cap_memory = row.cap_memory.map(|v| v + cost(Action::CapMemory));
             row.kill += cost(Action::Kill);
             row.restart = row.restart.map(|v| v + cost(Action::Restart));
         }
@@ -234,7 +235,7 @@ pub fn prepare_pressure_decision(
             "Relief fractions are policy heuristics, not measured recovery guarantees.",
             "CPU credit covers only the observed process, never its parent, agent, or cgroup peers.",
             "RSS can contain shared pages; it is not a unique reclaimable-memory estimate.",
-            "Reversible actions receive no memory or I/O relief credit; pending I/O can outlive a stop.",
+            "Only an observed owned-leaf memory.high cap receives reversible memory-pressure credit; this is a reclaim heuristic, not promised freed bytes. Pending I/O can outlive a stop.",
         ],
     };
     Ok(PressureDecisionInputs {
@@ -269,6 +270,11 @@ fn pressure_cost(
         _ => 0.0,
     };
     let other_relief = if action == Action::Kill { 1.0 } else { 0.0 };
+    let memory_relief = if action == Action::CapMemory {
+        model.cap_memory_relief
+    } else {
+        other_relief
+    };
     ResourcePressureCost {
         cpu: context.severity.cpu
             * context.shares.cpu.unwrap_or(0.0)
@@ -276,7 +282,7 @@ fn pressure_cost(
             * model.kappa,
         memory: context.severity.memory
             * context.shares.memory.unwrap_or(0.0)
-            * (1.0 - other_relief)
+            * (1.0 - memory_relief)
             * model.kappa,
         io: context.severity.io
             * context.shares.io.unwrap_or(0.0)
@@ -468,6 +474,7 @@ fn apply_load_to_loss_row(row: LossRow, adjustment: &LoadAdjustment) -> LossRow 
         keep: row.keep * adjustment.keep_multiplier,
         pause: row.pause.map(|v| v * adjustment.reversible_multiplier),
         throttle: row.throttle.map(|v| v * adjustment.reversible_multiplier),
+        cap_memory: row.cap_memory.map(|v| v * adjustment.reversible_multiplier),
         renice: row.renice.map(|v| v * adjustment.reversible_multiplier),
         kill: row.kill * adjustment.risky_multiplier,
         restart: row.restart.map(|v| v * adjustment.risky_multiplier),
@@ -625,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_pressure_does_not_claim_reversible_memory_relief() {
+    fn memory_pressure_only_credits_the_memory_cap_not_pauses_or_cpu_controls() {
         let context = PressureContext {
             severity: ResourceSeverity {
                 memory: 1.0,
@@ -651,10 +658,138 @@ mod tests {
         assert_eq!(prepared.report.modeled_pressure_relief, 0.0);
         for row in &prepared.report.actions {
             assert_eq!(row.pressure_by_resource.io, 0.0);
-            if row.action.is_reversible() {
+            if row.action == Action::CapMemory {
+                assert!((row.pressure_by_resource.memory - 0.81).abs() < 1e-12);
+            } else if row.action.is_reversible() {
                 assert_eq!(row.pressure_by_resource.memory, 0.9);
             }
         }
+    }
+
+    #[test]
+    fn memory_cap_changes_no_default_decision_without_attributed_memory_pressure() {
+        let policy = pressure_policy();
+        let mut before = policy.clone();
+        for row in [
+            &mut before.loss_matrix.useful,
+            &mut before.loss_matrix.useful_bad,
+            &mut before.loss_matrix.abandoned,
+            &mut before.loss_matrix.zombie,
+        ] {
+            row.cap_memory = None;
+        }
+        for useful in 0..=10 {
+            for useful_bad in 0..=10 - useful {
+                for abandoned in 0..=10 - useful - useful_bad {
+                    let posterior = ClassScores {
+                        useful: f64::from(useful) / 10.0,
+                        useful_bad: f64::from(useful_bad) / 10.0,
+                        abandoned: f64::from(abandoned) / 10.0,
+                        zombie: f64::from(10 - useful - useful_bad - abandoned) / 10.0,
+                    };
+                    let feasibility = ActionFeasibility::allow_all();
+                    for context in [
+                        PressureContext::default(),
+                        cpu_context(1.0, Some(0.8)),
+                        PressureContext {
+                            severity: ResourceSeverity {
+                                memory: 1.0,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                    ] {
+                        let original =
+                            prepare_pressure_decision(&posterior, &before, &feasibility, &context)
+                                .unwrap();
+                        let current =
+                            prepare_pressure_decision(&posterior, &policy, &feasibility, &context)
+                                .unwrap();
+                        assert_eq!(
+                            current.decision.optimal_action, original.decision.optimal_action,
+                            "posterior {posterior:?}, context {context:?}"
+                        );
+                        assert_ne!(current.decision.optimal_action, Action::CapMemory);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn attributed_memory_hog_can_receive_cap_without_authorizing_termination() {
+        let policy = pressure_policy();
+        let posterior = ClassScores {
+            useful: 0.05,
+            useful_bad: 0.95,
+            abandoned: 0.0,
+            zombie: 0.0,
+        };
+        let context = PressureContext {
+            severity: ResourceSeverity {
+                memory: 1.0,
+                ..Default::default()
+            },
+            shares: ResourceShares {
+                memory: Some(0.9),
+                ..Default::default()
+            },
+            unavailable: Vec::new(),
+        };
+        let result = prepare_pressure_decision(
+            &posterior,
+            &policy,
+            &ActionFeasibility::allow_all(),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(result.report.evidence_only_action, Action::Keep);
+        assert_eq!(result.decision.optimal_action, Action::CapMemory);
+        assert!((result.report.modeled_pressure_relief - 0.09).abs() < 1e-12);
+        assert!(!result.feasibility.is_allowed(Action::Kill));
+        assert!(!result.feasibility.is_allowed(Action::Restart));
+        let refusal = ActionFeasibility {
+            disabled: vec![DisabledAction {
+                action: Action::CapMemory,
+                reason: "no observed owned leaf cgroup".into(),
+            }],
+        };
+        let blocked = prepare_pressure_decision(&posterior, &policy, &refusal, &context).unwrap();
+        assert_eq!(blocked.decision.optimal_action, Action::Keep);
+        assert!(blocked
+            .report
+            .actions
+            .iter()
+            .any(|row| row.action == Action::CapMemory
+                && !row.eligible
+                && row.excluded_reason.as_deref() == Some("no observed owned leaf cgroup")));
+        let healthy = ClassScores {
+            useful: 1.0,
+            useful_bad: 0.0,
+            abandoned: 0.0,
+            zombie: 0.0,
+        };
+        assert_eq!(
+            prepare_pressure_decision(&healthy, &policy, &ActionFeasibility::allow_all(), &context)
+                .unwrap()
+                .decision
+                .optimal_action,
+            Action::Keep
+        );
+        let mut disabled_policy = policy;
+        disabled_policy.load_aware.enabled = false;
+        assert_eq!(
+            prepare_pressure_decision(
+                &posterior,
+                &disabled_policy,
+                &ActionFeasibility::allow_all(),
+                &context
+            )
+            .unwrap()
+            .decision
+            .optimal_action,
+            Action::Keep
+        );
     }
 
     #[test]
@@ -815,6 +950,8 @@ mod tests {
             weights in prop::array::uniform4(0.001f64..1.0),
             severity in 0.0f64..1.0,
             share in 0.0f64..1.0,
+            memory_severity in 0.0f64..1.0,
+            memory_share in 0.0f64..1.0,
             kappa in 0.0f64..1000.0,
         ) {
             let sum: f64 = weights.iter().sum();
@@ -824,8 +961,11 @@ mod tests {
             };
             let mut policy = pressure_policy();
             policy.load_aware.pressure.kappa = kappa;
+            let mut context = cpu_context(severity, Some(share));
+            context.severity.memory = memory_severity;
+            context.shares.memory = Some(memory_share);
             let prepared = prepare_pressure_decision(
-                &posterior, &policy, &ActionFeasibility::allow_all(), &cpu_context(severity, Some(share)),
+                &posterior, &policy, &ActionFeasibility::allow_all(), &context,
             ).unwrap();
             if matches!(prepared.decision.optimal_action, Action::Kill | Action::Restart) {
                 prop_assert_eq!(prepared.decision.optimal_action, prepared.report.evidence_only_action);
@@ -921,6 +1061,7 @@ mod tests {
     fn test_apply_load_to_loss_matrix() {
         let loss = LossMatrix {
             useful: LossRow {
+                cap_memory: None,
                 keep: 10.0,
                 pause: Some(4.0),
                 throttle: Some(6.0),
@@ -929,6 +1070,7 @@ mod tests {
                 restart: Some(50.0),
             },
             useful_bad: LossRow {
+                cap_memory: None,
                 keep: 10.0,
                 pause: Some(4.0),
                 throttle: Some(6.0),
@@ -937,6 +1079,7 @@ mod tests {
                 restart: Some(50.0),
             },
             abandoned: LossRow {
+                cap_memory: None,
                 keep: 10.0,
                 pause: Some(4.0),
                 throttle: Some(6.0),
@@ -945,6 +1088,7 @@ mod tests {
                 restart: Some(50.0),
             },
             zombie: LossRow {
+                cap_memory: None,
                 keep: 10.0,
                 pause: Some(4.0),
                 throttle: Some(6.0),

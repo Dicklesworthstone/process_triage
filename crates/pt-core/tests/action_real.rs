@@ -80,6 +80,7 @@ fn test_signal_kill_real() {
         confidence: ActionConfidence::Normal,
         original_zombie_target: None,
         d_state_diagnostics: None,
+        memory_cap: None,
         supervisor_restart: None,
     };
 
@@ -129,6 +130,7 @@ fn test_signal_pause_resume_real() {
         confidence: ActionConfidence::Normal,
         original_zombie_target: None,
         d_state_diagnostics: None,
+        memory_cap: None,
         supervisor_restart: None,
     };
 
@@ -235,6 +237,7 @@ fn test_process_group_pause_resume_real() {
         confidence: ActionConfidence::Normal,
         original_zombie_target: None,
         d_state_diagnostics: None,
+        memory_cap: None,
         supervisor_restart: None,
     };
 
@@ -269,6 +272,7 @@ fn test_process_group_pause_resume_real() {
         confidence: ActionConfidence::Normal,
         original_zombie_target: None,
         d_state_diagnostics: None,
+        memory_cap: None,
         supervisor_restart: None,
     };
 
@@ -328,6 +332,7 @@ fn test_zombie_verification_real() {
         confidence: ActionConfidence::Normal,
         original_zombie_target: None,
         d_state_diagnostics: None,
+        memory_cap: None,
         supervisor_restart: None,
     };
 

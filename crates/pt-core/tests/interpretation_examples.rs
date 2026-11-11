@@ -35,9 +35,12 @@ enum ActionTier {
 fn get_action_tier(action: Action) -> ActionTier {
     match action {
         Action::Keep => ActionTier::Keep,
-        Action::Pause | Action::Renice | Action::Throttle | Action::Freeze | Action::Quarantine => {
-            ActionTier::Review
-        }
+        Action::Pause
+        | Action::Renice
+        | Action::Throttle
+        | Action::Freeze
+        | Action::Quarantine
+        | Action::CapMemory => ActionTier::Review,
         Action::Kill | Action::Restart => ActionTier::Act,
         Action::Resume | Action::Unfreeze | Action::Unquarantine => ActionTier::Keep,
     }

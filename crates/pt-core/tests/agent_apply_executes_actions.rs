@@ -604,6 +604,7 @@ fn plan_action(action: Action, identity: &ProcessIdentity) -> PlanAction {
         confidence: ActionConfidence::Normal,
         original_zombie_target: None,
         d_state_diagnostics: None,
+        memory_cap: None,
         supervisor_restart: None,
     }
 }
@@ -740,6 +741,133 @@ fn apply_with_args(
         .unwrap_or("missing")
         .to_string();
     (status, json)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn agent_apply_rejects_unbound_memory_caps_before_prechecks_or_actions() {
+    use pt_core::action::memory_cap::MemoryCapPlan;
+    use pt_core::action::reversal::ReversalScope;
+
+    let data_dir = TempDir::new().expect("data dir");
+    let config_dir = TempDir::new().expect("config dir");
+    write_test_policy(config_dir.path());
+    let victim = ForeignTarget::spawn("sleep 356");
+    let identity = live_identity(victim.pid);
+    let original_nice = nice_of(victim.pid).unwrap();
+    let original_cgroup = fs::read_to_string(format!("/proc/{}/cgroup", victim.pid)).unwrap();
+    let target = format!("{}:{}", victim.pid, identity.start_id.0);
+    // This is a structurally valid observation, not permission to touch a live
+    // controller. Only its deliberately invalid neighbors are sent to apply.
+    let binding = MemoryCapPlan {
+        target: identity.clone(),
+        scope: ReversalScope {
+            cgroup_path: "/pt-memory-cap-parser-fixture".to_string(),
+            device: 1,
+            inode: 2,
+            mount_id: 3,
+            boot_id: identity.start_id.0.split(':').next().unwrap().to_string(),
+            mount_namespace_device: 4,
+            mount_namespace_inode: 5,
+            cgroup_namespace_device: 6,
+            cgroup_namespace_inode: 7,
+        },
+        limit_bytes: 144 * 1024 * 1024,
+        observed_high_bytes: None,
+        observed_current_bytes: 160 * 1024 * 1024,
+        observed_low_bytes: 16 * 1024 * 1024,
+        observed_min_bytes: 8 * 1024 * 1024,
+        page_size_bytes: 4096,
+    };
+    binding
+        .validate(&identity)
+        .expect("valid immutable cap binding");
+    let mut valid = plan_action(Action::CapMemory, &identity);
+    valid.memory_cap = Some(binding);
+    let valid_session = session_with_plan(data_dir.path(), valid.clone());
+    let valid_document = fs::read_to_string(
+        data_dir
+            .path()
+            .join("sessions")
+            .join(&valid_session)
+            .join("decision/plan.json"),
+    )
+    .unwrap();
+    pt_core::verify::parse_agent_plan(&valid_document).expect("valid cap parses without executing");
+
+    for defect in [
+        "missing",
+        "target",
+        "scope",
+        "zero_limit",
+        "raised_limit",
+        "wrong_action",
+        "routed",
+    ] {
+        let mut action = valid.clone();
+        match defect {
+            "missing" => action.memory_cap = None,
+            "target" => action.memory_cap.as_mut().unwrap().target.uid ^= 1,
+            "scope" => action.memory_cap.as_mut().unwrap().scope.inode = 0,
+            "zero_limit" => action.memory_cap.as_mut().unwrap().limit_bytes = 0,
+            "raised_limit" => action.memory_cap.as_mut().unwrap().limit_bytes = 256 * 1024 * 1024,
+            "wrong_action" => action.action = Action::Renice,
+            "routed" => action.routing = ActionRouting::ZombieToParent,
+            _ => unreachable!(),
+        }
+        let session = session_with_plan(data_dir.path(), action);
+        let output = cargo_bin_cmd!("pt-core")
+            .timeout(Duration::from_secs(60))
+            .env("PT_SKIP_GLOBAL_LOCK", "1")
+            .env("PROCESS_TRIAGE_DATA", data_dir.path())
+            .env("PROCESS_TRIAGE_CONFIG", config_dir.path())
+            .env("PROCESS_TRIAGE_RETENTION", "off")
+            .args([
+                "--format",
+                "json",
+                "agent",
+                "apply",
+                "--session",
+                &session,
+                "--targets",
+                &target,
+                "--yes",
+                "--settle",
+                "0",
+            ])
+            .output()
+            .expect("run actual apply with invalid memory cap");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(pt_core::exit_codes::ExitCode::InternalError.as_i32()),
+            "{defect}: stdout={} stderr={stderr}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(stderr.contains("invalid plan.json"), "{defect}: {stderr}");
+        assert!(stderr.contains("memory cap"), "{defect}: {stderr}");
+        let session_dir = data_dir.path().join("sessions").join(&session);
+        assert!(
+            !session_dir.join("action/outcomes.jsonl").exists(),
+            "{defect}: no execution attempt"
+        );
+        assert!(
+            !session_dir.join("action/reversals").exists(),
+            "{defect}: no controller intent"
+        );
+        assert!(
+            !data_dir.path().join("rate_limit.json").exists(),
+            "{defect}: no action budget spent"
+        );
+        assert!(victim.alive(), "{defect}: owned target must survive");
+        assert_eq!(live_identity(victim.pid), identity, "{defect}");
+        assert_eq!(nice_of(victim.pid).unwrap(), original_nice, "{defect}");
+        assert_eq!(
+            fs::read_to_string(format!("/proc/{}/cgroup", victim.pid)).unwrap(),
+            original_cgroup,
+            "{defect}"
+        );
+    }
 }
 
 #[test]

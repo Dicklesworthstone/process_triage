@@ -53,7 +53,7 @@ pub enum ReliefTier {
 impl ReliefTier {
     fn for_action(action: Action) -> Option<Self> {
         match action {
-            Action::Renice | Action::Throttle => Some(Self::Deprioritize),
+            Action::Renice | Action::Throttle | Action::CapMemory => Some(Self::Deprioritize),
             Action::Pause | Action::Freeze => Some(Self::Pause),
             Action::Kill => Some(Self::Terminate),
             _ => None,
@@ -221,13 +221,23 @@ pub fn select_relief_plan(
         status,
         unit: "heuristic_loss_units",
         goal_achievable: None,
-        selected_tier: if remediation_ladder.is_empty() { None } else { selected_tier },
+        selected_tier: if remediation_ladder.is_empty() {
+            None
+        } else {
+            selected_tier
+        },
         selected_action_ids: remediation_ladder
             .iter()
             .flat_map(|step| step.action_ids.iter().cloned())
             .collect(),
-        selected_targets: remediation_ladder.iter().map(|step| step.target.clone()).collect(),
-        selected_pids: remediation_ladder.iter().map(|step| step.target.pid.0).collect(),
+        selected_targets: remediation_ladder
+            .iter()
+            .map(|step| step.target.clone())
+            .collect(),
+        selected_pids: remediation_ladder
+            .iter()
+            .map(|step| step.target.pid.0)
+            .collect(),
         total_modeled_relief,
         remediation_ladder,
         alternatives,
@@ -319,6 +329,17 @@ fn candidate_step(
     if target != primary.target {
         return Err("mismatched_action_target");
     }
+    if action == Action::CapMemory {
+        let cap = primary
+            .memory_cap
+            .as_ref()
+            .ok_or("missing_memory_cap_binding")?;
+        if cap.validate(&primary.target).is_err()
+            || serde_json::to_value(cap).ok().as_ref() != Some(&candidate["memory_cap"])
+        {
+            return Err("invalid_memory_cap_binding");
+        }
+    }
     let mut ordered_actions = target_actions;
     if ordered_actions.iter().any(|entry| {
         entry.target != primary.target
@@ -369,6 +390,7 @@ fn eligible_plan_action(action: &PlanAction) -> bool {
         && action.original_zombie_target.is_none()
         && action.d_state_diagnostics.is_none()
         && action.supervisor_restart.is_none()
+        && (action.action == Action::CapMemory || action.memory_cap.is_none())
 }
 
 fn nonnegative(value: &Value) -> Option<f64> {
@@ -425,7 +447,10 @@ fn pressure_credit(
         if reduction < 0.0 {
             return Err("pressure_action_increases_resource_burden");
         }
-        if action != Action::Kill && resource != "cpu" && reduction > 0.0 {
+        let supported_credit = action == Action::Kill
+            || (action == Action::CapMemory && resource == "memory")
+            || (action != Action::CapMemory && resource == "cpu");
+        if !supported_credit && reduction > 0.0 {
             return Err("unsupported_reversible_resource_credit");
         }
         if reduction > 0.0 {
@@ -512,6 +537,7 @@ mod tests {
             original_zombie_target: None,
             d_state_diagnostics: None,
             supervisor_restart: None,
+            memory_cap: None,
         }
     }
 
@@ -577,6 +603,129 @@ mod tests {
                 ]
             }
         })
+    }
+
+    fn memory_cap_remedy(relief: [f64; 3]) -> (Value, PlanAction) {
+        let boot = "11111111-2222-4333-8444-555555555555";
+        let mut action = plan_action(100, Action::CapMemory, 0);
+        action.target.start_id = StartId::from_linux(boot, 42, 100);
+        let binding = crate::action::memory_cap::MemoryCapPlan {
+            target: action.target.clone(),
+            scope: crate::action::reversal::ReversalScope {
+                cgroup_path: "/user.slice/owned/workload".into(),
+                device: 1,
+                inode: 2,
+                mount_id: 3,
+                boot_id: boot.into(),
+                mount_namespace_device: 4,
+                mount_namespace_inode: 5,
+                cgroup_namespace_device: 6,
+                cgroup_namespace_inode: 7,
+            },
+            limit_bytes: 180 * 1024 * 1024,
+            observed_high_bytes: None,
+            observed_current_bytes: 200 * 1024 * 1024,
+            observed_low_bytes: 0,
+            observed_min_bytes: 0,
+            page_size_bytes: 4096,
+        };
+        binding.validate(&action.target).unwrap();
+        let mut proposed = candidate(100, Action::CapMemory, relief, 0.95);
+        proposed["start_id"] = json!(action.target.start_id);
+        proposed["action_target"] = json!(action.target);
+        proposed["memory_cap"] = json!(binding);
+        proposed["pressure_decision"]["evidence_only_action"] = json!("keep");
+        action.memory_cap = Some(binding);
+        (proposed, action)
+    }
+
+    #[test]
+    fn bound_memory_cap_precedes_termination_without_claiming_freed_bytes() {
+        let (proposed, cap) = memory_cap_remedy([0.0, 0.09, 0.0]);
+        let expected_id = cap.action_id.clone();
+        let actions = plan(vec![cap, plan_action(200, Action::Kill, 0)]);
+        let candidates = vec![proposed, candidate(200, Action::Kill, [0.0, 3.0, 0.0], 1.0)];
+        let selected = select_relief_plan(ReliefGoal::Memory, &candidates, &actions, None);
+        assert_eq!(selected.status, ReliefStatus::RemediesAvailable);
+        assert_eq!(selected.selected_tier, Some(ReliefTier::Deprioritize));
+        assert_eq!(selected.selected_pids, [100]);
+        assert_eq!(selected.selected_action_ids, [expected_id]);
+        assert_eq!(selected.remediation_ladder[0].action, Action::CapMemory);
+        assert_eq!(selected.total_modeled_relief, 0.09);
+        assert_eq!(selected.goal_achievable, None);
+        assert_eq!(selected.unit, "heuristic_loss_units");
+        assert_eq!(selected.alternatives.len(), 1);
+        assert_eq!(selected.alternatives[0].tier, ReliefTier::Terminate);
+        assert!(selected.alternatives[0].requires_new_plan);
+        for goal in [ReliefGoal::Cpu, ReliefGoal::Io] {
+            let unrelated = select_relief_plan(goal, &candidates, &actions, None);
+            assert!(unrelated.selected_action_ids.is_empty());
+        }
+    }
+
+    #[test]
+    fn memory_relief_requires_the_exact_valid_binding_and_matching_resource_credit() {
+        let (valid, cap) = memory_cap_remedy([0.0, 0.09, 0.0]);
+        let actions = plan(vec![cap.clone()]);
+        for (path, replacement) in [
+            ("/memory_cap", Value::Null),
+            ("/memory_cap/limit_bytes", json!(181 * 1024 * 1024)),
+            ("/memory_cap/scope/inode", json!(99)),
+            ("/memory_cap/target/uid", json!(1001)),
+            ("/pressure_decision/shares/memory", Value::Null),
+            ("/pressure_decision/severity/memory", json!(0.0)),
+        ] {
+            let mut malformed = valid.clone();
+            *malformed.pointer_mut(path).unwrap() = replacement;
+            let result = select_relief_plan(ReliefGoal::Memory, &[malformed], &actions, None);
+            assert!(result.selected_action_ids.is_empty(), "accepted {path}");
+            assert_eq!(result.status, ReliefStatus::NoEligibleRemedies);
+        }
+        let mut missing = cap.clone();
+        missing.memory_cap = None;
+        let result = select_relief_plan(
+            ReliefGoal::Memory,
+            std::slice::from_ref(&valid),
+            &plan(vec![missing]),
+            None,
+        );
+        assert!(result.selected_action_ids.is_empty());
+        assert_eq!(result.excluded[0].reason, "missing_memory_cap_binding");
+
+        // Even identical tampering in both artifacts cannot replace validation.
+        let mut modified = cap.clone();
+        modified.memory_cap.as_mut().unwrap().limit_bytes += 4096;
+        let mut matching = valid.clone();
+        matching["memory_cap"] = json!(modified.memory_cap);
+        let result =
+            select_relief_plan(ReliefGoal::Memory, &[matching], &plan(vec![modified]), None);
+        assert!(result.selected_action_ids.is_empty());
+        assert_eq!(result.excluded[0].reason, "invalid_memory_cap_binding");
+
+        for relief in [[0.1, 0.09, 0.0], [0.0, 0.09, 0.1]] {
+            let (unsupported, cap) = memory_cap_remedy(relief);
+            let result =
+                select_relief_plan(ReliefGoal::All, &[unsupported], &plan(vec![cap]), None);
+            assert!(result.selected_action_ids.is_empty());
+            assert_eq!(
+                result.excluded[0].reason,
+                "unsupported_reversible_resource_credit"
+            );
+        }
+
+        let mut pause = plan_action(100, Action::Pause, 0);
+        pause.memory_cap = cap.memory_cap;
+        let result = select_relief_plan(
+            ReliefGoal::Cpu,
+            &[candidate(100, Action::Pause, [0.1, 0.0, 0.0], 1.0)],
+            &plan(vec![pause]),
+            None,
+        );
+        assert!(result.selected_action_ids.is_empty());
+        assert_eq!(
+            result.excluded[0].reason,
+            "blocked_routed_or_ambiguous_plan_action"
+        );
     }
 
     #[test]

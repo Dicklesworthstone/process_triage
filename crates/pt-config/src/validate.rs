@@ -311,6 +311,15 @@ fn validate_loss_matrix(matrix: &crate::policy::LossMatrix) -> ValidationResult<
     ];
 
     for (name, row) in classes {
+        if row
+            .cap_memory
+            .is_some_and(|value| !value.is_finite() || value < 0.0)
+        {
+            return Err(ValidationError::InvalidValue {
+                field: format!("loss_matrix.{name}.cap_memory"),
+                message: "Must be finite and non-negative".to_string(),
+            });
+        }
         if row.keep < 0.0 {
             return Err(ValidationError::InvalidValue {
                 field: format!("loss_matrix.{}.keep", name),
@@ -803,6 +812,31 @@ mod tests {
         policy.load_aware.pressure.kappa = 0.0;
         policy.load_aware.pressure.renice_cpu_relief = 0.0;
         policy.load_aware.pressure.pause_cpu_relief = 1.0;
+        assert!(validate_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn memory_cap_cost_and_relief_require_finite_safe_values() {
+        for value in [-0.1, f64::NAN, f64::INFINITY] {
+            let mut policy = crate::policy::Policy::default();
+            policy.loss_matrix.useful_bad.cap_memory = Some(value);
+            assert!(validate_policy(&policy)
+                .unwrap_err()
+                .to_string()
+                .contains("loss_matrix.useful_bad.cap_memory"));
+        }
+        for value in [-0.1, 1.1, f64::NAN, f64::INFINITY] {
+            let mut policy = crate::policy::Policy::default();
+            policy.load_aware.enabled = true;
+            policy.load_aware.pressure.cap_memory_relief = value;
+            assert!(validate_policy(&policy)
+                .unwrap_err()
+                .to_string()
+                .contains("load_aware.pressure.cap_memory_relief"));
+        }
+        let mut policy = crate::policy::Policy::default();
+        policy.load_aware.enabled = true;
+        policy.load_aware.pressure.cap_memory_relief = 0.0;
         assert!(validate_policy(&policy).is_ok());
     }
 

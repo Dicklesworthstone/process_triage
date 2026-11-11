@@ -1626,6 +1626,7 @@ impl ActionRunner for ReniceActionRunner {
             | Action::Resume
             | Action::Kill
             | Action::Throttle
+            | Action::CapMemory
             | Action::Restart
             | Action::Freeze
             | Action::Unfreeze
@@ -1645,6 +1646,7 @@ impl ActionRunner for ReniceActionRunner {
             | Action::Resume
             | Action::Kill
             | Action::Throttle
+            | Action::CapMemory
             | Action::Restart
             | Action::Freeze
             | Action::Unfreeze

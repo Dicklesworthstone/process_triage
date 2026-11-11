@@ -337,19 +337,7 @@ impl ShadowRecorder {
 }
 
 fn action_to_recommendation(action: Action) -> &'static str {
-    match action {
-        Action::Keep => "keep",
-        Action::Renice => "renice",
-        Action::Pause => "pause",
-        Action::Resume => "resume",
-        Action::Freeze => "freeze",
-        Action::Unfreeze => "unfreeze",
-        Action::Throttle => "throttle",
-        Action::Quarantine => "quarantine",
-        Action::Unquarantine => "unquarantine",
-        Action::Restart => "restart",
-        Action::Kill => "kill",
-    }
+    action.as_str()
 }
 
 fn confidence_score(confidence: Confidence) -> f32 {

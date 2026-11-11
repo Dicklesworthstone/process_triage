@@ -25,7 +25,8 @@ pub use confirm_dialog::{ConfirmChoice, ConfirmDialog, ConfirmDialogState};
 pub use help_overlay::HelpOverlay;
 pub use process_detail::{DetailView, ProcessDetail};
 pub use process_table::{
-    ProcessRow, ProcessTable, ProcessTableState, SortColumn, SortOrder, ViewMode,
+    apply_plan_preview_to_rows, ProcessRow, ProcessTable, ProcessTableState, SortColumn, SortOrder,
+    ViewMode,
 };
 pub use search_input::{SearchInput, SearchInputState};
 pub use status_bar::{StatusBar, StatusMode};

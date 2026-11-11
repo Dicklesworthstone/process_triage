@@ -83,6 +83,7 @@ pub fn apply_outcome(
         Action::Kill => &mut updated.kill,
         Action::Restart => &mut updated.restart,
         Action::Keep
+        | Action::CapMemory
         | Action::Renice
         | Action::Resume
         | Action::Freeze
@@ -122,6 +123,7 @@ pub fn recovery_table(priors: &Priors, action: Action) -> Option<RecoveryTable> 
         Action::Kill => build_table(action, interventions.kill.as_ref()),
         Action::Restart => build_table(action, interventions.restart.as_ref()),
         Action::Keep
+        | Action::CapMemory
         | Action::Renice
         | Action::Resume
         | Action::Freeze
@@ -176,6 +178,7 @@ pub fn recovery_for_class(priors: &Priors, action: Action, class: ProcessClass) 
         Action::Kill => interventions.kill.as_ref(),
         Action::Restart => interventions.restart.as_ref(),
         Action::Keep
+        | Action::CapMemory
         | Action::Renice
         | Action::Resume
         | Action::Freeze
@@ -240,6 +243,7 @@ fn expected_recovery_stats_for_action(
         Action::Kill => interventions.kill.as_ref(),
         Action::Restart => interventions.restart.as_ref(),
         Action::Keep
+        | Action::CapMemory
         | Action::Renice
         | Action::Resume
         | Action::Freeze

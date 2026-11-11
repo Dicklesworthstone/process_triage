@@ -195,6 +195,7 @@ fn test_session_lifecycle_persistence_nomock() {
                 process_state: None,
                 parent_identity: None,
                 d_state_diagnostics: None,
+                memory_cap: None,
                 supervisor_restart: None,
             }],
             generated_at: Some(Utc::now().to_rfc3339()),
@@ -242,6 +243,7 @@ fn test_verify_plan_with_real_process_nomock() {
             process_state: Some(record.state),
             parent_identity: None,
             d_state_diagnostics: None,
+            memory_cap: None,
             supervisor_restart: None,
         }],
     };

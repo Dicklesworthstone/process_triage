@@ -154,6 +154,7 @@ fn developer_preset() -> Policy {
         loss_matrix: LossMatrix {
             // Lower penalty for killing useful processes (accept more false positives)
             useful: LossRow {
+                cap_memory: None,
                 keep: 0.0,
                 pause: Some(0.3),
                 throttle: Some(0.5),
@@ -162,6 +163,7 @@ fn developer_preset() -> Policy {
                 renice: Some(0.1),
             },
             useful_bad: LossRow {
+                cap_memory: None,
                 keep: 0.0,
                 pause: Some(0.2),
                 throttle: Some(0.3),
@@ -170,6 +172,7 @@ fn developer_preset() -> Policy {
                 renice: Some(0.05),
             },
             abandoned: LossRow {
+                cap_memory: None,
                 keep: 10.0, // Higher penalty for keeping abandoned (want to catch them)
                 // Non-terminal actions leave the abandoned process's resources held
                 // (see LossMatrix::default docs), so they stay close to `keep`.
@@ -180,6 +183,7 @@ fn developer_preset() -> Policy {
                 renice: Some(9.0),
             },
             zombie: LossRow {
+                cap_memory: None,
                 keep: 5.0,
                 pause: Some(5.0),
                 throttle: Some(5.0),
@@ -286,6 +290,7 @@ fn server_preset() -> Policy {
         loss_matrix: LossMatrix {
             // Very high penalty for killing useful processes
             useful: LossRow {
+                cap_memory: None,
                 keep: 0.0,
                 pause: Some(1.0),
                 throttle: Some(2.0),
@@ -294,6 +299,7 @@ fn server_preset() -> Policy {
                 renice: Some(0.5),
             },
             useful_bad: LossRow {
+                cap_memory: None,
                 keep: 0.0,
                 pause: Some(0.5),
                 throttle: Some(1.0),
@@ -302,6 +308,7 @@ fn server_preset() -> Policy {
                 renice: Some(0.3),
             },
             abandoned: LossRow {
+                cap_memory: None,
                 keep: 3.0, // Lower penalty for keeping abandoned (prefer false negatives)
                 // Non-terminal actions leave the abandoned process's resources held
                 // (see LossMatrix::default docs), so they stay close to `keep`.
@@ -312,6 +319,7 @@ fn server_preset() -> Policy {
                 renice: Some(2.7),
             },
             zombie: LossRow {
+                cap_memory: None,
                 keep: 2.0,
                 pause: Some(2.0),
                 throttle: Some(2.0),
@@ -505,6 +513,7 @@ fn ci_preset() -> Policy {
         loss_matrix: LossMatrix {
             // Conservative - CI should not break builds
             useful: LossRow {
+                cap_memory: None,
                 keep: 0.0,
                 pause: Some(0.5),
                 throttle: Some(1.0),
@@ -513,6 +522,7 @@ fn ci_preset() -> Policy {
                 renice: Some(0.3),
             },
             useful_bad: LossRow {
+                cap_memory: None,
                 keep: 0.0,
                 pause: Some(0.3),
                 throttle: Some(0.5),
@@ -521,6 +531,7 @@ fn ci_preset() -> Policy {
                 renice: Some(0.2),
             },
             abandoned: LossRow {
+                cap_memory: None,
                 keep: 5.0,
                 // Non-terminal actions leave the abandoned process's resources held
                 // (see LossMatrix::default docs), so they stay close to `keep`.
@@ -531,6 +542,7 @@ fn ci_preset() -> Policy {
                 renice: Some(4.5),
             },
             zombie: LossRow {
+                cap_memory: None,
                 keep: 3.0,
                 pause: Some(3.0),
                 throttle: Some(3.0),
@@ -654,6 +666,7 @@ fn paranoid_preset() -> Policy {
         loss_matrix: LossMatrix {
             // Extremely high penalty for false positives
             useful: LossRow {
+                cap_memory: None,
                 keep: 0.0,
                 pause: Some(5.0),
                 throttle: Some(10.0),
@@ -662,6 +675,7 @@ fn paranoid_preset() -> Policy {
                 renice: Some(2.0),
             },
             useful_bad: LossRow {
+                cap_memory: None,
                 keep: 0.0,
                 pause: Some(2.0),
                 throttle: Some(5.0),
@@ -670,6 +684,7 @@ fn paranoid_preset() -> Policy {
                 renice: Some(1.0),
             },
             abandoned: LossRow {
+                cap_memory: None,
                 keep: 1.0, // Very low penalty for keeping abandoned
                 pause: Some(0.5),
                 throttle: Some(1.0),
@@ -678,6 +693,7 @@ fn paranoid_preset() -> Policy {
                 renice: Some(0.5),
             },
             zombie: LossRow {
+                cap_memory: None,
                 keep: 0.5,
                 pause: Some(0.3),
                 throttle: Some(0.3),

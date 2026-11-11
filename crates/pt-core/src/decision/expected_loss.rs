@@ -24,6 +24,9 @@ pub enum Action {
     /// Unfreeze a previously frozen process (follow-up to Freeze, not a decision action).
     Unfreeze,
     Throttle,
+    /// Apply a reversible `memory.high` limit to an observed owned leaf cgroup.
+    #[serde(rename = "cap_memory")]
+    CapMemory,
     /// Quarantine process by restricting it to a limited cpuset (cgroup cpuset controller).
     Quarantine,
     /// Unquarantine a previously quarantined process (follow-up to Quarantine).
@@ -33,13 +36,32 @@ pub enum Action {
 }
 
 impl Action {
+    /// Stable spelling shared by JSON and command/presentation adapters.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Keep => "keep",
+            Self::Renice => "renice",
+            Self::Pause => "pause",
+            Self::Resume => "resume",
+            Self::Freeze => "freeze",
+            Self::Unfreeze => "unfreeze",
+            Self::Throttle => "throttle",
+            Self::CapMemory => "cap_memory",
+            Self::Quarantine => "quarantine",
+            Self::Unquarantine => "unquarantine",
+            Self::Restart => "restart",
+            Self::Kill => "kill",
+        }
+    }
+
     /// Actions available for decision-making (excludes Resume/Unfreeze/Unquarantine, which are follow-up actions).
-    pub(crate) const ALL: [Action; 8] = [
+    pub(crate) const ALL: [Action; 9] = [
         Action::Keep,
         Action::Renice,
         Action::Pause,
         Action::Freeze,
         Action::Throttle,
+        Action::CapMemory,
         Action::Quarantine,
         Action::Restart,
         Action::Kill,
@@ -56,6 +78,7 @@ impl Action {
             Action::Quarantine => 3,   // Same rank as Throttle (resource restriction)
             Action::Unquarantine => 3, // Same rank as Quarantine (both reversible)
             Action::Throttle => 3,
+            Action::CapMemory => 3,
             Action::Restart => 4,
             Action::Kill => 5,
         }
@@ -71,6 +94,7 @@ impl Action {
                 | Action::Unfreeze
                 | Action::Renice
                 | Action::Throttle
+                | Action::CapMemory
                 | Action::Quarantine
                 | Action::Unquarantine
         )
@@ -117,7 +141,8 @@ impl ActionFeasibility {
     /// **D-state (uninterruptible sleep) processes:**
     /// - May not respond to SIGKILL (stuck in kernel I/O)
     /// - Kill action has low probability of success
-    /// - Disables: Kill (with wchan diagnostic if available)
+    /// - Disables: Kill (with wchan diagnostic if available), CapMemory
+    /// - Memory reclaim is not a safe modeled remedy for a kernel I/O stall
     ///
     /// # Arguments
     /// * `is_zombie` - true if process is in Z state
@@ -150,7 +175,12 @@ impl ActionFeasibility {
                 action: Action::Unfreeze,
                 reason: "zombie process (Z state): cannot unfreeze a dead process".to_string(),
             });
-            for action in [Action::Renice, Action::Throttle, Action::Quarantine] {
+            for action in [
+                Action::Renice,
+                Action::Throttle,
+                Action::CapMemory,
+                Action::Quarantine,
+            ] {
                 disabled.push(DisabledAction {
                     action,
                     reason: "zombie process (Z state): uses no CPU or memory; only its \
@@ -176,6 +206,12 @@ impl ActionFeasibility {
             disabled.push(DisabledAction {
                 action: Action::Kill,
                 reason,
+            });
+            disabled.push(DisabledAction {
+                action: Action::CapMemory,
+                reason: "D-state process (uninterruptible sleep): memory-cap relief \
+                         is unavailable while blocked in kernel I/O"
+                    .to_string(),
             });
         }
 
@@ -598,6 +634,9 @@ fn loss_for_action(
         Action::Throttle => row
             .throttle
             .ok_or(DecisionError::MissingLoss { action, class }),
+        Action::CapMemory => row
+            .cap_memory
+            .ok_or(DecisionError::MissingLoss { action, class }),
         // Quarantine uses Throttle's loss value (semantically similar: resource restriction)
         Action::Quarantine => row
             .throttle
@@ -723,6 +762,47 @@ mod tests {
     }
 
     #[test]
+    fn memory_cap_is_a_reversible_action_with_canonical_wire_spelling() {
+        assert!(Action::CapMemory.is_reversible());
+        assert!(!Action::CapMemory.is_follow_up());
+        assert_eq!(Action::CapMemory.as_str(), "cap_memory");
+        assert_eq!(
+            serde_json::to_string(&Action::CapMemory).unwrap(),
+            "\"cap_memory\""
+        );
+        assert_eq!(
+            serde_json::from_str::<Action>("\"cap_memory\"").unwrap(),
+            Action::CapMemory
+        );
+        assert!(serde_json::from_str::<Action>("\"capmemory\"").is_err());
+        assert!(
+            !ActionFeasibility::from_process_state(true, false, None).is_allowed(Action::CapMemory)
+        );
+        let mut policy = Policy::default();
+        policy.loss_matrix.useful_bad.cap_memory = None;
+        let outcome = decide_action(
+            &ClassScores {
+                useful: 0.0,
+                useful_bad: 1.0,
+                abandoned: 0.0,
+                zombie: 0.0,
+            },
+            &policy,
+            &ActionFeasibility::allow_all(),
+        )
+        .unwrap();
+        assert!(outcome
+            .expected_loss
+            .iter()
+            .all(|entry| entry.action != Action::CapMemory));
+        assert!(outcome
+            .rationale
+            .disabled_actions
+            .iter()
+            .any(|entry| entry.action == Action::CapMemory));
+    }
+
+    #[test]
     fn expected_loss_matches_definition() {
         let policy = policy_for_tests();
         let posterior = ClassScores {
@@ -751,6 +831,7 @@ mod tests {
         let mut policy = policy_for_tests();
         policy.loss_matrix = LossMatrix {
             useful: LossRow {
+                cap_memory: None,
                 keep: 1.0,
                 renice: Some(1.0),
                 pause: Some(1.0),
@@ -759,6 +840,7 @@ mod tests {
                 restart: Some(1.0),
             },
             useful_bad: LossRow {
+                cap_memory: None,
                 keep: 1.0,
                 renice: Some(1.0),
                 pause: Some(1.0),
@@ -767,6 +849,7 @@ mod tests {
                 restart: Some(1.0),
             },
             abandoned: LossRow {
+                cap_memory: None,
                 keep: 1.0,
                 renice: Some(1.0),
                 pause: Some(1.0),
@@ -775,6 +858,7 @@ mod tests {
                 restart: Some(1.0),
             },
             zombie: LossRow {
+                cap_memory: None,
                 keep: 1.0,
                 renice: Some(1.0),
                 pause: Some(1.0),
@@ -916,6 +1000,7 @@ mod tests {
         };
 
         let loss_row = LossRow {
+            cap_memory: None,
             keep: 0.98,
             renice: Some(0.99),
             pause: Some(1.0),
@@ -1056,15 +1141,19 @@ mod tests {
     }
 
     #[test]
-    fn test_from_process_state_disksleep_disables_kill() {
+    fn test_from_process_state_disksleep_disables_kill_and_memory_cap() {
         let feasibility = ActionFeasibility::from_process_state(false, true, None);
 
         assert!(
             !feasibility.is_allowed(Action::Kill),
             "Kill should be disabled for D-state"
         );
+        assert!(
+            !feasibility.is_allowed(Action::CapMemory),
+            "Memory caps should not add reclaim pressure to a D-state workload"
+        );
 
-        // Other actions should still be allowed (including Freeze - cgroup freeze works at cgroup level)
+        // Existing pause/freeze behavior stays available at the cgroup level.
         assert!(
             feasibility.is_allowed(Action::Pause),
             "Pause should be allowed for D-state"

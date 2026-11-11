@@ -467,6 +467,7 @@ impl ActionRunner for FreezeActionRunner {
             | Action::Resume
             | Action::Kill
             | Action::Throttle
+            | Action::CapMemory
             | Action::Restart
             | Action::Renice
             | Action::Quarantine
@@ -486,6 +487,7 @@ impl ActionRunner for FreezeActionRunner {
             | Action::Resume
             | Action::Kill
             | Action::Throttle
+            | Action::CapMemory
             | Action::Restart
             | Action::Renice
             | Action::Quarantine
@@ -875,6 +877,7 @@ mod tests {
                 original_zombie_target: None,
                 d_state_diagnostics: None,
                 supervisor_restart: None,
+                memory_cap: None,
             }
         }
 
