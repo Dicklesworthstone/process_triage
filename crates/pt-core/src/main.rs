@@ -14686,6 +14686,7 @@ fn run_shadow_background(global: &GlobalOpts, args: &ShadowStartArgs) -> ExitCod
     };
 
     let mut cmd = std::process::Command::new(exe);
+    apply_shadow_context(&mut cmd, global);
     cmd.arg("shadow").arg("run");
     apply_shadow_start_args(&mut cmd, args);
     cmd.stdin(std::process::Stdio::null())
@@ -14736,6 +14737,10 @@ fn run_shadow_run(global: &GlobalOpts, args: &ShadowStartArgs) -> ExitCode {
 
     let mut iterations = args.iterations;
     let mut run_count: u32 = 0;
+    let mut successful_iterations: u32 = 0;
+    let mut failed_iterations: u32 = 0;
+    let mut last_iteration_exit_code = None;
+    let mut last_error = None;
     let mut next_deep_at = if args.deep || args.deep_interval == 0 {
         None
     } else {
@@ -14763,18 +14768,25 @@ fn run_shadow_run(global: &GlobalOpts, args: &ShadowStartArgs) -> ExitCode {
         }
 
         run_count = run_count.saturating_add(1);
-        match run_shadow_iteration(args, force_deep) {
+        match run_shadow_iteration(global, args, force_deep) {
             Ok(status) => {
-                if !status.success() {
-                    eprintln!(
-                        "shadow run: iteration {} failed (exit={})",
-                        run_count,
-                        status.code().unwrap_or(-1)
-                    );
+                last_iteration_exit_code = status.code();
+                // A plan with candidates is a successful observation, even
+                // though its CLI outcome is PlanReady (1), not shell success.
+                if matches!(status.code(), Some(0 | 1)) {
+                    successful_iterations = successful_iterations.saturating_add(1);
+                } else {
+                    failed_iterations = failed_iterations.saturating_add(1);
+                    let error = format!("planner exited with {status}");
+                    eprintln!("shadow run: iteration {} failed: {}", run_count, error);
+                    last_error = Some(error);
                 }
             }
             Err(err) => {
+                failed_iterations = failed_iterations.saturating_add(1);
+                last_iteration_exit_code = None;
                 eprintln!("shadow run: iteration {} failed: {}", run_count, err);
+                last_error = Some(err.to_string());
             }
         }
 
@@ -14803,6 +14815,10 @@ fn run_shadow_run(global: &GlobalOpts, args: &ShadowStartArgs) -> ExitCode {
     let response = serde_json::json!({
         "command": "shadow run",
         "iterations": run_count,
+        "iterations_succeeded": successful_iterations,
+        "iterations_failed": failed_iterations,
+        "last_iteration_exit_code": last_iteration_exit_code,
+        "last_error": last_error,
         "interval_seconds": args.interval,
         "base_dir": shadow_base_dir().display().to_string(),
     });
@@ -14812,20 +14828,29 @@ fn run_shadow_run(global: &GlobalOpts, args: &ShadowStartArgs) -> ExitCode {
             println!("{}", format_structured_output(global, response));
         }
         _ => {
-            println!("Shadow run complete ({} iterations).", run_count);
+            println!(
+                "Shadow run complete ({} iterations: {} succeeded, {} failed).",
+                run_count, successful_iterations, failed_iterations
+            );
         }
     }
 
-    ExitCode::Clean
+    if failed_iterations == 0 {
+        ExitCode::Clean
+    } else {
+        ExitCode::PartialFail
+    }
 }
 
 fn run_shadow_iteration(
+    global: &GlobalOpts,
     args: &ShadowStartArgs,
     force_deep: bool,
 ) -> Result<std::process::ExitStatus, std::io::Error> {
     let exe = std::env::current_exe()?;
 
     let mut cmd = std::process::Command::new(exe);
+    apply_shadow_context(&mut cmd, global);
     cmd.arg("--shadow")
         .arg("--format")
         .arg("json")
@@ -14834,6 +14859,64 @@ fn run_shadow_iteration(
     apply_shadow_plan_args(&mut cmd, args, force_deep);
 
     cmd.status()
+}
+
+/// Both observer subprocess hops must retain the configuration and collection
+/// context requested by the user. Pass paths as individual arguments so an
+/// explicit --config continues to take precedence over inherited environment.
+fn apply_shadow_context(cmd: &mut std::process::Command, global: &GlobalOpts) {
+    if let Some(config) = &global.config {
+        cmd.arg("--config").arg(config);
+    }
+    if let Some(capabilities) = &global.capabilities {
+        cmd.arg("--capabilities").arg(capabilities);
+    }
+    if let Some(timeout) = global.timeout {
+        cmd.arg("--timeout").arg(timeout.to_string());
+    }
+    if global.robot {
+        cmd.arg("--robot");
+    }
+    if global.standalone {
+        cmd.arg("--standalone");
+    }
+}
+
+#[cfg(test)]
+mod shadow_observer_tests {
+    use super::*;
+
+    #[test]
+    fn shadow_children_preserve_configuration_and_collection_context() {
+        let parsed = Cli::try_parse_from([
+            "pt-core",
+            "--config",
+            "/tmp/reviewed config 'quoted'",
+            "--capabilities",
+            "/tmp/capabilities with spaces.json",
+            "--timeout",
+            "17",
+            "--robot",
+            "--standalone",
+            "shadow",
+            "start",
+        ])
+        .expect("observer CLI");
+        for subcommand in [["shadow", "run"], ["agent", "plan"]] {
+            let mut command = std::process::Command::new("pt-core");
+            apply_shadow_context(&mut command, &parsed.global);
+            command.args(subcommand);
+            let child = Cli::try_parse_from(
+                std::iter::once(command.get_program()).chain(command.get_args()),
+            )
+            .expect("child CLI");
+            assert_eq!(child.global.config, parsed.global.config);
+            assert_eq!(child.global.capabilities, parsed.global.capabilities);
+            assert_eq!(child.global.timeout, Some(17));
+            assert!(child.global.robot);
+            assert!(child.global.standalone);
+        }
+    }
 }
 
 fn run_shadow_stop(global: &GlobalOpts) -> ExitCode {
@@ -23825,7 +23908,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             Ok(recorder) => Some(recorder),
             Err(err) => {
                 eprintln!("shadow mode: failed to initialize storage: {:?}", err);
-                None
+                return ExitCode::IoError;
             }
         }
     } else {
@@ -24028,6 +24111,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                         "shadow mode: failed to record observation for pid {}: {:?}",
                         proc.pid.0, err
                     );
+                    return ExitCode::IoError;
                 }
             }
         }
@@ -24504,6 +24588,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     if let Some(ref mut recorder) = shadow_recorder {
         if let Err(err) = recorder.flush() {
             eprintln!("shadow mode: failed to flush storage: {:?}", err);
+            return ExitCode::IoError;
         }
     }
 

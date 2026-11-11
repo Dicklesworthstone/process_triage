@@ -733,6 +733,148 @@ fn test_shadow_report_with_limit() {
 // Shadow Start (foreground, limited iterations)
 // ============================================================================
 
+fn write_observer_policy(path: &std::path::Path) {
+    fs::create_dir_all(path).expect("config directory");
+    let mut policy = pt_core::config::Policy::default();
+    // These tests only observe. Include ordinary processes on root and non-root
+    // runners so a zero-threshold scan reliably produces a PlanReady outcome.
+    policy.guardrails.builtin_protection = false;
+    policy.guardrails.protected_users.clear();
+    policy.guardrails.protected_categories.clear();
+    policy.guardrails.protected_patterns.clear();
+    policy.guardrails.never_kill_ppid.clear();
+    fs::write(
+        path.join("policy.json"),
+        serde_json::to_vec_pretty(&policy).expect("policy JSON"),
+    )
+    .expect("write observer policy");
+}
+
+#[test]
+fn shadow_observer_uses_explicit_config_and_accepts_plan_ready() {
+    let dir = tempdir().expect("tempdir");
+    let config = dir.path().join("explicit config 'quoted'");
+    let invalid_fallback = dir.path().join("invalid fallback");
+    write_observer_policy(&config);
+    fs::create_dir_all(&invalid_fallback).expect("fallback directory");
+    fs::write(invalid_fallback.join("policy.json"), "not JSON").expect("invalid fallback policy");
+
+    let output = pt_core()
+        .env("PROCESS_TRIAGE_DATA", dir.path().join("data"))
+        .env("PROCESS_TRIAGE_RETENTION", "off")
+        .env("PT_CONFIG_DIR", &invalid_fallback)
+        .arg("--config")
+        .arg(&config)
+        .args([
+            "--format",
+            "json",
+            "shadow",
+            "start",
+            "--iterations",
+            "1",
+            "--min-age",
+            "0",
+            "--min-posterior",
+            "0",
+            "--sample-size",
+            "1",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    let report = parse_last_json_object_with_command(&output.stdout, "shadow run");
+    assert_eq!(report["iterations"], 1);
+    assert_eq!(report["iterations_succeeded"], 1);
+    assert_eq!(report["iterations_failed"], 0);
+    assert_eq!(report["last_iteration_exit_code"], 1);
+    assert!(report["last_error"].is_null());
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("iteration 1 failed"),
+        "PlanReady must not be reported as a failed observation"
+    );
+    assert!(
+        dir.path().join("data/shadow/pending.json").is_file(),
+        "successful observation must persist shadow state"
+    );
+}
+
+#[test]
+fn shadow_observer_reports_failed_iterations_and_returns_failure() {
+    let dir = tempdir().expect("tempdir");
+    let valid_fallback = dir.path().join("valid fallback");
+    let invalid_config = dir.path().join("invalid explicit config");
+    write_observer_policy(&valid_fallback);
+    fs::create_dir_all(&invalid_config).expect("explicit config directory");
+    fs::write(invalid_config.join("policy.json"), "not JSON").expect("invalid explicit policy");
+
+    let output = pt_core()
+        .env("PROCESS_TRIAGE_DATA", dir.path().join("data"))
+        .env("PT_CONFIG_DIR", &valid_fallback)
+        .arg("--config")
+        .arg(&invalid_config)
+        .args([
+            "--format",
+            "json",
+            "shadow",
+            "start",
+            "--iterations",
+            "2",
+            "--interval",
+            "0",
+        ])
+        .assert()
+        .code(3)
+        .get_output()
+        .clone();
+
+    let report = parse_last_json_object_with_command(&output.stdout, "shadow run");
+    assert_eq!(report["iterations"], 2);
+    assert_eq!(report["iterations_succeeded"], 0);
+    assert_eq!(report["iterations_failed"], 2);
+    assert_eq!(report["last_iteration_exit_code"], 20);
+    assert!(report["last_error"].as_str().is_some_and(|s| !s.is_empty()));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("iteration 2 failed"));
+}
+
+#[test]
+fn shadow_observer_reports_unwritable_observation_store() {
+    let dir = tempdir().expect("tempdir");
+    let config = dir.path().join("config");
+    let data = dir.path().join("data");
+    write_observer_policy(&config);
+    fs::create_dir_all(&data).expect("data directory");
+    // A file in place of the shadow directory fails even for a root test runner.
+    fs::write(data.join("shadow"), "not a directory").expect("blocked store");
+
+    let output = pt_core()
+        .env("PROCESS_TRIAGE_DATA", &data)
+        .env("PROCESS_TRIAGE_RETENTION", "off")
+        .arg("--config")
+        .arg(&config)
+        .args([
+            "--format",
+            "json",
+            "shadow",
+            "start",
+            "--iterations",
+            "1",
+            "--sample-size",
+            "1",
+        ])
+        .assert()
+        .code(3)
+        .get_output()
+        .clone();
+
+    let report = parse_last_json_object_with_command(&output.stdout, "shadow run");
+    assert_eq!(report["iterations_succeeded"], 0);
+    assert_eq!(report["iterations_failed"], 1);
+    assert_eq!(report["last_iteration_exit_code"], 21);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("failed to initialize storage"));
+}
+
 #[test]
 fn test_shadow_start_foreground_one_iteration() {
     let dir = tempdir().expect("tempdir");
