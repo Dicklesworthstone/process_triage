@@ -21,6 +21,16 @@ pub enum Goal {
 }
 
 impl Goal {
+    /// Disk recovery and verification use one explicitly resolved filesystem.
+    /// Validate typed/deserialized goals too, not just the command parser.
+    pub fn disk_target(&self) -> Result<Option<&ResourceTarget>, GoalParseError> {
+        match self {
+            Self::Target(target) => Ok((target.metric == Metric::Disk).then_some(target)),
+            Self::Relieve(_) => Ok(None),
+            Self::And(parts) | Self::Or(parts) => disk_target_in(parts),
+        }
+    }
+
     /// Canonical string representation for telemetry/caching.
     pub fn canonical(&self) -> String {
         match self {
@@ -49,6 +59,11 @@ pub struct ResourceTarget {
     pub comparator: Comparator,
     /// Optional: specific port number for port goals.
     pub port: Option<u16>,
+    /// A directory on the filesystem to reclaim. None selects the filesystem
+    /// containing the caller's current directory, resolved during observation.
+    /// Omit absent fields so older saved goals retain their canonical hashes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_path: Option<String>,
 }
 
 impl ResourceTarget {
@@ -58,6 +73,12 @@ impl ResourceTarget {
             Metric::Cpu => format!("cpu {} {:.2}%", self.comparator, self.value * 100.0),
             Metric::Port => format!("release port {}", self.port.unwrap_or(0)),
             Metric::FileDescriptors => format!("fds {} {:.0}", self.comparator, self.value),
+            Metric::Disk => {
+                let scope = self.disk_path.as_ref().map_or_else(String::new, |path| {
+                    format!(" on {}", serde_json::Value::String(path.clone()))
+                });
+                format!("free-disk {:.0}B{scope}", self.value)
+            }
         }
     }
 }
@@ -69,6 +90,7 @@ pub enum Metric {
     Cpu,
     Port,
     FileDescriptors,
+    Disk,
 }
 
 /// Goal comparator.
@@ -105,6 +127,8 @@ pub enum GoalParseError {
     InvalidNumber(String),
     /// Invalid port number.
     InvalidPort(String),
+    /// Disk scope is not a valid absolute directory path.
+    InvalidDiskPath(String),
     /// Ambiguous input.
     Ambiguous(String),
 }
@@ -114,11 +138,15 @@ impl std::fmt::Display for GoalParseError {
         match self {
             Self::EmptyInput => write!(f, "Empty goal string"),
             Self::UnrecognizedFormat(s) => {
-                write!(f, "Unrecognized goal format: \"{}\". Try: \"relieve\", \"cpu-pressure\", \"mem-pressure\", \"io-pressure\", \"free 4GB RAM\", \"reduce CPU below 50%\", \"release port 3000\", \"free 100 FDs\"", s)
+                write!(f, "Unrecognized goal format: \"{}\". Try: \"relieve\", \"cpu-pressure\", \"mem-pressure\", \"io-pressure\", \"free 4GB RAM\", \"free-disk 4GB on /data\", \"reduce CPU below 50%\", \"release port 3000\", \"free 100 FDs\"", s)
             }
             Self::InvalidUnit(u) => write!(f, "Invalid unit: \"{}\". Use: B, KB, MB, GB, TB", u),
             Self::InvalidNumber(n) => write!(f, "Invalid number: \"{}\"", n),
             Self::InvalidPort(p) => write!(f, "Invalid port: \"{}\" (must be 1-65535)", p),
+            Self::InvalidDiskPath(path) => write!(
+                f,
+                "Invalid disk path: {path:?}; use an absolute directory path, optionally JSON-quoted"
+            ),
             Self::Ambiguous(s) => write!(f, "Ambiguous goal: \"{}\"", s),
         }
     }
@@ -137,6 +165,8 @@ impl std::fmt::Display for GoalParseError {
 /// - "free port 3000"
 /// - "free 100 FDs"
 /// - "free 50 file descriptors"
+/// - "free-disk 4GB" (filesystem containing the current directory)
+/// - "free-disk 4 GB on /data" (one filesystem per goal request)
 /// - Composition: "free 4GB RAM AND release port 3000"
 pub fn parse_goal(input: &str) -> Result<Goal, GoalParseError> {
     let trimmed = input.trim();
@@ -157,27 +187,49 @@ pub fn parse_goal(input: &str) -> Result<Goal, GoalParseError> {
 
     // Check for composition.
     // Split on " AND " or " OR " (case insensitive).
-    let upper = trimmed.to_ascii_uppercase();
-
-    if upper.contains(" AND ") {
-        let parts = split_preserving_case(trimmed, " AND ");
+    let parts = split_preserving_case(trimmed, " AND ");
+    if parts.len() > 1 {
         let goals: Result<Vec<Goal>, GoalParseError> = parts
             .iter()
             .map(|p| parse_single_goal(p.trim()).map(Goal::Target))
             .collect();
-        return Ok(Goal::And(goals?));
+        let goals = goals?;
+        validate_disk_target_count(&goals)?;
+        return Ok(Goal::And(goals));
     }
 
-    if upper.contains(" OR ") {
-        let parts = split_preserving_case(trimmed, " OR ");
+    let parts = split_preserving_case(trimmed, " OR ");
+    if parts.len() > 1 {
         let goals: Result<Vec<Goal>, GoalParseError> = parts
             .iter()
             .map(|p| parse_single_goal(p.trim()).map(Goal::Target))
             .collect();
-        return Ok(Goal::Or(goals?));
+        let goals = goals?;
+        validate_disk_target_count(&goals)?;
+        return Ok(Goal::Or(goals));
     }
 
     parse_single_goal(trimmed).map(Goal::Target)
+}
+
+fn validate_disk_target_count(goals: &[Goal]) -> Result<(), GoalParseError> {
+    disk_target_in(goals).map(|_| ())
+}
+
+fn disk_target_in(goals: &[Goal]) -> Result<Option<&ResourceTarget>, GoalParseError> {
+    let mut found = None;
+    for goal in goals {
+        if let Some(target) = goal.disk_target()? {
+            if found.is_some() {
+                return Err(GoalParseError::Ambiguous(
+                    "Use one disk target per request so planned and measured recovery share one filesystem"
+                        .to_string(),
+                ));
+            }
+            found = Some(target);
+        }
+    }
+    Ok(found)
 }
 
 /// Split a string on a separator (case-insensitive) but preserve original case.
@@ -189,15 +241,42 @@ fn split_preserving_case<'a>(input: &'a str, sep: &str) -> Vec<&'a str> {
     let mut parts = Vec::new();
     let mut start = 0;
 
-    while let Some(pos) = upper_input[start..].find(&upper_sep) {
-        parts.push(&input[start..start + pos]);
-        start += pos + sep.len();
+    let mut quoted = false;
+    let mut escaped = false;
+    for (pos, byte) in input.bytes().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if quoted && byte == b'\\' {
+            escaped = true;
+            continue;
+        }
+        if byte == b'"' {
+            quoted = !quoted;
+            continue;
+        }
+        if !quoted
+            && pos >= start
+            && upper_input.as_bytes().get(pos..pos + upper_sep.len())
+                == Some(upper_sep.as_bytes())
+        {
+            parts.push(&input[start..pos]);
+            start = pos + sep.len();
+        }
     }
     parts.push(&input[start..]);
     parts
 }
 
 fn parse_single_goal(input: &str) -> Result<ResourceTarget, GoalParseError> {
+    if input
+        .split_whitespace()
+        .next()
+        .is_some_and(|word| word.eq_ignore_ascii_case("free-disk"))
+    {
+        return parse_disk_goal(input);
+    }
     let lower = input.to_lowercase();
     let tokens: Vec<&str> = lower.split_whitespace().collect();
 
@@ -219,6 +298,7 @@ fn parse_single_goal(input: &str) -> Result<ResourceTarget, GoalParseError> {
             value: port as f64,
             comparator: Comparator::Release,
             port: Some(port),
+            disk_path: None,
         });
     }
 
@@ -231,6 +311,7 @@ fn parse_single_goal(input: &str) -> Result<ResourceTarget, GoalParseError> {
                 value: parse_cpu_fraction(amount.trim())?,
                 comparator: Comparator::ReduceBelow,
                 port: None,
+                disk_path: None,
             });
         }
     }
@@ -242,6 +323,7 @@ fn parse_single_goal(input: &str) -> Result<ResourceTarget, GoalParseError> {
             value: parse_cpu_fraction(tokens[3])?,
             comparator: Comparator::ReduceBelow,
             port: None,
+            disk_path: None,
         });
     }
 
@@ -256,6 +338,7 @@ fn parse_single_goal(input: &str) -> Result<ResourceTarget, GoalParseError> {
                 value: parse_cpu_fraction(amount_str)?,
                 comparator: Comparator::FreeAtLeast,
                 port: None,
+                disk_path: None,
             });
         }
 
@@ -272,6 +355,7 @@ fn parse_single_goal(input: &str) -> Result<ResourceTarget, GoalParseError> {
                 value: n,
                 comparator: Comparator::FreeAtLeast,
                 port: None,
+                disk_path: None,
             });
         }
 
@@ -283,6 +367,7 @@ fn parse_single_goal(input: &str) -> Result<ResourceTarget, GoalParseError> {
                 value: bytes,
                 comparator: Comparator::FreeAtLeast,
                 port: None,
+                disk_path: None,
             });
         }
 
@@ -297,6 +382,54 @@ fn parse_single_goal(input: &str) -> Result<ResourceTarget, GoalParseError> {
     }
 
     Err(GoalParseError::UnrecognizedFormat(input.to_string()))
+}
+
+fn parse_disk_goal(input: &str) -> Result<ResourceTarget, GoalParseError> {
+    let rest = input
+        .split_once(char::is_whitespace)
+        .map(|(_, rest)| rest.trim())
+        .ok_or_else(|| GoalParseError::UnrecognizedFormat(input.to_string()))?;
+    let lower = rest.to_ascii_lowercase();
+    let (amount, path) = match lower.find(" on ") {
+        Some(at) => (&rest[..at], Some(rest[at + 4..].trim())),
+        None => (rest, None),
+    };
+    let words: Vec<_> = amount.split_whitespace().collect();
+    if words.is_empty() || words.len() > 2 {
+        return Err(GoalParseError::UnrecognizedFormat(input.to_string()));
+    }
+    if words.len() == 2 && !words[1].bytes().all(|byte| byte.is_ascii_alphabetic()) {
+        return Err(GoalParseError::InvalidUnit(words[1].to_string()));
+    }
+    let amount = words.join("");
+    let bytes = parse_memory_amount(&amount)?;
+    if !bytes.is_finite() || bytes < 0.0 || bytes >= u64::MAX as f64 {
+        return Err(GoalParseError::InvalidNumber(amount));
+    }
+    let disk_path = path
+        .map(|path| {
+            let decoded = if path.starts_with('"') {
+                serde_json::from_str::<String>(path)
+                    .map_err(|_| GoalParseError::InvalidDiskPath(path.to_string()))?
+            } else {
+                path.to_string()
+            };
+            if !decoded.starts_with('/')
+                || decoded.chars().any(char::is_control)
+                || decoded.len() > 4096
+            {
+                return Err(GoalParseError::InvalidDiskPath(decoded));
+            }
+            Ok(decoded)
+        })
+        .transpose()?;
+    Ok(ResourceTarget {
+        metric: Metric::Disk,
+        value: bytes.ceil(),
+        comparator: Comparator::FreeAtLeast,
+        port: None,
+        disk_path,
+    })
 }
 
 /// CPU goals are fractions of the whole host, not percentages of one core.
@@ -345,6 +478,58 @@ fn parse_memory_amount(s: &str) -> Result<f64, GoalParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disk_goals_bind_one_preserved_path_and_roundtrip() {
+        for (input, expected_bytes, path) in [
+            ("free-disk 1.5GB", 1_610_612_736.0, None),
+            ("FREE-DISK 2 GiB on /Data/Builds", 2_147_483_648.0, Some("/Data/Builds")),
+            ("free-disk 0B on /", 0.0, Some("/")),
+            (r#"free-disk 1MB on "/dåta/Build AND Cache""#, 1_048_576.0, Some("/dåta/Build AND Cache")),
+        ] {
+            let goal = parse_goal(input).unwrap();
+            let target = goal.disk_target().unwrap().unwrap();
+            assert_eq!(target.metric, Metric::Disk);
+            assert_eq!(target.value, expected_bytes);
+            assert_eq!(target.disk_path.as_deref(), path);
+            assert_eq!(target.port, None);
+            assert_eq!(parse_goal(&goal.canonical()).unwrap(), goal);
+            assert_eq!(serde_json::from_str::<Goal>(&serde_json::to_string(&goal).unwrap()).unwrap(), goal);
+        }
+    }
+
+    #[test]
+    fn disk_composition_keeps_filesystem_scope_unambiguous() {
+        let goal = parse_goal(r#"free-disk 1GB on "/Build AND Cache" AND free 2GB RAM"#).unwrap();
+        assert_eq!(goal.disk_target().unwrap().unwrap().disk_path.as_deref(), Some("/Build AND Cache"));
+        for input in [
+            "free-disk 1GB on /data AND free-disk 2GB on /other",
+            "free-disk 1GB OR free-disk 2GB",
+            "free-disk -1GB",
+            "free-disk NaNGB",
+            "free-disk 18446744073709551616B",
+            "free-disk 1 2GB",
+            "free-disk 1GB on relative",
+            "free-disk 1GB on",
+            r#"free-disk 1GB on "/data" trailing"#,
+            "free-disk 1GB on /bad\npath",
+        ] {
+            assert!(parse_goal(input).is_err(), "accepted {input:?}");
+        }
+        let typed = Goal::And(vec![parse_goal("free-disk 1GB").unwrap(), parse_goal("free-disk 2GB").unwrap()]);
+        assert!(typed.disk_target().is_err());
+    }
+
+    #[test]
+    fn older_goal_json_does_not_gain_an_empty_disk_scope() {
+        let original = serde_json::json!({
+            "metric": "Memory", "value": 4096.0,
+            "comparator": "FreeAtLeast", "port": null,
+        });
+        let target: ResourceTarget = serde_json::from_value(original.clone()).unwrap();
+        assert_eq!(target.disk_path, None);
+        assert_eq!(serde_json::to_value(target).unwrap(), original);
+    }
 
     #[test]
     fn pressure_goals_round_trip_without_implying_resource_targets() {

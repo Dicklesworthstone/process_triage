@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::collect::disk::DiskMountObservation;
+
 /// Metric snapshot (before or after action application).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricSnapshot {
@@ -18,6 +20,11 @@ pub struct MetricSnapshot {
     pub occupied_ports: Option<Vec<u16>>,
     /// Total open file descriptors in a consistent, completely observed scope.
     pub total_fds: Option<u64>,
+    /// Available space on the one filesystem selected by the saved disk goal.
+    /// Its mount identity is required to compare two observations. Older
+    /// snapshots have no disk observation, rather than a measured zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_space: Option<DiskMountObservation>,
     /// Timestamp (epoch seconds).
     pub timestamp: f64,
 }
@@ -107,6 +114,7 @@ pub enum GoalMetric {
     Cpu,
     Port,
     FileDescriptors,
+    Disk,
 }
 
 /// Configuration for progress measurement.
@@ -314,6 +322,50 @@ fn compute_observed_delta(
                 .ok_or("A complete file-descriptor total is unavailable after application")?;
             Ok((i128::from(before) - i128::from(after)) as f64)
         }
+        GoalMetric::Disk => {
+            let before = before
+                .disk_space
+                .as_ref()
+                .ok_or("Filesystem available space was not observed before application")?;
+            let after = after
+                .disk_space
+                .as_ref()
+                .ok_or("Filesystem available space was not observed after application")?;
+            before
+                .identity
+                .validate()
+                .map_err(|_| "The before filesystem identity is incomplete or invalid")?;
+            after
+                .identity
+                .validate()
+                .map_err(|_| "The after filesystem identity is incomplete or invalid")?;
+            if before.identity != after.identity {
+                return Err(
+                    "Filesystem observations belong to different mounts, namespaces, or boots",
+                );
+            }
+            before.validate_capacity().map_err(|_| {
+                "Filesystem capacity was not completely observed before application"
+            })?;
+            after
+                .validate_capacity()
+                .map_err(|_| "Filesystem capacity was not completely observed after application")?;
+            if before.total_bytes != after.total_bytes {
+                return Err(
+                    "Filesystem capacity changed between the before and after observations",
+                );
+            }
+            let before = before
+                .available_bytes
+                .ok_or("Filesystem available space was not observed before application")?;
+            let after = after
+                .available_bytes
+                .ok_or("Filesystem available space was not observed after application")?;
+            // A concurrent writer can consume more space than the selected
+            // processes released. Preserve that loss; this is a filesystem
+            // observation, not proof of the actions' causal contribution.
+            Ok((i128::from(after) - i128::from(before)) as f64)
+        }
     }
 }
 
@@ -372,12 +424,35 @@ fn diagnose_causes(outcomes: &[ActionOutcome], class: DiscrepancyClass) -> Vec<S
 mod tests {
     use super::*;
 
+    fn disk_observation(available_bytes: u64) -> DiskMountObservation {
+        DiskMountObservation {
+            identity: crate::collect::disk::DiskMountIdentity {
+                boot_id: "11111111-1111-4111-8111-111111111111".into(),
+                mount_namespace_device: 1,
+                mount_namespace_inode: 2,
+                mount_id: 3,
+                device_major: 8,
+                device_minor: 1,
+                filesystem_type: "ext4".into(),
+                mount_root_sha256: "1".repeat(64),
+                mount_source_sha256: "2".repeat(64),
+                mount_options_sha256: "3".repeat(64),
+            },
+            mount_point: "/observed".into(),
+            total_bytes: Some(10_000_000_000),
+            free_bytes: Some(available_bytes),
+            available_bytes: Some(available_bytes),
+            ..Default::default()
+        }
+    }
+
     fn make_before() -> MetricSnapshot {
         MetricSnapshot {
             available_memory_bytes: Some(2_000_000_000),
             total_cpu_frac: Some(0.8),
             occupied_ports: Some(vec![3000, 8080]),
             total_fds: Some(5000),
+            disk_space: Some(disk_observation(2_000_000_000)),
             timestamp: 1000.0,
         }
     }
@@ -388,6 +463,7 @@ mod tests {
             total_cpu_frac: Some(0.5),
             occupied_ports: Some(vec![8080]), // Port 3000 freed
             total_fds: Some(4500),
+            disk_space: Some(disk_observation(3_000_000_000)),
             timestamp: 1010.0,
         }
     }
@@ -400,6 +476,119 @@ mod tests {
             respawn_detected: respawn,
             expected_contribution: Some(expected),
         }]
+    }
+
+    #[test]
+    fn disk_progress_preserves_space_increases_and_losses_without_crediting_failed_actions() {
+        let before = make_before();
+        for (available, expected_delta) in [
+            (3_000_000_000, 1_000_000_000.0),
+            (1_500_000_000, -500_000_000.0),
+        ] {
+            let after = MetricSnapshot {
+                disk_space: Some(disk_observation(available)),
+                ..make_after_good()
+            };
+            let mut outcomes = make_outcomes(1_000_000_000.0, true, false);
+            outcomes.push(ActionOutcome {
+                pid: 5678,
+                label: "failed or skipped process".into(),
+                success: false,
+                respawn_detected: false,
+                expected_contribution: None,
+            });
+            let report = measure_progress(
+                GoalMetric::Disk,
+                None,
+                &before,
+                &after,
+                outcomes,
+                &ProgressConfig::default(),
+                None,
+            );
+            assert_eq!(report.expected_progress, Some(1_000_000_000.0));
+            assert_eq!(report.observed_progress, Some(expected_delta));
+            assert_eq!(report.discrepancy, Some(expected_delta - 1_000_000_000.0));
+            assert_eq!(report.action_outcomes.len(), 2);
+        }
+    }
+
+    #[test]
+    fn disk_progress_rejects_missing_invalid_and_changed_filesystem_observations() {
+        for case in [
+            "missing",
+            "error",
+            "total",
+            "free",
+            "available",
+            "invalid_capacity",
+            "empty_boot",
+            "boot",
+            "namespace",
+            "mount",
+            "device",
+            "options",
+            "resize",
+        ] {
+            for change_before in [true, false] {
+                let mut before = make_before();
+                let mut after = make_after_good();
+                let changed = if change_before {
+                    &mut before
+                } else {
+                    &mut after
+                };
+                if case == "missing" {
+                    changed.disk_space = None;
+                } else {
+                    let disk = changed.disk_space.as_mut().unwrap();
+                    match case {
+                        "error" => disk.error = Some("permission denied".into()),
+                        "total" => disk.total_bytes = None,
+                        "free" => disk.free_bytes = None,
+                        "available" => disk.available_bytes = None,
+                        "invalid_capacity" => disk.available_bytes = Some(11_000_000_000),
+                        "empty_boot" => disk.identity.boot_id.clear(),
+                        "boot" => {
+                            disk.identity.boot_id = "22222222-2222-4222-8222-222222222222".into()
+                        }
+                        "namespace" => disk.identity.mount_namespace_inode += 1,
+                        "mount" => disk.identity.mount_id += 1,
+                        "device" => disk.identity.device_minor += 1,
+                        "options" => disk.identity.mount_options_sha256 = "4".repeat(64),
+                        "resize" => disk.total_bytes = Some(20_000_000_000),
+                        _ => unreachable!(),
+                    }
+                }
+                let report = measure_progress(
+                    GoalMetric::Disk,
+                    None,
+                    &before,
+                    &after,
+                    make_outcomes(1_000_000_000.0, true, false),
+                    &ProgressConfig::default(),
+                    None,
+                );
+                assert_eq!(
+                    report.classification,
+                    DiscrepancyClass::Unavailable,
+                    "{case}, before={change_before}"
+                );
+                assert_eq!(report.observed_progress, None);
+                assert_eq!(report.discrepancy, None);
+                assert!(report.measurement_unavailable_reason.is_some());
+                assert!(report.suspected_causes.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn older_metric_snapshot_preserves_its_serialized_representation() {
+        let mut older = serde_json::to_value(make_before()).unwrap();
+        older.as_object_mut().unwrap().remove("disk_space");
+        let restored: MetricSnapshot = serde_json::from_value(older.clone()).unwrap();
+        assert!(restored.disk_space.is_none());
+        assert_eq!(serde_json::to_value(restored).unwrap(), older);
     }
 
     #[test]
@@ -704,6 +893,7 @@ mod tests {
             GoalMetric::Cpu,
             GoalMetric::Port,
             GoalMetric::FileDescriptors,
+            GoalMetric::Disk,
         ] {
             for missing_before in [true, false] {
                 let mut before = make_before();
@@ -718,6 +908,7 @@ mod tests {
                     GoalMetric::Cpu => missing.total_cpu_frac = None,
                     GoalMetric::Port => missing.occupied_ports = None,
                     GoalMetric::FileDescriptors => missing.total_fds = None,
+                    GoalMetric::Disk => missing.disk_space = None,
                 }
                 let report = measure_progress(
                     metric,
@@ -753,6 +944,7 @@ mod tests {
             total_cpu_frac: Some(0.0),
             occupied_ports: Some(Vec::new()),
             total_fds: Some(0),
+            disk_space: Some(disk_observation(0)),
             timestamp: 1.0,
         };
         let after = MetricSnapshot {
@@ -764,6 +956,7 @@ mod tests {
             GoalMetric::Cpu,
             GoalMetric::Port,
             GoalMetric::FileDescriptors,
+            GoalMetric::Disk,
         ] {
             let report = measure_progress(
                 metric,

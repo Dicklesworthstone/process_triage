@@ -3211,6 +3211,7 @@ proptest! {
             total_cpu_frac: Some(0.5),
             occupied_ports: Some(vec![]),
             total_fds: Some(1000),
+            disk_space: None,
             timestamp: 0.0,
         };
         let after = MetricSnapshot {
@@ -3218,6 +3219,7 @@ proptest! {
             total_cpu_frac: Some(0.5),
             occupied_ports: Some(vec![]),
             total_fds: Some(1000),
+            disk_space: None,
             timestamp: 1.0,
         };
         let outcomes = vec![ActionOutcome {
@@ -3252,10 +3254,12 @@ proptest! {
             total_cpu_frac: Some(0.5),
             occupied_ports: Some(vec![]),
             total_fds: Some(1000),
+            disk_space: None,
             timestamp: 0.0,
         };
         let after = MetricSnapshot {
             available_memory_bytes: Some(1_000_000_000 + observed as u64),
+            disk_space: None,
             timestamp: 1.0,
             ..before.clone()
         };
@@ -3286,6 +3290,7 @@ proptest! {
             total_cpu_frac: Some(0.5),
             occupied_ports: Some(vec![]),
             total_fds: Some(1000),
+            disk_space: None,
             timestamp: 0.0,
         };
         let after = MetricSnapshot {
@@ -3293,6 +3298,7 @@ proptest! {
             total_cpu_frac: Some(0.5),
             occupied_ports: Some(vec![]),
             total_fds: Some(1000),
+            disk_space: None,
             timestamp: 1.0,
         };
         let outcomes: Vec<ActionOutcome> = (0..n_outcomes).map(|i| ActionOutcome {
@@ -3323,9 +3329,11 @@ proptest! {
             total_cpu_frac: Some(before_cpu),
             occupied_ports: None,
             total_fds: None,
+            disk_space: None,
             timestamp: 0.0,
         };
         let after = MetricSnapshot {
+            disk_space: None,
             total_cpu_frac: Some(after_cpu), timestamp: 1.0, ..before.clone()
         };
         let outcomes = vec![

@@ -96,8 +96,9 @@ use pt_core::verify::relief_store::{
     begin_resource_run, finish_resource_run, load_resource_runs, ResourceRun, ResourceRunResult,
 };
 use pt_core::verify::resource_prediction::{
-    ActionResourcePrediction, FileDescriptorPrediction, HostCpuPrediction, PrivateMemoryPrediction,
-    ResourcePredictionSnapshot, ValidatedResourcePredictions, RESOURCE_PREDICTION_SCHEMA_VERSION,
+    ActionResourcePrediction, DiskRecoveryPrediction, FileDescriptorPrediction, HostCpuPrediction,
+    PrivateMemoryPrediction, ResourcePredictionSnapshot, ValidatedResourcePredictions,
+    RESOURCE_PREDICTION_SCHEMA_VERSION,
 };
 #[cfg(test)]
 use pt_core::verify::verify_plan;
@@ -3016,6 +3017,7 @@ fn score_tui_rows(
     let mut output = build_tui_rows(
         processes,
         population,
+        census_complete,
         Some(min_age),
         deep_signals.as_ref(),
         Some(&probe_advice),
@@ -4898,6 +4900,7 @@ fn tui_goal_summary(goal_str: &str, output: &GoalPlanOutput) -> Vec<String> {
 fn build_tui_rows(
     processes: &[ProcessRecord],
     population: &[ProcessRecord],
+    census_complete: bool,
     min_age: Option<u64>,
     deep_signals: Option<&HashMap<u32, DeepSignals>>,
     probe_advice: Option<&HashMap<u32, ProbeAdvice>>,
@@ -5173,7 +5176,10 @@ fn build_tui_rows(
     if let Some(goal_str) = goal_str {
         match parse_goal(goal_str) {
             Ok(parsed) => {
-                let resources = GoalResourceSnapshot::collect(&parsed, population);
+                let mut resources = GoalResourceSnapshot::collect(&parsed, population);
+                if !census_complete {
+                    resources.mark_census_incomplete();
+                }
                 match finalize_tui_goal_selection(
                     session_id,
                     &parsed,
@@ -5943,6 +5949,27 @@ fn resource_goal_from_target(
                 weight: 1.0,
             }
         }
+        Metric::Disk => {
+            if target.comparator != Comparator::FreeAtLeast || target.value >= u64::MAX as f64 {
+                return Err("disk goals require a finite free-disk byte target".into());
+            }
+            if let Some(error) = &resources.disk_error {
+                return Err(format!("disk filesystem unavailable: {error}"));
+            }
+            resources
+                .disk_mount
+                .as_ref()
+                .ok_or("disk filesystem was not observed")?
+                .validate_capacity()?;
+            if resources.disk.as_ref().is_none_or(|disk| !disk.complete) {
+                warnings.push("disk_exclusive_ownership_unavailable".into());
+            }
+            ResourceGoal {
+                resource: "disk_bytes".into(),
+                target: target.value.ceil(),
+                weight: 1.0,
+            }
+        }
     };
     Ok((goal, warnings))
 }
@@ -6041,6 +6068,10 @@ fn build_opt_candidates_for_goals(
                         .as_ref()
                         .and_then(|identity| resources.fd_count(identity))
                         .unwrap_or(0) as f64,
+                    "disk_bytes" => identity
+                        .as_ref()
+                        .and_then(|identity| resources.exclusive_disk_bytes(identity).ok())
+                        .unwrap_or(0) as f64,
                     resource if resource.starts_with("port_") => {
                         let holders = resource
                             .strip_prefix("port_")
@@ -6122,6 +6153,14 @@ fn attach_goal_resource_observations(
             "memory_basis": "private_clean_plus_private_dirty",
             "private_memory_bytes": private_memory_bytes,
             "private_memory": private_memory,
+            "disk": resources.disk_mount.as_ref().map(|mount| serde_json::json!({
+                "mount": mount,
+                "exclusive_deleted_allocated_bytes": identity.as_ref()
+                    .and_then(|identity| resources.exclusive_disk_bytes(identity).ok()),
+                "basis": "exclusive_unlinked_inode_allocated_blocks",
+                "ownership_complete": resources.disk.as_ref().is_some_and(|disk| disk.complete),
+                "guaranteed_recovery": false,
+            })),
             "bound_ports": resources.ports.iter().filter_map(|(port, observed)| {
                 observed.holders.as_ref().filter(|holders| identity.as_ref().is_some_and(|identity|
                     holders.iter().any(|holder| holder.matches(identity)))).map(|_| *port)
@@ -6167,6 +6206,7 @@ struct PlanningResourceTimes {
     activity_unix_ms: i64,
     private_memory_unix_ms: Option<i64>,
     descriptors_unix_ms: Option<i64>,
+    disk_unix_ms: Option<i64>,
 }
 
 fn build_resource_predictions(
@@ -6189,6 +6229,7 @@ fn build_resource_predictions(
             memory: None,
             cpu: None,
             file_descriptors: None,
+            disk: None,
             unavailable: Vec::new(),
         };
         if action.action != Action::Kill {
@@ -6255,6 +6296,28 @@ fn build_resource_predictions(
                     .into(),
             );
         }
+        if resources.disk_mount.is_some() || resources.disk_error.is_some() {
+            let disk = resources
+                .exclusive_disk_bytes(&action.target)
+                .and_then(|bytes| {
+                    DiskRecoveryPrediction::new(
+                        resources
+                            .disk_mount
+                            .as_ref()
+                            .ok_or("disk filesystem unavailable")?
+                            .identity
+                            .clone(),
+                        bytes,
+                        times
+                            .disk_unix_ms
+                            .ok_or("disk observation time is unavailable")?,
+                    )
+                });
+            match disk {
+                Ok(disk) => prediction.disk = Some(disk),
+                Err(error) => prediction.unavailable.push(format!("disk: {error}")),
+            }
+        }
         prediction.unavailable.push(
             "ports: exclusive release in the observer network namespace is not established".into(),
         );
@@ -6295,9 +6358,27 @@ fn build_goal_plan_from_candidates(
     candidates: &[serde_json::Value],
     resources: &GoalResourceSnapshot,
 ) -> Result<GoalPlanOutput, String> {
+    let _ = goal.disk_target().map_err(|error| error.to_string())?;
     let mut warnings = resources.warnings.clone();
     let requests_cpu = goal_requests_metric(goal, Metric::Cpu);
     let requests_memory = goal_requests_metric(goal, Metric::Memory);
+    let requests_disk = goal_requests_metric(goal, Metric::Disk);
+    if requests_disk {
+        let unavailable = candidates
+            .iter()
+            .filter(|candidate| {
+                candidate["recommended_action"].as_str() == Some("kill")
+                    && goal_candidate_identity(candidate)
+                        .and_then(|identity| resources.exclusive_disk_bytes(&identity).ok())
+                        .is_none()
+            })
+            .count();
+        if unavailable > 0 {
+            warnings.push(format!(
+                "disk_contribution_unavailable_for_{unavailable}_candidates"
+            ));
+        }
+    }
     if requests_memory {
         let unavailable = candidates
             .iter()
@@ -6337,6 +6418,15 @@ fn build_goal_plan_from_candidates(
         "port_scope": "current_network_namespace",
         "process_scope": "mounted_procfs",
         "ports": resources.ports,
+        "disk": requests_disk.then(|| serde_json::json!({
+            "mount": resources.disk_mount,
+            "error": resources.disk_error,
+            "ownership_complete": resources.disk.as_ref().is_some_and(|disk| disk.complete),
+            "basis": "exclusive_unlinked_inode_allocated_blocks",
+            "unit": "bytes",
+            "shared_files_contribute": 0,
+            "guaranteed_recovery": false,
+        })),
         "memory": requests_memory.then(|| serde_json::json!({
             "basis": "private_clean_plus_private_dirty",
             "source": "proc_pid_smaps_rollup",
@@ -6364,6 +6454,15 @@ fn build_goal_plan_from_candidates(
                 };
                 let (g, mut w) = match resource_goal_from_target(t, current_cpu_pct, resources) {
                     Ok(value) => value,
+                    Err(error)
+                        if t.metric == Metric::Disk
+                            && t.comparator == Comparator::FreeAtLeast
+                            && t.value.is_finite()
+                            && (0.0..u64::MAX as f64).contains(&t.value) =>
+                    {
+                        warnings.push(format!("disk_branch_unavailable: {error}"));
+                        continue;
+                    }
                     Err(error)
                         if goal_requires_cpu_baseline(sub)
                             && (!current_cpu_pct.is_finite() || current_cpu_pct < 0.0)
@@ -6474,6 +6573,7 @@ fn goal_summary_json(goal_str: &str, goal: &Goal, output: &GoalPlanOutput) -> se
                     "memory_mb" => "MiB",
                     "cpu_pct" => "percent_of_host_capacity",
                     "fd_count" => "descriptors",
+                    "disk_bytes" => "bytes",
                     resource if resource.starts_with("port_") => "holder_processes",
                     _ => "unknown",
                 },
@@ -7203,6 +7303,199 @@ mod executable_goal_tests {
         }
     }
 
+    fn disk_resources(plan: &Plan, allocations: &[(u32, u64)]) -> GoalResourceSnapshot {
+        use pt_core::collect::disk::{
+            DeletedFileObservation, DiskMountIdentity, DiskMountObservation,
+            DiskProcessObservation, DiskResourceSnapshot,
+        };
+        let mount = DiskMountObservation {
+            identity: DiskMountIdentity {
+                boot_id: "goal-test".into(),
+                mount_namespace_device: 4,
+                mount_namespace_inode: 123,
+                mount_id: 9,
+                device_major: 8,
+                device_minor: 1,
+                filesystem_type: "ext4".into(),
+                mount_root_sha256: "a".repeat(64),
+                mount_source_sha256: "b".repeat(64),
+                mount_options_sha256: "c".repeat(64),
+            },
+            mount_point: "/data".into(),
+            total_bytes: Some(100 * MIB),
+            free_bytes: Some(5 * MIB),
+            available_bytes: Some(4 * MIB),
+            ownership_complete: true,
+            ..Default::default()
+        };
+        let mut disk = DiskResourceSnapshot {
+            mounts: vec![mount.clone()],
+            complete: true,
+            ..Default::default()
+        };
+        for &(pid, bytes) in allocations {
+            let identity = plan.actions.iter().find(|action| action.target.pid.0 == pid)
+                .unwrap().target.clone();
+            let id = format!("8:1:{pid}");
+            disk.processes.push(DiskProcessObservation {
+                identity: identity.clone(),
+                fd_count: 1,
+                complete: true,
+                file_ids: vec![id.clone()],
+            });
+            disk.files.push(DeletedFileObservation {
+                id,
+                device_major: 8,
+                device_minor: 1,
+                inode: u64::from(pid),
+                allocated_bytes: Some(bytes),
+                // Sparse apparent size must never enter the optimizer.
+                logical_bytes: Some(1000 * MIB),
+                unlinked: Some(true),
+                holders: vec![identity],
+                mount_keys: vec![mount.identity.key()],
+                allocation_stable: true,
+                holders_complete: true,
+                ..Default::default()
+            });
+        }
+        GoalResourceSnapshot {
+            disk: Some(disk),
+            disk_mount: Some(mount),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn disk_goal_uses_exclusive_allocations_on_the_selected_filesystem() {
+        let goal = parse_goal("free-disk 4096B on /data").unwrap();
+        let (mut candidates, mut plan) = fixture(&[(100, 1, 0.0), (200, 1, 0.0), (300, 1, 0.0), (400, 1, 0.0)]);
+        let mut resources = disk_resources(&plan, &[(100, 4096), (200, 16 * MIB), (300, 32 * MIB), (400, 64 * MIB)]);
+        let disk = resources.disk.as_mut().unwrap();
+        disk.files[1].holders.push(plan.actions[2].target.clone());
+        // The other holder is useful/review-only, so its own private files
+        // cannot become a kill recommendation just to satisfy disk demand.
+        candidates[2]["recommended_action"] = serde_json::json!("review");
+        let mut other_mount = disk.mounts[0].clone();
+        other_mount.identity.mount_id += 1;
+        other_mount.identity.device_minor += 1;
+        disk.files[3].device_minor += 1;
+        disk.files[3].mount_keys = vec![other_mount.identity.key()];
+        disk.mounts.push(other_mount);
+        attach_goal_resource_observations(&mut candidates, &resources);
+        let output = finalize_goal_action_plan(
+            Some(&goal), f64::NAN, &mut candidates, &mut plan, &resources, &[], false,
+        ).unwrap();
+        assert!(output.result.feasible);
+        assert_eq!(output.selected_pids, [100]);
+        assert_eq!(output.result.total_contributions, [4096.0]);
+        assert_eq!(plan.actions.len(), 1);
+        assert_eq!(plan.actions[0].target.pid.0, 100);
+        assert_eq!(candidates[1]["goal_resources"]["disk"]["exclusive_deleted_allocated_bytes"], 0);
+        assert_eq!(candidates[3]["goal_resources"]["disk"]["exclusive_deleted_allocated_bytes"], 0);
+        assert_eq!(candidates[2]["recommended_action"], "review");
+        let summary = goal_summary_json("free-disk 4096B on /data", &goal, &output);
+        assert_eq!(summary["targets"][0]["unit"], "bytes");
+        assert_eq!(summary["resource_observations"]["disk"]["guaranteed_recovery"], false);
+    }
+
+    #[test]
+    fn disk_unknown_evidence_never_saves_unrelated_kills() {
+        let goal = parse_goal("free-disk 1MB on /data").unwrap();
+        for case in ["census", "holders", "allocation", "identity", "capacity", "mount"] {
+            let (mut candidates, mut plan) = fixture(&[(100, 1000, 90.0)]);
+            let mut resources = disk_resources(&plan, &[(100, 10 * MIB)]);
+            match case {
+                "census" => resources.mark_census_incomplete(),
+                "holders" => resources.disk.as_mut().unwrap().files[0].holders_complete = false,
+                "allocation" => resources.disk.as_mut().unwrap().files[0].allocated_bytes = None,
+                "identity" => resources.disk.as_mut().unwrap().processes[0].identity.uid += 1,
+                "capacity" => resources.disk_mount.as_mut().unwrap().available_bytes = None,
+                "mount" => resources.disk_error = Some("mount changed".into()),
+                _ => unreachable!(),
+            }
+            if let Ok(output) = finalize_goal_action_plan(
+                Some(&goal), 90.0, &mut candidates, &mut plan, &resources, &[], false,
+            ) {
+                assert!(!output.result.feasible, "{case}");
+                assert!(output.selected_pids.is_empty(), "{case}");
+            }
+            assert_empty_saved_goal_plan(&plan, &candidates);
+        }
+    }
+
+    #[test]
+    fn zero_disk_goal_selects_nothing_and_unavailable_or_branch_can_fall_back() {
+        let (mut candidates, mut plan) = fixture(&[(100, 1, 0.0)]);
+        let resources = disk_resources(&plan, &[(100, MIB)]);
+        let goal = parse_goal("free-disk 0B on /data").unwrap();
+        let output = finalize_goal_action_plan(
+            Some(&goal),
+            f64::NAN,
+            &mut candidates,
+            &mut plan,
+            &resources,
+            &[],
+            false,
+        )
+        .unwrap();
+        assert!(output.result.feasible);
+        assert_empty_saved_goal_plan(&plan, &candidates);
+
+        let (mut candidates, mut plan) = fixture(&[(100, 1, 0.0)]);
+        let mut resources = disk_resources(&plan, &[(100, MIB)]);
+        resources.private_memory = memory_resources(&plan, &[(100, MIB)]).private_memory;
+        resources.disk_mount.as_mut().unwrap().available_bytes = None;
+        let goal = parse_goal("free 1MB memory OR free-disk 1MB on /data").unwrap();
+        let output = finalize_goal_action_plan(
+            Some(&goal),
+            f64::NAN,
+            &mut candidates,
+            &mut plan,
+            &resources,
+            &[],
+            false,
+        )
+        .unwrap();
+        assert!(output.result.feasible);
+        assert_eq!(output.selected_pids, [100]);
+        assert_eq!(output.goals[0].resource, "memory_mb");
+        assert!(output.warnings.iter().any(|warning| warning.starts_with("disk_branch_unavailable:")));
+    }
+
+    #[test]
+    fn saved_disk_forecast_retains_allocations_and_rejects_scope_changes() {
+        let goal_str = "free-disk 4096B on /data";
+        let goal = parse_goal(goal_str).unwrap();
+        let (mut candidates, mut plan) = fixture(&[(100, 1, 0.0)]);
+        let mut resources = disk_resources(&plan, &[(100, 4096)]);
+        let output = finalize_goal_action_plan(
+            Some(&goal), f64::NAN, &mut candidates, &mut plan, &resources, &[], false,
+        ).unwrap();
+        let snapshot = build_resource_predictions(
+            &plan, &resources, &PlanningPressure::default(),
+            PlanningResourceTimes { disk_unix_ms: Some(1000), ..Default::default() },
+            |_| None,
+        ).unwrap();
+        let mut document = serde_json::to_value(&plan).unwrap();
+        document["resource_predictions"] = serde_json::to_value(snapshot).unwrap();
+        document["goal_summary"] = goal_summary_json(goal_str, &goal, &output);
+        let saved = saved_resource_predictions(&document, &plan).unwrap().unwrap();
+        resources.disk.as_mut().unwrap().files[0].allocated_bytes = Some(900 * MIB);
+        let expected = ExpectedGoalContribution::from_saved(&plan.actions[0], Some(&saved), "worker".into());
+        assert_eq!(expected.disk_bytes, Some(4096.0));
+        let mount = saved_disk_goal_mount(&document, Some(&saved), &[&plan.actions[0]]).unwrap().unwrap();
+        assert_eq!(expected.disk_mount, Some(mount));
+        document["goal_summary"]["resource_observations"]["disk"]["mount"]["identity"]["mount_id"] = serde_json::json!(999);
+        assert!(saved_disk_goal_mount(&document, Some(&saved), &[&plan.actions[0]]).is_err());
+        document.as_object_mut().unwrap().remove("goal_summary");
+        assert!(saved_disk_goal_mount(&document, Some(&saved), &[&plan.actions[0]]).is_err());
+        assert!(saved_disk_goal_mount(&serde_json::json!({}), None, &[&plan.actions[0]]).unwrap().is_none());
+        let mut changed_action = plan.actions[0].clone();
+        changed_action.target.uid += 1;
+        assert!(ExpectedGoalContribution::from_saved(&changed_action, Some(&saved), "changed".into()).disk_bytes.is_none());
+    }
+
     #[test]
     fn satisfied_goal_saves_no_actions_even_with_independent_kill_advice() {
         let goal_str = "free port 3000";
@@ -7695,6 +7988,7 @@ mod executable_goal_tests {
                 activity_unix_ms: 1000,
                 private_memory_unix_ms: Some(2000),
                 descriptors_unix_ms: Some(1500),
+                disk_unix_ms: None,
             },
             |identity| Some(prediction_activity(identity)),
         )
@@ -7769,6 +8063,7 @@ mod executable_goal_tests {
                 activity_unix_ms: 1000,
                 private_memory_unix_ms: Some(1000),
                 descriptors_unix_ms: Some(1000),
+                disk_unix_ms: None,
             },
             |identity| {
                 let mut activity = prediction_activity(identity);
@@ -8459,7 +8754,10 @@ fn build_goal_advisory_from_scan(
     // A one-shot inventory has no host or per-process counter interval. Lifetime
     // percentages cannot establish current utilization or attainable CPU relief.
     let total_cpu_pct = f64::NAN;
-    let resources = GoalResourceSnapshot::collect(goal, &result.processes);
+    let mut resources = GoalResourceSnapshot::collect(goal, &result.processes);
+    if !result.metadata.warnings.is_empty() {
+        resources.mark_census_incomplete();
+    }
 
     let (goals, mut warnings) = match build_resource_goals(goal, total_cpu_pct, &resources) {
         Ok(v) => v,
@@ -8508,6 +8806,8 @@ fn build_goal_advisory_from_scan(
             "memory_basis": "private_clean_plus_private_dirty",
             "private_memory_bytes": observed_private_memory_bytes,
             "private_memory_processes": resources.private_memory.len(),
+            "disk_mount": resources.disk_mount,
+            "disk_ownership_complete": resources.disk.as_ref().is_some_and(|disk| disk.complete),
             "census_processes": result.processes.len(),
             "guaranteed_recovery": false,
         },
@@ -17899,6 +18199,7 @@ mod process_tree_safety_tests {
             total_cpu_frac: Some(0.0),
             occupied_ports: Some(Vec::new()),
             total_fds: Some(0),
+            disk_space: None,
             timestamp: 1.0,
         };
         let after = super::MetricSnapshot {
@@ -22872,6 +23173,7 @@ mod planning_pressure_tests {
                 total_cpu_frac: None,
                 occupied_ports: Some(vec![8080]),
                 total_fds: Some(100),
+                disk_space: None,
                 timestamp: 1.0,
             };
             let mut after = MetricSnapshot {
@@ -25061,9 +25363,14 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             Ok(goal) => {
                 if !matches!(&goal, Goal::Relieve(_)) {
                     goal_resources = GoalResourceSnapshot::collect(&goal, &scan_result.processes);
+                    if !scan_result.metadata.warnings.is_empty() {
+                        goal_resources.mark_census_incomplete();
+                    }
                     let observed_at = chrono::Utc::now().timestamp_millis();
                     resource_times.private_memory_unix_ms = Some(observed_at);
                     resource_times.descriptors_unix_ms = Some(observed_at);
+                    resource_times.disk_unix_ms =
+                        goal_resources.disk_mount.as_ref().map(|_| observed_at);
                     attach_goal_resource_observations(&mut candidates, &goal_resources);
                     // Goal ranking influences the kill budget, but only the final
                     // executable plan below can substantiate a recovery forecast.
@@ -25276,6 +25583,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 value: 0.0,
                 comparator: Comparator::FreeAtLeast,
                 port: None,
+                disk_path: None,
             });
             let measured = GoalResourceSnapshot::collect(&memory_goal, &targets);
             resource_times.private_memory_unix_ms = Some(chrono::Utc::now().timestamp_millis());
@@ -26766,8 +27074,52 @@ fn capture_metric_snapshot_for_goal_progress(
         total_cpu_frac: None,
         occupied_ports: collect_occupied_ports_for_goal_progress(),
         total_fds: processes.and_then(collect_total_fds_for_goal_progress),
+        disk_space: None,
         timestamp: chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
     }
+}
+
+/// Reuse the filesystem resolved at planning time. Re-resolving the caller's
+/// working directory or a path at apply time can silently measure another disk.
+fn saved_disk_goal_mount(
+    document: &serde_json::Value,
+    predictions: Option<&ValidatedResourcePredictions>,
+    actions: &[&PlanAction],
+) -> Result<Option<pt_core::collect::disk::DiskMountIdentity>, String> {
+    let saved_mount = document
+        .pointer("/goal_summary/resource_observations/disk/mount")
+        .filter(|value| !value.is_null());
+    let mount = saved_mount
+        .map(|value| {
+            let observed: pt_core::collect::disk::DiskMountObservation =
+                serde_json::from_value(value.clone())
+                    .map_err(|error| format!("invalid saved disk filesystem: {error}"))?;
+            observed.validate_capacity()?;
+            Ok::<_, String>(observed.identity)
+        })
+        .transpose()?;
+    for action in actions {
+        if let Some(disk) = predictions
+            .and_then(|predictions| predictions.for_action(action))
+            .and_then(|prediction| prediction.disk.as_ref())
+            && mount.as_ref() != Some(&disk.mount)
+        {
+            return Err("saved disk forecast and goal filesystem disagree".into());
+        }
+    }
+    Ok(mount)
+}
+
+fn observe_disk_goal_mount(
+    identity: &pt_core::collect::disk::DiskMountIdentity,
+) -> pt_core::collect::disk::DiskMountObservation {
+    pt_core::collect::disk::observe_mount(identity).unwrap_or_else(|error| {
+        pt_core::collect::disk::DiskMountObservation {
+            identity: identity.clone(),
+            error: Some(error),
+            ..Default::default()
+        }
+    })
 }
 
 fn attach_measured_goal_resources(
@@ -26788,6 +27140,8 @@ fn attach_measured_goal_resources(
         after.occupied_ports = None;
         before.total_fds = None;
         after.total_fds = None;
+        before.disk_space = None;
+        after.disk_space = None;
         return;
     }
     let run = run.unwrap();
@@ -26921,6 +27275,8 @@ struct ExpectedGoalContribution {
     cpu_host_fraction: Option<f64>,
     ports: Option<f64>,
     file_descriptors: Option<f64>,
+    disk_bytes: Option<f64>,
+    disk_mount: Option<pt_core::collect::disk::DiskMountIdentity>,
     label: String,
 }
 
@@ -26943,6 +27299,12 @@ impl ExpectedGoalContribution {
             file_descriptors: prediction
                 .and_then(|prediction| prediction.file_descriptors.as_ref())
                 .map(|descriptors| descriptors.count as f64),
+            disk_bytes: prediction
+                .and_then(|prediction| prediction.disk.as_ref())
+                .map(|disk| disk.allocated_bytes as f64),
+            disk_mount: prediction
+                .and_then(|prediction| prediction.disk.as_ref())
+                .map(|disk| disk.mount.clone()),
             label,
         }
     }
@@ -27559,6 +27921,15 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     let mut before_snapshot = capture_metric_snapshot_for_goal_progress(
         before_scan_complete.then_some(before_scan_processes.as_slice()),
     );
+    let (disk_goal_mount, disk_goal_error) = match saved_disk_goal_mount(
+        &saved_document,
+        resource_predictions.as_ref(),
+        &actions_to_apply,
+    ) {
+        Ok(mount) => (mount, None),
+        Err(error) => (None, Some(error)),
+    };
+    before_snapshot.disk_space = disk_goal_mount.as_ref().map(observe_disk_goal_mount);
     let before_by_pid: HashMap<u32, &ProcessRecord> = before_scan_processes
         .iter()
         .map(|proc| (proc.pid.0, proc))
@@ -28588,6 +28959,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         .filter(|scan| scan.metadata.warnings.is_empty())
         .map(|scan| scan.processes.as_slice());
     let mut after_snapshot = capture_metric_snapshot_for_goal_progress(after_scan_processes);
+    after_snapshot.disk_space = disk_goal_mount.as_ref().map(observe_disk_goal_mount);
     attach_measured_goal_resources(
         &mut before_snapshot,
         &mut after_snapshot,
@@ -28622,6 +28994,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     let mut cpu_action_outcomes = Vec::new();
     let mut port_action_outcomes = Vec::new();
     let mut fd_action_outcomes = Vec::new();
+    let mut disk_action_outcomes = Vec::new();
     let mut credited_kill_targets = HashSet::new();
     for action in &actions_to_apply {
         let execution = execution_by_action.get(action.action_id.as_str()).copied();
@@ -28661,6 +29034,9 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             // file-handle metric cannot provide that separate observation.
             expected.file_descriptors = None;
         }
+        if expected.disk_mount.as_ref() != disk_goal_mount.as_ref() {
+            expected.disk_bytes = None;
+        }
         if success
             && action.action == Action::Kill
             && !credited_kill_targets.insert((
@@ -28674,6 +29050,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             expected.memory_bytes = expected.memory_bytes.map(|_| 0.0);
             expected.cpu_host_fraction = expected.cpu_host_fraction.map(|_| 0.0);
             expected.file_descriptors = expected.file_descriptors.map(|_| 0.0);
+            expected.disk_bytes = expected.disk_bytes.map(|_| 0.0);
         }
 
         let action_pid = action.target.pid.0;
@@ -28700,10 +29077,17 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         });
         fd_action_outcomes.push(GoalActionOutcome {
             pid: action_pid,
-            label: expected.label,
+            label: expected.label.clone(),
             success,
             respawn_detected,
             expected_contribution: expected.file_descriptors,
+        });
+        disk_action_outcomes.push(GoalActionOutcome {
+            pid: action_pid,
+            label: expected.label,
+            success,
+            respawn_detected,
+            expected_contribution: expected.disk_bytes,
         });
     }
 
@@ -28746,6 +29130,15 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     );
 
     let planning_only = global.dry_run || global.shadow || !executed_attempt;
+    let disk_report = goal_progress::measure_progress(
+        GoalMetric::Disk,
+        None,
+        &before_snapshot,
+        &after_snapshot,
+        disk_action_outcomes,
+        &progress_config,
+        Some(sid.0.clone()),
+    );
     let goal_progress_payload = serde_json::json!({
         "session_id": sid.0,
         "before": before_snapshot,
@@ -28753,22 +29146,25 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         "planning_only": planning_only,
         "execution_evidence_error": goal_evidence_error,
         "resource_prediction_error": resource_prediction_error,
+        "disk_goal_error": disk_goal_error,
         "resource_predictions": resource_predictions.as_ref().map(|predictions| predictions.snapshot()),
         "after_scan_error": after_scan_error,
         "scope": "host_observations_not_per_action_causal_relief",
-        "units": {"memory": "bytes", "cpu": "host_busy_fraction", "ports": "observer_network_namespace", "file_descriptors": "observed_process_census_fd_entries"},
+        "units": {"memory": "bytes", "cpu": "host_busy_fraction", "ports": "observer_network_namespace", "file_descriptors": "observed_process_census_fd_entries", "disk": "available_bytes_on_saved_filesystem"},
         "prediction_notes": [
             "Forecasts retain the exact planning-time evidence for successful saved actions; execution never substitutes current readings, RSS, or lifetime CPU.",
             "CPU predictions are measured fractions of whole-host capacity. Private-memory predictions use Private_Clean plus Private_Dirty and exclude shared pages and huge-TLB pools.",
             "CPU comparison additionally requires the observed online capacity to match the original planning window.",
             "Port-release forecasts require exclusive ownership in the observer network namespace and remain unavailable without it.",
+            "Disk forecasts retain exclusive unlinked-inode allocated blocks from planning; progress compares available bytes on the same saved filesystem and may be negative. Shared holders, kernel-held references, snapshots, reflinks, and concurrent writes can prevent equivalent physical recovery.",
             "A host-wide before/after change is an association, not a causal per-action recovery measurement. Unsupported actions or missing forecasts keep the complete comparison unknown."
         ],
         "metrics": {
             "memory": goal_report_json(&memory_report, planning_only),
             "cpu": goal_report_json(&cpu_report, planning_only),
             "ports": goal_report_json(&port_report, planning_only),
-            "file_descriptors": goal_report_json(&fd_report, planning_only)
+            "file_descriptors": goal_report_json(&fd_report, planning_only),
+            "disk": goal_report_json(&disk_report, planning_only)
         }
     });
     let goal_progress_discrepancy = serde_json::json!({
@@ -28776,6 +29172,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         "cpu": goal_report_brief_json(&cpu_report, planning_only),
         "ports": goal_report_brief_json(&port_report, planning_only),
         "file_descriptors": goal_report_brief_json(&fd_report, planning_only),
+        "disk": goal_report_brief_json(&disk_report, planning_only),
         "respawn_loop_suspected": respawn_by_action.values().any(|detected| *detected == Some(true)),
         "respawn_observation_available": after_scan_processes.is_some(),
     });

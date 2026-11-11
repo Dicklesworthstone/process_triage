@@ -1164,6 +1164,7 @@ mod tests {
                 memory: Some(PrivateMemoryPrediction::new(40, 60, Some(9000), 900).unwrap()),
                 cpu: None,
                 file_descriptors: None,
+                disk: None,
                 unavailable: Vec::new(),
             }],
         };

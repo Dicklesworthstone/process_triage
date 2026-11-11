@@ -1170,6 +1170,7 @@ pt agent plan --goal "free 4GB memory" --format json
 pt agent plan --goal "release port 8080" --format json
 pt agent plan --goal "free port 3000" --format json
 pt agent plan --goal "free 100 FDs" --format json
+pt agent plan --goal "free-disk 4GB on /var" --format json
 pt agent plan --goal "CPU < 80%" --window-ms 1000 --format json
 ```
 
@@ -1190,6 +1191,18 @@ Each candidate's "efficiency" is `contribution / expected_loss`, measuring how m
 On Linux, FD goals use measured `/proc/PID/fd` counts bound to the process's PID, start identity, and UID. Port goals inspect TCP and UDP bindings, including IPv6, in the current network namespace. Both `release port N` and `free port N` require **every observed holder** to be eligible for termination: duplicated or inherited sockets and separate `SO_REUSEPORT` sockets must all be accounted for. A protected, filtered, or budget-blocked holder prevents the optimizer from claiming that the port can be released; it does not select a partial set solely for that port goal. An already unbound port requires no action.
 
 The JSON goal summary identifies these observations as a snapshot forecast scoped to the mounted procfs and current network namespace. Port targets and projected recovery use `holder_processes` as the unit, with `requires_all_holders: true`; per-candidate `goal_resources` exposes measured descriptor counts and bound ports. Inaccessible process evidence, a `hidepid` restriction, changed socket bindings or process censuses, and sockets without a discoverable owner produce an explicit unavailable/shortfall result. FD and port observations are currently unavailable on other platforms. Holders outside the visible PID namespace cannot generally be ruled out, and processes can open, transfer, or inherit descriptors after observation, so a forecast is not a guarantee of the port's state after execution.
+
+### Recovering disk space held by processes
+
+On Linux, `free-disk 4GB on /var` requests four GiB of potential recovery on the filesystem containing that directory. An omitted `on /path` selects the filesystem containing the planning command's working directory. Paths must name existing absolute directories without symlink traversal; quote a path containing `AND` or `OR` as a JSON string inside the goal. One request can include only one disk target, optionally combined with memory, CPU, descriptor, or port goals.
+
+The collector identifies unlinked regular files by device and inode and measures allocated 512-byte blocks. Apparent file length does not supply recovery credit. Multiple descriptors and bind-mount aliases do not multiply allocation. Descriptor holders and file-backed memory mappings both count as owners, including protected processes and processes outside the candidate set. A file held by another process contributes zero to an individual candidate; selecting several shared holders does not turn their shared allocation into a summed estimate.
+
+Positive credit requires complete, stable process and ownership observations in a proven host procfs view. Permission failures, restricted visibility, process churn, changed allocations, and inspection limits keep uncertain contributions unavailable. Container-visible ownership alone cannot establish that no process outside the container holds a file. Capacity readings remain useful even when ownership is incomplete. Supported local persistent filesystems include ext2/3/4, XFS, Btrfs, overlayfs, and ZFS; tmpfs, memfd, FUSE, and network filesystems do not supply disk-goal credit.
+
+The existing abandonment, policy, protection, identity, process-tree, and data-loss gates still determine action eligibility. Disk pressure supplies a resource target; it does not authorize termination of a useful process. The tool never truncates held files. `goal_summary.resource_observations.disk` records the chosen filesystem and coverage, and each candidate's `goal_resources.disk` records its exclusive allocation forecast.
+
+`agent apply` retains the saved per-action forecast and measures available space before and after execution on the same saved filesystem identity. The `goal_progress.metrics.disk` report uses bytes and preserves negative changes. Missing or changed mounts, namespaces, boot identities, total capacity, or execution evidence leave the comparison unavailable. Shared extents, snapshots, kernel-held references such as queued socket transfers or registered io_uring files, delayed accounting, and concurrent writers can make observed recovery differ from the allocation forecast; a filesystem-wide change is not proof of an action's causal effect. Dry runs do not report measured goal completion.
 
 ---
 

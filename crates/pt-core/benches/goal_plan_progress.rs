@@ -32,6 +32,7 @@ fn make_before() -> MetricSnapshot {
         total_cpu_frac: Some(0.8),
         occupied_ports: Some(vec![3000, 8080, 9090]),
         total_fds: Some(5000),
+        disk_space: None,
         timestamp: 1000.0,
     }
 }
@@ -170,6 +171,7 @@ fn bench_measure_progress(c: &mut Criterion) {
         total_cpu_frac: Some(0.5),
         occupied_ports: Some(vec![8080]),
         total_fds: Some(4500),
+        disk_space: None,
         timestamp: 1010.0,
     };
 
@@ -223,6 +225,7 @@ fn bench_measure_progress(c: &mut Criterion) {
     for n in [1, 5, 10, 20] {
         let after = MetricSnapshot {
             available_memory_bytes: Some(3_000_000_000),
+            disk_space: None,
             timestamp: 1010.0,
             ..make_before()
         };
@@ -247,11 +250,13 @@ fn bench_measure_progress(c: &mut Criterion) {
     // Discrepancy scenarios
     let no_change = MetricSnapshot {
         available_memory_bytes: Some(2_000_000_000),
+        disk_space: None,
         timestamp: 1010.0,
         ..make_before()
     };
     let overperform = MetricSnapshot {
         available_memory_bytes: Some(5_000_000_000),
+        disk_space: None,
         timestamp: 1010.0,
         ..make_before()
     };

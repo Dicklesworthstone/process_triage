@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use super::goal_parser::{Goal, Metric};
+use crate::collect::disk::{DiskMountObservation, DiskResourceSnapshot};
 use crate::collect::ProcessRecord;
 use pt_common::ProcessIdentity;
 
@@ -54,6 +55,11 @@ pub struct GoalResourceSnapshot {
     /// Separate from descriptor observations so a memory-only collection never
     /// manufactures a zero descriptor count. Other goals leave this map empty.
     pub private_memory: BTreeMap<u32, ProcessPrivateMemory>,
+    /// Full ownership observations, independent of the eventual action subset.
+    pub disk: Option<DiskResourceSnapshot>,
+    /// One resolved filesystem shared by planning and later measurement.
+    pub disk_mount: Option<DiskMountObservation>,
+    pub disk_error: Option<String>,
     pub warnings: Vec<String>,
 }
 
@@ -65,15 +71,27 @@ impl GoalResourceSnapshot {
         let mut need_memory = false;
         let mut ports = BTreeMap::new();
         requested_resources(goal, &mut need_fds, &mut need_memory, &mut ports);
-        if !need_fds && !need_memory && ports.is_empty() {
+        let disk_target = match goal.disk_target() {
+            Ok(target) => target,
+            Err(error) => {
+                return Self {
+                    warnings: vec![error.to_string()],
+                    disk_error: Some(error.to_string()),
+                    ..Self::default()
+                };
+            }
+        };
+        if !need_fds && !need_memory && ports.is_empty() && disk_target.is_none() {
             return Self::default();
         }
         #[cfg(target_os = "linux")]
-        {
+        let mut snapshot = if need_fds || need_memory || !ports.is_empty() {
             collect_linux_goal_resources(population, need_fds, need_memory, ports)
-        }
+        } else {
+            Self::default()
+        };
         #[cfg(not(target_os = "linux"))]
-        {
+        let mut snapshot = {
             let _ = population;
             let mut warnings = Vec::new();
             if need_fds || !ports.is_empty() {
@@ -88,7 +106,58 @@ impl GoalResourceSnapshot {
                 warnings,
                 ..Self::default()
             }
+        };
+        if let Some(target) = disk_target {
+            match crate::collect::disk::resolve_mount(target.disk_path.as_deref()) {
+                Ok(mount) => {
+                    let disk = crate::collect::disk::collect_disk_resources(population);
+                    snapshot.disk_mount = Some(
+                        disk.mounts
+                            .iter()
+                            .find(|observed| observed.identity == mount.identity)
+                            .cloned()
+                            .unwrap_or(mount),
+                    );
+                    if !disk.complete {
+                        snapshot.warnings.push(
+                            "disk_ownership_incomplete: exclusive recovery is unavailable".into(),
+                        );
+                    }
+                    snapshot.disk = Some(disk);
+                }
+                Err(error) => {
+                    snapshot.warnings.push(format!("disk: {error}"));
+                    snapshot.disk_error = Some(error);
+                }
+            }
         }
+        snapshot
+    }
+
+    pub fn mark_census_incomplete(&mut self) {
+        if let Some(disk) = &mut self.disk {
+            disk.mark_census_incomplete();
+            if let Some(mount) = &mut self.disk_mount {
+                mount.ownership_complete = false;
+            }
+            self.warnings
+                .push("disk_ownership_incomplete: process scan reported missing evidence".into());
+        }
+    }
+
+    /// Count only the allocated blocks of unlinked files held exclusively by
+    /// this exact process in the selected filesystem. Shared or unobserved
+    /// ownership never supplies an optimistic resource budget.
+    pub fn exclusive_disk_bytes(&self, identity: &ProcessIdentity) -> Result<u64, String> {
+        if let Some(error) = &self.disk_error {
+            return Err(error.clone());
+        }
+        let mount = self.disk_mount.as_ref().ok_or("disk filesystem was not observed")?;
+        mount.validate_capacity()?;
+        self.disk
+            .as_ref()
+            .ok_or("disk ownership was not observed")?
+            .exclusive_allocated_bytes(identity, Some(&mount.identity.key()))
     }
 
     /// A PID alone is not sufficient to use a measured descriptor count.

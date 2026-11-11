@@ -5,6 +5,7 @@
 //! Host changes remain observations, never proof of per-action causal recovery.
 
 use super::relief::{ResourceActionBinding, ResourceDelta};
+use crate::collect::disk::DiskMountIdentity;
 use crate::collect::pressure::HostCpuWindow;
 use crate::decision::Action;
 use crate::plan::{Plan, PlanAction};
@@ -144,6 +145,40 @@ pub struct FileDescriptorPrediction {
     pub observed_at_unix_ms: i64,
 }
 
+/// Planning-time allocation held exclusively by this action's process on one
+/// observed filesystem. Apparent file lengths and shared holders contribute
+/// nothing. Apply retains this forecast; fresh readings measure progress only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskRecoveryPrediction {
+    pub mount: DiskMountIdentity,
+    pub allocated_bytes: u64,
+    pub observed_at_unix_ms: i64,
+}
+
+impl DiskRecoveryPrediction {
+    pub fn new(
+        mount: DiskMountIdentity,
+        allocated_bytes: u64,
+        observed_at_unix_ms: i64,
+    ) -> Result<Self, String> {
+        let prediction = Self {
+            mount,
+            allocated_bytes,
+            observed_at_unix_ms,
+        };
+        prediction.validate()?;
+        Ok(prediction)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        self.mount.validate()?;
+        if self.observed_at_unix_ms < 0 {
+            return Err("disk prediction observation time precedes the epoch".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActionResourcePrediction {
     pub action_id: String,
@@ -152,6 +187,8 @@ pub struct ActionResourcePrediction {
     pub memory: Option<PrivateMemoryPrediction>,
     pub cpu: Option<HostCpuPrediction>,
     pub file_descriptors: Option<FileDescriptorPrediction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk: Option<DiskRecoveryPrediction>,
     #[serde(default)]
     pub unavailable: Vec<String>,
 }
@@ -223,7 +260,8 @@ impl ResourcePredictionSnapshot {
             if prediction.action != Action::Kill
                 && (prediction.memory.is_some()
                     || prediction.cpu.is_some()
-                    || prediction.file_descriptors.is_some())
+                    || prediction.file_descriptors.is_some()
+                    || prediction.disk.is_some())
             {
                 return Err(
                     "this prediction schema supports recovery forecasts only for Kill".into(),
@@ -234,6 +272,23 @@ impl ResourcePredictionSnapshot {
             }
             if let Some(cpu) = &prediction.cpu {
                 cpu.validate()?;
+            }
+            if let Some(disk) = &prediction.disk {
+                disk.validate()?;
+                let start_id = &prediction.target.start_id.0;
+                if pt_common::StartId::parse(start_id).is_none()
+                    || start_id.split(':').next() != Some(disk.mount.boot_id.as_str())
+                    || start_id
+                        .rsplit(':')
+                        .next()
+                        .and_then(|pid| pid.parse::<u32>().ok())
+                        != Some(prediction.target.pid.0)
+                {
+                    return Err(
+                        "disk prediction filesystem does not bind the target's boot and identity"
+                            .into(),
+                    );
+                }
             }
             for observed in [
                 prediction
@@ -246,6 +301,10 @@ impl ResourcePredictionSnapshot {
                     .map(|value| value.observed_at_unix_ms),
                 prediction
                     .file_descriptors
+                    .as_ref()
+                    .map(|value| value.observed_at_unix_ms),
+                prediction
+                    .disk
                     .as_ref()
                     .map(|value| value.observed_at_unix_ms),
             ]
@@ -612,6 +671,21 @@ mod tests {
 
     const BOOT: &str = "11111111-1111-4111-8111-111111111111";
 
+    fn disk_mount() -> DiskMountIdentity {
+        DiskMountIdentity {
+            boot_id: BOOT.into(),
+            mount_namespace_device: 1,
+            mount_namespace_inode: 2,
+            mount_id: 3,
+            device_major: 8,
+            device_minor: 1,
+            filesystem_type: "ext4".into(),
+            mount_root_sha256: "1".repeat(64),
+            mount_source_sha256: "2".repeat(64),
+            mount_options_sha256: "3".repeat(64),
+        }
+    }
+
     fn fixture() -> (Plan, ResourcePredictionSnapshot, Vec<ResourceActionBinding>) {
         let actions: Vec<_> = [42_u32, 43]
             .into_iter()
@@ -658,6 +732,7 @@ mod tests {
                         count: amount,
                         observed_at_unix_ms: 1000,
                     }),
+                    disk: None,
                     unavailable: Vec::new(),
                 }
             })
@@ -783,6 +858,78 @@ mod tests {
         let mut blocked = plan.clone();
         blocked.actions[0].blocked = true;
         assert!(snapshot.validate(&blocked).is_err());
+    }
+
+    #[test]
+    fn disk_forecast_roundtrips_only_for_its_saved_kill_and_filesystem() {
+        let (mut plan, mut snapshot, _) = fixture();
+        snapshot.actions[0].disk =
+            Some(DiskRecoveryPrediction::new(disk_mount(), 50_000_000, 1000).unwrap());
+        let restored: ResourcePredictionSnapshot =
+            serde_json::from_slice(&serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        let valid = restored.validate(&plan).unwrap();
+        assert_eq!(
+            valid.for_action(&plan.actions[0]).unwrap().disk,
+            snapshot.actions[0].disk
+        );
+
+        let mut replacement = plan.actions[0].clone();
+        replacement.target.start_id = StartId::from_linux(BOOT, 11, replacement.target.pid.0);
+        assert!(valid.for_action(&replacement).is_none());
+
+        // Isolate the new forecast from other recovery metrics: even a pause
+        // with no memory/CPU/FD forecast may not promise released disk space.
+        plan.actions[0].action = Action::Pause;
+        snapshot.actions[0].action = Action::Pause;
+        snapshot.actions[0].memory = None;
+        snapshot.actions[0].cpu = None;
+        snapshot.actions[0].file_descriptors = None;
+        assert!(snapshot.validate(&plan).is_err());
+    }
+
+    #[test]
+    fn disk_forecast_rejects_weak_scope_wrong_boot_and_late_observations() {
+        let (plan, mut snapshot, _) = fixture();
+        snapshot.actions[0].disk =
+            Some(DiskRecoveryPrediction::new(disk_mount(), 0, 1000).unwrap());
+        assert!(
+            snapshot.validate(&plan).is_ok(),
+            "measured zero allocation is valid"
+        );
+        for case in [
+            "boot",
+            "namespace",
+            "mount",
+            "digest",
+            "negative_time",
+            "late_time",
+        ] {
+            let mut changed = snapshot.clone();
+            let disk = changed.actions[0].disk.as_mut().unwrap();
+            match case {
+                "boot" => disk.mount.boot_id = "22222222-2222-4222-8222-222222222222".into(),
+                "namespace" => disk.mount.mount_namespace_inode = 0,
+                "mount" => disk.mount.mount_id = 0,
+                "digest" => disk.mount.mount_root_sha256.clear(),
+                "negative_time" => disk.observed_at_unix_ms = -1,
+                "late_time" => disk.observed_at_unix_ms = 2001,
+                _ => unreachable!(),
+            }
+            assert!(changed.validate(&plan).is_err(), "{case}");
+        }
+    }
+
+    #[test]
+    fn older_resource_forecasts_preserve_their_serialized_representation() {
+        let (plan, snapshot, _) = fixture();
+        let older = serde_json::to_value(&snapshot).unwrap();
+        for action in older["actions"].as_array().unwrap() {
+            assert!(action.get("disk").is_none());
+        }
+        let restored: ResourcePredictionSnapshot = serde_json::from_value(older.clone()).unwrap();
+        assert!(restored.actions.iter().all(|action| action.disk.is_none()));
+        assert!(restored.validate(&plan).is_ok());
+        assert_eq!(serde_json::to_value(restored).unwrap(), older);
     }
 
     #[test]
