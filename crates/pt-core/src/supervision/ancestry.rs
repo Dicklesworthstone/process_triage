@@ -601,7 +601,8 @@ wait "$!"
             Some(SupervisorCategory::Orchestrator)
         );
         assert!(is_human_supervised(&combined));
-        let provider = LivePreCheckProvider::new(None, LivePreCheckConfig::default());
+        let provider = LivePreCheckProvider::new(None, LivePreCheckConfig::default())
+            .expect("default live precheck provider");
         assert!(matches!(
             provider.check_agent_supervision(tree.target),
             PreCheckResult::Blocked {

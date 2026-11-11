@@ -4608,7 +4608,7 @@ mod tests {
                     assert!(matches!(
                         session_error,
                         crate::supervision::session::SessionError::Environment(
-                            crate::supervision::environ::EnvironError::IoError { source, .. }
+                            crate::supervision::EnvironError::IoError { source, .. }
                         ) if source.kind() == std::io::ErrorKind::PermissionDenied
                     ));
                 } else {

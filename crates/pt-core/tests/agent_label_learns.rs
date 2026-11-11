@@ -135,7 +135,14 @@ fn explain(config_dir: &Path, data_dir: &Path, pid: u32) -> Value {
         ))
         .expect("create session");
     let out = pt_core(config_dir, data_dir)
-        .args(["--format", "json", "agent", "explain", "--live", "--session"])
+        .args([
+            "--format",
+            "json",
+            "agent",
+            "explain",
+            "--live",
+            "--session",
+        ])
         .arg(&session.0)
         .arg("--pids")
         .arg(pid.to_string())
