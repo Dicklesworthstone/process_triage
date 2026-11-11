@@ -784,6 +784,7 @@ mod tests {
                             resource_graph: crate::collect::SharedResourceGraph::default(),
                             lineages: HashMap::new(),
                             children: HashMap::new(),
+                            network_errors: HashMap::new(),
                         },
                     ));
                     observations

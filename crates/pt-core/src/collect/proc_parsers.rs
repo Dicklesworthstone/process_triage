@@ -463,7 +463,10 @@ pub fn read_required_proc_stat(pid: u32) -> Result<ProcessStat, StatReadError> {
     parse_required_proc_stat_content(pid, content)
 }
 
-fn parse_required_proc_stat_content(pid: u32, content: &str) -> Result<ProcessStat, StatReadError> {
+pub(crate) fn parse_required_proc_stat_content(
+    pid: u32,
+    content: &str,
+) -> Result<ProcessStat, StatReadError> {
     let invalid = |reason: &str| StatReadError::Parse {
         pid,
         reason: reason.to_string(),

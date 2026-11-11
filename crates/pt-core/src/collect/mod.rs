@@ -171,7 +171,7 @@ pub use lineage_collector::collect_lineage_for_pid;
 #[cfg(target_os = "linux")]
 pub use network_resource_collector::{
     collect_fd_ipc_resources, collect_listener_resources, collect_listener_resources_from,
-    detect_listener_conflicts,
+    collect_listener_resources_from_checked, detect_listener_conflicts,
 };
 
 // Re-export workspace resolver types

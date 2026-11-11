@@ -7,19 +7,45 @@
 //! - Per-process socket counts
 //!
 //! # Data Sources
-//! - `/proc/net/tcp`, `/proc/net/udp` - Raw socket tables
+//! - `/proc/[pid]/net/*` - Socket tables in the target's network namespace
 //! - `/proc/[pid]/fd/` - Per-process socket mappings
-//! - `ss` command output (fallback)
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// Identity of a network namespace, held open for the lifetime of its snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct NetworkNamespace {
+    pub device: u64,
+    pub inode: u64,
+}
+
+impl NetworkNamespace {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+
+    pub fn resource_key(&self, resource: &str) -> String {
+        format!("netns:{}:{}:{resource}", self.device, self.inode)
+    }
+}
 
 /// Network connection information for a process.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NetworkInfo {
+    /// Namespace in which socket addresses were observed. Legacy serialized
+    /// observations without this field cannot establish cross-process sharing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<NetworkNamespace>,
     /// Total socket count by protocol.
     pub socket_counts: SocketCounts,
     /// Active TCP connections.
@@ -64,66 +90,247 @@ impl NetworkInfo {
     }
 }
 
-/// A snapshot of global network state for O(1) process lookup.
-///
-/// This structure reads /proc/net/* files once and indexes them by inode,
-/// avoiding the O(N*M) complexity of reading them for every process.
 #[derive(Debug, Default)]
-pub struct NetworkSnapshot {
+struct NetworkTables {
     tcp_by_inode: HashMap<u64, TcpConnection>,
     udp_by_inode: HashMap<u64, UdpSocket>,
     unix_by_inode: HashMap<u64, UnixSocket>,
+    other_inodes: HashSet<u64>,
+}
+
+type ObservedNetworkTables = Result<Arc<NetworkTables>, (std::io::ErrorKind, String)>;
+
+#[derive(Debug)]
+struct NamespaceTables {
+    _namespace: fs::File,
+    tables: OnceLock<ObservedNetworkTables>,
+}
+
+/// Scan-scoped socket tables, indexed by network namespace and socket inode.
+///
+/// Tables are read lazily from `/proc/PID/net` once per observed namespace.
+/// Holding namespace handles prevents inode reuse while the snapshot is alive.
+/// Construct a fresh snapshot for each scan and before action-time validation.
+#[derive(Debug)]
+pub struct NetworkSnapshot {
+    proc_root: PathBuf,
+    namespaces: Mutex<HashMap<NetworkNamespace, Arc<NamespaceTables>>>,
+}
+
+impl Default for NetworkSnapshot {
+    fn default() -> Self {
+        Self {
+            proc_root: PathBuf::from("/proc"),
+            namespaces: Mutex::new(HashMap::new()),
+        }
+    }
 }
 
 impl NetworkSnapshot {
-    /// Collect a global snapshot of network sockets.
+    /// Start a scan-scoped snapshot. Each namespace is collected on first use.
     pub fn collect() -> Self {
-        let mut snapshot = NetworkSnapshot::default();
-
-        // TCP
-        if let Some(entries) = parse_proc_net_tcp("/proc/net/tcp", false) {
-            for e in entries {
-                snapshot.tcp_by_inode.insert(e.inode, e);
-            }
-        }
-        if let Some(entries) = parse_proc_net_tcp("/proc/net/tcp6", true) {
-            for e in entries {
-                snapshot.tcp_by_inode.insert(e.inode, e);
-            }
-        }
-
-        // UDP
-        if let Some(entries) = parse_proc_net_udp("/proc/net/udp", false) {
-            for e in entries {
-                snapshot.udp_by_inode.insert(e.inode, e);
-            }
-        }
-        if let Some(entries) = parse_proc_net_udp("/proc/net/udp6", true) {
-            for e in entries {
-                snapshot.udp_by_inode.insert(e.inode, e);
-            }
-        }
-
-        // Unix
-        if let Ok(entries) = parse_proc_net_unix("/proc/net/unix") {
-            for e in entries {
-                snapshot.unix_by_inode.insert(e.inode, e);
-            }
-        }
-
-        snapshot
+        Self::default()
     }
 
-    /// Get network info for a specific process using the cached snapshot.
-    pub fn get_process_info(&self, pid: u32) -> Option<NetworkInfo> {
-        let socket_inodes = get_process_socket_inodes(pid)?;
-        if socket_inodes.is_empty() {
-            return Some(NetworkInfo::default());
+    /// Get complete network evidence, retaining diagnostics for inaccessible,
+    /// truncated, unclassified or changing observations.
+    pub fn get_process_info_checked(&self, pid: u32) -> std::io::Result<NetworkInfo> {
+        let process_dir = self.proc_root.join(pid.to_string());
+        let before = read_network_process_identity(&process_dir, pid)?;
+        let namespace_handle = fs::File::open(process_dir.join("ns/net"))?;
+        let namespace = NetworkNamespace::from_metadata(&namespace_handle.metadata()?);
+        let socket_inodes = get_process_socket_inodes_from(&process_dir.join("fd"), 50_000)?;
+        let mut info = NetworkInfo {
+            namespace: Some(namespace),
+            ..NetworkInfo::default()
+        };
+
+        if !socket_inodes.is_empty() {
+            let tables = self.tables_for(&process_dir, namespace, namespace_handle)?;
+            info = tables.process_info(&socket_inodes, namespace)?;
         }
 
-        let mut info = NetworkInfo::default();
+        revalidate_network_observation(&process_dir, pid, namespace, before, &socket_inodes)?;
+        Ok(info)
+    }
 
-        for inode in socket_inodes {
+    /// Get complete evidence, or `None` when its coverage cannot be established.
+    pub fn get_process_info(&self, pid: u32) -> Option<NetworkInfo> {
+        self.get_process_info_checked(pid).ok()
+    }
+
+    fn tables_for(
+        &self,
+        process_dir: &Path,
+        namespace: NetworkNamespace,
+        handle: fs::File,
+    ) -> std::io::Result<Arc<NetworkTables>> {
+        check_network_namespace(process_dir, namespace)?;
+        let entry = {
+            let mut namespaces = self
+                .namespaces
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Arc::clone(namespaces.entry(namespace).or_insert_with(|| {
+                Arc::new(NamespaceTables {
+                    _namespace: handle,
+                    tables: OnceLock::new(),
+                })
+            }))
+        };
+        // Serialize only readers of the same namespace. Different containers
+        // can collect in parallel; a shared namespace is still parsed once.
+        let observed = entry.tables.get_or_init(|| {
+            let result = NetworkTables::read_from(&process_dir.join("net")).and_then(|tables| {
+                check_network_namespace(process_dir, namespace)?;
+                Ok(Arc::new(tables))
+            });
+            result.map_err(|error| (error.kind(), error.to_string()))
+        });
+        match observed {
+            Ok(tables) => Ok(Arc::clone(tables)),
+            Err((kind, reason)) => Err(std::io::Error::new(*kind, reason.clone())),
+        }
+    }
+}
+
+fn invalid_network(reason: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, reason)
+}
+
+fn read_network_process_identity(
+    process_dir: &Path,
+    pid: u32,
+) -> std::io::Result<(u64, u64, u64, u32)> {
+    let directory = fs::metadata(process_dir)?;
+    let content = fs::read_to_string(process_dir.join("stat"))?;
+    let stat = super::proc_parsers::parse_required_proc_stat_content(pid, &content)
+        .map_err(|error| invalid_network(&error.to_string()))?;
+    Ok((
+        directory.dev(),
+        directory.ino(),
+        stat.starttime,
+        directory.uid(),
+    ))
+}
+
+fn check_network_namespace(process_dir: &Path, expected: NetworkNamespace) -> std::io::Result<()> {
+    let observed = NetworkNamespace::from_metadata(&fs::metadata(process_dir.join("ns/net"))?);
+    if observed != expected {
+        return Err(invalid_network(
+            "network namespace changed during collection",
+        ));
+    }
+    Ok(())
+}
+
+fn revalidate_network_observation(
+    process_dir: &Path,
+    pid: u32,
+    namespace: NetworkNamespace,
+    identity: (u64, u64, u64, u32),
+    sockets: &HashSet<u64>,
+) -> std::io::Result<()> {
+    // Neither a namespace switch nor PID reuse may join evidence from two
+    // processes. FD churn also makes a negative socket observation unsafe.
+    let observed_sockets = get_process_socket_inodes_from(&process_dir.join("fd"), 50_000)?;
+    check_network_namespace(process_dir, namespace)?;
+    if read_network_process_identity(process_dir, pid)? != identity || &observed_sockets != sockets
+    {
+        return Err(invalid_network(
+            "process or socket descriptors changed during collection",
+        ));
+    }
+    Ok(())
+}
+
+fn read_optional_socket_table(path: &Path) -> std::io::Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(content) => Ok(Some(content)),
+        // Protocol modules (notably IPv6) may be absent. This never proves
+        // absence: every descriptor must still resolve through another table.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(std::io::Error::new(
+            error.kind(),
+            format!("{}: {error}", path.display()),
+        )),
+    }
+}
+
+impl NetworkTables {
+    fn read_from(net_dir: &Path) -> std::io::Result<Self> {
+        let mut tables = Self::default();
+        for (name, ipv6, tcp) in [
+            ("tcp", false, true),
+            ("tcp6", true, true),
+            ("udp", false, false),
+            ("udp6", true, false),
+        ] {
+            let Some(content) = read_optional_socket_table(&net_dir.join(name))? else {
+                continue;
+            };
+            validate_inet_table(&content, ipv6)?;
+            if tcp {
+                for connection in parse_proc_net_tcp_reader(content.as_bytes(), ipv6) {
+                    tables.tcp_by_inode.insert(connection.inode, connection);
+                }
+            } else {
+                for socket in parse_proc_net_udp_reader(content.as_bytes(), ipv6) {
+                    tables.udp_by_inode.insert(socket.inode, socket);
+                }
+            }
+        }
+        if let Some(content) = read_optional_socket_table(&net_dir.join("unix"))? {
+            for socket in parse_proc_net_unix_reader(content.as_bytes())? {
+                tables.unix_by_inode.insert(socket.inode, socket);
+            }
+        }
+        for (name, ipv6) in [
+            ("raw", false),
+            ("raw6", true),
+            ("udplite", false),
+            ("udplite6", true),
+        ] {
+            if let Some(content) = read_optional_socket_table(&net_dir.join(name))? {
+                validate_inet_table(&content, ipv6)?;
+                tables
+                    .other_inodes
+                    .extend(inet_table_inodes(content.as_bytes())?);
+            }
+        }
+        for name in ["netlink", "packet"] {
+            if let Some(content) = read_optional_socket_table(&net_dir.join(name))? {
+                tables.other_inodes.extend(named_inode_table(&content)?);
+            }
+        }
+        let mut observed = HashSet::new();
+        for &inode in tables
+            .tcp_by_inode
+            .keys()
+            .chain(tables.udp_by_inode.keys())
+            .chain(tables.unix_by_inode.keys())
+            .chain(tables.other_inodes.iter())
+        {
+            if inode != 0 && !observed.insert(inode) {
+                return Err(invalid_network(
+                    "socket inode appears in multiple protocol tables",
+                ));
+            }
+        }
+        Ok(tables)
+    }
+
+    fn process_info(
+        &self,
+        socket_inodes: &HashSet<u64>,
+        namespace: NetworkNamespace,
+    ) -> std::io::Result<NetworkInfo> {
+        let mut info = NetworkInfo {
+            namespace: Some(namespace),
+            ..NetworkInfo::default()
+        };
+
+        for &inode in socket_inodes {
             // Check TCP
             if let Some(conn) = self.tcp_by_inode.get(&inode) {
                 if conn.is_ipv6 {
@@ -182,10 +389,22 @@ impl NetworkSnapshot {
             if let Some(sock) = self.unix_by_inode.get(&inode) {
                 info.socket_counts.unix += 1;
                 info.unix_sockets.push(sock.clone());
+                continue;
             }
+            if self.other_inodes.contains(&inode) {
+                info.socket_counts.raw += 1;
+                continue;
+            }
+            return Err(invalid_network(&format!(
+                "socket inode {inode} is absent from the namespace snapshot; its protocol, namespace or creation time is unknown"
+            )));
         }
 
-        Some(info)
+        info.tcp_connections.sort_by_key(|socket| socket.inode);
+        info.udp_sockets.sort_by_key(|socket| socket.inode);
+        info.unix_sockets.sort_by_key(|socket| socket.inode);
+        info.listen_ports.sort_by_key(|socket| socket.inode);
+        Ok(info)
     }
 }
 
@@ -202,7 +421,7 @@ pub struct SocketCounts {
     pub udp6: usize,
     /// Unix domain socket count.
     pub unix: usize,
-    /// Raw socket count.
+    /// Other observed kernel sockets (raw IP, UDP-Lite, netlink and packet).
     pub raw: usize,
 }
 
@@ -379,7 +598,7 @@ impl UnixSocketState {
 /// Collect network information for a specific process.
 ///
 /// This function reads /proc/\[pid\]/fd to find socket inodes, then
-/// looks them up in /proc/net/tcp, /proc/net/udp, /proc/net/unix.
+/// looks them up in the target's /proc/[pid]/net tables.
 ///
 /// Note: For bulk collection, use `NetworkSnapshot::collect()` and `get_process_info`
 /// to avoid reading /proc/net/* files repeatedly.
@@ -388,34 +607,39 @@ pub fn collect_network_info(pid: u32) -> Option<NetworkInfo> {
     snapshot.get_process_info(pid)
 }
 
-/// Get all socket inode numbers for a process from /proc/[pid]/fd.
-fn get_process_socket_inodes(pid: u32) -> Option<HashSet<u64>> {
-    let fd_path = format!("/proc/{}/fd", pid);
+/// Read the complete descriptor directory. An inspection budget or failed
+/// read is unavailable evidence, never a complete empty socket inventory.
+fn get_process_socket_inodes_from(
+    fd_path: &Path,
+    max_inspect: usize,
+) -> std::io::Result<HashSet<u64>> {
     let mut inodes = HashSet::new();
-
-    let entries = fs::read_dir(&fd_path).ok()?;
-    // Limit inspection to prevent stall on processes with massive FD counts
-    const MAX_INSPECT: usize = 50_000;
-
-    for (inspected_count, entry) in entries.flatten().enumerate() {
-        if inspected_count >= MAX_INSPECT {
-            break;
+    for (inspected_count, entry) in fs::read_dir(fd_path)?.enumerate() {
+        if inspected_count >= max_inspect {
+            return Err(invalid_network("descriptor inspection limit exceeded"));
         }
-
-        if let Ok(target) = fs::read_link(entry.path()) {
-            let target_str = target.to_string_lossy();
-            // Socket links look like "socket:[12345]"
-            if let Some(inode_str) = target_str.strip_prefix("socket:[") {
-                if let Some(inode_str) = inode_str.strip_suffix(']') {
-                    if let Ok(inode) = inode_str.parse::<u64>() {
-                        inodes.insert(inode);
-                    }
-                }
-            }
+        let entry = entry?;
+        let name = entry.file_name();
+        if name
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+            .is_none()
+        {
+            return Err(invalid_network("invalid descriptor directory entry"));
+        }
+        let target = fs::read_link(entry.path())?;
+        let target = target.to_string_lossy();
+        if let Some(inode) = target.strip_prefix("socket:") {
+            let inode = inode
+                .strip_prefix('[')
+                .and_then(|inode| inode.strip_suffix(']'))
+                .and_then(|inode| inode.parse::<u64>().ok())
+                .filter(|inode| *inode != 0)
+                .ok_or_else(|| invalid_network("invalid socket descriptor link"))?;
+            inodes.insert(inode);
         }
     }
-
-    Some(inodes)
+    Ok(inodes)
 }
 
 /// Parse /proc/net/tcp or /proc/net/tcp6 file.
@@ -624,7 +848,19 @@ pub(crate) fn has_inet_socket_inode(pid: u32, inode: u64) -> std::io::Result<boo
 
 #[cfg(any(target_os = "linux", test))]
 fn inet_table_has_inode<R: BufRead>(reader: R, inode: u64) -> std::io::Result<bool> {
+    Ok(inet_table_inodes_until(reader, Some(inode))?.contains(&inode))
+}
+
+fn inet_table_inodes<R: BufRead>(reader: R) -> std::io::Result<HashSet<u64>> {
+    inet_table_inodes_until(reader, None)
+}
+
+fn inet_table_inodes_until<R: BufRead>(
+    reader: R,
+    required_inode: Option<u64>,
+) -> std::io::Result<HashSet<u64>> {
     let invalid = |reason: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, reason);
+    let mut inodes = HashSet::new();
     let mut lines = reader.lines();
     let header = lines
         .next()
@@ -680,11 +916,68 @@ fn inet_table_has_inode<R: BufRead>(reader: R, inode: u64) -> std::io::Result<bo
             .get(9)
             .and_then(|inode| inode.parse().ok())
             .ok_or_else(|| invalid("invalid TCP/UDP socket inode row"))?;
-        if observed == inode {
-            return Ok(true);
+        // TIME_WAIT rows can carry inode zero; they have no owning descriptor.
+        if observed != 0 && !inodes.insert(observed) {
+            return Err(invalid("duplicate TCP/UDP socket inode"));
+        }
+        // Supervision only needs positive proof of this inode's protocol.
+        // Whole-snapshot validation passes None and always reads every row.
+        if required_inode == Some(observed) {
+            return Ok(inodes);
         }
     }
-    Ok(false)
+    Ok(inodes)
+}
+
+fn validate_inet_table(content: &str, ipv6: bool) -> std::io::Result<()> {
+    inet_table_inodes(content.as_bytes())?;
+    let address_len = if ipv6 { 32 } else { 8 };
+    for line in content
+        .lines()
+        .skip(1)
+        .filter(|line| !line.trim().is_empty())
+    {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if ![fields[1], fields[2]].iter().all(|address| {
+            address
+                .split_once(':')
+                .is_some_and(|(host, _)| host.len() == address_len)
+        }) || !fields[4].split_once(':').is_some_and(|(tx, rx)| {
+            u32::from_str_radix(tx, 16).is_ok() && u32::from_str_radix(rx, 16).is_ok()
+        }) {
+            return Err(invalid_network(
+                "invalid address width or queue size in socket table",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn named_inode_table(content: &str) -> std::io::Result<HashSet<u64>> {
+    let mut lines = content.lines();
+    let header: Vec<_> = lines
+        .next()
+        .ok_or_else(|| invalid_network("missing socket table header"))?
+        .split_whitespace()
+        .collect();
+    let inode_column = header
+        .iter()
+        .position(|column| column.eq_ignore_ascii_case("inode"))
+        .ok_or_else(|| invalid_network("missing socket inode column"))?;
+    let mut inodes = HashSet::new();
+    for line in lines.filter(|line| !line.trim().is_empty()) {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() != header.len() {
+            return Err(invalid_network("truncated kernel socket table row"));
+        }
+        let inode = fields[inode_column]
+            .parse::<u64>()
+            .map_err(|_| invalid_network("invalid kernel socket inode"))?;
+        if inode != 0 && !inodes.insert(inode) {
+            return Err(invalid_network("duplicate kernel socket inode"));
+        }
+    }
+    Ok(inodes)
 }
 
 /// Parse tx_queue:rx_queue field from /proc/net/tcp format (hex encoded).
@@ -772,6 +1065,207 @@ fn parse_ipv6_addr(hex: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const INET_HEADER: &str = "sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n";
+    const UNIX_HEADER: &str = "Num RefCount Protocol Flags Type St Inode Path\n";
+
+    fn fixture_process(root: &Path, pid: u32, namespace: &Path, inode: u64, port: u16) -> PathBuf {
+        let dir = root.join(pid.to_string());
+        for child in ["fd", "net", "ns"] {
+            fs::create_dir_all(dir.join(child)).unwrap();
+        }
+        fs::hard_link(namespace, dir.join("ns/net")).unwrap();
+        fs::write(
+            dir.join("stat"),
+            format!(
+                "{pid} (fixture) S 1 {pid} {pid} 0 0 0 0 0 0 0 0 0 0 0 20 0 1 0 12345 4096 1\n"
+            ),
+        )
+        .unwrap();
+        fs::write(dir.join("net/unix"), UNIX_HEADER).unwrap();
+        fs::write(
+            dir.join("net/tcp"),
+            format!("{INET_HEADER}0: 00000000:{port:04X} 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 {inode}\n"),
+        ).unwrap();
+        std::os::unix::fs::symlink(format!("socket:[{inode}]"), dir.join("fd/3")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn snapshot_isolates_namespaces_and_reuses_each_observed_table() {
+        let root = tempfile::tempdir().unwrap();
+        let first_namespace = root.path().join("namespace-a");
+        let second_namespace = root.path().join("namespace-b");
+        fs::write(&first_namespace, "a").unwrap();
+        fs::write(&second_namespace, "b").unwrap();
+        fixture_process(root.path(), 100, &first_namespace, 42, 8080);
+        fixture_process(root.path(), 200, &second_namespace, 42, 9090);
+        let sibling = fixture_process(root.path(), 101, &first_namespace, 42, 8080);
+        let snapshot = NetworkSnapshot {
+            proc_root: root.path().to_path_buf(),
+            ..NetworkSnapshot::default()
+        };
+
+        let first = snapshot.get_process_info_checked(100).unwrap();
+        let second = snapshot.get_process_info_checked(200).unwrap();
+        assert_eq!(first.listen_ports[0].port, 8080);
+        assert_eq!(second.listen_ports[0].port, 9090);
+        assert_ne!(first.namespace, second.namespace);
+        // A later candidate in the same namespace must not parse its table
+        // again. Its live descriptor and namespace identity are still checked.
+        fs::write(sibling.join("net/tcp"), "must not be read again").unwrap();
+        let same_namespace = snapshot.get_process_info_checked(101).unwrap();
+        assert_eq!(same_namespace.namespace, first.namespace);
+        assert_eq!(same_namespace.listen_ports[0].port, 8080);
+        assert_eq!(snapshot.namespaces.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn absent_unclassified_and_changed_socket_evidence_stays_unavailable() {
+        let root = tempfile::tempdir().unwrap();
+        let namespace = root.path().join("namespace");
+        fs::write(&namespace, "namespace").unwrap();
+        let dir = fixture_process(root.path(), 100, &namespace, 42, 8080);
+        let snapshot = NetworkSnapshot {
+            proc_root: root.path().to_path_buf(),
+            ..NetworkSnapshot::default()
+        };
+        assert_eq!(
+            snapshot
+                .get_process_info_checked(100)
+                .unwrap()
+                .listen_ports
+                .len(),
+            1
+        );
+
+        // A newly created or foreign inherited socket cannot be resolved in the
+        // scan's namespace snapshot. It must not lower the impact estimate.
+        std::os::unix::fs::symlink("socket:[43]", dir.join("fd/4")).unwrap();
+        let error = snapshot.get_process_info_checked(100).unwrap_err();
+        assert!(error.to_string().contains("socket inode 43"));
+        assert!(snapshot.get_process_info(100).is_none());
+        assert!(snapshot.get_process_info(999).is_none());
+
+        let second_namespace = root.path().join("namespace-b");
+        fs::write(&second_namespace, "other").unwrap();
+        let observed = NetworkNamespace::from_metadata(&fs::metadata(&namespace).unwrap());
+        assert!(snapshot
+            .tables_for(
+                &dir,
+                NetworkNamespace::from_metadata(&fs::metadata(&second_namespace).unwrap()),
+                fs::File::open(&second_namespace).unwrap(),
+            )
+            .is_err());
+        assert!(check_network_namespace(&dir, observed).is_ok());
+    }
+
+    #[test]
+    fn descriptor_failures_and_inspection_limits_are_not_empty_observations() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(get_process_socket_inodes_from(root.path(), 1)
+            .unwrap()
+            .is_empty());
+        std::os::unix::fs::symlink("/dev/null", root.path().join("0")).unwrap();
+        assert!(get_process_socket_inodes_from(root.path(), 1)
+            .unwrap()
+            .is_empty());
+        std::os::unix::fs::symlink("socket:[42]", root.path().join("3")).unwrap();
+        assert!(get_process_socket_inodes_from(root.path(), 1).is_err());
+        assert_eq!(
+            get_process_socket_inodes_from(root.path(), 2).unwrap(),
+            HashSet::from([42])
+        );
+        fs::write(root.path().join("4"), "not a readable descriptor link").unwrap();
+        assert!(get_process_socket_inodes_from(root.path(), 10).is_err());
+
+        let malformed = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("socket:[invalid]", malformed.path().join("0")).unwrap();
+        assert!(get_process_socket_inodes_from(malformed.path(), 10).is_err());
+    }
+
+    #[test]
+    fn known_other_protocols_are_counted_without_inventing_listeners() {
+        let root = tempfile::tempdir().unwrap();
+        let namespace = root.path().join("namespace");
+        fs::write(&namespace, "namespace").unwrap();
+        let dir = fixture_process(root.path(), 100, &namespace, 42, 8080);
+        std::os::unix::fs::symlink("socket:[43]", dir.join("fd/4")).unwrap();
+        fs::write(
+            dir.join("net/netlink"),
+            "sk Eth Pid Groups Rmem Wmem Dump Locks Drops Inode\n0 0 100 00000000 0 0 0 2 0 43\n",
+        )
+        .unwrap();
+        let snapshot = NetworkSnapshot {
+            proc_root: root.path().to_path_buf(),
+            ..NetworkSnapshot::default()
+        };
+        let info = snapshot.get_process_info_checked(100).unwrap();
+        assert_eq!(info.socket_counts.raw, 1);
+        assert_eq!(info.socket_counts.tcp, 1);
+        assert_eq!(info.listen_ports.len(), 1);
+    }
+
+    #[test]
+    fn malformed_tables_never_authorize_partial_network_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let namespace = root.path().join("namespace");
+        fs::write(&namespace, "namespace").unwrap();
+        let dir = fixture_process(root.path(), 100, &namespace, 42, 8080);
+        let tcp = fs::read_to_string(dir.join("net/tcp")).unwrap();
+        fs::write(dir.join("net/tcp"), format!("{tcp}truncated\n")).unwrap();
+        let snapshot = NetworkSnapshot {
+            proc_root: root.path().to_path_buf(),
+            ..NetworkSnapshot::default()
+        };
+        assert!(snapshot.get_process_info_checked(100).is_err());
+        assert!(validate_inet_table(&format!("{tcp}truncated\n"), false).is_err());
+        assert!(named_inode_table("Inode\n42\ninvalid\n").is_err());
+    }
+
+    #[test]
+    fn empty_descriptor_inventory_is_observed_even_without_protocol_tables() {
+        let root = tempfile::tempdir().unwrap();
+        let process = root.path().join("100");
+        fs::create_dir_all(process.join("fd")).unwrap();
+        fs::create_dir_all(process.join("ns")).unwrap();
+        fs::write(process.join("ns/net"), "namespace").unwrap();
+        fs::write(
+            process.join("stat"),
+            "100 (fixture) S 1 100 100 0 0 0 0 0 0 0 0 0 0 0 20 0 1 0 12345 4096 1\n",
+        )
+        .unwrap();
+        let snapshot = NetworkSnapshot {
+            proc_root: root.path().to_path_buf(),
+            ..NetworkSnapshot::default()
+        };
+        let info = snapshot.get_process_info_checked(100).unwrap();
+        assert!(info.namespace.is_some());
+        assert!(info.listen_ports.is_empty());
+        assert!(snapshot.namespaces.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn final_observation_refuses_pid_reuse_and_incomplete_birth_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let namespace_path = root.path().join("namespace");
+        fs::write(&namespace_path, "namespace").unwrap();
+        let dir = fixture_process(root.path(), 100, &namespace_path, 42, 8080);
+        let namespace = NetworkNamespace::from_metadata(&fs::metadata(&namespace_path).unwrap());
+        let identity = read_network_process_identity(&dir, 100).unwrap();
+        let sockets = HashSet::from([42]);
+        revalidate_network_observation(&dir, 100, namespace, identity, &sockets).unwrap();
+        let stat = fs::read_to_string(dir.join("stat")).unwrap();
+        fs::write(dir.join("stat"), stat.replace("12345", "23456")).unwrap();
+        assert!(revalidate_network_observation(&dir, 100, namespace, identity, &sockets).is_err());
+        fs::write(dir.join("stat"), "100 (fixture) S 1\n").unwrap();
+        assert!(read_network_process_identity(&dir, 100).is_err());
+        let snapshot = NetworkSnapshot {
+            proc_root: root.path().to_path_buf(),
+            ..NetworkSnapshot::default()
+        };
+        assert!(snapshot.get_process_info_checked(100).is_err());
+    }
 
     #[test]
     fn test_tcp_state_from_hex() {

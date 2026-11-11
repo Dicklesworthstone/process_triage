@@ -33480,6 +33480,7 @@ mod queue_metrics_tests {
     #[test]
     fn observed_queue_metrics_retains_real_queue_pressure() {
         let info = NetworkInfo {
+            namespace: None,
             socket_counts: SocketCounts {
                 tcp: 1,
                 ..SocketCounts::default()
@@ -33516,6 +33517,7 @@ mod queue_metrics_tests {
     #[test]
     fn shared_unix_sockets_do_not_manufacture_queue_pressure() {
         let info = NetworkInfo {
+            namespace: None,
             socket_counts: SocketCounts {
                 unix: 1,
                 ..SocketCounts::default()

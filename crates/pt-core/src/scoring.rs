@@ -920,7 +920,7 @@ mod provenance {
     };
 
     use crate::collect::{
-        collect_fd_ipc_resources, collect_lineage_for_pid, collect_listener_resources_from,
+        collect_fd_ipc_resources, collect_lineage_for_pid, collect_listener_resources_from_checked,
         collect_local_resource_evidence, detect_listener_conflicts, parse_fd, NetworkSnapshot,
         ProcessRecord, SharedResourceGraph,
     };
@@ -938,6 +938,8 @@ mod provenance {
         pub resource_graph: SharedResourceGraph,
         pub lineages: HashMap<u32, RawLineageEvidence>,
         pub children: HashMap<u32, Vec<u32>>,
+        /// Failed network observations are not empty resource inventories.
+        pub network_errors: HashMap<u32, String>,
     }
 
     /// Provenance-derived evidence terms and confidence caveats for one process.
@@ -986,6 +988,7 @@ mod provenance {
     pub fn build_provenance_bundle(processes: &[&ProcessRecord]) -> ProvenanceInferenceBundle {
         let mut lineages = HashMap::new();
         let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+        let mut network_errors = HashMap::new();
         let mut per_process_resources: Vec<(u32, Vec<pt_common::RawResourceEvidence>)> = Vec::new();
         let mut all_resources = Vec::new();
         // One socket-table snapshot for the whole scan (was re-parsed per process).
@@ -1002,7 +1005,12 @@ mod provenance {
 
             let fd_info = parse_fd(pid);
             let mut resources = collect_local_resource_evidence(pid, fd_info.as_ref());
-            resources.extend(collect_listener_resources_from(pid, &network_snapshot));
+            match collect_listener_resources_from_checked(pid, &network_snapshot) {
+                Ok(network_resources) => resources.extend(network_resources),
+                Err(error) => {
+                    network_errors.insert(pid, error.to_string());
+                }
+            }
             resources.extend(collect_fd_ipc_resources(pid));
             all_resources.extend(resources.iter().cloned());
             per_process_resources.push((pid, resources));
@@ -1036,6 +1044,7 @@ mod provenance {
             resource_graph,
             lineages,
             children,
+            network_errors,
         }
     }
 
@@ -1125,16 +1134,46 @@ mod provenance {
             .map(|lineage| lineage.confidence)
             .unwrap_or(ProvenanceConfidence::Unknown);
         let lineage_score = provenance_confidence_score(lineage_confidence);
-        let resource_score = if resolved_resources + unresolved_resources == 0 {
+        let resource_score = if bundle.network_errors.contains_key(&pid) {
+            // Even an apparently empty graph may hide every network dependency
+            // when this process's namespace, descriptors or tables were unreadable.
+            0.0
+        } else if resolved_resources + unresolved_resources == 0 {
             0.7
         } else {
             resolved_resources as f64 / (resolved_resources + unresolved_resources) as f64
         };
+        // Missing peers can hide shared resources even when this target was
+        // observed completely. Retain the actual scan coverage in confidence.
+        let network_coverage = if bundle.network_errors.is_empty() {
+            1.0
+        } else if bundle.lineages.is_empty() {
+            0.0
+        } else {
+            bundle
+                .lineages
+                .len()
+                .saturating_sub(bundle.network_errors.len()) as f64
+                / bundle.lineages.len() as f64
+        };
+        let resource_score = resource_score * network_coverage;
         let mut evidence_completeness = ((lineage_score + resource_score) / 2.0).clamp(0.0, 1.0);
 
         let mut confidence_notes = Vec::new();
         let mut confidence_penalty_steps = 0usize;
 
+        if let Some(reason) = bundle.network_errors.get(&pid) {
+            confidence_notes.push(format!(
+                "network resource evidence unavailable for PID {pid}: {reason}"
+            ));
+            confidence_penalty_steps += 1;
+        } else if !bundle.network_errors.is_empty() {
+            confidence_notes.push(format!(
+                "network resource graph is incomplete: {} other process observation(s) unavailable",
+                bundle.network_errors.len()
+            ));
+            confidence_penalty_steps += 1;
+        }
         if lineage.is_none() {
             confidence_notes.push("missing lineage provenance".to_string());
             confidence_penalty_steps += 1;
@@ -1231,7 +1270,9 @@ mod provenance {
                     -0.20,
                 ));
             }
-            RiskLevel::Low if blast_radius.total_affected == 0 => {
+            RiskLevel::Low
+                if blast_radius.total_affected == 0 && bundle.network_errors.is_empty() =>
+            {
                 evidence_terms.push(provenance_term(
                     "provenance_blast_radius_low",
                     -0.25,
@@ -2521,6 +2562,7 @@ mod provenance_tests {
             resource_graph: SharedResourceGraph::from_evidence(&[]),
             lineages: HashMap::from([(100, orphan)]),
             children: HashMap::new(),
+            network_errors: HashMap::new(),
         };
 
         let adjustment = derive_provenance_adjustment(100, &bundle);
@@ -2528,6 +2570,105 @@ mod provenance_tests {
 
         assert!(features.contains(&"provenance_ownership_orphaned"));
         assert!(features.contains(&"provenance_blast_radius_low"));
+    }
+
+    #[test]
+    fn failed_network_probe_is_preserved_through_live_provenance_collection() {
+        let missing = crate::mock_process::MockProcessBuilder::new()
+            .pid(u32::MAX)
+            .comm("missing-worker")
+            .build();
+        let bundle = build_provenance_bundle(&[&missing]);
+        assert!(bundle.network_errors.contains_key(&missing.pid.0));
+        let adjustment = derive_provenance_adjustment(missing.pid.0, &bundle);
+        assert!(!feature_names(&adjustment).contains(&"provenance_blast_radius_low"));
+        assert!(adjustment.confidence_penalty_steps > 0);
+        assert!(adjustment
+            .confidence_notes
+            .iter()
+            .any(|note| note.contains("network resource evidence unavailable")));
+    }
+
+    #[test]
+    fn incomplete_network_graph_never_proves_isolation() {
+        let mut orphan = lineage(100, 1, None);
+        orphan.sid = 90;
+        let mut bundle = ProvenanceInferenceBundle {
+            resource_graph: SharedResourceGraph::from_evidence(&[]),
+            lineages: HashMap::from([(100, orphan), (200, lineage(200, 2, None))]),
+            children: HashMap::new(),
+            network_errors: HashMap::new(),
+        };
+        let complete = derive_provenance_adjustment(100, &bundle);
+        assert!(feature_names(&complete).contains(&"provenance_blast_radius_low"));
+
+        for unreadable_pid in [100, 200] {
+            bundle.network_errors = HashMap::from([(
+                unreadable_pid,
+                "namespace descriptor table unavailable".to_string(),
+            )]);
+            let incomplete = derive_provenance_adjustment(100, &bundle);
+            assert!(!feature_names(&incomplete).contains(&"provenance_blast_radius_low"));
+            assert!(feature_names(&incomplete).contains(&"provenance_ownership_orphaned"));
+            assert!(incomplete.evidence_completeness < complete.evidence_completeness);
+            assert!(incomplete.confidence_penalty_steps > complete.confidence_penalty_steps);
+            assert!(incomplete
+                .confidence_notes
+                .iter()
+                .any(|note| note.contains("network resource")));
+        }
+
+        // Positive observations remain useful even when a different participant
+        // could not be inspected. Missing evidence only forbids absence claims.
+        bundle.resource_graph =
+            SharedResourceGraph::from_evidence(&[(100, vec![listener_ev(100, 8080)])]);
+        let incomplete = derive_provenance_adjustment(100, &bundle);
+        assert!(feature_names(&incomplete).contains(&"provenance_active_listener"));
+        assert!(!feature_names(&incomplete).contains(&"provenance_blast_radius_low"));
+    }
+
+    #[test]
+    fn recorded_scoring_retains_unavailable_network_evidence() {
+        let process = crate::mock_process::MockProcessBuilder::new()
+            .pid(100)
+            .ppid(90)
+            .comm("worker")
+            .elapsed(Duration::from_secs(7200))
+            .build();
+        let mut scorer = Scorer::new(
+            Priors::default(),
+            DecisionStore::default(),
+            SignatureDatabase::new(),
+            FastPathConfig::disabled(),
+        );
+        scorer.provenance = Some(ProvenanceInferenceBundle {
+            resource_graph: SharedResourceGraph::from_evidence(&[]),
+            lineages: HashMap::from([(100, lineage(100, 90, None))]),
+            children: HashMap::new(),
+            network_errors: HashMap::from([(100, "unclassified socket inode".to_string())]),
+        });
+        let observations = scorer.recorded_observations(&process, None);
+        let measured = scorer
+            .score_recorded(
+                &process,
+                Evidence::from_snapshot(&process),
+                observations.clone(),
+            )
+            .unwrap()
+            .ledger;
+        let restored: ScoringObservations =
+            serde_json::from_value(serde_json::to_value(observations).unwrap()).unwrap();
+        let recorded_provenance = restored.provenance.as_ref().unwrap();
+        assert!(!feature_names(recorded_provenance).contains(&"provenance_blast_radius_low"));
+        assert!(recorded_provenance
+            .confidence_notes
+            .iter()
+            .any(|note| note.contains("unclassified socket inode")));
+        scorer.provenance = None;
+        let replayed = scorer
+            .score_recorded(&process, Evidence::from_snapshot(&process), restored)
+            .unwrap();
+        assert_eq!(replayed.ledger, measured);
     }
 
     /// Its own session leader under PID 1 with no readable chain (hidepid): as likely
@@ -2538,6 +2679,7 @@ mod provenance_tests {
             resource_graph: SharedResourceGraph::from_evidence(&[]),
             lineages: HashMap::from([(100, lineage(100, 1, None))]),
             children: HashMap::new(),
+            network_errors: HashMap::new(),
         };
 
         let adjustment = derive_provenance_adjustment(100, &bundle);
@@ -2567,6 +2709,7 @@ mod provenance_tests {
             resource_graph: SharedResourceGraph::from_evidence(&[]),
             lineages: HashMap::from([(400, orphan)]),
             children: HashMap::new(),
+            network_errors: HashMap::new(),
         };
 
         let features = feature_names(&derive_provenance_adjustment(400, &bundle)).join(",");
@@ -2602,6 +2745,7 @@ mod provenance_tests {
             resource_graph: SharedResourceGraph::from_evidence(&[]),
             lineages: HashMap::from([(500, orphan)]),
             children: HashMap::new(),
+            network_errors: HashMap::new(),
         };
 
         let features = feature_names(&derive_provenance_adjustment(500, &bundle)).join(",");
@@ -2632,6 +2776,7 @@ mod provenance_tests {
                 ),
             )]),
             children: HashMap::new(),
+            network_errors: HashMap::new(),
         };
 
         let adjustment = derive_provenance_adjustment(200, &bundle);
@@ -2664,6 +2809,7 @@ mod provenance_tests {
             )]),
             lineages: HashMap::from([(process.pid.0, lineage(process.pid.0, 2, None))]),
             children: HashMap::new(),
+            network_errors: HashMap::new(),
         });
         let observations = measured.recorded_observations(&process, None);
         let expected = measured
@@ -2702,6 +2848,7 @@ mod provenance_tests {
             )]),
             lineages: HashMap::new(),
             children: HashMap::new(),
+            network_errors: HashMap::new(),
         };
 
         let adjustment = derive_provenance_adjustment(300, &bundle);

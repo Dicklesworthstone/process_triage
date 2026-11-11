@@ -28,49 +28,83 @@ pub fn collect_listener_resources_from(
     pid: u32,
     snapshot: &super::network::NetworkSnapshot,
 ) -> Vec<RawResourceEvidence> {
+    collect_listener_resources_from_checked(pid, snapshot).unwrap_or_default()
+}
+
+/// Collect namespace-bound resource evidence without converting missing
+/// observation coverage into a complete empty resource inventory.
+#[cfg(target_os = "linux")]
+pub fn collect_listener_resources_from_checked(
+    pid: u32,
+    snapshot: &super::network::NetworkSnapshot,
+) -> std::io::Result<Vec<RawResourceEvidence>> {
+    snapshot
+        .get_process_info_checked(pid)
+        .and_then(|info| listener_resources_from_info(pid, &info))
+}
+
+#[cfg(target_os = "linux")]
+fn listener_resources_from_info(
+    pid: u32,
+    net_info: &super::network::NetworkInfo,
+) -> std::io::Result<Vec<RawResourceEvidence>> {
+    // Addresses and abstract Unix names are namespace-local. Without observed
+    // namespace identity, identical text cannot establish resource sharing.
+    let Some(namespace) = net_info.namespace else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "network resources have no observed namespace identity",
+        ));
+    };
     let now = chrono::Utc::now().to_rfc3339();
     let mut resources = Vec::new();
 
-    if let Some(net_info) = snapshot.get_process_info(pid) {
-        // Convert listening ports to resource evidence
-        for port in &net_info.listen_ports {
-            resources.push(RawResourceEvidence {
-                kind: ResourceKind::Listener,
-                key: format!("{}:{}:{}", port.protocol, port.address, port.port),
-                owner_pid: pid,
-                collection_method: ResourceCollectionMethod::ProcNet,
-                state: ResourceState::Active,
-                details: ResourceDetails::Listener {
-                    protocol: port.protocol.clone(),
-                    port: port.port,
-                    bind_address: port.address.clone(),
-                },
-                observed_at: now.clone(),
-            });
-        }
+    // Convert listening ports to resource evidence
+    for port in &net_info.listen_ports {
+        resources.push(RawResourceEvidence {
+            kind: ResourceKind::Listener,
+            key: namespace
+                .resource_key(&format!("{}:{}:{}", port.protocol, port.address, port.port)),
+            owner_pid: pid,
+            collection_method: ResourceCollectionMethod::ProcNet,
+            state: ResourceState::Active,
+            details: ResourceDetails::Listener {
+                protocol: port.protocol.clone(),
+                port: port.port,
+                bind_address: port.address.clone(),
+            },
+            observed_at: now.clone(),
+        });
+    }
 
-        // Convert Unix sockets to resource evidence
-        for sock in &net_info.unix_sockets {
-            if let Some(path) = &sock.path {
-                if !path.is_empty() {
-                    resources.push(RawResourceEvidence {
-                        kind: ResourceKind::UnixSocket,
-                        key: path.clone(),
-                        owner_pid: pid,
-                        collection_method: ResourceCollectionMethod::ProcNet,
-                        state: ResourceState::Active,
-                        details: ResourceDetails::UnixSocket {
-                            path: path.clone(),
-                            socket_type: format!("{:?}", sock.socket_type),
-                        },
-                        observed_at: now.clone(),
-                    });
-                }
+    // Convert Unix sockets to resource evidence
+    for sock in &net_info.unix_sockets {
+        if let Some(path) = &sock.path {
+            if !path.is_empty() {
+                resources.push(RawResourceEvidence {
+                    kind: ResourceKind::UnixSocket,
+                    // Abstract names belong to a network namespace.
+                    // Filesystem path text does not: distinct mounts can
+                    // contain the same path, while an inherited socket can
+                    // remain shared after its holders switch namespaces.
+                    key: if path.starts_with('@') {
+                        namespace.resource_key(&format!("unix:{path}"))
+                    } else {
+                        format!("unix:inode:{}", sock.inode)
+                    },
+                    owner_pid: pid,
+                    collection_method: ResourceCollectionMethod::ProcNet,
+                    state: ResourceState::Active,
+                    details: ResourceDetails::UnixSocket {
+                        path: path.clone(),
+                        socket_type: format!("{:?}", sock.socket_type),
+                    },
+                    observed_at: now.clone(),
+                });
             }
         }
     }
-
-    resources
+    Ok(resources)
 }
 
 /// Detect listener conflicts: multiple processes listening on the same port.
@@ -196,6 +230,84 @@ pub fn collect_fd_ipc_resources(pid: u32) -> Vec<RawResourceEvidence> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listener_and_abstract_socket_keys_are_scoped_by_observed_namespace() {
+        use super::super::network::{
+            ListenPort, NetworkInfo, NetworkNamespace, UnixSocket, UnixSocketState, UnixSocketType,
+        };
+        let mut info = NetworkInfo {
+            namespace: Some(NetworkNamespace {
+                device: 4,
+                inode: 100,
+            }),
+            listen_ports: vec![ListenPort {
+                protocol: "tcp".to_string(),
+                port: 8080,
+                address: "0.0.0.0".to_string(),
+                inode: 42,
+            }],
+            unix_sockets: vec![UnixSocket {
+                path: Some("@agent".to_string()),
+                socket_type: UnixSocketType::Stream,
+                state: UnixSocketState::Unconnected,
+                inode: 43,
+                ref_count: 1,
+            }],
+            ..NetworkInfo::default()
+        };
+        let first = listener_resources_from_info(1, &info).unwrap();
+        let same_namespace = listener_resources_from_info(2, &info).unwrap();
+        assert_eq!(first[0].key, same_namespace[0].key);
+        info.namespace = Some(NetworkNamespace {
+            device: 4,
+            inode: 200,
+        });
+        let second = listener_resources_from_info(3, &info).unwrap();
+        assert_ne!(first[0].key, second[0].key);
+        assert_ne!(first[1].key, second[1].key);
+        assert!(detect_listener_conflicts(&[first[0].clone(), second[0].clone()]).is_empty());
+        assert_eq!(
+            detect_listener_conflicts(&[first[0].clone(), same_namespace[0].clone()]).len(),
+            2
+        );
+        info.namespace = None;
+        assert!(listener_resources_from_info(3, &info).is_err());
+    }
+
+    #[test]
+    fn filesystem_unix_resources_use_socket_identity_instead_of_path_text() {
+        use super::super::network::{
+            NetworkInfo, NetworkNamespace, UnixSocket, UnixSocketState, UnixSocketType,
+        };
+        let mut info = NetworkInfo {
+            namespace: Some(NetworkNamespace {
+                device: 4,
+                inode: 100,
+            }),
+            unix_sockets: vec![UnixSocket {
+                path: Some("/run/agent.sock".to_string()),
+                socket_type: UnixSocketType::Stream,
+                state: UnixSocketState::Unconnected,
+                inode: 43,
+                ref_count: 1,
+            }],
+            ..NetworkInfo::default()
+        };
+        let first = listener_resources_from_info(1, &info).unwrap();
+        info.namespace = Some(NetworkNamespace {
+            device: 4,
+            inode: 200,
+        });
+        let inherited = listener_resources_from_info(2, &info).unwrap();
+        assert_eq!(first[0].key, inherited[0].key);
+        info.unix_sockets[0].inode = 44;
+        let same_path_other_socket = listener_resources_from_info(3, &info).unwrap();
+        assert_ne!(first[0].key, same_path_other_socket[0].key);
+        assert!(
+            matches!(&first[0].details, ResourceDetails::UnixSocket { path, .. } if path == "/run/agent.sock")
+        );
+    }
 
     #[test]
     fn detect_conflicts_empty() {
