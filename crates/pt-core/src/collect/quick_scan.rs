@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use thiserror::Error;
-use tracing::{debug, span, warn, Level};
+use tracing::{debug, span, Level};
 
 /// Options for quick scan operation.
 #[derive(Clone, Default)]
@@ -90,36 +90,8 @@ impl PsChildGuard {
 
 impl Drop for PsChildGuard {
     fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
-            match child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) => {}
-                Err(error) => {
-                    // In particular, ECHILD no longer proves that our numeric
-                    // PID is pinned. Never signal after losing child ownership.
-                    warn!(pid = child.id(), %error, "cannot establish collector ownership for cleanup");
-                    return;
-                }
-            }
-            // The unreaped child pins its PID until wait, even if it has exited.
-            // A process stuck in uninterruptible kernel I/O may not die promptly
-            // after SIGKILL. Reap off the caller so cleanup cannot defeat the
-            // scan's deadline. Healthy scans create no background threads.
-            let pid = child.id();
-            if let Err(error) = child.kill() {
-                warn!(pid, %error, "cannot terminate failed collector");
-            }
-            if matches!(child.try_wait(), Ok(Some(_))) {
-                return;
-            }
-            if let Err(error) = thread::Builder::new()
-                .name("pt-ps-reaper".to_string())
-                .spawn(move || {
-                    let _ = child.wait();
-                })
-            {
-                warn!(pid, %error, "cannot start collector reaper; cleanup remains unverified");
-            }
+        if let Some(child) = self.0.take() {
+            super::tool_runner::terminate_owned_child(child);
         }
     }
 }

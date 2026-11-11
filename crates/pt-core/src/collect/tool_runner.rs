@@ -3,7 +3,7 @@
 //! This module provides safe execution of external tools (ps, lsof, perf, etc.)
 //! with robust safety controls:
 //!
-//! - Per-command timeout with SIGTERM → SIGKILL escalation
+//! - Per-command deadline covering all pipes and child termination
 //! - Output size caps to prevent memory exhaustion
 //! - Parallel execution with concurrency limits
 //! - Cumulative budget tracking for overhead management
@@ -44,9 +44,6 @@ pub const DEFAULT_MAX_PARALLEL: usize = 4;
 
 /// Default budget in milliseconds (5 seconds).
 pub const DEFAULT_BUDGET_MS: u64 = 5000;
-
-/// Grace period between SIGTERM and SIGKILL in milliseconds.
-const SIGTERM_GRACE_MS: u64 = 500;
 
 /// Errors that can occur during tool execution.
 #[derive(Debug, Error)]
@@ -127,7 +124,7 @@ impl ToolOutput {
 
     /// Check if the command succeeded (exit code 0).
     pub fn success(&self) -> bool {
-        self.exit_code == Some(0)
+        self.exit_code == Some(0) && !self.timed_out && !self.truncated
     }
 }
 
@@ -260,6 +257,49 @@ pub struct ToolRunner {
     config: ToolConfig,
     /// Cumulative time used in milliseconds.
     used_ms: Arc<AtomicU64>,
+}
+
+/// Retain ownership until collection finishes, including every error path.
+/// A timeout must not turn a D-state child into a blocking `wait()` in the caller.
+struct ToolChildGuard(Option<Child>);
+
+impl Drop for ToolChildGuard {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.take() {
+            terminate_owned_child(child);
+        }
+    }
+}
+
+/// Cancel only an unreaped child whose ownership can still be established.
+/// Reaping can wait for uninterruptible kernel I/O, so it runs off the collection
+/// path. Successful commands do not create a reaper thread.
+pub(super) fn terminate_owned_child(mut child: Child) {
+    match child.try_wait() {
+        Ok(Some(_)) => return,
+        Ok(None) => {}
+        Err(error) => {
+            // ECHILD no longer proves that the numeric PID belongs to us.
+            warn!(pid = child.id(), %error, "cannot establish tool ownership for cleanup");
+            return;
+        }
+    }
+    let pid = child.id();
+    // The unreaped child pins its PID, even if it exits before this call.
+    if let Err(error) = child.kill() {
+        warn!(pid, %error, "cannot terminate failed tool");
+    }
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
+    if let Err(error) = thread::Builder::new()
+        .name("pt-tool-reaper".to_string())
+        .spawn(move || {
+            let _ = child.wait();
+        })
+    {
+        warn!(pid, %error, "cannot start tool reaper; cleanup remains unverified");
+    }
 }
 
 impl ToolRunner {
@@ -400,7 +440,7 @@ impl ToolRunner {
         };
 
         // Spawn process
-        let mut child = match command
+        let child = match command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -414,31 +454,19 @@ impl ToolRunner {
             }
         };
 
-        // Handle stdin if provided
-        if let Some(stdin_data) = spec.stdin.clone() {
-            if let Some(mut stdin) = child.stdin.take() {
-                // We must write to stdin in a separate thread to avoid deadlocks
-                // if the child starts writing to stdout before we finish writing to stdin.
-                std::thread::spawn(move || {
-                    let _ = stdin.write_all(&stdin_data);
-                });
-            }
-        }
-
-        // Set non-blocking mode on stdout/stderr once
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            if let Some(ref out) = child.stdout {
-                let _ = set_nonblocking(out.as_raw_fd());
-            }
-            if let Some(ref err) = child.stderr {
-                let _ = set_nonblocking(err.as_raw_fd());
-            }
-        }
-
-        // Execute with timeout and output capture
-        let result = self.execute_with_timeout(&mut child, timeout, max_output);
+        let mut child = ToolChildGuard(Some(child));
+        // Stdin, both output pipes, and child exit share the original deadline.
+        // Never leave a detached writer blocked on a child that stopped reading.
+        let result = self.execute_with_timeout(
+            child.0.as_mut().expect("owned tool child"),
+            start,
+            timeout,
+            max_output,
+            spec.stdin.as_deref(),
+        );
+        // Cancel/reap before charging elapsed time, without waiting for a child
+        // stuck in kernel I/O. This also runs after setup or pipe-read failures.
+        drop(child);
 
         let duration = start.elapsed();
         // Charge whole milliseconds, rounded up, and at least 1 ms per run. Truncating
@@ -602,235 +630,113 @@ impl ToolRunner {
         Ok(command)
     }
 
-    /// Execute a child process with timeout and output capture.
+    /// Read/write each nonblocking pipe once per iteration. EOF and process exit
+    /// are separate conditions: descendants can retain output pipes after the
+    /// tool exits, and a tool can close its pipes before becoming stuck.
+    #[cfg(unix)]
     #[allow(clippy::type_complexity)]
     fn execute_with_timeout(
         &self,
         child: &mut Child,
+        started: Instant,
         timeout: Duration,
         max_output: usize,
+        input: Option<&[u8]>,
     ) -> Result<(Vec<u8>, Vec<u8>, Option<i32>, bool, bool), ToolError> {
-        let deadline = Instant::now() + timeout;
+        use std::os::fd::AsRawFd;
+
+        let mut stdout = child.stdout.take();
+        let mut stderr = child.stderr.take();
+        let mut stdin = child.stdin.take();
+        if let Some(pipe) = &stdout {
+            set_nonblocking(pipe.as_raw_fd())?;
+        }
+        if let Some(pipe) = &stderr {
+            set_nonblocking(pipe.as_raw_fd())?;
+        }
+        if let Some(pipe) = &stdin {
+            set_nonblocking(pipe.as_raw_fd())?;
+        }
+        let input = input.unwrap_or_default();
+        let mut written = 0;
         let mut stdout_buf = Vec::with_capacity(max_output.min(65536));
         let mut stderr_buf = Vec::with_capacity(max_output.min(65536));
         let mut truncated = false;
-        let mut timed_out = false;
-
-        // Take ownership of stdout/stderr
-        let mut stdout = child.stdout.take();
-        let mut stderr = child.stderr.take();
-
-        // Read output in chunks with timeout checks
-        let chunk_size = 8192;
-        let mut chunk = vec![0u8; chunk_size];
+        let mut status = None;
+        let mut chunk = [0_u8; 8192];
 
         loop {
-            if Instant::now() >= deadline {
-                timed_out = true;
-                warn!("command timed out, sending SIGTERM");
-                self.kill_with_grace(child);
-                break;
+            if started.elapsed() >= timeout {
+                return Ok((
+                    stdout_buf,
+                    stderr_buf,
+                    status.and_then(|status: std::process::ExitStatus| status.code()),
+                    truncated,
+                    true,
+                ));
             }
-
-            let mut did_read = false;
-
-            // Try to read stdout
-            let mut stdout_eof = false;
-            if let Some(ref mut out) = stdout {
-                match try_read_nonblocking(out, &mut chunk) {
-                    Ok(0) => stdout_eof = true,
-                    Ok(n) => {
-                        did_read = true;
-                        let space = max_output.saturating_sub(stdout_buf.len());
-                        if space > 0 {
-                            let to_copy = n.min(space);
-                            stdout_buf.extend_from_slice(&chunk[..to_copy]);
-                            if n > space {
-                                truncated = true;
-                            }
-                        } else {
-                            truncated = true;
-                        }
+            let mut progressed = false;
+            if written == input.len() {
+                stdin = None;
+            }
+            if let Some(pipe) = stdin.as_mut() {
+                let end = (written + chunk.len()).min(input.len());
+                match pipe.write(&input[written..end]) {
+                    Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into()),
+                    Ok(count) => {
+                        written += count;
+                        progressed = true;
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(_) => stdout_eof = true, // Treat other errors as EOF
+                    Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => stdin = None,
+                    Err(error) if retry_pipe_io(&error) => {}
+                    Err(error) => return Err(error.into()),
                 }
             }
-            if stdout_eof {
-                stdout = None;
+            progressed |= read_tool_pipe(
+                &mut stdout,
+                &mut stdout_buf,
+                &mut chunk,
+                max_output,
+                &mut truncated,
+            )?;
+            progressed |= read_tool_pipe(
+                &mut stderr,
+                &mut stderr_buf,
+                &mut chunk,
+                max_output,
+                &mut truncated,
+            )?;
+            if status.is_none() {
+                status = child.try_wait()?;
             }
-
-            // Try to read stderr
-            let mut stderr_eof = false;
-            if let Some(ref mut err) = stderr {
-                match try_read_nonblocking(err, &mut chunk) {
-                    Ok(0) => stderr_eof = true,
-                    Ok(n) => {
-                        did_read = true;
-                        let space = max_output.saturating_sub(stderr_buf.len());
-                        if space > 0 {
-                            let to_copy = n.min(space);
-                            stderr_buf.extend_from_slice(&chunk[..to_copy]);
-                            if n > space {
-                                truncated = true;
-                            }
-                        } else {
-                            truncated = true;
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(_) => stderr_eof = true, // Treat other errors as EOF
-                }
+            if truncated || (status.is_some() && stdout.is_none() && stderr.is_none()) {
+                let exit_code = status.and_then(|status| status.code());
+                trace!(?exit_code, truncated, "tool collection complete");
+                return Ok((stdout_buf, stderr_buf, exit_code, truncated, false));
             }
-            if stderr_eof {
-                stderr = None;
-            }
-
-            // Check if process has exited
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    // Process exited, drain remaining output
-                    if let Some(ref mut out) = stdout {
-                        let _ =
-                            Self::drain_to_limit(out, &mut stdout_buf, max_output, &mut truncated);
-                    }
-                    if let Some(ref mut err) = stderr {
-                        let _ =
-                            Self::drain_to_limit(err, &mut stderr_buf, max_output, &mut truncated);
-                    }
-
-                    let exit_code = status.code();
-                    trace!(exit_code = ?exit_code, "process exited");
-                    return Ok((stdout_buf, stderr_buf, exit_code, truncated, timed_out));
-                }
-                Ok(None) => {
-                    // Still running
-                    if !did_read {
-                        // Avoid busy-waiting
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                }
-                Err(e) => {
-                    error!(error = %e, "failed to wait for child");
-                    return Err(ToolError::Io(e));
-                }
-            }
-        }
-
-        // Timed out - wait for kill to complete
-        let status = child.wait().ok();
-        let exit_code = status.and_then(|s| s.code());
-
-        Ok((stdout_buf, stderr_buf, exit_code, truncated, timed_out))
-    }
-
-    /// Drain remaining data from a stream up to the limit.
-    ///
-    /// Uses non-blocking reads to avoid hanging on grandchild processes
-    /// that may still hold the pipe open after the direct child exits.
-    #[cfg(unix)]
-    fn drain_to_limit<R: Read>(
-        stream: &mut R,
-        buf: &mut Vec<u8>,
-        max: usize,
-        truncated: &mut bool,
-    ) -> std::io::Result<()> {
-        let mut chunk = vec![0u8; 8192];
-        // Use non-blocking reads to drain what's immediately available.
-        // This prevents hanging when a grandchild process still holds the pipe open.
-        loop {
-            if *truncated {
-                break;
-            }
-            match try_read_nonblocking(stream, &mut chunk) {
-                Ok(0) => break, // No more data available
-                Ok(n) => {
-                    let space = max.saturating_sub(buf.len());
-                    if space > 0 {
-                        let to_copy = n.min(space);
-                        buf.extend_from_slice(&chunk[..to_copy]);
-                        if n > space {
-                            *truncated = true;
-                        }
-                    } else {
-                        *truncated = true;
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
-    }
-
-    /// Drain remaining data from a stream up to the limit.
-    #[cfg(not(unix))]
-    fn drain_to_limit(
-        stream: &mut impl Read,
-        buf: &mut Vec<u8>,
-        max: usize,
-        truncated: &mut bool,
-    ) -> std::io::Result<()> {
-        let mut chunk = vec![0u8; 8192];
-        loop {
-            if *truncated {
-                break;
-            }
-            let n = stream.read(&mut chunk)?;
-            if n == 0 {
-                break;
-            }
-            let space = max.saturating_sub(buf.len());
-            if space > 0 {
-                let to_copy = n.min(space);
-                buf.extend_from_slice(&chunk[..to_copy]);
-                if n > space {
-                    *truncated = true;
-                }
-            } else {
-                *truncated = true;
-            }
-        }
-        Ok(())
-    }
-
-    /// Kill a process with SIGTERM, then SIGKILL after grace period.
-    #[cfg(unix)]
-    fn kill_with_grace(&self, child: &mut Child) {
-        let pid = child.id() as i32;
-
-        // Send SIGTERM
-        unsafe {
-            libc::kill(pid, libc::SIGTERM);
-        }
-        debug!(pid, "sent SIGTERM");
-
-        // Wait for grace period
-        thread::sleep(Duration::from_millis(SIGTERM_GRACE_MS));
-
-        // Check if still running
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                trace!(pid, "process exited after SIGTERM");
-            }
-            Ok(None) => {
-                // Still running, escalate to SIGKILL
-                warn!(pid, "process did not exit after SIGTERM, sending SIGKILL");
-                unsafe {
-                    libc::kill(pid, libc::SIGKILL);
-                }
-                let _ = child.wait();
-            }
-            Err(e) => {
-                error!(pid, error = %e, "failed to check process status");
+            if !progressed {
+                thread::sleep(
+                    Duration::from_millis(5).min(timeout.saturating_sub(started.elapsed())),
+                );
             }
         }
     }
 
     #[cfg(not(unix))]
-    fn kill_with_grace(&self, child: &mut Child) {
-        let _ = child.kill();
-        let _ = child.wait();
+    #[allow(clippy::type_complexity)]
+    fn execute_with_timeout(
+        &self,
+        _child: &mut Child,
+        _started: Instant,
+        _timeout: Duration,
+        _max_output: usize,
+        _input: Option<&[u8]>,
+    ) -> Result<(Vec<u8>, Vec<u8>, Option<i32>, bool, bool), ToolError> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "bounded tool collection requires Unix pipes",
+        )
+        .into())
     }
 }
 
@@ -856,20 +762,39 @@ fn set_nonblocking(fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Try to read from a stream without blocking.
-///
-/// On Unix, this assumes O_NONBLOCK is already set on the file descriptor.
-/// Returns Ok(0) if no data is available (EAGAIN/EWOULDBLOCK).
 #[cfg(unix)]
-fn try_read_nonblocking<R: Read>(stream: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
-    stream.read(buf)
+fn retry_pipe_io(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+    )
 }
 
-/// Non-blocking read fallback for non-Unix platforms.
-/// Falls back to blocking read.
-#[cfg(not(unix))]
-fn try_read_nonblocking<R: Read>(stream: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
-    stream.read(buf)
+#[cfg(unix)]
+fn read_tool_pipe<R: Read>(
+    pipe: &mut Option<R>,
+    output: &mut Vec<u8>,
+    chunk: &mut [u8],
+    max_output: usize,
+    truncated: &mut bool,
+) -> std::io::Result<bool> {
+    let Some(stream) = pipe.as_mut() else {
+        return Ok(false);
+    };
+    match stream.read(chunk) {
+        Ok(0) => {
+            *pipe = None;
+            Ok(true)
+        }
+        Ok(count) => {
+            let retained = count.min(max_output.saturating_sub(output.len()));
+            output.extend_from_slice(&chunk[..retained]);
+            *truncated |= retained != count;
+            Ok(true)
+        }
+        Err(error) if retry_pipe_io(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 /// Builder for creating a tool runner with custom configuration.
@@ -1011,13 +936,16 @@ mod tests {
         let runner = test_runner();
         let default_spec = ToolSpec::new("systemctl", vec!["--user".into()]);
         let default_command = runner.build_command(&default_spec).unwrap();
-        assert!(default_command.get_envs().all(|(key, _)| {
-            matches!(key.to_str(), Some("PATH" | "LC_ALL" | "LANG"))
-        }));
+        assert!(default_command
+            .get_envs()
+            .all(|(key, _)| { matches!(key.to_str(), Some("PATH" | "LC_ALL" | "LANG")) }));
 
         let spec = default_spec
             .with_env("XDG_RUNTIME_DIR", "/run/user/1000")
-            .with_env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/bus $literal%name")
+            .with_env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                "unix:path=/tmp/bus $literal%name",
+            )
             .with_env("HOME", "/home/user with spaces");
         let command = runner.build_command(&spec).unwrap();
         for (key, value) in &spec.env {
@@ -1109,6 +1037,131 @@ mod tests {
         );
         // Process should have been killed (allow extra slack for busy CI)
         assert!(output.duration < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deadline_covers_closed_pipes_and_blocked_stdin() {
+        let runner = test_runner();
+        for spec in [
+            ToolSpec::new(
+                "sh",
+                vec!["-c".into(), "exec 1>&- 2>&-; exec sleep 30".into()],
+            ),
+            ToolSpec::new("sleep", vec!["30".into()]).with_stdin(vec![b'x'; 1024 * 1024]),
+        ] {
+            let started = Instant::now();
+            let output = runner
+                .run(&spec.with_timeout(Duration::from_millis(100)))
+                .expect("bounded collection");
+            assert!(output.timed_out, "{output:?}");
+            assert!(!output.success(), "incomplete capture is not success");
+            assert!(started.elapsed() < Duration::from_secs(2));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn large_stdin_and_stdout_share_deadline_without_deadlock() {
+        let data = vec![b'x'; 512 * 1024];
+        let output = test_runner()
+            .run(
+                &ToolSpec::new("cat", vec![])
+                    .with_stdin(data.clone())
+                    .with_timeout(Duration::from_secs(10)),
+            )
+            .expect("cat run");
+        assert!(output.success(), "{output:?}");
+        assert_eq!(output.stdout, data);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exited_tool_with_inherited_pipes_is_incomplete_and_leaves_holder_alive() {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+
+        let (reader, writer) = UnixStream::pair().expect("output pair");
+        let holder_writer = writer.try_clone().expect("holder output");
+        let mut holder = ToolChildGuard(Some(
+            Command::new("sleep")
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(OwnedFd::from(holder_writer)))
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("owned output holder"),
+        ));
+        let mut tool = ToolChildGuard(Some(
+            Command::new("sh")
+                .args(["-c", "exit 0"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(OwnedFd::from(writer)))
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("owned exiting tool"),
+        ));
+        let child = tool.0.as_mut().unwrap();
+        child.stdout = Some(std::process::ChildStdout::from(OwnedFd::from(reader)));
+        let fixture_start = Instant::now();
+        loop {
+            if let Some(status) = child.try_wait().expect("tool status") {
+                assert!(status.success());
+                break;
+            }
+            assert!(fixture_start.elapsed() < Duration::from_secs(5));
+            thread::sleep(Duration::from_millis(5));
+        }
+        let started = Instant::now();
+        let (_, _, code, truncated, timed_out) = test_runner()
+            .execute_with_timeout(child, started, Duration::from_millis(100), 1024, None)
+            .expect("bounded inherited output");
+        assert_eq!(code, Some(0));
+        assert!(timed_out);
+        assert!(!truncated);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(tool);
+        assert!(holder.0.as_mut().unwrap().try_wait().unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_output_is_an_error_not_eof() {
+        struct FailedReader;
+        impl Read for FailedReader {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::PermissionDenied.into())
+            }
+        }
+        let error = read_tool_pipe(
+            &mut Some(FailedReader),
+            &mut Vec::new(),
+            &mut [0; 8],
+            8,
+            &mut false,
+        )
+        .expect_err("read failures cannot establish complete output");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn complete_exit_status_does_not_hide_capture_failure() {
+        let mut output = ToolOutput {
+            command: "fixture".into(),
+            args: vec![],
+            stdout: vec![],
+            stderr: vec![],
+            exit_code: Some(0),
+            truncated: false,
+            duration: Duration::ZERO,
+            timed_out: false,
+        };
+        assert!(output.success());
+        output.timed_out = true;
+        assert!(!output.success());
+        output.timed_out = false;
+        output.truncated = true;
+        assert!(!output.success());
     }
 
     /// Regression: the free `run_tool` capped every call at the default 5 s budget,

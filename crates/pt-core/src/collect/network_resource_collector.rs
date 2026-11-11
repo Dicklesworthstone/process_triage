@@ -158,30 +158,83 @@ pub fn detect_listener_conflicts(
 ///
 /// Supplements listener collection with non-network IPC resources visible
 /// in the process's file descriptor table.
+/// Use [`collect_fd_ipc_resources_with_diagnostics`] when interpreting a lack of
+/// observations: unavailable metadata must not be treated as proven absence.
 #[cfg(target_os = "linux")]
 pub fn collect_fd_ipc_resources(pid: u32) -> Vec<RawResourceEvidence> {
+    collect_fd_ipc_resources_with_diagnostics(pid).resources
+}
+
+/// Collect IPC observations together with explicit collection failures.
+#[cfg(target_os = "linux")]
+pub fn collect_fd_ipc_resources_with_diagnostics(pid: u32) -> FdIpcResources {
+    collect_fd_ipc_resources_with_runner(pid, &super::resource_collector::resource_probe_runner())
+}
+
+/// Positive observations and collection gaps are separate: a failed FD walk or
+/// metadata probe cannot establish that a process has no shared resources.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default)]
+pub struct FdIpcResources {
+    pub resources: Vec<RawResourceEvidence>,
+    pub unavailable: Vec<String>,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn collect_fd_ipc_resources_with_runner(
+    pid: u32,
+    runner: &super::tool_runner::ToolRunner,
+) -> FdIpcResources {
     use std::fs;
     use std::path::PathBuf;
 
     let now = chrono::Utc::now().to_rfc3339();
-    let mut resources = Vec::new();
+    let mut result = FdIpcResources::default();
     let fd_dir = PathBuf::from(format!("/proc/{pid}/fd"));
 
     let entries = match fs::read_dir(&fd_dir) {
         Ok(e) => e,
-        Err(_) => return resources,
+        Err(error) => {
+            result
+                .unavailable
+                .push(format!("fd_ipc_directory: {error}"));
+            return result;
+        }
     };
 
     const MAX_FDS: usize = 10_000;
+    let mut metadata_candidates = std::collections::BTreeMap::new();
 
-    for (count, entry) in entries.flatten().enumerate() {
+    for (count, entry) in entries.enumerate() {
         if count >= MAX_FDS {
+            result
+                .unavailable
+                .push("fd_ipc_inspection_limit".to_string());
             break;
         }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                result.unavailable.push(format!("fd_ipc_entry: {error}"));
+                continue;
+            }
+        };
+        let fd = match entry.file_name().to_string_lossy().parse::<u32>() {
+            Ok(fd) => fd,
+            Err(_) => {
+                result
+                    .unavailable
+                    .push("fd_ipc_invalid_descriptor".to_string());
+                continue;
+            }
+        };
 
         let link = match fs::read_link(entry.path()) {
             Ok(l) => l,
-            Err(_) => continue,
+            Err(error) => {
+                result.unavailable.push(format!("fd_ipc_link: {error}"));
+                continue;
+            }
         };
 
         let target = link.to_string_lossy();
@@ -189,7 +242,7 @@ pub fn collect_fd_ipc_resources(pid: u32) -> Vec<RawResourceEvidence> {
         // Detect shared memory segments
         if let Some(shm_name) = target.strip_prefix("/dev/shm/") {
             if !shm_name.is_empty() {
-                resources.push(RawResourceEvidence {
+                result.resources.push(RawResourceEvidence {
                     kind: ResourceKind::SharedMemory,
                     key: format!("shm:{shm_name}"),
                     owner_pid: pid,
@@ -204,27 +257,87 @@ pub fn collect_fd_ipc_resources(pid: u32) -> Vec<RawResourceEvidence> {
             continue;
         }
 
-        // Detect named FIFOs (not anonymous pipes)
-        if let Ok(metadata) = fs::metadata(link.as_path()) {
-            use std::os::unix::fs::FileTypeExt;
-            if metadata.file_type().is_fifo() {
-                let path = target.to_string();
-                resources.push(RawResourceEvidence {
-                    kind: ResourceKind::NamedPipe,
-                    key: path.clone(),
-                    owner_pid: pid,
-                    collection_method: ResourceCollectionMethod::ProcFd,
-                    state: ResourceState::Active,
-                    details: ResourceDetails::Generic {
-                        description: format!("fifo:{path}"),
-                    },
-                    observed_at: now.clone(),
-                });
-            }
+        // Do not stat the displayed target path in this thread. It can cross
+        // namespaces, reopen a different inode, or block on an unhealthy mount.
+        // Kernel-labelled sockets/anonymous pipes/devices need no FIFO probe.
+        if target.starts_with('/') && !target.starts_with("/dev/") {
+            metadata_candidates.insert(format!("/proc/{pid}/fd/{fd}"), link);
         }
     }
 
-    resources
+    if !metadata_candidates.is_empty() {
+        let mut args = vec![
+            "-L".to_string(),
+            "--format=%n %f".to_string(),
+            "--".to_string(),
+        ];
+        args.extend(metadata_candidates.keys().cloned());
+        let spec = super::tool_runner::ToolSpec::new("stat", args).with_max_output(MAX_FDS * 96);
+        match runner.run(&spec) {
+            Ok(output) if output.success() && output.stderr.is_empty() => {
+                let mut observed = std::collections::HashSet::new();
+                for line in output.stdout_str().lines() {
+                    let Some((descriptor, mode)) = line.split_once(' ') else {
+                        result
+                            .unavailable
+                            .push("fd_ipc_invalid_metadata".to_string());
+                        continue;
+                    };
+                    let Some(target) = metadata_candidates.get(descriptor) else {
+                        result
+                            .unavailable
+                            .push("fd_ipc_unrequested_metadata".to_string());
+                        continue;
+                    };
+                    let Ok(mode) = u32::from_str_radix(mode, 16) else {
+                        result.unavailable.push("fd_ipc_invalid_mode".to_string());
+                        continue;
+                    };
+                    if !observed.insert(descriptor.to_string()) {
+                        result
+                            .unavailable
+                            .push("fd_ipc_duplicate_metadata".to_string());
+                        continue;
+                    }
+                    if fs::read_link(descriptor).as_ref().ok() != Some(target) {
+                        result
+                            .unavailable
+                            .push("fd_ipc_descriptor_changed".to_string());
+                        continue;
+                    }
+                    if mode & libc::S_IFMT == libc::S_IFIFO {
+                        let path = target.to_string_lossy().into_owned();
+                        result.resources.push(RawResourceEvidence {
+                            kind: ResourceKind::NamedPipe,
+                            key: path.clone(),
+                            owner_pid: pid,
+                            collection_method: ResourceCollectionMethod::ProcFd,
+                            state: ResourceState::Active,
+                            details: ResourceDetails::Generic {
+                                description: format!("fifo:{path}"),
+                            },
+                            observed_at: now.clone(),
+                        });
+                    }
+                }
+                if observed.len() != metadata_candidates.len() {
+                    result
+                        .unavailable
+                        .push("fd_ipc_metadata_incomplete".to_string());
+                }
+            }
+            Ok(output) => result.unavailable.push(format!(
+                "fd_ipc_metadata_unavailable: exit={:?}, timed_out={}, truncated={}",
+                output.exit_code, output.timed_out, output.truncated
+            )),
+            Err(error) => result
+                .unavailable
+                .push(format!("fd_ipc_metadata_unavailable: {error}")),
+        }
+    }
+    result.unavailable.sort();
+    result.unavailable.dedup();
+    result
 }
 
 #[cfg(test)]
@@ -430,5 +543,90 @@ mod tests {
         let pid = std::process::id();
         let resources = collect_fd_ipc_resources(pid);
         assert!(resources.iter().all(|r| r.owner_pid == pid));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_named_fifo_is_detected_without_opening_its_path() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        struct OwnedChild(Option<std::process::Child>);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                if let Some(child) = self.0.take() {
+                    super::super::tool_runner::terminate_owned_child(child);
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("work.pipe");
+        let moved = dir.path().join("held.pipe");
+        let path_c = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the fixture owns this new path and supplies a valid C string.
+        assert_eq!(unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) }, 0);
+        let fifo = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+            .unwrap();
+        let mut holder = OwnedChild(Some(
+            Command::new("sleep")
+                .arg("30")
+                .stdin(Stdio::from(fifo))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        ));
+        let pid = holder.0.as_ref().unwrap().id();
+        std::fs::rename(&path, &moved).unwrap();
+        std::fs::write(&path, "replacement regular file").unwrap();
+
+        let started = Instant::now();
+        let result = collect_fd_ipc_resources_with_diagnostics(pid);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(result.unavailable.is_empty(), "{:?}", result.unavailable);
+        let fifo = result
+            .resources
+            .iter()
+            .find(|item| item.kind == ResourceKind::NamedPipe)
+            .expect("held FIFO is positively identified");
+        assert_eq!(fifo.key, moved.to_string_lossy());
+        assert_eq!(fifo.state, ResourceState::Active);
+        assert_eq!(fifo.owner_pid, pid);
+
+        let exhausted =
+            super::super::tool_runner::ToolRunner::new(super::super::tool_runner::ToolConfig {
+                budget_ms: 0,
+                ..Default::default()
+            });
+        let unknown = collect_fd_ipc_resources_with_runner(pid, &exhausted);
+        assert!(unknown.resources.is_empty());
+        assert!(
+            unknown
+                .unavailable
+                .iter()
+                .any(|reason| reason.contains("budget")),
+            "{:?}",
+            unknown.unavailable
+        );
+        assert!(holder.0.as_mut().unwrap().try_wait().unwrap().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unavailable_descriptor_directory_is_reported_as_unknown() {
+        let result = collect_fd_ipc_resources_with_diagnostics(u32::MAX);
+        assert!(result.resources.is_empty());
+        assert!(result
+            .unavailable
+            .iter()
+            .any(|reason| reason.starts_with("fd_ipc_directory:")));
     }
 }
