@@ -69,8 +69,8 @@ pub use deep_scan::{
 #[cfg(target_os = "linux")]
 pub use network::{
     collect_network_info, parse_proc_net_tcp, parse_proc_net_udp, parse_proc_net_unix, ListenPort,
-    NetworkInfo, NetworkSnapshot, SocketCounts, TcpConnection, TcpState, UdpSocket, UnixSocket,
-    UnixSocketState, UnixSocketType,
+    NetworkInfo, NetworkObservation, NetworkSnapshot, SocketCounts, TcpConnection, TcpState,
+    UdpSocket, UnixSocket, UnixSocketState, UnixSocketType,
 };
 #[cfg(target_os = "linux")]
 pub use prober::{ProbeResult, Prober, ProberConfig};
@@ -172,7 +172,8 @@ pub use lineage_collector::collect_lineage_for_pid;
 pub use network_resource_collector::{
     collect_fd_ipc_resources, collect_fd_ipc_resources_with_diagnostics,
     collect_listener_resources, collect_listener_resources_from,
-    collect_listener_resources_from_checked, detect_listener_conflicts, FdIpcResources,
+    collect_listener_resources_from_checked, collect_listener_resources_with_diagnostics,
+    detect_listener_conflicts, FdIpcResources, ListenerResources,
 };
 
 // Re-export workspace resolver types

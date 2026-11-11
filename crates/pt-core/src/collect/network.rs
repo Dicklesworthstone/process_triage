@@ -62,6 +62,15 @@ pub struct NetworkInfo {
     pub unix_sockets: Vec<UnixSocket>,
 }
 
+/// Identity-validated positive observations and explicit attribution gaps.
+/// Unmatched descriptors never establish that no listeners exist, and must not
+/// erase listeners that were resolved in the same stable process/namespace.
+#[derive(Debug, Clone)]
+pub struct NetworkObservation {
+    pub info: NetworkInfo,
+    pub unavailable: Vec<String>,
+}
+
 impl NetworkInfo {
     /// Total receive queue depth across all TCP connections (bytes).
     ///
@@ -135,23 +144,38 @@ impl NetworkSnapshot {
     /// Get complete network evidence, retaining diagnostics for inaccessible,
     /// truncated, unclassified or changing observations.
     pub fn get_process_info_checked(&self, pid: u32) -> std::io::Result<NetworkInfo> {
+        let observation = self.observe_process(pid)?;
+        if let Some(reason) = observation.unavailable.first() {
+            return Err(invalid_network(reason));
+        }
+        Ok(observation.info)
+    }
+
+    /// Retain known sockets alongside unmatched-inode diagnostics. Namespace,
+    /// process incarnation and the complete descriptor set are revalidated
+    /// before exposing any result, including a partial one. Unreadable or
+    /// malformed tables and changing process scopes remain errors.
+    pub fn observe_process(&self, pid: u32) -> std::io::Result<NetworkObservation> {
         let process_dir = self.proc_root.join(pid.to_string());
         let before = read_network_process_identity(&process_dir, pid)?;
         let namespace_handle = fs::File::open(process_dir.join("ns/net"))?;
         let namespace = NetworkNamespace::from_metadata(&namespace_handle.metadata()?);
         let socket_inodes = get_process_socket_inodes_from(&process_dir.join("fd"), 50_000)?;
-        let mut info = NetworkInfo {
-            namespace: Some(namespace),
-            ..NetworkInfo::default()
+        let mut observation = NetworkObservation {
+            info: NetworkInfo {
+                namespace: Some(namespace),
+                ..NetworkInfo::default()
+            },
+            unavailable: Vec::new(),
         };
 
         if !socket_inodes.is_empty() {
             let tables = self.tables_for(&process_dir, namespace, namespace_handle)?;
-            info = tables.process_info(&socket_inodes, namespace)?;
+            observation = tables.process_observation(&socket_inodes, namespace);
         }
 
         revalidate_network_observation(&process_dir, pid, namespace, before, &socket_inodes)?;
-        Ok(info)
+        Ok(observation)
     }
 
     /// Get complete evidence, or `None` when its coverage cannot be established.
@@ -320,15 +344,16 @@ impl NetworkTables {
         Ok(tables)
     }
 
-    fn process_info(
+    fn process_observation(
         &self,
         socket_inodes: &HashSet<u64>,
         namespace: NetworkNamespace,
-    ) -> std::io::Result<NetworkInfo> {
+    ) -> NetworkObservation {
         let mut info = NetworkInfo {
             namespace: Some(namespace),
             ..NetworkInfo::default()
         };
+        let mut unmatched = Vec::new();
 
         for &inode in socket_inodes {
             // Check TCP
@@ -395,16 +420,31 @@ impl NetworkTables {
                 info.socket_counts.raw += 1;
                 continue;
             }
-            return Err(invalid_network(&format!(
-                "socket inode {inode} is absent from the namespace snapshot; its protocol, namespace or creation time is unknown"
-            )));
+            unmatched.push(inode);
         }
 
         info.tcp_connections.sort_by_key(|socket| socket.inode);
         info.udp_sockets.sort_by_key(|socket| socket.inode);
         info.unix_sockets.sort_by_key(|socket| socket.inode);
         info.listen_ports.sort_by_key(|socket| socket.inode);
-        Ok(info)
+        // Descriptor inventories are bounded, but diagnostic ledgers must not
+        // grow by one message for every unresolved socket in a large process.
+        let mut unavailable = Vec::new();
+        if !unmatched.is_empty() {
+            unmatched.sort_unstable();
+            let sample = unmatched
+                .iter()
+                .take(8)
+                .map(|inode| format!("socket inode {inode}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            unavailable.push(format!(
+                "{} socket inode(s) are absent from the namespace snapshot ({sample}{}); their protocol, namespace or creation time is unknown",
+                unmatched.len(),
+                if unmatched.len() > 8 { ", ..." } else { "" },
+            ));
+        }
+        NetworkObservation { info, unavailable }
     }
 }
 
@@ -1161,6 +1201,134 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_observation_preserves_cached_listener_with_unknown_sockets() {
+        let root = tempfile::tempdir().unwrap();
+        let namespace = root.path().join("namespace");
+        fs::write(&namespace, "namespace").unwrap();
+        let dir = fixture_process(root.path(), 100, &namespace, 42, 8080);
+        let snapshot = NetworkSnapshot {
+            proc_root: root.path().to_path_buf(),
+            ..NetworkSnapshot::default()
+        };
+        let complete = snapshot.observe_process(100).unwrap();
+        assert!(complete.unavailable.is_empty());
+        assert_eq!(complete.info.listen_ports[0].inode, 42);
+
+        // The namespace table is already cached. Later sockets do not erase
+        // the known listener, and their missing attribution remains explicit.
+        for inode in 43..55 {
+            std::os::unix::fs::symlink(
+                format!("socket:[{inode}]"),
+                dir.join(format!("fd/{inode}")),
+            )
+            .unwrap();
+        }
+        let partial = snapshot.observe_process(100).unwrap();
+        assert_eq!(partial.info.namespace, complete.info.namespace);
+        assert_eq!(partial.info.socket_counts.tcp, 1);
+        assert_eq!(partial.info.listen_ports.len(), 1);
+        assert_eq!(partial.info.listen_ports[0].inode, 42);
+        assert_eq!(partial.info.listen_ports[0].port, 8080);
+        assert_eq!(partial.unavailable.len(), 1);
+        let reason = &partial.unavailable[0];
+        assert!(reason.contains("12 socket inode(s)"), "{reason}");
+        assert!(reason.contains("socket inode 43"), "{reason}");
+        assert!(reason.contains("socket inode 50"), "{reason}");
+        assert!(!reason.contains("socket inode 51"), "{reason}");
+        assert!(reason.len() < 512, "diagnostics must remain bounded");
+        assert_eq!(
+            snapshot.observe_process(100).unwrap().unavailable,
+            partial.unavailable,
+            "diagnostics must not depend on hash iteration order"
+        );
+        assert!(snapshot.get_process_info_checked(100).is_err());
+        assert!(snapshot.get_process_info(100).is_none());
+
+        // A process whose only socket was created after the shared snapshot
+        // still has an incomplete observation, never a confirmed empty one.
+        fixture_process(root.path(), 101, &namespace, 99, 9090);
+        let unknown = snapshot.observe_process(101).unwrap();
+        assert!(unknown.info.listen_ports.is_empty());
+        assert_eq!(unknown.info.socket_counts.tcp, 0);
+        assert!(unknown.unavailable[0].contains("socket inode 99"));
+        assert!(snapshot.get_process_info_checked(101).is_err());
+    }
+
+    #[test]
+    fn partial_observation_refuses_identity_namespace_and_descriptor_changes() {
+        use std::ffi::CString;
+        use std::io::Write;
+        use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
+        use std::time::{Duration, Instant};
+
+        for changed in ["birth", "namespace", "descriptors"] {
+            let root = tempfile::tempdir().unwrap();
+            let namespace = root.path().join("namespace");
+            fs::write(&namespace, "namespace").unwrap();
+            let dir = fixture_process(root.path(), 100, &namespace, 42, 8080);
+            std::os::unix::fs::symlink("socket:[43]", dir.join("fd/4")).unwrap();
+            let tcp_path = dir.join("net/tcp");
+            let tcp_contents = fs::read_to_string(&tcp_path).unwrap();
+            fs::rename(&tcp_path, dir.join("net/original-tcp")).unwrap();
+            let fifo_path = CString::new(tcp_path.as_os_str().as_bytes()).unwrap();
+            // SAFETY: this fixture owns the new path and a valid C string.
+            assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+            let mutation_dir = dir.clone();
+            let writer = std::thread::spawn(move || {
+                let started = Instant::now();
+                let mut pipe = loop {
+                    match fs::OpenOptions::new()
+                        .write(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(&tcp_path)
+                    {
+                        Ok(pipe) => break pipe,
+                        Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                            assert!(started.elapsed() < Duration::from_secs(5));
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("owned FIFO fixture failed: {error}"),
+                    }
+                };
+                // Opening the FIFO writer proves table collection has begun,
+                // after the initial identity, namespace and FD observations.
+                match changed {
+                    "birth" => {
+                        let stat = mutation_dir.join("stat");
+                        let content = fs::read_to_string(&stat).unwrap();
+                        fs::write(stat, content.replace("12345", "23456")).unwrap();
+                    }
+                    "namespace" => {
+                        fs::rename(
+                            mutation_dir.join("ns/net"),
+                            mutation_dir.join("ns/original-net"),
+                        )
+                        .unwrap();
+                        fs::write(mutation_dir.join("ns/net"), "other namespace").unwrap();
+                    }
+                    "descriptors" => {
+                        std::os::unix::fs::symlink("socket:[44]", mutation_dir.join("fd/5"))
+                            .unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                pipe.write_all(tcp_contents.as_bytes()).unwrap();
+            });
+            let snapshot = NetworkSnapshot {
+                proc_root: root.path().to_path_buf(),
+                ..NetworkSnapshot::default()
+            };
+            let result = snapshot.observe_process(100);
+            writer.join().unwrap();
+            let error = result.expect_err("a partial result still requires stable live scope");
+            assert!(
+                error.to_string().contains("changed during collection"),
+                "{changed}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn descriptor_failures_and_inspection_limits_are_not_empty_observations() {
         let root = tempfile::tempdir().unwrap();
         assert!(get_process_socket_inodes_from(root.path(), 1)
@@ -1219,6 +1387,7 @@ mod tests {
             ..NetworkSnapshot::default()
         };
         assert!(snapshot.get_process_info_checked(100).is_err());
+        assert!(snapshot.observe_process(100).is_err());
         assert!(validate_inet_table(&format!("{tcp}truncated\n"), false).is_err());
         assert!(named_inode_table("Inode\n42\ninvalid\n").is_err());
     }
@@ -1265,6 +1434,7 @@ mod tests {
             ..NetworkSnapshot::default()
         };
         assert!(snapshot.get_process_info_checked(100).is_err());
+        assert!(snapshot.observe_process(100).is_err());
     }
 
     #[test]

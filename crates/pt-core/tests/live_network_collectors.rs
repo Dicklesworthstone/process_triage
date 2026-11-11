@@ -62,6 +62,7 @@ struct NamespaceListener {
     child: Child,
     pid: u32,
     port: u16,
+    events: std::sync::mpsc::Receiver<String>,
 }
 
 impl NamespaceListener {
@@ -76,6 +77,7 @@ impl NamespaceListener {
         } else {
             Command::new(executable)
         };
+        let (send, receive) = std::sync::mpsc::channel();
         let child = command
             .args([
                 "--exact",
@@ -93,19 +95,21 @@ impl NamespaceListener {
             child,
             pid: 0,
             port: 0,
+            events: receive,
         };
         let stdout = owned.child.stdout.take().unwrap();
-        let (send, receive) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
                 if let Some(ready) = line.strip_prefix("PT_NETWORK_READY ") {
-                    let _ = send.send(ready.to_string());
-                    break;
+                    if send.send(ready.to_string()).is_err() {
+                        break;
+                    }
                 }
             }
         });
-        let ready = receive
+        let ready = owned
+            .events
             .recv_timeout(Duration::from_secs(10))
             .expect("owned listener becomes ready within a bounded interval");
         let mut fields = ready.split_whitespace();
@@ -113,6 +117,24 @@ impl NamespaceListener {
         owned.port = fields.next().unwrap().parse().unwrap();
         assert!(fields.next().is_none());
         owned
+    }
+
+    fn add_listener(&mut self) -> u16 {
+        self.child
+            .stdin
+            .as_mut()
+            .expect("owned child command pipe")
+            .write_all(b"add_listener\n")
+            .expect("request another owned listener");
+        let ready = self
+            .events
+            .recv_timeout(Duration::from_secs(10))
+            .expect("new owned listener becomes ready within a bounded interval");
+        let mut fields = ready.split_whitespace();
+        assert_eq!(fields.next().unwrap().parse::<u32>().unwrap(), self.pid);
+        let port = fields.next().unwrap().parse().unwrap();
+        assert!(fields.next().is_none());
+        port
     }
 }
 
@@ -138,9 +160,140 @@ fn namespace_listener_child() {
         listener.local_addr().unwrap().port()
     );
     std::io::stdout().flush().unwrap();
-    let mut release = String::new();
-    std::io::stdin().read_line(&mut release).unwrap();
-    drop(listener);
+    let mut listeners = vec![listener];
+    let stdin = std::io::stdin();
+    for command in stdin.lock().lines() {
+        if command.unwrap() != "add_listener" {
+            break;
+        }
+        let listener = std::net::TcpListener::bind(("0.0.0.0", 0))
+            .expect("create another listener in the same owned process");
+        println!(
+            "\nPT_NETWORK_READY {} {}",
+            std::process::id(),
+            listener.local_addr().unwrap().port()
+        );
+        std::io::stdout().flush().unwrap();
+        listeners.push(listener);
+    }
+    drop(listeners);
+}
+
+#[test]
+fn live_cached_network_preserves_listener_when_new_socket_is_unattributed() {
+    if skip_if_proc_unavailable() {
+        return;
+    }
+    let mut target = NamespaceListener::spawn(false, 0);
+    assert_eq!(target.pid, target.child.id());
+    let before = pt_core::collect::proc_parsers::read_required_proc_stat(target.pid)
+        .expect("owned child birth identity");
+    let snapshot = NetworkSnapshot::collect();
+    let complete = snapshot
+        .get_process_info_checked(target.pid)
+        .expect("first socket inventory is complete");
+    let original = complete
+        .listen_ports
+        .iter()
+        .find(|socket| socket.port == target.port)
+        .expect("initial owned listener");
+    let mut impact = pt_core::inference::ImpactScorer::new();
+    impact
+        .populate_caches()
+        .expect("populate scan-scoped impact cache");
+    let initial_impact = impact.score(target.pid);
+    assert_eq!(
+        initial_impact.components.listen_ports_count,
+        complete.listen_ports.len()
+    );
+    assert!(!initial_impact
+        .components
+        .missing_data
+        .contains(&pt_core::inference::MissingDataSource::Network));
+
+    let later_port = target.add_listener();
+    assert_ne!(later_port, target.port);
+    let partial = snapshot
+        .observe_process(target.pid)
+        .expect("stable partial observation retains known sockets");
+    assert_eq!(partial.info.namespace, complete.namespace);
+    assert!(partial
+        .info
+        .listen_ports
+        .iter()
+        .any(|socket| { socket.inode == original.inode && socket.port == target.port }));
+    assert!(!partial
+        .info
+        .listen_ports
+        .iter()
+        .any(|socket| socket.port == later_port));
+    assert_eq!(partial.unavailable.len(), 1);
+    assert!(partial.unavailable[0].contains("1 socket inode(s)"));
+    assert!(snapshot.get_process_info_checked(target.pid).is_err());
+    assert!(snapshot.get_process_info(target.pid).is_none());
+    let partial_impact = impact.score(target.pid);
+    assert_eq!(
+        partial_impact.components.listen_ports_count,
+        initial_impact.components.listen_ports_count
+    );
+    assert!(partial_impact
+        .components
+        .missing_data
+        .contains(&pt_core::inference::MissingDataSource::Network));
+    assert!(partial_impact.elevated_due_to_missing_data);
+
+    let observed =
+        pt_core::collect::collect_listener_resources_with_diagnostics(target.pid, &snapshot)
+            .expect("resource collection retains the partial observation");
+    assert!(!observed.unavailable.is_empty());
+    assert!(observed.resources.iter().any(|resource| {
+        resource.owner_pid == target.pid
+            && resource.state == pt_common::ResourceState::Active
+            && matches!(resource.details, pt_common::ResourceDetails::Listener { port, .. } if port == target.port)
+    }));
+    let bundle = pt_core::scoring::ProvenanceInferenceBundle {
+        resource_graph: pt_core::collect::SharedResourceGraph::from_evidence(&[(
+            target.pid,
+            observed.resources,
+        )]),
+        network_errors: std::collections::HashMap::from([(
+            target.pid,
+            observed.unavailable.join("; "),
+        )]),
+        ..Default::default()
+    };
+    let adjustment = pt_core::scoring::derive_provenance_adjustment(target.pid, &bundle);
+    assert!(adjustment
+        .evidence_terms
+        .iter()
+        .any(|term| term.feature == "provenance_active_listener"));
+    assert!(!adjustment
+        .evidence_terms
+        .iter()
+        .any(|term| term.feature == "provenance_blast_radius_low"));
+    assert!(adjustment
+        .confidence_notes
+        .iter()
+        .any(|note| note.contains("socket inode")));
+
+    let fresh = NetworkSnapshot::collect()
+        .get_process_info_checked(target.pid)
+        .expect("a fresh namespace snapshot observes both real listeners");
+    assert_eq!(fresh.namespace, complete.namespace);
+    assert!(fresh
+        .listen_ports
+        .iter()
+        .any(|socket| socket.port == target.port));
+    let later = fresh
+        .listen_ports
+        .iter()
+        .find(|socket| socket.port == later_port)
+        .expect("new real listener exists in a fresh scan");
+    assert!(partial.unavailable[0].contains(&format!("socket inode {}", later.inode)));
+    let after = pt_core::collect::proc_parsers::read_required_proc_stat(target.pid)
+        .expect("same owned child remains observable");
+    assert_eq!(after.starttime, before.starttime);
+    assert!(target.child.try_wait().unwrap().is_none());
 }
 
 #[test]

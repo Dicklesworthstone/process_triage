@@ -43,6 +43,37 @@ pub fn collect_listener_resources_from_checked(
         .and_then(|info| listener_resources_from_info(pid, &info))
 }
 
+/// Known listeners and sockets remain useful even when another descriptor was
+/// not present in the scan's namespace snapshot. Callers must retain the
+/// accompanying caveats before reasoning about absent dependencies.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default)]
+pub struct ListenerResources {
+    pub resources: Vec<RawResourceEvidence>,
+    pub unavailable: Vec<String>,
+}
+
+/// Preserve validated positive resource observations and attribution gaps.
+/// Identity changes, inaccessible descriptors and invalid tables remain errors.
+#[cfg(target_os = "linux")]
+pub fn collect_listener_resources_with_diagnostics(
+    pid: u32,
+    snapshot: &super::network::NetworkSnapshot,
+) -> std::io::Result<ListenerResources> {
+    listener_resources_from_observation(pid, snapshot.observe_process(pid)?)
+}
+
+#[cfg(target_os = "linux")]
+fn listener_resources_from_observation(
+    pid: u32,
+    observation: super::network::NetworkObservation,
+) -> std::io::Result<ListenerResources> {
+    Ok(ListenerResources {
+        resources: listener_resources_from_info(pid, &observation.info)?,
+        unavailable: observation.unavailable,
+    })
+}
+
 #[cfg(target_os = "linux")]
 fn listener_resources_from_info(
     pid: u32,
@@ -343,6 +374,61 @@ pub(crate) fn collect_fd_ipc_resources_with_runner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_network_observation_keeps_known_resources_and_caveats_together() {
+        use super::super::network::{
+            ListenPort, NetworkInfo, NetworkNamespace, NetworkObservation,
+        };
+        let namespace = NetworkNamespace {
+            device: 4,
+            inode: 100,
+        };
+        let reason = "socket inode 43 is absent from the namespace snapshot";
+        let observed = NetworkObservation {
+            info: NetworkInfo {
+                namespace: Some(namespace),
+                listen_ports: vec![ListenPort {
+                    protocol: "tcp".into(),
+                    port: 8080,
+                    address: "0.0.0.0".into(),
+                    inode: 42,
+                }],
+                ..Default::default()
+            },
+            unavailable: vec![reason.into()],
+        };
+        let collected = listener_resources_from_observation(100, observed).unwrap();
+        assert_eq!(collected.resources.len(), 1);
+        assert_eq!(
+            collected.resources[0].key,
+            namespace.resource_key("tcp:0.0.0.0:8080")
+        );
+        assert_eq!(collected.resources[0].state, ResourceState::Active);
+        assert_eq!(collected.unavailable, vec![reason]);
+
+        let unknown = listener_resources_from_observation(
+            100,
+            NetworkObservation {
+                info: NetworkInfo {
+                    namespace: Some(namespace),
+                    ..Default::default()
+                },
+                unavailable: vec![reason.into()],
+            },
+        )
+        .unwrap();
+        assert!(unknown.resources.is_empty());
+        assert_eq!(unknown.unavailable, vec![reason]);
+        assert!(listener_resources_from_observation(
+            100,
+            NetworkObservation {
+                info: NetworkInfo::default(),
+                unavailable: vec![reason.into()],
+            }
+        )
+        .is_err());
+    }
 
     #[test]
     fn listener_and_abstract_socket_keys_are_scoped_by_observed_namespace() {

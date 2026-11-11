@@ -37,7 +37,7 @@
 //! ```
 
 use crate::collect::{
-    collect_network_info, parse_fd, CriticalFileCategory, FdInfo, NetworkInfo, NetworkSnapshot,
+    parse_fd, CriticalFileCategory, FdInfo, NetworkInfo, NetworkObservation, NetworkSnapshot,
 };
 use crate::supervision::{detect_supervision, CombinedResult, SupervisorCategory};
 use serde::{Deserialize, Serialize};
@@ -480,27 +480,22 @@ impl ImpactScorer {
 
         // Collect network information
         #[cfg(target_os = "linux")]
-        let network_info_opt = if let Some(snapshot) = &self.network_snapshot {
-            snapshot.get_process_info(pid)
+        let network_observation = if let Some(snapshot) = &self.network_snapshot {
+            snapshot.observe_process(pid).ok()
         } else {
-            collect_network_info(pid)
+            NetworkSnapshot::collect().observe_process(pid).ok()
         };
 
         #[cfg(not(target_os = "linux"))]
-        let network_info_opt: Option<NetworkInfo> = None;
+        let network_observation: Option<NetworkObservation> = None;
 
-        let network_score = match network_info_opt {
-            Some(net_info) => {
-                let (score, listen, established) = self.score_network(&net_info);
-                components.listen_ports_count = listen;
-                components.established_conns_count = established;
-                score
-            }
-            None => {
-                missing_data.push(MissingDataSource::Network);
-                self.config.missing_data_penalty
-            }
-        };
+        let (network_score, listen, established, incomplete) =
+            self.score_network_observation(network_observation.as_ref());
+        components.listen_ports_count = listen;
+        components.established_conns_count = established;
+        if incomplete {
+            missing_data.push(MissingDataSource::Network);
+        }
 
         // Collect file descriptor information
         let fd_score = match parse_fd(pid) {
@@ -581,6 +576,29 @@ impl ImpactScorer {
             explanation,
             elevated_due_to_missing_data: elevated,
         }
+    }
+
+    /// Missing attribution cannot lower the risk implied by known sockets.
+    /// Counts remain observed lower bounds and missing coverage stays explicit.
+    fn score_network_observation(
+        &self,
+        observation: Option<&NetworkObservation>,
+    ) -> (f64, usize, usize, bool) {
+        let Some(observation) = observation else {
+            return (self.config.missing_data_penalty, 0, 0, true);
+        };
+        let (score, listen, established) = self.score_network(&observation.info);
+        let incomplete = !observation.unavailable.is_empty();
+        (
+            if incomplete {
+                score.max(self.config.missing_data_penalty)
+            } else {
+                score
+            },
+            listen,
+            established,
+            incomplete,
+        )
     }
 
     /// Score network-related impact.
@@ -933,6 +951,50 @@ mod tests {
         assert_eq!(score, 0.0);
         assert_eq!(listen, 0);
         assert_eq!(established, 0);
+    }
+
+    #[test]
+    fn partial_network_evidence_never_lowers_known_impact_or_erases_counts() {
+        let scorer = ImpactScorer::new();
+        let mut observed = NetworkObservation {
+            info: NetworkInfo {
+                listen_ports: (0..10)
+                    .map(|index| crate::collect::ListenPort {
+                        protocol: "tcp".into(),
+                        port: 8000 + index,
+                        address: "0.0.0.0".into(),
+                        inode: u64::from(index) + 42,
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            unavailable: Vec::new(),
+        };
+        let complete = scorer.score_network_observation(Some(&observed));
+        assert!(complete.0 > scorer.config.missing_data_penalty);
+        assert_eq!(complete.1, 10);
+        assert!(!complete.3);
+
+        observed
+            .unavailable
+            .push("one socket was created after the snapshot".into());
+        let partial = scorer.score_network_observation(Some(&observed));
+        assert_eq!(partial.0, complete.0);
+        assert_eq!((partial.1, partial.2), (complete.1, complete.2));
+        assert!(
+            partial.3,
+            "positive evidence does not make coverage complete"
+        );
+
+        observed.info = NetworkInfo::default();
+        let unknown = scorer.score_network_observation(Some(&observed));
+        assert_eq!(unknown, (scorer.config.missing_data_penalty, 0, 0, true));
+        assert_eq!(scorer.score_network_observation(None), unknown);
+        observed.unavailable.clear();
+        assert_eq!(
+            scorer.score_network_observation(Some(&observed)),
+            (0.0, 0, 0, false)
+        );
     }
 
     #[test]

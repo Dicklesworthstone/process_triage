@@ -924,7 +924,7 @@ mod provenance {
         collect_local_resource_evidence_with_runner, resource_probe_runner,
     };
     use crate::collect::{
-        collect_lineage_for_pid, collect_listener_resources_from_checked,
+        collect_lineage_for_pid, collect_listener_resources_with_diagnostics,
         detect_listener_conflicts, parse_fd, NetworkSnapshot, ProcessRecord, SharedResourceGraph,
     };
     use crate::decision::{
@@ -1016,8 +1016,13 @@ mod provenance {
                 fd_info.as_ref(),
                 &resource_runner,
             );
-            match collect_listener_resources_from_checked(pid, &network_snapshot) {
-                Ok(network_resources) => resources.extend(network_resources),
+            match collect_listener_resources_with_diagnostics(pid, &network_snapshot) {
+                Ok(observed) => {
+                    resources.extend(observed.resources);
+                    if !observed.unavailable.is_empty() {
+                        network_errors.insert(pid, observed.unavailable.join("; "));
+                    }
+                }
                 Err(error) => {
                     network_errors.insert(pid, error.to_string());
                 }
