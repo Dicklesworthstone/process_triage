@@ -744,6 +744,54 @@ fn apply_with_args(
 }
 
 #[cfg(target_os = "linux")]
+fn recorded_action_command(
+    data_dir: &Path,
+    config_dir: &Path,
+    session: &str,
+    step: &str,
+    args: &[&str],
+) -> (Option<i32>, Value) {
+    let started = std::time::Instant::now();
+    let output = cargo_bin_cmd!("pt-core")
+        .timeout(Duration::from_secs(120))
+        .env("PT_SKIP_GLOBAL_LOCK", "1")
+        .env("PROCESS_TRIAGE_DATA", data_dir)
+        .env("PROCESS_TRIAGE_CONFIG", config_dir)
+        .env("PROCESS_TRIAGE_RETENTION", "off")
+        .args(args)
+        .output()
+        .expect("run actual action history command");
+    let log_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/test-logs/e2e/agent_apply")
+        .join(session)
+        .join(step);
+    fs::create_dir_all(&log_dir).unwrap();
+    fs::write(log_dir.join("stdout.json"), &output.stdout).unwrap();
+    fs::write(log_dir.join("stderr.jsonl"), &output.stderr).unwrap();
+    fs::write(
+        log_dir.join("step.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "command": "pt-core", "session_id": session, "args": args,
+                "exit_code": output.status.code(), "elapsed_ms": started.elapsed().as_millis(),
+                "stdout_sha256": pt_bundle::FileEntry::compute_checksum(&output.stdout),
+                "stderr_sha256": pt_bundle::FileEntry::compute_checksum(&output.stderr),
+            })
+        ),
+    )
+    .unwrap();
+    let document = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "{step}: {error}; stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        )
+    });
+    (output.status.code(), document)
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn agent_apply_rejects_unbound_memory_caps_before_prechecks_or_actions() {
     use pt_core::action::memory_cap::MemoryCapPlan;
@@ -3759,6 +3807,133 @@ fn agent_undo_renice_uses_saved_priorities_and_reports_restoration_truthfully() 
     }
 }
 
+/// A new CLI invocation can restore a SIGSTOP after the applying process exits.
+/// An existing stop belongs to its original operator and must never be resumed.
+#[cfg(target_os = "linux")]
+#[test]
+fn agent_undo_pause_preserves_original_job_control_and_execution_history() {
+    use pt_core::action::{ActionRunner, SignalActionRunner};
+    use pt_core::exit_codes::ExitCode;
+
+    for originally_stopped in [false, true] {
+        let data_dir = TempDir::new().unwrap().keep();
+        let config_dir = TempDir::new().unwrap().keep();
+        write_test_policy(&config_dir);
+        let victim = ForeignTarget::spawn("sleep 366");
+        let identity = live_identity(victim.pid);
+        let action = plan_action(Action::Pause, &identity);
+        let action_id = action.action_id.clone();
+        let target = format!("{}:{}", victim.pid, identity.start_id.0);
+        let external = SignalActionRunner::with_defaults();
+        if originally_stopped {
+            external.execute(&action).unwrap();
+            external.verify(&action).unwrap();
+        }
+        let session = session_with_plan(&data_dir, action.clone());
+        let (status, applied) = apply(&data_dir, &config_dir, &session, &target);
+        assert_eq!(status, "success", "{applied}");
+        assert_eq!(state_of(victim.pid), Some('T'));
+        let handle = SessionStore::at_data_dir(&data_dir)
+            .open(&SessionId::parse(&session).unwrap())
+            .unwrap();
+        let plan_bytes = fs::read(handle.dir.join("decision/plan.json")).unwrap();
+        let outcomes_bytes = fs::read(handle.dir.join("action/outcomes.jsonl")).unwrap();
+        let run = |step: &str, args: &[&str]| {
+            recorded_action_command(&data_dir, &config_dir, &session, step, args)
+        };
+        let undo_args = [
+            "--format",
+            "json",
+            "agent",
+            "undo",
+            "--session",
+            &session,
+            "--action-id",
+            &action_id,
+        ];
+        for (step, flags) in [
+            ("pause-undo-preview", vec![]),
+            ("pause-undo-dry-run", vec!["--confirm", "--dry-run"]),
+            ("pause-undo-shadow", vec!["--confirm", "--shadow"]),
+        ] {
+            let mut args = undo_args.to_vec();
+            args.extend(flags);
+            let (code, preview) = run(step, &args);
+            assert_eq!(code, Some(ExitCode::Clean.as_i32()), "{preview}");
+            assert_eq!(preview["status"], "preview", "{preview}");
+            assert_eq!(preview["records"].as_array().unwrap().len(), 1);
+            let receipt = &preview["records"][0];
+            assert_eq!(receipt["action"], "pause");
+            assert_eq!(receipt["target"], serde_json::to_value(&identity).unwrap());
+            assert_eq!(receipt["operation"]["kind"], "signal_stop");
+            assert_eq!(receipt["operation"]["was_stopped"], originally_stopped);
+            assert!(receipt["restorations"].as_array().unwrap().is_empty());
+            assert_eq!(state_of(victim.pid), Some('T'));
+        }
+
+        let mut restore_args = undo_args.to_vec();
+        restore_args.push("--confirm");
+        let (code, restored) = run("pause-undo-confirmed", &restore_args);
+        assert_eq!(code, Some(ExitCode::ActionsOk.as_i32()), "{restored}");
+        assert_eq!(restored["status"], "restored", "{restored}");
+        assert_eq!(restored["restoration"]["changed"], !originally_stopped);
+        assert_eq!(state_of(victim.pid) == Some('T'), originally_stopped);
+        assert!(victim.alive());
+        assert!(live_identity(victim.pid).matches(&identity));
+        let (code, repeated) = run("pause-undo-repeated", &restore_args);
+        assert_eq!(code, Some(ExitCode::ActionsOk.as_i32()), "{repeated}");
+        assert_eq!(repeated["restoration"]["changed"], false);
+
+        let (_, verified) = run(
+            "pause-verify-restored",
+            &["--format", "json", "agent", "verify", "--session", &session],
+        );
+        assert_eq!(
+            verified["action_outcomes"][0]["outcome"], "confirmed_restored",
+            "{verified}"
+        );
+        assert_eq!(
+            verified["action_outcomes"][0]["restoration"]["original_value"]["control"],
+            "job_control"
+        );
+        assert_eq!(
+            verified["action_outcomes"][0]["restoration"]["original_value"]["stopped"],
+            originally_stopped
+        );
+        assert_eq!(verified["restoration_summary"]["confirmed_restored"], 1);
+        assert!(verified["action_outcomes"][0]
+            .get("expected_resources_freed")
+            .is_none());
+
+        if !originally_stopped {
+            // Another actor's later stop must not inherit our old undo authority.
+            external.execute(&action).unwrap();
+            external.verify(&action).unwrap();
+            let (code, refused) = run("pause-undo-after-external-stop", &restore_args);
+            assert_eq!(code, Some(ExitCode::PartialFail.as_i32()), "{refused}");
+            assert_eq!(refused["status"], "failed", "{refused}");
+            assert_eq!(state_of(victim.pid), Some('T'));
+            let (_, verified) = run(
+                "pause-verify-changed-original",
+                &["--format", "json", "agent", "verify", "--session", &session],
+            );
+            assert_eq!(
+                verified["action_outcomes"][0]["outcome"], "restoration_unverified",
+                "{verified}"
+            );
+            assert_eq!(state_of(victim.pid), Some('T'));
+        }
+        assert_eq!(
+            fs::read(handle.dir.join("decision/plan.json")).unwrap(),
+            plan_bytes
+        );
+        assert_eq!(
+            fs::read(handle.dir.join("action/outcomes.jsonl")).unwrap(),
+            outcomes_bytes
+        );
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn agent_apply_records_and_replays_bound_resource_windows_without_inventing_rates() {
@@ -4426,8 +4601,52 @@ fn agent_apply_pauses_resumes_and_refuses_stale_or_protected_targets() {
     assert_eq!(restored_result["note"], "nothing_to_do");
     unchanged();
 
-    let s = session_with_plan(&data_dir, plan_action(Action::Resume, &identity));
-    let (status, json) = apply(&data_dir, &config_dir, &s, &target);
+    let resume_session = session_with_plan(&data_dir, plan_action(Action::Resume, &identity));
+    #[cfg(target_os = "linux")]
+    {
+        use pt_core::action::{ActionRunner, SignalActionRunner};
+
+        let (status, refused) = apply(&data_dir, &config_dir, &resume_session, &target);
+        assert_eq!(
+            status, "failed",
+            "active pause must retain its undo owner: {refused}"
+        );
+        assert!(
+            refused.to_string().contains("unresolved durable owner"),
+            "{refused}"
+        );
+        assert_eq!(state_of(pid), Some('T'));
+        let (code, restored) = recorded_action_command(
+            &data_dir,
+            &config_dir,
+            &s,
+            "pause-undo-before-explicit-resume",
+            &[
+                "--format",
+                "json",
+                "agent",
+                "undo",
+                "--session",
+                &s,
+                "--action-id",
+                &plan.actions[0].action_id,
+                "--confirm",
+            ],
+        );
+        assert_eq!(
+            code,
+            Some(pt_core::exit_codes::ExitCode::ActionsOk.as_i32()),
+            "{restored}"
+        );
+        assert_ne!(state_of(pid), Some('T'));
+        // The receipt has released ownership. An explicitly requested Resume
+        // still works for an independently stopped process with no active owner.
+        let external = SignalActionRunner::with_defaults();
+        let pause = plan_action(Action::Pause, &identity);
+        external.execute(&pause).unwrap();
+        external.verify(&pause).unwrap();
+    }
+    let (status, json) = apply(&data_dir, &config_dir, &resume_session, &target);
     assert_eq!(status, "success", "resume outcome: {json}");
     assert_eq!(json["outcomes"][0]["signal_path"], SIGNAL_PATH, "{json}");
     assert_ne!(state_of(pid), Some('T'), "child should run again");

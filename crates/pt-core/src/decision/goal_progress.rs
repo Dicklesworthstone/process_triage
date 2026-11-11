@@ -977,6 +977,7 @@ mod tests {
             total_cpu_frac: Some(0.8),
             occupied_ports: None,
             total_fds: None,
+            disk_space: None,
             timestamp: 1.0,
         };
         let after = MetricSnapshot {

@@ -1,4 +1,4 @@
-//! Durable, conditional undo for recorded cgroup-v2 and Linux renice actions.
+//! Durable, conditional undo for recorded cgroup-v2, renice and pause actions.
 //!
 //! A receipt is synchronized before a controller is changed. `Prepared` means
 //! that execution may or may not have reached the kernel; it is never a success
@@ -168,6 +168,15 @@ pub enum ReversalOperation {
         pid_namespace_device: u64,
         pid_namespace_inode: u64,
     },
+    /// A single process's job-control stop, never a process-group signal or
+    /// debugger stop. Undo may release a stop but never invent a new one.
+    SignalStop {
+        target: ProcessIdentity,
+        was_stopped: bool,
+        pid_namespace_device: u64,
+        pid_namespace_inode: u64,
+        verify_timeout_ms: u64,
+    },
     Unsupported {
         reason: String,
     },
@@ -184,6 +193,7 @@ pub enum RestorationValue {
     MemoryHigh { limit_bytes: Option<u64> },
     Cpuset { cpus: String },
     ThreadPriorities { threads: Vec<ReniceThreadReversal> },
+    JobControl { stopped: bool },
 }
 
 impl From<ReversalValue> for RestorationValue {
@@ -276,6 +286,9 @@ impl ReversalRecord {
             ));
         }
         if let ReversalOperation::CgroupV2 {
+            verify_timeout_ms, ..
+        }
+        | ReversalOperation::SignalStop {
             verify_timeout_ms, ..
         } = self.operation
         {
@@ -388,6 +401,7 @@ impl ReversalJournal {
                 | Action::CapMemory
                 | Action::Quarantine
                 | Action::Renice
+                | Action::Pause
         ) {
             return Ok(None);
         }
@@ -418,6 +432,9 @@ impl ReversalJournal {
             ReversalOperation::CgroupV2 { before, .. } => before.clone().into(),
             ReversalOperation::Renice { metadata, .. } => RestorationValue::ThreadPriorities {
                 threads: metadata.threads.clone(),
+            },
+            ReversalOperation::SignalStop { was_stopped, .. } => RestorationValue::JobControl {
+                stopped: *was_stopped,
             },
             ReversalOperation::Unsupported { .. } => {
                 return Err(failed("unsupported recorded restoration"))
@@ -572,6 +589,47 @@ impl ReversalJournal {
             journal: Arc::clone(self),
             attempt_id: record.attempt_id,
         })
+    }
+
+    /// Persist the original single-process job-control state before SIGSTOP.
+    /// The caller must still pin and revalidate the target immediately before
+    /// delivering the signal. A tracing stop is never a restorable pause.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn prepare_signal_stop(
+        self: &Arc<Self>,
+        action: &PlanAction,
+        was_stopped: bool,
+    ) -> Result<PreparedReversal, ActionError> {
+        self.ensure_signal_stop_unowned(&action.target)?;
+        let operation = signal_stop_operation(
+            &action.target,
+            was_stopped,
+            action.timeouts.verify_ms.min(MAX_RESTORE_VERIFY_MS),
+        )?;
+        if job_control_stopped(super::signal::signal_state(&action.target)?)? != was_stopped {
+            return Err(failed(
+                "job-control state changed before pause receipt preparation",
+            ));
+        }
+        let record = self.insert(action, operation, ReversalStatus::Prepared)?;
+        Ok(PreparedReversal {
+            journal: Arc::clone(self),
+            attempt_id: record.attempt_id,
+        })
+    }
+
+    /// Explicit Resume must not release a stop with unresolved durable recovery.
+    /// `agent undo` is the operation that restores and releases that ownership.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn ensure_signal_stop_unowned(
+        &self,
+        target: &ProcessIdentity,
+    ) -> Result<(), ActionError> {
+        refuse_other_session_owner(
+            &self.sessions_root,
+            &signal_stop_operation(target, false, 0)?,
+            None,
+        )
     }
 
     /// V1 actuation keeps its existing behavior but must never appear undoable.
@@ -928,6 +986,27 @@ fn validate_record(record: &ReversalRecord) -> Result<(), ActionError> {
                 ));
             }
         }
+        ReversalOperation::SignalStop {
+            target,
+            pid_namespace_inode,
+            verify_timeout_ms,
+            ..
+        } => {
+            let boot_id = target.start_id.0.split(':').next().unwrap_or_default();
+            validate_target(target, boot_id)?;
+            if record.action != Action::Pause
+                || record.routing != ActionRouting::Direct
+                || record.original_zombie_target.is_some()
+                || *target != record.target
+                || *pid_namespace_inode == 0
+                || *verify_timeout_ms > MAX_RESTORE_VERIFY_MS
+                || record.status == ReversalStatus::Unsupported
+            {
+                return Err(failed(
+                    "pause receipt does not match its action, target, namespace or deadline",
+                ));
+            }
+        }
         ReversalOperation::Unsupported { reason } => {
             if record.status != ReversalStatus::Unsupported || reason.is_empty() {
                 return Err(failed("malformed unsupported undo receipt"));
@@ -1037,7 +1116,9 @@ fn latest_recorded_restoration<'a>(
         || restored.status != RestorationStatus::Restored
         || !matches!(
             record.operation,
-            ReversalOperation::CgroupV2 { .. } | ReversalOperation::Renice { .. }
+            ReversalOperation::CgroupV2 { .. }
+                | ReversalOperation::Renice { .. }
+                | ReversalOperation::SignalStop { .. }
         )
     {
         return Err(failed(
@@ -1109,6 +1190,22 @@ fn operations_share_control(left: &ReversalOperation, right: &ReversalOperation)
                     .as_ref()
                     .zip(b.identity.as_ref())
                     .is_some_and(|(a, b)| a.matches(b))
+        }
+        (
+            ReversalOperation::SignalStop {
+                target: a,
+                pid_namespace_device: device_a,
+                pid_namespace_inode: inode_a,
+                ..
+            },
+            ReversalOperation::SignalStop {
+                target: b,
+                pid_namespace_device: device_b,
+                pid_namespace_inode: inode_b,
+                ..
+            },
+        ) => {
+            device_a == device_b && inode_a == inode_b && a.pid == b.pid && a.start_id == b.start_id
         }
         _ => false,
     }
@@ -1313,6 +1410,20 @@ pub(crate) fn ensure_renice_unowned(
             pid_namespace_device: namespace.dev(),
             pid_namespace_inode: namespace.ino(),
         },
+        None,
+    )
+}
+
+/// A mutable-plan caller may pause or resume a process only while no other
+/// session owns its job-control state. This scan is read-only.
+#[cfg(target_os = "linux")]
+pub(crate) fn ensure_signal_stop_unowned(
+    sessions_root: &Path,
+    target: &ProcessIdentity,
+) -> Result<(), ActionError> {
+    refuse_other_session_owner(
+        sessions_root,
+        &signal_stop_operation(target, false, 0)?,
         None,
     )
 }
@@ -1591,6 +1702,9 @@ fn restore_live(record: &ReversalRecord) -> Result<bool, ActionError> {
         validate_renice_scope(record)?;
         return Ok(changed);
     }
+    if matches!(record.operation, ReversalOperation::SignalStop { .. }) {
+        return restore_signal_stop(record);
+    }
     let ReversalOperation::CgroupV2 { scope, .. } = &record.operation else {
         return Err(failed("unsupported recorded undo operation"));
     };
@@ -1629,6 +1743,9 @@ fn observe_restored_control(record: &ReversalRecord) -> Result<(), ActionError> 
         validate_renice_scope(record)?;
         super::renice::ReniceActionRunner::with_defaults().observe_restored(metadata)?;
         return validate_renice_scope(record);
+    }
+    if let ReversalOperation::SignalStop { was_stopped, .. } = &record.operation {
+        return observe_original_signal_stop(record, *was_stopped);
     }
     let ReversalOperation::CgroupV2 { scope, before, .. } = &record.operation else {
         return Err(failed("unsupported recorded restoration"));
@@ -1703,6 +1820,188 @@ fn validate_renice_scope(record: &ReversalRecord) -> Result<(), ActionError> {
         ));
     }
     Ok(())
+}
+
+/// Only a kernel job-control stop is resumable. A debugger owns tracing stops,
+/// and exited or unobservable targets cannot establish a restored live state.
+#[cfg(target_os = "linux")]
+fn job_control_stopped(state: char) -> Result<bool, ActionError> {
+    match state {
+        'T' => Ok(true),
+        'R' | 'S' | 'D' | 'I' => Ok(false),
+        't' => Err(failed("pause undo refuses a debugger tracing stop")),
+        _ => Err(failed(
+            "pause undo requires an observable live process state",
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn signal_stop_operation(
+    target: &ProcessIdentity,
+    was_stopped: bool,
+    verify_timeout_ms: u64,
+) -> Result<ReversalOperation, ActionError> {
+    ensure_signal_stop_target(target)?;
+    let namespace = fs::metadata("/proc/self/ns/pid")
+        .map_err(|error| failed(format!("cannot bind pause PID namespace: {error}")))?;
+    Ok(ReversalOperation::SignalStop {
+        target: target.clone(),
+        was_stopped,
+        pid_namespace_device: namespace.dev(),
+        pid_namespace_inode: namespace.ino(),
+        verify_timeout_ms,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_signal_stop_target(target: &ProcessIdentity) -> Result<(), ActionError> {
+    super::signal::ensure_action_pid_namespace()?;
+    let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map_err(|error| failed(format!("cannot revalidate pause boot: {error}")))?;
+    validate_target(target, boot.trim())?;
+    // SAFETY: geteuid only reads the caller's effective credentials.
+    if target.uid != unsafe { libc::geteuid() } {
+        return Err(ActionError::PermissionDenied);
+    }
+    if crate::collect::protected::live_invoker_chain_pids().contains(&target.pid.0) {
+        return Err(failed(
+            "pause undo refuses the invoker and its ancestor chain",
+        ));
+    }
+    job_control_stopped(super::signal::signal_state(target)?)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_signal_stop_scope(record: &ReversalRecord) -> Result<(), ActionError> {
+    let ReversalOperation::SignalStop {
+        target,
+        pid_namespace_device,
+        pid_namespace_inode,
+        ..
+    } = &record.operation
+    else {
+        return Err(failed("receipt is not a signal pause operation"));
+    };
+    if *target != record.target {
+        return Err(failed(
+            "pause receipt target differs from its action binding",
+        ));
+    }
+    ensure_signal_stop_target(target)?;
+    let namespace = fs::metadata("/proc/self/ns/pid")
+        .map_err(|error| failed(format!("cannot revalidate pause PID namespace: {error}")))?;
+    if namespace.dev() != *pid_namespace_device || namespace.ino() != *pid_namespace_inode {
+        return Err(failed(
+            "pause PID namespace differs from the recorded namespace",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn observe_original_signal_stop(
+    record: &ReversalRecord,
+    was_stopped: bool,
+) -> Result<(), ActionError> {
+    for _ in 0..2 {
+        validate_signal_stop_scope(record)?;
+        if job_control_stopped(super::signal::signal_state(&record.target)?)? != was_stopped {
+            return Err(failed("original job-control state is not present"));
+        }
+    }
+    validate_signal_stop_scope(record)
+}
+
+#[cfg(target_os = "linux")]
+fn restore_signal_stop(record: &ReversalRecord) -> Result<bool, ActionError> {
+    let ReversalOperation::SignalStop {
+        was_stopped,
+        verify_timeout_ms,
+        ..
+    } = &record.operation
+    else {
+        return Err(failed("receipt is not a signal pause operation"));
+    };
+    let restored = record.is_restored();
+    restore_signal_stop_with(
+        *was_stopped,
+        restored,
+        Duration::from_millis(*verify_timeout_ms),
+        || {
+            validate_signal_stop_scope(record)?;
+            let state = super::signal::signal_state(&record.target)?;
+            validate_signal_stop_scope(record)?;
+            Ok(state)
+        },
+        || {
+            validate_signal_stop_scope(record)?;
+            if super::signal::signal_state(&record.target)? != 'T' {
+                return Err(failed("job-control stop changed before pause restoration"));
+            }
+            // No numeric-PID fallback: a replacement cannot inherit this signal.
+            super::signal::send_bound_signal(&record.target, libc::SIGCONT)
+        },
+    )
+}
+
+/// Keep the transition protocol testable without manufacturing a live process
+/// identity. The real callbacks validate the complete scope around observations
+/// and pin the delivery to the original process with a pidfd.
+#[cfg(target_os = "linux")]
+fn restore_signal_stop_with(
+    was_stopped: bool,
+    already_restored: bool,
+    timeout: Duration,
+    mut observe: impl FnMut() -> Result<char, ActionError>,
+    mut resume: impl FnMut() -> Result<(), ActionError>,
+) -> Result<bool, ActionError> {
+    let stopped = job_control_stopped(observe()?)?;
+    if already_restored || was_stopped {
+        if stopped != was_stopped || job_control_stopped(observe()?)? != was_stopped {
+            return Err(failed(
+                "original job-control state changed after pause restoration",
+            ));
+        }
+        return Ok(false);
+    }
+    if !stopped {
+        // A Prepared receipt can precede a pending SIGSTOP. Merely seeing a
+        // running process does not prove that the original stop was never sent.
+        return Err(failed(
+            "unresolved pause has no completed job-control stop; refusing to infer restoration",
+        ));
+    }
+    if timeout.is_zero() {
+        return Err(ActionError::Timeout);
+    }
+    if !job_control_stopped(observe()?)? {
+        return Err(failed("job-control stop changed before pause restoration"));
+    }
+    let started = std::time::Instant::now();
+    resume()?;
+    loop {
+        let state = observe()?;
+        if started.elapsed() >= timeout {
+            return Err(ActionError::Timeout);
+        }
+        if !job_control_stopped(state)? {
+            let confirmed = observe()?;
+            if started.elapsed() >= timeout {
+                return Err(ActionError::Timeout);
+            }
+            if !job_control_stopped(confirmed)? {
+                return Ok(true);
+            }
+            return Err(failed("job-control state changed during pause restoration"));
+        }
+        let remaining = timeout
+            .checked_sub(started.elapsed())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(ActionError::Timeout)?;
+        std::thread::sleep(remaining.min(Duration::from_millis(25)));
+    }
 }
 
 /// Read exact original values twice with scope guards surrounding each sample.
@@ -2049,6 +2348,278 @@ mod tests {
         }
     }
 
+    fn pause_operation(action: &PlanAction, was_stopped: bool) -> ReversalOperation {
+        ReversalOperation::SignalStop {
+            target: action.target.clone(),
+            was_stopped,
+            pid_namespace_device: 1,
+            pid_namespace_inode: 2,
+            verify_timeout_ms: action.timeouts.verify_ms.min(MAX_RESTORE_VERIFY_MS),
+        }
+    }
+
+    #[test]
+    fn pause_receipts_bind_the_exact_process_action_namespace_and_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = journal(temp.path());
+        let action = action(Action::Pause);
+        let record = journal
+            .insert(
+                &action,
+                pause_operation(&action, false),
+                ReversalStatus::Prepared,
+            )
+            .unwrap();
+        let encoded = serde_json::to_value(&record).unwrap();
+        assert_eq!(encoded["operation"]["kind"], "signal_stop");
+        assert_eq!(encoded["operation"]["was_stopped"], false);
+        assert_eq!(
+            journal.inspect(&action).unwrap()[0].attempt_id,
+            record.attempt_id
+        );
+        record.check_action(&action).unwrap();
+        for changed in [
+            "action",
+            "target",
+            "namespace",
+            "timeout",
+            "zombie",
+            "route",
+        ] {
+            let mut invalid = record.clone();
+            match changed {
+                "action" => invalid.action = Action::Resume,
+                "zombie" => invalid.original_zombie_target = Some(action.target.clone()),
+                "route" => invalid.routing = ActionRouting::ZombieToParent,
+                _ => {
+                    let ReversalOperation::SignalStop {
+                        target,
+                        pid_namespace_inode,
+                        verify_timeout_ms,
+                        ..
+                    } = &mut invalid.operation
+                    else {
+                        unreachable!()
+                    };
+                    match changed {
+                        "target" => target.uid += 1,
+                        "namespace" => *pid_namespace_inode = 0,
+                        _ => *verify_timeout_ms = MAX_RESTORE_VERIFY_MS + 1,
+                    }
+                }
+            }
+            assert!(validate_record(&invalid).is_err(), "{changed}");
+        }
+        let mut shortened = action.clone();
+        shortened.timeouts.verify_ms = 0;
+        assert!(record.check_action(&shortened).is_err());
+        assert!(
+            journal
+                .insert(
+                    &action,
+                    pause_operation(&action, true),
+                    ReversalStatus::Prepared,
+                )
+                .is_err(),
+            "an unresolved attempt cannot be overwritten"
+        );
+    }
+
+    #[test]
+    fn pause_ownership_follows_incarnation_even_after_group_or_owner_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = journal_in_sessions(temp.path(), "pause-first");
+        let second = journal_in_sessions(temp.path(), "pause-second");
+        let action = action(Action::Pause);
+        first
+            .insert(
+                &action,
+                pause_operation(&action, false),
+                ReversalStatus::Verified,
+            )
+            .unwrap();
+        for changed in ["same", "groups", "uid"] {
+            let mut next = action.clone();
+            next.action_id = format!("next-{changed}");
+            if changed == "groups" {
+                next.target.pgid = Some(999);
+                next.target.sid = Some(998);
+            } else if changed == "uid" {
+                next.target.uid += 1;
+            }
+            assert!(
+                second
+                    .insert(
+                        &next,
+                        pause_operation(&next, true),
+                        ReversalStatus::Prepared
+                    )
+                    .is_err(),
+                "{changed}"
+            );
+        }
+        let mut replacement = action.clone();
+        replacement.target.start_id = pt_common::StartId::from_linux(BOOT, 789, 123);
+        assert!(
+            second
+                .insert(
+                    &replacement,
+                    pause_operation(&replacement, false),
+                    ReversalStatus::Prepared,
+                )
+                .is_ok(),
+            "a genuinely different incarnation does not inherit the old stop"
+        );
+    }
+
+    #[test]
+    fn pause_restore_requires_completed_job_control_stop_before_any_signal() {
+        for state in ['R', 'S', 'D', 'I', 't', 'Z', 'X', '?'] {
+            let sent = Cell::new(0);
+            let result = restore_signal_stop_with(
+                false,
+                false,
+                Duration::from_millis(10),
+                || Ok(state),
+                || {
+                    sent.set(sent.get() + 1);
+                    Ok(())
+                },
+            );
+            assert!(result.is_err(), "{state}");
+            assert_eq!(sent.get(), 0, "{state}");
+        }
+        let sent = Cell::new(false);
+        assert!(restore_signal_stop_with(
+            false,
+            false,
+            Duration::ZERO,
+            || Ok('T'),
+            || {
+                sent.set(true);
+                Ok(())
+            },
+        )
+        .is_err());
+        assert!(!sent.get());
+        let mut samples = ['T', 'S'].into_iter();
+        assert!(restore_signal_stop_with(
+            false,
+            false,
+            Duration::from_millis(10),
+            || Ok(samples.next().expect("two pre-signal observations")),
+            || panic!("a changed stop must not receive SIGCONT"),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn pause_restore_releases_once_and_preserves_original_job_control_stops() {
+        let state = Cell::new('T');
+        let sent = Cell::new(0);
+        let changed = restore_signal_stop_with(
+            false,
+            false,
+            Duration::from_secs(1),
+            || Ok(state.get()),
+            || {
+                sent.set(sent.get() + 1);
+                state.set('S');
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(changed);
+        assert_eq!(sent.get(), 1);
+        assert!(!restore_signal_stop_with(
+            false,
+            true,
+            Duration::from_millis(10),
+            || Ok('S'),
+            || panic!("a completed receipt must never signal again"),
+        )
+        .unwrap());
+        assert!(restore_signal_stop_with(
+            false,
+            true,
+            Duration::from_millis(10),
+            || Ok('T'),
+            || panic!("an external later stop belongs to its new controller"),
+        )
+        .is_err());
+        for completed in [false, true] {
+            assert!(!restore_signal_stop_with(
+                true,
+                completed,
+                Duration::ZERO,
+                || Ok('T'),
+                || panic!("never resume a process that was already stopped"),
+            )
+            .unwrap());
+            assert!(restore_signal_stop_with(
+                true,
+                completed,
+                Duration::from_millis(10),
+                || Ok('S'),
+                || panic!("undo cannot recreate somebody else's original stop"),
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn pause_restore_never_claims_observation_after_its_deadline() {
+        let resumed = Cell::new(false);
+        let result = restore_signal_stop_with(
+            false,
+            false,
+            Duration::from_millis(1),
+            || {
+                if resumed.get() {
+                    std::thread::sleep(Duration::from_millis(2));
+                    Ok('S')
+                } else {
+                    Ok('T')
+                }
+            },
+            || {
+                resumed.set(true);
+                Ok(())
+            },
+        );
+        assert!(resumed.get());
+        assert!(matches!(result, Err(ActionError::Timeout)));
+    }
+
+    #[test]
+    fn pause_restore_reports_post_signal_identity_loss_tracing_and_timeout() {
+        for failure in ["identity", "gone", "tracing", "timeout"] {
+            let sent = Cell::new(false);
+            let result = restore_signal_stop_with(
+                false,
+                false,
+                Duration::from_millis(1),
+                || {
+                    if !sent.get() {
+                        return Ok('T');
+                    }
+                    match failure {
+                        "identity" => Err(ActionError::IdentityMismatch),
+                        "gone" => Err(ActionError::ProcessNotFound),
+                        "tracing" => Ok('t'),
+                        _ => Ok('T'),
+                    }
+                },
+                || {
+                    sent.set(true);
+                    Ok(())
+                },
+            );
+            assert!(sent.get(), "{failure}");
+            assert!(result.is_err(), "{failure}");
+        }
+    }
+
     #[test]
     fn memory_high_receipts_bind_the_exact_reviewed_limit_and_scope() {
         let temp = tempfile::tempdir().unwrap();
@@ -2311,6 +2882,201 @@ mod tests {
         action.target = super::super::dispatch::read_cgroup_identity(child.0.id())
             .expect("owned process full Linux identity");
         (child, action)
+    }
+
+    #[test]
+    fn durable_pause_owned_child_survives_runner_exit_and_undo_is_not_reusable() {
+        use crate::action::{ActionRunner, SignalActionRunner};
+        let (_child, mut action) = owned_renice_target();
+        action.action = Action::Pause;
+        let directory = tempfile::tempdir().unwrap();
+        let journal = journal(directory.path());
+        {
+            let runner =
+                SignalActionRunner::with_defaults().with_reversal_journal(Arc::clone(&journal));
+            runner.execute(&action).unwrap();
+            runner.verify(&action).unwrap();
+        }
+        assert_eq!(
+            super::super::signal::signal_state(&action.target).unwrap(),
+            'T'
+        );
+        let records = journal.inspect(&action).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, ReversalStatus::Verified);
+        assert!(matches!(
+            records[0].operation,
+            ReversalOperation::SignalStop {
+                was_stopped: false,
+                ..
+            }
+        ));
+        // Construct a fresh journal as a later CLI invocation does; no runner
+        // memory supplies the original state or authorizes the restoration.
+        let reopened = ReversalJournal::new(
+            journal.directory().parent().unwrap(),
+            &journal.session_id,
+            &journal.plan_sha256,
+            &journal.sessions_root,
+        )
+        .unwrap();
+        let restored = reopened.restore(&action, None).unwrap();
+        assert_eq!(restored.status, RestorationStatus::Restored);
+        assert_eq!(restored.changed, Some(true));
+        assert!(
+            !job_control_stopped(super::super::signal::signal_state(&action.target).unwrap())
+                .unwrap()
+        );
+        assert_eq!(
+            reopened
+                .observe_restoration(&action)
+                .unwrap()
+                .unwrap()
+                .original_value,
+            RestorationValue::JobControl { stopped: false },
+        );
+        assert_eq!(
+            reopened.restore(&action, None).unwrap().changed,
+            Some(false)
+        );
+
+        // A subsequent stop belongs to another actor. The old receipt cannot
+        // release it even though its PID, birth and state still match.
+        let later = SignalActionRunner::with_defaults();
+        later.execute(&action).unwrap();
+        later.verify(&action).unwrap();
+        let refused = reopened.restore(&action, None).unwrap();
+        assert_eq!(refused.status, RestorationStatus::Failed);
+        assert_eq!(refused.changed, None);
+        assert_eq!(
+            super::super::signal::signal_state(&action.target).unwrap(),
+            'T'
+        );
+    }
+
+    #[test]
+    fn durable_pause_preserves_a_disposable_process_that_was_already_stopped() {
+        use crate::action::{ActionRunner, SignalActionRunner};
+        let (_child, mut action) = owned_renice_target();
+        action.action = Action::Pause;
+        let original_stop = SignalActionRunner::with_defaults();
+        original_stop.execute(&action).unwrap();
+        original_stop.verify(&action).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let journal = journal(directory.path());
+        let runner =
+            SignalActionRunner::with_defaults().with_reversal_journal(Arc::clone(&journal));
+        runner.execute(&action).unwrap();
+        runner.verify(&action).unwrap();
+        assert!(matches!(
+            journal.inspect(&action).unwrap()[0].operation,
+            ReversalOperation::SignalStop {
+                was_stopped: true,
+                ..
+            }
+        ));
+        let restored = journal.restore(&action, None).unwrap();
+        assert_eq!(restored.status, RestorationStatus::Restored);
+        assert_eq!(restored.changed, Some(false));
+        assert_eq!(
+            super::super::signal::signal_state(&action.target).unwrap(),
+            'T'
+        );
+        assert_eq!(
+            journal
+                .observe_restoration(&action)
+                .unwrap()
+                .unwrap()
+                .original_value,
+            RestorationValue::JobControl { stopped: true },
+        );
+    }
+
+    #[test]
+    fn durable_pause_storage_failure_never_stops_the_disposable_process() {
+        use crate::action::{ActionRunner, SignalActionRunner};
+        let (_child, mut action) = owned_renice_target();
+        action.action = Action::Pause;
+        let directory = tempfile::tempdir().unwrap();
+        let journal = journal(directory.path());
+        fs::write(journal.directory(), b"receipt storage is unavailable").unwrap();
+        let runner = SignalActionRunner::with_defaults().with_reversal_journal(journal);
+        assert!(runner.execute(&action).is_err());
+        assert!(
+            !job_control_stopped(super::super::signal::signal_state(&action.target).unwrap())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn durable_pause_refuses_group_signaling_without_stopping_the_group() {
+        use crate::action::{ActionRunner, SignalActionRunner, SignalConfig};
+        use std::os::unix::process::CommandExt;
+
+        // Isolate the disposable target's group even if the refusal regresses.
+        let child = OwnedReniceChild(
+            std::process::Command::new("sleep")
+                .arg("60")
+                .process_group(0)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let mut action = action(Action::Pause);
+        action.target = super::super::dispatch::read_cgroup_identity(child.0.id()).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let journal = journal(directory.path());
+        let runner = SignalActionRunner::new(SignalConfig {
+            use_process_groups: true,
+            ..Default::default()
+        })
+        .with_reversal_journal(Arc::clone(&journal));
+        assert!(runner.execute(&action).is_err());
+        assert!(journal.inspect(&action).unwrap().is_empty());
+        assert!(
+            !job_control_stopped(super::super::signal::signal_state(&action.target).unwrap())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn explicit_resume_and_unjournaled_pause_cannot_supersede_durable_stop() {
+        use crate::action::{ActionRunner, SignalActionRunner};
+        let (_child, mut pause) = owned_renice_target();
+        pause.action = Action::Pause;
+        let directory = tempfile::tempdir().unwrap();
+        let first = journal_in_sessions(directory.path(), "first-pause");
+        let second = journal_in_sessions(directory.path(), "second-pause");
+        let owner = SignalActionRunner::with_defaults().with_reversal_journal(Arc::clone(&first));
+        owner.execute(&pause).unwrap();
+        owner.verify(&pause).unwrap();
+        let mut repeated_pause = pause.clone();
+        repeated_pause.action_id = "another-pause-in-the-same-session".into();
+        assert!(owner.execute(&repeated_pause).is_err());
+        assert!(first.inspect(&repeated_pause).unwrap().is_empty());
+        let mut resume = pause.clone();
+        resume.action = Action::Resume;
+        resume.action_id = "explicit-resume".into();
+        assert!(owner.execute(&resume).is_err());
+        let other = SignalActionRunner::with_defaults().with_reversal_journal(second);
+        assert!(other.execute(&resume).is_err());
+        assert!(other.execute(&pause).is_err());
+        let mutable = SignalActionRunner::with_defaults()
+            .with_reversal_ownership_guard(directory.path().to_path_buf());
+        assert!(mutable.execute(&resume).is_err());
+        assert!(mutable.execute(&pause).is_err());
+        assert_eq!(
+            super::super::signal::signal_state(&pause.target).unwrap(),
+            'T'
+        );
+        assert_eq!(
+            first.restore(&pause, None).unwrap().status,
+            RestorationStatus::Restored
+        );
+        mutable.execute(&resume).unwrap();
+        mutable.verify(&resume).unwrap();
     }
 
     #[test]

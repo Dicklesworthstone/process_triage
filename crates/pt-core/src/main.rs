@@ -29749,13 +29749,15 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
 
             if !matches!(
                 action.action,
-                Action::Renice
+                Action::Pause
+                    | Action::Renice
                     | Action::Freeze
                     | Action::Unfreeze
                     | Action::Throttle
                     | Action::CapMemory
                     | Action::Quarantine
-            ) || (action.action == Action::Renice && !cfg!(target_os = "linux"))
+            ) || (matches!(action.action, Action::Pause | Action::Renice)
+                && !cfg!(target_os = "linux"))
             {
                 return observe_live_postcondition(action);
             }
@@ -29827,7 +29829,7 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
     verification_output["restoration_summary"] = serde_json::json!({
         "confirmed_restored": restored_count,
         "restoration_unverified": restoration_unverified_count,
-        "observation_source": "current_controller_state",
+        "observation_source": "current_process_and_controller_state",
     });
     verification_output["resource_prediction_error"] =
         serde_json::json!(&resource_prediction_error);
@@ -30737,7 +30739,8 @@ fn run_agent_undo(global: &GlobalOpts, args: &AgentUndoArgs) -> ExitCode {
     output["records"] = serde_json::json!(&records);
     if !matches!(
         action.action,
-        Action::Renice
+        Action::Pause
+            | Action::Renice
             | Action::Freeze
             | Action::Unfreeze
             | Action::Throttle
@@ -30747,7 +30750,7 @@ fn run_agent_undo(global: &GlobalOpts, args: &AgentUndoArgs) -> ExitCode {
         return refuse(
             output,
             "unsupported_action",
-            "durable undo currently supports Linux per-thread renice and cgroup-v2 freeze, unfreeze, CPU throttle, memory.high caps and cpuset quarantine"
+            "durable undo currently supports Linux signal pause, per-thread renice and cgroup-v2 freeze, unfreeze, CPU throttle, memory.high caps and cpuset quarantine"
                 .to_string(),
             ExitCode::PolicyBlocked,
         );
@@ -30792,7 +30795,7 @@ fn run_agent_undo(global: &GlobalOpts, args: &AgentUndoArgs) -> ExitCode {
         output["status"] = serde_json::json!("preview");
         output["live_eligibility_checked"] = serde_json::json!(false);
         output["note"] = serde_json::json!(
-            "receipt inspection only; --confirm revalidates process identity, ownership and the recorded thread priorities or cgroup control before restoration. Select --attempt-id when multiple attempts exist."
+            "receipt inspection only; --confirm revalidates process identity, ownership and the recorded job-control state, thread priorities or cgroup control before restoration. Select --attempt-id when multiple attempts exist."
         );
         emit(output);
         return ExitCode::Clean;

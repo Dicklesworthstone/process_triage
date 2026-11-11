@@ -7,10 +7,14 @@
 //! - Outcome verification
 
 use super::executor::{ActionError, ActionRunner};
+#[cfg(target_os = "linux")]
+use super::reversal::{PreparedReversal, ReversalJournal, ReversalStatus};
 use crate::decision::Action;
 use crate::plan::PlanAction;
 use std::thread;
 use std::time::{Duration, Instant};
+#[cfg(target_os = "linux")]
+use std::{path::PathBuf, sync::Arc};
 
 /// One observation of the recorded incarnation. Missing or replaced processes
 /// can prove exit, but never successful pause/resume of the current occupant.
@@ -197,6 +201,42 @@ fn observe_signal_target(
     }
 }
 
+/// Read a known state only for the complete recorded live incarnation. Undo
+/// callers decide which observed states they may safely restore.
+#[cfg(target_os = "linux")]
+pub(crate) fn signal_state(target: &pt_common::ProcessIdentity) -> Result<char, ActionError> {
+    match observe_signal_target(target)? {
+        SignalObservation::Present(state) => Ok(state),
+        SignalObservation::Gone => Err(ActionError::ProcessNotFound),
+        SignalObservation::Replaced => Err(ActionError::IdentityMismatch),
+    }
+}
+
+/// Undo may release only a verified job-control stop, through an fd pinned to
+/// that process. A numeric-PID fallback cannot provide this restoration promise.
+#[cfg(target_os = "linux")]
+pub(crate) fn send_bound_signal(
+    target: &pt_common::ProcessIdentity,
+    signal: i32,
+) -> Result<(), ActionError> {
+    if signal != libc::SIGCONT || target.quality != pt_common::IdentityQuality::Full {
+        return Err(ActionError::Failed(
+            "pause restoration requires SIGCONT and the full original identity".to_string(),
+        ));
+    }
+    ensure_action_pid_namespace()?;
+    let pidfd = PidFd::open(target.pid.0)?.ok_or_else(|| {
+        ActionError::Failed("pause restoration requires kernel pidfd support".to_string())
+    })?;
+    if signal_state(target)? != 'T' {
+        return Err(ActionError::Failed(
+            "pause restoration requires the original process to remain job-control stopped"
+                .to_string(),
+        ));
+    }
+    pidfd.send(signal)
+}
+
 #[cfg(unix)]
 fn wait_for_signal_observation(
     timeout: Duration,
@@ -370,6 +410,20 @@ pub struct SignalActionRunner {
     last_path: std::sync::Mutex<Option<&'static str>>,
     /// A successful SIGTERM/SIGKILL delivery, even if later verification fails.
     kill_signal_delivered: std::sync::atomic::AtomicBool,
+    #[cfg(target_os = "linux")]
+    reversal_journal: Option<Arc<ReversalJournal>>,
+    #[cfg(target_os = "linux")]
+    reversal_ownership_root: Option<PathBuf>,
+    #[cfg(target_os = "linux")]
+    applied_pause: std::sync::Mutex<Option<AppliedPause>>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct AppliedPause {
+    action_id: String,
+    target: pt_common::ProcessIdentity,
+    receipt: PreparedReversal,
 }
 
 impl SignalActionRunner {
@@ -378,6 +432,40 @@ impl SignalActionRunner {
             config,
             last_path: std::sync::Mutex::new(None),
             kill_signal_delivered: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(target_os = "linux")]
+            reversal_journal: None,
+            #[cfg(target_os = "linux")]
+            reversal_ownership_root: None,
+            #[cfg(target_os = "linux")]
+            applied_pause: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Record the original job-control state durably before sending SIGSTOP.
+    #[cfg(target_os = "linux")]
+    pub fn with_reversal_journal(mut self, journal: Arc<ReversalJournal>) -> Self {
+        self.reversal_journal = Some(journal);
+        self
+    }
+
+    /// Prevent an unjournaled action from superseding another session's stop.
+    #[cfg(target_os = "linux")]
+    pub fn with_reversal_ownership_guard(mut self, sessions_root: PathBuf) -> Self {
+        self.reversal_ownership_root = Some(sessions_root);
+        self
+    }
+
+    #[cfg(target_os = "linux")]
+    fn ensure_signal_stop_unowned(
+        &self,
+        target: &pt_common::ProcessIdentity,
+    ) -> Result<(), ActionError> {
+        if let Some(journal) = &self.reversal_journal {
+            journal.ensure_signal_stop_unowned(target)
+        } else if let Some(sessions_root) = &self.reversal_ownership_root {
+            super::reversal::ensure_signal_stop_unowned(sessions_root, target)
+        } else {
+            Ok(())
         }
     }
 
@@ -624,6 +712,22 @@ impl SignalActionRunner {
         let (target, use_group) = self.resolve_group_target(pid, action.target.pgid);
 
         #[cfg(target_os = "linux")]
+        {
+            if use_group
+                && (self.reversal_journal.is_some() || self.reversal_ownership_root.is_some())
+            {
+                return Err(ActionError::Failed(
+                    "single-process stop ownership cannot authorize a process-group pause"
+                        .to_string(),
+                ));
+            }
+            if self.reversal_journal.is_some() {
+                return self.execute_journaled_pause(action, &deadline);
+            }
+            self.ensure_signal_stop_unowned(&action.target)?;
+        }
+
+        #[cfg(target_os = "linux")]
         if !use_group {
             if let Some(pidfd) = self.pinned_pidfd(action)? {
                 deadline.remaining()?;
@@ -638,6 +742,66 @@ impl SignalActionRunner {
         }
         deadline.remaining()?;
         self.send_signal(target, libc::SIGSTOP, use_group)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn execute_journaled_pause(
+        &self,
+        action: &PlanAction,
+        deadline: &SignalDeadline,
+    ) -> Result<(), ActionError> {
+        if self.verification_timeout(action).is_zero() {
+            return Err(ActionError::Failed(
+                "durable pause requires a nonzero verification budget for recovery".to_string(),
+            ));
+        }
+        let mut applied = self
+            .applied_pause
+            .lock()
+            .map_err(|_| ActionError::Failed("pause execution record unavailable".to_string()))?;
+        *applied = None;
+        let journal = self.reversal_journal.as_ref().ok_or_else(|| {
+            ActionError::Failed("pause requires its configured undo journal".to_string())
+        })?;
+        deadline.remaining()?;
+        ensure_action_pid_namespace()?;
+        let pidfd = PidFd::open(action.target.pid.0)?.ok_or_else(|| {
+            ActionError::Failed("durable pause requires kernel pidfd support".to_string())
+        })?;
+        let state = signal_state(&action.target)?;
+        let was_stopped = match state {
+            'T' => true,
+            'R' | 'S' | 'D' | 'I' => false,
+            _ => {
+                return Err(ActionError::Failed(
+                    "durable pause requires a live process outside a debugger tracing stop"
+                        .to_string(),
+                ))
+            }
+        };
+        let receipt = journal.prepare_signal_stop(action, was_stopped)?;
+        let execution = (|| {
+            deadline.remaining()?;
+            let state = signal_state(&action.target)?;
+            if !matches!(state, 'R' | 'S' | 'D' | 'I' | 'T') || (state == 'T') != was_stopped {
+                return Err(ActionError::Failed(
+                    "job-control state changed after pause receipt preparation".to_string(),
+                ));
+            }
+            deadline.remaining()?;
+            if !was_stopped {
+                pidfd.send(libc::SIGSTOP)?;
+                self.note_path("pidfd");
+            }
+            Ok(())
+        })();
+        receipt.finish(execution, ReversalStatus::Applied)?;
+        *applied = Some(AppliedPause {
+            action_id: action.action_id.clone(),
+            target: action.target.clone(),
+            receipt,
+        });
         Ok(())
     }
 
@@ -785,6 +949,28 @@ impl SignalActionRunner {
     /// Verify a pause action succeeded.
     #[cfg(unix)]
     fn verify_pause(&self, action: &PlanAction) -> Result<(), ActionError> {
+        #[cfg(target_os = "linux")]
+        if self.reversal_journal.is_some() {
+            let applied = self.applied_pause.lock().map_err(|_| {
+                ActionError::Failed("pause execution record unavailable".to_string())
+            })?;
+            let record = applied.as_ref().ok_or_else(|| {
+                ActionError::Failed(
+                    "cannot verify a pause without its execution receipt".to_string(),
+                )
+            })?;
+            if record.action_id != action.action_id || record.target != action.target {
+                return Err(ActionError::IdentityMismatch);
+            }
+            return record.receipt.finish(
+                self.wait_for_planned_state(
+                    &action.target,
+                    SignalExpectation::Stopped,
+                    self.verification_timeout(action),
+                ),
+                ReversalStatus::Verified,
+            );
+        }
         self.wait_for_planned_state(
             &action.target,
             SignalExpectation::Stopped,
@@ -825,6 +1011,19 @@ impl SignalActionRunner {
         deadline.remaining()?;
         let pid = action.target.pid.0;
         let (target, use_group) = self.resolve_group_target(pid, action.target.pgid);
+
+        #[cfg(target_os = "linux")]
+        {
+            if use_group
+                && (self.reversal_journal.is_some() || self.reversal_ownership_root.is_some())
+            {
+                return Err(ActionError::Failed(
+                    "single-process stop ownership cannot authorize a process-group resume"
+                        .to_string(),
+                ));
+            }
+            self.ensure_signal_stop_unowned(&action.target)?;
+        }
 
         #[cfg(target_os = "linux")]
         if !use_group {
@@ -1729,6 +1928,97 @@ mod tests {
                 Err(ActionError::ProcessNotFound)
             ));
             assert!(!runner.take_kill_signal_delivered());
+        }
+
+        #[test]
+        fn bound_resume_requires_the_original_full_identity_and_a_job_control_stop() {
+            let dir = tempfile::tempdir().expect("marker directory");
+            let marker = dir.path().join("term-handled");
+            let (child, action) = stopped_term_child(&marker, false, false);
+            let runner = SignalActionRunner::with_defaults();
+            let mut wrong_owner = action.target.clone();
+            wrong_owner.uid ^= 1;
+            let mut wrong_birth = action.target.clone();
+            let (boot, ticks, pid) = parse_start_id(&wrong_birth.start_id.0);
+            wrong_birth.start_id =
+                pt_common::StartId::from_linux(boot.unwrap(), ticks.unwrap() + 1, pid.unwrap());
+            let mut weak_identity = action.target.clone();
+            weak_identity.quality = pt_common::IdentityQuality::NoBootId;
+            for stale in [&wrong_owner, &wrong_birth, &weak_identity] {
+                assert!(send_bound_signal(stale, libc::SIGCONT).is_err());
+                assert_eq!(runner.get_process_state(child.0.id()), Some('T'));
+            }
+            assert!(send_bound_signal(&action.target, libc::SIGTERM).is_err());
+            assert_eq!(signal_state(&action.target).unwrap(), 'T');
+            send_bound_signal(&action.target, libc::SIGCONT)
+                .expect("resume the pinned owned child");
+            runner
+                .wait_for_planned_state(
+                    &action.target,
+                    SignalExpectation::Resumed,
+                    Duration::from_secs(1),
+                )
+                .expect("the original child resumed");
+            assert!(send_bound_signal(&action.target, libc::SIGCONT).is_err());
+            assert!(!marker.exists());
+            assert!(!runner.take_kill_signal_delivered());
+        }
+
+        #[test]
+        fn journaled_pause_refuses_zero_verification_budget_before_stopping_a_running_child() {
+            for (saved_verify_ms, runner_verify_ms) in [(0, 1_000), (1_000, 0)] {
+                let dir = tempfile::tempdir().expect("pause session directory");
+                let marker = dir.path().join("term-handled");
+                let (child, mut action) = stopped_term_child(&marker, false, false);
+                let setup = SignalActionRunner::with_defaults();
+                setup
+                    .resume(child.0.id(), false, None)
+                    .expect("resume owned child before pause attempt");
+                setup
+                    .wait_for_planned_state(
+                        &action.target,
+                        SignalExpectation::Resumed,
+                        Duration::from_secs(5),
+                    )
+                    .expect("original child is running");
+                action.action = Action::Pause;
+                action.timeouts.verify_ms = saved_verify_ms;
+                let sessions_root = dir.path().join("sessions");
+                let session_id = "pt-zero-pause-budget";
+                let action_directory = sessions_root.join(session_id).join("action");
+                std::fs::create_dir_all(&action_directory).unwrap();
+                let journal = Arc::new(
+                    ReversalJournal::new(
+                        action_directory,
+                        session_id,
+                        "a".repeat(64),
+                        &sessions_root,
+                    )
+                    .unwrap(),
+                );
+                let runner = SignalActionRunner::new(SignalConfig {
+                    verify_timeout_ms: runner_verify_ms,
+                    ..SignalConfig::default()
+                })
+                .with_reversal_journal(Arc::clone(&journal));
+
+                let error = runner
+                    .execute(&action)
+                    .expect_err("pause must retain an observation budget for recovery");
+                assert!(error.to_string().contains("nonzero verification budget"));
+                assert!(journal.inspect(&action).unwrap().is_empty());
+                assert!(!journal.directory().exists());
+                journal
+                    .ensure_signal_stop_unowned(&action.target)
+                    .expect("refused pause must not claim stop ownership");
+                assert!(matches!(
+                    signal_state(&action.target),
+                    Ok('R' | 'S' | 'D' | 'I')
+                ));
+                assert!(runner.take_signal_path().is_none());
+                assert!(!runner.take_kill_signal_delivered());
+                assert!(!marker.exists());
+            }
         }
 
         #[test]

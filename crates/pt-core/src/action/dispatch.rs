@@ -57,11 +57,12 @@ impl CompositeActionRunner {
     }
 
     /// Capture durable restoration receipts at the actual control writes.
-    /// The journal binds renice, freeze, throttle and quarantine to the saved plan.
+    /// The journal binds pause, renice and cgroup controls to the saved plan.
     pub fn with_reversal_journal(self, journal: Arc<ReversalJournal>) -> Self {
         #[cfg(target_os = "linux")]
         {
             let mut runner = self;
+            runner.signal = runner.signal.with_reversal_journal(Arc::clone(&journal));
             runner.renice = runner.renice.with_reversal_journal(Arc::clone(&journal));
             runner.freeze = runner.freeze.with_reversal_journal(Arc::clone(&journal));
             runner.throttle = runner.throttle.with_reversal_journal(Arc::clone(&journal));
@@ -84,6 +85,9 @@ impl CompositeActionRunner {
         #[cfg(target_os = "linux")]
         {
             let mut runner = self;
+            runner.signal = runner
+                .signal
+                .with_reversal_ownership_guard(sessions_root.clone());
             runner.renice = runner
                 .renice
                 .with_reversal_ownership_guard(sessions_root.clone());
@@ -135,6 +139,46 @@ impl CompositeActionRunner {
 impl Default for CompositeActionRunner {
     fn default() -> Self {
         Self::with_defaults()
+    }
+}
+
+/// Observe the raw Linux job-control state without losing the distinction
+/// between `T` and debugger-owned `t` in the portable process snapshot enum.
+/// An unavailable observation cannot confirm a previously observed stop.
+#[cfg(target_os = "linux")]
+pub(crate) fn observe_pause_postcondition(
+    target: &ProcessIdentity,
+) -> crate::verify::ActionPostcondition {
+    use crate::verify::ActionPostcondition;
+
+    if target.quality != pt_common::IdentityQuality::Full {
+        return ActionPostcondition::NotSatisfied {
+            detail: "Pause verification requires the complete original process identity"
+                .to_string(),
+        };
+    }
+    match super::signal::signal_state(target) {
+        Ok('T') => ActionPostcondition::Satisfied {
+            detail: "The original process is currently job-control stopped; this does not establish resource relief"
+                .to_string(),
+        },
+        Ok('t') => ActionPostcondition::NotSatisfied {
+            detail: "The original process is in a debugger tracing stop, not a job-control pause"
+                .to_string(),
+        },
+        Ok('Z' | 'X' | 'x') => ActionPostcondition::NotSatisfied {
+            detail: "The original process has exited; exit cannot confirm a live pause"
+                .to_string(),
+        },
+        Ok(state) => ActionPostcondition::NotSatisfied {
+            detail: format!(
+                "The original process has current state {state:?}, not a verified job-control stop"
+            ),
+        },
+        Err(ActionError::IdentityMismatch) => ActionPostcondition::IdentityChanged,
+        Err(error) => ActionPostcondition::NotSatisfied {
+            detail: format!("Cannot establish the original process's current job-control stop: {error}"),
+        },
     }
 }
 
@@ -674,6 +718,86 @@ mod tests {
         };
         let plan = generate_plan(&bundle);
         plan.actions[0].clone()
+    }
+
+    #[cfg(target_os = "linux")]
+    struct PauseObservationChild(std::process::Child);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for PauseObservationChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_pause_observation_requires_current_stop_and_complete_original_identity() {
+        use crate::verify::ActionPostcondition;
+
+        let mut child = PauseObservationChild(
+            std::process::Command::new("sleep")
+                .arg("60")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("owned disposable process"),
+        );
+        let mut action = make_action();
+        action.target = read_cgroup_identity(child.0.id()).unwrap();
+        assert!(matches!(
+            observe_pause_postcondition(&action.target),
+            ActionPostcondition::NotSatisfied { .. }
+        ));
+        assert_ne!(
+            super::super::signal::signal_state(&action.target).unwrap(),
+            'T'
+        );
+
+        let signal = SignalActionRunner::with_defaults();
+        signal.execute(&action).unwrap();
+        signal.verify(&action).unwrap();
+        assert!(matches!(
+            observe_pause_postcondition(&action.target),
+            ActionPostcondition::Satisfied { .. }
+        ));
+
+        let mut stale_owner = action.target.clone();
+        stale_owner.uid = stale_owner.uid.wrapping_add(1);
+        assert!(matches!(
+            observe_pause_postcondition(&stale_owner),
+            ActionPostcondition::IdentityChanged
+        ));
+        let mut stale_birth = action.target.clone();
+        let mut parts = action.target.start_id.0.split(':');
+        let boot = parts.next().unwrap();
+        let ticks = parts.next().unwrap().parse::<u64>().unwrap();
+        stale_birth.start_id =
+            StartId::from_linux(boot, ticks.checked_add(1).unwrap(), child.0.id());
+        assert!(matches!(
+            observe_pause_postcondition(&stale_birth),
+            ActionPostcondition::IdentityChanged
+        ));
+        let mut weak_identity = action.target.clone();
+        weak_identity.quality = IdentityQuality::NoBootId;
+        assert!(matches!(
+            observe_pause_postcondition(&weak_identity),
+            ActionPostcondition::NotSatisfied { .. }
+        ));
+        // All observations are read-only, including rejected identities.
+        assert_eq!(
+            super::super::signal::signal_state(&action.target).unwrap(),
+            'T'
+        );
+
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        assert!(matches!(
+            observe_pause_postcondition(&action.target),
+            ActionPostcondition::NotSatisfied { .. }
+        ));
     }
 
     #[cfg(target_os = "linux")]

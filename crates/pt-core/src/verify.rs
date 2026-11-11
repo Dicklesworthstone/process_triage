@@ -185,6 +185,10 @@ pub enum ActionPostcondition {
 /// Controller observations bind both process identity and cgroup membership around
 /// their reads. Verifying a configured effect does not establish resource relief.
 pub fn observe_live_postcondition(action: &PlanAction) -> ActionPostcondition {
+    #[cfg(target_os = "linux")]
+    if action.action == Action::Pause {
+        return crate::action::dispatch::observe_pause_postcondition(&action.target);
+    }
     if action.action == Action::CapMemory {
         let Some(plan) = action.memory_cap.as_ref() else {
             return ActionPostcondition::Unavailable {
@@ -1111,7 +1115,8 @@ pub fn verify_plan(
 
 /// Verify saved successful executions against current, identity-bound evidence.
 ///
-/// Process snapshots prove Kill/Pause/Resume states. Priority and controller
+/// Process snapshots prove Kill/Pause/Resume states. A paused process may also
+/// have a durable, independently observed restoration. Priority and controller
 /// actions need separate current observations, injected to keep fixture replay pure.
 /// Missing, failed and planning-only execution records never invoke the observer.
 pub fn verify_plan_with_postconditions(
@@ -1280,8 +1285,73 @@ pub fn verify_plan_with_postconditions(
                 (Action::Kill, Some(process)) if process.state.is_zombie() => {
                     (VerifyOutcome::ConfirmedDead, "zombie", None)
                 }
-                (Action::Pause, Some(process)) if process.state == ProcessState::Stopped => {
-                    (VerifyOutcome::ConfirmedStopped, "stopped", None)
+                (Action::Pause, Some(process))
+                    if !matches!(
+                        process.state,
+                        ProcessState::Zombie | ProcessState::Dead | ProcessState::Unknown
+                    ) =>
+                {
+                    // An intentional undo supersedes the old stopped-state
+                    // expectation. Inspect it even if the snapshot is stopped:
+                    // the process may have been stopped again after restoration,
+                    // or may already have been stopped before our original action.
+                    match observe(action) {
+                        ActionPostcondition::Restored { observation }
+                            if observation.action_id == action.action_id
+                                && matches!(
+                                    &observation.original_value,
+                                    RestorationValue::JobControl { .. }
+                                ) =>
+                        {
+                            let detail = format!(
+                                "The recorded original job-control state was independently observed at {}; undo {} restored execution attempt {}. The original pause history is retained; this is not evidence of resource relief",
+                                observation.observed_at,
+                                observation.restore_id,
+                                observation.attempt_id,
+                            );
+                            restoration = Some(observation);
+                            (
+                                VerifyOutcome::ConfirmedRestored,
+                                "restoration_verified",
+                                Some(detail),
+                            )
+                        }
+                        ActionPostcondition::Restored { .. } => (
+                            VerifyOutcome::RestorationUnverified,
+                            "restoration_unverified",
+                            Some(
+                                "Restoration observation does not match this pause and job-control state"
+                                    .to_string(),
+                            ),
+                        ),
+                        ActionPostcondition::RestorationUnverified { reason } => (
+                            VerifyOutcome::RestorationUnverified,
+                            "restoration_unverified",
+                            Some(reason),
+                        ),
+                        ActionPostcondition::IdentityChanged => (
+                            VerifyOutcome::PidReused,
+                            "identity_changed",
+                            Some("The process identity changed during pause observation".to_string()),
+                        ),
+                        ActionPostcondition::Satisfied { detail } => (
+                            VerifyOutcome::ConfirmedStopped,
+                            "stopped",
+                            Some(detail),
+                        ),
+                        ActionPostcondition::NotSatisfied { detail } => (
+                            VerifyOutcome::EffectNotObserved,
+                            "pause_postcondition_not_observed",
+                            Some(detail),
+                        ),
+                        // Without restoration evidence, preserve snapshot-only
+                        // verification when no live observer is available,
+                        // including pure offline replay.
+                        _ if process.state == ProcessState::Stopped => {
+                            (VerifyOutcome::ConfirmedStopped, "stopped", None)
+                        }
+                        _ => (VerifyOutcome::StillRunning, "still_running", None),
+                    }
                 }
                 (Action::Resume, Some(process))
                     if matches!(
@@ -1509,10 +1579,10 @@ pub fn verify_plan_with_postconditions(
             respawn_detected: respawn,
             expected: Some(
                 if restoration.is_some() {
-                    if action.action == Action::Renice {
-                        "recorded_original_thread_priorities"
-                    } else {
-                        "recorded_original_controller_state"
+                    match action.action {
+                        Action::Pause => "recorded_original_job_control_state",
+                        Action::Renice => "recorded_original_thread_priorities",
+                        _ => "recorded_original_controller_state",
                     }
                 } else {
                     match action.action {
@@ -2833,6 +2903,7 @@ mod tests {
             restore_id: "00000000-0000-4000-8000-000000000002".into(),
             action_id: action.action_id.clone(),
             original_value: match action.action {
+                Action::Pause => RestorationValue::JobControl { stopped: false },
                 Action::Throttle => RestorationValue::CpuMax {
                     quota_us: -1,
                     period_us: 100_000,
@@ -2861,6 +2932,7 @@ mod tests {
     #[test]
     fn confirmed_restoration_preserves_action_history_and_earns_no_relief_credit() {
         for action_kind in [
+            Action::Pause,
             Action::Renice,
             Action::Freeze,
             Action::Unfreeze,
@@ -2891,10 +2963,10 @@ mod tests {
             assert_eq!(outcome.action, action_kind.as_str());
             assert_eq!(
                 outcome.expected.as_deref(),
-                Some(if action_kind == Action::Renice {
-                    "recorded_original_thread_priorities"
-                } else {
-                    "recorded_original_controller_state"
+                Some(match action_kind {
+                    Action::Pause => "recorded_original_job_control_state",
+                    Action::Renice => "recorded_original_thread_priorities",
+                    _ => "recorded_original_controller_state",
                 })
             );
             assert_eq!(outcome.actual.as_deref(), Some("restoration_verified"));
@@ -2947,11 +3019,90 @@ mod tests {
     }
 
     #[test]
+    fn pause_live_observation_overrides_stale_snapshot_state() {
+        let action = make_action(123, Action::Pause);
+        let saved = execution(&action);
+        let current = make_proc(123, 1000, "worker", 5, ProcessState::Stopped);
+        let plan = make_plan(vec![action]);
+        for detail in [
+            "current process is running",
+            "a debugger owns the current tracing stop",
+            "current process state is unreadable",
+        ] {
+            let verified = verify_plan_with_postconditions(
+                &plan,
+                std::slice::from_ref(&saved),
+                std::slice::from_ref(&current),
+                DateTime::from_timestamp(30, 0).unwrap(),
+                DateTime::from_timestamp(31, 0).unwrap(),
+                |_| ActionPostcondition::NotSatisfied {
+                    detail: detail.to_string(),
+                },
+                None,
+            )
+            .unwrap();
+            let outcome = &verified.action_outcomes[0];
+            assert_eq!(outcome.outcome, VerifyOutcome::EffectNotObserved);
+            assert_eq!(outcome.verified, Some(false));
+            assert_eq!(outcome.note.as_deref(), Some(detail));
+            assert_eq!(verified.verification.overall_status, "failure");
+        }
+    }
+
+    #[test]
+    fn pause_restoration_is_checked_even_when_the_current_snapshot_is_stopped() {
+        let action = make_action(123, Action::Pause);
+        let saved = execution(&action);
+        let current = make_proc(123, 1000, "worker", 5, ProcessState::Stopped);
+        let mut observation = restored_observation(&action);
+        observation.original_value = RestorationValue::JobControl { stopped: true };
+        let plan = make_plan(vec![action]);
+        let verified = verify_plan_with_postconditions(
+            &plan,
+            std::slice::from_ref(&saved),
+            std::slice::from_ref(&current),
+            DateTime::from_timestamp(30, 0).unwrap(),
+            DateTime::from_timestamp(31, 0).unwrap(),
+            |_| ActionPostcondition::Restored {
+                observation: observation.clone(),
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            verified.action_outcomes[0].outcome,
+            VerifyOutcome::ConfirmedRestored
+        );
+        assert_eq!(verified.action_outcomes[0].restoration, Some(observation));
+
+        let refused = verify_plan_with_postconditions(
+            &plan,
+            &[saved],
+            &[current],
+            DateTime::from_timestamp(30, 0).unwrap(),
+            DateTime::from_timestamp(31, 0).unwrap(),
+            |_| ActionPostcondition::RestorationUnverified {
+                reason: "a later external stop does not belong to this pause".into(),
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            refused.action_outcomes[0].outcome,
+            VerifyOutcome::RestorationUnverified
+        );
+        assert_eq!(refused.action_outcomes[0].verified, Some(false));
+        assert_eq!(refused.verification.overall_status, "failure");
+        assert!(refused.action_outcomes[0].restoration.is_none());
+    }
+
+    #[test]
     fn restoration_observations_cannot_cross_actions_or_controller_types() {
-        for case in ["action_id", "control", "renice", "quarantine"] {
+        for case in ["action_id", "control", "renice", "quarantine", "pause"] {
             let action_kind = match case {
                 "renice" => Action::Renice,
                 "quarantine" => Action::Quarantine,
+                "pause" => Action::Pause,
                 _ => Action::Freeze,
             };
             let action = make_action(123, action_kind);
@@ -2965,7 +3116,7 @@ mod tests {
                         period_us: 100_000,
                     }
                 }
-                "renice" | "quarantine" => {
+                "renice" | "quarantine" | "pause" => {
                     observation.original_value = RestorationValue::Freeze { requested: false };
                 }
                 _ => {}

@@ -352,7 +352,7 @@ pt shadow stop                    # Stop observer
 | `pt agent explain` | Evidence for specific PIDs | `pt agent explain --session <id> --pids 1234` |
 | `pt agent label` | Record your kill/spare verdict | `pt agent label --pid 1234 --spare` |
 | `pt agent apply` | Execute a plan (robot mode) | `pt agent apply --session <id> --yes` |
-| `pt agent undo` | Inspect or restore recorded priorities or cgroup controls | `pt agent undo --session <id> --action-id <action-id>` |
+| `pt agent undo` | Inspect or restore a recorded pause, priorities, or cgroup controls | `pt agent undo --session <id> --action-id <action-id>` |
 | `pt agent verify` | Confirm outcomes | `pt agent verify --session <id>` |
 | `pt agent watch` | Stream events | `pt agent watch --format jsonl` |
 | `pt agent report` | Generate HTML report | `pt agent report --session <id>` |
@@ -1553,9 +1553,9 @@ not implemented.
 
 ### Restoring a recorded control
 
-`agent apply` records durable undo receipts for Linux **Renice** and cgroup-v2
+`agent apply` records durable undo receipts for Linux **Pause**, **Renice** and cgroup-v2
 **Freeze, Unfreeze, Throttle, CapMemory, and Quarantine** actions. Each receipt saves the
-original state before changing it: every thread's priority for Renice, or the
+original state before changing it: the job-control stop state for Pause, every thread's priority for Renice, or the
 freezer request, CPU quota and period, memory soft limit, or requested cpuset for cgroup controls.
 Receipts are bound to the complete saved plan, action ID and process incarnation. Priority receipts also
 bind the PID namespace and each thread's birth time and owner; cgroup receipts
@@ -1583,6 +1583,19 @@ operation. If the original value is already present, undo verifies it without
 another write. Freezer undo also waits for the actual `cgroup.events` frozen
 state, including when the request is already correct. A completed receipt cannot
 authorize a second write after another actor changes the control again.
+
+Pause restoration is available even after the applying command exits. It uses a
+Linux pidfd bound to the original process and checks its PID namespace, birth
+identity, owner and current job-control state before sending SIGCONT. If the
+process was already stopped before apply, undo preserves that stop and sends no
+signal. Tracing stops, missing or changed identities, and unreadable state are
+refused. An unresolved receipt for a previously running process requires a
+currently observed job-control stop: a `prepared` record may precede a still
+pending SIGSTOP, so an apparently running process cannot be treated as safely
+restored. After a completed undo, a later stop cannot reuse the old receipt to
+resume the process again. Explicit Resume actions respect active pause ownership;
+use the original pause's `agent undo` command to release it. Staged termination
+can still follow its pause and keeps the original receipt for inspection.
 
 Quarantine undo restores the original requested CPU identities, including an
 empty assignment that inherits CPUs from the parent. It checks that effective
@@ -1633,9 +1646,9 @@ including completed restoration histories and incomplete or unreadable
 receipts. Cleanup uses the execution lock so it cannot remove a session while
 an action is preparing the state needed for undo.
 
-This command currently covers Linux thread priorities and cgroup-v2 freezer,
+This command currently covers Linux signal pauses, thread priorities and cgroup-v2 freezer,
 CPU bandwidth, memory soft limits, and cpuset controls from `agent apply`. Hybrid v1 throttling and
-quarantine record that durable undo is unsupported. Pause/resume, service restart,
+quarantine record that durable undo is unsupported. Resume, service restart, macOS Pause,
 macOS Renice, and TUI actions do not capture these receipts; TUI control writes
 still respect existing receipt ownership. A bare Unquarantine action cannot
 reconstruct the old CPU set; restore the recorded Quarantine action with
