@@ -2554,6 +2554,7 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
                 let output = score_tui_rows(
                     &filter_result.passed,
                     &scan_result.processes,
+                    scan_result.metadata.warnings.is_empty(),
                     min_age_r,
                     deep_r,
                     window_ms_r,
@@ -2963,6 +2964,7 @@ fn build_tui_data_from_live_scan(
     score_tui_rows(
         &filter_result.passed,
         &scan_result.processes,
+        scan_result.metadata.warnings.is_empty(),
         args.min_age,
         args.deep,
         args.window_ms,
@@ -2981,6 +2983,7 @@ fn build_tui_data_from_live_scan(
 fn score_tui_rows(
     processes: &[ProcessRecord],
     population: &[ProcessRecord],
+    census_complete: bool,
     min_age: Option<u64>,
     deep: bool,
     window_ms: u64,
@@ -2995,7 +2998,8 @@ fn score_tui_rows(
         .filter(|proc| proc.elapsed.as_secs() >= min_age)
         .collect();
     scorer.collect_provenance(&eligible);
-    let system_state = collect_planning_activity(&mut scorer, population, window_ms);
+    let system_state =
+        collect_planning_activity(&mut scorer, population, window_ms, census_complete);
     let pressure = PlanningPressure::from_system_state(&system_state);
     let probe_advice = compute_probe_advice(processes, &scorer, policy, &pressure);
     let deep_signals = if deep {
@@ -5139,6 +5143,7 @@ fn build_tui_rows(
                 "state": proc.state.to_string(),
                 "recommended_action": recommendation,
                 "action_rationale": rationale,
+                "work": scorer.workload_diagnosis_for(proc),
                 "supervisor_restart": scorer.supervisor_restart_for(proc),
                 "supervisor_restart_unavailable": scorer.supervisor_restart_unavailable_for(proc),
                 "memory_mb": memory_mb,
@@ -5651,9 +5656,7 @@ fn replay_evaluation_error(error: pt_core::replay::ReplayEvaluationError) -> Exi
 }
 
 fn run_replay(global: &GlobalOpts, args: &ReplayArgs) -> ExitCode {
-    use pt_core::replay::{
-        evaluate_pair, make_review_template, read_review_labels, ReviewSplit,
-    };
+    use pt_core::replay::{evaluate_pair, make_review_template, read_review_labels, ReviewSplit};
 
     let snapshot_path = match &args.command {
         ReplayCommands::LabelTemplate { snapshot, .. }
@@ -5720,7 +5723,11 @@ fn run_replay(global: &GlobalOpts, args: &ReplayArgs) -> ExitCode {
                 );
                 return ExitCode::ArgsError;
             }
-            if let Some(path) = global.config.as_ref().filter(|path| !Path::new(path).is_dir()) {
+            if let Some(path) = global
+                .config
+                .as_ref()
+                .filter(|path| !Path::new(path).is_dir())
+            {
                 eprintln!("replay: candidate configuration directory is inaccessible: {path}");
                 return ExitCode::ArgsError;
             }
@@ -5813,15 +5820,13 @@ fn run_replay(global: &GlobalOpts, args: &ReplayArgs) -> ExitCode {
         OutputFormat::Json | OutputFormat::Toon => {
             println!("{}", format_structured_output(global, output));
         }
-        OutputFormat::Jsonl => {
-            match serde_json::to_string(&global.process_output_value(output)) {
-                Ok(line) => println!("{line}"),
-                Err(error) => {
-                    eprintln!("replay: cannot serialize output: {error}");
-                    return ExitCode::InternalError;
-                }
+        OutputFormat::Jsonl => match serde_json::to_string(&global.process_output_value(output)) {
+            Ok(line) => println!("{line}"),
+            Err(error) => {
+                eprintln!("replay: cannot serialize output: {error}");
+                return ExitCode::InternalError;
             }
-        }
+        },
         OutputFormat::Exitcode => {}
         _ => println!("{summary}"),
     }
@@ -13328,9 +13333,9 @@ fn run_daemon(global: &GlobalOpts, args: &DaemonArgs) -> ExitCode {
         Some(DaemonCommands::Start { foreground }) => run_daemon_start(global, *foreground),
         Some(DaemonCommands::Stop) => run_daemon_stop(global),
         Some(DaemonCommands::Status) => run_daemon_status(global),
-        Some(DaemonCommands::Install { activate }) => run_daemon_service(global, |service| {
-            service.install(*activate, global.dry_run)
-        }),
+        Some(DaemonCommands::Install { activate }) => {
+            run_daemon_service(global, |service| service.install(*activate, global.dry_run))
+        }
         Some(DaemonCommands::ServiceStatus) => {
             run_daemon_service(global, |service| service.status())
         }
@@ -16094,10 +16099,20 @@ mod daemon_pressure_tests {
         let mut config = DaemonConfig::default();
         config.escalation.allow_auto_mitigation = true;
         std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
-        assert!(!load_daemon_config(&cli.global).0.escalation.allow_auto_mitigation);
+        assert!(
+            !load_daemon_config(&cli.global)
+                .0
+                .escalation
+                .allow_auto_mitigation
+        );
         // The reload path calls the same loader, including the legacy schema.
         std::fs::write(&config_path, r#"{"auto_mitigate":{"enabled":true}}"#).unwrap();
-        assert!(!load_daemon_config(&cli.global).0.escalation.allow_auto_mitigation);
+        assert!(
+            !load_daemon_config(&cli.global)
+                .0
+                .escalation
+                .allow_auto_mitigation
+        );
         let mut child = std::process::Command::new("pt-core");
         apply_daemon_global_args(&mut child, &cli.global);
         assert_eq!(
@@ -20434,14 +20449,7 @@ mod tui_learning_tests {
         let config = shadow_config(directory.path());
         seed_prediction(&commands[&21], &config);
         assert_eq!(
-            record_confirmed_spares(
-                &mut store,
-                &commands,
-                &[],
-                &[21, 21],
-                &config,
-            )
-            .unwrap(),
+            record_confirmed_spares(&mut store, &commands, &[], &[21, 21], &config,).unwrap(),
             1
         );
         let loaded = DecisionStore::load(directory.path()).unwrap();
@@ -21672,7 +21680,12 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
     };
 
     let system_state = match &scan_result {
-        Some(scan) => collect_planning_activity(&mut scorer, &scan.processes, args.window_ms),
+        Some(scan) => collect_planning_activity(
+            &mut scorer,
+            &scan.processes,
+            args.window_ms,
+            scan.metadata.warnings.is_empty(),
+        ),
         None => collect_system_state(None),
     };
     if let Err(error) = write_system_state_to_session(&handle, &system_state) {
@@ -21807,6 +21820,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                 "recommended_action": advice.action,
                 "action_rationale": advice.rationale,
                 "respawn_history": score.respawn_history,
+                "work": score.work,
                 "supervisor_restart": score.supervisor_restart,
                 "supervisor_restart_unavailable": score.supervisor_restart_unavailable,
             }));
@@ -21921,6 +21935,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                         "cpu_lifetime_percent": p.cpu_percent,
                         "activity": activity,
                         "respawn_history": scorer.respawn_history_for(p),
+                        "work": scorer.workload_diagnosis_for(p),
                         "supervisor_restart": scorer.supervisor_restart_for(p),
                         "supervisor_restart_unavailable": scorer.supervisor_restart_unavailable_for(p),
                         "responsible_unit": responsible_unit_summary(
@@ -22059,6 +22074,9 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                 "[{}] agent snapshot: created ({} procs, {:.0}/{:.0}GB mem)",
                 session_id, procs, mem, total
             );
+            for line in workload_summary_lines(&system_state["workloads"]) {
+                println!("{line}");
+            }
         }
         OutputFormat::Exitcode => {}
         _ => {
@@ -22107,6 +22125,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
             if let Some(table) = &responsible_units {
                 print_responsible_units(table);
             }
+            print_workload_summary(&system_state);
 
             // Display process snapshot if collected
             if let Some(snapshot) = &process_snapshot {
@@ -23037,6 +23056,7 @@ fn collect_planning_activity(
     scorer: &mut Scorer,
     population: &[ProcessRecord],
     window_ms: u64,
+    census_complete: bool,
 ) -> serde_json::Value {
     use pt_core::collect::pressure::{
         host_cpu_window, read_host_cpu_counters, read_pressure_snapshot,
@@ -23089,7 +23109,76 @@ fn collect_planning_activity(
     let mut system = system_state_from_pressure(snapshot, window, Some(population));
     system["cpu_usage"] = serde_json::json!(cpu_usage.ok());
     system["respawn_history"] = collect_planning_respawn_history(scorer, population);
+    system["workloads"] = collect_planning_workloads(scorer, population, census_complete);
     system
+}
+
+/// Diagnose duplicate and competing launches once for the full census. This
+/// runs after sampling, so collector time cannot dilute measured CPU/I/O rates.
+/// Group membership does not add an uncalibrated abandonment likelihood.
+fn collect_planning_workloads(
+    scorer: &mut Scorer,
+    population: &[ProcessRecord],
+    census_complete: bool,
+) -> serde_json::Value {
+    let mut snapshot = pt_core::collect::duplicates::collect_duplicate_work(population);
+    if !census_complete {
+        snapshot.mark_census_incomplete();
+    }
+    let output = serde_json::json!(&snapshot);
+    scorer.set_workload_snapshot(snapshot);
+    output
+}
+
+fn workload_summary_lines(workloads: &serde_json::Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (key, label) in [
+        ("duplicates", "Duplicate launches"),
+        (
+            "competing_builds",
+            "Competing builds with distinct target directories",
+        ),
+    ] {
+        let Some(groups) = workloads[key]
+            .as_array()
+            .filter(|groups| !groups.is_empty())
+        else {
+            continue;
+        };
+        for group in groups.iter().take(8) {
+            let pids = group["members"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|member| member["identity"]["pid"].as_u64())
+                .map(|pid| pid.to_string())
+                .collect::<Vec<_>>();
+            lines.push(format!(
+                "{label}: PIDs {}. Review the workload evidence before changing any process.",
+                pids.join(", ")
+            ));
+        }
+        if groups.len() > 8 {
+            lines.push(format!(
+                "{} more {key} groups in the full JSON report",
+                groups.len() - 8
+            ));
+        }
+    }
+    if !lines.is_empty() && workloads["complete"].as_bool() != Some(true) {
+        lines.push("Workload observation is incomplete; missing evidence does not establish that other builds or lock holders are absent.".to_string());
+    }
+    lines
+}
+
+fn print_workload_summary(system: &serde_json::Value) {
+    let lines = workload_summary_lines(&system["workloads"]);
+    if !lines.is_empty() {
+        println!("\n## Duplicate and Competing Work\n");
+        for line in lines {
+            println!("- {line}");
+        }
+    }
 }
 
 /// Load remediation history once per census. Outcomes are action advice, not
@@ -23511,6 +23600,14 @@ fn candidate_recommendation(
             );
         }
     }
+    if let Some(reason) = workload_preservation_refusal(
+        score.work.as_ref(),
+        action,
+        policy.guardrails.builtin_protection,
+    ) {
+        action = "review";
+        rationale = format!("{reason}; {rationale}");
+    }
     CandidateRecommendation {
         action,
         rationale,
@@ -23519,6 +23616,32 @@ fn candidate_recommendation(
         fuse_server,
         fuse_mounts,
     }
+}
+
+/// A duplicate group is not permission to disrupt its retained build or a
+/// possible lock holder. Apply this same refusal on every presentation surface;
+/// ordinary recommendations for other members still require all existing gates.
+fn workload_preservation_refusal(
+    diagnosis: Option<&pt_core::collect::duplicates::ProcessWorkDiagnosis>,
+    action: &str,
+    builtin_protection: bool,
+) -> Option<String> {
+    if !builtin_protection
+        || !matches!(
+            action,
+            "kill" | "restart" | "pause" | "freeze" | "renice" | "throttle" | "quarantine"
+        )
+    {
+        return None;
+    }
+    let diagnosis = diagnosis.filter(|diagnosis| diagnosis.preserves_work())?;
+    Some(format!(
+        "Downgraded to review: {}",
+        diagnosis
+            .review_reason
+            .as_deref()
+            .unwrap_or("preserve this duplicate build until its ownership is reviewed")
+    ))
 }
 
 /// Check only the mandatory supervision evidence needed to authorize advice.
@@ -24213,8 +24336,12 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     let probe_cost_model = pt_core::decision::ProbeCostModel::default();
     let deep_scan_probe = [pt_core::decision::ProbeType::DeepScan];
     scorer.collect_provenance(&processes_to_infer);
-    let system_state =
-        collect_planning_activity(&mut scorer, &scan_result.processes, args.window_ms);
+    let system_state = collect_planning_activity(
+        &mut scorer,
+        &scan_result.processes,
+        args.window_ms,
+        scan_result.metadata.warnings.is_empty(),
+    );
     let activity_observed_at_ms = chrono::Utc::now().timestamp_millis();
     if let Err(error) = write_system_state_to_session(&handle, &system_state) {
         eprintln!("agent plan: {error}");
@@ -24591,6 +24718,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             "cpu_host_percent": pressure.cpu_goal_percent(proc, activity.as_ref()),
             "activity": activity,
             "respawn_history": scorer.respawn_history_for(proc),
+            "work": scorer.workload_diagnosis_for(proc),
             "supervisor_restart": scorer.supervisor_restart_for(proc),
             "supervisor_restart_unavailable": scorer.supervisor_restart_unavailable_for(proc),
             "resource_observation": resource_observation,
@@ -25638,6 +25766,9 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 kill_candidates.len(),
                 review_candidates.len()
             );
+            for line in workload_summary_lines(&system_state["workloads"]) {
+                println!("{line}");
+            }
             if let Some(text) = goal_summary.as_ref().and_then(pressure_goal_summary_text) {
                 println!("{text}");
             }
@@ -25662,6 +25793,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 println!("\n{}", agent_plan_differential_summary(comparison));
             }
             print_responsible_units(&responsible_units);
+            print_workload_summary(&system_state);
             println!("\n## Candidates\n");
             for candidate in &candidates {
                 let pid = candidate.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -25951,7 +26083,14 @@ fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
             // Human readable markdown output
             println!("# pt-core agent explain\n");
             println!("Session: {}", sid);
-            println!("Evidence: {}", if args.live { "new live observation" } else { "recorded session decision" });
+            println!(
+                "Evidence: {}",
+                if args.live {
+                    "new live observation"
+                } else {
+                    "recorded session decision"
+                }
+            );
             println!();
 
             for expl in &explanations {
@@ -26094,11 +26233,17 @@ fn collect_explain_provenance(
         Err(e) => {
             eprintln!("agent explain: warning: provenance scan failed: {e}");
             scorer.collect_respawn_history(None, &[], chrono::Utc::now());
+            collect_planning_workloads(scorer, &[], false);
             scorer.collect_supervisor_restarts(&[]);
             scorer.collect_provenance(&targets.iter().collect::<Vec<_>>());
             return;
         }
     };
+    collect_planning_workloads(
+        scorer,
+        &population.processes,
+        population.metadata.warnings.is_empty(),
+    );
     let history = collect_planning_respawn_history(scorer, &population.processes);
     if history["available"].as_bool() == Some(false) {
         eprintln!(
@@ -26195,6 +26340,7 @@ fn build_process_explanation(
         "cpu_lifetime_percent": proc.cpu_percent,
         "activity": activity,
         "respawn_history": score.respawn_history,
+        "work": score.work,
         "supervisor_restart": score.supervisor_restart,
         "supervisor_restart_unavailable": score.supervisor_restart_unavailable,
         "classification": ledger.classification.label(),
@@ -27802,7 +27948,9 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             }
 
             skipped += 1;
-            checkpoint_outcome!(serde_json::json!({"action_id": action.action_id, "pid": action.target.pid.0, "status": if global.dry_run { "dry_run" } else { "shadow" }}));
+            checkpoint_outcome!(
+                serde_json::json!({"action_id": action.action_id, "pid": action.target.pid.0, "status": if global.dry_run { "dry_run" } else { "shadow" }})
+            );
             emit_action_event(
                 pt_core::events::event_names::ACTION_COMPLETE,
                 action_index,
@@ -27970,7 +28118,9 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     Ok(false) => {
                         failed += 1;
                         let elapsed_ms = start.elapsed().as_millis() as u64;
-                        checkpoint_outcome!(serde_json::json!({"action_id": action.action_id, "pid": action.target.pid.0, "status": "identity_mismatch", "time_ms": elapsed_ms}));
+                        checkpoint_outcome!(
+                            serde_json::json!({"action_id": action.action_id, "pid": action.target.pid.0, "status": "identity_mismatch", "time_ms": elapsed_ms})
+                        );
                         emit_action_event(
                             pt_core::events::event_names::ACTION_FAILED,
                             action_index,
@@ -27987,7 +28137,9 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     Err(_) => {
                         failed += 1;
                         let elapsed_ms = start.elapsed().as_millis() as u64;
-                        checkpoint_outcome!(serde_json::json!({"action_id": action.action_id, "pid": action.target.pid.0, "status": "identity_check_failed", "time_ms": elapsed_ms}));
+                        checkpoint_outcome!(
+                            serde_json::json!({"action_id": action.action_id, "pid": action.target.pid.0, "status": "identity_check_failed", "time_ms": elapsed_ms})
+                        );
                         emit_action_event(
                             pt_core::events::event_names::ACTION_FAILED,
                             action_index,
@@ -28365,7 +28517,9 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     continue;
                 }
                 skipped += 1;
-                checkpoint_outcome!(serde_json::json!({"action_id": action.action_id, "pid": action.target.pid.0, "status": "unsupported_platform"}));
+                checkpoint_outcome!(
+                    serde_json::json!({"action_id": action.action_id, "pid": action.target.pid.0, "status": "unsupported_platform"})
+                );
                 emit_action_event(
                     pt_core::events::event_names::ACTION_COMPLETE,
                     action_index,
@@ -32178,6 +32332,7 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
 
     let mut baseline: Option<WatchBaseline> = None;
     let mut pressure_watch = WatchPressureState::new();
+    let mut workload_watch = WatchWorkloadState::default();
     let mut previous: HashMap<u32, WatchCandidate> = HashMap::new();
     let interval = Duration::from_secs(args.interval.max(1));
     let notify_cmd = args.notify_cmd.as_deref();
@@ -32234,8 +32389,12 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
             .filter(|proc| proc.pid.0 > 1 && proc.elapsed.as_secs() >= min_age)
             .collect();
         scorer.collect_provenance(&eligible);
-        let system_state =
-            collect_planning_activity(&mut scorer, &scan_result.processes, args.window_ms);
+        let system_state = collect_planning_activity(
+            &mut scorer,
+            &scan_result.processes,
+            args.window_ms,
+            scan_result.metadata.warnings.is_empty(),
+        );
         let pressure = PlanningPressure::from_system_state(&system_state);
         let responsible_units = collect_responsible_units(&scan_result, &scorer, &pressure);
         // These are system events, independent of process age and posterior
@@ -32243,6 +32402,9 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
         // a zombie leak or D-state storm.
         let census = watch_process_census(&scan_result.processes, &scan_result.metadata.warnings);
         let timestamp = chrono::Utc::now().to_rfc3339();
+        if let Some(event) = workload_watch.update(&system_state, &timestamp) {
+            emit_watch_event(&event, notify_exec, notify_cmd, notify_args);
+        }
         for mut event in pressure_watch.update(
             pressure.snapshot.as_ref(),
             census.as_ref(),
@@ -32436,6 +32598,7 @@ fn evaluate_watch_candidate(
             "action_target": action_target,
             "activity": score.activity,
             "respawn_history": score.respawn_history,
+            "work": score.work,
             "supervisor_restart": score.supervisor_restart,
             "supervisor_restart_unavailable": score.supervisor_restart_unavailable,
             "cpu_percent": process_cpu_percent(proc, score.activity.as_ref()),
@@ -32497,6 +32660,226 @@ fn severity_label(severity: WatchSeverity) -> &'static str {
 struct WatchBaseline {
     load1: f64,
     available_gb: f64,
+}
+
+/// Workload findings are independent of age/posterior filters. Publish changes
+/// in membership or lock roles, not a new event just because a scan time changed.
+#[derive(Default)]
+struct WatchWorkloadState {
+    previous: Option<serde_json::Value>,
+    saw_groups: bool,
+}
+
+impl WatchWorkloadState {
+    fn update(&mut self, system: &serde_json::Value, timestamp: &str) -> Option<serde_json::Value> {
+        let workloads = system.get("workloads")?;
+        let duplicates = workloads.get("duplicates")?.as_array()?;
+        let competing = workloads.get("competing_builds")?.as_array()?;
+        let complete = workloads["complete"].as_bool() == Some(true);
+        let has_groups = !duplicates.is_empty() || !competing.is_empty();
+        let observed = serde_json::json!({
+            "duplicates": duplicates,
+            "competing_builds": competing,
+            "complete": complete,
+        });
+        if self.previous.as_ref() == Some(&observed) {
+            return None;
+        }
+        self.previous = Some(observed);
+        if !has_groups && !self.saw_groups {
+            return None;
+        }
+        // An incomplete census can neither retire an earlier finding nor imply
+        // that the retained job and its lock holder have exited.
+        if complete {
+            self.saw_groups = has_groups;
+        } else {
+            self.saw_groups |= has_groups;
+        }
+        Some(serde_json::json!({
+            "event": "workload_diagnostics",
+            "timestamp": timestamp,
+            "status": if !complete { "incomplete" } else if has_groups { "observed" } else { "no_longer_observed" },
+            "workloads": workloads,
+            "pressure_assessment": system["assessment"],
+            "automatic_action_authorized": false,
+        }))
+    }
+}
+
+#[cfg(test)]
+mod workload_diagnostics_tests {
+    use super::*;
+    use pt_core::collect::duplicates::{DuplicateRole, ProcessWorkDiagnosis};
+
+    fn diagnosis(role: DuplicateRole) -> ProcessWorkDiagnosis {
+        ProcessWorkDiagnosis {
+            identity: ProcessIdentity::full(
+                41,
+                StartId::from_linux("workload-test-boot", 100, 41),
+                1000,
+                Some(40),
+                Some(40),
+                IdentityQuality::Full,
+            ),
+            parent_pid: 40,
+            record_command_sha256: "recorded-command".to_string(),
+            duplicate_group_id: Some("duplicate-group".to_string()),
+            duplicate_role: Some(role),
+            competing_group_ids: Vec::new(),
+            review_reason: Some("preserve useful or potentially locked work".to_string()),
+        }
+    }
+
+    #[test]
+    fn preserved_work_does_not_enter_an_executable_plan() {
+        use pt_core::decision::decide_action;
+        use pt_core::inference::ClassScores;
+
+        let policy = pt_core::config::Policy::default();
+        let posterior = ClassScores {
+            useful: 0.001,
+            useful_bad: 0.0,
+            abandoned: 0.999,
+            zombie: 0.0,
+        };
+        let decision = decide_action(&posterior, &policy, &ActionFeasibility::allow_all()).unwrap();
+        assert_eq!(decision.optimal_action, Action::Kill);
+        for role in [
+            DuplicateRole::PreferredNewest,
+            DuplicateRole::ProtectedLockHolder,
+            DuplicateRole::Undetermined,
+        ] {
+            let diagnosis = diagnosis(role);
+            for action in [
+                "kill",
+                "restart",
+                "pause",
+                "freeze",
+                "renice",
+                "throttle",
+                "quarantine",
+            ] {
+                assert!(workload_preservation_refusal(Some(&diagnosis), action, true).is_some());
+            }
+            for action in ["keep", "review", "resume", "unfreeze", "unquarantine"] {
+                assert!(workload_preservation_refusal(Some(&diagnosis), action, true).is_none());
+            }
+            let final_action =
+                if workload_preservation_refusal(Some(&diagnosis), "kill", true).is_some() {
+                    "review"
+                } else {
+                    "kill"
+                };
+            let inputs = HashMap::from([(
+                41,
+                DecisionCandidate {
+                    identity: diagnosis.identity,
+                    ppid: Some(40),
+                    decision: decision.clone(),
+                    blocked_reasons: Vec::new(),
+                    stage_pause_before_kill: false,
+                    process_state: Some(ProcessState::Sleeping),
+                    parent_identity: None,
+                    d_state_diagnostics: None,
+                    supervisor_restart: None,
+                },
+            )]);
+            let plan = build_agent_action_plan(
+                &SessionId::new(),
+                &policy,
+                &[serde_json::json!({"pid": 41, "recommended_action": final_action})],
+                &inputs,
+                "2026-11-11T00:00:00Z".to_string(),
+            );
+            assert!(plan
+                .actions
+                .iter()
+                .all(|action| action.action == Action::Keep));
+        }
+        for role in [
+            DuplicateRole::RedundantOlder,
+            DuplicateRole::RedundantWaiter,
+        ] {
+            // Lack of a preservation veto is not a new action authorization.
+            assert!(workload_preservation_refusal(Some(&diagnosis(role)), "keep", true).is_none());
+            assert!(
+                workload_preservation_refusal(Some(&diagnosis(role)), "review", true).is_none()
+            );
+        }
+    }
+
+    fn observed_workloads() -> serde_json::Value {
+        serde_json::json!({
+            "workloads": {
+                "observed_at": "first",
+                "complete": true,
+                "duplicates": [{
+                    "id": "build",
+                    "members": [
+                        {"identity": {"pid": 41}, "role": "redundant_older"},
+                        {"identity": {"pid": 42}, "role": "preferred_newest"},
+                    ],
+                }],
+                "competing_builds": [],
+            },
+        })
+    }
+
+    #[test]
+    fn watch_reports_role_changes_without_repeating_scan_timestamps() {
+        let mut state = WatchWorkloadState::default();
+        let mut system = observed_workloads();
+        let first = state.update(&system, "t1").unwrap();
+        assert_eq!(first["status"], "observed");
+        assert_eq!(first["automatic_action_authorized"], false);
+        system["workloads"]["observed_at"] = serde_json::json!("second");
+        assert!(state.update(&system, "t2").is_none());
+        system["workloads"]["duplicates"][0]["members"][0]["role"] =
+            serde_json::json!("protected_lock_holder");
+        let changed = state.update(&system, "t3").unwrap();
+        assert_eq!(changed["timestamp"], "t3");
+        assert_eq!(
+            changed["workloads"]["duplicates"][0]["members"][0]["role"],
+            "protected_lock_holder"
+        );
+    }
+
+    #[test]
+    fn incomplete_watch_census_cannot_clear_an_observed_group() {
+        let mut state = WatchWorkloadState::default();
+        let mut system = observed_workloads();
+        assert!(state.update(&system, "t1").is_some());
+        system["workloads"]["duplicates"] = serde_json::json!([]);
+        system["workloads"]["complete"] = serde_json::json!(false);
+        let partial = state.update(&system, "t2").unwrap();
+        assert_eq!(partial["status"], "incomplete");
+        assert!(state.saw_groups);
+        assert!(state.update(&system, "t3").is_none());
+        system["workloads"]["complete"] = serde_json::json!(true);
+        let clear = state.update(&system, "t4").unwrap();
+        assert_eq!(clear["status"], "no_longer_observed");
+        assert!(!state.saw_groups);
+        assert!(state.update(&system, "t5").is_none());
+    }
+
+    #[test]
+    fn workload_summary_is_bounded_and_does_not_expose_command_context() {
+        let mut system = observed_workloads();
+        let mut group = system["workloads"]["duplicates"][0].clone();
+        group["private_workspace"] = serde_json::json!("/private/workspace");
+        group["members"][0]["comm"] = serde_json::json!("secret-command");
+        system["workloads"]["duplicates"] = serde_json::json!(vec![group; 11]);
+        system["workloads"]["complete"] = serde_json::json!(false);
+        let lines = workload_summary_lines(&system["workloads"]);
+        assert_eq!(lines.len(), 10);
+        assert!(lines[0].contains("PIDs 41, 42"));
+        assert!(lines[8].contains("3 more"));
+        assert!(lines[9].contains("incomplete"));
+        let rendered = lines.join("\n");
+        assert!(!rendered.contains("secret-command"));
+        assert!(!rendered.contains("/private/workspace"));
+    }
 }
 
 const WATCH_PRESSURE_ENTER_SAMPLES: u32 = 2;

@@ -123,6 +123,18 @@ impl Evaluator {
             .collect()
     }
 
+    /// Collect across the full census, so age/protection filters cannot hide a
+    /// duplicate's newer peer or lock holder. Call after activity sampling.
+    fn collect_workloads(&mut self, scan: &ScanResult) -> serde_json::Value {
+        let mut workloads = crate::collect::duplicates::collect_duplicate_work(&scan.processes);
+        if !scan.metadata.warnings.is_empty() {
+            workloads.mark_census_incomplete();
+        }
+        let output = serde_json::json!(&workloads);
+        self.scorer.set_workload_snapshot(workloads);
+        output
+    }
+
     fn collect_deep_evidence(&mut self, scan: &ScanResult) -> serde_json::Value {
         #[cfg(target_os = "linux")]
         {
@@ -422,7 +434,9 @@ fn label_command_args(params: &serde_json::Value) -> Result<Vec<String>, String>
                 let comm = value
                     .as_str()
                     .filter(|comm| !comm.trim().is_empty() && !comm.contains('\0'))
-                    .ok_or_else(|| "comm must be a nonempty string without NUL bytes".to_string())?;
+                    .ok_or_else(|| {
+                        "comm must be a nonempty string without NUL bytes".to_string()
+                    })?;
                 args.push(format!("--comm={comm}"));
             }
         }
@@ -660,6 +674,7 @@ fn tool_scan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
     evaluator
         .scorer
         .collect_activity(&eligible, Duration::from_millis(window_ms));
+    let workloads = evaluator.collect_workloads(&scan_result);
 
     // Score = P(abandoned or zombie) from the same posterior `agent plan` uses (it was
     // a signature-match score plus a state bonus, not a probability).
@@ -703,6 +718,7 @@ fn tool_scan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
         "platform": scan_result.metadata.platform,
         "warnings": scan_result.metadata.warnings,
         "deep_scan": deep_scan,
+        "workloads": workloads,
         "window_ms": window_ms,
         "total_processes": scan_result.processes.len(),
         "min_age_seconds": evaluator.min_age_seconds,
@@ -732,6 +748,7 @@ fn tool_scan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
                 "elapsed_sec": p.elapsed.as_secs(),
                 "tty": p.tty,
                 "deep_evidence": evaluator.deep_evidence(p),
+                "work": evaluator.scorer.workload_diagnosis_for(p),
                 "score": score,
                 "suspicion_score": posterior.suspicion_score(),
                 "posterior": posterior,
@@ -789,6 +806,7 @@ fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
             evaluator
                 .scorer
                 .collect_activity(&[p], Duration::from_millis(window_ms));
+            let workloads = evaluator.collect_workloads(&scan);
             let activity = evaluator.scorer.activity_for(p);
             let matches = evaluator.scorer.signatures.match_process(&ctx);
             let score = evaluator.score(p);
@@ -846,6 +864,8 @@ fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
                 "learned_prior": learned_prior,
                 "desktop_app": desktop_app,
                 "desktop_app_credited": desktop_app_credited,
+                "work": evaluator.scorer.workload_diagnosis_for(p),
+                "workloads": workloads,
                 "evidence": evidence_terms,
             });
 

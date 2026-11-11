@@ -124,6 +124,8 @@ pub struct ReplayScoreResult {
     pub ledger: Option<EvidenceLedger>,
     pub prior_source: Option<String>,
     pub signature: Option<String>,
+    /// Captured workload diagnosis; replay never refreshes it from live PIDs.
+    pub work: Option<crate::collect::duplicates::ProcessWorkDiagnosis>,
 }
 
 /// Shared-scoring output, deliberately separate from an executable plan.
@@ -364,7 +366,11 @@ pub fn capture_snapshot(
             },
             |_| None,
         );
-        let passed: HashSet<u32> = filtered.passed.iter().map(|process| process.pid.0).collect();
+        let passed: HashSet<u32> = filtered
+            .passed
+            .iter()
+            .map(|process| process.pid.0)
+            .collect();
         let eligible: Vec<&ProcessRecord> = scan
             .processes
             .iter()
@@ -379,6 +385,11 @@ pub fn capture_snapshot(
             .collect();
 
         scorer.collect_activity(&eligible, window);
+        let mut workloads = crate::collect::duplicates::collect_duplicate_work(&scan.processes);
+        if !scan.metadata.warnings.is_empty() {
+            workloads.mark_census_incomplete();
+        }
+        scorer.set_workload_snapshot(workloads);
         scorer.collect_provenance(&eligible);
         let eligible_pids: HashSet<u32> = eligible.iter().map(|process| process.pid.0).collect();
         for process in &scan.processes {
@@ -418,7 +429,9 @@ pub fn capture_snapshot(
 
 /// Reject omitted context instead of treating a recording as fresh live data.
 /// Explicit capture failures are valid rows; they stay unavailable in the report.
-fn validate_scoring_context(snapshot: &ReplaySnapshot) -> Result<&ReplayScoringContext, ReplayError> {
+fn validate_scoring_context(
+    snapshot: &ReplaySnapshot,
+) -> Result<&ReplayScoringContext, ReplayError> {
     let context = snapshot.scoring_context.as_ref().ok_or_else(|| {
         ReplayError::ScoringContext(
             "inventory-only snapshot; capture again with scan --record-replay".to_string(),
@@ -480,8 +493,7 @@ fn validate_scoring_context(snapshot: &ReplaySnapshot) -> Result<&ReplayScoringC
         }
         match (&observations.activity, context.requested_window_ms) {
             (None, 0) => {}
-            (Some(activity), window)
-                if window > 0 && activity.requested_window_ms == window => {}
+            (Some(activity), window) if window > 0 && activity.requested_window_ms == window => {}
             _ => {
                 return Err(ReplayError::ScoringContext(format!(
                     "missing or inconsistent activity window for PID {}",
@@ -545,6 +557,10 @@ pub fn replay_scores(
             ledger: None,
             prior_source: None,
             signature: None,
+            work: input
+                .observations
+                .as_ref()
+                .and_then(|observations| observations.work.clone()),
         };
         if input.cgroup_role.is_none() {
             // An identity failure cannot supply even an apparent safe placement.
@@ -559,7 +575,8 @@ pub fn replay_scores(
             || process.elapsed.as_secs() < policy.guardrails.min_process_age_seconds
         {
             row.status = ReplayScoreStatus::TooYoung;
-            row.reason = Some("not eligible under the current minimum-age/identity policy".to_string());
+            row.reason =
+                Some("not eligible under the current minimum-age/identity policy".to_string());
         } else if let Some(observations) = &input.observations {
             match scorer.score_recorded(
                 process,
@@ -571,7 +588,9 @@ pub fn replay_scores(
                     row.reason = None;
                     row.posterior = Some(score.posterior.posterior);
                     row.prior_source = Some(score.prior_source);
-                    row.signature = score.signature.map(|matched| matched.signature.name.clone());
+                    row.signature = score
+                        .signature
+                        .map(|matched| matched.signature.name.clone());
                     row.ledger = Some(score.ledger);
                 }
                 None => {
@@ -941,7 +960,9 @@ mod tests {
         assert_eq!(report.unavailable_count, 1);
         assert_eq!(report.processes.len(), 5);
         assert!(report.processes[0].ledger.is_some());
-        assert!(report.processes[1..].iter().all(|row| row.posterior.is_none()));
+        assert!(report.processes[1..]
+            .iter()
+            .all(|row| row.posterior.is_none()));
         assert!(report.scoring_only);
         assert!(!serde_json::to_string(&report)
             .unwrap()
@@ -951,7 +972,9 @@ mod tests {
     #[test]
     fn scoring_replay_uses_shared_signature_and_human_prior_precedence() {
         use crate::decision::decision_store::Verdict;
-        use crate::supervision::signature::{SignatureDatabase, SignaturePriors, SupervisorSignature};
+        use crate::supervision::signature::{
+            SignatureDatabase, SignaturePriors, SupervisorSignature,
+        };
         use crate::supervision::SupervisorCategory;
 
         let mut signatures = SignatureDatabase::new();
@@ -967,19 +990,30 @@ mod tests {
         let snapshot = scoring_fixture(vec![scoring_process(201, "worker", 7200)], &scorer);
         let policy = Policy::default();
         let signed = replay_scores(&snapshot, &scorer, &policy).unwrap();
-        assert_eq!(signed.processes[0].prior_source.as_deref(), Some("signature"));
+        assert_eq!(
+            signed.processes[0].prior_source.as_deref(),
+            Some("signature")
+        );
         assert_eq!(
             signed.processes[0].signature.as_deref(),
             Some("recorded-worker")
         );
         for _ in 0..12 {
-            scorer.decisions.record("worker", "worker --job", Verdict::Spare);
+            scorer
+                .decisions
+                .record("worker", "worker --job", Verdict::Spare);
         }
         let learned = replay_scores(&snapshot, &scorer, &policy).unwrap();
         assert_eq!(learned.processes[0].prior_source.as_deref(), Some("user"));
         assert!(
-            learned.processes[0].posterior.unwrap().abandonment_probability()
-                < signed.processes[0].posterior.unwrap().abandonment_probability()
+            learned.processes[0]
+                .posterior
+                .unwrap()
+                .abandonment_probability()
+                < signed.processes[0]
+                    .posterior
+                    .unwrap()
+                    .abandonment_probability()
         );
     }
 
@@ -1000,7 +1034,12 @@ mod tests {
         rejects(&changed);
 
         let mut changed = original.clone();
-        changed.scoring_context.as_mut().unwrap().processes.remove(&301);
+        changed
+            .scoring_context
+            .as_mut()
+            .unwrap()
+            .processes
+            .remove(&301);
         rejects(&changed);
 
         let mut changed = original.clone();
@@ -1016,7 +1055,11 @@ mod tests {
         rejects(&changed);
 
         let mut changed = original.clone();
-        changed.scoring_context.as_mut().unwrap().requested_window_ms = 500;
+        changed
+            .scoring_context
+            .as_mut()
+            .unwrap()
+            .requested_window_ms = 500;
         rejects(&changed);
 
         let mut changed = original.clone();

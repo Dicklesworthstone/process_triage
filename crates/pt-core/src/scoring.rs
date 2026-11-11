@@ -27,6 +27,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::action::SystemdUserServiceBinding;
+use crate::collect::duplicates::{DuplicateWorkSnapshot, ProcessWorkDiagnosis};
 use crate::collect::{ProcessActivity, ProcessRecord};
 use crate::config::{Policy, Priors, ResolvedConfig};
 use crate::decision::decision_store::{DecisionStore, LearnedPrior};
@@ -270,6 +271,9 @@ pub struct ProcessScore<'a> {
     /// Observed kill/respawn history for this command and exact parent incarnation.
     /// This informs action utility and review, never the class posterior.
     pub respawn_history: Option<RespawnLoopSummary>,
+    /// Identity-bound duplicate/competing-work diagnosis. This informs review
+    /// and preservation of useful work, never the abandonment posterior.
+    pub work: Option<ProcessWorkDiagnosis>,
     /// A separately observed service route; it never changes class probabilities.
     pub supervisor_restart: Option<SystemdUserServiceBinding>,
     pub supervisor_restart_unavailable: Option<String>,
@@ -308,6 +312,10 @@ pub struct ScoringObservations {
     pub activity: Option<ProcessActivity>,
     #[serde(deserialize_with = "Option::deserialize")]
     pub respawn_history: Option<RespawnLoopSummary>,
+    /// Older recordings contain no work census. Absence is unknown, not proof
+    /// that the process was the only build of its workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work: Option<ProcessWorkDiagnosis>,
     #[serde(deserialize_with = "Option::deserialize")]
     pub supervisor_restart: Option<SystemdUserServiceBinding>,
     #[serde(deserialize_with = "Option::deserialize")]
@@ -328,6 +336,10 @@ impl ScoringObservations {
                 .activity
                 .as_ref()
                 .is_none_or(|activity| activity.matches_record(process))
+            && self
+                .work
+                .as_ref()
+                .is_none_or(|work| work.matches_record(process))
     }
 }
 
@@ -342,6 +354,7 @@ pub struct Scorer {
     activity_window: Option<Duration>,
     activity: BTreeMap<u32, ProcessActivity>,
     respawn_history: BTreeMap<u32, (pt_common::StartId, u32, RespawnLoopSummary)>,
+    work: Option<DuplicateWorkSnapshot>,
     supervisor_restarts: BTreeMap<u32, SupervisorRestartObservation>,
     #[cfg(target_os = "linux")]
     provenance: Option<ProvenanceInferenceBundle>,
@@ -370,6 +383,7 @@ impl Scorer {
             activity_window: None,
             activity: BTreeMap::new(),
             respawn_history: BTreeMap::new(),
+            work: None,
             supervisor_restarts: BTreeMap::new(),
             #[cfg(target_os = "linux")]
             provenance: None,
@@ -420,6 +434,18 @@ impl Scorer {
         {
             let _ = processes;
         }
+    }
+
+    /// Replace the full workload census on every scan. The caller collects it
+    /// over the population, before age/protection/posterior filters; otherwise a
+    /// protected lock holder could disappear from a duplicate group's advice.
+    pub fn set_workload_snapshot(&mut self, snapshot: DuplicateWorkSnapshot) {
+        self.work = Some(snapshot);
+    }
+
+    /// Never transfer a duplicate role to a reused PID or changed job identity.
+    pub fn workload_diagnosis_for(&self, process: &ProcessRecord) -> Option<ProcessWorkDiagnosis> {
+        self.work.as_ref()?.diagnosis_for(process)
     }
 
     /// Discover read-only service capabilities once per census. A refresh drops
@@ -630,6 +656,7 @@ impl Scorer {
             desktop_app,
             activity: self.activity_for(process),
             respawn_history: self.respawn_history_for(process).cloned(),
+            work: self.workload_diagnosis_for(process),
             supervisor_restart: self.supervisor_restart_for(process).cloned(),
             supervisor_restart_unavailable: self
                 .supervisor_restart_unavailable_for(process)
@@ -672,6 +699,7 @@ impl Scorer {
         let desktop_app = observations.desktop_app;
         let activity = observations.activity;
         let respawn_history = observations.respawn_history;
+        let work = observations.work;
         if let Some(activity) = &activity {
             evidence.cpu = activity.cpu_percent.map(|percent| CpuEvidence::Fraction {
                 occupancy: (percent / 100.0).clamp(0.0, 1.0),
@@ -889,6 +917,13 @@ impl Scorer {
             }
         }
 
+        if let Some(diagnosis) = &work {
+            if let Some(reason) = &diagnosis.review_reason {
+                ledger.top_evidence.push(reason.clone());
+                ledger.why_summary.push_str(&format!(" {reason}"));
+            }
+        }
+
         Some(ProcessScore {
             posterior,
             ledger,
@@ -898,6 +933,7 @@ impl Scorer {
             signature_age_weight,
             learned_prior,
             respawn_history,
+            work,
             supervisor_restart: observations.supervisor_restart,
             supervisor_restart_unavailable: observations.supervisor_restart_unavailable,
             fast_path_used: false,
@@ -1496,6 +1532,106 @@ mod tests {
     }
 
     const FOUR_DAYS: Duration = Duration::from_secs(4 * 24 * 3600);
+
+    fn work_diagnosis(process: &ProcessRecord) -> ProcessWorkDiagnosis {
+        use crate::collect::duplicates::record_command_digest;
+        serde_json::from_value(serde_json::json!({
+            "identity": pt_common::ProcessIdentity::full(
+                process.pid.0,
+                process.start_id.clone(),
+                process.uid,
+                process.pgid,
+                process.sid,
+                pt_common::IdentityQuality::Full,
+            ),
+            "parent_pid": process.ppid.0,
+            "record_command_sha256": record_command_digest(process),
+            "duplicate_group_id": "observed-duplicate-group",
+            "duplicate_role": "preferred_newest",
+            "competing_group_ids": [],
+            "review_reason": "Preserve the newest observed independent build; review older copies.",
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn workload_diagnostics_survive_recording_without_changing_probabilities() {
+        let scorer = scorer(SignatureDatabase::with_defaults());
+        let process = record(9001, "cargo", "cargo build --all-targets", FOUR_DAYS);
+        let mut observations = scorer.recorded_observations(&process, None);
+        let before = scorer
+            .score_recorded(
+                &process,
+                Evidence::from_snapshot(&process),
+                observations.clone(),
+            )
+            .unwrap();
+        observations.work = Some(work_diagnosis(&process));
+        let recorded: ScoringObservations =
+            serde_json::from_slice(&serde_json::to_vec(&observations).unwrap()).unwrap();
+        let after = scorer
+            .score_recorded(&process, Evidence::from_snapshot(&process), recorded)
+            .unwrap();
+        assert_eq!(before.posterior.posterior, after.posterior.posterior);
+        assert_eq!(
+            serde_json::to_value(&before.posterior.evidence_terms).unwrap(),
+            serde_json::to_value(&after.posterior.evidence_terms).unwrap(),
+        );
+        assert_eq!(before.ledger.classification, after.ledger.classification);
+        assert!(after
+            .ledger
+            .why_summary
+            .contains("newest observed independent build"));
+        assert!(after.work.unwrap().preserves_work());
+    }
+
+    #[test]
+    fn recorded_work_diagnosis_rejects_reused_identity_and_changed_work() {
+        let scorer = scorer(SignatureDatabase::new());
+        let process = record(9001, "cargo", "cargo check", FOUR_DAYS);
+        let mut observations = scorer.recorded_observations(&process, None);
+        observations.work = Some(work_diagnosis(&process));
+        for changed in ["start", "uid", "parent", "group", "session", "argv", "comm"] {
+            let mut other = process.clone();
+            match changed {
+                "start" => other.start_id = StartId::from_linux("test-boot-id", 987, 9001),
+                "uid" => other.uid += 1,
+                "parent" => other.ppid.0 += 1,
+                "group" => other.pgid = Some(7),
+                "session" => other.sid = Some(7),
+                "argv" => other.cmd = "cargo build".to_string(),
+                "comm" => other.comm = "different".to_string(),
+                _ => unreachable!(),
+            }
+            assert!(
+                scorer
+                    .score_recorded(
+                        &other,
+                        Evidence::from_snapshot(&other),
+                        observations.clone()
+                    )
+                    .is_none(),
+                "stale workload diagnosis survived changed {changed}"
+            );
+        }
+    }
+
+    #[test]
+    fn older_recording_has_unknown_work_diagnosis() {
+        let scorer = scorer(SignatureDatabase::new());
+        let process = record(9001, "cargo", "cargo check", FOUR_DAYS);
+        let mut recorded =
+            serde_json::to_value(scorer.recorded_observations(&process, None)).unwrap();
+        recorded.as_object_mut().unwrap().remove("work");
+        let restored: ScoringObservations = serde_json::from_value(recorded.clone()).unwrap();
+        assert!(restored.work.is_none());
+        // Review labels bind the canonical capture hash. Loading an older
+        // recording must not insert a new null field and invalidate its labels.
+        assert_eq!(serde_json::to_value(&restored).unwrap(), recorded);
+        assert!(scorer
+            .score_recorded(&process, Evidence::from_snapshot(&process), restored)
+            .is_some());
+    }
 
     #[test]
     fn configuration_returns_signature_load_failures_in_model_warnings() {

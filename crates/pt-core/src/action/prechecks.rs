@@ -484,7 +484,7 @@ fn proc_locks_mentions_pid(content: &str, pid: u32) -> Result<bool, String> {
 /// Validate the complete kernel lock record before interpreting its owner.
 /// OFD locks use owner -1; fdinfo, rather than that value, attributes them.
 #[cfg(any(target_os = "linux", test))]
-fn parse_proc_lock_owner(line: &str) -> Result<i64, String> {
+pub(crate) fn parse_proc_lock_owner(line: &str) -> Result<i64, String> {
     let mut parts = line.split_whitespace().peekable();
     parts
         .next()

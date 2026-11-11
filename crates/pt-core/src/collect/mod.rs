@@ -28,6 +28,7 @@ pub mod container;
 pub mod cpu_capacity;
 #[cfg(target_os = "linux")]
 mod deep_scan;
+pub mod duplicates;
 #[cfg(target_os = "linux")]
 pub mod gpu;
 pub mod incremental;

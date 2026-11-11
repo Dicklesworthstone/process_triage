@@ -683,6 +683,38 @@ with reasons; observed zero remains zero. Tree-only groups have no exclusive
 kernel accounting scope. Verified pane IDs and automatic group actions remain
 unimplemented.
 
+#### Duplicate and competing builds
+
+On Linux, full `agent plan` and `agent snapshot` output includes
+`system_state.workloads`. It diagnoses repeated independent launches in a
+workspace and builds using different explicitly configured target directories.
+The collection includes young and protected processes, so filtering the action
+list cannot hide the build that owns a lock. It records process identities and
+hashes of command, workspace, directory, and selected build configuration;
+environment values and directory names are not copied into these diagnostics.
+
+Duplicate groups distinguish the preferred newest launch, observed lock holders,
+waiting or older copies, and cases where lock ownership is unknown. With built-in
+protection enabled, disruptive recommendations for the retained build or an
+uncertain lock holder require review. A duplicate finding does not increase the
+abandonment probability or authorize a kill. Existing protection, identity,
+process-tree, and data-loss checks still apply to every other member.
+
+Each affected candidate has a `work` field, and its evidence explanation appears
+in the TUI and `agent explain`. `agent watch` emits `workload_diagnostics` when
+group membership or lock roles change, independently of candidate age and
+posterior thresholds. Incomplete observations are reported explicitly and never
+treated as proof that contention has cleared. Full plans retain the observation
+in `scan/system_state.json`; compact output modes can omit the table.
+MCP `pt_scan` and `pt_explain` expose the same census and per-process diagnosis.
+Replay captures retain observed roles with the original process identity; replay
+does not consult current processes or turn these diagnostics into action permission.
+
+Different target directories are a contention diagnosis to review alongside CPU
+and I/O pressure, not evidence that either build is abandoned. The detector does
+not infer arbitrary Cargo configuration or rewrite build commands. Unsupported,
+unreadable, ambiguous, and over-budget observations remain unknown.
+
 #### Resource trends from saved observations
 
 `pt agent plan --include-predictions` estimates RSS and windowed CPU trends from
