@@ -53,56 +53,77 @@ pub enum RestorationStatus {
 }
 
 /// Typed controls prevent a receipt from authorizing an arbitrary file write.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "control", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReversalValue {
-    Freeze { requested: bool },
-    CpuMax { quota_us: i64, period_us: u64 },
+    Freeze {
+        requested: bool,
+    },
+    CpuMax {
+        quota_us: i64,
+        period_us: u64,
+    },
+    /// Canonical requested CPU list. Empty preserves inheritance from the
+    /// parent; effective CPUs are observed afresh and are never written.
+    Cpuset {
+        cpus: String,
+    },
 }
 
 #[cfg(target_os = "linux")]
 impl ReversalValue {
-    fn same_control(self, other: Self) -> bool {
+    fn same_control(&self, other: &Self) -> bool {
         matches!(
             (self, other),
-            (Self::Freeze { .. }, Self::Freeze { .. }) | (Self::CpuMax { .. }, Self::CpuMax { .. })
+            (Self::Freeze { .. }, Self::Freeze { .. })
+                | (Self::CpuMax { .. }, Self::CpuMax { .. })
+                | (Self::Cpuset { .. }, Self::Cpuset { .. })
         )
     }
 
-    fn validate(self) -> Result<(), ActionError> {
+    fn validate(&self) -> Result<(), ActionError> {
         if let Self::CpuMax {
             quota_us,
             period_us,
         } = self
         {
-            if (quota_us != -1 && quota_us < 1_000) || !(1_000..=1_000_000).contains(&period_us) {
+            if (*quota_us != -1 && *quota_us < 1_000) || !(1_000..=1_000_000).contains(period_us) {
                 return Err(failed("invalid saved CPU bandwidth limit"));
+            }
+        }
+        if let Self::Cpuset { cpus } = self {
+            if !cpus.is_empty() && super::cpuset_quarantine::CpuSet::parse(cpus)?.as_list() != *cpus
+            {
+                return Err(failed("saved cpuset is not a canonical CPU list"));
             }
         }
         Ok(())
     }
 
-    fn filename(self) -> &'static str {
+    fn filename(&self) -> &'static str {
         match self {
             Self::Freeze { .. } => "cgroup.freeze",
             Self::CpuMax { .. } => "cpu.max",
+            Self::Cpuset { .. } => "cpuset.cpus",
         }
     }
 
-    fn contents(self) -> String {
+    fn contents(&self) -> String {
         match self {
-            Self::Freeze { requested } => u8::from(requested).to_string(),
+            Self::Freeze { requested } => u8::from(*requested).to_string(),
             Self::CpuMax {
                 quota_us,
                 period_us,
             } => format!(
                 "{} {period_us}",
-                if quota_us == -1 {
+                if *quota_us == -1 {
                     "max".to_string()
                 } else {
                     quota_us.to_string()
                 }
             ),
+            // A zero-byte write cannot clear a kernfs cpuset assignment.
+            Self::Cpuset { cpus } => format!("{cpus}\n"),
         }
     }
 }
@@ -312,7 +333,7 @@ impl ReversalJournal {
     ) -> Result<Option<RestorationObservation>, ActionError> {
         if !matches!(
             action.action,
-            Action::Freeze | Action::Unfreeze | Action::Throttle
+            Action::Freeze | Action::Unfreeze | Action::Throttle | Action::Quarantine
         ) {
             return Ok(None);
         }
@@ -339,14 +360,14 @@ impl ReversalJournal {
         directory.revalidate()?;
         let observed_at = chrono::Utc::now();
         validate_restoration_times(record, restored, observed_at)?;
-        let ReversalOperation::CgroupV2 { before, .. } = record.operation else {
+        let ReversalOperation::CgroupV2 { before, .. } = &record.operation else {
             return Err(failed("unsupported recorded restoration"));
         };
         Ok(Some(RestorationObservation {
             attempt_id: record.attempt_id.clone(),
             restore_id: restored.restore_id.clone(),
             action_id: record.action_id.clone(),
-            original_value: before,
+            original_value: before.clone(),
             recorded_restored_at: restored.timestamp.clone(),
             observed_at: observed_at.to_rfc3339(),
         }))
@@ -715,7 +736,7 @@ fn validate_record(record: &ReversalRecord) -> Result<(), ActionError> {
             validate_target(&record.target, &scope.boot_id)?;
             before.validate()?;
             applied.validate()?;
-            if !before.same_control(*applied)
+            if !before.same_control(applied)
                 || *verify_timeout_ms > MAX_RESTORE_VERIFY_MS
                 || scope.inode == 0
                 || scope.mount_id == 0
@@ -727,6 +748,7 @@ fn validate_record(record: &ReversalRecord) -> Result<(), ActionError> {
                     (Action::Freeze, ReversalValue::Freeze { requested: true })
                         | (Action::Unfreeze, ReversalValue::Freeze { requested: false })
                         | (Action::Throttle, ReversalValue::CpuMax { .. })
+                        | (Action::Quarantine, ReversalValue::Cpuset { .. })
                 )
             {
                 return Err(failed(
@@ -750,6 +772,20 @@ fn validate_record(record: &ReversalRecord) -> Result<(), ActionError> {
                             > (*previous_quota as u128) * u128::from(*applied_period))
                 {
                     return Err(failed("saved throttle would increase CPU bandwidth"));
+                }
+            }
+            if let (
+                ReversalValue::Cpuset { cpus: previous },
+                ReversalValue::Cpuset { cpus: requested },
+            ) = (before, applied)
+            {
+                let requested = super::cpuset_quarantine::CpuSet::parse(requested)?;
+                if !previous.is_empty()
+                    && !requested.is_subset_of(&super::cpuset_quarantine::CpuSet::parse(previous)?)
+                {
+                    return Err(failed(
+                        "saved quarantine would expand the requested CPU set",
+                    ));
                 }
             }
         }
@@ -911,7 +947,7 @@ fn operations_share_control(left: &ReversalOperation, right: &ReversalOperation)
             a.boot_id == b.boot_id
                 && a.device == b.device
                 && a.inode == b.inode
-                && control_a.same_control(*control_b)
+                && control_a.same_control(control_b)
         }
         _ => false,
     }
@@ -1093,7 +1129,7 @@ pub(crate) fn ensure_control_unowned(
         sessions_root,
         &ReversalOperation::CgroupV2 {
             scope,
-            before: control,
+            before: control.clone(),
             applied: control,
             verify_timeout_ms: 0,
         },
@@ -1422,7 +1458,7 @@ fn observe_restored_control(record: &ReversalRecord) -> Result<(), ActionError> 
         }
         super::dispatch::ensure_exclusive_cgroup_path(record.target.pid.0, &pinned)
     };
-    observe_original_control_at(&pinned, *before, revalidate)
+    observe_original_control_at(&pinned, before, revalidate)
 }
 
 /// Read exact original values twice with scope guards surrounding each sample.
@@ -1430,7 +1466,7 @@ fn observe_restored_control(record: &ReversalRecord) -> Result<(), ActionError> 
 #[cfg(target_os = "linux")]
 fn observe_original_control_at(
     directory: &Path,
-    original: ReversalValue,
+    original: &ReversalValue,
     revalidate: impl Fn() -> Result<(), ActionError>,
 ) -> Result<(), ActionError> {
     original.validate()?;
@@ -1439,18 +1475,25 @@ fn observe_original_control_at(
         match original {
             ReversalValue::Freeze { requested } => {
                 let state = super::freeze::read_freezer_state(directory)?;
-                if state.requested != requested || state.frozen != requested {
+                if state.requested != *requested || state.frozen != *requested {
                     return Err(failed(
                         "original freezer request and completed state are not both present",
                     ));
                 }
             }
             ReversalValue::CpuMax { .. } => {
-                if read_control(directory, original)? != original {
+                if read_control(directory, original)? != *original {
                     return Err(failed(
                         "current CPU limit differs from the recorded original",
                     ));
                 }
+            }
+            ReversalValue::Cpuset { cpus } => {
+                super::cpuset_quarantine::verify_cpuset_assignment(
+                    directory,
+                    "cpuset.cpus.effective",
+                    cpus,
+                )?;
             }
         }
         revalidate()?;
@@ -1475,8 +1518,8 @@ fn restore_record_at(
     };
     restore_control_at(
         directory,
-        *before,
-        *applied,
+        before,
+        applied,
         *verify_timeout_ms,
         !record.is_restored(),
         revalidate,
@@ -1485,9 +1528,9 @@ fn restore_record_at(
 
 #[cfg(target_os = "linux")]
 fn needs_restore(
-    before: ReversalValue,
-    applied: ReversalValue,
-    current: ReversalValue,
+    before: &ReversalValue,
+    applied: &ReversalValue,
+    current: &ReversalValue,
 ) -> Result<bool, ActionError> {
     before.validate()?;
     applied.validate()?;
@@ -1507,7 +1550,11 @@ fn needs_restore(
 }
 
 #[cfg(target_os = "linux")]
-fn read_control(directory: &Path, kind: ReversalValue) -> Result<ReversalValue, ActionError> {
+fn read_control(directory: &Path, kind: &ReversalValue) -> Result<ReversalValue, ActionError> {
+    if matches!(kind, ReversalValue::Cpuset { .. }) {
+        return super::cpuset_quarantine::read_cpuset_assignment(&directory.join("cpuset.cpus"))
+            .map(|cpus| ReversalValue::Cpuset { cpus });
+    }
     let bytes = read_bounded(
         File::open(directory.join(kind.filename()))
             .map_err(|error| failed(format!("cannot read saved controller: {error}")))?,
@@ -1540,6 +1587,7 @@ fn read_control(directory: &Path, kind: ReversalValue) -> Result<ReversalValue, 
                     .map_err(|_| failed("invalid CPU period"))?,
             }
         }
+        ReversalValue::Cpuset { .. } => unreachable!("cpuset uses its bounded CPU-list parser"),
     };
     value.validate()?;
     Ok(value)
@@ -1550,23 +1598,37 @@ fn read_control(directory: &Path, kind: ReversalValue) -> Result<ReversalValue, 
 #[cfg(target_os = "linux")]
 fn restore_control_at(
     directory: &Path,
-    before: ReversalValue,
-    applied: ReversalValue,
+    before: &ReversalValue,
+    applied: &ReversalValue,
     verify_timeout_ms: u64,
     allow_write: bool,
     revalidate: impl Fn() -> Result<(), ActionError>,
 ) -> Result<bool, ActionError> {
     revalidate()?;
     let current = read_control(directory, applied)?;
-    let changed = needs_restore(before, applied, current)?;
+    let changed = needs_restore(before, applied, &current)?;
     if changed && !allow_write {
         return Err(failed(
             "this receipt was already restored; it cannot authorize another controller write",
         ));
     }
+    if let ReversalValue::Cpuset { cpus } = &current {
+        super::cpuset_quarantine::verify_cpuset_assignment(
+            directory,
+            "cpuset.cpus.effective",
+            cpus,
+        )?;
+    }
     revalidate()?;
     if read_control(directory, applied)? != current {
         return Err(failed("controller changed immediately before undo"));
+    }
+    if let ReversalValue::Cpuset { cpus } = &current {
+        super::cpuset_quarantine::verify_cpuset_assignment(
+            directory,
+            "cpuset.cpus.effective",
+            cpus,
+        )?;
     }
     if changed {
         fs::write(directory.join(before.filename()), before.contents())
@@ -1576,7 +1638,7 @@ fn restore_control_at(
     match before {
         ReversalValue::Freeze { requested } => {
             super::freeze::wait_for_frozen_state(
-                requested,
+                *requested,
                 Duration::from_millis(verify_timeout_ms.min(MAX_RESTORE_VERIFY_MS)),
                 || {
                     revalidate()?;
@@ -1587,14 +1649,24 @@ fn restore_control_at(
             )?;
         }
         ReversalValue::CpuMax { .. } => {
-            if read_control(directory, before)? != before {
+            if read_control(directory, before)? != *before {
                 return Err(failed(
                     "restored CPU limit does not match the saved original",
                 ));
             }
             revalidate()?;
-            if read_control(directory, before)? != before {
+            if read_control(directory, before)? != *before {
                 return Err(failed("restored CPU limit changed during verification"));
+            }
+        }
+        ReversalValue::Cpuset { cpus } => {
+            for _ in 0..2 {
+                super::cpuset_quarantine::verify_cpuset_assignment(
+                    directory,
+                    "cpuset.cpus.effective",
+                    cpus,
+                )?;
+                revalidate()?;
             }
         }
     }
@@ -1859,7 +1931,7 @@ mod tests {
             quota_us: -1,
             period_us: 100_000,
         };
-        assert!(observe_original_control_at(directory.path(), original, || Ok(())).is_err());
+        assert!(observe_original_control_at(directory.path(), &original, || Ok(())).is_err());
         assert!(!path.exists());
         for (text, matches) in [
             ("max 100000\n", true),
@@ -1869,7 +1941,7 @@ mod tests {
         ] {
             fs::write(&path, text).unwrap();
             assert_eq!(
-                observe_original_control_at(directory.path(), original, || Ok(())).is_ok(),
+                observe_original_control_at(directory.path(), &original, || Ok(())).is_ok(),
                 matches
             );
             assert_eq!(fs::read_to_string(&path).unwrap(), text);
@@ -1889,7 +1961,7 @@ mod tests {
                     fs::write(directory.path().join("cgroup.freeze"), &request).unwrap();
                     fs::write(directory.path().join("cgroup.events"), &events).unwrap();
                     assert_eq!(
-                        observe_original_control_at(directory.path(), original, || Ok(())).is_ok(),
+                        observe_original_control_at(directory.path(), &original, || Ok(())).is_ok(),
                         current_request == requested && completed == requested,
                     );
                     assert_eq!(
@@ -1916,7 +1988,7 @@ mod tests {
             quota_us: -1,
             period_us: 100_000,
         };
-        let result = observe_original_control_at(directory.path(), original, || {
+        let result = observe_original_control_at(directory.path(), &original, || {
             checks.set(checks.get() + 1);
             if checks.get() == 2 {
                 fs::write(&path, "25000 100000").unwrap();
@@ -1933,7 +2005,7 @@ mod tests {
         let handle = open_directory(&leaf).unwrap();
         let expected = handle.metadata().unwrap();
         let checks = Cell::new(0);
-        let result = observe_original_control_at(&pinned_directory(&handle), original, || {
+        let result = observe_original_control_at(&pinned_directory(&handle), &original, || {
             checks.set(checks.get() + 1);
             if checks.get() == 2 {
                 fs::rename(&leaf, &moved).unwrap();
@@ -2345,11 +2417,11 @@ mod tests {
         let mut original = first
             .insert(
                 &action,
-                operation(unlimited, capped),
+                operation(unlimited, capped.clone()),
                 ReversalStatus::Applied,
             )
             .unwrap();
-        let unchanged_cap = operation(capped, capped);
+        let unchanged_cap = operation(capped.clone(), capped);
         assert!(second
             .insert(&action, unchanged_cap.clone(), ReversalStatus::Prepared)
             .is_err());
@@ -2397,6 +2469,219 @@ mod tests {
     }
 
     #[test]
+    fn cpuset_receipts_require_canonical_nonexpanding_assignments() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = journal(directory.path());
+        let record = journal
+            .insert(
+                &action(Action::Quarantine),
+                operation(
+                    ReversalValue::Cpuset {
+                        cpus: String::new(),
+                    },
+                    ReversalValue::Cpuset {
+                        cpus: "8".to_string(),
+                    },
+                ),
+                ReversalStatus::Applied,
+            )
+            .unwrap();
+        for (previous, requested, valid) in [
+            ("", "8", true),
+            ("8-11", "8", true),
+            ("8-11", "8-11", true),
+            ("8-11", "", false),
+            ("8-11", "0", false),
+            ("8-11", "8-12", false),
+            ("8-11", "8,9", false),
+            ("8,9", "8", false),
+            ("\n", "8", false),
+            ("", "8,broken", false),
+        ] {
+            let mut changed = record.clone();
+            changed.operation = operation(
+                ReversalValue::Cpuset {
+                    cpus: previous.to_string(),
+                },
+                ReversalValue::Cpuset {
+                    cpus: requested.to_string(),
+                },
+            );
+            assert_eq!(
+                validate_record(&changed).is_ok(),
+                valid,
+                "{previous:?} -> {requested:?}"
+            );
+        }
+        let mut wrong_action = record.clone();
+        wrong_action.action = Action::Throttle;
+        assert!(validate_record(&wrong_action).is_err());
+        let mut wrong_controller = record;
+        if let ReversalOperation::CgroupV2 { before, .. } = &mut wrong_controller.operation {
+            *before = ReversalValue::Freeze { requested: false };
+        }
+        assert!(validate_record(&wrong_controller).is_err());
+    }
+
+    #[test]
+    fn cpuset_ownership_survives_new_journal_instances_without_claiming_other_controls() {
+        let directory = tempfile::tempdir().unwrap();
+        let sessions = directory.path().join("sessions");
+        let first = journal_in_sessions(&sessions, "session-a");
+        let second = journal_in_sessions(&sessions, "session-b");
+        let quarantine = action(Action::Quarantine);
+        let restricted = ReversalValue::Cpuset {
+            cpus: "8".to_string(),
+        };
+        let mut original = first
+            .insert(
+                &quarantine,
+                operation(
+                    ReversalValue::Cpuset {
+                        cpus: String::new(),
+                    },
+                    restricted.clone(),
+                ),
+                ReversalStatus::Verified,
+            )
+            .unwrap();
+        drop(first);
+        let first = journal_in_sessions(&sessions, "session-a");
+        let unchanged = operation(restricted.clone(), restricted);
+        assert!(second
+            .insert(&quarantine, unchanged.clone(), ReversalStatus::Prepared)
+            .is_err());
+        assert!(refuse_other_session_owner(&sessions, &unchanged, None).is_err());
+        assert!(!operations_share_control(
+            &original.operation,
+            &freeze_operation()
+        ));
+        let throttle = operation(
+            ReversalValue::CpuMax {
+                quota_us: -1,
+                period_us: 100_000,
+            },
+            ReversalValue::CpuMax {
+                quota_us: 25_000,
+                period_us: 100_000,
+            },
+        );
+        assert!(!operations_share_control(&original.operation, &throttle));
+        let mut throttle_action = action(Action::Throttle);
+        throttle_action.action_id = "other-controller".to_string();
+        second
+            .insert(&throttle_action, throttle, ReversalStatus::Prepared)
+            .unwrap();
+
+        // Historical journal transition only: this does not stand in for a
+        // live kernel restore, which separately proves the full cgroup scope.
+        original.restorations.push(restored_outcome(&original));
+        let stored = JournalDirectory::open(first.directory(), false)
+            .unwrap()
+            .unwrap();
+        first.write_record(&stored, &original, false).unwrap();
+        second
+            .insert(&quarantine, unchanged, ReversalStatus::Prepared)
+            .unwrap();
+        assert_eq!(
+            first.inspect(&quarantine).unwrap()[0].operation,
+            original.operation
+        );
+    }
+
+    #[test]
+    fn real_file_cpuset_restore_preserves_inherited_and_explicit_intent() {
+        for previous in ["", "8-11", "8"] {
+            let directory = tempfile::tempdir().unwrap();
+            let requested = directory.path().join("cpuset.cpus");
+            let effective = directory.path().join("cpuset.cpus.effective");
+            let sibling = directory.path().join("sibling.cpus");
+            let before = ReversalValue::Cpuset {
+                cpus: previous.to_string(),
+            };
+            let applied = ReversalValue::Cpuset {
+                cpus: "8".to_string(),
+            };
+            fs::write(&requested, "8\n").unwrap();
+            fs::write(&effective, "8\n").unwrap();
+            fs::write(&sibling, "16-19\n").unwrap();
+            let observe_effective = || {
+                // Exercise write/read ordering on files; delegated integration
+                // tests supply kernel-managed effective CPU evidence.
+                if fs::read_to_string(&requested).unwrap() == before.contents() {
+                    fs::write(&effective, if previous == "8" { "8\n" } else { "8-11\n" }).unwrap();
+                }
+                Ok(())
+            };
+            assert_eq!(
+                restore_control_at(
+                    directory.path(),
+                    &before,
+                    &applied,
+                    0,
+                    true,
+                    observe_effective
+                )
+                .unwrap(),
+                previous != "8"
+            );
+            assert_eq!(
+                fs::read_to_string(&requested).unwrap(),
+                format!("{previous}\n")
+            );
+            assert!(
+                !restore_control_at(directory.path(), &before, &applied, 0, false, || Ok(()))
+                    .unwrap()
+            );
+            assert!(observe_original_control_at(directory.path(), &before, || Ok(())).is_ok());
+            assert_eq!(fs::read_to_string(&sibling).unwrap(), "16-19\n");
+        }
+    }
+
+    #[test]
+    fn cpuset_restore_and_observation_refuse_external_or_missing_evidence_without_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let requested = directory.path().join("cpuset.cpus");
+        let effective = directory.path().join("cpuset.cpus.effective");
+        let before = ReversalValue::Cpuset {
+            cpus: "8-11".to_string(),
+        };
+        let applied = ReversalValue::Cpuset {
+            cpus: "8".to_string(),
+        };
+        fs::write(&requested, "8\n").unwrap();
+        assert!(
+            restore_control_at(directory.path(), &before, &applied, 0, true, || Ok(())).is_err()
+        );
+        assert_eq!(fs::read_to_string(&requested).unwrap(), "8\n");
+        for (current, available) in [
+            ("9\n", "9\n"),
+            ("\n", "8-11\n"),
+            ("8\n", "\n"),
+            ("8\n", "0-15\n"),
+            ("8\n", "8,broken\n"),
+            ("8-11\n", "0-15\n"),
+        ] {
+            fs::write(&requested, current).unwrap();
+            fs::write(&effective, available).unwrap();
+            assert!(
+                restore_control_at(directory.path(), &before, &applied, 0, true, || Ok(()))
+                    .is_err(),
+                "accepted {current:?}/{available:?}"
+            );
+            assert!(observe_original_control_at(directory.path(), &before, || Ok(())).is_err());
+            assert_eq!(fs::read_to_string(&requested).unwrap(), current);
+            assert_eq!(fs::read_to_string(&effective).unwrap(), available);
+        }
+        fs::write(&requested, "8\n").unwrap();
+        fs::write(&effective, "8\n").unwrap();
+        assert!(
+            restore_control_at(directory.path(), &before, &applied, 0, false, || Ok(())).is_err()
+        );
+        assert_eq!(fs::read_to_string(&requested).unwrap(), "8\n");
+    }
+
+    #[test]
     fn real_file_cpu_restore_preserves_exact_prior_limit_and_is_idempotent() {
         for before in [
             ReversalValue::CpuMax {
@@ -2420,7 +2705,7 @@ mod tests {
                     ..
                 }
             ) {
-                before
+                before.clone()
             } else {
                 ReversalValue::CpuMax {
                     quota_us: 25_000,
@@ -2429,7 +2714,8 @@ mod tests {
             };
             fs::write(directory.path().join("cpu.max"), applied.contents()).unwrap();
             assert_eq!(
-                restore_control_at(directory.path(), before, applied, 0, true, || Ok(())).unwrap(),
+                restore_control_at(directory.path(), &before, &applied, 0, true, || Ok(()))
+                    .unwrap(),
                 before != applied
             );
             assert_eq!(
@@ -2437,7 +2723,7 @@ mod tests {
                 before.contents()
             );
             assert!(
-                !restore_control_at(directory.path(), before, applied, 0, false, || Ok(()))
+                !restore_control_at(directory.path(), &before, &applied, 0, false, || Ok(()))
                     .unwrap()
             );
         }
@@ -2456,11 +2742,13 @@ mod tests {
             period_us: 100_000,
         };
         fs::write(&path, "17000 100000").unwrap();
-        assert!(restore_control_at(directory.path(), before, applied, 0, true, || Ok(())).is_err());
+        assert!(
+            restore_control_at(directory.path(), &before, &applied, 0, true, || Ok(())).is_err()
+        );
         assert_eq!(fs::read_to_string(&path).unwrap(), "17000 100000");
         fs::write(&path, applied.contents()).unwrap();
         assert!(
-            restore_control_at(directory.path(), before, applied, 0, false, || Ok(())).is_err()
+            restore_control_at(directory.path(), &before, &applied, 0, false, || Ok(())).is_err()
         );
         assert_eq!(fs::read_to_string(&path).unwrap(), applied.contents());
     }
@@ -2479,7 +2767,11 @@ mod tests {
             period_us: 100_000,
         };
         let mut record = journal
-            .insert(&action, operation(before, applied), ReversalStatus::Applied)
+            .insert(
+                &action,
+                operation(before.clone(), applied.clone()),
+                ReversalStatus::Applied,
+            )
             .unwrap();
         record.restorations.push(restored_outcome(&record));
         let mut next = restored_outcome(&record);
@@ -2516,7 +2808,7 @@ mod tests {
         };
         fs::write(&path, applied.contents()).unwrap();
         let calls = Cell::new(0);
-        let result = restore_control_at(directory.path(), before, applied, 0, true, || {
+        let result = restore_control_at(directory.path(), &before, &applied, 0, true, || {
             calls.set(calls.get() + 1);
             if calls.get() == 2 {
                 fs::write(&path, "17000 100000").unwrap();
@@ -2544,10 +2836,11 @@ mod tests {
             )
             .unwrap();
             assert!(
-                restore_control_at(directory.path(), before, applied, 0, true, || Ok(())).unwrap()
+                restore_control_at(directory.path(), &before, &applied, 0, true, || Ok(()))
+                    .unwrap()
             );
             assert!(
-                !restore_control_at(directory.path(), before, applied, 0, false, || Ok(()))
+                !restore_control_at(directory.path(), &before, &applied, 0, false, || Ok(()))
                     .unwrap()
             );
             fs::write(
@@ -2556,7 +2849,7 @@ mod tests {
             )
             .unwrap();
             assert!(matches!(
-                restore_control_at(directory.path(), before, applied, 0, false, || Ok(())),
+                restore_control_at(directory.path(), &before, &applied, 0, false, || Ok(())),
                 Err(ActionError::Timeout)
             ));
         }
@@ -2584,7 +2877,8 @@ mod tests {
         ] {
             fs::write(directory.path().join("cpu.max"), contents).unwrap();
             assert!(
-                restore_control_at(directory.path(), before, applied, 0, true, || Ok(())).is_err()
+                restore_control_at(directory.path(), &before, &applied, 0, true, || Ok(()))
+                    .is_err()
             );
             assert_eq!(
                 fs::read_to_string(directory.path().join("cpu.max")).unwrap(),

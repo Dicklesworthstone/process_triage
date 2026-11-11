@@ -51,13 +51,14 @@ impl CompositeActionRunner {
     }
 
     /// Capture durable restoration receipts at the actual cgroup controller writes.
-    /// The same journal binds freeze and throttle attempts to the saved session plan.
+    /// The same journal binds freeze, throttle and quarantine to the saved plan.
     pub fn with_reversal_journal(self, journal: Arc<ReversalJournal>) -> Self {
         #[cfg(target_os = "linux")]
         {
             let mut runner = self;
             runner.freeze = runner.freeze.with_reversal_journal(Arc::clone(&journal));
-            runner.throttle = runner.throttle.with_reversal_journal(journal);
+            runner.throttle = runner.throttle.with_reversal_journal(Arc::clone(&journal));
+            runner.quarantine = runner.quarantine.with_reversal_journal(journal);
             runner
         }
         #[cfg(not(target_os = "linux"))]
@@ -76,7 +77,12 @@ impl CompositeActionRunner {
             runner.freeze = runner
                 .freeze
                 .with_reversal_ownership_guard(sessions_root.clone());
-            runner.throttle = runner.throttle.with_reversal_ownership_guard(sessions_root);
+            runner.throttle = runner
+                .throttle
+                .with_reversal_ownership_guard(sessions_root.clone());
+            runner.quarantine = runner
+                .quarantine
+                .with_reversal_ownership_guard(sessions_root);
             runner
         }
         #[cfg(not(target_os = "linux"))]

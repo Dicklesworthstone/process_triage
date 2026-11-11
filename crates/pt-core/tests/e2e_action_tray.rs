@@ -1591,6 +1591,189 @@ mod cgroup_throttle_action {
 // SCENARIO 6: Cgroup Freeze Action (Placeholder - pending sj6.5)
 // ============================================================================
 
+/// Exercise the production dispatcher, durable receipt and a fresh undo CLI.
+/// This requires an explicitly delegated CPU/cpuset-enabled parent and never
+/// enables controllers or changes an existing shared cgroup.
+#[cfg(target_os = "linux")]
+mod cgroup_quarantine_undo {
+    use super::*;
+    use pt_common::SessionId;
+    use pt_core::action::executor::ActionRunner;
+    use pt_core::action::reversal::ReversalStatus;
+    use pt_core::action::{CompositeActionRunner, ReversalJournal};
+    use pt_core::session::{SessionManifest, SessionMode, SessionStore};
+    use pt_core::test_utils::OwnedCgroupFixture;
+    use sha2::{Digest, Sha256};
+    use std::fs;
+    use std::sync::Arc;
+
+    #[test]
+    fn quarantine_undo_restores_inheritance_from_a_fresh_cli_and_preserves_sibling() {
+        let mut ctx = TestContext::new();
+        let Some(fixture) = OwnedCgroupFixture::new().expect("safe delegated cgroup setup") else {
+            ctx.log("capability_unavailable", json!({"reason": "PT_TEST_CGROUP_PARENT prerequisite absent", "positive_kernel_proof": false}));
+            return;
+        };
+        if !fixture.leaf.join("cpuset.cpus").exists() {
+            ctx.log("capability_unavailable", json!({"reason": "delegated parent cpuset controller is not already enabled", "positive_kernel_proof": false}));
+            return;
+        }
+        let requested = fixture.leaf.join("cpuset.cpus");
+        let effective = fixture.leaf.join("cpuset.cpus.effective");
+        let previous = fs::read(&requested).expect("original requested CPUs");
+        assert!(
+            std::str::from_utf8(&previous).unwrap().trim().is_empty(),
+            "new leaf should inherit its parent CPUs"
+        );
+        assert!(!fs::read_to_string(&effective).unwrap().trim().is_empty());
+        let sibling_previous = fs::read(fixture.sibling_leaf.join("cpuset.cpus")).unwrap();
+        let other_controls = OwnedCgroupFixture::controls(&fixture.leaf);
+        let sibling_controls = OwnedCgroupFixture::controls(&fixture.sibling_leaf);
+        let action = PlanAction {
+            action_id: "e2e-quarantine".to_string(),
+            target: fixture.identity.clone(),
+            action: Action::Quarantine,
+            order: 0,
+            stage: 0,
+            timeouts: ActionTimeouts::default(),
+            pre_checks: vec![],
+            rationale: empty_rationale(),
+            on_success: vec![],
+            on_failure: vec![],
+            blocked: false,
+            routing: ActionRouting::Direct,
+            confidence: ActionConfidence::Normal,
+            original_zombie_target: None,
+            d_state_diagnostics: None,
+            supervisor_restart: None,
+        };
+        let data = tempdir().unwrap();
+        let store = SessionStore::at_data_dir(data.path());
+        let session = SessionId::new();
+        let handle = store
+            .create(&SessionManifest::new(
+                &session,
+                None,
+                SessionMode::RobotPlan,
+                None,
+            ))
+            .unwrap();
+        let mut plan = make_test_plan_from_actions(vec![action.clone()]);
+        plan.session_id = session.0.clone();
+        let plan_bytes = serde_json::to_vec_pretty(&plan).unwrap();
+        fs::write(handle.dir.join("decision/plan.json"), &plan_bytes).unwrap();
+        let plan_hash = format!("{:x}", Sha256::digest(&plan_bytes));
+        let journal = Arc::new(
+            ReversalJournal::new(
+                handle.dir.join("action"),
+                &session.0,
+                &plan_hash,
+                store.sessions_root(),
+            )
+            .unwrap(),
+        );
+        let runner =
+            CompositeActionRunner::with_defaults().with_reversal_journal(Arc::clone(&journal));
+        runner.execute(&action).expect("quarantine execution");
+        runner
+            .verify(&action)
+            .expect("requested and effective quarantine verification");
+        let restricted = fs::read(&requested).unwrap();
+        assert!(!std::str::from_utf8(&restricted).unwrap().trim().is_empty());
+        assert_eq!(
+            journal.inspect(&action).unwrap()[0].status,
+            ReversalStatus::Verified
+        );
+        fixture.record("quarantined");
+        fs::write(
+            fixture.artifacts.join("quarantined/target.cpuset.cpus"),
+            &restricted,
+        )
+        .unwrap();
+        fs::write(
+            fixture
+                .artifacts
+                .join("quarantined/target.cpuset.cpus.effective"),
+            fs::read(&effective).unwrap(),
+        )
+        .unwrap();
+        // Drop all in-memory undo state before invoking separate processes.
+        drop(runner);
+        drop(journal);
+
+        let mut undo = |confirm: bool| {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_pt-core"));
+            command
+                .args([
+                    "agent",
+                    "undo",
+                    "--session",
+                    &session.0,
+                    "--action-id",
+                    &action.action_id,
+                    "--format",
+                    "json",
+                ])
+                .env("PROCESS_TRIAGE_DATA", data.path())
+                .env("PT_SKIP_GLOBAL_LOCK", "1")
+                .stdin(Stdio::null());
+            if confirm {
+                command.arg("--confirm");
+            }
+            let output = command.output().expect("fresh undo CLI");
+            assert_eq!(
+                output.status.code(),
+                Some(if confirm { 2 } else { 0 }),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let result: serde_json::Value =
+                serde_json::from_slice(&output.stdout).expect("undo JSON");
+            ctx.log("undo_cli", result.clone());
+            result
+        };
+        assert_eq!(undo(false)["status"], "preview");
+        assert_eq!(fs::read(&requested).unwrap(), restricted);
+        let restored = undo(true);
+        assert_eq!(restored["status"], "restored");
+        assert_eq!(restored["restoration"]["changed"], true);
+        assert_eq!(fs::read(&requested).unwrap(), previous);
+        assert!(!fs::read_to_string(&effective).unwrap().trim().is_empty());
+        assert_eq!(undo(true)["restoration"]["changed"], false);
+        fixture.record("quarantine-restored");
+        fs::write(
+            fixture
+                .artifacts
+                .join("quarantine-restored/target.cpuset.cpus"),
+            fs::read(&requested).unwrap(),
+        )
+        .unwrap();
+        fixture.assert_isolated();
+        assert_eq!(OwnedCgroupFixture::controls(&fixture.leaf), other_controls);
+        assert_eq!(
+            OwnedCgroupFixture::controls(&fixture.sibling_leaf),
+            sibling_controls
+        );
+        assert_eq!(
+            fs::read(fixture.sibling_leaf.join("cpuset.cpus")).unwrap(),
+            sibling_previous
+        );
+        let reloaded = ReversalJournal::new(
+            handle.dir.join("action"),
+            &session.0,
+            &plan_hash,
+            store.sessions_root(),
+        )
+        .unwrap();
+        let receipts = reloaded.inspect(&action).unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].status, ReversalStatus::Verified);
+        assert_eq!(receipts[0].restorations.len(), 2);
+        assert!(reloaded.observe_restoration(&action).unwrap().is_some());
+    }
+}
+
 // cgroup v2 freezing is Linux-only.
 #[cfg(target_os = "linux")]
 mod cgroup_freeze_action {

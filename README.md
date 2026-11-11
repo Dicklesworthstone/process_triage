@@ -1446,10 +1446,10 @@ not implemented.
 ### Restoring a recorded control
 
 `agent apply` records durable undo receipts for Linux cgroup-v2 **Freeze,
-Unfreeze, and Throttle** actions. Each receipt saves the exact previous freezer
-request or CPU quota and period before the controller write. The receipt is
-bound to the complete saved plan, action ID, process incarnation, boot,
-namespace, mount, and cgroup directory identity.
+Unfreeze, Throttle, and Quarantine** actions. Each receipt saves the exact previous
+freezer request, CPU quota and period, or requested cpuset before the controller
+write. The receipt is bound to the complete saved plan, action ID, process
+incarnation, boot, namespace, mount, and cgroup directory identity.
 
 ```bash
 # Inspect the saved receipt without changing the controller.
@@ -1473,6 +1473,12 @@ present, undo verifies it without another write. Freezer undo also waits for
 the actual `cgroup.events` frozen state, including when the request is already
 correct. A completed receipt cannot authorize a second write after another
 actor changes the control again.
+
+Quarantine undo restores the original requested CPU identities, including an
+empty assignment that inherits CPUs from the parent. It checks that effective
+CPUs remain nonempty and, for an explicit assignment, within the restored set.
+It never writes the effective CPU list or replaces inherited intent with a
+fixed snapshot of the parent's CPUs.
 
 An unresolved durable receipt also reserves that physical control across
 sessions. A different session, or an unjournaled TUI action, cannot replace it
@@ -1503,11 +1509,12 @@ including completed restoration histories and incomplete or unreadable
 receipts. Cleanup uses the execution lock so it cannot remove a session while
 an action is preparing the state needed for undo.
 
-This command currently covers cgroup-v2 freezer and CPU bandwidth controls
-from `agent apply`. Hybrid v1 throttling records that durable undo is
-unsupported. Renice, pause/resume, cpuset quarantine, service restart, and TUI
-actions do not use this receipt path. The cpuset library retains explicit prior
-metadata, but a bare Unquarantine action cannot reconstruct the old CPU set.
+This command currently covers cgroup-v2 freezer, CPU bandwidth, and cpuset
+controls from `agent apply`. Hybrid v1 throttling and quarantine record that
+durable undo is unsupported. Renice, pause/resume, service restart, and TUI
+actions do not capture these receipts; TUI controller writes still respect
+existing receipt ownership. A bare Unquarantine action cannot reconstruct the
+old CPU set; restore the recorded Quarantine action with `agent undo`.
 
 ### cpuset Quarantine
 

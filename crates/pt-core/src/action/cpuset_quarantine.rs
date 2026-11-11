@@ -25,6 +25,8 @@
 //!   a bare Unquarantine action cannot reconstruct it and is refused
 
 use super::executor::{ActionError, ActionRunner};
+#[cfg(target_os = "linux")]
+use super::reversal::{PreparedReversal, ReversalJournal, ReversalStatus, ReversalValue};
 use crate::collect::cgroup::collect_cgroup_details;
 use crate::decision::Action;
 use crate::plan::PlanAction;
@@ -33,6 +35,8 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
 use std::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -169,23 +173,41 @@ pub struct CpusetQuarantineActionRunner {
     // ActionExecutor executes and verifies one action at a time. Retaining the
     // exact last assignment avoids deriving expectations from mutable readback.
     applied: Mutex<Option<AppliedQuarantine>>,
+    #[cfg(target_os = "linux")]
+    reversal_journal: Option<Arc<ReversalJournal>>,
+    #[cfg(target_os = "linux")]
+    reversal_ownership_root: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct CpusetScope {
     unified_path: String,
     controller_path: String,
     is_v2: bool,
+    #[cfg(target_os = "linux")]
+    unified: PinnedCpusetDirectory,
+    #[cfg(target_os = "linux")]
+    controller_v1: Option<PinnedCpusetDirectory>,
 }
 
 impl CpusetScope {
+    #[cfg(target_os = "linux")]
     fn directory(&self) -> PathBuf {
-        let root = if self.is_v2 {
-            "/sys/fs/cgroup"
-        } else {
-            "/sys/fs/cgroup/cpuset"
-        };
-        PathBuf::from(format!("{root}{}", self.controller_path))
+        self.controller().pinned_directory()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn controller(&self) -> &PinnedCpusetDirectory {
+        self.controller_v1.as_ref().unwrap_or(&self.unified)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn check_directories(&self) -> Result<(), ActionError> {
+        self.unified.revalidate()?;
+        if let Some(controller) = &self.controller_v1 {
+            controller.revalidate()?;
+        }
+        Ok(())
     }
 
     fn effective_name(&self) -> &'static str {
@@ -204,6 +226,11 @@ impl CpusetScope {
                 "refusing quarantine after cgroup membership changed".to_string(),
             ));
         }
+        self.check_directories()?;
+        super::dispatch::ensure_exclusive_cgroup_path(
+            identity.pid.0,
+            &self.unified.pinned_directory(),
+        )?;
         if !self.is_v2 {
             let current_path = collect_cgroup_details(identity.pid.0)
                 .and_then(|details| details.v1_paths.get("cpuset").cloned());
@@ -217,12 +244,71 @@ impl CpusetScope {
     }
 }
 
-#[derive(Debug, Clone)]
+/// Hold the actual directory through receipt creation, writing and verification;
+/// a reused pathname must never redirect an approved controller mutation.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct PinnedCpusetDirectory {
+    path: PathBuf,
+    handle: fs::File,
+}
+
+#[cfg(target_os = "linux")]
+impl PinnedCpusetDirectory {
+    fn open(path: PathBuf) -> Result<Self, ActionError> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let handle = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)
+            .map_err(|error| {
+                ActionError::Failed(format!(
+                    "cannot pin cpuset cgroup {}: {error}",
+                    path.display()
+                ))
+            })?;
+        let directory = Self { path, handle };
+        directory.revalidate()?;
+        Ok(directory)
+    }
+
+    fn pinned_directory(&self) -> PathBuf {
+        use std::os::fd::AsRawFd;
+        PathBuf::from(format!("/proc/self/fd/{}", self.handle.as_raw_fd()))
+    }
+
+    fn revalidate(&self) -> Result<(), ActionError> {
+        use std::os::unix::fs::MetadataExt;
+        let pinned = self.handle.metadata().map_err(|error| {
+            ActionError::Failed(format!("cannot inspect pinned cpuset cgroup: {error}"))
+        })?;
+        let current = fs::symlink_metadata(&self.path).map_err(|error| {
+            ActionError::Failed(format!(
+                "cannot inspect cpuset cgroup {}: {error}",
+                self.path.display()
+            ))
+        })?;
+        if !pinned.is_dir()
+            || !current.is_dir()
+            || pinned.dev() != current.dev()
+            || pinned.ino() != current.ino()
+        {
+            return Err(ActionError::Failed(
+                "cpuset cgroup directory changed since execution".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
 struct AppliedQuarantine {
     action_id: String,
     identity: pt_common::ProcessIdentity,
     scope: CpusetScope,
     cpus: CpuSet,
+    #[cfg(target_os = "linux")]
+    reversal: Option<PreparedReversal>,
 }
 
 impl CpusetQuarantineActionRunner {
@@ -230,11 +316,29 @@ impl CpusetQuarantineActionRunner {
         Self {
             config,
             applied: Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            reversal_journal: None,
+            #[cfg(target_os = "linux")]
+            reversal_ownership_root: None,
         }
     }
 
     pub fn with_defaults() -> Self {
         Self::new(CpusetQuarantineConfig::default())
+    }
+
+    /// Persist the original requested assignment before every v2 mutation.
+    #[cfg(target_os = "linux")]
+    pub fn with_reversal_journal(mut self, journal: Arc<ReversalJournal>) -> Self {
+        self.reversal_journal = Some(journal);
+        self
+    }
+
+    /// Keep unjournaled callers from overwriting another action's durable undo.
+    #[cfg(target_os = "linux")]
+    pub fn with_reversal_ownership_guard(mut self, sessions_root: PathBuf) -> Self {
+        self.reversal_ownership_root = Some(sessions_root);
+        self
     }
 
     /// Check if a process is protected from quarantine.
@@ -282,7 +386,8 @@ impl CpusetQuarantineActionRunner {
             .flatten();
         let v1_directory =
             v1_path.map(|path| PathBuf::from(format!("/sys/fs/cgroup/cpuset{path}")));
-        let (_, is_v2) = select_cpuset_controller(&v2_directory, v1_directory.as_deref())?;
+        let (controller_directory, is_v2) =
+            select_cpuset_controller(&v2_directory, v1_directory.as_deref())?;
         let controller_path = if is_v2 {
             checked_path.clone()
         } else {
@@ -298,6 +403,12 @@ impl CpusetQuarantineActionRunner {
             unified_path: checked_path,
             controller_path,
             is_v2,
+            unified: PinnedCpusetDirectory::open(v2_directory)?,
+            controller_v1: if is_v2 {
+                None
+            } else {
+                Some(PinnedCpusetDirectory::open(controller_directory)?)
+            },
         };
         *applied = Some(self.apply_quarantine(action, scope)?);
         Ok(())
@@ -312,50 +423,120 @@ impl CpusetQuarantineActionRunner {
     ) -> Result<AppliedQuarantine, ActionError> {
         scope.revalidate(&action.target)?;
         let directory = scope.directory();
-        let cpus_path = directory.join("cpuset.cpus");
-        let available = read_cpuset_file(&directory.join(scope.effective_name()))?;
-        let cpus = select_cpuset(
-            self.config.target_cpus,
-            self.config.specific_cpus.as_deref(),
-            &available,
-        )?;
-        let new_cpuset = cpus.as_list();
-
-        // Recheck the process incarnation and both controller memberships after
-        // reading availability, immediately before the cgroup-wide write.
-        scope.revalidate(&action.target)?;
-        let pid = action.target.pid.0;
-
-        debug!(
-            pid,
-            path = %cpus_path.display(),
-            value = %new_cpuset,
-            "writing cpuset.cpus"
-        );
-
-        // Write new cpuset value
-        fs::write(&cpus_path, &new_cpuset).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                ActionError::PermissionDenied
-            } else {
-                ActionError::Failed(format!("failed to write cpuset.cpus: {}", e))
+        if !scope.is_v2 {
+            if let Some(journal) = &self.reversal_journal {
+                journal.record_unsupported(
+                    action,
+                    "cgroup-v1 quarantine has no supported durable undo",
+                )?;
             }
-        })?;
-
-        info!(
-            pid,
-            cgroup = %scope.controller_path,
-            is_v2 = scope.is_v2,
-            cpuset = %new_cpuset,
-            "cpuset quarantine assignment written"
-        );
-
+        }
+        let (cpus, reversal) = self.apply_quarantine_with_reversal(
+            &directory,
+            scope.effective_name(),
+            || scope.revalidate(&action.target),
+            |previous, requested| match &self.reversal_journal {
+                Some(journal) if scope.is_v2 => journal
+                    .prepare(
+                        action,
+                        &scope.unified_path,
+                        &scope.unified.handle,
+                        ReversalValue::Cpuset {
+                            cpus: previous.to_string(),
+                        },
+                        ReversalValue::Cpuset {
+                            cpus: requested.to_string(),
+                        },
+                        0,
+                    )
+                    .map(Some),
+                _ => {
+                    if scope.is_v2 {
+                        if let Some(sessions_root) = &self.reversal_ownership_root {
+                            super::reversal::ensure_control_unowned(
+                                sessions_root,
+                                &scope.unified_path,
+                                &scope.unified.handle,
+                                ReversalValue::Cpuset {
+                                    cpus: requested.to_string(),
+                                },
+                            )?;
+                        }
+                    }
+                    Ok(None)
+                }
+            },
+        )?;
         Ok(AppliedQuarantine {
             action_id: action.action_id.clone(),
             identity: action.target.clone(),
             scope,
             cpus,
+            reversal,
         })
+    }
+
+    /// The receipt must be durable before the write. An unchanged requested
+    /// set still checks ownership, and a concurrent external edit is refused.
+    #[cfg(target_os = "linux")]
+    fn apply_quarantine_with_reversal(
+        &self,
+        directory: &Path,
+        effective_name: &str,
+        revalidate: impl Fn() -> Result<(), ActionError>,
+        prepare: impl FnOnce(&str, &str) -> Result<Option<PreparedReversal>, ActionError>,
+    ) -> Result<(CpuSet, Option<PreparedReversal>), ActionError> {
+        revalidate()?;
+        let cpus_path = directory.join("cpuset.cpus");
+        let previous = read_cpuset_assignment(&cpus_path)?;
+        verify_cpuset_assignment(directory, effective_name, &previous)?;
+        let available = read_cpuset_file(&directory.join(effective_name))?;
+        if !previous.is_empty() && !available.is_subset_of(&CpuSet::parse(&previous)?) {
+            return Err(ActionError::Failed(
+                "effective CPUs escaped the original requested assignment before quarantine"
+                    .to_string(),
+            ));
+        }
+        let cpus = select_cpuset(
+            self.config.target_cpus,
+            self.config.specific_cpus.as_deref(),
+            &available,
+        )?;
+        let requested = cpus.as_list();
+        let reversal = prepare(&previous, &requested)?;
+        let execution = (|| {
+            revalidate()?;
+            if read_cpuset_assignment(&cpus_path)? != previous
+                || read_cpuset_file(&directory.join(effective_name))? != available
+            {
+                return Err(ActionError::Failed(
+                    "CPU assignment or availability changed before quarantine".to_string(),
+                ));
+            }
+            if previous != requested {
+                fs::write(&cpus_path, format!("{requested}\n")).map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::PermissionDenied {
+                        ActionError::PermissionDenied
+                    } else {
+                        ActionError::Failed(format!("failed to write cpuset.cpus: {error}"))
+                    }
+                })?;
+            }
+            revalidate()?;
+            verify_cpuset_files(directory, effective_name, &cpus)?;
+            revalidate()?;
+            info!(
+                path = %directory.display(),
+                cpuset = %requested,
+                "cpuset quarantine assignment written and observed"
+            );
+            Ok(())
+        })();
+        match &reversal {
+            Some(receipt) => receipt.finish(execution, ReversalStatus::Applied)?,
+            None => execution?,
+        }
+        Ok((cpus, reversal))
     }
 
     /// Execute an unquarantine action (restore previous cpuset).
@@ -383,19 +564,27 @@ impl CpusetQuarantineActionRunner {
         if record.action_id != action.action_id || record.identity != action.target {
             return Err(ActionError::IdentityMismatch);
         }
-        record.scope.revalidate(&action.target)?;
-        verify_cpuset_files(
-            &record.scope.directory(),
-            record.scope.effective_name(),
-            &record.cpus,
-        )?;
-        record.scope.revalidate(&action.target)?;
-        debug!(
-            pid = action.target.pid.0,
-            cpuset = %record.cpus.as_list(),
-            "quarantine requested and effective CPUs verified"
-        );
-        Ok(())
+        let verification = (|| {
+            record.scope.revalidate(&action.target)?;
+            for _ in 0..2 {
+                verify_cpuset_files(
+                    &record.scope.directory(),
+                    record.scope.effective_name(),
+                    &record.cpus,
+                )?;
+                record.scope.revalidate(&action.target)?;
+            }
+            debug!(
+                pid = action.target.pid.0,
+                cpuset = %record.cpus.as_list(),
+                "quarantine requested and effective CPUs verified"
+            );
+            Ok(())
+        })();
+        match &record.reversal {
+            Some(receipt) => receipt.finish(verification, ReversalStatus::Verified),
+            None => verification,
+        }
     }
 
     /// Capture reversal metadata before applying quarantine.
@@ -586,19 +775,16 @@ pub(super) fn check_quarantine_capability(
     }
     let cpus_path = directory.join("cpuset.cpus");
     super::dispatch::check_controller_access(&cpus_path)?;
-    let previous = fs::read_to_string(&cpus_path).map_err(|error| {
-        ActionError::Failed(format!("cannot read {}: {error}", cpus_path.display()))
-    })?;
-    // Empty assignments inherit CPUs and are valid reversal evidence. Effective
-    // CPUs must still form a nonempty set accepted by the execution selector.
-    if !previous.trim().is_empty() {
-        CpuSet::parse(&previous)?;
-    }
-    let available = read_cpuset_file(&directory.join(if is_v2 {
+    let previous = read_cpuset_assignment(&cpus_path)?;
+    let effective_name = if is_v2 {
         "cpuset.cpus.effective"
     } else {
         "cpuset.effective_cpus"
-    }))?;
+    };
+    // Preserve empty (inherited) assignments, and reject configurations whose
+    // effective CPUs already escape their explicit requested set.
+    verify_cpuset_assignment(&directory, effective_name, &previous)?;
+    let available = read_cpuset_file(&directory.join(effective_name))?;
     select_cpuset(
         config.target_cpus,
         config.specific_cpus.as_deref(),
@@ -666,7 +852,7 @@ impl CpuSet {
         Ok(Self { ranges: merged })
     }
 
-    fn is_subset_of(&self, other: &Self) -> bool {
+    pub(crate) fn is_subset_of(&self, other: &Self) -> bool {
         let mut outer = other.ranges.iter().peekable();
         for &(start, end) in &self.ranges {
             while outer.peek().is_some_and(|&&(_, upper)| upper < start) {
@@ -737,7 +923,7 @@ fn select_cpuset(
     }
 }
 
-fn read_cpuset_file(path: &Path) -> Result<CpuSet, ActionError> {
+fn read_cpuset_contents(path: &Path) -> Result<String, ActionError> {
     let mut content = String::new();
     fs::File::open(path)
         .and_then(|file| {
@@ -745,12 +931,60 @@ fn read_cpuset_file(path: &Path) -> Result<CpuSet, ActionError> {
                 .read_to_string(&mut content)
         })
         .map_err(|error| ActionError::Failed(format!("cannot read {}: {error}", path.display())))?;
+    if content.len() > MAX_CPUSET_BYTES {
+        return Err(ActionError::Failed(format!(
+            "CPU evidence at {} exceeds the size limit",
+            path.display()
+        )));
+    }
+    Ok(content)
+}
+
+fn read_cpuset_file(path: &Path) -> Result<CpuSet, ActionError> {
+    let content = read_cpuset_contents(path)?;
     CpuSet::parse(&content).map_err(|error| {
         ActionError::Failed(format!(
             "invalid CPU evidence at {}: {error}",
             path.display()
         ))
     })
+}
+
+/// Requested CPU lists may be empty to inherit from the parent. Compare
+/// canonical CPU identities, not textual formatting or only their count.
+pub(super) fn read_cpuset_assignment(path: &Path) -> Result<String, ActionError> {
+    let content = read_cpuset_contents(path)?;
+    if content.trim().is_empty() {
+        Ok(String::new())
+    } else {
+        CpuSet::parse(&content).map(|cpus| cpus.as_list())
+    }
+}
+
+/// Verify an original requested assignment after undo. Inheritance is retained
+/// as inheritance, with a fresh nonempty effective set; explicit assignments
+/// additionally require effective CPU identities to stay within that set.
+pub(super) fn verify_cpuset_assignment(
+    directory: &Path,
+    effective_name: &str,
+    requested: &str,
+) -> Result<(), ActionError> {
+    let observed = read_cpuset_assignment(&directory.join("cpuset.cpus"))?;
+    let effective = read_cpuset_file(&directory.join(effective_name))?;
+    if requested.is_empty() {
+        if !observed.is_empty() {
+            return Err(ActionError::Failed(
+                "cpuset no longer has the recorded inherited assignment".to_string(),
+            ));
+        }
+        Ok(())
+    } else {
+        verify_cpuset_readback(
+            &CpuSet::parse(requested)?,
+            &CpuSet::parse(&observed)?,
+            &effective,
+        )
+    }
 }
 
 fn verify_cpuset_readback(
@@ -1021,6 +1255,29 @@ mod tests {
     }
 
     #[test]
+    fn cpuset_assignment_preserves_inheritance_and_requires_effective_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let requested = directory.path().join("cpuset.cpus");
+        let effective = directory.path().join("cpuset.cpus.effective");
+        fs::write(&requested, "\n").unwrap();
+        assert_eq!(read_cpuset_assignment(&requested).unwrap(), "");
+        assert!(verify_cpuset_assignment(directory.path(), "cpuset.cpus.effective", "").is_err());
+        fs::write(&effective, "8-11\n").unwrap();
+        assert!(verify_cpuset_assignment(directory.path(), "cpuset.cpus.effective", "").is_ok());
+
+        fs::write(&requested, "9,8\n").unwrap();
+        assert_eq!(read_cpuset_assignment(&requested).unwrap(), "8-9");
+        assert!(verify_cpuset_assignment(directory.path(), "cpuset.cpus.effective", "").is_err());
+        assert!(
+            verify_cpuset_assignment(directory.path(), "cpuset.cpus.effective", "8-9").is_err()
+        );
+        fs::write(&effective, "9\n").unwrap();
+        assert!(verify_cpuset_assignment(directory.path(), "cpuset.cpus.effective", "8-9").is_ok());
+        fs::write(&requested, " ".repeat(MAX_CPUSET_BYTES + 1)).unwrap();
+        assert!(read_cpuset_assignment(&requested).is_err());
+    }
+
+    #[test]
     fn cpuset_restoration_writes_inherited_and_explicit_assignments() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("cpuset.cpus");
@@ -1072,6 +1329,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     mod linux_tests {
         use super::*;
+        use std::cell::Cell;
 
         fn quarantine_action() -> PlanAction {
             PlanAction {
@@ -1114,6 +1372,7 @@ mod tests {
             let action = quarantine_action();
             let missing = runner.verify(&action).unwrap_err().to_string();
             assert!(missing.contains("without an executed assignment"));
+            let directory = tempfile::tempdir().unwrap();
             *runner.applied.lock().unwrap() = Some(AppliedQuarantine {
                 action_id: action.action_id.clone(),
                 identity: action.target.clone(),
@@ -1121,8 +1380,11 @@ mod tests {
                     unified_path: "/test-only".to_string(),
                     controller_path: "/test-only".to_string(),
                     is_v2: true,
+                    unified: PinnedCpusetDirectory::open(directory.path().to_path_buf()).unwrap(),
+                    controller_v1: None,
                 },
                 cpus: CpuSet::parse("8").unwrap(),
+                reversal: None,
             });
             for field in ["action", "birth", "pid", "uid", "quality"] {
                 let mut changed = action.clone();
@@ -1150,6 +1412,130 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("without an executed assignment"));
+        }
+
+        #[test]
+        fn quarantine_prepares_reversal_before_writing_and_refuses_failed_persistence() {
+            let directory = tempfile::tempdir().unwrap();
+            let requested = directory.path().join("cpuset.cpus");
+            let effective = directory.path().join("cpuset.cpus.effective");
+            fs::write(&requested, "\n").unwrap();
+            fs::write(&effective, "8-11\n").unwrap();
+            let runner = CpusetQuarantineActionRunner::with_defaults();
+            let result = runner.apply_quarantine_with_reversal(
+                directory.path(),
+                "cpuset.cpus.effective",
+                || Ok(()),
+                |before, applied| {
+                    assert_eq!(before, "");
+                    assert_eq!(applied, "8");
+                    assert_eq!(fs::read_to_string(&requested).unwrap(), "\n");
+                    Err(ActionError::Failed(
+                        "receipt storage unavailable".to_string(),
+                    ))
+                },
+            );
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("receipt storage unavailable"));
+            assert_eq!(fs::read_to_string(&requested).unwrap(), "\n");
+
+            let prepared = Cell::new(false);
+            let result = runner
+                .apply_quarantine_with_reversal(
+                    directory.path(),
+                    "cpuset.cpus.effective",
+                    || {
+                        if fs::read_to_string(&requested).unwrap() == "8\n" {
+                            assert!(prepared.get());
+                            // Model only the controller readback sequence in this
+                            // file test; real kernel proof needs a delegated leaf.
+                            fs::write(&effective, "8\n").unwrap();
+                        }
+                        Ok(())
+                    },
+                    |before, applied| {
+                        assert_eq!((before, applied), ("", "8"));
+                        assert_eq!(fs::read_to_string(&requested).unwrap(), "\n");
+                        prepared.set(true);
+                        Ok(None)
+                    },
+                )
+                .unwrap();
+            assert_eq!(result.0.as_list(), "8");
+            assert!(prepared.get());
+            assert_eq!(fs::read_to_string(&requested).unwrap(), "8\n");
+        }
+
+        #[test]
+        fn quarantine_refuses_values_changed_while_receipt_is_prepared() {
+            for change_requested in [true, false] {
+                let directory = tempfile::tempdir().unwrap();
+                let requested = directory.path().join("cpuset.cpus");
+                let effective = directory.path().join("cpuset.cpus.effective");
+                fs::write(&requested, "8-11\n").unwrap();
+                fs::write(&effective, "8-11\n").unwrap();
+                let runner = CpusetQuarantineActionRunner::with_defaults();
+                let result = runner.apply_quarantine_with_reversal(
+                    directory.path(),
+                    "cpuset.cpus.effective",
+                    || Ok(()),
+                    |_, _| {
+                        fs::write(
+                            if change_requested {
+                                &requested
+                            } else {
+                                &effective
+                            },
+                            "9-11\n",
+                        )
+                        .unwrap();
+                        Ok(None)
+                    },
+                );
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("changed before quarantine"));
+                assert_eq!(
+                    fs::read_to_string(&requested).unwrap(),
+                    if change_requested { "9-11\n" } else { "8-11\n" }
+                );
+            }
+        }
+
+        #[test]
+        fn quarantine_refuses_replaced_directory_before_controller_write() {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("leaf");
+            let old = root.path().join("original-leaf");
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join("cpuset.cpus"), "\n").unwrap();
+            fs::write(path.join("cpuset.cpus.effective"), "8-11\n").unwrap();
+            let pinned = PinnedCpusetDirectory::open(path.clone()).unwrap();
+            let runner = CpusetQuarantineActionRunner::with_defaults();
+            let result = runner.apply_quarantine_with_reversal(
+                &pinned.pinned_directory(),
+                "cpuset.cpus.effective",
+                || pinned.revalidate(),
+                |_, _| {
+                    fs::rename(&path, &old).unwrap();
+                    fs::create_dir(&path).unwrap();
+                    fs::write(path.join("cpuset.cpus"), "16-19\n").unwrap();
+                    fs::write(path.join("cpuset.cpus.effective"), "16-19\n").unwrap();
+                    Ok(None)
+                },
+            );
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("directory changed"));
+            assert_eq!(
+                fs::read_to_string(path.join("cpuset.cpus")).unwrap(),
+                "16-19\n"
+            );
+            assert_eq!(fs::read_to_string(old.join("cpuset.cpus")).unwrap(), "\n");
         }
 
         #[test]

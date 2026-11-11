@@ -28948,7 +28948,7 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
 
             if !matches!(
                 action.action,
-                Action::Freeze | Action::Unfreeze | Action::Throttle
+                Action::Freeze | Action::Unfreeze | Action::Throttle | Action::Quarantine
             ) {
                 return observe_live_postcondition(action);
             }
@@ -29930,12 +29930,12 @@ fn run_agent_undo(global: &GlobalOpts, args: &AgentUndoArgs) -> ExitCode {
     output["records"] = serde_json::json!(&records);
     if !matches!(
         action.action,
-        Action::Freeze | Action::Unfreeze | Action::Throttle
+        Action::Freeze | Action::Unfreeze | Action::Throttle | Action::Quarantine
     ) {
         return refuse(
             output,
             "unsupported_action",
-            "durable undo currently supports Linux cgroup-v2 freeze, unfreeze and CPU throttle"
+            "durable undo currently supports Linux cgroup-v2 freeze, unfreeze, CPU throttle and cpuset quarantine"
                 .to_string(),
             ExitCode::PolicyBlocked,
         );

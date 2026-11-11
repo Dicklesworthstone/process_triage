@@ -1289,9 +1289,10 @@ pub fn verify_plan_with_postconditions(
                         ActionPostcondition::Restored { observation }
                             if observation.action_id == action.action_id
                                 && matches!(
-                                    (action.action, observation.original_value),
+                                    (action.action, &observation.original_value),
                                     (Action::Freeze | Action::Unfreeze, ReversalValue::Freeze { .. })
                                         | (Action::Throttle, ReversalValue::CpuMax { .. })
+                                        | (Action::Quarantine, ReversalValue::Cpuset { .. })
                                 ) =>
                         {
                             let detail = format!(
@@ -2634,6 +2635,9 @@ mod tests {
                     period_us: 100_000,
                 },
                 Action::Unfreeze => ReversalValue::Freeze { requested: true },
+                Action::Quarantine => ReversalValue::Cpuset {
+                    cpus: String::new(),
+                },
                 _ => ReversalValue::Freeze { requested: false },
             },
             recorded_restored_at: "1970-01-01T00:00:20Z".into(),
@@ -2643,7 +2647,12 @@ mod tests {
 
     #[test]
     fn confirmed_restoration_preserves_action_history_and_earns_no_relief_credit() {
-        for action_kind in [Action::Freeze, Action::Unfreeze, Action::Throttle] {
+        for action_kind in [
+            Action::Freeze,
+            Action::Unfreeze,
+            Action::Throttle,
+            Action::Quarantine,
+        ] {
             let action = make_action(123, action_kind);
             let saved = execution(&action);
             let saved_before = serde_json::to_value(&saved).unwrap();
@@ -2731,6 +2740,9 @@ mod tests {
             let mut observation = restored_observation(&action);
             match case {
                 "action_id" => observation.action_id = "unrelated-action".into(),
+                "quarantine" => {
+                    observation.original_value = ReversalValue::Freeze { requested: false }
+                }
                 "control" => {
                     observation.original_value = ReversalValue::CpuMax {
                         quota_us: -1,
