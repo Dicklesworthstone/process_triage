@@ -18624,7 +18624,58 @@ mod process_tree_safety_tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[test]
+    fn environment_only_plan_distinguishes_failed_probe_from_observed_absence() {
+        use pt_core::supervision::{CombinedResult, DetectionError, EnvironError, EnvironResult};
+
+        for observation in [
+            Err(DetectionError::Environment(EnvironError::Unsupported(1234))),
+            Ok(CombinedResult::not_supervised()),
+        ] {
+            let info = super::environment_supervision_for_plan(1234, observation);
+            assert_eq!(info["status"], "unknown", "{info}");
+            assert!(info["detected"].is_null(), "{info}");
+            assert_eq!(info["recommended_action"], "review", "{info}");
+            assert!(info["reason"].as_str().unwrap().contains("PID 1234"));
+        }
+
+        let mut observed = CombinedResult::not_supervised();
+        observed.environ = Some(EnvironResult::not_supervised());
+        let info = super::environment_supervision_for_plan(1234, Ok(observed));
+        assert_eq!(info["status"], "observed", "{info}");
+        assert_eq!(info["detected"], false, "{info}");
+        assert_eq!(info["recommended_action"], "kill", "{info}");
+        assert_eq!(info["evidence_scope"], "environment", "{info}");
+        assert_eq!(info["ancestry_observed"], false, "{info}");
+        assert_eq!(info["ipc_observed"], false, "{info}");
+    }
+
+    #[test]
+    fn environment_only_plan_exposes_observed_human_supervision() {
+        use pt_core::supervision::{CombinedResult, EnvironAnalyzer, SupervisorCategory};
+
+        let mut observed = CombinedResult::not_supervised();
+        observed.is_supervised = true;
+        observed.supervisor_name = Some("codex".to_string());
+        observed.supervisor_type = Some(SupervisorCategory::Agent);
+        observed.confidence = 0.95;
+        observed.environ = Some(EnvironAnalyzer::new().analyze_env(
+            &std::collections::HashMap::from([(
+                "CODEX_SESSION_ID".to_string(),
+                "owned-session".to_string(),
+            )]),
+        ));
+        let info = super::environment_supervision_for_plan(1234, Ok(observed));
+        assert_eq!(info["status"], "observed", "{info}");
+        assert_eq!(info["detected"], true, "{info}");
+        assert_eq!(info["type"], "agent", "{info}");
+        assert_eq!(info["unit"], "codex", "{info}");
+        assert_eq!(info["recommended_action"], "review", "{info}");
+        assert_eq!(info["evidence_scope"], "environment", "{info}");
+        assert!(info["supervisor_command"].is_null(), "{info}");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn unavailable_live_identity_is_not_observed_absence_of_supervision() {
         let process = rec(u32::MAX, 500, "missing worker", ProcessState::Sleeping);
@@ -23125,7 +23176,6 @@ fn planning_supervision_evidence(
     identity: &ProcessIdentity,
     detector: &mut pt_core::supervision::SupervisionDetector,
 ) -> Result<(), String> {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let unavailable = |reason: &str| {
         format!(
             "Mandatory supervision evidence unavailable for PID {}: {reason}",
@@ -23140,12 +23190,9 @@ fn planning_supervision_evidence(
             "supervision subject identity changed or is unavailable",
         ));
     }
-    #[cfg(target_os = "linux")]
     detector
         .detect(identity.pid.0)
         .map_err(|error| unavailable(&error.to_string()))?;
-    #[cfg(not(target_os = "linux"))]
-    let _ = (identity, detector);
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     if !matches!(provider.revalidate(identity), Ok(true)) {
         return Err(unavailable(
@@ -25900,22 +25947,38 @@ fn supervisor_info_for_plan(
     })
 }
 
-/// No systemd, container or cgroup supervisors to probe here (launchd is checked by
-/// the apply-time pre-check). As in v2.2.1 the plan reports none detected; an
-/// "unknown" status turned every macOS candidate into REVIEW.
+/// Report the supported environment probe without inventing Linux ancestry or
+/// IPC observations. A failed supported probe is Unknown, not an observed absence.
 #[cfg(not(target_os = "linux"))]
 fn supervisor_info_for_plan(
-    _pid: u32,
-    _supervision: &mut pt_core::supervision::SupervisionDetector,
+    pid: u32,
+    supervision: &mut pt_core::supervision::SupervisionDetector,
 ) -> serde_json::Value {
+    environment_supervision_for_plan(pid, supervision.detect(pid))
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+fn environment_supervision_for_plan(
+    pid: u32,
+    observation: Result<pt_core::supervision::CombinedResult, pt_core::supervision::DetectionError>,
+) -> serde_json::Value {
+    let observed = match observation {
+        Ok(observed) if observed.environ.is_some() => observed,
+        Ok(_) => return unknown_supervision_for_plan(pid, "environment was not observed"),
+        Err(error) => return unknown_supervision_for_plan(pid, &error.to_string()),
+    };
+    let requires_review = is_human_supervised(&observed) || observed.is_supervised;
     serde_json::json!({
-        "detected": false,
+        "detected": observed.is_supervised,
         "status": "observed",
-        "type": serde_json::Value::Null,
-        "unit": serde_json::Value::Null,
+        "type": observed.supervisor_type.map(|category| category.to_string()),
+        "unit": observed.supervisor_name,
         "manager": serde_json::Value::Null,
-        "recommended_action": "kill",
+        "recommended_action": if requires_review { "review" } else { "kill" },
         "supervisor_command": serde_json::Value::Null,
+        "evidence_scope": "environment",
+        "ancestry_observed": observed.ancestry.is_some(),
+        "ipc_observed": observed.ipc.is_some(),
     })
 }
 

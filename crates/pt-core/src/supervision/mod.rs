@@ -311,24 +311,31 @@ impl SupervisionDetector {
 
     /// Detect supervision where ancestry and IPC evidence (/proc) do not exist.
     ///
-    /// As in v2.2.1, detection rests on the environment there and an unreadable
-    /// environment leaves `environ` as `None` for callers to judge. Treating the
-    /// missing Linux-only probes as an error refused every action on macOS.
+    /// These platforms use the supported environment probe. Its failure is not
+    /// evidence of an unsupervised process: propagate it to every planning and
+    /// execution caller. Missing Linux-only probes remain outside this probe's
+    /// scope, so readable environment evidence still succeeds on macOS.
     #[cfg(not(target_os = "linux"))]
     pub fn detect(&mut self, pid: u32) -> Result<CombinedResult, DetectionError> {
-        let mut result = CombinedResult::not_supervised();
-        if let Ok(environ_result) = self.environ.analyze(pid) {
-            if environ_result.is_supervised {
-                result.evidence.extend(environ_result.evidence.clone());
-                result.is_supervised = environ_result.confidence > 0.0;
-                result.confidence = environ_result.confidence;
-                result.supervisor_name = environ_result.supervisor_name.clone();
-                result.supervisor_type = environ_result.category;
-            }
-            result.environ = Some(environ_result);
-        }
-        Ok(result)
+        environment_only_supervision(self.environ.analyze(pid))
     }
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+fn environment_only_supervision(
+    observation: Result<EnvironResult, EnvironError>,
+) -> Result<CombinedResult, DetectionError> {
+    let environ = observation?;
+    let mut result = CombinedResult::not_supervised();
+    if environ.is_supervised {
+        result.evidence.extend(environ.evidence.clone());
+        result.is_supervised = true;
+        result.confidence = environ.confidence;
+        result.supervisor_name = environ.supervisor_name.clone();
+        result.supervisor_type = environ.category;
+    }
+    result.environ = Some(environ);
+    Ok(result)
 }
 
 impl Default for SupervisionDetector {
@@ -512,8 +519,58 @@ mod tests {
         assert!(result.confidence <= 1.0);
     }
 
-    /// Without /proc ancestry or IPC evidence, detection still answers from the
-    /// environment instead of failing (which refused every macOS action).
+    #[test]
+    fn environment_only_detection_preserves_probe_failures() {
+        for error in [
+            EnvironError::ProcessNotFound(1234),
+            EnvironError::Unsupported(1234),
+            EnvironError::Parse {
+                pid: 1234,
+                reason: "truncated evidence".to_string(),
+            },
+            EnvironError::IoError {
+                pid: 1234,
+                source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            },
+        ] {
+            let expected = error.to_string();
+            let observed = environment_only_supervision(Err(error)).unwrap_err();
+            assert!(matches!(observed, DetectionError::Environment(_)));
+            assert!(observed.to_string().contains(&expected));
+        }
+    }
+
+    #[test]
+    fn environment_only_detection_keeps_readable_negative_and_human_evidence() {
+        let analyzer = EnvironAnalyzer::new();
+        let negative = environment_only_supervision(Ok(
+            analyzer.analyze_env(&std::collections::HashMap::new())
+        ))
+        .expect("an observed environment needs no Linux-only probes");
+        assert!(!negative.is_supervised);
+        assert!(!is_human_supervised(&negative));
+        assert!(negative.environ.is_some());
+        assert!(negative.ancestry.is_none());
+        assert!(negative.ipc.is_none());
+
+        for marker in ["CLAUDECODE", "CODEX_SESSION_ID", "VSCODE_PID", "TMUX"] {
+            let environment = std::collections::HashMap::from([
+                (
+                    "XPC_SERVICE_NAME".to_string(),
+                    "com.example.service".to_string(),
+                ),
+                (marker.to_string(), "present".to_string()),
+            ]);
+            let observed = environment_only_supervision(Ok(analyzer.analyze_env(&environment)))
+                .expect("readable supervision evidence");
+            assert!(observed.is_supervised, "{marker}: {observed:?}");
+            assert!(is_human_supervised(&observed), "{marker}: {observed:?}");
+            assert!(observed.environ.is_some());
+        }
+    }
+
+    /// Missing Linux-only evidence is not an error when the supported macOS
+    /// environment probe succeeds.
     #[cfg(target_os = "macos")]
     #[test]
     fn test_detect_supervision_current_process_macos() {
@@ -522,6 +579,37 @@ mod tests {
         assert!(result.ipc.is_none());
         assert!(result.environ.is_some());
         assert!(result.confidence >= 0.0 && result.confidence <= 1.0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_missing_process_is_not_observed_unsupervised() {
+        assert!(matches!(
+            detect_supervision(u32::MAX),
+            Err(DetectionError::Environment(_))
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_owned_agent_child_retains_human_supervision() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .env("CODEX_SESSION_ID", "pt-macos-supervision-regression")
+            .spawn()
+            .expect("spawn an owned process with known supervision evidence");
+        let observed = detect_supervision(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        let observed = observed.expect("read the owned child's environment");
+        assert!(is_human_supervised(&observed), "{observed:?}");
+        assert!(observed
+            .environ
+            .as_ref()
+            .unwrap()
+            .matched_vars
+            .iter()
+            .any(|(key, _)| key == "CODEX_SESSION_ID"));
     }
 
     #[cfg(target_os = "linux")]
