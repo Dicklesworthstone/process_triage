@@ -7,6 +7,7 @@ use crate::decision::decision_store::Verdict;
 use crate::decision::{Action, DecisionOutcome};
 use crate::inference::{ClassScores, Confidence, EvidenceLedger};
 use chrono::Utc;
+use pt_common::ProcessIdentity;
 use pt_telemetry::shadow::{
     BeliefState, EventType, Observation, ProcessEvent, ShadowStorage, ShadowStorageConfig,
     ShadowStorageError, StateSnapshot,
@@ -44,6 +45,24 @@ impl From<serde_json::Error> for ShadowRecordError {
     }
 }
 
+/// Sources that capture an explicit human judgment, never an accepted model
+/// default or an automated action outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanVerdictSource {
+    AgentLabel,
+    TuiReview,
+}
+
+impl HumanVerdictSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AgentLabel => "agent_label",
+            Self::TuiReview => "tui_review",
+        }
+    }
+}
+
 /// Persist an explicit judgment about one live process incarnation for shadow
 /// calibration. A command-pattern label alone cannot identify a past prediction.
 ///
@@ -55,20 +74,34 @@ pub fn record_human_verdict(
     proc: &ProcessRecord,
     verdict: Verdict,
 ) -> Result<String, ShadowRecordError> {
-    record_human_verdict_with_config(shadow_config_from_env(), proc, verdict)
+    record_reviewed_verdict(
+        &shadow_config_from_env(),
+        &ProcessIdentity::new(proc.pid.0, proc.start_id.clone(), proc.uid),
+        &proc.comm,
+        &proc.cmd,
+        verdict,
+        HumanVerdictSource::AgentLabel,
+    )
 }
 
-fn record_human_verdict_with_config(
-    config: ShadowStorageConfig,
-    proc: &ProcessRecord,
+/// Persist feedback for the exact process and command reviewed by a human.
+/// The process may have exited since review; never look up its PID again.
+/// Record this before updating learned priors, just as for a live CLI label.
+pub fn record_reviewed_verdict(
+    config: &ShadowStorageConfig,
+    identity: &ProcessIdentity,
+    comm: &str,
+    cmd: &str,
     verdict: Verdict,
+    source: HumanVerdictSource,
 ) -> Result<String, ShadowRecordError> {
     let timestamp = Utc::now();
-    let identity_hash = compute_identity_hash(proc);
-    let mut storage = ShadowStorage::new(config)?;
+    let identity_hash =
+        compute_reviewed_identity_hash(identity.uid, &identity.start_id.0, comm, cmd);
+    let mut storage = ShadowStorage::new(config.clone())?;
     storage.record(Observation {
         timestamp,
-        pid: proc.pid.0,
+        pid: identity.pid.0,
         identity_hash: identity_hash.clone(),
         state: StateSnapshot::default(),
         events: vec![ProcessEvent {
@@ -77,8 +110,8 @@ fn record_human_verdict_with_config(
             details: Some(
                 serde_json::json!({
                     "verdict": verdict,
-                    "source": "agent_label",
-                    "comm": proc.comm,
+                    "source": source,
+                    "comm": comm,
                 })
                 .to_string(),
             ),
@@ -124,7 +157,10 @@ pub struct ShadowRecorder {
 
 impl ShadowRecorder {
     pub fn new() -> Result<Self, ShadowRecordError> {
-        let config = shadow_config_from_env();
+        Self::with_config(shadow_config_from_env())
+    }
+
+    pub fn with_config(config: ShadowStorageConfig) -> Result<Self, ShadowRecordError> {
         let storage = ShadowStorage::new(config)?;
         let pending_path = storage.config().base_dir.join("pending.json");
         let pending = match load_pending(&pending_path) {
@@ -326,11 +362,15 @@ fn confidence_score(confidence: Confidence) -> f32 {
 }
 
 fn compute_identity_hash(proc: &ProcessRecord) -> String {
+    compute_reviewed_identity_hash(proc.uid, &proc.start_id.0, &proc.comm, &proc.cmd)
+}
+
+fn compute_reviewed_identity_hash(uid: u32, start_id: &str, comm: &str, cmd: &str) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(proc.uid.to_le_bytes());
-    hasher.update(proc.start_id.0.as_bytes());
-    hasher.update(proc.comm.as_bytes());
-    hasher.update(proc.cmd.as_bytes());
+    hasher.update(uid.to_le_bytes());
+    hasher.update(start_id.as_bytes());
+    hasher.update(comm.as_bytes());
+    hasher.update(cmd.as_bytes());
     let digest = hasher.finalize();
     hex::encode(&digest[..8])
 }
@@ -647,9 +687,22 @@ mod tests {
             ..Default::default()
         };
         let proc = make_proc(412, "sleep", "sleep 621");
-        for verdict in [Verdict::Kill, Verdict::Spare] {
-            let identity = record_human_verdict_with_config(config.clone(), &proc, verdict)
-                .expect("persist explicit verdict");
+        let verdicts = [
+            (HumanVerdictSource::AgentLabel, Verdict::Kill),
+            (HumanVerdictSource::AgentLabel, Verdict::Spare),
+            (HumanVerdictSource::TuiReview, Verdict::Kill),
+            (HumanVerdictSource::TuiReview, Verdict::Spare),
+        ];
+        for (source, verdict) in verdicts {
+            let identity = record_reviewed_verdict(
+                &config,
+                &ProcessIdentity::new(proc.pid.0, proc.start_id.clone(), proc.uid),
+                &proc.comm,
+                &proc.cmd,
+                verdict,
+                source,
+            )
+            .expect("persist explicit verdict");
             assert_eq!(identity, compute_identity_hash(&proc));
         }
 
@@ -665,8 +718,8 @@ mod tests {
             }
         }
         observations.sort_by_key(|obs| obs.timestamp);
-        assert_eq!(observations.len(), 2);
-        for (obs, verdict) in observations.iter().zip(["kill", "spare"]) {
+        assert_eq!(observations.len(), 4);
+        for (obs, (source, verdict)) in observations.iter().zip(verdicts) {
             assert_eq!(obs.pid, proc.pid.0);
             assert_eq!(obs.identity_hash, compute_identity_hash(&proc));
             assert_eq!(obs.events.len(), 1);
@@ -675,8 +728,8 @@ mod tests {
             assert_eq!(event.timestamp, obs.timestamp);
             let details: serde_json::Value =
                 serde_json::from_str(event.details.as_deref().unwrap()).unwrap();
-            assert_eq!(details["verdict"], verdict);
-            assert_eq!(details["source"], "agent_label");
+            assert_eq!(details["verdict"], serde_json::to_value(verdict).unwrap());
+            assert_eq!(details["source"], source.as_str());
             assert_eq!(details["comm"], "sleep");
             assert_eq!(obs.belief.recommendation, "human_verdict");
         }

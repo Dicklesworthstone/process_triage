@@ -33,8 +33,13 @@ before its first observation, that incarnation supplies no calibration sample:
 repeating the label cannot evaluate a prediction that already learned from it.
 
 `--cmd` labels still teach command patterns, but have no process identity and
-therefore do not label shadow predictions. TUI judgments currently teach pattern
-priors; use explicit `agent label --pid` judgments for shadow calibration.
+therefore do not label shadow predictions. Explicit per-row TUI judgments also
+supply shadow labels: individually spared rows and individually selected direct
+kills that succeeded. They use the identity and command shown during review,
+even when the killed process has already exited. Accepted defaults, select-all,
+failed actions, zombie-parent remedies, and dry-run/shadow execution supply no
+human labels. A TUI judgment and a CLI label for the same incarnation still count
+as at most one calibration sample; an earlier prediction is required.
 
 ## 3) Read the report
 

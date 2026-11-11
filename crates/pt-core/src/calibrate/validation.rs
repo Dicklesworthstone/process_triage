@@ -1018,12 +1018,15 @@ fn map_explicit_verdict(
     event: &ProcessEvent,
 ) -> Option<(GroundTruth, Option<i32>, Option<i32>, Option<String>)> {
     match event.event_type {
-        EventType::HumanVerdict => Some((
-            map_human_verdict(event)?,
-            None,
-            None,
-            Some("human:agent_label".to_string()),
-        )),
+        EventType::HumanVerdict => {
+            let (verdict, source) = map_human_verdict(event)?;
+            Some((
+                verdict,
+                None,
+                None,
+                Some(format!("human:{}", source.as_str())),
+            ))
+        }
         EventType::ProcessExit => {
             let outcome = map_exit_event(event);
             outcome.0.is_resolved().then_some(outcome)
@@ -1032,16 +1035,17 @@ fn map_explicit_verdict(
     }
 }
 
-fn map_human_verdict(event: &ProcessEvent) -> Option<GroundTruth> {
+fn map_human_verdict(
+    event: &ProcessEvent,
+) -> Option<(GroundTruth, crate::shadow::HumanVerdictSource)> {
     let details = serde_json::from_str::<JsonValue>(event.details.as_deref()?).ok()?;
-    if details.get("source")?.as_str()? != "agent_label" {
-        return None;
-    }
-    match details.get("verdict")?.as_str()? {
-        "kill" => Some(GroundTruth::UserKilled),
-        "spare" => Some(GroundTruth::UserSpared),
-        _ => None,
-    }
+    let source = serde_json::from_value(details.get("source")?.clone()).ok()?;
+    let verdict = match details.get("verdict")?.as_str()? {
+        "kill" => GroundTruth::UserKilled,
+        "spare" => GroundTruth::UserSpared,
+        _ => return None,
+    };
+    Some((verdict, source))
 }
 
 fn map_exit_event(event: &ProcessEvent) -> (GroundTruth, Option<i32>, Option<i32>, Option<String>) {
@@ -2010,6 +2014,61 @@ mod tests {
             exit_only.records()[0].resolved_at,
             Some(at + Duration::seconds(1))
         );
+    }
+
+    #[test]
+    fn cli_and_tui_verdicts_share_one_calibration_label_per_incarnation() {
+        let at = Utc::now();
+        for (first_source, later_source) in
+            [("agent_label", "tui_review"), ("tui_review", "agent_label")]
+        {
+            let prediction = human_label_prediction(at, 100, "worker", 0.8);
+            let learned_prediction =
+                human_label_prediction(at + Duration::seconds(2), 100, "worker", 0.1);
+            let mut first =
+                human_label_observation(at + Duration::seconds(1), 100, "worker", "spare");
+            first.events[0].details =
+                Some(serde_json::json!({"verdict": "spare", "source": first_source}).to_string());
+            let mut later =
+                human_label_observation(at + Duration::seconds(3), 100, "worker", "kill");
+            later.events[0].details =
+                Some(serde_json::json!({"verdict": "kill", "source": later_source}).to_string());
+            assert!(is_explicit_shadow_verdict(&first.events[0]));
+            assert!(is_explicit_shadow_verdict(&later.events[0]));
+            let engine = ValidationEngine::from_shadow_observations(
+                &[later, learned_prediction, first, prediction],
+                0.5,
+            );
+            let resolved = engine.resolved_records();
+            assert_eq!(resolved.len(), 1);
+            assert_eq!(resolved[0].ground_truth, Some(GroundTruth::UserSpared));
+            assert_eq!(resolved[0].predicted_at, at);
+            assert_eq!(
+                resolved[0].outcome_source,
+                Some(format!("human:{first_source}"))
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_tui_choices_are_not_explicit_calibration_labels() {
+        let at = Utc::now();
+        for source in [
+            "accepted_default",
+            "tui_default",
+            "agent_apply",
+            "automatic",
+        ] {
+            let prediction = human_label_prediction(at, 100, "worker", 0.8);
+            let mut label =
+                human_label_observation(at + Duration::seconds(1), 100, "worker", "kill");
+            label.events[0].details =
+                Some(serde_json::json!({"verdict": "kill", "source": source}).to_string());
+            assert!(!is_explicit_shadow_verdict(&label.events[0]));
+            let engine = ValidationEngine::from_shadow_observations(&[prediction, label], 0.5);
+            assert!(engine.resolved_records().is_empty(), "source {source}");
+            assert_eq!(engine.pending_records().len(), 1);
+        }
     }
 
     #[test]

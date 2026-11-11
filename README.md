@@ -1342,9 +1342,11 @@ The checked-in files under `completions/` are snapshots and may lag behind the C
 - **Explicit labels**: `pt agent label --pid 1234 --kill` or `pt agent label --cmd "python3 -m http.server 8000" --spare`.
 - **Robot/agent applies are never recorded**, so the model cannot teach itself its own mistakes.
 
-Live-process labels (`agent label --pid`) also supply explicit positive/negative
-labels to `shadow report`, matched to an earlier observation of the same process
-incarnation. Command-pattern labels (`--cmd`) update priors only. Shadow calibration
+Live-process labels (`agent label --pid`) and explicit per-row TUI spares/successful
+direct kills also supply positive/negative labels to `shadow report`, matched to
+an earlier observation of the same process incarnation. TUI feedback retains the
+reviewed identity and command even after exit; repeated CLI/TUI labels cannot count
+the same incarnation twice. Command-pattern labels (`--cmd`) update priors only. Shadow calibration
 never treats disappearance, successful execution of an action, or a model's own
 recommendation as a human judgment. It requires at least five labels of each class
 before computing metrics; see [the shadow calibration tutorial](docs/tutorials/06-shadow-calibration.md).

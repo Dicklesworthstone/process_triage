@@ -2591,6 +2591,10 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
         let shadow = global.shadow;
         let decisions_e = Arc::clone(&decisions);
         let execution_state_e = Arc::clone(&execution_state);
+        let feedback_shadow_config = ShadowStorageConfig {
+            base_dir: shadow_base_dir(),
+            ..Default::default()
+        };
 
         let execute_fn = Arc::new(
             move |selected: Vec<u32>,
@@ -2615,12 +2619,19 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
                             &candidates,
                         )?)
                     };
-                    let commands: HashMap<u32, (String, String)> = selected
+                    let commands: HashMap<u32, TuiReviewedProcess> = selected
                         .iter()
                         .chain(explicitly_spared.iter())
                         .filter_map(|pid| {
                             let c = candidates.get(pid)?;
-                            Some((*pid, (c.comm.clone(), c.cmd.clone())))
+                            Some((
+                                *pid,
+                                TuiReviewedProcess {
+                                    identity: c.identity.clone(),
+                                    comm: c.comm.clone(),
+                                    cmd: c.cmd.clone(),
+                                },
+                            ))
                         })
                         .collect();
                     drop(candidates); // release lock before I/O
@@ -2652,7 +2663,13 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
                             "cannot save spare feedback: decision learning is unavailable"
                                 .to_string()
                         })?;
-                        record_confirmed_spares(store, &commands, &selected, &explicitly_spared)?;
+                        record_confirmed_spares(
+                            store,
+                            &commands,
+                            &selected,
+                            &explicitly_spared,
+                            &feedback_shadow_config,
+                        )?;
                     }
                     let Some(plan) = plan else {
                         if explicitly_spared.is_empty() {
@@ -2676,6 +2693,7 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
                                 &result,
                                 &commands,
                                 &explicitly_selected,
+                                &feedback_shadow_config,
                             );
                         }
                     }
@@ -2766,15 +2784,23 @@ impl PlanCandidateInput {
     }
 }
 
+#[cfg(feature = "ui")]
+struct TuiReviewedProcess {
+    identity: ProcessIdentity,
+    comm: String,
+    cmd: String,
+}
+
 /// A confirmed spare is a judgment about the command the user saw. Use that
 /// frozen snapshot, never a fresh PID lookup that may refer to another process.
 /// Bulk omissions do not reach this function, and duplicate PIDs count once.
 #[cfg(feature = "ui")]
 fn record_confirmed_spares(
     store: &mut pt_core::decision::decision_store::DecisionStore,
-    commands: &HashMap<u32, (String, String)>,
+    commands: &HashMap<u32, TuiReviewedProcess>,
     selected: &[u32],
     explicitly_spared: &[u32],
+    shadow_config: &ShadowStorageConfig,
 ) -> Result<usize, String> {
     use pt_core::decision::decision_store::Verdict;
 
@@ -2785,7 +2811,10 @@ fn record_confirmed_spares(
                 "conflicting action and spare feedback for PID {pid}"
             ));
         }
-        if !commands.contains_key(pid) {
+        if !commands
+            .get(pid)
+            .is_some_and(|reviewed| reviewed.identity.pid.0 == *pid)
+        {
             return Err(format!(
                 "spare feedback lacks the reviewed command for PID {pid}"
             ));
@@ -2798,8 +2827,22 @@ fn record_confirmed_spares(
     // scan's in-memory priors or silently discard the user's explicit choice.
     let mut updated = store.clone();
     for pid in &spared {
-        let (comm, command) = &commands[pid];
-        updated.record(comm, command, Verdict::Spare);
+        let reviewed = &commands[pid];
+        pt_core::shadow::record_reviewed_verdict(
+            shadow_config,
+            &reviewed.identity,
+            &reviewed.comm,
+            &reviewed.cmd,
+            Verdict::Spare,
+            pt_core::shadow::HumanVerdictSource::TuiReview,
+        )
+        .map_err(|error| {
+            format!(
+                "save spare calibration feedback for PID {pid}: {error:?}; learned priors unchanged \
+                 (earlier verdicts may already be retained)"
+            )
+        })?;
+        updated.record(&reviewed.comm, &reviewed.cmd, Verdict::Spare);
     }
     updated
         .save()
@@ -2815,14 +2858,16 @@ fn record_confirmed_kills(
     store: &mut pt_core::decision::decision_store::DecisionStore,
     plan: &Plan,
     result: &pt_core::action::ExecutionResult,
-    commands: &HashMap<u32, (String, String)>,
+    commands: &HashMap<u32, TuiReviewedProcess>,
     explicitly_selected: &[u32],
+    shadow_config: &ShadowStorageConfig,
 ) {
     use pt_core::action::ActionStatus;
     use pt_core::decision::decision_store::Verdict;
 
     let mut recorded = false;
     let mut learned = HashSet::new();
+    let mut updated = store.clone();
     for outcome in &result.outcomes {
         if !matches!(outcome.status, ActionStatus::Success) {
             continue;
@@ -2843,14 +2888,35 @@ fn record_confirmed_kills(
         {
             continue;
         }
-        if let Some((comm, cmd)) = commands.get(&action.target.pid.0) {
-            store.record(comm, cmd, Verdict::Kill);
-            recorded = true;
+        let Some(reviewed) = commands.get(&action.target.pid.0) else {
+            continue;
+        };
+        if !reviewed.identity.matches(&action.target) {
+            continue;
         }
+        if let Err(error) = pt_core::shadow::record_reviewed_verdict(
+            shadow_config,
+            &reviewed.identity,
+            &reviewed.comm,
+            &reviewed.cmd,
+            Verdict::Kill,
+            pt_core::shadow::HumanVerdictSource::TuiReview,
+        ) {
+            tracing::warn!(
+                pid = action.target.pid.0,
+                error = ?error,
+                "failed to save explicit kill calibration feedback; learned prior unchanged"
+            );
+            continue;
+        }
+        updated.record(&reviewed.comm, &reviewed.cmd, Verdict::Kill);
+        recorded = true;
     }
     if recorded {
-        if let Err(e) = store.save() {
+        if let Err(e) = updated.save() {
             tracing::warn!(error = %e, "failed to save decision store");
+        } else {
+            *store = updated;
         }
     }
 }
@@ -20203,16 +20269,25 @@ mod process_tree_safety_tests {
 
 #[cfg(all(test, feature = "ui"))]
 mod tui_learning_tests {
-    use super::{record_confirmed_kills, record_confirmed_spares};
+    use super::{
+        collect_shadow_observations, record_confirmed_kills, record_confirmed_spares,
+        TuiReviewedProcess,
+    };
     use pt_common::{IdentityQuality, ProcessIdentity, StartId};
     use pt_core::action::{ActionResult, ActionStatus, ExecutionResult, ExecutionSummary};
+    use pt_core::calibrate::validation::{GroundTruth, ValidationEngine};
+    use pt_core::collect::{ProcessRecord, ProcessState};
     use pt_core::config::Priors;
     use pt_core::decision::decision_store::DecisionStore;
-    use pt_core::decision::Action;
+    use pt_core::decision::{decide_action, Action, ActionFeasibility};
+    use pt_core::inference::Evidence;
     use pt_core::plan::{
         ActionConfidence, ActionRationale, ActionRouting, ActionTimeouts, GatesSummary, Plan,
         PlanAction,
     };
+    use pt_core::scoring::Scorer;
+    use pt_core::shadow::ShadowRecorder;
+    use pt_telemetry::shadow::{EventType, ShadowStorageConfig};
     use std::collections::HashMap;
 
     fn action(id: &str, pid: u32, action: Action) -> PlanAction {
@@ -20262,16 +20337,90 @@ mod tui_learning_tests {
         }
     }
 
+    fn reviewed(pid: u32, comm: &str, cmd: &str) -> TuiReviewedProcess {
+        TuiReviewedProcess {
+            identity: action("reviewed", pid, Action::Keep).target,
+            comm: comm.to_string(),
+            cmd: cmd.to_string(),
+        }
+    }
+
+    fn shadow_config(directory: &std::path::Path) -> ShadowStorageConfig {
+        ShadowStorageConfig {
+            base_dir: directory.join("shadow"),
+            auto_compact: false,
+            delete_expired: false,
+            ..Default::default()
+        }
+    }
+
+    fn seed_prediction(subject: &TuiReviewedProcess, config: &ShadowStorageConfig) {
+        let process = ProcessRecord {
+            pid: subject.identity.pid,
+            ppid: pt_common::ProcessId(1),
+            uid: subject.identity.uid,
+            user: "reviewed-user".to_string(),
+            pgid: subject.identity.pgid,
+            sid: subject.identity.sid,
+            start_id: subject.identity.start_id.clone(),
+            comm: subject.comm.clone(),
+            cmd: subject.cmd.clone(),
+            state: ProcessState::Sleeping,
+            cpu_percent: 0.0,
+            rss_bytes: 1024,
+            vsz_bytes: 2048,
+            tty: None,
+            start_time_unix: 1,
+            elapsed: std::time::Duration::from_secs(7200),
+            source: "fixture".to_string(),
+            container_info: None,
+        };
+        let scorer = Scorer::new(
+            Priors::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
+        let score = scorer
+            .score(&process, Evidence::from_snapshot(&process))
+            .expect("recorded model prediction");
+        let decision = decide_action(
+            &score.posterior.posterior,
+            &pt_core::config::Policy::default(),
+            &ActionFeasibility::allow_all(),
+        )
+        .unwrap();
+        let mut recorder = ShadowRecorder::with_config(config.clone()).unwrap();
+        recorder
+            .record_candidate(
+                &process,
+                &score.posterior.posterior,
+                &score.ledger,
+                &decision,
+            )
+            .unwrap();
+        recorder.flush().unwrap();
+    }
+
     #[test]
     fn confirmed_spares_use_reviewed_commands_and_persist_without_an_action() {
         let directory = tempfile::tempdir().unwrap();
         let mut store = DecisionStore::load(directory.path()).unwrap();
         let commands = HashMap::from([
-            (21, ("vim".to_string(), "vim notes.txt".to_string())),
-            (22, ("sleep".to_string(), "sleep 900".to_string())),
+            (21, reviewed(21, "vim", "vim notes.txt")),
+            (22, reviewed(22, "sleep", "sleep 900")),
         ]);
+        let config = shadow_config(directory.path());
+        seed_prediction(&commands[&21], &config);
         assert_eq!(
-            record_confirmed_spares(&mut store, &commands, &[], &[21, 21]).unwrap(),
+            record_confirmed_spares(
+                &mut store,
+                &commands,
+                &[],
+                &[21, 21],
+                &config,
+            )
+            .unwrap(),
             1
         );
         let loaded = DecisionStore::load(directory.path()).unwrap();
@@ -20283,23 +20432,52 @@ mod tui_learning_tests {
         assert!(loaded
             .learned_prior("sleep", "sleep 900", &priors)
             .is_none());
+
+        let observations = collect_shadow_observations(&config.base_dir, None, true).unwrap();
+        assert_eq!(
+            observations.len(),
+            2,
+            "one prediction and one explicit spare"
+        );
+        let engine = ValidationEngine::from_shadow_observations(&observations, 0.5);
+        let resolved = engine.resolved_records();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].ground_truth, Some(GroundTruth::UserSpared));
+        assert_eq!(
+            resolved[0].outcome_source.as_deref(),
+            Some("human:tui_review")
+        );
+        assert!(resolved[0].predicted_at < resolved[0].resolved_at.unwrap());
+
+        // A later refresh may already use this spare as a learned prior. A second
+        // judgment must not evaluate that in-sample prediction against itself.
+        seed_prediction(&commands[&21], &config);
+        record_confirmed_spares(&mut store, &commands, &[], &[21], &config).unwrap();
+        let observations = collect_shadow_observations(&config.base_dir, None, true).unwrap();
+        let engine = ValidationEngine::from_shadow_observations(&observations, 0.5);
+        assert_eq!(engine.resolved_records().len(), 1);
     }
 
     #[test]
     fn conflicting_or_missing_spare_snapshot_never_partially_trains() {
         let directory = tempfile::tempdir().unwrap();
         let mut store = DecisionStore::load(directory.path()).unwrap();
-        let commands = HashMap::from([(21, ("vim".to_string(), "vim notes.txt".to_string()))]);
-        assert!(record_confirmed_spares(&mut store, &commands, &[21], &[21]).is_err());
-        assert!(record_confirmed_spares(&mut store, &commands, &[], &[21, 22]).is_err());
+        let commands = HashMap::from([(21, reviewed(21, "vim", "vim notes.txt"))]);
+        let config = shadow_config(directory.path());
+        assert!(record_confirmed_spares(&mut store, &commands, &[21], &[21], &config).is_err());
+        assert!(record_confirmed_spares(&mut store, &commands, &[], &[21, 22], &config).is_err());
         assert_eq!(
-            record_confirmed_spares(&mut store, &commands, &[], &[]).unwrap(),
+            record_confirmed_spares(&mut store, &commands, &[], &[], &config).unwrap(),
             0
         );
         assert!(store
             .learned_prior("vim", "vim notes.txt", &Priors::default())
             .is_none());
         assert!(!directory.path().join("decisions.json").exists());
+        assert!(
+            !config.base_dir.exists(),
+            "invalid feedback writes no shadow labels"
+        );
     }
 
     #[test]
@@ -20308,12 +20486,35 @@ mod tui_learning_tests {
         let mut store = DecisionStore::load(directory.path()).unwrap();
         // A directory at the destination fails even when the test runs as root.
         std::fs::create_dir(directory.path().join("decisions.json")).unwrap();
-        let commands = HashMap::from([(21, ("vim".to_string(), "vim notes.txt".to_string()))]);
-        assert!(record_confirmed_spares(&mut store, &commands, &[], &[21]).is_err());
+        let commands = HashMap::from([(21, reviewed(21, "vim", "vim notes.txt"))]);
+        assert!(record_confirmed_spares(
+            &mut store,
+            &commands,
+            &[],
+            &[21],
+            &shadow_config(directory.path()),
+        )
+        .is_err());
         assert!(store
             .learned_prior("vim", "vim notes.txt", &Priors::default())
             .is_none());
         assert!(directory.path().join("decisions.json").is_dir());
+    }
+
+    #[test]
+    fn failed_shadow_spare_save_does_not_train_an_untracked_prior() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = DecisionStore::load(directory.path()).unwrap();
+        let config = shadow_config(directory.path());
+        std::fs::write(&config.base_dir, "blocked shadow directory").unwrap();
+        let commands = HashMap::from([(21, reviewed(21, "vim", "vim notes.txt"))]);
+        let error =
+            record_confirmed_spares(&mut store, &commands, &[], &[21], &config).unwrap_err();
+        assert!(error.contains("calibration feedback"));
+        assert!(store
+            .learned_prior("vim", "vim notes.txt", &Priors::default())
+            .is_none());
+        assert!(!directory.path().join("decisions.json").exists());
     }
 
     #[test]
@@ -20333,10 +20534,11 @@ mod tui_learning_tests {
                 action("a4", 14, Action::Kill),
                 action("a5", 15, Action::Kill),
                 action("a6", 16, Action::Kill),
+                action("a7", 17, Action::Kill),
             ],
             pre_toggled: Vec::new(),
             gates_summary: GatesSummary {
-                total_candidates: 6,
+                total_candidates: 7,
                 blocked_candidates: 1,
                 pre_toggled_actions: 0,
             },
@@ -20345,8 +20547,8 @@ mod tui_learning_tests {
         plan.actions[5].original_zombie_target = Some(plan.actions[1].target.clone());
         let result = ExecutionResult {
             summary: ExecutionSummary {
-                actions_attempted: 7,
-                actions_succeeded: 6,
+                actions_attempted: 8,
+                actions_succeeded: 7,
                 actions_failed: 1,
             },
             outcomes: vec![
@@ -20356,24 +20558,41 @@ mod tui_learning_tests {
                 outcome("a4", ActionStatus::Success),
                 outcome("a5", ActionStatus::Success),
                 outcome("a6", ActionStatus::Success),
+                outcome("a7", ActionStatus::Success),
                 outcome("a1", ActionStatus::Success),
             ],
         };
-        let commands: HashMap<u32, (String, String)> = [
-            (11, ("sleep".to_string(), "sleep 900".to_string())),
-            (12, ("vim".to_string(), "vim notes.txt".to_string())),
-            (13, ("cat".to_string(), "cat".to_string())),
-            (14, ("perl".to_string(), "perl worker.pl".to_string())),
-            (15, ("ruby".to_string(), "ruby worker.rb".to_string())),
-            (16, ("python".to_string(), "python worker.py".to_string())),
+        let mut reused = reviewed(17, "node", "node new-worker.js");
+        reused.identity.start_id = StartId("b:new-start:17".to_string());
+        let commands = [
+            (11, reviewed(11, "sleep", "sleep 900")),
+            (12, reviewed(12, "vim", "vim notes.txt")),
+            (13, reviewed(13, "cat", "cat")),
+            (14, reviewed(14, "perl", "perl worker.pl")),
+            (15, reviewed(15, "ruby", "ruby worker.rb")),
+            (16, reviewed(16, "python", "python worker.py")),
+            (17, reused),
         ]
         .into_iter()
         .collect();
 
-        record_confirmed_kills(&mut store, &plan, &result, &commands, &[]);
+        let config = shadow_config(dir.path());
+        record_confirmed_kills(&mut store, &plan, &result, &commands, &[], &config);
         let g = Priors::default();
         assert!(store.learned_prior("sleep", "sleep 900", &g).is_none());
-        record_confirmed_kills(&mut store, &plan, &result, &commands, &[11, 12, 13, 15, 16]);
+        assert!(
+            !config.base_dir.exists(),
+            "bulk defaults are not human labels"
+        );
+        seed_prediction(&commands[&11], &config);
+        record_confirmed_kills(
+            &mut store,
+            &plan,
+            &result,
+            &commands,
+            &[11, 12, 13, 15, 16, 17],
+            &config,
+        );
 
         // Persisted once, excluding an untouched default, failures, non-kills,
         // blocked actions and a remedy routed from a different process.
@@ -20389,6 +20608,31 @@ mod tui_learning_tests {
         assert!(store
             .learned_prior("python", "python worker.py", &g)
             .is_none());
+        assert!(store
+            .learned_prior("node", "node new-worker.js", &g)
+            .is_none());
+
+        let observations = collect_shadow_observations(&config.base_dir, None, true).unwrap();
+        assert_eq!(observations.len(), 2);
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|observation| observation
+                    .events
+                    .iter()
+                    .any(|event| { event.event_type == EventType::HumanVerdict }))
+                .count(),
+            1,
+            "exactly one successful explicit direct kill is a calibration label"
+        );
+        let engine = ValidationEngine::from_shadow_observations(&observations, 0.5);
+        let resolved = engine.resolved_records();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].ground_truth, Some(GroundTruth::UserKilled));
+        assert_eq!(
+            resolved[0].outcome_source.as_deref(),
+            Some("human:tui_review")
+        );
     }
 }
 
