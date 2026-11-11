@@ -3650,6 +3650,312 @@ fn state_of(pid: u32) -> Option<char> {
     String::from_utf8_lossy(&out.stdout).trim().chars().next()
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn agent_apply_checkpoints_outcomes_and_stops_on_persistence_failure() {
+    use std::os::unix::fs::symlink;
+
+    for failure in ["none", "flush", "sync", "refusal"] {
+        let data_dir = TempDir::new().unwrap().keep();
+        let config_dir = TempDir::new().unwrap().keep();
+        write_test_policy(&config_dir);
+        let first = ForeignTarget::spawn("sleep 371");
+        let later = ForeignTarget::spawn("sleep 372");
+        let first_identity = live_identity(first.pid);
+        let later_identity = live_identity(later.pid);
+        let mut first_action = plan_action(Action::Pause, &first_identity);
+        first_action.action_id = "checkpoint-first".to_string();
+        first_action.blocked = failure == "refusal";
+        let mut later_action = plan_action(Action::Pause, &later_identity);
+        later_action.action_id = "checkpoint-later".to_string();
+        let session = session_with_actions(&data_dir, vec![first_action, later_action]);
+        let handle = SessionStore::at_data_dir(&data_dir)
+            .open(&SessionId::parse(&session).unwrap())
+            .unwrap();
+        let journal = handle.dir.join("action/outcomes.jsonl");
+        match failure {
+            "flush" => symlink("/dev/full", &journal).unwrap(),
+            "sync" => symlink("/dev/null", &journal).unwrap(),
+            "refusal" => fs::create_dir(&journal).unwrap(),
+            _ => {}
+        }
+        let targets = format!(
+            "{}:{},{}:{}",
+            first.pid, first_identity.start_id.0, later.pid, later_identity.start_id.0
+        );
+        let args = [
+            "--format",
+            "json",
+            "agent",
+            "apply",
+            "--session",
+            &session,
+            "--targets",
+            &targets,
+            "--yes",
+            "--settle",
+            "0",
+        ];
+        let started = std::time::Instant::now();
+        let output = cargo_bin_cmd!("pt-core")
+            .timeout(Duration::from_secs(120))
+            .env("PT_SKIP_GLOBAL_LOCK", "1")
+            .env("PROCESS_TRIAGE_DATA", &data_dir)
+            .env("PROCESS_TRIAGE_CONFIG", &config_dir)
+            .env("PROCESS_TRIAGE_RETENTION", "off")
+            .args(args)
+            .output()
+            .unwrap();
+        fs::write(data_dir.join("checkpoint.stdout.json"), &output.stdout).unwrap();
+        fs::write(data_dir.join("checkpoint.stderr.jsonl"), &output.stderr).unwrap();
+        fs::write(
+            data_dir.join("checkpoint.step.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "case": failure, "command": "pt-core", "args": args,
+                    "exit_code": output.status.code(), "elapsed_ms": started.elapsed().as_millis(),
+                })
+            ),
+        )
+        .unwrap();
+        let document: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "{failure}: {error}; stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+        assert_eq!(document["summary"]["selected"], 2, "{document}");
+        let outcomes = document["outcomes"].as_array().unwrap();
+        assert_eq!(outcomes[0]["action_id"], "checkpoint-first", "{document}");
+        assert!(first.alive());
+        assert!(later.alive());
+        if failure == "none" {
+            assert_eq!(output.status.code(), Some(2), "{document}");
+            assert_eq!(document["summary"]["attempted"], 2);
+            assert_eq!(document["summary"]["not_attempted"], 0);
+            assert!(document["persistence_error"].is_null());
+            assert_eq!(state_of(first.pid), Some('T'));
+            assert_eq!(state_of(later.pid), Some('T'));
+            let saved =
+                pt_core::verify::parse_action_outcomes(&fs::read_to_string(&journal).unwrap())
+                    .unwrap();
+            assert_eq!(
+                saved.len(),
+                2,
+                "finalization must not append checkpoints again"
+            );
+            assert_eq!(saved[0].action_id, "checkpoint-first");
+            assert_eq!(saved[1].action_id, "checkpoint-later");
+            assert!(saved.iter().all(|outcome| outcome.status == "success"));
+        } else {
+            assert_eq!(output.status.code(), Some(21), "{document}");
+            assert_eq!(outcomes.len(), 1, "later action must not start: {document}");
+            assert_eq!(document["summary"]["attempted"], 1);
+            assert_eq!(document["summary"]["not_attempted"], 1);
+            assert_ne!(state_of(later.pid), Some('T'), "later target was mutated");
+            let error = document["persistence_error"].as_str().unwrap();
+            let operation = match failure {
+                "flush" => "flush action outcomes",
+                "sync" => "sync action outcomes",
+                _ => "open action outcomes",
+            };
+            assert!(error.contains(operation), "{error}");
+            assert_eq!(
+                handle.read_manifest().unwrap().state,
+                pt_core::session::SessionState::Failed,
+            );
+            if failure == "refusal" {
+                assert_eq!(outcomes[0]["status"], "blocked_by_plan");
+                assert_eq!(document["summary"]["succeeded"], 0);
+                assert_ne!(state_of(first.pid), Some('T'));
+            } else {
+                // A persistence error is not a failed pause; retain exact actual
+                // execution evidence while preventing the next mutation.
+                assert_eq!(outcomes[0]["status"], "success");
+                assert_eq!(outcomes[0]["action"], "pause");
+                assert_eq!(document["summary"]["succeeded"], 1);
+                assert_eq!(state_of(first.pid), Some('T'));
+                let target: ProcessIdentity =
+                    serde_json::from_value(outcomes[0]["target"].clone()).unwrap();
+                assert!(target.matches(&first_identity));
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn agent_apply_interruption_retains_completed_predecessor_for_resume() {
+    use std::process::Stdio;
+
+    struct OwnedApply(Child);
+    impl Drop for OwnedApply {
+        fn drop(&mut self) {
+            if matches!(self.0.try_wait(), Ok(None)) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    let data_dir = TempDir::new().unwrap().keep();
+    let config_dir = TempDir::new().unwrap().keep();
+    write_test_policy(&config_dir);
+    let policy_path = config_dir.join("policy.json");
+    let mut policy: Policy = serde_json::from_slice(&fs::read(&policy_path).unwrap()).unwrap();
+    policy.data_loss_gates.block_if_recent_io_seconds = Some(1);
+    fs::write(&policy_path, serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+    let ready = data_dir.join("target.ready");
+    let term_received = data_dir.join("target.term");
+    let script = data_dir.join("owned-term-observer.py");
+    fs::write(
+        &script,
+        r#"import signal, sys, time
+from pathlib import Path
+def observe_term(*unused):
+    Path(sys.argv[2]).write_text("TERM")
+signal.signal(signal.SIGTERM, observe_term)
+Path(sys.argv[1]).write_text("READY")
+while True:
+    time.sleep(1)
+"#,
+    )
+    .unwrap();
+    let shell_quote = |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
+    let first = ForeignTarget::spawn("sleep 373");
+    let later = ForeignTarget::spawn(&format!(
+        "python3 {} {} {}",
+        shell_quote(&script),
+        shell_quote(&ready),
+        shell_quote(&term_received),
+    ));
+    let readiness = std::time::Instant::now();
+    while !ready.exists() {
+        assert!(
+            readiness.elapsed() < Duration::from_secs(10),
+            "owned target did not initialize"
+        );
+        assert!(later.alive(), "owned target exited before readiness");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let first_identity = live_identity(first.pid);
+    let later_identity = live_identity(later.pid);
+    let mut first_action = plan_action(Action::Pause, &first_identity);
+    first_action.action_id = "checkpoint-completed".to_string();
+    let mut later_action = plan_action(Action::Kill, &later_identity);
+    later_action.action_id = "checkpoint-interrupted".to_string();
+    let session = session_with_actions(&data_dir, vec![first_action, later_action]);
+    let handle = SessionStore::at_data_dir(&data_dir)
+        .open(&SessionId::parse(&session).unwrap())
+        .unwrap();
+    let targets = format!(
+        "{}:{},{}:{}",
+        first.pid, first_identity.start_id.0, later.pid, later_identity.start_id.0,
+    );
+    let args = [
+        "--format",
+        "json",
+        "agent",
+        "apply",
+        "--session",
+        &session,
+        "--targets",
+        &targets,
+        "--yes",
+        "--settle",
+        "0",
+    ];
+    let stderr_path = data_dir.join("interrupted.stderr.jsonl");
+    let started = std::time::Instant::now();
+    let mut applying = OwnedApply(
+        ProcessCommand::new(assert_cmd::cargo::cargo_bin!("pt-core"))
+            .env("PT_SKIP_GLOBAL_LOCK", "1")
+            .env("PROCESS_TRIAGE_DATA", &data_dir)
+            .env("PROCESS_TRIAGE_CONFIG", &config_dir)
+            .env("PROCESS_TRIAGE_RETENTION", "off")
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(fs::File::create(data_dir.join("interrupted.stdout.json")).unwrap())
+            .stderr(fs::File::create(&stderr_path).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    // The marker proves the second owned action has begun and is waiting through
+    // its SIGTERM grace period. A completed predecessor must already be durable.
+    while !term_received.exists() {
+        assert!(
+            applying.0.try_wait().unwrap().is_none(),
+            "apply exited before later action: {}",
+            fs::read_to_string(&stderr_path).unwrap()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(90),
+            "apply never reached the later action: {}",
+            fs::read_to_string(&stderr_path).unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    applying
+        .0
+        .kill()
+        .expect("interrupt only the owned apply child");
+    let interrupted = applying.0.wait().unwrap();
+    fs::write(
+        data_dir.join("interrupted.step.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "command": "pt-core", "args": args, "status": interrupted.to_string(),
+                "elapsed_ms": started.elapsed().as_millis(),
+            })
+        ),
+    )
+    .unwrap();
+    assert!(!interrupted.success());
+    assert_eq!(state_of(first.pid), Some('T'));
+    assert!(
+        later.alive(),
+        "interruption must precede SIGKILL escalation"
+    );
+    let journal_path = handle.dir.join("action/outcomes.jsonl");
+    let checkpoint =
+        fs::read(&journal_path).expect("completed predecessor checkpoint survives interruption");
+    fs::write(data_dir.join("interrupted.checkpoint.jsonl"), &checkpoint).unwrap();
+    let saved =
+        pt_core::verify::parse_action_outcomes(std::str::from_utf8(&checkpoint).unwrap()).unwrap();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].action_id, "checkpoint-completed");
+    assert_eq!(saved[0].status, "success");
+    assert_eq!(saved[0].action, Some(Action::Pause));
+    assert!(saved[0].target.as_ref().unwrap().matches(&first_identity));
+    assert_eq!(
+        handle.read_manifest().unwrap().state,
+        pt_core::session::SessionState::Executing
+    );
+
+    // Resume the known-completed target only. The interrupted syscall-to-outcome
+    // window of the second action is deliberately not claimed to be idempotent.
+    let first_target = format!("{}:{}", first.pid, first_identity.start_id.0);
+    let (_, resumed) = apply_with_args(
+        &data_dir,
+        &config_dir,
+        &session,
+        &first_target,
+        &["--resume"],
+    );
+    assert_eq!(resumed["note"], "nothing_to_do", "{resumed}");
+    assert_eq!(resumed["summary"]["attempted"], 0);
+    assert!(resumed["outcomes"].as_array().unwrap().is_empty());
+    assert_eq!(
+        fs::read(journal_path).unwrap(),
+        checkpoint,
+        "resume must not repeat the predecessor"
+    );
+    assert_eq!(state_of(first.pid), Some('T'));
+    assert!(later.alive());
+}
+
 #[test]
 fn agent_apply_pauses_resumes_and_refuses_stale_or_protected_targets() {
     let data_dir = TempDir::new().expect("data dir").keep();

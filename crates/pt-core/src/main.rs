@@ -17939,6 +17939,13 @@ mod process_tree_safety_tests {
     }
 
     #[test]
+    fn empty_action_checkpoint_never_creates_an_execution_log() {
+        let directory = retained_outcome_fixture("empty");
+        super::append_action_outcomes(&directory, &[]).unwrap();
+        assert!(!directory.exists());
+    }
+
+    #[test]
     fn action_outcome_log_reports_creation_and_open_failures() {
         let root = retained_outcome_fixture("refusal");
         std::fs::create_dir_all(&root).unwrap();
@@ -17968,6 +17975,20 @@ mod process_tree_safety_tests {
         let records = vec![serde_json::json!({"action_id":"a1", "pid":100, "status":"success"})];
         let error = super::append_action_outcomes(&directory, &records).unwrap_err();
         assert!(error.contains("flush action outcomes"), "{error}");
+        assert_eq!(records[0]["status"], "success");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn action_outcome_log_reports_real_sync_failure() {
+        use std::os::unix::fs::symlink;
+        let directory = retained_outcome_fixture("sync");
+        std::fs::create_dir_all(&directory).unwrap();
+        // /dev/null accepts the write and flush but cannot durably retain it.
+        symlink("/dev/null", directory.join("outcomes.jsonl")).unwrap();
+        let records = vec![serde_json::json!({"action_id":"a1", "pid":100, "status":"success"})];
+        let error = super::append_action_outcomes(&directory, &records).unwrap_err();
+        assert!(error.contains("sync action outcomes"), "{error}");
         assert_eq!(records[0]["status"], "success");
     }
 
@@ -26926,8 +26947,19 @@ fn record_respawn_history_in_data_dir(
 }
 
 /// Persist the actual results, including refusals, without replacing a previous
-/// execution log. A returned error must not turn a completed kill into a failure.
+/// execution log. Sync completed records before another action can begin. A
+/// returned error must not turn a completed kill into a failure, and callers must
+/// not retry the same records: a failed write or sync may have published bytes.
 fn append_action_outcomes(action_dir: &Path, outcomes: &[serde_json::Value]) -> Result<(), String> {
+    if outcomes.is_empty() {
+        return Ok(());
+    }
+    let directory_existed = action_dir.try_exists().map_err(|error| {
+        format!(
+            "inspect action outcome directory {}: {error}",
+            action_dir.display()
+        )
+    })?;
     std::fs::create_dir_all(action_dir).map_err(|error| {
         format!(
             "create action outcome directory {}: {error}",
@@ -26947,7 +26979,39 @@ fn append_action_outcomes(action_dir: &Path, outcomes: &[serde_json::Value]) -> 
     }
     writer
         .flush()
-        .map_err(|error| format!("flush action outcomes {}: {error}", path.display()))
+        .map_err(|error| format!("flush action outcomes {}: {error}", path.display()))?;
+    writer
+        .get_ref()
+        .sync_all()
+        .map_err(|error| format!("sync action outcomes {}: {error}", path.display()))?;
+    #[cfg(unix)]
+    {
+        // File sync alone does not make a newly created journal's directory
+        // entry durable. The action directory may also be new for this session.
+        std::fs::File::open(action_dir)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                format!(
+                    "sync action outcome directory {}: {error}",
+                    action_dir.display()
+                )
+            })?;
+        if !directory_existed {
+            if let Some(parent) = action_dir.parent() {
+                std::fs::File::open(parent)
+                    .and_then(|directory| directory.sync_all())
+                    .map_err(|error| {
+                        format!(
+                            "sync action outcome parent directory {}: {error}",
+                            parent.display()
+                        )
+                    })?;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = directory_existed;
+    Ok(())
 }
 
 fn goal_report_json(report: &GoalProgressReport, planning_only: bool) -> serde_json::Value {
@@ -27541,6 +27605,24 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     }
 
     let mut outcomes: Vec<serde_json::Value> = Vec::new();
+    let action_dir = handle.dir.join("action");
+    let mut persistence_error = None;
+    // All branches, including refusals and early breaks, checkpoint their real
+    // outcome before the next target. Keep a failed checkpoint's original result
+    // in the response, stop immediately, and never append it again at finalization.
+    // This narrows the crash window; a syscall followed by a crash before its
+    // outcome is recorded still cannot provide exactly-once execution on resume.
+    macro_rules! checkpoint_outcome {
+        ($outcome:expr) => {{
+            let outcome = $outcome;
+            let persisted = append_action_outcomes(&action_dir, std::slice::from_ref(&outcome));
+            outcomes.push(outcome);
+            if let Err(error) = persisted {
+                persistence_error = Some(error);
+                break;
+            }
+        }};
+    }
     let mut resource_run: Option<ResourceRun> = None;
     // Verification and retention use this same lock. Keep it through outcome
     // append, resource evidence and final state persistence, not just actuation.
@@ -27577,7 +27659,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             // Skip already completed actions in resume mode
             if completed_action_ids.contains(&action.action_id) {
                 resumed_skipped += 1;
-                outcomes.push(serde_json::json!({
+                checkpoint_outcome!(serde_json::json!({
                     "action_id": action.action_id,
                     "pid": action.target.pid.0,
                     "status": "already_completed",
@@ -27596,7 +27678,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
 
             if action.blocked {
                 blocked_by_prechecks += 1;
-                outcomes.push(serde_json::json!({
+                checkpoint_outcome!(serde_json::json!({
                     "action_id": action.action_id,
                     "pid": action.target.pid.0,
                     "status": "blocked_by_plan"
@@ -27616,7 +27698,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 Ok(supervised) => supervised,
                 Err(reason) => {
                     blocked_by_prechecks += 1;
-                    outcomes.push(serde_json::json!({
+                    checkpoint_outcome!(serde_json::json!({
                         "action_id": action.action_id,
                         "pid": action.target.pid.0,
                         "status": "precheck_blocked",
@@ -27658,7 +27740,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             }
             if !check.allowed {
                 blocked_by_constraints += 1;
-                outcomes.push(serde_json::json!({
+                checkpoint_outcome!(serde_json::json!({
                     "action_id": action.action_id,
                     "pid": action.target.pid.0,
                     "status": "blocked_by_constraints",
@@ -27681,7 +27763,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 .find_map(|provider| first_precheck_block(provider, action))
             {
                 blocked_by_prechecks += 1;
-                outcomes.push(serde_json::json!({
+                checkpoint_outcome!(serde_json::json!({
                     "action_id": action.action_id,
                     "pid": action.target.pid.0,
                     "status": "precheck_blocked",
@@ -27701,7 +27783,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
 
             if let Some(reason) = tree_refusals.get(&action.target.pid.0) {
                 blocked_by_prechecks += 1;
-                outcomes.push(serde_json::json!({
+                checkpoint_outcome!(serde_json::json!({
                     "action_id": action.action_id,
                     "pid": action.target.pid.0,
                     "status": "precheck_blocked",
@@ -27720,7 +27802,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             }
 
             skipped += 1;
-            outcomes.push(serde_json::json!({"action_id": action.action_id, "pid": action.target.pid.0, "status": if global.dry_run { "dry_run" } else { "shadow" }}));
+            checkpoint_outcome!(serde_json::json!({"action_id": action.action_id, "pid": action.target.pid.0, "status": if global.dry_run { "dry_run" } else { "shadow" }}));
             emit_action_event(
                 pt_core::events::event_names::ACTION_COMPLETE,
                 action_index,
@@ -27844,7 +27926,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 // Skip already completed actions in resume mode
                 if completed_action_ids.contains(&action.action_id) {
                     resumed_skipped += 1;
-                    outcomes.push(serde_json::json!({
+                    checkpoint_outcome!(serde_json::json!({
                         "action_id": action.action_id,
                         "pid": action.target.pid.0,
                         "status": "already_completed",
@@ -27863,7 +27945,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
 
                 if action.blocked {
                     blocked_by_prechecks += 1;
-                    outcomes.push(serde_json::json!({
+                    checkpoint_outcome!(serde_json::json!({
                         "action_id": action.action_id,
                         "pid": action.target.pid.0,
                         "status": "blocked_by_plan"
@@ -27888,7 +27970,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     Ok(false) => {
                         failed += 1;
                         let elapsed_ms = start.elapsed().as_millis() as u64;
-                        outcomes.push(serde_json::json!({"action_id": action.action_id, "pid": action.target.pid.0, "status": "identity_mismatch", "time_ms": elapsed_ms}));
+                        checkpoint_outcome!(serde_json::json!({"action_id": action.action_id, "pid": action.target.pid.0, "status": "identity_mismatch", "time_ms": elapsed_ms}));
                         emit_action_event(
                             pt_core::events::event_names::ACTION_FAILED,
                             action_index,
@@ -27905,7 +27987,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     Err(_) => {
                         failed += 1;
                         let elapsed_ms = start.elapsed().as_millis() as u64;
-                        outcomes.push(serde_json::json!({"action_id": action.action_id, "pid": action.target.pid.0, "status": "identity_check_failed", "time_ms": elapsed_ms}));
+                        checkpoint_outcome!(serde_json::json!({"action_id": action.action_id, "pid": action.target.pid.0, "status": "identity_check_failed", "time_ms": elapsed_ms}));
                         emit_action_event(
                             pt_core::events::event_names::ACTION_FAILED,
                             action_index,
@@ -27926,7 +28008,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 {
                     blocked_by_prechecks += 1;
                     let elapsed_ms = start.elapsed().as_millis() as u64;
-                    outcomes.push(serde_json::json!({
+                    checkpoint_outcome!(serde_json::json!({
                         "action_id": action.action_id,
                         "pid": action.target.pid.0,
                         "status": "precheck_blocked",
@@ -27956,7 +28038,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                         Ok(scan) if scan.metadata.warnings.is_empty() => scan.processes,
                         Ok(scan) => {
                             failed += 1;
-                            outcomes.push(serde_json::json!({
+                            checkpoint_outcome!(serde_json::json!({
                                 "action_id": action.action_id,
                                 "pid": action.target.pid.0,
                                 "status": "identity_check_failed",
@@ -27968,7 +28050,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                         Err(error) => {
                             eprintln!("agent apply: cannot revalidate process tree: {error}");
                             failed += 1;
-                            outcomes.push(serde_json::json!({
+                            checkpoint_outcome!(serde_json::json!({
                                 "action_id": action.action_id,
                                 "pid": action.target.pid.0,
                                 "status": "identity_check_failed",
@@ -27985,7 +28067,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 }
                 if let Some(reason) = tree_reason {
                     blocked_by_prechecks += 1;
-                    outcomes.push(serde_json::json!({
+                    checkpoint_outcome!(serde_json::json!({
                         "action_id": action.action_id,
                         "pid": action.target.pid.0,
                         "status": "precheck_blocked",
@@ -28011,7 +28093,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                         Ok(check) => check,
                         Err(error) => {
                             blocked_by_prechecks += 1;
-                            outcomes.push(serde_json::json!({
+                            checkpoint_outcome!(serde_json::json!({
                                 "action_id": action.action_id,
                                 "pid": action.target.pid.0,
                                 "status": "blocked_by_policy",
@@ -28029,7 +28111,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     let rate_limit = policy_check.violation.as_ref().is_some_and(|violation| {
                         violation.kind == pt_core::decision::ViolationKind::RateLimitExceeded
                     });
-                    outcomes.push(serde_json::json!({
+                    checkpoint_outcome!(serde_json::json!({
                         "action_id": action.action_id,
                         "pid": action.target.pid.0,
                         "status": "blocked_by_policy",
@@ -28056,7 +28138,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     Err(reason) => {
                         blocked_by_prechecks += 1;
                         let elapsed_ms = start.elapsed().as_millis() as u64;
-                        outcomes.push(serde_json::json!({
+                        checkpoint_outcome!(serde_json::json!({
                             "action_id": action.action_id,
                             "pid": action.target.pid.0,
                             "status": "precheck_blocked",
@@ -28100,7 +28182,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 if !check.allowed {
                     blocked_by_constraints += 1;
                     let elapsed_ms = start.elapsed().as_millis() as u64;
-                    outcomes.push(serde_json::json!({
+                    checkpoint_outcome!(serde_json::json!({
                         "action_id": action.action_id,
                         "pid": action.target.pid.0,
                         "status": "blocked_by_constraints",
@@ -28126,7 +28208,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     if let Err(error) = enforcer.begin_kill_accounting() {
                         accounting_error = Some(error.to_string());
                         blocked_by_prechecks += 1;
-                        outcomes.push(serde_json::json!({
+                        checkpoint_outcome!(serde_json::json!({
                             "action_id": action.action_id,
                             "pid": action.target.pid.0,
                             "status": "precheck_blocked",
@@ -28146,7 +28228,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                             }
                         }
                         blocked_by_prechecks += 1;
-                        outcomes.push(serde_json::json!({
+                        checkpoint_outcome!(serde_json::json!({
                             "action_id": action.action_id,
                             "pid": action.target.pid.0,
                             "status": "precheck_blocked",
@@ -28204,7 +28286,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                             {
                                 fields.extend(evidence.clone());
                             }
-                            outcomes.push(outcome);
+                            checkpoint_outcome!(outcome);
                             break;
                         }
                         succeeded += 1;
@@ -28215,7 +28297,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                         {
                             fields.extend(evidence.clone());
                         }
-                        outcomes.push(outcome);
+                        checkpoint_outcome!(outcome);
                         emit_action_event(
                             pt_core::events::event_names::ACTION_COMPLETE,
                             action_index,
@@ -28234,7 +28316,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                         {
                             fields.extend(evidence.clone());
                         }
-                        outcomes.push(outcome);
+                        checkpoint_outcome!(outcome);
                         emit_action_event(
                             pt_core::events::event_names::ACTION_FAILED,
                             action_index,
@@ -28266,7 +28348,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 // Skip already completed actions in resume mode
                 if completed_action_ids.contains(&action.action_id) {
                     resumed_skipped += 1;
-                    outcomes.push(serde_json::json!({
+                    checkpoint_outcome!(serde_json::json!({
                         "action_id": action.action_id,
                         "pid": action.target.pid.0,
                         "status": "already_completed",
@@ -28283,7 +28365,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     continue;
                 }
                 skipped += 1;
-                outcomes.push(serde_json::json!({"action_id": action.action_id, "pid": action.target.pid.0, "status": "unsupported_platform"}));
+                checkpoint_outcome!(serde_json::json!({"action_id": action.action_id, "pid": action.target.pid.0, "status": "unsupported_platform"}));
                 emit_action_event(
                     pt_core::events::event_names::ACTION_COMPLETE,
                     action_index,
@@ -28296,12 +28378,10 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         }
     }
 
-    // Persist execution results before the observation wait. A telemetry error
-    // must never erase a real action or rewrite its success as a failure.
-    let action_dir = handle.dir.join("action");
-    let persistence_error = append_action_outcomes(&action_dir, &outcomes).err();
+    // Outcomes are already checkpointed. A failed append may have written some
+    // bytes, so retrying the batch here would duplicate earlier execution records.
     if let Some(error) = &persistence_error {
-        eprintln!("agent apply: {error}; actual action outcomes remain in this response");
+        eprintln!("agent apply: {error}; stopped before later actions; actual action outcomes remain in this response");
     }
     let resource_outcomes = outcomes
         .iter()
@@ -28613,7 +28693,9 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         "session_id": sid.0,
         "mode": "robot_apply",
         "summary": {
-            "attempted": actions_to_apply.len(),
+            "attempted": outcomes.len(),
+            "selected": actions_to_apply.len(),
+            "not_attempted": actions_to_apply.len().saturating_sub(outcomes.len()),
             "succeeded": succeeded,
             "failed": failed,
             "skipped": skipped,

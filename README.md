@@ -709,6 +709,19 @@ Use `--prediction-fields memory,cpu,trajectory,diagnostics` to select the sectio
 you need. Diagnostics also identify the limited candidate-only history: processes
 filtered out of earlier plans have no recorded samples in those plans.
 
+#### Durable progress and resume
+
+`agent apply` appends and syncs each action outcome, including refusals, before
+starting the next target. An interruption during a later action preserves the
+completed outcomes used by `--resume`. If a checkpoint cannot be persisted,
+apply stops before further actions and retains the actual result in its response;
+`summary.selected`, `attempted`, and `not_attempted` distinguish the selected
+batch from the work reached before stopping.
+
+There is still a crash window between an operating-system action and recording
+its result. An incomplete action needs inspection before retrying; per-action
+checkpoints do not guarantee exactly-once execution of that interrupted action.
+
 #### Measuring relief after apply
 
 `pt agent apply --session <id> --recommended --yes` now records a short baseline
