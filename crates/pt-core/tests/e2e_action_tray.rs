@@ -1600,12 +1600,22 @@ mod cgroup_quarantine_undo {
     use pt_common::SessionId;
     use pt_core::action::executor::ActionRunner;
     use pt_core::action::reversal::ReversalStatus;
-    use pt_core::action::{CompositeActionRunner, ReversalJournal};
+    use pt_core::action::{
+        CompositeActionRunner, CpusetQuarantineActionRunner, RestorationStatus, ReversalJournal,
+    };
     use pt_core::session::{SessionManifest, SessionMode, SessionStore};
     use pt_core::test_utils::OwnedCgroupFixture;
     use sha2::{Digest, Sha256};
     use std::fs;
+    use std::path::Path;
     use std::sync::Arc;
+
+    fn cpuset_controls(directory: &Path) -> Vec<Vec<u8>> {
+        ["cpuset.cpus", "cpuset.cpus.effective"]
+            .iter()
+            .map(|name| fs::read(directory.join(name)).expect("actual cpuset bytes"))
+            .collect()
+    }
 
     #[test]
     fn quarantine_undo_restores_inheritance_from_a_fresh_cli_and_preserves_sibling() {
@@ -1627,8 +1637,13 @@ mod cgroup_quarantine_undo {
         );
         assert!(!fs::read_to_string(&effective).unwrap().trim().is_empty());
         let sibling_previous = fs::read(fixture.sibling_leaf.join("cpuset.cpus")).unwrap();
+        let sibling_cpus = cpuset_controls(&fixture.sibling_leaf);
         let other_controls = OwnedCgroupFixture::controls(&fixture.leaf);
         let sibling_controls = OwnedCgroupFixture::controls(&fixture.sibling_leaf);
+        let legacy_runner = CpusetQuarantineActionRunner::with_defaults();
+        let legacy_metadata = legacy_runner
+            .capture_reversal_metadata(fixture.target.pid())
+            .expect("capture actual original cpuset metadata");
         let action = PlanAction {
             action_id: "e2e-quarantine".to_string(),
             target: fixture.identity.clone(),
@@ -1697,6 +1712,66 @@ mod cgroup_quarantine_undo {
             fs::read(&effective).unwrap(),
         )
         .unwrap();
+        // Neither the unjournaled dispatcher nor legacy metadata restoration
+        // may overwrite the controller reserved by this durable receipt.
+        let unjournaled = CompositeActionRunner::with_defaults()
+            .with_reversal_ownership_guard(store.sessions_root().to_path_buf());
+        assert!(unjournaled.execute(&action).is_err());
+        let legacy_restore = legacy_runner
+            .with_reversal_ownership_guard(store.sessions_root().to_path_buf())
+            .restore_from_metadata(&legacy_metadata)
+            .unwrap_err();
+        assert!(legacy_restore
+            .to_string()
+            .contains("unresolved durable owner"));
+        let mut bare_unquarantine = action.clone();
+        bare_unquarantine.action = Action::Unquarantine;
+        assert!(runner.execute(&bare_unquarantine).is_err());
+        assert_eq!(fs::read(&requested).unwrap(), restricted);
+
+        // Move only this fixture's target to another newly created leaf. Undo
+        // must refuse the changed membership and leave all controls untouched.
+        let moved_leaf = fixture
+            .leaf
+            .parent()
+            .unwrap()
+            .join(format!("pt-moved-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&moved_leaf).unwrap();
+        assert!(fs::read_to_string(moved_leaf.join("cgroup.procs"))
+            .unwrap()
+            .trim()
+            .is_empty());
+        assert_eq!(
+            OwnedCgroupFixture::read_identity(fixture.target.pid()).unwrap(),
+            fixture.identity
+        );
+        fs::write(
+            moved_leaf.join("cgroup.procs"),
+            fixture.target.pid().to_string(),
+        )
+        .unwrap();
+        let moved_before = cpuset_controls(&moved_leaf);
+        let refused = journal.restore(&action, None).unwrap();
+        assert_eq!(refused.status, RestorationStatus::Failed);
+        assert_eq!(refused.changed, None);
+        assert_eq!(cpuset_controls(&moved_leaf), moved_before);
+        assert_eq!(fs::read(&requested).unwrap(), restricted);
+        assert_eq!(cpuset_controls(&fixture.sibling_leaf), sibling_cpus);
+        ctx.log(
+            "moved_target_refused",
+            json!({"outcome": refused, "moved_leaf": moved_leaf}),
+        );
+        assert_eq!(
+            OwnedCgroupFixture::read_identity(fixture.target.pid()).unwrap(),
+            fixture.identity
+        );
+        fs::write(
+            fixture.leaf.join("cgroup.procs"),
+            fixture.target.pid().to_string(),
+        )
+        .unwrap();
+        fixture.assert_isolated();
+
         // Drop all in-memory undo state before invoking separate processes.
         drop(runner);
         drop(journal);
@@ -1769,7 +1844,11 @@ mod cgroup_quarantine_undo {
         let receipts = reloaded.inspect(&action).unwrap();
         assert_eq!(receipts.len(), 1);
         assert_eq!(receipts[0].status, ReversalStatus::Verified);
-        assert_eq!(receipts[0].restorations.len(), 2);
+        assert_eq!(receipts[0].restorations.len(), 3);
+        assert_eq!(
+            receipts[0].restorations[0].status,
+            RestorationStatus::Failed
+        );
         assert!(reloaded.observe_restoration(&action).unwrap().is_some());
     }
 }

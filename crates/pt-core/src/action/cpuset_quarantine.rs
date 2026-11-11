@@ -637,6 +637,12 @@ impl CpusetQuarantineActionRunner {
         &self,
         metadata: &QuarantineReversalMetadata,
     ) -> Result<(), ActionError> {
+        if self.reversal_journal.is_some() {
+            return Err(ActionError::Failed(
+                "journaled quarantine must be restored through its durable undo receipt"
+                    .to_string(),
+            ));
+        }
         if metadata.pid != metadata.identity.pid.0 {
             return Err(ActionError::IdentityMismatch);
         }
@@ -646,16 +652,33 @@ impl CpusetQuarantineActionRunner {
                 "refusing cpuset reversal without unchanged cgroup v2 membership".to_string(),
             ));
         }
-        let cpuset_path = if metadata.is_v2 {
-            format!("/sys/fs/cgroup{}/cpuset.cpus", metadata.cgroup_path)
-        } else {
-            format!("/sys/fs/cgroup/cpuset{}/cpuset.cpus", metadata.cgroup_path)
+        let scope = CpusetScope {
+            unified_path: checked_path.clone(),
+            controller_path: checked_path.clone(),
+            is_v2: true,
+            unified: PinnedCpusetDirectory::open(PathBuf::from(format!(
+                "/sys/fs/cgroup{checked_path}"
+            )))?,
+            controller_v1: None,
         };
-
-        restore_cpuset_assignment(Path::new(&cpuset_path), &metadata.previous_cpuset)?;
+        let previous = canonical_cpuset_assignment(&metadata.previous_cpuset)?;
+        if let Some(sessions_root) = &self.reversal_ownership_root {
+            super::reversal::ensure_control_unowned(
+                sessions_root,
+                &scope.unified_path,
+                &scope.unified.handle,
+                ReversalValue::Cpuset {
+                    cpus: previous.clone(),
+                },
+            )?;
+        }
+        scope.revalidate(&metadata.identity)?;
+        let cpuset_path = scope.directory().join("cpuset.cpus");
+        restore_cpuset_assignment(&cpuset_path, &previous)?;
+        scope.revalidate(&metadata.identity)?;
 
         info!(
-            path = %cpuset_path,
+            path = %cpuset_path.display(),
             value = %metadata.previous_cpuset,
             "restored cpuset from reversal metadata"
         );
@@ -953,11 +976,19 @@ fn read_cpuset_file(path: &Path) -> Result<CpuSet, ActionError> {
 /// Requested CPU lists may be empty to inherit from the parent. Compare
 /// canonical CPU identities, not textual formatting or only their count.
 pub(super) fn read_cpuset_assignment(path: &Path) -> Result<String, ActionError> {
-    let content = read_cpuset_contents(path)?;
-    if content.trim().is_empty() {
+    canonical_cpuset_assignment(&read_cpuset_contents(path)?)
+}
+
+fn canonical_cpuset_assignment(input: &str) -> Result<String, ActionError> {
+    if input.len() > MAX_CPUSET_BYTES {
+        return Err(ActionError::Failed(
+            "CPU list exceeds the size limit".to_string(),
+        ));
+    }
+    if input.trim().is_empty() {
         Ok(String::new())
     } else {
-        CpuSet::parse(&content).map(|cpus| cpus.as_list())
+        CpuSet::parse(input).map(|cpus| cpus.as_list())
     }
 }
 
@@ -971,6 +1002,11 @@ pub(super) fn verify_cpuset_assignment(
 ) -> Result<(), ActionError> {
     let observed = read_cpuset_assignment(&directory.join("cpuset.cpus"))?;
     let effective = read_cpuset_file(&directory.join(effective_name))?;
+    if read_cpuset_assignment(&directory.join("cpuset.cpus"))? != observed {
+        return Err(ActionError::Failed(
+            "cpuset assignment changed while reading effective CPUs".to_string(),
+        ));
+    }
     if requested.is_empty() {
         if !observed.is_empty() {
             return Err(ActionError::Failed(
@@ -1536,6 +1572,39 @@ mod tests {
                 "16-19\n"
             );
             assert_eq!(fs::read_to_string(old.join("cpuset.cpus")).unwrap(), "\n");
+        }
+
+        #[test]
+        fn legacy_restore_cannot_bypass_a_journaled_quarantine() {
+            let directory = tempfile::tempdir().unwrap();
+            let sessions = directory.path().join("sessions");
+            let journal = Arc::new(
+                ReversalJournal::new(
+                    sessions.join("test-session/action"),
+                    "test-session",
+                    "a".repeat(64),
+                    &sessions,
+                )
+                .unwrap(),
+            );
+            let runner =
+                CpusetQuarantineActionRunner::with_defaults().with_reversal_journal(journal);
+            let identity = quarantine_action().target;
+            let metadata = QuarantineReversalMetadata {
+                pid: identity.pid.0,
+                identity,
+                cgroup_path: "/test-only".into(),
+                previous_cpuset: String::new(),
+                previous_effective: Some("8-9".into()),
+                is_v2: true,
+                applied_at: chrono::Utc::now().to_rfc3339(),
+            };
+            let refused = runner.restore_from_metadata(&metadata).unwrap_err();
+            assert!(refused.to_string().contains("durable undo receipt"));
+            assert!(
+                !sessions.exists(),
+                "legacy refusal must not create journal state"
+            );
         }
 
         #[test]
