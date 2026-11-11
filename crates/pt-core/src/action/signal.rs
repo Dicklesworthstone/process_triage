@@ -12,6 +12,212 @@ use crate::plan::PlanAction;
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// One observation of the recorded incarnation. Missing or replaced processes
+/// can prove exit, but never successful pause/resume of the current occupant.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignalObservation {
+    Gone,
+    Replaced,
+    Present(char),
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy)]
+enum SignalExpectation {
+    Exited,
+    Stopped,
+    Resumed,
+    Reaped,
+}
+
+#[cfg(unix)]
+impl SignalExpectation {
+    fn satisfied(self, observation: SignalObservation) -> Result<bool, ActionError> {
+        match observation {
+            SignalObservation::Gone => match self {
+                Self::Exited | Self::Reaped => Ok(true),
+                Self::Stopped | Self::Resumed => Err(ActionError::ProcessNotFound),
+            },
+            SignalObservation::Replaced => match self {
+                Self::Exited | Self::Reaped => Ok(true),
+                Self::Stopped | Self::Resumed => Err(ActionError::IdentityMismatch),
+            },
+            SignalObservation::Present(state) => {
+                let dead = matches!(state, 'Z' | 'X' | 'x');
+                if !matches!(
+                    state,
+                    'R' | 'S' | 'D' | 'Z' | 'T' | 't' | 'X' | 'x' | 'K' | 'W' | 'P' | 'I'
+                ) {
+                    return Err(ActionError::Failed(
+                        "cannot verify an unknown process state".to_string(),
+                    ));
+                }
+                match self {
+                    Self::Exited => Ok(dead),
+                    // A zombie is still present until it disappears or a new
+                    // birth takes its PID. An unreadable or live process is not
+                    // evidence that the recorded zombie was reaped.
+                    Self::Reaped if dead => Ok(false),
+                    Self::Reaped => Err(ActionError::Failed(
+                        "recorded zombie is still present with a live state".to_string(),
+                    )),
+                    Self::Stopped | Self::Resumed if dead => Err(ActionError::ProcessNotFound),
+                    Self::Stopped | Self::Resumed if state == 't' => Err(ActionError::Failed(
+                        "tracing stop belongs to the debugger, not a verified job-control transition"
+                            .to_string(),
+                    )),
+                    Self::Stopped => Ok(state == 'T'),
+                    Self::Resumed => Ok(state != 'T'),
+                }
+            }
+        }
+    }
+}
+
+/// Read failures remain unknown unless the kernel independently confirms that
+/// this positive PID no longer exists. In particular, EPERM is not exit.
+#[cfg(unix)]
+fn signal_observation_unavailable(
+    pid: u32,
+    reason: impl std::fmt::Display,
+) -> Result<SignalObservation, ActionError> {
+    let target = signal_syscall_target(pid, false)?;
+    // SAFETY: signal zero only checks this validated positive PID's existence.
+    if unsafe { libc::kill(target, 0) } != 0
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    {
+        return Ok(SignalObservation::Gone);
+    }
+    Err(ActionError::Failed(format!(
+        "process {pid} observation unavailable: {reason}"
+    )))
+}
+
+/// Observe birth, owner and state together, with identity reads bracketing the
+/// other fields. Group/session facts in the plan remain binding when supplied.
+#[cfg(unix)]
+fn observe_signal_target(
+    target: &pt_common::ProcessIdentity,
+) -> Result<SignalObservation, ActionError> {
+    signal_syscall_target(target.pid.0, false)?;
+    ensure_action_pid_namespace()?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let (expected_boot, expected_start, expected_pid) = parse_start_id(&target.start_id.0);
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let expected_start = expected_start
+        .filter(|_| target.can_safely_revalidate())
+        .filter(|_| expected_pid.is_none_or(|pid| pid == target.pid.0))
+        .filter(|_| {
+            target.quality != pt_common::IdentityQuality::Full
+                || (expected_pid.is_some()
+                    && (!cfg!(target_os = "linux") || expected_boot.is_some()))
+        })
+        .ok_or(ActionError::IdentityMismatch)?;
+
+    #[cfg(target_os = "linux")]
+    {
+        use crate::collect::proc_parsers::read_required_proc_stat;
+
+        let identity = LiveIdentityProvider::new();
+        if identity.boot_id == "unknown" || identity.boot_id.is_empty() {
+            return Err(ActionError::Failed(
+                "cannot verify signal outcome without the current boot identity".to_string(),
+            ));
+        }
+        if expected_boot.is_some_and(|boot| boot != identity.boot_id) {
+            return Err(ActionError::IdentityMismatch);
+        }
+        let before = match read_required_proc_stat(target.pid.0) {
+            Ok(stat) => stat,
+            Err(error) => return signal_observation_unavailable(target.pid.0, error),
+        };
+        if before.starttime != expected_start {
+            return Ok(SignalObservation::Replaced);
+        }
+        let Some(uid) = identity.read_uid(target.pid.0) else {
+            return signal_observation_unavailable(target.pid.0, "cannot read process owner");
+        };
+        let after = match read_required_proc_stat(target.pid.0) {
+            Ok(stat) => stat,
+            Err(error) => return signal_observation_unavailable(target.pid.0, error),
+        };
+        if after.starttime != expected_start {
+            return Ok(SignalObservation::Replaced);
+        }
+        if uid != target.uid
+            || target.pgid.is_some_and(|pgid| {
+                u32::try_from(before.pgrp) != Ok(pgid) || u32::try_from(after.pgrp) != Ok(pgid)
+            })
+            || target.sid.is_some_and(|sid| {
+                u32::try_from(before.session) != Ok(sid) || u32::try_from(after.session) != Ok(sid)
+            })
+        {
+            return Err(ActionError::IdentityMismatch);
+        }
+        Ok(SignalObservation::Present(after.state))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = expected_boot;
+        let Some(before) = crate::collect::macos::read_bsd_info(target.pid.0) else {
+            return signal_observation_unavailable(target.pid.0, "cannot read native identity");
+        };
+        if before.start_us != expected_start {
+            return Ok(SignalObservation::Replaced);
+        }
+        let Some(stat) = crate::collect::macos::read_session_stat(target.pid.0) else {
+            return signal_observation_unavailable(target.pid.0, "cannot read native state");
+        };
+        let Some(after) = crate::collect::macos::read_bsd_info(target.pid.0) else {
+            return signal_observation_unavailable(target.pid.0, "cannot recheck native identity");
+        };
+        if after.start_us != expected_start || stat.starttime != expected_start {
+            return Ok(SignalObservation::Replaced);
+        }
+        if before.uid != target.uid
+            || after.uid != target.uid
+            || target
+                .pgid
+                .is_some_and(|pgid| u32::try_from(stat.pgrp) != Ok(pgid))
+            || target
+                .sid
+                .is_some_and(|sid| u32::try_from(stat.session) != Ok(sid))
+        {
+            return Err(ActionError::IdentityMismatch);
+        }
+        Ok(SignalObservation::Present(stat.state))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = target;
+        Err(ActionError::Failed(
+            "identity-bound signal observations are unsupported on this platform".to_string(),
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_signal_observation(
+    timeout: Duration,
+    poll_interval: Duration,
+    expected: SignalExpectation,
+    mut observe: impl FnMut() -> Result<SignalObservation, ActionError>,
+) -> Result<(), ActionError> {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        let observation = observe()?;
+        if start.elapsed() >= timeout {
+            return Err(ActionError::Timeout);
+        }
+        if expected.satisfied(observation)? {
+            return Ok(());
+        }
+        thread::sleep(poll_interval.min(timeout.saturating_sub(start.elapsed())));
+    }
+    Err(ActionError::Timeout)
+}
+
 /// Procfs identities and numeric-PID syscalls must refer to the same namespace.
 /// A container can inherit an ancestor namespace's procfs mount: in that case
 /// even a matching start time in `/proc/PID` does not identify `kill(PID)` or
@@ -341,9 +547,12 @@ impl SignalActionRunner {
 
             if let Some(stopped) = expect_stopped {
                 if let Some(state) = self.get_process_state(pid) {
-                    // 'T' = stopped (traced or stopped), 't' = tracing stop
-                    let is_stopped = state == 'T' || state == 't';
-                    if is_stopped == stopped {
+                    let expected = if stopped {
+                        SignalExpectation::Stopped
+                    } else {
+                        SignalExpectation::Resumed
+                    };
+                    if expected.satisfied(SignalObservation::Present(state))? {
                         return Ok(());
                     }
                 }
@@ -356,18 +565,40 @@ impl SignalActionRunner {
         Err(ActionError::Timeout)
     }
 
+    /// Follow the process incarnation from the approved plan through every
+    /// observation. A replacement must never supply a successful stop/resume
+    /// result or keep a completed termination waiting on the replacement.
+    #[cfg(unix)]
+    fn wait_for_planned_state(
+        &self,
+        target: &pt_common::ProcessIdentity,
+        expected: SignalExpectation,
+        timeout: Duration,
+    ) -> Result<(), ActionError> {
+        wait_for_signal_observation(
+            timeout,
+            Duration::from_millis(self.config.poll_interval_ms.max(1)),
+            expected,
+            || observe_signal_target(target),
+        )
+    }
+
     /// Observe the full configured TERM grace period when the plan permits it.
     /// A shorter execution budget is a timeout, never permission to escalate to
     /// KILL early. `false` means the full grace expired with time left to escalate.
     #[cfg(unix)]
     fn wait_for_term_grace(
         &self,
-        pid: u32,
+        action: &PlanAction,
         deadline: &SignalDeadline,
     ) -> Result<bool, ActionError> {
         let remaining = deadline.remaining()?;
         let grace = Duration::from_millis(self.config.term_grace_ms);
-        match self.wait_for_state_change(pid, true, None, grace.min(remaining)) {
+        match self.wait_for_planned_state(
+            &action.target,
+            SignalExpectation::Exited,
+            grace.min(remaining),
+        ) {
             Ok(()) => Ok(true),
             Err(ActionError::Timeout) => {
                 if remaining <= grace {
@@ -447,7 +678,7 @@ impl SignalActionRunner {
                         Err(error) => return Err(error),
                     }
                 }
-                return if self.wait_for_term_grace(pid, &deadline)? {
+                return if self.wait_for_term_grace(action, &deadline)? {
                     Ok(())
                 } else {
                     deadline.remaining()?;
@@ -488,7 +719,7 @@ impl SignalActionRunner {
         }
 
         // Wait for graceful termination
-        if self.wait_for_term_grace(pid, &deadline)? {
+        if self.wait_for_term_grace(action, &deadline)? {
             return Ok(());
         }
 
@@ -531,45 +762,44 @@ impl SignalActionRunner {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub fn verify_zombie_reaped(&self, action: &PlanAction) -> Result<(), ActionError> {
         let Some(zombie) = action.original_zombie_target.as_ref() else {
-            return Ok(());
+            return Err(ActionError::Failed(
+                "cannot verify reaping without the original zombie identity".to_string(),
+            ));
         };
         let pid = zombie.pid.0;
-        let reaped = || {
-            self.get_process_state(pid) != Some('Z')
-                || self
-                    .read_starttime(pid)
-                    .is_some_and(|st| !ids_match_starttime(&zombie.start_id.0, st))
-        };
-        let start = Instant::now();
-        let timeout = self.verification_timeout(action);
-        while start.elapsed() < timeout {
-            if reaped() {
-                return Ok(());
-            }
-            let poll_interval = Duration::from_millis(self.config.poll_interval_ms.max(1));
-            thread::sleep(poll_interval.min(timeout.saturating_sub(start.elapsed())));
+        match self.wait_for_planned_state(
+            zombie,
+            SignalExpectation::Reaped,
+            self.verification_timeout(action),
+        ) {
+            Ok(()) => Ok(()),
+            Err(ActionError::Timeout) => Err(ActionError::Failed(format!(
+                "zombie {pid} persists: parent {} did not reap it on SIGCHLD; \
+                 restart or stop the parent to clear it",
+                action.target.pid.0
+            ))),
+            Err(error) => Err(error),
         }
-        Err(ActionError::Failed(format!(
-            "zombie {pid} persists: parent {} did not reap it on SIGCHLD; \
-             restart or stop the parent to clear it",
-            action.target.pid.0
-        )))
     }
 
     /// Verify a pause action succeeded.
     #[cfg(unix)]
     fn verify_pause(&self, action: &PlanAction) -> Result<(), ActionError> {
-        let pid = action.target.pid.0;
-        let timeout = self.verification_timeout(action);
-        self.wait_for_state_change(pid, false, Some(true), timeout)
+        self.wait_for_planned_state(
+            &action.target,
+            SignalExpectation::Stopped,
+            self.verification_timeout(action),
+        )
     }
 
     /// Verify a kill action succeeded.
     #[cfg(unix)]
     fn verify_kill(&self, action: &PlanAction) -> Result<(), ActionError> {
-        let pid = action.target.pid.0;
-        let timeout = self.verification_timeout(action);
-        self.wait_for_state_change(pid, true, None, timeout)
+        self.wait_for_planned_state(
+            &action.target,
+            SignalExpectation::Exited,
+            self.verification_timeout(action),
+        )
     }
 
     /// Execute a resume action (SIGCONT) - raw version.
@@ -615,10 +845,12 @@ impl SignalActionRunner {
     /// Verify a resume action succeeded.
     #[cfg(unix)]
     fn verify_resume(&self, action: &PlanAction) -> Result<(), ActionError> {
-        let pid = action.target.pid.0;
-        let timeout = self.verification_timeout(action);
         // Process should not be stopped anymore
-        self.wait_for_state_change(pid, false, Some(false), timeout)
+        self.wait_for_planned_state(
+            &action.target,
+            SignalExpectation::Resumed,
+            self.verification_timeout(action),
+        )
     }
 }
 
@@ -949,6 +1181,84 @@ fn ids_match_starttime(start_id: &str, current_starttime: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_outcome_observations_preserve_exit_and_job_control_semantics() {
+        for missing in [SignalObservation::Gone, SignalObservation::Replaced] {
+            assert!(SignalExpectation::Exited.satisfied(missing).unwrap());
+            assert!(SignalExpectation::Reaped.satisfied(missing).unwrap());
+            assert!(SignalExpectation::Stopped.satisfied(missing).is_err());
+            assert!(SignalExpectation::Resumed.satisfied(missing).is_err());
+        }
+        for state in ['Z', 'X', 'x'] {
+            let observation = SignalObservation::Present(state);
+            assert!(SignalExpectation::Exited.satisfied(observation).unwrap());
+            assert!(!SignalExpectation::Reaped.satisfied(observation).unwrap());
+            assert!(SignalExpectation::Stopped.satisfied(observation).is_err());
+            assert!(SignalExpectation::Resumed.satisfied(observation).is_err());
+        }
+        for state in ['R', 'S', 'D', 'I', 'W', 'K', 'P'] {
+            let observation = SignalObservation::Present(state);
+            assert!(!SignalExpectation::Exited.satisfied(observation).unwrap());
+            assert!(!SignalExpectation::Stopped.satisfied(observation).unwrap());
+            assert!(SignalExpectation::Resumed.satisfied(observation).unwrap());
+            assert!(SignalExpectation::Reaped.satisfied(observation).is_err());
+        }
+        assert!(SignalExpectation::Stopped
+            .satisfied(SignalObservation::Present('T'))
+            .unwrap());
+        assert!(!SignalExpectation::Resumed
+            .satisfied(SignalObservation::Present('T'))
+            .unwrap());
+        for state in ['t', '?'] {
+            assert!(SignalExpectation::Stopped
+                .satisfied(SignalObservation::Present(state))
+                .is_err());
+            assert!(SignalExpectation::Resumed
+                .satisfied(SignalObservation::Present(state))
+                .is_err());
+        }
+        assert!(SignalExpectation::Exited
+            .satisfied(SignalObservation::Present('?'))
+            .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unavailable_signal_observations_never_become_completed_effects() {
+        for expected in [
+            SignalExpectation::Exited,
+            SignalExpectation::Stopped,
+            SignalExpectation::Resumed,
+            SignalExpectation::Reaped,
+        ] {
+            let mut reads = 0;
+            let result = wait_for_signal_observation(
+                Duration::from_secs(1),
+                Duration::from_millis(1),
+                expected,
+                || {
+                    reads += 1;
+                    Err(ActionError::PermissionDenied)
+                },
+            );
+            assert!(matches!(result, Err(ActionError::PermissionDenied)));
+            assert_eq!(reads, 1);
+        }
+        let mut reads = 0;
+        let result = wait_for_signal_observation(
+            Duration::ZERO,
+            Duration::from_millis(1),
+            SignalExpectation::Exited,
+            || {
+                reads += 1;
+                Ok(SignalObservation::Gone)
+            },
+        );
+        assert!(matches!(result, Err(ActionError::Timeout)));
+        assert_eq!(reads, 0, "a zero approved window certifies nothing");
+    }
 
     #[test]
     fn signal_syscall_target_rejects_broadcast_and_init_values() {
@@ -1311,6 +1621,149 @@ mod tests {
             }))
             .expect("valid kill PlanAction");
             (child, action)
+        }
+
+        #[test]
+        fn planned_signal_verification_requires_the_recorded_identity() {
+            let dir = tempfile::tempdir().expect("marker directory");
+            let marker = dir.path().join("term-handled");
+            let (child, mut action) = stopped_term_child(&marker, false, false);
+            action.action = Action::Pause;
+            action.timeouts.verify_ms = 100;
+            let stat = crate::collect::proc_parsers::read_required_proc_stat(child.0.id())
+                .expect("owned child identity");
+            action.target.pgid = Some(stat.pgrp as u32);
+            action.target.sid = Some(stat.session as u32);
+            let runner = SignalActionRunner::with_defaults();
+            runner.verify(&action).expect("original child is stopped");
+
+            for changed in ["birth", "boot", "pid", "uid", "pgid", "sid"] {
+                let mut stale = action.clone();
+                match changed {
+                    "birth" => {
+                        let (boot, ticks, pid) = parse_start_id(&stale.target.start_id.0);
+                        stale.target.start_id = pt_common::StartId::from_linux(
+                            boot.unwrap(),
+                            ticks.unwrap() + 1,
+                            pid.unwrap(),
+                        );
+                    }
+                    "boot" => {
+                        let (_, ticks, pid) = parse_start_id(&stale.target.start_id.0);
+                        stale.target.start_id = pt_common::StartId::from_linux(
+                            "different-boot",
+                            ticks.unwrap(),
+                            pid.unwrap(),
+                        );
+                    }
+                    "pid" => {
+                        let (boot, ticks, pid) = parse_start_id(&stale.target.start_id.0);
+                        stale.target.start_id = pt_common::StartId::from_linux(
+                            boot.unwrap(),
+                            ticks.unwrap(),
+                            pid.unwrap() + 1,
+                        );
+                    }
+                    "uid" => stale.target.uid ^= 1,
+                    "pgid" => stale.target.pgid = Some(stat.pgrp as u32 + 1),
+                    "sid" => stale.target.sid = Some(stat.session as u32 + 1),
+                    _ => unreachable!(),
+                }
+                assert!(
+                    runner.verify(&stale).is_err(),
+                    "{changed}: a matching numeric PID/state cannot verify another identity"
+                );
+            }
+            assert_eq!(runner.get_process_state(child.0.id()), Some('T'));
+            assert!(!runner.take_kill_signal_delivered());
+            assert!(!marker.exists());
+        }
+
+        #[test]
+        fn kill_verification_recognizes_a_replaced_incarnation() {
+            let dir = tempfile::tempdir().expect("marker directory");
+            let marker = dir.path().join("term-handled");
+            let (child, mut action) = stopped_term_child(&marker, false, false);
+            action.timeouts.verify_ms = 100;
+            let (boot, ticks, pid) = parse_start_id(&action.target.start_id.0);
+            action.target.start_id =
+                pt_common::StartId::from_linux(boot.unwrap(), ticks.unwrap() + 1, pid.unwrap());
+            let runner = SignalActionRunner::with_defaults();
+            runner
+                .verify(&action)
+                .expect("a different birth proves the original target is gone");
+            // Verification never signals the unrelated current occupant.
+            assert_eq!(runner.get_process_state(child.0.id()), Some('T'));
+            assert!(!runner.take_kill_signal_delivered());
+            assert!(!marker.exists());
+        }
+
+        #[test]
+        fn planned_resume_requires_the_original_live_process() {
+            let dir = tempfile::tempdir().expect("marker directory");
+            let marker = dir.path().join("term-handled");
+            let (mut child, mut action) = stopped_term_child(&marker, false, false);
+            action.action = Action::Resume;
+            let runner = SignalActionRunner::with_defaults();
+            runner.execute(&action).expect("resume owned child");
+            runner.verify(&action).expect("owned child resumed");
+            let mut wrong_owner = action.clone();
+            wrong_owner.target.uid ^= 1;
+            assert!(matches!(
+                runner.verify(&wrong_owner),
+                Err(ActionError::IdentityMismatch)
+            ));
+            let mut wrong_birth = action.clone();
+            let (boot, ticks, pid) = parse_start_id(&wrong_birth.target.start_id.0);
+            wrong_birth.target.start_id =
+                pt_common::StartId::from_linux(boot.unwrap(), ticks.unwrap() + 1, pid.unwrap());
+            assert!(matches!(
+                runner.verify(&wrong_birth),
+                Err(ActionError::IdentityMismatch)
+            ));
+            assert!(signal_observation_unavailable(child.0.id(), "unreadable state").is_err());
+            child.0.kill().expect("kill owned target");
+            child.0.wait().expect("reap owned target");
+            assert!(matches!(
+                runner.verify(&action),
+                Err(ActionError::ProcessNotFound)
+            ));
+            assert!(!runner.take_kill_signal_delivered());
+        }
+
+        #[test]
+        fn term_grace_finishes_on_reuse_without_signalling_the_current_occupant() {
+            let dir = tempfile::tempdir().expect("marker directory");
+            let marker = dir.path().join("term-handled");
+            let (child, mut action) = stopped_term_child(&marker, false, false);
+            let (boot, ticks, pid) = parse_start_id(&action.target.start_id.0);
+            action.target.start_id =
+                pt_common::StartId::from_linux(boot.unwrap(), ticks.unwrap() + 1, pid.unwrap());
+            let runner = SignalActionRunner::with_defaults();
+            assert!(runner
+                .wait_for_term_grace(&action, &SignalDeadline::new(100))
+                .unwrap());
+            assert_eq!(runner.get_process_state(child.0.id()), Some('T'));
+            assert!(!runner.take_kill_signal_delivered());
+            assert!(!marker.exists());
+        }
+
+        #[test]
+        fn zombie_reaping_verification_does_not_credit_a_live_same_birth() {
+            let dir = tempfile::tempdir().expect("marker directory");
+            let marker = dir.path().join("term-handled");
+            let (child, mut action) = stopped_term_child(&marker, false, false);
+            action.action = Action::Restart;
+            action.routing = crate::plan::ActionRouting::ZombieToParent;
+            action.original_zombie_target = Some(action.target.clone());
+            action.timeouts.verify_ms = 100;
+            let runner = SignalActionRunner::with_defaults();
+            assert!(
+                runner.verify_zombie_reaped(&action).is_err(),
+                "a readable live target with the recorded birth was not reaped"
+            );
+            assert_eq!(runner.get_process_state(child.0.id()), Some('T'));
+            assert!(!runner.take_kill_signal_delivered());
         }
 
         #[test]
