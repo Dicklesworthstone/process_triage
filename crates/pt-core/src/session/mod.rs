@@ -383,17 +383,11 @@ impl SessionStore {
     }
 
     pub fn create(&self, manifest: &SessionManifest) -> Result<SessionHandle, SessionError> {
-        std::fs::create_dir_all(&self.sessions_root).map_err(|e| SessionError::Io {
-            path: self.sessions_root.clone(),
-            source: e,
-        })?;
+        create_session_directory(&self.sessions_root)?;
 
         let session_id = SessionId(manifest.session_id.clone());
         let dir = self.session_dir(&session_id);
-        std::fs::create_dir_all(&dir).map_err(|e| SessionError::Io {
-            path: dir.clone(),
-            source: e,
-        })?;
+        create_session_directory(&dir)?;
 
         // Create canonical subdirs upfront (makes later phases simpler).
         for rel in [
@@ -407,7 +401,7 @@ impl SessionStore {
             EXPORTS_DIR,
         ] {
             let p = dir.join(rel);
-            std::fs::create_dir_all(&p).map_err(|e| SessionError::Io { path: p, source: e })?;
+            create_session_directory(&p)?;
         }
 
         let handle = SessionHandle {
@@ -1025,39 +1019,325 @@ fn resolve_sessions_root() -> Result<PathBuf, SessionError> {
     Err(SessionError::DataDirUnavailable)
 }
 
+/// Atomically publish a complete JSON artifact and synchronize its directory.
+///
+/// Failures before rename leave an existing artifact untouched. A directory-sync
+/// failure after rename is reported, but the complete new artifact may already
+/// be visible; callers must not interpret an error as a rollback. Failed private
+/// temporary files are retained rather than deleting possible recovery evidence.
 pub fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<(), SessionError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| SessionError::Io {
-            path: parent.to_path_buf(),
-            source: e,
-        })?;
-    }
     let content = serde_json::to_vec_pretty(value).map_err(|e| SessionError::Json {
         path: path.to_path_buf(),
         source: e,
     })?;
-    let file_name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("file.json");
-    let tmp_path = path.with_file_name(format!("{}.tmp.{}", file_name, std::process::id()));
-    {
-        use std::io::Write;
-        let mut file = std::fs::File::create(&tmp_path).map_err(|e| SessionError::Io {
-            path: tmp_path.clone(),
-            source: e,
-        })?;
-        file.write_all(&content).map_err(|e| SessionError::Io {
-            path: tmp_path.clone(),
-            source: e,
-        })?;
-        let _ = file.sync_all();
-    }
-    std::fs::rename(&tmp_path, path).map_err(|e| SessionError::Io {
+    // Randomness prevents same-process writers from sharing a temporary path;
+    // exclusive creation, rather than randomness, enforces collision safety.
+    let temporary = format!(".pt-json-{}.tmp", uuid::Uuid::new_v4());
+    write_json_bytes(path, &content, temporary.as_ref(), std::fs::File::sync_all)
+}
+
+fn session_io(path: &Path, source: std::io::Error) -> SessionError {
+    SessionError::Io {
         path: path.to_path_buf(),
-        source: e,
+        source,
+    }
+}
+
+#[cfg(unix)]
+fn artifact_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+#[cfg(unix)]
+fn artifact_name(name: &std::ffi::OsStr) -> Result<std::ffi::CString, std::io::Error> {
+    use std::os::unix::ffi::OsStrExt;
+    if name.is_empty() || Path::new(name).file_name() != Some(name) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "artifact name must be one normal path component",
+        ));
+    }
+    std::ffi::CString::new(name.as_bytes())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+}
+
+/// Hold the parent inode throughout creation, synchronization and rename. Path
+/// revalidation detects moved directories; descriptor-relative operations never
+/// follow a replacement directory or a temporary-file symlink.
+#[cfg(unix)]
+struct JsonDirectory {
+    path: PathBuf,
+    handle: std::fs::File,
+}
+
+#[cfg(unix)]
+impl JsonDirectory {
+    fn open(path: &Path) -> Result<Self, SessionError> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|error| session_io(path, error))?;
+        let directory = Self {
+            path: path.to_path_buf(),
+            handle,
+        };
+        directory.revalidate()?;
+        Ok(directory)
+    }
+
+    fn create(path: &Path) -> Result<Self, SessionError> {
+        Self::create_with_sync(path, &std::fs::File::sync_all)
+    }
+
+    fn create_with_sync(
+        path: &Path,
+        synchronize: &impl Fn(&std::fs::File) -> std::io::Result<()>,
+    ) -> Result<Self, SessionError> {
+        use std::os::fd::AsRawFd;
+        match Self::open(path) {
+            Ok(directory) => {
+                // A concurrent creator, or an earlier attempt whose sync failed,
+                // can leave a visible directory with an unpersisted parent entry.
+                // Existence alone must not skip this part of publication.
+                directory.sync_parent_entry(synchronize)?;
+                return Ok(directory);
+            }
+            Err(SessionError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let name = path.file_name().ok_or_else(|| {
+            session_io(
+                path,
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "directory has no name"),
+            )
+        })?;
+        let name = artifact_name(name).map_err(|error| session_io(path, error))?;
+        let parent = Self::create_with_sync(artifact_parent(path), synchronize)?;
+        parent.revalidate()?;
+        // SAFETY: the live directory descriptor and NUL-terminated name remain
+        // valid for this call; mkdirat creates only this one private child.
+        let created = unsafe { libc::mkdirat(parent.handle.as_raw_fd(), name.as_ptr(), 0o700) };
+        if created != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(session_io(path, error));
+            }
+        }
+        parent.revalidate()?;
+        let directory = Self::open(path)?;
+        // Synchronize the directory inode and the entry linking it to its
+        // parent, including a concurrent creator's entry. Every new ancestor
+        // is handled by the same path before an artifact can report success.
+        synchronize(&directory.handle).map_err(|error| session_io(path, error))?;
+        synchronize(&parent.handle).map_err(|error| session_io(&parent.path, error))?;
+        parent.revalidate()?;
+        directory.revalidate()?;
+        Ok(directory)
+    }
+
+    fn sync_parent_entry(
+        &self,
+        synchronize: &impl Fn(&std::fs::File) -> std::io::Result<()>,
+    ) -> Result<(), SessionError> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        self.revalidate()?;
+        let path = self.path.join("..");
+        // SAFETY: the directory descriptor remains live. Resolving '..' from
+        // that inode also handles '.' and filesystem roots without guessing a
+        // parent from the spelling of a relative path.
+        let fd = unsafe {
+            libc::openat(
+                self.handle.as_raw_fd(),
+                c"..".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(session_io(&path, std::io::Error::last_os_error()));
+        }
+        // SAFETY: ownership of the new descriptor is transferred exactly once.
+        let parent = unsafe { std::fs::File::from_raw_fd(fd) };
+        synchronize(&parent).map_err(|error| session_io(&path, error))?;
+        self.revalidate()
+    }
+
+    fn revalidate(&self) -> Result<(), SessionError> {
+        use std::os::unix::fs::MetadataExt;
+        let saved = self
+            .handle
+            .metadata()
+            .map_err(|error| session_io(&self.path, error))?;
+        let current =
+            std::fs::symlink_metadata(&self.path).map_err(|error| session_io(&self.path, error))?;
+        if !current.is_dir() || saved.dev() != current.dev() || saved.ino() != current.ino() {
+            return Err(session_io(
+                &self.path,
+                std::io::Error::other("artifact directory identity changed"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn create_temporary(&self, name: &std::ffi::OsStr) -> Result<std::fs::File, SessionError> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        self.revalidate()?;
+        let path = self.path.join(name);
+        let name = artifact_name(name).map_err(|error| session_io(&path, error))?;
+        // SAFETY: openat borrows the live directory fd and valid C string. The
+        // returned descriptor is exclusively owned by the File constructed below.
+        let fd = unsafe {
+            libc::openat(
+                self.handle.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600 as libc::mode_t,
+            )
+        };
+        if fd < 0 {
+            return Err(session_io(&path, std::io::Error::last_os_error()));
+        }
+        // SAFETY: fd is a newly opened, valid descriptor transferred exactly once.
+        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+    }
+
+    fn rename(
+        &self,
+        temporary: &std::ffi::OsStr,
+        destination: &std::ffi::OsStr,
+        file: &std::fs::File,
+    ) -> Result<(), SessionError> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::fs::MetadataExt;
+        self.revalidate()?;
+        let source = artifact_name(temporary)
+            .map_err(|error| session_io(&self.path.join(temporary), error))?;
+        let target = artifact_name(destination)
+            .map_err(|error| session_io(&self.path.join(destination), error))?;
+        let saved = file
+            .metadata()
+            .map_err(|error| session_io(&self.path.join(temporary), error))?;
+        // SAFETY: the name and directory descriptor remain live. O_NOFOLLOW
+        // refuses a substituted symlink; O_NONBLOCK avoids waiting on a FIFO.
+        let fd = unsafe {
+            libc::openat(
+                self.handle.as_raw_fd(),
+                source.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            return Err(session_io(
+                &self.path.join(temporary),
+                std::io::Error::new(
+                    error.kind(),
+                    format!("artifact temporary identity changed or unreadable: {error}"),
+                ),
+            ));
+        }
+        // SAFETY: this newly opened descriptor is transferred exactly once.
+        let current_file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let current = current_file
+            .metadata()
+            .map_err(|error| session_io(&self.path.join(temporary), error))?;
+        if !current.is_file()
+            || current.dev() != saved.dev()
+            || current.ino() != saved.ino()
+            || current.nlink() != 1
+        {
+            return Err(session_io(
+                &self.path.join(temporary),
+                std::io::Error::other("artifact temporary identity changed"),
+            ));
+        }
+        // SAFETY: both names are single NUL-terminated components relative to
+        // the same live directory descriptor; renameat never follows the target.
+        let result = unsafe {
+            libc::renameat(
+                self.handle.as_raw_fd(),
+                source.as_ptr(),
+                self.handle.as_raw_fd(),
+                target.as_ptr(),
+            )
+        };
+        if result != 0 {
+            return Err(session_io(
+                &self.path.join(destination),
+                std::io::Error::last_os_error(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn create_session_directory(path: &Path) -> Result<(), SessionError> {
+    JsonDirectory::create(path).map(|_| ())
+}
+
+#[cfg(not(unix))]
+fn create_session_directory(path: &Path) -> Result<(), SessionError> {
+    Err(session_io(
+        path,
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "durable session publication requires Unix directory synchronization",
+        ),
+    ))
+}
+
+// The synchronization operation is explicit so failure tests can exercise the
+// complete publication protocol, without weakening production synchronization.
+#[cfg(unix)]
+fn write_json_bytes(
+    path: &Path,
+    content: &[u8],
+    temporary: &std::ffi::OsStr,
+    synchronize: impl Fn(&std::fs::File) -> std::io::Result<()>,
+) -> Result<(), SessionError> {
+    use std::io::Write;
+    let destination = path.file_name().ok_or_else(|| {
+        session_io(
+            path,
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "artifact has no filename"),
+        )
     })?;
-    Ok(())
+    artifact_name(destination).map_err(|error| session_io(path, error))?;
+    let directory = JsonDirectory::create(artifact_parent(path))?;
+    let temporary_path = directory.path.join(temporary);
+    let mut file = directory.create_temporary(temporary)?;
+    file.write_all(content)
+        .map_err(|error| session_io(&temporary_path, error))?;
+    synchronize(&file).map_err(|error| session_io(&temporary_path, error))?;
+    directory.rename(temporary, destination, &file)?;
+    synchronize(&directory.handle).map_err(|error| {
+        session_io(
+            &directory.path,
+            std::io::Error::new(
+                error.kind(),
+                format!(
+                    "artifact {} was renamed, but directory synchronization failed: {error}",
+                    path.display()
+                ),
+            ),
+        )
+    })?;
+    directory.revalidate()
+}
+
+#[cfg(not(unix))]
+fn write_json_bytes(
+    path: &Path,
+    _content: &[u8],
+    _temporary: &std::ffi::OsStr,
+    _synchronize: impl Fn(&std::fs::File) -> std::io::Result<()>,
+) -> Result<(), SessionError> {
+    create_session_directory(path)
 }
 
 #[cfg(test)]
@@ -1944,6 +2224,394 @@ mod tests {
         let entries: Vec<_> = std::fs::read_dir(tmp.path()).unwrap().collect();
         assert_eq!(entries.len(), 1);
         assert!(entries[0].as_ref().unwrap().file_name().to_str().unwrap() == "clean.json");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_json_pretty_concurrent_readers_observe_complete_artifacts() {
+        use std::sync::Barrier;
+        let directory = tempfile::tempdir().unwrap().keep();
+        let path = directory.join("snapshot.json");
+        let value = |writer: usize, generation: usize| {
+            serde_json::json!({
+                "writer": writer,
+                "generation": generation,
+                "payload": format!("{writer}:{generation}:").repeat(4096),
+            })
+        };
+        write_json_pretty(&path, &value(0, 0)).unwrap();
+        const WRITERS: usize = 4;
+        let barrier = Barrier::new(WRITERS + 1);
+        std::thread::scope(|scope| {
+            let mut writers = Vec::new();
+            for writer in 1..=WRITERS {
+                let (path, barrier) = (&path, &barrier);
+                writers.push(scope.spawn(move || {
+                    barrier.wait();
+                    for generation in 0..4 {
+                        write_json_pretty(path, &value(writer, generation)).unwrap();
+                    }
+                }));
+            }
+            barrier.wait();
+            loop {
+                let observed: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                let writer = observed["writer"].as_u64().unwrap() as usize;
+                let generation = observed["generation"].as_u64().unwrap() as usize;
+                assert!(writer <= WRITERS && generation < 4);
+                assert_eq!(observed, value(writer, generation));
+                if writers
+                    .iter()
+                    .all(std::thread::ScopedJoinHandle::is_finished)
+                {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            for writer in writers {
+                writer.join().unwrap();
+            }
+        });
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_json_pretty_preserves_artifact_when_serialization_fails() {
+        struct Invalid;
+        impl Serialize for Invalid {
+            fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom(
+                    "deliberate serialization failure",
+                ))
+            }
+        }
+        let directory = tempfile::tempdir().unwrap().keep();
+        let path = directory.join("snapshot.json");
+        let original = b"{\"generation\":1}\n";
+        std::fs::write(&path, original).unwrap();
+        assert!(matches!(
+            write_json_pretty(&path, &Invalid),
+            Err(SessionError::Json { .. })
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        let absent_parent = directory.join("absent/nested");
+        assert!(write_json_pretty(&absent_parent.join("snapshot.json"), &Invalid).is_err());
+        assert!(!absent_parent.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_json_pretty_does_not_follow_old_temporary_or_destination_symlinks() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap().keep();
+        let outside = directory.join("outside.json");
+        let path = directory.join("snapshot.json");
+        let legacy = directory.join(format!("snapshot.json.tmp.{}", std::process::id()));
+        std::fs::write(&outside, b"retain the referent").unwrap();
+        symlink(&outside, &legacy).unwrap();
+        symlink(&outside, &path).unwrap();
+        let replacement = serde_json::json!({"published": true});
+        write_json_pretty(&path, &replacement).unwrap();
+        assert_eq!(std::fs::read(&outside).unwrap(), b"retain the referent");
+        assert_eq!(std::fs::read_link(&legacy).unwrap(), outside);
+        assert!(std::fs::symlink_metadata(&path).unwrap().is_file());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap(),
+            replacement
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_json_bytes_refuses_existing_temporary_files_and_symlinks() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap().keep();
+        let path = directory.join("snapshot.json");
+        let outside = directory.join("outside.json");
+        let original = b"{\"generation\":1}\n";
+        std::fs::write(&path, original).unwrap();
+        std::fs::write(&outside, b"retain the outside file").unwrap();
+        std::fs::write(directory.join("existing.tmp"), b"retain the temporary file").unwrap();
+        symlink(&outside, directory.join("symlink.tmp")).unwrap();
+        std::fs::hard_link(&outside, directory.join("hardlink.tmp")).unwrap();
+        std::fs::create_dir(directory.join("directory.tmp")).unwrap();
+        for name in [
+            "existing.tmp",
+            "symlink.tmp",
+            "hardlink.tmp",
+            "directory.tmp",
+        ] {
+            let result = write_json_bytes(
+                &path,
+                b"{\"generation\":2}",
+                name.as_ref(),
+                std::fs::File::sync_all,
+            );
+            assert!(
+                matches!(result, Err(SessionError::Io { source, .. }) if source.kind() == std::io::ErrorKind::AlreadyExists)
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+        assert_eq!(std::fs::read(&outside).unwrap(), b"retain the outside file");
+        assert_eq!(
+            std::fs::read(directory.join("existing.tmp")).unwrap(),
+            b"retain the temporary file"
+        );
+        assert_eq!(
+            std::fs::read_link(directory.join("symlink.tmp")).unwrap(),
+            outside
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn write_json_bytes_preserves_original_on_file_sync_error() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let path = directory.join("snapshot.json");
+        let original = b"{\"generation\":1}\n";
+        let replacement = b"{\"generation\":2}";
+        std::fs::write(&path, original).unwrap();
+        let device = std::fs::File::open("/dev/null").unwrap();
+        let failure_kind = device.sync_all().unwrap_err().kind();
+        let syncs = std::cell::Cell::new(0);
+        let result = write_json_bytes(&path, replacement, "retained.tmp".as_ref(), |file| {
+            assert!(file.metadata()?.is_file());
+            syncs.set(syncs.get() + 1);
+            // A real failing fsync exercises the same publication error path as
+            // a storage failure, without depending on a writable faulting mount.
+            device.sync_all()
+        });
+        assert!(
+            matches!(result, Err(SessionError::Io { path: failed, source })
+            if failed == directory.join("retained.tmp") && source.kind() == failure_kind)
+        );
+        assert_eq!(syncs.get(), 1);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(
+            std::fs::read(directory.join("retained.tmp")).unwrap(),
+            replacement
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn write_json_bytes_reports_directory_sync_error_after_publication() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let path = directory.join("snapshot.json");
+        std::fs::write(&path, b"{\"generation\":1}").unwrap();
+        let replacement = b"{\"generation\":2}";
+        let device = std::fs::File::open("/dev/null").unwrap();
+        let failure_kind = device.sync_all().unwrap_err().kind();
+        let syncs = std::cell::Cell::new(0);
+        let result = write_json_bytes(&path, replacement, "complete.tmp".as_ref(), |file| {
+            syncs.set(syncs.get() + 1);
+            if file.metadata()?.is_dir() {
+                device.sync_all()
+            } else {
+                file.sync_all()
+            }
+        });
+        let error = result.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("was renamed, but directory synchronization failed"));
+        assert!(matches!(error, SessionError::Io { path: failed, source }
+            if failed == directory && source.kind() == failure_kind));
+        assert_eq!(syncs.get(), 2);
+        assert_eq!(std::fs::read(&path).unwrap(), replacement);
+        assert!(!directory.join("complete.tmp").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_json_bytes_retains_complete_temporary_on_rename_failure() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let path = directory.join("snapshot.json");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("retained"), b"existing directory content").unwrap();
+        let replacement = b"{\"generation\":2}";
+        assert!(write_json_bytes(
+            &path,
+            replacement,
+            "complete.tmp".as_ref(),
+            std::fs::File::sync_all
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read(path.join("retained")).unwrap(),
+            b"existing directory content"
+        );
+        assert_eq!(
+            std::fs::read(directory.join("complete.tmp")).unwrap(),
+            replacement
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_json_bytes_refuses_a_substituted_parent_directory() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap().keep();
+        let directory = root.join("artifacts");
+        let retained = root.join("retained-artifacts");
+        let redirect = root.join("redirect");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::create_dir(&redirect).unwrap();
+        let path = directory.join("snapshot.json");
+        let original = b"{\"generation\":1}";
+        std::fs::write(&path, original).unwrap();
+        let replacement = b"{\"generation\":2}";
+        let result = write_json_bytes(&path, replacement, "retained.tmp".as_ref(), |file| {
+            file.sync_all()?;
+            std::fs::rename(&directory, &retained)?;
+            symlink(&redirect, &directory)
+        });
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("directory identity changed"));
+        assert_eq!(
+            std::fs::read(retained.join("snapshot.json")).unwrap(),
+            original
+        );
+        assert_eq!(
+            std::fs::read(retained.join("retained.tmp")).unwrap(),
+            replacement
+        );
+        assert_eq!(std::fs::read_dir(&redirect).unwrap().count(), 0);
+        assert!(
+            write_json_pretty(&directory.join("another.json"), &serde_json::json!({})).is_err()
+        );
+        assert_eq!(std::fs::read_dir(&redirect).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_json_bytes_refuses_a_substituted_temporary_file() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap().keep();
+        let path = directory.join("snapshot.json");
+        let outside = directory.join("outside.json");
+        let temporary = directory.join("complete.tmp");
+        let retained = directory.join("retained.tmp");
+        let original = b"{\"generation\":1}";
+        let replacement = b"{\"generation\":2}";
+        std::fs::write(&path, original).unwrap();
+        std::fs::write(&outside, b"retain the referent").unwrap();
+        let result = write_json_bytes(&path, replacement, "complete.tmp".as_ref(), |file| {
+            file.sync_all()?;
+            std::fs::rename(&temporary, &retained)?;
+            symlink(&outside, &temporary)
+        });
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("temporary identity changed"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(std::fs::read(&retained).unwrap(), replacement);
+        assert_eq!(std::fs::read(&outside).unwrap(), b"retain the referent");
+        assert_eq!(std::fs::read_link(&temporary).unwrap(), outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_json_bytes_binds_publication_to_the_written_inode() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let path = directory.join("snapshot.json");
+        let temporary = directory.join("complete.tmp");
+        let retained = directory.join("retained.tmp");
+        let original = b"{\"generation\":1}";
+        let replacement = b"{\"generation\":2}";
+        let substituted = b"{\"unexpected\":true}";
+        std::fs::write(&path, original).unwrap();
+        let result = write_json_bytes(&path, replacement, "complete.tmp".as_ref(), |file| {
+            file.sync_all()?;
+            std::fs::rename(&temporary, &retained)?;
+            std::fs::write(&temporary, substituted)
+        });
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("temporary identity changed"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(std::fs::read(&retained).unwrap(), replacement);
+        assert_eq!(std::fs::read(&temporary).unwrap(), substituted);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn session_directory_retry_syncs_an_existing_parent_entry() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap().keep();
+        let path = root.join("new-session");
+        let root_metadata = std::fs::metadata(&root).unwrap();
+        let device = std::fs::File::open("/dev/null").unwrap();
+        let failure_kind = device.sync_all().unwrap_err().kind();
+        let fail_parent_sync = |file: &std::fs::File| {
+            let metadata = file.metadata()?;
+            if metadata.dev() == root_metadata.dev() && metadata.ino() == root_metadata.ino() {
+                device.sync_all()
+            } else {
+                file.sync_all()
+            }
+        };
+        assert!(
+            matches!(JsonDirectory::create_with_sync(&path, &fail_parent_sync),
+            Err(SessionError::Io { source, .. }) if source.kind() == failure_kind)
+        );
+        assert!(path.is_dir());
+        // Retry must still fail: visible directory creation is not proof that
+        // the entry in its parent has reached durable storage.
+        assert!(
+            matches!(JsonDirectory::create_with_sync(&path, &fail_parent_sync),
+            Err(SessionError::Io { source, .. }) if source.kind() == failure_kind)
+        );
+        let parent_syncs = std::cell::Cell::new(0);
+        JsonDirectory::create_with_sync(&path.join("."), &|file| {
+            let metadata = file.metadata()?;
+            assert_eq!(
+                (metadata.dev(), metadata.ino()),
+                (root_metadata.dev(), root_metadata.ino())
+            );
+            parent_syncs.set(parent_syncs.get() + 1);
+            file.sync_all()
+        })
+        .unwrap();
+        assert_eq!(parent_syncs.get(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_json_pretty_creates_private_artifacts_with_non_utf8_names() {
+        use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
+        let directory = tempfile::tempdir().unwrap().keep();
+        let parent = directory.join("new/nested");
+        let path = parent.join(std::ffi::OsStr::from_bytes(b"snapshot-\xff.json"));
+        let value = serde_json::json!({"published": true});
+        write_json_pretty(&path, &value).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap(),
+            value
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(directory.join("new"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
     }
 
     // ── SnapshotHost / SnapshotScanSummary ──────────────────────────
