@@ -589,6 +589,192 @@ pub fn load_inference_unchecked(
     load_artifact_unchecked(handle, INFERENCE_FILE)
 }
 
+/// Historical explanation inputs. These are recorded values, never a rescore of
+/// a live PID or a reconstruction using the reader's current configuration.
+#[derive(Debug)]
+pub struct RecordedExplanationSnapshot {
+    pub candidates: BTreeMap<u32, serde_json::Value>,
+    pub source: serde_json::Value,
+    pub activity_window_ms: Option<u64>,
+}
+
+fn index_explanation_candidates(
+    candidates: Vec<serde_json::Value>,
+) -> Result<BTreeMap<u32, serde_json::Value>, String> {
+    let mut indexed = BTreeMap::new();
+    for candidate in candidates {
+        let pid = candidate["pid"]
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok())
+            .filter(|pid| *pid > 0)
+            .ok_or("recorded candidate has an invalid PID")?;
+        let start_id = candidate["start_id"]
+            .as_str()
+            .ok_or("recorded candidate has no process birth identity")?;
+        if pt_common::StartId::parse(start_id).is_none()
+            || start_id
+                .rsplit(':')
+                .next()
+                .and_then(|pid| pid.parse::<u32>().ok())
+                != Some(pid)
+        {
+            return Err(format!(
+                "recorded PID {pid} has an invalid process birth identity"
+            ));
+        }
+        if candidate["uid"]
+            .as_u64()
+            .is_none_or(|uid| uid > u64::from(u32::MAX))
+        {
+            return Err(format!("recorded PID {pid} has an invalid owner identity"));
+        }
+        let probabilities: Option<Vec<f64>> = ["useful", "useful_bad", "abandoned", "zombie"]
+            .iter()
+            .map(|class| candidate["posterior"][*class].as_f64())
+            .collect();
+        if probabilities.as_ref().is_none_or(|values| {
+            values
+                .iter()
+                .any(|value| !value.is_finite() || !(0.0..=1.0).contains(value))
+                || (values.iter().sum::<f64>() - 1.0).abs() > 1e-6
+        }) {
+            return Err(format!("recorded PID {pid} has an invalid posterior"));
+        }
+        if indexed.insert(pid, candidate).is_some() {
+            return Err(format!(
+                "recorded inference has ambiguous duplicate PID {pid}"
+            ));
+        }
+    }
+    Ok(indexed)
+}
+
+/// Prefer the rich canonical plan so final policy/tree/goal decisions and exact
+/// ledgers agree with the approved document. Snapshot-only sessions use the
+/// existing checksummed inventory/inference pair and explicitly lack a ledger.
+/// A corrupt available artifact is an error, never permission to inspect a new
+/// process that happens to have the same PID.
+pub fn load_recorded_explanation_snapshot(
+    handle: &SessionHandle,
+) -> Result<RecordedExplanationSnapshot, String> {
+    let mut plan_source = None;
+    match std::fs::read(handle.dir.join(PLAN_FILE)) {
+        Ok(bytes) => {
+            let plan: serde_json::Value = serde_json::from_slice(&bytes)
+                .map_err(|error| format!("invalid recorded plan: {error}"))?;
+            if plan["session_id"].as_str() != Some(handle.id.0.as_str()) {
+                return Err("recorded plan session ID mismatch".into());
+            }
+            let source = serde_json::json!({
+                "artifact": PLAN_FILE,
+                "sha256": sha256_hex(&bytes),
+                "observed_at": plan["generated_at"],
+                "host_id": plan["host_id"],
+            });
+            if let Some(candidates) = plan.get("candidates") {
+                let candidates = candidates
+                    .as_array()
+                    .ok_or("recorded plan candidates must be an array")?;
+                return Ok(RecordedExplanationSnapshot {
+                    candidates: index_explanation_candidates(candidates.clone())?,
+                    source,
+                    activity_window_ms: plan["args"]["window_ms"].as_u64(),
+                });
+            }
+            plan_source = Some(source);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("cannot read recorded plan: {error}")),
+    }
+
+    // An older action-only plan can still be inspected, but contains no recorded
+    // inference. Do not substitute its action rationale for a full posterior.
+    let inference_path = handle.dir.join(INFERENCE_FILE);
+    match std::fs::metadata(&inference_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return plan_source
+                .map(|source| RecordedExplanationSnapshot {
+                    candidates: BTreeMap::new(),
+                    source,
+                    activity_window_ms: None,
+                })
+                .ok_or_else(|| {
+                    "no recorded session inference found; use --live for a new observation".into()
+                });
+        }
+        Err(error) => return Err(format!("cannot inspect recorded inference: {error}")),
+        Ok(_) => {}
+    }
+    let inventory =
+        load_inventory(handle).map_err(|error| format!("recorded inventory: {error}"))?;
+    let inference =
+        load_inference(handle).map_err(|error| format!("recorded inference: {error}"))?;
+    if inventory.session_id != handle.id.0 || inference.session_id != handle.id.0 {
+        return Err("recorded snapshot session ID mismatch".into());
+    }
+    if inventory.host_id.is_empty() || inventory.host_id != inference.host_id {
+        return Err("recorded inventory and inference host IDs differ".into());
+    }
+    if inventory.payload.record_count != inventory.payload.records.len()
+        || inference.payload.candidate_count != inference.payload.candidates.len()
+    {
+        return Err("recorded snapshot count mismatch".into());
+    }
+    let mut records = BTreeMap::new();
+    for process in &inventory.payload.records {
+        if records.insert(process.start_id.as_str(), process).is_some() {
+            return Err("recorded inventory has duplicate process identities".into());
+        }
+    }
+    let candidates = inference
+        .payload
+        .candidates
+        .iter()
+        .map(|candidate| {
+            let process = records
+                .get(candidate.start_id.as_str())
+                .filter(|process| process.pid == candidate.pid)
+                .ok_or_else(|| {
+                    format!(
+                        "recorded PID {} inference does not match its inventory",
+                        candidate.pid
+                    )
+                })?;
+            Ok(serde_json::json!({
+                "pid": candidate.pid,
+                "start_id": candidate.start_id,
+                "uid": process.uid,
+                "ppid": process.ppid,
+                "command_short": process.comm,
+                "command": process.cmd,
+                "state": process.state,
+                "age_seconds": process.elapsed_secs,
+                "classification": candidate.classification,
+                "confidence": candidate.confidence,
+                "posterior": {
+                    "useful": candidate.posterior_useful,
+                    "useful_bad": candidate.posterior_useful_bad,
+                    "abandoned": candidate.posterior_abandoned,
+                    "zombie": candidate.posterior_zombie,
+                },
+                "score": candidate.score,
+                "recommended_action": candidate.recommended_action,
+            }))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(RecordedExplanationSnapshot {
+        candidates: index_explanation_candidates(candidates)?,
+        source: serde_json::json!({
+            "artifact": INFERENCE_FILE,
+            "integrity_sha256": inference.integrity_sha256,
+            "inventory_integrity_sha256": inventory.integrity_sha256,
+            "observed_at": inference.generated_at,
+            "host_id": inference.host_id,
+        }),
+        activity_window_ms: None,
+    })
+}
+
 /// Load the plan artifact with validation.
 pub fn load_plan(handle: &SessionHandle) -> Result<ArtifactEnvelope<PlanArtifact>, SessionError> {
     load_artifact(handle, PLAN_FILE)
@@ -845,6 +1031,124 @@ mod tests {
                 rationale: "P(abandoned)=0.90, low blast radius".to_string(),
             }],
         }
+    }
+
+    #[test]
+    fn recorded_explanations_prefer_final_plan_without_rescoring() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        persist_inventory(&handle, &handle.id.0, "host1", sample_inventory()).unwrap();
+        persist_inference(&handle, &handle.id.0, "host1", sample_inference()).unwrap();
+        let candidate = serde_json::json!({
+            "pid": 1234, "start_id": "boot1:12345:1234", "uid": 1000,
+            "posterior": {"useful": 0.01, "useful_bad": 0.01, "abandoned": 0.97, "zombie": 0.01},
+            "score": 98, "recommended_action": "review",
+            "evidence_ledger": {"why_summary": "recorded explanation", "precise_term": 1.23456789012345},
+        });
+        let plan = serde_json::json!({
+            "session_id": handle.id.0, "host_id": "host1",
+            "generated_at": "2026-01-01T00:00:00Z", "args": {"window_ms": 750},
+            "candidates": [candidate.clone()],
+        });
+        let bytes = serde_json::to_vec(&plan).unwrap();
+        std::fs::write(handle.dir.join(PLAN_FILE), &bytes).unwrap();
+        let saved = load_recorded_explanation_snapshot(&handle).unwrap();
+        assert_eq!(saved.candidates[&1234], candidate);
+        assert_eq!(saved.source["sha256"], sha256_hex(&bytes));
+        assert_eq!(saved.source["observed_at"], "2026-01-01T00:00:00Z");
+        assert_eq!(saved.activity_window_ms, Some(750));
+
+        // Valid compact data must never hide a corrupt canonical plan.
+        std::fs::write(handle.dir.join(PLAN_FILE), b"{interrupted").unwrap();
+        assert!(load_recorded_explanation_snapshot(&handle)
+            .unwrap_err()
+            .contains("invalid recorded plan"));
+    }
+
+    #[test]
+    fn recorded_explanations_validate_snapshot_identity_and_integrity() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        persist_inventory(&handle, &handle.id.0, "host1", sample_inventory()).unwrap();
+        persist_inference(&handle, &handle.id.0, "host1", sample_inference()).unwrap();
+        let saved = load_recorded_explanation_snapshot(&handle).unwrap();
+        assert_eq!(saved.candidates[&1234]["command"], "node server.js");
+        assert_eq!(saved.candidates[&1234]["posterior"]["abandoned"], 0.90);
+        assert!(saved.candidates[&1234].get("evidence_ledger").is_none());
+        assert!(saved.activity_window_ms.is_none());
+
+        let mut wrong_identity = sample_inference();
+        wrong_identity.candidates[0].start_id = "boot1:99999:1234".into();
+        persist_inference(&handle, &handle.id.0, "host1", wrong_identity).unwrap();
+        assert!(load_recorded_explanation_snapshot(&handle)
+            .unwrap_err()
+            .contains("does not match its inventory"));
+
+        persist_inference(&handle, &handle.id.0, "other-host", sample_inference()).unwrap();
+        assert!(load_recorded_explanation_snapshot(&handle)
+            .unwrap_err()
+            .contains("host IDs differ"));
+        persist_inference(&handle, "other-session", "host1", sample_inference()).unwrap();
+        assert!(load_recorded_explanation_snapshot(&handle)
+            .unwrap_err()
+            .contains("session ID mismatch"));
+
+        let mut duplicate = sample_inference();
+        duplicate.candidates.push(duplicate.candidates[0].clone());
+        duplicate.candidate_count = 2;
+        persist_inference(&handle, &handle.id.0, "host1", duplicate).unwrap();
+        assert!(load_recorded_explanation_snapshot(&handle)
+            .unwrap_err()
+            .contains("duplicate PID"));
+
+        persist_inference(&handle, &handle.id.0, "host1", sample_inference()).unwrap();
+        let path = handle.dir.join(INFERENCE_FILE);
+        let mut corrupted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        corrupted["payload"]["candidates"][0]["score"] = serde_json::json!(0);
+        std::fs::write(path, serde_json::to_vec(&corrupted).unwrap()).unwrap();
+        assert!(load_recorded_explanation_snapshot(&handle).is_err());
+    }
+
+    #[test]
+    fn recorded_explanations_refuse_invalid_rich_candidates() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let candidate = serde_json::json!({
+            "pid": 1234, "start_id": "boot1:12345:1234", "uid": 1000,
+            "posterior": {"useful": 0.05, "useful_bad": 0.02, "abandoned": 0.9, "zombie": 0.03},
+        });
+        let valid = serde_json::json!({"session_id": handle.id.0, "candidates": [candidate]});
+        for (field, value) in [
+            ("start_id", serde_json::json!("boot1:12345:5678")),
+            ("uid", serde_json::json!(-1)),
+            (
+                "posterior",
+                serde_json::json!({"useful": 1.0, "useful_bad": 1.0, "abandoned": 1.0, "zombie": 1.0}),
+            ),
+        ] {
+            let mut invalid = valid.clone();
+            invalid["candidates"][0][field] = value;
+            std::fs::write(
+                handle.dir.join(PLAN_FILE),
+                serde_json::to_vec(&invalid).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                load_recorded_explanation_snapshot(&handle).is_err(),
+                "{field}"
+            );
+        }
+        let mut foreign = valid;
+        foreign["session_id"] = serde_json::json!("different-session");
+        std::fs::write(
+            handle.dir.join(PLAN_FILE),
+            serde_json::to_vec(&foreign).unwrap(),
+        )
+        .unwrap();
+        assert!(load_recorded_explanation_snapshot(&handle)
+            .unwrap_err()
+            .contains("session ID mismatch"));
     }
 
     fn sample_metadata() -> RunMetadata {

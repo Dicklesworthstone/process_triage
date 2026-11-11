@@ -228,6 +228,7 @@ fn explain_live_process_returns_explanation() {
                 "json",
                 "agent",
                 "explain",
+                "--live",
                 "--session",
                 &session_id.0,
                 "--pids",
@@ -244,6 +245,7 @@ fn explain_live_process_returns_explanation() {
             json.get("command").and_then(|v| v.as_str()),
             Some("agent explain"),
         );
+        assert_eq!(json["mode"], "live");
         assert!(json.get("schema_version").is_some());
         assert_eq!(
             json.get("session_id").and_then(|v| v.as_str()),
@@ -298,7 +300,14 @@ fn explain_reports_protection_reason() {
         let session_id = create_session_with_plan(dir, test_identity(mux_pid), false);
         let output = pt_core_fast()
             .env("PROCESS_TRIAGE_DATA", dir.path())
-            .args(["--format", "json", "agent", "explain", "--session"])
+            .args([
+                "--format",
+                "json",
+                "agent",
+                "explain",
+                "--live",
+                "--session",
+            ])
             .arg(&session_id.0)
             .arg("--pids")
             .arg(format!("{mux_pid},{plain_pid}"))
@@ -445,6 +454,248 @@ fn explain_with_target_flag() {
             explanations[0].get("pid").and_then(|v| v.as_u64()),
             Some(fake_pid as u64),
         );
+    });
+}
+
+#[test]
+fn explain_recorded_plan_survives_process_exit_and_configuration_changes() {
+    with_temp_data_dir(|dir| {
+        let config = TempDir::new().unwrap();
+        // The producer observes only our owned child, including on root-owned
+        // build workers. No action is applied by this test.
+        let mut policy = pt_core::config::Policy::default();
+        policy.guardrails.builtin_protection = false;
+        policy.guardrails.protected_users.clear();
+        policy.guardrails.protected_groups.clear();
+        policy.guardrails.protected_patterns.clear();
+        policy.guardrails.protected_categories.clear();
+        fs::write(
+            config.path().join("policy.json"),
+            serde_json::to_vec(&policy).unwrap(),
+        )
+        .unwrap();
+        let child = ProcessCommand::new("sleep").arg("61").spawn().unwrap();
+        let pid = child.id();
+        let child = ChildGuard { child };
+        let plan_output = pt_core_fast()
+            .env("PROCESS_TRIAGE_DATA", dir.path())
+            .env("PROCESS_TRIAGE_RETENTION", "off")
+            .arg("--config")
+            .arg(config.path())
+            .args(["--format", "json", "agent", "plan", "--pids"])
+            .arg(pid.to_string())
+            .args([
+                "--min-age",
+                "0",
+                "--min-posterior",
+                "0",
+                "--window-ms",
+                "25",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            matches!(plan_output.status.code(), Some(0 | 1)),
+            "{}",
+            String::from_utf8_lossy(&plan_output.stderr)
+        );
+        let plan: Value = serde_json::from_slice(&plan_output.stdout).unwrap();
+        let candidate = plan["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| candidate["pid"] == pid)
+            .unwrap()
+            .clone();
+        let session = plan["session_id"].as_str().unwrap();
+        let plan_path = dir
+            .path()
+            .join("sessions")
+            .join(session)
+            .join("decision/plan.json");
+        let original_plan = fs::read(&plan_path).unwrap();
+        drop(child);
+        // A historical explanation must not even need readable current priors.
+        fs::write(
+            config.path().join("priors.json"),
+            b"{invalid-current-priors",
+        )
+        .unwrap();
+
+        let output = pt_core_fast()
+            .env("PROCESS_TRIAGE_DATA", dir.path())
+            .env("PROCESS_TRIAGE_RETENTION", "off")
+            .arg("--config")
+            .arg(config.path())
+            .args([
+                "--format",
+                "json",
+                "agent",
+                "explain",
+                "--session",
+                session,
+                "--target",
+            ])
+            .arg(format!("{pid}:{}", candidate["start_id"].as_str().unwrap()))
+            .args(["--include", "ledger", "--include", "evidence"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let explained: Value = serde_json::from_slice(&output).unwrap();
+        let actual = &explained["explanations"][0];
+        assert_eq!(explained["mode"], "recorded");
+        assert_eq!(explained["source"]["artifact"], "decision/plan.json");
+        assert_eq!(explained["source"]["observed_at"], plan["generated_at"]);
+        assert_eq!(explained["activity_window_ms"], 25);
+        for field in [
+            "start_id",
+            "uid",
+            "score",
+            "posterior",
+            "recommended_action",
+            "evidence_ledger",
+            "evidence",
+            "policy",
+        ] {
+            assert_eq!(actual[field], candidate[field], "recorded {field} changed");
+        }
+        assert_eq!(actual["ledger_status"], "recorded");
+        assert_eq!(
+            actual["learned_prior"],
+            candidate["inference"]["learned_prior"]
+        );
+        assert_eq!(fs::read(&plan_path).unwrap(), original_plan);
+
+        // A stable target cannot silently degrade to a PID-only lookup.
+        let wrong_target = format!("{pid}:different-boot:1:{pid}");
+        let refused = pt_core_fast()
+            .env("PROCESS_TRIAGE_DATA", dir.path())
+            .args([
+                "--format",
+                "json",
+                "agent",
+                "explain",
+                "--session",
+                session,
+                "--target",
+                &wrong_target,
+            ])
+            .assert()
+            .code(ExitCode::IdentityError.as_i32())
+            .get_output()
+            .stdout
+            .clone();
+        let refused: Value = serde_json::from_slice(&refused).unwrap();
+        assert!(refused["explanations"][0]["classification"].is_null());
+        assert!(refused["explanations"][0]["posterior"].is_null());
+    });
+}
+
+#[test]
+fn explain_live_refuses_reused_identity_and_malformed_targets() {
+    with_temp_data_dir(|dir| {
+        let child = ChildGuard {
+            child: ProcessCommand::new("sleep").arg("62").spawn().unwrap(),
+        };
+        let pid = child.child.id();
+        let session = create_session_with_plan(dir, test_identity(pid), false);
+        let wrong_target = format!("{pid}:old-boot:1:{pid}");
+        let result = pt_core_fast()
+            .env("PROCESS_TRIAGE_DATA", dir.path())
+            .args([
+                "--format",
+                "json",
+                "agent",
+                "explain",
+                "--live",
+                "--session",
+                &session.0,
+                "--target",
+                &wrong_target,
+            ])
+            .assert()
+            .code(ExitCode::IdentityError.as_i32())
+            .get_output()
+            .stdout
+            .clone();
+        let result: Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(result["mode"], "live");
+        assert!(result["explanations"][0]["posterior"].is_null());
+        for target in [
+            pid.to_string(),
+            format!("{pid}:boot:1:1"),
+            format!("{pid}:not-an-identity"),
+        ] {
+            pt_core_fast()
+                .env("PROCESS_TRIAGE_DATA", dir.path())
+                .args([
+                    "--format",
+                    "json",
+                    "agent",
+                    "explain",
+                    "--session",
+                    &session.0,
+                    "--target",
+                    &target,
+                ])
+                .assert()
+                .code(ExitCode::ArgsError.as_i32());
+        }
+    });
+}
+
+#[test]
+fn explain_does_not_rescore_when_recorded_evidence_is_missing_or_corrupt() {
+    with_temp_data_dir(|dir| {
+        let child = ChildGuard {
+            child: ProcessCommand::new("sleep").arg("63").spawn().unwrap(),
+        };
+        let pid = child.child.id();
+        let session = create_session_with_plan(dir, test_identity(pid), false);
+        let output = pt_core_fast()
+            .env("PROCESS_TRIAGE_DATA", dir.path())
+            .args([
+                "--format",
+                "json",
+                "agent",
+                "explain",
+                "--session",
+                &session.0,
+                "--pids",
+                &pid.to_string(),
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let output: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(output["mode"], "recorded");
+        assert_eq!(output["explanations"][0]["ledger_status"], "not_recorded");
+        assert!(output["explanations"][0]["posterior"].is_null());
+        let path = dir
+            .path()
+            .join("sessions")
+            .join(&session.0)
+            .join("decision/plan.json");
+        fs::write(&path, b"{corrupt-recorded-plan").unwrap();
+        pt_core_fast()
+            .env("PROCESS_TRIAGE_DATA", dir.path())
+            .args([
+                "--format",
+                "json",
+                "agent",
+                "explain",
+                "--session",
+                &session.0,
+                "--pids",
+                &pid.to_string(),
+            ])
+            .assert()
+            .code(ExitCode::SessionError.as_i32());
+        assert_eq!(fs::read(path).unwrap(), b"{corrupt-recorded-plan");
     });
 }
 

@@ -1208,6 +1208,14 @@ Each evidence term has a glyph, a Bayes factor (ratio of likelihoods), a strengt
 
 Access this via `pt agent explain --session <id> --pids <pid> --galaxy-brain`, the TUI detail pane, or `pt report --include-ledger`.
 
+`agent explain` reads the session's saved decision, including its final recommendation,
+posterior and exact ledger when recorded. It still works after the process exits or
+configuration changes. Snapshot-only and older sessions expose the evidence they
+actually saved; a missing ledger remains unavailable. `--target <pid>:<start_id>`
+checks the full recorded process identity. Use `--live` explicitly to observe and
+score the current process with current configuration instead. The output identifies
+recorded versus live evidence and includes the source observation time.
+
 ---
 
 ## Plan Format and Example Output

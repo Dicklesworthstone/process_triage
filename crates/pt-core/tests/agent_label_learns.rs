@@ -1,5 +1,5 @@
 //! The learning loop end to end: `agent label` records a human verdict for a live
-//! process's command pattern, and the next `agent plan` / `agent explain` use it
+//! process's command pattern, and the next `agent plan` / `agent explain --live` use it
 //! as the prior.
 
 #![cfg(unix)]
@@ -124,7 +124,7 @@ fn human_kill_labels_raise_the_plan_prior_for_that_pattern() {
 }
 
 fn explain(config_dir: &Path, data_dir: &Path, pid: u32) -> Value {
-    // `agent explain` runs within a session; it explains the live process by pid.
+    // Explicitly request a new observation after each human verdict.
     let session = SessionId::new();
     SessionStore::at_data_dir(data_dir)
         .create(&SessionManifest::new(
@@ -135,7 +135,7 @@ fn explain(config_dir: &Path, data_dir: &Path, pid: u32) -> Value {
         ))
         .expect("create session");
     let out = pt_core(config_dir, data_dir)
-        .args(["--format", "json", "agent", "explain", "--session"])
+        .args(["--format", "json", "agent", "explain", "--live", "--session"])
         .arg(&session.0)
         .arg("--pids")
         .arg(pid.to_string())

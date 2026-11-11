@@ -1254,15 +1254,19 @@ struct AgentExplainArgs {
     #[arg(long)]
     session: String,
 
-    /// PIDs to explain
-    #[arg(long, value_delimiter = ',')]
+    /// PIDs whose recorded session decisions should be explained
+    #[arg(long, value_delimiter = ',', conflicts_with = "target")]
     pids: Vec<u32>,
 
     /// Target process with stable identity (format: pid:start_id)
     #[arg(long)]
     target: Option<String>,
 
-    /// Activity sampling window in milliseconds (0 uses lifetime CPU averages)
+    /// Rescan live processes with current configuration instead of reading saved evidence
+    #[arg(long)]
+    live: bool,
+
+    /// Live activity sampling window in milliseconds (0 uses lifetime CPU averages)
     #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(u64).range(0..=60_000))]
     window_ms: u64,
 
@@ -25421,6 +25425,75 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     }
 }
 
+fn parse_explain_target(target: &str) -> Result<(u32, pt_common::StartId), String> {
+    let (pid, start_id) = target
+        .split_once(':')
+        .ok_or("invalid --target: expected pid:boot_id:start_time:pid")?;
+    let pid = pid
+        .parse::<u32>()
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or("invalid --target process ID")?;
+    let start_id =
+        pt_common::StartId::parse(start_id).ok_or("invalid --target process birth identity")?;
+    if start_id
+        .0
+        .rsplit(':')
+        .next()
+        .and_then(|pid| pid.parse::<u32>().ok())
+        != Some(pid)
+    {
+        return Err("--target PID disagrees with its process birth identity".into());
+    }
+    Ok((pid, start_id))
+}
+
+fn recorded_process_explanation(
+    candidate: &serde_json::Value,
+    args: &AgentExplainArgs,
+) -> serde_json::Value {
+    // Preserve final decisions, sampled evidence and exact probabilities. No
+    // scorer is consulted, including for older sessions without a ledger.
+    let mut explanation = candidate.clone();
+    explanation["comm"] = candidate["command_short"].clone();
+    explanation["elapsed_seconds"] = candidate["age_seconds"].clone();
+    for field in [
+        "prior_source",
+        "signature_age_weight",
+        "learned_prior",
+        "desktop_app",
+        "desktop_app_credited",
+    ] {
+        explanation[field] = candidate["inference"][field].clone();
+    }
+    let ledger = &candidate["evidence_ledger"];
+    explanation["ledger_status"] = serde_json::json!(if ledger.is_object() {
+        "recorded"
+    } else {
+        "not_recorded"
+    });
+    explanation["why_summary"] = ledger["why_summary"].clone();
+    explanation["top_evidence"] = ledger["top_evidence"].clone();
+    if args.galaxy_brain
+        || args
+            .include
+            .iter()
+            .any(|field| field == "bayes_factors" || field == "ledger")
+    {
+        explanation["bayes_factors"] = ledger["bayes_factors"].clone();
+    }
+    let fields = explanation
+        .as_object_mut()
+        .expect("validated recorded candidate");
+    if !args.galaxy_brain && !args.include.iter().any(|field| field == "ledger") {
+        fields.remove("evidence_ledger");
+    }
+    if !args.include.iter().any(|field| field == "evidence") {
+        fields.remove("evidence");
+    }
+    explanation
+}
+
 fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
     let store = match SessionStore::from_env() {
         Ok(store) => store,
@@ -25444,89 +25517,132 @@ fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
         }
     };
 
-    // Load the plan's scorer from config or use defaults
-    let ExplainContext {
-        mut scorer,
-        protected,
-        min_age_seconds,
-    } = match load_priors_for_explain(global) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("agent explain: failed to load priors: {}", e);
-            return ExitCode::InternalError;
+    let target = match args.target.as_deref().map(parse_explain_target).transpose() {
+        Ok(target) => target,
+        Err(error) => {
+            eprintln!("agent explain: {error}");
+            return ExitCode::ArgsError;
         }
     };
-
-    // Determine which PIDs to explain
-    let pids_to_explain: Vec<u32> = if !args.pids.is_empty() {
+    let pids_to_explain = if let Some((pid, _)) = &target {
+        vec![*pid]
+    } else if !args.pids.is_empty() {
         args.pids.clone()
-    } else if let Some(ref target) = args.target {
-        // Parse target format "pid:start_id" and extract PID
-        match target.split(':').next().and_then(|s| s.parse::<u32>().ok()) {
-            Some(pid) => vec![pid],
-            None => {
-                eprintln!("agent explain: invalid --target format, expected pid:start_id");
-                return ExitCode::ArgsError;
-            }
-        }
     } else {
         eprintln!("agent explain: must specify --pids or --target");
         return ExitCode::ArgsError;
     };
-
-    // Quick scan to get process records for the specified PIDs
-    let scan_options = QuickScanOptions {
-        pids: pids_to_explain.clone(),
-        include_kernel_threads: false,
-        timeout: global.timeout.map(std::time::Duration::from_secs),
-        progress: None,
-    };
-
-    let scan_result = match quick_scan(&scan_options) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("agent explain: scan failed: {}", e);
-            return ExitCode::InternalError;
-        }
-    };
-
-    collect_explain_provenance(
-        global,
-        &mut scorer,
-        protected.as_ref(),
-        min_age_seconds,
-        &scan_result.processes,
-    );
-    // Explanations include explicitly requested young/protected subjects; their
-    // activity is safe to observe even when policy forbids acting on them.
-    scorer.collect_activity(
-        &scan_result.processes.iter().collect::<Vec<_>>(),
-        Duration::from_millis(args.window_ms),
-    );
-
-    // Build explanations for each process
     let mut explanations: Vec<serde_json::Value> = Vec::new();
+    let mut exit_code = ExitCode::Clean;
+    let source;
+    let activity_window_ms;
 
-    for pid in &pids_to_explain {
-        let record = scan_result.processes.iter().find(|p| p.pid.0 == *pid);
-        match record {
-            Some(proc) => {
-                let mut explanation = build_process_explanation(proc, &scorer, args);
-                if let Some(ref filter) = protected {
-                    // agent plan skips protected processes; say so and why.
-                    explanation["protection"] = explain_protection(filter, proc);
+    if !args.live {
+        let recorded =
+            match pt_core::session::snapshot_persist::load_recorded_explanation_snapshot(&handle) {
+                Ok(recorded) => recorded,
+                Err(error) => {
+                    eprintln!("agent explain: {error}");
+                    return ExitCode::SessionError;
                 }
-                explanations.push(explanation);
-            }
-            None => {
-                // Process not found - might have exited
-                explanations.push(serde_json::json!({
+            };
+        source = recorded.source;
+        activity_window_ms = recorded.activity_window_ms;
+        for pid in &pids_to_explain {
+            match recorded.candidates.get(pid) {
+                Some(candidate) if target.as_ref().is_some_and(|(_, start_id)| {
+                    candidate["start_id"].as_str() != Some(start_id.0.as_str())
+                }) => {
+                    exit_code = ExitCode::IdentityError;
+                    explanations.push(serde_json::json!({
+                        "pid": pid,
+                        "error": "requested process identity does not match the recorded session",
+                        "classification": null,
+                    }));
+                }
+                Some(candidate) => explanations.push(recorded_process_explanation(candidate, args)),
+                None => explanations.push(serde_json::json!({
                     "pid": pid,
-                    "error": "process not found (may have exited)",
+                    "error": "process not found in recorded session inference; use --live for a new observation",
                     "classification": null,
-                }));
+                    "ledger_status": "not_recorded",
+                })),
             }
         }
+    } else {
+        // Current configuration and process reads are only used when the caller
+        // explicitly requests a new observation.
+        let ExplainContext {
+            mut scorer,
+            protected,
+            min_age_seconds,
+        } = match load_priors_for_explain(global) {
+            Ok(context) => context,
+            Err(error) => {
+                eprintln!("agent explain: failed to load priors: {error}");
+                return ExitCode::InternalError;
+            }
+        };
+        let scan_options = QuickScanOptions {
+            pids: pids_to_explain.clone(),
+            include_kernel_threads: false,
+            timeout: global.timeout.map(std::time::Duration::from_secs),
+            progress: None,
+        };
+        let mut scan_result = match quick_scan(&scan_options) {
+            Ok(result) => result,
+            Err(error) => {
+                eprintln!("agent explain: scan failed: {error}");
+                return ExitCode::InternalError;
+            }
+        };
+        if let Some((pid, start_id)) = &target {
+            if scan_result
+                .processes
+                .iter()
+                .any(|process| process.pid.0 == *pid && process.start_id != *start_id)
+            {
+                exit_code = ExitCode::IdentityError;
+                scan_result.processes.clear();
+            }
+        }
+        collect_explain_provenance(
+            global,
+            &mut scorer,
+            protected.as_ref(),
+            min_age_seconds,
+            &scan_result.processes,
+        );
+        scorer.collect_activity(
+            &scan_result.processes.iter().collect::<Vec<_>>(),
+            Duration::from_millis(args.window_ms),
+        );
+        for pid in &pids_to_explain {
+            match scan_result
+                .processes
+                .iter()
+                .find(|process| process.pid.0 == *pid)
+            {
+                Some(process) => {
+                    let mut explanation = build_process_explanation(process, &scorer, args);
+                    if let Some(ref filter) = protected {
+                        explanation["protection"] = explain_protection(filter, process);
+                    }
+                    explanations.push(explanation);
+                }
+                None => explanations.push(serde_json::json!({
+                    "pid": pid,
+                    "error": if exit_code == ExitCode::IdentityError {
+                        "requested process identity does not match the live process"
+                    } else {
+                        "process not found (may have exited)"
+                    },
+                    "classification": null,
+                })),
+            }
+        }
+        source = serde_json::json!({"observed_at": chrono::Utc::now().to_rfc3339()});
+        activity_window_ms = Some(args.window_ms);
     }
 
     // Output in requested format
@@ -25535,7 +25651,9 @@ fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
         "session_id": sid.0,
         "generated_at": chrono::Utc::now().to_rfc3339(),
         "command": "agent explain",
-        "activity_window_ms": args.window_ms,
+        "mode": if args.live { "live" } else { "recorded" },
+        "source": source,
+        "activity_window_ms": activity_window_ms,
         "explanations": explanations,
     });
 
@@ -25568,6 +25686,7 @@ fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
             // Human readable markdown output
             println!("# pt-core agent explain\n");
             println!("Session: {}", sid);
+            println!("Evidence: {}", if args.live { "new live observation" } else { "recorded session decision" });
             println!();
 
             for expl in &explanations {
@@ -25640,7 +25759,7 @@ fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
         }
     }
 
-    ExitCode::Clean
+    exit_code
 }
 
 /// The config directory pt reads and writes (`--config`/`PT_CONFIG_DIR`, then
@@ -25837,7 +25956,12 @@ fn build_process_explanation(
     });
 
     // Add Bayes factors if galaxy_brain mode or requested
-    if args.galaxy_brain || args.include.contains(&"bayes_factors".to_string()) {
+    if args.galaxy_brain
+        || args
+            .include
+            .iter()
+            .any(|field| field == "bayes_factors" || field == "ledger")
+    {
         let bf_entries: Vec<serde_json::Value> = ledger
             .bayes_factors
             .iter()
@@ -25854,6 +25978,9 @@ fn build_process_explanation(
             .collect();
         explanation["bayes_factors"] = serde_json::json!(bf_entries);
         explanation["top_evidence"] = serde_json::json!(ledger.top_evidence);
+    }
+    if args.galaxy_brain || args.include.iter().any(|field| field == "ledger") {
+        explanation["evidence_ledger"] = serde_json::json!(ledger);
     }
 
     // Add input evidence if requested
