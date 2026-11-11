@@ -1122,7 +1122,7 @@ The `memory_pressure` section of `daemon.json` configures the thresholds, `trans
 
 ## Host Hygiene Audit (`pt doctor`)
 
-Many incidents come from host configuration, not from any one process. `pt doctor` (Linux) reads the machine's settings and reports findings as `ok` / `info` / `warn` / `crit`, each with the observed values, a recommendation, the reason it matters, and the exact commands a person could run. It is **read-only**: nothing is written and no command is executed (`--fix-script` prints them as a commented shell script for review).
+Many incidents come from host configuration, not from any one process. `pt doctor` (Linux) reads the machine's settings and reports findings as `ok` / `info` / `warn` / `crit`, each with the observed values, a recommendation, the reason it matters, and the exact commands a person could run. It is **read-only**: it does not execute the suggested remedies (`--fix-script` prints them as a commented shell script for review).
 
 | Check | Flags |
 |-------|-------|
@@ -1135,7 +1135,8 @@ Many incidents come from host configuration, not from any one process. `pt docto
 | journald | volatile storage or retention under a day (OOM post-mortems lost) |
 | File handles / inotify | system file table above 75% (with the largest descriptor holders); `max_user_watches` below 524288 |
 | Process table | zombies grouped by parent (a parent with 5+ unreaped children), D-state count |
-| Deleted but open files | disk space held by files deleted while a process still has them open (1 GiB or more), with the holder |
+| Filesystem capacity | available space at or below 10% (warning) or 5% (critical), measured per supported local filesystem; reserved blocks are not counted as available |
+| Deleted but open files | allocated blocks held by unlinked regular files, with all observed descriptor or mapping holders and ownership coverage; sparse apparent size does not inflate the estimate |
 | pt itself | PSI unavailable (regimes fall back to load and memory); session store past 1000 sessions or 1 GiB, or growing with retention switched off |
 
 Exit code: 0 when nothing needs attention, 1 when there is a warning or critical finding (the severity is in `worst`). Not yet covered: multiplexer hygiene, a policy section for thresholds, macOS.

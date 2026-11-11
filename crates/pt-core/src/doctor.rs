@@ -8,9 +8,11 @@
 //! the incidents behind it (each finding states its rationale).
 //!
 //! Everything is read from files under a root directory (`/` on a live system), so every
-//! check is testable against recorded files. Nothing is written and nothing is run:
-//! suggested commands are printed for a person to review ([`fix_script`]).
+//! check is testable against recorded files. Live filesystem checks also inspect
+//! kernel capacity and a read-only process census. Suggested remedies are never
+//! run: commands are printed for a person to review ([`fix_script`]).
 
+use crate::collect::disk::DiskResourceSnapshot;
 use crate::collect::pressure::{
     parse_file_nr, parse_meminfo, read_pressure_snapshot_from, FileHandles, MemInfo,
 };
@@ -144,7 +146,10 @@ pub struct DeletedOpenFile {
 /// Deleted regular files among the open descriptors in `fd_dir`, as `(path, bytes,
 /// (dev, inode))`. memfd and /dev (tmpfs/shm) objects hold memory, not disk, and are
 /// skipped.
-fn deleted_open_files(fd_dir: &[std::fs::DirEntry]) -> Vec<(String, u64, u64, (u64, u64))> {
+fn deleted_open_files(
+    fd_dir: &[std::fs::DirEntry],
+    #[cfg(target_os = "linux")] filesystems: Option<&crate::collect::procfs::FilesystemGuard>,
+) -> Vec<(String, u64, u64, (u64, u64))> {
     let mut out = Vec::new();
     for fd in fd_dir {
         let Ok(target) = std::fs::read_link(fd.path()) else {
@@ -157,7 +162,30 @@ fn deleted_open_files(fd_dir: &[std::fs::DirEntry]) -> Vec<(String, u64, u64, (u
         if !path.starts_with('/') || path.starts_with("/memfd:") || path.starts_with("/dev/") {
             continue;
         }
-        // Follows the link to the open file itself (it has no name any more).
+        // Inspect the held inode only after its kernel mount identity is known
+        // to be local. A direct stat can itself wait on a stalled FUSE server.
+        #[cfg(target_os = "linux")]
+        let meta = {
+            use std::os::unix::fs::OpenOptionsExt;
+            let Some(filesystems) = filesystems else {
+                continue;
+            };
+            let Ok(file) = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+                .open(fd.path())
+            else {
+                continue;
+            };
+            if !filesystems.permits(&file) {
+                continue;
+            }
+            let Ok(metadata) = file.metadata() else {
+                continue;
+            };
+            metadata
+        };
+        #[cfg(not(target_os = "linux"))]
         let Ok(meta) = std::fs::metadata(fd.path()) else {
             continue;
         };
@@ -201,6 +229,12 @@ pub struct HostFacts {
     pub inotify_max_user_watches: Option<u64>,
     pub inotify_max_user_instances: Option<u64>,
     pub procs: ProcTable,
+    /// Live filesystem capacity and deleted-file holder evidence. Capacity
+    /// remains independently useful when complete ownership is unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk: Option<DiskResourceSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_error: Option<String>,
     /// pt's own session store (filled by [`run_doctor`]; fixtures pass it explicitly).
     pub pt_sessions: Option<SessionUsage>,
     /// Whether Pressure Stall Information (/proc/pressure) could be read.
@@ -479,6 +513,8 @@ fn read_proc_table(root: &Path, clk_tck: u64) -> ProcTable {
     let mut fd_counts: Vec<FdHolder> = Vec::new();
     let mut deleted: Vec<DeletedOpenFile> = Vec::new();
     let mut seen_deleted: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+    #[cfg(target_os = "linux")]
+    let filesystems = crate::collect::procfs::FilesystemGuard::load().ok();
     let Ok(entries) = std::fs::read_dir(root.join("proc")) else {
         return table;
     };
@@ -520,7 +556,11 @@ fn read_proc_table(root: &Path, clk_tck: u64) -> ProcTable {
         }
         if let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) {
             let fds: Vec<std::fs::DirEntry> = fds.flatten().collect();
-            for (path, bytes, logical_bytes, key) in deleted_open_files(&fds) {
+            #[cfg(target_os = "linux")]
+            let held_files = deleted_open_files(&fds, filesystems.as_ref());
+            #[cfg(not(target_os = "linux"))]
+            let held_files = deleted_open_files(&fds);
+            for (path, bytes, logical_bytes, key) in held_files {
                 if seen_deleted.insert(key) {
                     deleted.push(DeletedOpenFile {
                         pid,
@@ -590,6 +630,8 @@ pub fn read_host_facts_from(root: &Path, clk_tck: u64) -> HostFacts {
         inotify_max_user_watches: read_u64(root, "proc/sys/fs/inotify/max_user_watches"),
         inotify_max_user_instances: read_u64(root, "proc/sys/fs/inotify/max_user_instances"),
         procs: read_proc_table(root, clk_tck),
+        disk: None,
+        disk_error: None,
         pt_sessions: None,
         psi_available: false,
     }
@@ -1155,6 +1197,98 @@ fn check_deleted_open(f: &HostFacts, out: &mut Vec<Finding>) {
     );
 }
 
+fn check_disk_space(f: &HostFacts, out: &mut Vec<Finding>) {
+    if let Some(error) = &f.disk_error {
+        out.push(
+            finding(
+                "disk.observation_unavailable",
+                Level::Info,
+                "The process census for deleted-file ownership could not be collected",
+            )
+            .observed(json!({"error": error}))
+            .rationale("An unavailable process observation cannot establish zero allocation or exclusive ownership. Independently valid filesystem capacity readings remain available."),
+        );
+    }
+    let Some(snapshot) = &f.disk else {
+        return;
+    };
+    for mount in &snapshot.mounts {
+        if mount.validate_capacity().is_err() {
+            continue;
+        }
+        let Some((total, available)) = mount.total_bytes.zip(mount.available_bytes) else {
+            continue;
+        };
+        let available_percent = 100.0 * available as f64 / total as f64;
+        let allocated = mount.deleted_allocated_bytes.unwrap_or(0);
+        let level = if u128::from(available) * 100 <= u128::from(total) * 5 {
+            Level::Crit
+        } else if u128::from(available) * 100 <= u128::from(total) * 10 {
+            Level::Warn
+        } else if allocated > 0 {
+            Level::Info
+        } else {
+            continue;
+        };
+        let key = mount.identity.key();
+        let mut files: Vec<_> = snapshot
+            .files
+            .iter()
+            .filter(|file| file.mount_keys.contains(&key))
+            .collect();
+        files.sort_by(|left, right| {
+            right
+                .allocated_bytes
+                .unwrap_or(0)
+                .cmp(&left.allocated_bytes.unwrap_or(0))
+                .then(left.id.cmp(&right.id))
+        });
+        let observed_files = files.len();
+        files.truncate(10);
+        let allocation_detail = mount
+            .deleted_allocated_bytes
+            .map(|bytes| format!("; {} allocated to observed deleted files", gib(bytes)))
+            .unwrap_or_else(|| "; deleted-file allocation is unavailable".into());
+        out.push(
+            finding(
+                "disk.filesystem_space",
+                level,
+                format!(
+                    "{}: {available_percent:.1}% available ({} of {}){allocation_detail}",
+                    mount.mount_point.escape_debug(),
+                    gib(available),
+                    gib(total),
+                ),
+            )
+            .observed(json!({
+                "mount": mount,
+                "available_percent": available_percent,
+                "ownership_complete": mount.ownership_complete,
+                "largest_deleted_files": files,
+                "omitted_deleted_files": observed_files.saturating_sub(10),
+                "allocation_scope": "observed_deleted_inodes_not_guaranteed_recovery",
+            }))
+            .recommended("Inspect the holders and other writers on this filesystem before choosing a process action")
+            .rationale("Capacity uses filesystem blocks available to the current user. Deleted files retain allocation until every descriptor and mapping is released. Shared holders and incomplete observations do not establish exclusive recovery; other filesystem activity can change the actual space available."),
+        );
+    }
+    if !snapshot.complete || !snapshot.diagnostics.is_empty() || snapshot.omitted_diagnostics > 0 {
+        out.push(
+            finding(
+                "disk.ownership_incomplete",
+                Level::Info,
+                "Some disk ownership observations are unavailable; complete recovery forecasts may be unavailable",
+            )
+            .observed(json!({
+                "complete": snapshot.complete,
+                "diagnostics": snapshot.diagnostics,
+                "omitted_diagnostics": snapshot.omitted_diagnostics,
+            }))
+            .rationale("Permission failures, process changes, inspection limits, or unsupported filesystems remain unknown. Independently valid capacity readings still identify full filesystems."),
+        );
+    }
+}
+
 fn pressure_findings(a: &PressureAssessment, out: &mut Vec<Finding>) {
     for r in &a.regimes {
         // The swap check reports the paradox itself, with its safety condition and
@@ -1195,6 +1329,7 @@ pub fn audit(facts: &HostFacts, pressure: &PressureAssessment) -> Vec<Finding> {
     check_files(facts, &mut out);
     check_procs(facts, &mut out);
     check_deleted_open(facts, &mut out);
+    check_disk_space(facts, &mut out);
     check_pt(facts, &mut out);
     out
 }
@@ -1212,6 +1347,26 @@ pub fn run_doctor_with(
     sessions: Option<SessionUsage>,
 ) -> DoctorReport {
     let mut facts = read_host_facts_from(root, clk_tck);
+    // Fixtures supply typed disk observations to audit() directly. Never use
+    // the evaluator's live filesystems while inspecting an alternate root.
+    #[cfg(target_os = "linux")]
+    if root == Path::new("/") {
+        match crate::collect::quick_scan(&crate::collect::QuickScanOptions::default()) {
+            Ok(scan) => {
+                let mut disk = crate::collect::disk::collect_disk_resources(&scan.processes);
+                if !scan.metadata.warnings.is_empty() {
+                    disk.mark_census_incomplete();
+                }
+                facts.disk = Some(disk);
+            }
+            Err(error) => {
+                let mut disk = crate::collect::disk::collect_disk_resources(&[]);
+                disk.mark_census_incomplete();
+                facts.disk = Some(disk);
+                facts.disk_error = Some(error.to_string());
+            }
+        }
+    }
     let snapshot = read_pressure_snapshot_from(root, cpus);
     facts.psi_available =
         snapshot.cpu.is_some() || snapshot.memory.is_some() || snapshot.io.is_some();
@@ -1386,8 +1541,183 @@ mod tests {
             .collect();
         assert!(loud.is_empty(), "{loud:#?}");
         assert!(r.worst <= Level::Info);
+        assert!(
+            r.facts.disk.is_none(),
+            "fixture roots must not inspect live mounts"
+        );
+        assert!(r.facts.disk_error.is_none());
         // oomd off is reported, not alarmed about.
         assert_eq!(find(&r, "oomd.running").unwrap().level, Level::Info);
+    }
+
+    fn disk_mount(id: u64, available: u64) -> crate::collect::disk::DiskMountObservation {
+        use crate::collect::disk::{DiskMountIdentity, DiskMountObservation};
+        DiskMountObservation {
+            identity: DiskMountIdentity {
+                boot_id: "11111111-1111-4111-8111-111111111111".into(),
+                mount_namespace_device: 1,
+                mount_namespace_inode: 2,
+                mount_id: id,
+                device_major: 8,
+                device_minor: id as u32,
+                filesystem_type: "ext4".into(),
+                mount_root_sha256: "1".repeat(64),
+                mount_source_sha256: "2".repeat(64),
+                mount_options_sha256: "3".repeat(64),
+            },
+            mount_point: format!("/disk-{id}"),
+            total_bytes: Some(1000),
+            free_bytes: Some(available),
+            available_bytes: Some(available),
+            deleted_allocated_bytes: Some(0),
+            known_holder_count: Some(0),
+            ownership_complete: true,
+            ..DiskMountObservation::default()
+        }
+    }
+
+    #[test]
+    fn disk_capacity_thresholds_use_available_space_and_keep_mounts_separate() {
+        let mut report = healthy().report();
+        report.facts.disk = Some(DiskResourceSnapshot {
+            mounts: vec![
+                disk_mount(1, 50),
+                disk_mount(2, 51),
+                disk_mount(3, 100),
+                disk_mount(4, 101),
+            ],
+            complete: true,
+            ..DiskResourceSnapshot::default()
+        });
+        // Reserved blocks do not make space available to the observing user.
+        report.facts.disk.as_mut().unwrap().mounts[0].free_bytes = Some(900);
+        let findings = audit(&report.facts, &report.pressure);
+        let disk: Vec<_> = findings
+            .iter()
+            .filter(|finding| finding.id == "disk.filesystem_space")
+            .collect();
+        assert_eq!(disk.len(), 3);
+        for (finding, id, level) in [
+            (disk[0], 1, Level::Crit),
+            (disk[1], 2, Level::Warn),
+            (disk[2], 3, Level::Warn),
+        ] {
+            assert_eq!(finding.level, level);
+            assert_eq!(finding.observed["mount"]["identity"]["mount_id"], id);
+            assert!(finding.commands.is_empty());
+        }
+    }
+
+    #[test]
+    fn disk_findings_preserve_shared_holders_and_observation_scope() {
+        use crate::collect::disk::DeletedFileObservation;
+        use pt_common::{ProcessIdentity, StartId};
+        let mut mount = disk_mount(1, 50);
+        mount.deleted_allocated_bytes = Some(80);
+        mount.known_holder_count = Some(2);
+        let shared = DeletedFileObservation {
+            id: "shared-inode".into(),
+            allocated_bytes: Some(80),
+            logical_bytes: Some(10_000),
+            unlinked: Some(true),
+            holders: [500, 501]
+                .into_iter()
+                .map(|pid| {
+                    ProcessIdentity::new(
+                        pid,
+                        StartId::from_linux(&mount.identity.boot_id, 1000, pid),
+                        1000,
+                    )
+                })
+                .collect(),
+            mount_keys: vec![mount.identity.key()],
+            allocation_stable: true,
+            holders_complete: true,
+            ..DeletedFileObservation::default()
+        };
+        let other = disk_mount(2, 20);
+        let unrelated = DeletedFileObservation {
+            id: "another-mount-inode".into(),
+            allocated_bytes: Some(100),
+            mount_keys: vec![other.identity.key()],
+            ..DeletedFileObservation::default()
+        };
+        let facts = HostFacts {
+            disk: Some(DiskResourceSnapshot {
+                mounts: vec![mount, other],
+                files: vec![shared, unrelated],
+                complete: true,
+                ..DiskResourceSnapshot::default()
+            }),
+            ..HostFacts::default()
+        };
+        let mut findings = Vec::new();
+        check_disk_space(&facts, &mut findings);
+        assert_eq!(findings.len(), 2);
+        let finding = &findings[0];
+        assert_eq!(finding.observed["mount"]["deleted_allocated_bytes"], 80);
+        assert_eq!(
+            finding.observed["largest_deleted_files"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            finding.observed["largest_deleted_files"][0]["id"],
+            "shared-inode"
+        );
+        assert_eq!(
+            finding.observed["largest_deleted_files"][0]["holders"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            finding.observed["allocation_scope"],
+            "observed_deleted_inodes_not_guaranteed_recovery"
+        );
+        assert!(finding.rationale.contains("every descriptor and mapping"));
+        assert!(finding.commands.is_empty());
+    }
+
+    #[test]
+    fn disk_capacity_remains_useful_when_ownership_or_other_mounts_are_unknown() {
+        let mut invalid = disk_mount(2, 0);
+        invalid.available_bytes = None;
+        invalid.error = Some("disk_capacity_unavailable".into());
+        let mut snapshot = DiskResourceSnapshot {
+            mounts: vec![disk_mount(1, 50), invalid],
+            complete: true,
+            ..DiskResourceSnapshot::default()
+        };
+        snapshot.mark_census_incomplete();
+        let facts = HostFacts {
+            disk: Some(snapshot),
+            disk_error: Some("process census unavailable".into()),
+            ..HostFacts::default()
+        };
+        let mut findings = Vec::new();
+        check_disk_space(&facts, &mut findings);
+        let disk: Vec<_> = findings
+            .iter()
+            .filter(|finding| finding.id == "disk.filesystem_space")
+            .collect();
+        assert_eq!(
+            disk.len(),
+            1,
+            "unknown capacity is not observed zero available space"
+        );
+        assert_eq!(disk[0].level, Level::Crit);
+        assert_eq!(disk[0].observed["ownership_complete"], false);
+        assert!(findings
+            .iter()
+            .any(|finding| finding.id == "disk.ownership_incomplete"));
+        assert!(findings
+            .iter()
+            .any(|finding| finding.id == "disk.observation_unavailable"));
+        assert!(findings.iter().all(|finding| finding.commands.is_empty()));
     }
 
     #[test]

@@ -268,11 +268,11 @@ pub fn collect_duplicate_work(processes: &[ProcessRecord]) -> DuplicateWorkSnaps
 mod linux {
     use super::*;
     use crate::collect::proc_parsers::parse_proc_stat_content;
+    use crate::collect::procfs::{directory_path, open_directory, read_bounded, FilesystemGuard};
     use crate::collect::ProcessState;
     use pt_common::StartId;
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs::{self, File, OpenOptions};
-    use std::io::Read;
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::path::{Path, PathBuf};
@@ -489,96 +489,11 @@ mod linux {
         }
     }
 
-    fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, &'static str> {
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)
-            .map_err(|_| "process_field_unavailable")?;
-        let mut bytes = Vec::new();
-        file.take(limit as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| "process_field_unavailable")?;
-        if bytes.len() > limit {
-            return Err("process_field_size_limit");
-        }
-        Ok(bytes)
-    }
-
-    fn open_directory(path: &Path) -> Result<File, &'static str> {
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
-            .open(path)
-            .map_err(|_| "directory_identity_unavailable")
-    }
-
-    fn directory_path(file: &File, suffix: &str) -> PathBuf {
-        PathBuf::from(format!("/proc/self/fd/{}/{}", file.as_raw_fd(), suffix))
-    }
-
     fn directory_id(directory: &File) -> Result<ObjectId, &'static str> {
         directory
             .metadata()
             .map(|meta| ObjectId::of(&meta))
             .map_err(|_| "directory_identity_unavailable")
-    }
-
-    /// Classify held paths through kernel procfs tables. Even fstatfs can invoke
-    /// a stalled FUSE/network server, so it must not be used as the safety probe.
-    struct FilesystemGuard {
-        mounts: BTreeMap<u64, bool>,
-    }
-
-    impl FilesystemGuard {
-        fn load() -> Result<Self, &'static str> {
-            let bytes = read_bounded(Path::new("/proc/self/mountinfo"), MAX_LOCK_BYTES)?;
-            Self::parse(&bytes)
-        }
-
-        fn parse(bytes: &[u8]) -> Result<Self, &'static str> {
-            if bytes.last() != Some(&b'\n') {
-                return Err("filesystem_mount_table_incomplete");
-            }
-            let text = std::str::from_utf8(bytes).map_err(|_| "filesystem_mount_table_invalid")?;
-            let mut mounts = BTreeMap::new();
-            for line in text.lines() {
-                let (before, after) = line
-                    .split_once(" - ")
-                    .ok_or("filesystem_mount_table_invalid")?;
-                let before: Vec<_> = before.split_whitespace().collect();
-                let after: Vec<_> = after.split_whitespace().collect();
-                if before.len() < 6 || after.len() < 3 {
-                    return Err("filesystem_mount_table_invalid");
-                }
-                let mount_id = before[0]
-                    .parse::<u64>()
-                    .map_err(|_| "filesystem_mount_table_invalid")?;
-                let safe = matches!(
-                    after[0],
-                    "ext2" | "ext3" | "ext4" | "xfs" | "btrfs" | "tmpfs" | "overlay" | "zfs"
-                );
-                if mounts.insert(mount_id, safe).is_some() {
-                    return Err("filesystem_mount_table_ambiguous");
-                }
-            }
-            Ok(Self { mounts })
-        }
-
-        fn permits(&self, file: &File) -> bool {
-            let path = PathBuf::from(format!("/proc/self/fdinfo/{}", file.as_raw_fd()));
-            let Ok(bytes) = read_bounded(&path, MAX_FIELD_BYTES) else {
-                return false;
-            };
-            let Ok(text) = std::str::from_utf8(&bytes) else {
-                return false;
-            };
-            let mut ids = text.lines().filter_map(|line| line.strip_prefix("mnt_id:"));
-            let Some(id) = ids.next().and_then(|id| id.trim().parse::<u64>().ok()) else {
-                return false;
-            };
-            ids.next().is_none() && self.mounts.get(&id) == Some(&true)
-        }
     }
 
     fn workspace_id(
@@ -823,40 +738,16 @@ mod linux {
             return None;
         }
         let target = Path::new(std::ffi::OsStr::from_bytes(target));
-        let mut directory = if target.is_absolute() {
+        if target.is_absolute() {
             // Absolute names are only interpretable in the collector's mount namespace.
             let own = ObjectId::of(&fs::metadata("/proc/self/ns/mnt").ok()?);
             if &own != namespace {
                 return None;
             }
-            open_directory(Path::new("/")).ok()?
-        } else {
-            cwd.try_clone().ok()?
-        };
-        if !filesystems.permits(&directory) {
-            return None;
         }
-        // Resolve one final component at a time, rejecting symlinks and unsafe
-        // mounts before any following lookup. A direct open of an arbitrary
-        // target path could traverse a stalled FUSE mount or automount.
-        for (count, component) in target.components().enumerate() {
-            if count >= MAX_WORKSPACE_DEPTH || Instant::now() >= deadline {
-                return None;
-            }
-            match component {
-                std::path::Component::RootDir | std::path::Component::CurDir => continue,
-                std::path::Component::Prefix(_) => return None,
-                _ => {}
-            }
-            directory = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(directory_path(&directory, "").join(component.as_os_str()))
-                .ok()?;
-            if !filesystems.permits(&directory) {
-                return None;
-            }
-        }
+        let directory = filesystems
+            .resolve_directory(cwd, target, MAX_WORKSPACE_DEPTH, deadline)
+            .ok()?;
         Some(digest([
             namespace.digest(),
             directory_id(&directory).ok()?.digest(),

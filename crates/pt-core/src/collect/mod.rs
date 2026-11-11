@@ -28,6 +28,7 @@ pub mod container;
 pub mod cpu_capacity;
 #[cfg(target_os = "linux")]
 mod deep_scan;
+pub mod disk;
 pub mod duplicates;
 #[cfg(target_os = "linux")]
 pub mod gpu;
@@ -42,6 +43,8 @@ pub mod pressure;
 #[cfg(target_os = "linux")]
 pub mod prober;
 pub mod proc_parsers;
+#[cfg(target_os = "linux")]
+pub(crate) mod procfs;
 pub mod protected;
 pub mod provenance_continuity;
 mod quick_scan;
