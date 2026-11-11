@@ -27874,7 +27874,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             ) {
                 Ok(journal) => Arc::new(journal),
                 Err(error) => {
-                    eprintln!("agent apply: cannot bind durable cgroup undo journal: {error}");
+                    eprintln!("agent apply: cannot bind durable action undo journal: {error}");
                     return ExitCode::PolicyBlocked;
                 }
             };
@@ -29030,8 +29030,13 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
 
             if !matches!(
                 action.action,
-                Action::Freeze | Action::Unfreeze | Action::Throttle | Action::Quarantine
-            ) {
+                Action::Renice
+                    | Action::Freeze
+                    | Action::Unfreeze
+                    | Action::Throttle
+                    | Action::Quarantine
+            ) || (action.action == Action::Renice && !cfg!(target_os = "linux"))
+            {
                 return observe_live_postcondition(action);
             }
             let restoration = match &reversal_journal {
@@ -30012,12 +30017,12 @@ fn run_agent_undo(global: &GlobalOpts, args: &AgentUndoArgs) -> ExitCode {
     output["records"] = serde_json::json!(&records);
     if !matches!(
         action.action,
-        Action::Freeze | Action::Unfreeze | Action::Throttle | Action::Quarantine
+        Action::Renice | Action::Freeze | Action::Unfreeze | Action::Throttle | Action::Quarantine
     ) {
         return refuse(
             output,
             "unsupported_action",
-            "durable undo currently supports Linux cgroup-v2 freeze, unfreeze, CPU throttle and cpuset quarantine"
+            "durable undo currently supports Linux per-thread renice and cgroup-v2 freeze, unfreeze, CPU throttle and cpuset quarantine"
                 .to_string(),
             ExitCode::PolicyBlocked,
         );
@@ -30026,7 +30031,7 @@ fn run_agent_undo(global: &GlobalOpts, args: &AgentUndoArgs) -> ExitCode {
         return refuse(
             output,
             "reversal_state_unavailable",
-            "no durable receipt was captured for this action; legacy execution history cannot reconstruct its original controller state".to_string(),
+            "no durable receipt was captured for this action; legacy execution history cannot reconstruct its original state".to_string(),
             ExitCode::PolicyBlocked,
         );
     }
@@ -30053,7 +30058,7 @@ fn run_agent_undo(global: &GlobalOpts, args: &AgentUndoArgs) -> ExitCode {
         return refuse(
             output,
             "unsupported_reversal_receipt",
-            "the selected receipt records an unsupported controller; inspect its operation reason"
+            "the selected receipt records an unsupported operation; inspect its operation reason"
                 .to_string(),
             ExitCode::PolicyBlocked,
         );
@@ -30062,7 +30067,7 @@ fn run_agent_undo(global: &GlobalOpts, args: &AgentUndoArgs) -> ExitCode {
         output["status"] = serde_json::json!("preview");
         output["live_eligibility_checked"] = serde_json::json!(false);
         output["note"] = serde_json::json!(
-            "receipt inspection only; --confirm revalidates process identity, ownership, cgroup scope and controller values before restoration. Select --attempt-id when multiple attempts exist."
+            "receipt inspection only; --confirm revalidates process identity, ownership and the recorded thread priorities or cgroup control before restoration. Select --attempt-id when multiple attempts exist."
         );
         emit(output);
         return ExitCode::Clean;

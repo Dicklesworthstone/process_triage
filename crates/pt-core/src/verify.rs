@@ -7,7 +7,7 @@ pub mod relief;
 pub mod relief_store;
 pub mod resource_prediction;
 
-use crate::action::reversal::{RestorationObservation, ReversalValue};
+use crate::action::reversal::{RestorationObservation, RestorationValue};
 use crate::collect::{ProcessRecord, ProcessState};
 use crate::decision::Action;
 use crate::plan::{Plan, PlanAction};
@@ -431,9 +431,12 @@ fn observe_cgroup_files(
                 .map_err(|error| error.to_string())?;
             let expected = action == Action::Freeze;
             let detail = format!(
-            "Observed cgroup {}: freeze requested={}, effectively frozen={}; expected both {}. This verifies freezer state, not resource relief",
-            directory.display(), state.requested, state.frozen, expected,
-        );
+                "Observed cgroup {}: freeze requested={}, effectively frozen={}; expected both {}. This verifies freezer state, not resource relief",
+                directory.display(),
+                state.requested,
+                state.frozen,
+                expected,
+            );
             Ok(if state.requested == expected && state.frozen == expected {
                 ActionPostcondition::Satisfied { detail }
             } else {
@@ -526,8 +529,13 @@ fn throttle_postcondition(content: &str) -> Result<ActionPostcondition, String> 
         .map_err(|error| error.to_string())?;
     let detail = format!(
         "Observed CPU quota {} per {period} us; expected no more bandwidth than {} per {} us from the default runner. This verifies the configured limit, not measured CPU relief",
-        if quota == -1 { "unlimited".to_string() } else { quota.to_string() },
-        expected.quota_us(), expected.period_us,
+        if quota == -1 {
+            "unlimited".to_string()
+        } else {
+            quota.to_string()
+        },
+        expected.quota_us(),
+        expected.period_us,
     );
     Ok(if matches {
         ActionPostcondition::Satisfied { detail }
@@ -570,7 +578,8 @@ fn quarantine_postcondition(
     let matches = requested == effective && effective.first(limit) == effective;
     let detail = format!(
         "Observed configured CPUs {}, effective CPUs {}; expected the same nonempty set of at most {limit} CPU(s) from the default runner. This verifies CPU confinement, not resource relief",
-        requested.as_list(), effective.as_list(),
+        requested.as_list(),
+        effective.as_list(),
     );
     Ok(if matches {
         ActionPostcondition::Satisfied { detail }
@@ -1192,7 +1201,10 @@ pub fn verify_plan_with_postconditions(
                         ActionPostcondition::Restored { .. } => (
                             VerifyOutcome::RestorationUnverified,
                             "restoration_unverified",
-                            Some("Cgroup restoration evidence cannot verify a supervisor restart".to_string()),
+                            Some(
+                                "Cgroup restoration evidence cannot verify a supervisor restart"
+                                    .to_string(),
+                            ),
                         ),
                         ActionPostcondition::RestorationUnverified { reason } => (
                             VerifyOutcome::RestorationUnverified,
@@ -1202,12 +1214,17 @@ pub fn verify_plan_with_postconditions(
                     }
                 }
                 (
-                    Action::Kill | Action::Pause | Action::Resume | Action::Renice
-                    | Action::Freeze | Action::Unfreeze | Action::Throttle | Action::Quarantine,
+                    Action::Kill
+                    | Action::Pause
+                    | Action::Resume
+                    | Action::Renice
+                    | Action::Freeze
+                    | Action::Unfreeze
+                    | Action::Throttle
+                    | Action::Quarantine,
                     Some(process),
-                )
-                    if process.start_id != action.target.start_id
-                        || process.uid != action.target.uid =>
+                ) if process.start_id != action.target.start_id
+                    || process.uid != action.target.uid =>
                 {
                     (VerifyOutcome::PidReused, "pid_reused", None)
                 }
@@ -1242,14 +1259,16 @@ pub fn verify_plan_with_postconditions(
                     Some("The executed target is still stopped".to_string()),
                 ),
                 (
-                    Action::Renice | Action::Freeze | Action::Unfreeze
-                    | Action::Throttle | Action::Quarantine,
+                    Action::Renice
+                    | Action::Freeze
+                    | Action::Unfreeze
+                    | Action::Throttle
+                    | Action::Quarantine,
                     Some(process),
-                )
-                    if !matches!(
-                        process.state,
-                        ProcessState::Zombie | ProcessState::Dead | ProcessState::Unknown
-                    ) =>
+                ) if !matches!(
+                    process.state,
+                    ProcessState::Zombie | ProcessState::Dead | ProcessState::Unknown
+                ) =>
                 {
                     match observe(action) {
                         ActionPostcondition::Satisfied { detail } => (
@@ -1284,28 +1303,46 @@ pub fn verify_plan_with_postconditions(
                         ActionPostcondition::IdentityChanged => (
                             VerifyOutcome::PidReused,
                             "identity_changed",
-                            Some("The process identity changed during postcondition observation".to_string()),
+                            Some(
+                                "The process identity changed during postcondition observation"
+                                    .to_string(),
+                            ),
                         ),
                         ActionPostcondition::Restored { observation }
                             if observation.action_id == action.action_id
                                 && matches!(
                                     (action.action, &observation.original_value),
-                                    (Action::Freeze | Action::Unfreeze, ReversalValue::Freeze { .. })
-                                        | (Action::Throttle, ReversalValue::CpuMax { .. })
-                                        | (Action::Quarantine, ReversalValue::Cpuset { .. })
+                                    (
+                                        Action::Freeze | Action::Unfreeze,
+                                        RestorationValue::Freeze { .. }
+                                    ) | (Action::Throttle, RestorationValue::CpuMax { .. })
+                                        | (Action::Quarantine, RestorationValue::Cpuset { .. })
+                                        | (
+                                            Action::Renice,
+                                            RestorationValue::ThreadPriorities { .. }
+                                        )
                                 ) =>
                         {
                             let detail = format!(
-                                "The recorded original controller state was independently observed at {}; undo {} restored execution attempt {}. The original action history is retained; this is not evidence of resource relief",
-                                observation.observed_at, observation.restore_id, observation.attempt_id,
+                                "The recorded original state was independently observed at {}; undo {} restored execution attempt {}. The original action history is retained; this is not evidence of resource relief",
+                                observation.observed_at,
+                                observation.restore_id,
+                                observation.attempt_id,
                             );
                             restoration = Some(observation);
-                            (VerifyOutcome::ConfirmedRestored, "restoration_verified", Some(detail))
+                            (
+                                VerifyOutcome::ConfirmedRestored,
+                                "restoration_verified",
+                                Some(detail),
+                            )
                         }
                         ActionPostcondition::Restored { .. } => (
                             VerifyOutcome::RestorationUnverified,
                             "restoration_unverified",
-                            Some("Restoration observation does not match this action and controller".to_string()),
+                            Some(
+                                "Restoration observation does not match this action and control"
+                                    .to_string(),
+                            ),
                         ),
                         ActionPostcondition::RestorationUnverified { reason } => (
                             VerifyOutcome::RestorationUnverified,
@@ -1420,7 +1457,11 @@ pub fn verify_plan_with_postconditions(
             respawn_detected: respawn,
             expected: Some(
                 if restoration.is_some() {
-                    "recorded_original_controller_state"
+                    if action.action == Action::Renice {
+                        "recorded_original_thread_priorities"
+                    } else {
+                        "recorded_original_controller_state"
+                    }
                 } else {
                     match action.action {
                         Action::Kill => "terminated",
@@ -2630,15 +2671,24 @@ mod tests {
             restore_id: "00000000-0000-4000-8000-000000000002".into(),
             action_id: action.action_id.clone(),
             original_value: match action.action {
-                Action::Throttle => ReversalValue::CpuMax {
+                Action::Throttle => RestorationValue::CpuMax {
                     quota_us: -1,
                     period_us: 100_000,
                 },
-                Action::Unfreeze => ReversalValue::Freeze { requested: true },
-                Action::Quarantine => ReversalValue::Cpuset {
+                Action::Unfreeze => RestorationValue::Freeze { requested: true },
+                Action::Quarantine => RestorationValue::Cpuset {
                     cpus: String::new(),
                 },
-                _ => ReversalValue::Freeze { requested: false },
+                Action::Renice => RestorationValue::ThreadPriorities {
+                    threads: vec![crate::action::renice::ReniceThreadReversal {
+                        tid: action.target.pid.0,
+                        start_ticks: 100,
+                        uid: action.target.uid,
+                        previous_nice: 0,
+                        applied_nice: 10,
+                    }],
+                },
+                _ => RestorationValue::Freeze { requested: false },
             },
             recorded_restored_at: "1970-01-01T00:00:20Z".into(),
             observed_at: "1970-01-01T00:00:30Z".into(),
@@ -2648,6 +2698,7 @@ mod tests {
     #[test]
     fn confirmed_restoration_preserves_action_history_and_earns_no_relief_credit() {
         for action_kind in [
+            Action::Renice,
             Action::Freeze,
             Action::Unfreeze,
             Action::Throttle,
@@ -2676,7 +2727,11 @@ mod tests {
             assert_eq!(outcome.action, format!("{action_kind:?}").to_lowercase());
             assert_eq!(
                 outcome.expected.as_deref(),
-                Some("recorded_original_controller_state")
+                Some(if action_kind == Action::Renice {
+                    "recorded_original_thread_priorities"
+                } else {
+                    "recorded_original_controller_state"
+                })
             );
             assert_eq!(outcome.actual.as_deref(), Some("restoration_verified"));
             assert_eq!(outcome.restoration.as_ref(), Some(&observation));
@@ -2740,14 +2795,14 @@ mod tests {
             let mut observation = restored_observation(&action);
             match case {
                 "action_id" => observation.action_id = "unrelated-action".into(),
-                "quarantine" => {
-                    observation.original_value = ReversalValue::Freeze { requested: false }
-                }
                 "control" => {
-                    observation.original_value = ReversalValue::CpuMax {
+                    observation.original_value = RestorationValue::CpuMax {
                         quota_us: -1,
                         period_us: 100_000,
                     }
+                }
+                "renice" | "quarantine" => {
+                    observation.original_value = RestorationValue::Freeze { requested: false };
                 }
                 _ => {}
             }
@@ -3005,8 +3060,10 @@ mod tests {
         }
         for members in ["456\n", "", "123\nbad\n", "123\n0\n"] {
             fs::write(leaf.join("cgroup.procs"), members).unwrap();
-            assert!(observe(Action::Quarantine).is_err(),
-                "matching controller values in a wrong or unreadable group cannot verify the target: {members:?}");
+            assert!(
+                observe(Action::Quarantine).is_err(),
+                "matching controller values in a wrong or unreadable group cannot verify the target: {members:?}"
+            );
         }
         fs::write(leaf.join("cgroup.procs"), "123\n").unwrap();
         assert!(

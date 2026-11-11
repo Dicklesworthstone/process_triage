@@ -7,9 +7,16 @@
 //! - Reversal metadata capture for undo operations
 
 use super::executor::{ActionError, ActionRunner};
+#[cfg(target_os = "linux")]
+use super::reversal::{PreparedReversal, ReversalJournal, ReversalStatus};
 use crate::decision::Action;
 use crate::plan::PlanAction;
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "linux")]
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 #[cfg(all(unix, not(target_os = "linux")))]
 use tracing::warn;
 use tracing::{debug, info};
@@ -42,7 +49,8 @@ impl Default for ReniceConfig {
 }
 
 /// Captured state for reversal of renice action.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReniceReversalMetadata {
     /// PID of the reniced process.
     pub pid: u32,
@@ -66,7 +74,8 @@ pub struct ReniceReversalMetadata {
 }
 
 /// Identity-bound prior state of one Linux thread, for exact restoration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReniceThreadReversal {
     pub tid: u32,
     pub start_ticks: u64,
@@ -95,15 +104,51 @@ pub struct ReniceResult {
 #[derive(Debug)]
 pub struct ReniceActionRunner {
     config: ReniceConfig,
+    #[cfg(target_os = "linux")]
+    reversal_journal: Option<Arc<ReversalJournal>>,
+    #[cfg(target_os = "linux")]
+    reversal_ownership_root: Option<PathBuf>,
+    #[cfg(target_os = "linux")]
+    applied: Mutex<Option<AppliedRenice>>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct AppliedRenice {
+    action_id: String,
+    metadata: ReniceReversalMetadata,
+    reversal: PreparedReversal,
 }
 
 impl ReniceActionRunner {
     pub fn new(config: ReniceConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            #[cfg(target_os = "linux")]
+            reversal_journal: None,
+            #[cfg(target_os = "linux")]
+            reversal_ownership_root: None,
+            #[cfg(target_os = "linux")]
+            applied: Mutex::new(None),
+        }
     }
 
     pub fn with_defaults() -> Self {
         Self::new(ReniceConfig::default())
+    }
+
+    /// Persist exact thread priorities before any journaled priority change.
+    #[cfg(target_os = "linux")]
+    pub fn with_reversal_journal(mut self, journal: Arc<ReversalJournal>) -> Self {
+        self.reversal_journal = Some(journal);
+        self
+    }
+
+    /// Unjournaled callers must not supersede a durable priority restoration.
+    #[cfg(target_os = "linux")]
+    pub fn with_reversal_ownership_guard(mut self, sessions_root: PathBuf) -> Self {
+        self.reversal_ownership_root = Some(sessions_root);
+        self
     }
 
     /// Get the nice value to use, clamped if configured.
@@ -231,6 +276,25 @@ impl ReniceActionRunner {
         linux_threads::restore(&linux_threads::LiveTasks(self), metadata)
     }
 
+    /// Durable receipts use stricter conditional restoration: a completed undo
+    /// cannot authorize a second write, and unrelated priority changes refuse.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn restore_recorded(
+        &self,
+        metadata: &ReniceReversalMetadata,
+        allow_write: bool,
+    ) -> Result<bool, ActionError> {
+        linux_threads::restore_conditional(&linux_threads::LiveTasks(self), metadata, allow_write)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn observe_restored(
+        &self,
+        metadata: &ReniceReversalMetadata,
+    ) -> Result<(), ActionError> {
+        linux_threads::observe_captured(&linux_threads::LiveTasks(self), metadata, false)
+    }
+
     /// Restore the process-level priority on other Unix platforms.
     #[cfg(all(unix, not(target_os = "linux")))]
     pub fn restore_from_metadata(
@@ -282,11 +346,33 @@ impl ReniceActionRunner {
     /// Linux nice values belong to threads, including threads other than the leader.
     #[cfg(target_os = "linux")]
     fn execute_renice(&self, action: &PlanAction) -> Result<(), ActionError> {
-        linux_threads::apply(
-            &linux_threads::LiveTasks(self),
-            &action.target,
-            self.effective_nice_value(),
-        )
+        let mut applied = self
+            .applied
+            .lock()
+            .map_err(|_| ActionError::Failed("renice execution record is unavailable".into()))?;
+        *applied = None;
+        let ops = linux_threads::LiveTasks(self);
+        let nice = self.effective_nice_value();
+        if let Some(journal) = &self.reversal_journal {
+            let metadata = linux_threads::capture_for_target(&ops, &action.target, nice)?;
+            let reversal = journal.prepare_renice(action, metadata.clone())?;
+            reversal.finish(
+                linux_threads::apply_captured(&ops, &metadata),
+                ReversalStatus::Applied,
+            )?;
+            *applied = Some(AppliedRenice {
+                action_id: action.action_id.clone(),
+                metadata,
+                reversal,
+            });
+            Ok(())
+        } else {
+            if let Some(root) = &self.reversal_ownership_root {
+                let metadata = linux_threads::capture_for_target(&ops, &action.target, nice)?;
+                super::reversal::ensure_renice_unowned(root, &metadata)?;
+            }
+            linux_threads::apply(&ops, &action.target, nice)
+        }
     }
 
     /// Execute a process-level priority change on other Unix platforms.
@@ -328,6 +414,29 @@ impl ReniceActionRunner {
 
     #[cfg(target_os = "linux")]
     fn verify_renice(&self, action: &PlanAction) -> Result<(), ActionError> {
+        if self.reversal_journal.is_some() {
+            let applied = self.applied.lock().map_err(|_| {
+                ActionError::Failed("renice execution record is unavailable".into())
+            })?;
+            let applied = applied.as_ref().ok_or_else(|| {
+                ActionError::Failed(
+                    "cannot verify journaled renice without its execution record".into(),
+                )
+            })?;
+            if applied.action_id != action.action_id
+                || applied.metadata.identity.as_ref() != Some(&action.target)
+            {
+                return Err(ActionError::IdentityMismatch);
+            }
+            return applied.reversal.finish(
+                linux_threads::observe_captured(
+                    &linux_threads::LiveTasks(self),
+                    &applied.metadata,
+                    true,
+                ),
+                ReversalStatus::Verified,
+            );
+        }
         linux_threads::verify(
             &linux_threads::LiveTasks(self),
             &action.target,
@@ -360,6 +469,13 @@ impl ReniceActionRunner {
             )),
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn validate_reversal_metadata(
+    metadata: &ReniceReversalMetadata,
+) -> Result<(), ActionError> {
+    linux_threads::validate_saved(metadata)
 }
 
 #[cfg(target_os = "linux")]
@@ -679,29 +795,36 @@ mod linux_threads {
             StartId::from_linux(boot_id.trim(), leader.start_ticks, pid),
             leader.uid,
         );
-        let before = snapshot(&ops, &target)?;
-        let after = snapshot(&ops, &target)?;
+        capture_for_target(&ops, &target, runner.effective_nice_value())
+    }
+
+    pub(super) fn capture_for_target(
+        ops: &impl TaskOps,
+        target: &ProcessIdentity,
+        nice: i32,
+    ) -> Result<ReniceReversalMetadata, ActionError> {
+        let before = snapshot(ops, target)?;
+        let after = snapshot(ops, target)?;
         if !before.complete || !after.complete || before.tasks != after.tasks {
             return Err(ActionError::Failed(
                 "thread state changed during renice reversal capture".into(),
             ));
         }
-        let nice = runner.effective_nice_value();
         if !(-20..=MAX_NICE_VALUE).contains(&nice) {
             return Err(ActionError::Failed("invalid priority value".into()));
         }
         let previous_nice = after
             .tasks
             .iter()
-            .find(|task| task.tid == pid)
+            .find(|task| task.tid == target.pid.0)
             .ok_or(ActionError::ProcessNotFound)?
             .nice;
         Ok(ReniceReversalMetadata {
-            pid,
+            pid: target.pid.0,
             previous_nice,
             applied_nice: previous_nice.max(nice),
             applied_at: chrono::Utc::now().to_rfc3339(),
-            identity: Some(target),
+            identity: Some(target.clone()),
             threads: after
                 .tasks
                 .into_iter()
@@ -716,10 +839,57 @@ mod linux_threads {
         })
     }
 
-    pub(super) fn restore(
+    /// A journaled operation only writes priorities whose original values are
+    /// already durable. New or changed threads require a fresh reviewed attempt;
+    /// they must never be silently changed without a recoverable prior value.
+    pub(super) fn apply_captured(
         ops: &impl TaskOps,
         metadata: &ReniceReversalMetadata,
     ) -> Result<(), ActionError> {
+        let target = validate_metadata(metadata)?;
+        observe_captured(ops, metadata, false)?;
+        let mut writes = Vec::new();
+        let result = (|| {
+            for saved in &metadata.threads {
+                ops.revalidate(target)?;
+                let Some(current) = ops.read(target.pid.0, saved.tid)? else {
+                    continue;
+                };
+                if current.start_ticks != saved.start_ticks || current.uid != saved.uid {
+                    return Err(ActionError::IdentityMismatch);
+                }
+                if current.nice != saved.previous_nice {
+                    return Err(ActionError::Failed(format!(
+                        "thread {} priority changed after undo capture; refusing to overwrite it",
+                        saved.tid
+                    )));
+                }
+                if saved.previous_nice == saved.applied_nice {
+                    continue;
+                }
+                ops.set(saved.tid, saved.applied_nice)?;
+                writes.push(saved.tid);
+                let after = ops
+                    .read(target.pid.0, saved.tid)?
+                    .ok_or(ActionError::ProcessNotFound)?;
+                if !current.same_task(&after) {
+                    return Err(ActionError::IdentityMismatch);
+                }
+                if after.nice != saved.applied_nice {
+                    return Err(ActionError::Failed(format!(
+                        "thread {} priority changed during journaled renice",
+                        saved.tid
+                    )));
+                }
+            }
+            observe_captured(ops, metadata, true)
+        })();
+        result.map_err(|error| partial_error("journaled renice", &writes, error))
+    }
+
+    fn validate_metadata(
+        metadata: &ReniceReversalMetadata,
+    ) -> Result<&ProcessIdentity, ActionError> {
         let target = metadata
             .identity
             .as_ref()
@@ -732,19 +902,113 @@ mod linux_threads {
                 "renice reversal lacks a bounded set of per-thread priorities".into(),
             ));
         }
-        let mut saved_by_tid = std::collections::BTreeMap::new();
+        let mut tids = std::collections::BTreeSet::new();
         for saved in &metadata.threads {
             if saved.tid == 0
                 || saved.tid > i32::MAX as u32
+                || saved.start_ticks == 0
                 || saved.uid != target.uid
                 || !(-20..=MAX_NICE_VALUE).contains(&saved.previous_nice)
                 || !(saved.previous_nice..=MAX_NICE_VALUE).contains(&saved.applied_nice)
-                || saved_by_tid.insert(saved.tid, saved).is_some()
+                || !tids.insert(saved.tid)
             {
                 return Err(ActionError::Failed(
                     "invalid or duplicate per-thread renice reversal state".into(),
                 ));
             }
+        }
+        let leader = metadata
+            .threads
+            .iter()
+            .find(|thread| thread.tid == metadata.pid)
+            .ok_or_else(|| {
+                ActionError::Failed("renice reversal lacks the process leader".into())
+            })?;
+        if leader.previous_nice != metadata.previous_nice
+            || leader.applied_nice != metadata.applied_nice
+            || target
+                .start_id
+                .0
+                .split(':')
+                .nth(1)
+                .and_then(|ticks| ticks.parse::<u64>().ok())
+                != Some(leader.start_ticks)
+        {
+            return Err(ActionError::Failed(
+                "renice leader identity or priority differs from its receipt".into(),
+            ));
+        }
+        Ok(target)
+    }
+
+    pub(super) fn validate_saved(metadata: &ReniceReversalMetadata) -> Result<(), ActionError> {
+        validate_metadata(metadata).map(|_| ())
+    }
+
+    /// Observe two stable censuses without writes. Exited threads need no action;
+    /// unknown/reused threads make the original process-wide state unverifiable.
+    pub(super) fn observe_captured(
+        ops: &impl TaskOps,
+        metadata: &ReniceReversalMetadata,
+        applied: bool,
+    ) -> Result<(), ActionError> {
+        let target = validate_metadata(metadata)?;
+        let before = snapshot(ops, target)?;
+        let after = snapshot(ops, target)?;
+        if !before.complete || !after.complete || before.tasks != after.tasks {
+            return Err(ActionError::Failed(
+                "thread state changed during recorded-priority observation".into(),
+            ));
+        }
+        let saved_by_tid: std::collections::BTreeMap<_, _> = metadata
+            .threads
+            .iter()
+            .map(|saved| (saved.tid, saved))
+            .collect();
+        for task in &after.tasks {
+            let saved = saved_by_tid.get(&task.tid).ok_or_else(|| {
+                ActionError::Failed(format!(
+                    "no prior priority recorded for thread {}",
+                    task.tid
+                ))
+            })?;
+            if saved.start_ticks != task.start_ticks || saved.uid != task.uid {
+                return Err(ActionError::IdentityMismatch);
+            }
+            let expected = if applied {
+                saved.applied_nice
+            } else {
+                saved.previous_nice
+            };
+            if task.nice != expected {
+                return Err(ActionError::Failed(format!(
+                    "thread {} priority differs from recorded {} value: expected {}, got {}",
+                    task.tid,
+                    if applied { "applied" } else { "original" },
+                    expected,
+                    task.nice
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn restore(
+        ops: &impl TaskOps,
+        metadata: &ReniceReversalMetadata,
+    ) -> Result<(), ActionError> {
+        restore_conditional(ops, metadata, true).map(|_| ())
+    }
+
+    pub(super) fn restore_conditional(
+        ops: &impl TaskOps,
+        metadata: &ReniceReversalMetadata,
+        allow_write: bool,
+    ) -> Result<bool, ActionError> {
+        let target = validate_metadata(metadata)?;
+        let mut saved_by_tid = std::collections::BTreeMap::new();
+        for saved in &metadata.threads {
+            saved_by_tid.insert(saved.tid, saved);
         }
         let mut writes = Vec::new();
         let result = (|| {
@@ -766,6 +1030,14 @@ mod linux_threads {
                 if saved.start_ticks != task.start_ticks || saved.uid != task.uid {
                     return Err(ActionError::IdentityMismatch);
                 }
+                if task.nice != saved.previous_nice
+                    && (task.nice != saved.applied_nice || !allow_write)
+                {
+                    return Err(ActionError::Failed(format!(
+                        "thread {} priority changed or its receipt was already restored; refusing to overwrite it",
+                        task.tid
+                    )));
+                }
             }
             for task in &before.tasks {
                 let saved = saved_by_tid
@@ -780,6 +1052,9 @@ mod linux_threads {
                 }
                 if current.nice == saved.previous_nice {
                     continue;
+                }
+                if !allow_write {
+                    return Err(ActionError::Failed("this receipt was already restored; it cannot authorize another priority write".into()));
                 }
                 if current.nice != saved.applied_nice {
                     return Err(ActionError::Failed(format!(
@@ -815,7 +1090,7 @@ mod linux_threads {
                     "all-thread priority restoration could not be verified".into(),
                 ));
             }
-            Ok(())
+            Ok(!writes.is_empty())
         })();
         result.map_err(|error| partial_error("renice restoration", &writes, error))
     }
@@ -1085,6 +1360,84 @@ mod linux_threads {
                 Err(ActionError::IdentityMismatch)
             ));
             assert!(ops.writes.borrow().is_empty());
+        }
+
+        #[test]
+        fn journaled_renice_only_changes_threads_with_durable_original_values() {
+            let ops = FakeTasks::new(&[(100, 0), (200, 5), (300, 19)]);
+            let saved = capture_for_target(&ops, &FakeTasks::target(), 10).unwrap();
+            apply_captured(&ops, &saved).unwrap();
+            observe_captured(&ops, &saved, true).unwrap();
+            assert_eq!(*ops.writes.borrow(), vec![(100, 10), (200, 10)]);
+
+            let ops = FakeTasks::new(&[(100, 0), (200, 5)]);
+            let saved = capture_for_target(&ops, &FakeTasks::target(), 10).unwrap();
+            ops.add_after_write.set(true);
+            let error = apply_captured(&ops, &saved).unwrap_err().to_string();
+            assert!(error.contains("no prior priority recorded for thread 400"));
+            assert!(error.contains("already succeeded"));
+            assert_eq!(ops.tasks.borrow()[&400].nice, 0);
+            assert!(!ops.writes.borrow().iter().any(|(tid, _)| *tid == 400));
+        }
+
+        #[test]
+        fn journaled_renice_refuses_priority_changes_after_capture_before_any_write() {
+            let ops = FakeTasks::new(&[(100, 0), (200, 5)]);
+            let saved = capture_for_target(&ops, &FakeTasks::target(), 10).unwrap();
+            ops.tasks.borrow_mut().get_mut(&200).unwrap().nice = 15;
+            let error = apply_captured(&ops, &saved).unwrap_err().to_string();
+            assert!(error.contains("recorded original"));
+            assert!(ops.writes.borrow().is_empty());
+            assert_eq!(ops.tasks.borrow()[&100].nice, 0);
+        }
+
+        #[test]
+        fn recorded_renice_restore_is_exact_idempotent_and_never_reauthorizes_a_write() {
+            let ops = FakeTasks::new(&[(100, 0), (200, 5), (300, 19)]);
+            let before = ops.tasks.borrow().clone();
+            let saved = capture_for_target(&ops, &FakeTasks::target(), 10).unwrap();
+            apply_captured(&ops, &saved).unwrap();
+            assert!(restore_conditional(&ops, &saved, true).unwrap());
+            assert_eq!(*ops.tasks.borrow(), before);
+            observe_captured(&ops, &saved, false).unwrap();
+            let writes = ops.writes.borrow().len();
+            assert!(!restore_conditional(&ops, &saved, false).unwrap());
+            assert_eq!(ops.writes.borrow().len(), writes);
+            ops.tasks.borrow_mut().get_mut(&100).unwrap().nice = 10;
+            assert!(restore_conditional(&ops, &saved, false).is_err());
+            assert_eq!(ops.writes.borrow().len(), writes);
+            assert_eq!(ops.tasks.borrow()[&100].nice, 10);
+        }
+
+        #[test]
+        fn recorded_renice_restore_refuses_interference_before_touching_other_threads() {
+            let ops = FakeTasks::new(&[(100, 0), (200, 5)]);
+            let saved = capture_for_target(&ops, &FakeTasks::target(), 10).unwrap();
+            apply_captured(&ops, &saved).unwrap();
+            ops.tasks.borrow_mut().get_mut(&200).unwrap().nice = 15;
+            let writes = ops.writes.borrow().len();
+            assert!(restore_conditional(&ops, &saved, true).is_err());
+            assert_eq!(ops.writes.borrow().len(), writes);
+            assert_eq!(ops.tasks.borrow()[&100].nice, 10);
+            assert_eq!(ops.tasks.borrow()[&200].nice, 15);
+        }
+
+        #[test]
+        fn recorded_renice_partial_permission_failure_remains_retryable() {
+            let mut ops = FakeTasks::new(&[(100, 0), (200, 5), (300, 19)]);
+            let saved = capture_for_target(&ops, &FakeTasks::target(), 10).unwrap();
+            apply_captured(&ops, &saved).unwrap();
+            ops.fail_set = Some(200);
+            let error = restore_conditional(&ops, &saved, true)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("permission denied"));
+            assert!(error.contains("1 thread priority write(s) already succeeded"));
+            assert_eq!(ops.tasks.borrow()[&100].nice, 0);
+            assert_eq!(ops.tasks.borrow()[&200].nice, 10);
+            ops.fail_set = None;
+            assert!(restore_conditional(&ops, &saved, true).unwrap());
+            observe_captured(&ops, &saved, false).unwrap();
         }
 
         #[test]

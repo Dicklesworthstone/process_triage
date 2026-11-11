@@ -2353,7 +2353,11 @@ finally:
         before_budget["kill_timestamps"]
     );
     assert_eq!(after_budget["pending_kill_intent"], false);
-    eprintln!("saved hourly cap1/current caps100/100/100/1000; actual post-delivery elapsed={}ms; retained={}", delivered_at.elapsed().as_millis(), drift_log.display());
+    eprintln!(
+        "saved hourly cap1/current caps100/100/100/1000; actual post-delivery elapsed={}ms; retained={}",
+        delivered_at.elapsed().as_millis(),
+        drift_log.display()
+    );
     for (reaper, target_log) in [
         (&mut first_reaper, &first_log),
         (&mut second_reaper, &second_log),
@@ -3435,6 +3439,196 @@ fn agent_apply_executes_renice_then_kill_on_live_process() {
         false
     });
     assert!(exited, "target {pid} still running after apply kill");
+}
+
+/// Exercise the real apply -> receipt -> undo -> verify commands. Unchanged
+/// priorities can be restored without CAP_SYS_NICE; raising a lowered priority
+/// must either restore the saved value or report the actual kernel denial.
+#[cfg(target_os = "linux")]
+#[test]
+fn agent_undo_renice_uses_saved_priorities_and_reports_restoration_truthfully() {
+    use pt_core::action::ReniceActionRunner;
+
+    for script in ["sleep 362", "nice -n 19 sleep 363"] {
+        let data_dir = TempDir::new().expect("data dir");
+        let config_dir = TempDir::new().expect("config dir");
+        write_test_policy(config_dir.path());
+        let victim = ForeignTarget::spawn(script);
+        if script.starts_with("nice ") {
+            let started = std::time::Instant::now();
+            while nice_of(victim.pid).unwrap() != 19 {
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "nice fixture did not become ready"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let identity = live_identity(victim.pid);
+        let target = format!("{}:{}", victim.pid, identity.start_id.0);
+        let before = ReniceActionRunner::with_defaults()
+            .capture_reversal_metadata(victim.pid)
+            .expect("complete original thread priorities");
+        let action = plan_action(Action::Renice, &identity);
+        let action_id = action.action_id.clone();
+        let session = session_with_plan(data_dir.path(), action);
+        let (status, applied) = apply(data_dir.path(), config_dir.path(), &session, &target);
+        assert_eq!(status, "success", "{applied}");
+        let applied_nice = nice_of(victim.pid).expect("applied priority");
+        let store = SessionStore::at_data_dir(data_dir.path());
+        let handle = store
+            .open(&SessionId::parse(&session).unwrap())
+            .expect("saved session");
+        let plan_bytes = fs::read(handle.dir.join("decision/plan.json")).unwrap();
+        let outcomes_bytes = fs::read(handle.dir.join("action/outcomes.jsonl")).unwrap();
+
+        let run = |step: &str, args: &[&str]| {
+            let started = std::time::Instant::now();
+            let output = cargo_bin_cmd!("pt-core")
+                .timeout(Duration::from_secs(120))
+                .env("PT_SKIP_GLOBAL_LOCK", "1")
+                .env("PROCESS_TRIAGE_DATA", data_dir.path())
+                .env("PROCESS_TRIAGE_CONFIG", config_dir.path())
+                .env("PROCESS_TRIAGE_RETENTION", "off")
+                .args(args)
+                .output()
+                .expect("run actual undo/verify command");
+            let log_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/test-logs/e2e/agent_apply")
+                .join(&session)
+                .join(step);
+            fs::create_dir_all(&log_dir).unwrap();
+            fs::write(log_dir.join("stdout.json"), &output.stdout).unwrap();
+            fs::write(log_dir.join("stderr.jsonl"), &output.stderr).unwrap();
+            fs::write(
+                log_dir.join("step.jsonl"),
+                format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "command": "pt-core", "session_id": session, "args": args,
+                        "exit_code": output.status.code(), "elapsed_ms": started.elapsed().as_millis(),
+                        "stdout_sha256": pt_bundle::FileEntry::compute_checksum(&output.stdout),
+                        "stderr_sha256": pt_bundle::FileEntry::compute_checksum(&output.stderr),
+                    })
+                ),
+            )
+            .unwrap();
+            let document: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+                panic!(
+                    "{step}: {error}; stdout={}, stderr={}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                )
+            });
+            (output.status.code(), document)
+        };
+
+        let undo_args = [
+            "--format",
+            "json",
+            "agent",
+            "undo",
+            "--session",
+            &session,
+            "--action-id",
+            &action_id,
+        ];
+        for (step, flags) in [
+            ("undo-preview", vec![]),
+            ("undo-robot-preview", vec!["--robot"]),
+            ("undo-dry-preview", vec!["--confirm", "--dry-run"]),
+            ("undo-shadow-preview", vec!["--confirm", "--shadow"]),
+        ] {
+            let mut args = undo_args.to_vec();
+            args.extend(flags);
+            let (code, preview) = run(step, &args);
+            assert_eq!(
+                code,
+                Some(pt_core::exit_codes::ExitCode::Clean.as_i32()),
+                "{preview}"
+            );
+            assert_eq!(preview["status"], "preview", "{preview}");
+            assert_eq!(preview["records"].as_array().unwrap().len(), 1);
+            let receipt = &preview["records"][0];
+            assert_eq!(receipt["action"], "renice");
+            assert_eq!(receipt["target"], serde_json::to_value(&identity).unwrap());
+            assert_eq!(receipt["operation"]["kind"], "renice");
+            assert_eq!(
+                receipt["operation"]["metadata"]["threads"],
+                serde_json::to_value(&before.threads).unwrap(),
+                "the receipt must preserve every original priority"
+            );
+            assert!(receipt["restorations"].as_array().unwrap().is_empty());
+            assert_eq!(nice_of(victim.pid).unwrap(), applied_nice);
+        }
+
+        let mut restore_args = undo_args.to_vec();
+        restore_args.push("--confirm");
+        let (code, restored) = run("undo-confirmed", &restore_args);
+        let restoration_succeeded = restored["status"] == "restored";
+        if restoration_succeeded {
+            assert_eq!(
+                code,
+                Some(pt_core::exit_codes::ExitCode::ActionsOk.as_i32()),
+                "{restored}"
+            );
+            assert_eq!(
+                nice_of(victim.pid).unwrap(),
+                i64::from(before.previous_nice)
+            );
+            let (repeat_code, repeated) = run("undo-repeated", &restore_args);
+            assert_eq!(repeat_code, code, "{repeated}");
+            assert_eq!(repeated["status"], "restored");
+            assert_eq!(repeated["restoration"]["changed"], false);
+        } else {
+            assert_ne!(
+                before.previous_nice, applied_nice as i32,
+                "an unchanged original priority must be verifiable without special privilege: {restored}"
+            );
+            assert_eq!(
+                code,
+                Some(pt_core::exit_codes::ExitCode::PartialFail.as_i32()),
+                "{restored}"
+            );
+            assert_eq!(restored["status"], "failed");
+            let reason = restored.to_string().to_lowercase();
+            assert!(
+                reason.contains("permission"),
+                "only the actual kernel permission failure is accepted here: {restored}"
+            );
+            assert_eq!(nice_of(victim.pid).unwrap(), applied_nice);
+        }
+
+        let (_, verified) = run(
+            "verify-after-undo",
+            &["--format", "json", "agent", "verify", "--session", &session],
+        );
+        assert_eq!(
+            verified["action_outcomes"][0]["outcome"],
+            if restoration_succeeded {
+                "confirmed_restored"
+            } else {
+                "restoration_unverified"
+            },
+            "{verified}",
+        );
+        assert_eq!(
+            verified["restoration_summary"]["confirmed_restored"],
+            usize::from(restoration_succeeded),
+        );
+        assert!(verified["action_outcomes"][0]
+            .get("expected_resources_freed")
+            .is_none());
+        assert_eq!(
+            fs::read(handle.dir.join("decision/plan.json")).unwrap(),
+            plan_bytes
+        );
+        assert_eq!(
+            fs::read(handle.dir.join("action/outcomes.jsonl")).unwrap(),
+            outcomes_bytes
+        );
+        assert!(victim.alive(), "undo and verify must not signal the target");
+    }
 }
 
 #[cfg(target_os = "linux")]

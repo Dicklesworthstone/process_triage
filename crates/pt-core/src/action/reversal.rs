@@ -1,4 +1,4 @@
-//! Durable, conditional undo for recorded cgroup-v2 actions.
+//! Durable, conditional undo for recorded cgroup-v2 and Linux renice actions.
 //!
 //! A receipt is synchronized before a controller is changed. `Prepared` means
 //! that execution may or may not have reached the kernel; it is never a success
@@ -7,6 +7,7 @@
 //! Callers must hold the same execution-policy lock used for normal actions.
 
 use super::executor::ActionError;
+use super::renice::{ReniceReversalMetadata, ReniceThreadReversal};
 use crate::decision::Action;
 use crate::plan::{ActionRouting, PlanAction};
 use pt_common::ProcessIdentity;
@@ -152,9 +153,42 @@ pub enum ReversalOperation {
         applied: ReversalValue,
         verify_timeout_ms: u64,
     },
+    Renice {
+        metadata: ReniceReversalMetadata,
+        pid_namespace_device: u64,
+        pid_namespace_inode: u64,
+    },
     Unsupported {
         reason: String,
     },
+}
+
+/// The original state that was observed after an intentional restoration.
+/// Thread priorities retain every captured incarnation and value; a leader's
+/// priority alone cannot establish that a multithreaded process was restored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "control", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RestorationValue {
+    Freeze { requested: bool },
+    CpuMax { quota_us: i64, period_us: u64 },
+    Cpuset { cpus: String },
+    ThreadPriorities { threads: Vec<ReniceThreadReversal> },
+}
+
+impl From<ReversalValue> for RestorationValue {
+    fn from(value: ReversalValue) -> Self {
+        match value {
+            ReversalValue::Freeze { requested } => Self::Freeze { requested },
+            ReversalValue::CpuMax {
+                quota_us,
+                period_us,
+            } => Self::CpuMax {
+                quota_us,
+                period_us,
+            },
+            ReversalValue::Cpuset { cpus } => Self::Cpuset { cpus },
+        }
+    }
 }
 
 /// Every restore attempt is retained separately from the execution result.
@@ -180,7 +214,7 @@ pub struct RestorationObservation {
     pub attempt_id: String,
     pub restore_id: String,
     pub action_id: String,
-    pub original_value: ReversalValue,
+    pub original_value: RestorationValue,
     pub recorded_restored_at: String,
     pub observed_at: String,
 }
@@ -319,7 +353,7 @@ impl ReversalJournal {
 
     #[cfg(not(target_os = "linux"))]
     pub fn inspect(&self, _action: &PlanAction) -> Result<Vec<ReversalRecord>, ActionError> {
-        Err(failed("cgroup undo receipts are supported only on Linux"))
+        Err(failed("durable undo receipts are supported only on Linux"))
     }
 
     /// Observe intentional restoration without changing a controller or receipt.
@@ -333,7 +367,11 @@ impl ReversalJournal {
     ) -> Result<Option<RestorationObservation>, ActionError> {
         if !matches!(
             action.action,
-            Action::Freeze | Action::Unfreeze | Action::Throttle | Action::Quarantine
+            Action::Freeze
+                | Action::Unfreeze
+                | Action::Throttle
+                | Action::Quarantine
+                | Action::Renice
         ) {
             return Ok(None);
         }
@@ -360,14 +398,20 @@ impl ReversalJournal {
         directory.revalidate()?;
         let observed_at = chrono::Utc::now();
         validate_restoration_times(record, restored, observed_at)?;
-        let ReversalOperation::CgroupV2 { before, .. } = &record.operation else {
-            return Err(failed("unsupported recorded restoration"));
+        let original_value = match &record.operation {
+            ReversalOperation::CgroupV2 { before, .. } => before.clone().into(),
+            ReversalOperation::Renice { metadata, .. } => RestorationValue::ThreadPriorities {
+                threads: metadata.threads.clone(),
+            },
+            ReversalOperation::Unsupported { .. } => {
+                return Err(failed("unsupported recorded restoration"))
+            }
         };
         Ok(Some(RestorationObservation {
             attempt_id: record.attempt_id.clone(),
             restore_id: restored.restore_id.clone(),
             action_id: record.action_id.clone(),
-            original_value: before.clone(),
+            original_value,
             recorded_restored_at: restored.timestamp.clone(),
             observed_at: observed_at.to_rfc3339(),
         }))
@@ -449,7 +493,7 @@ impl ReversalJournal {
         self.write_record(&directory, &record, false)
             .map_err(|error| {
                 failed(format!(
-                    "{error}; undo may have changed the controller; retained receipt {}",
+                    "{error}; undo may have changed the target; retained receipt {}",
                     record.attempt_id
                 ))
             })?;
@@ -462,7 +506,7 @@ impl ReversalJournal {
         _action: &PlanAction,
         _attempt_id: Option<&str>,
     ) -> Result<ReversalOutcome, ActionError> {
-        Err(failed("cgroup undo is supported only on Linux"))
+        Err(failed("durable undo is supported only on Linux"))
     }
 
     #[cfg(target_os = "linux")]
@@ -484,6 +528,30 @@ impl ReversalJournal {
             verify_timeout_ms: verify_timeout_ms.min(MAX_RESTORE_VERIFY_MS),
         };
         let record = self.insert(action, operation, ReversalStatus::Prepared)?;
+        Ok(PreparedReversal {
+            journal: Arc::clone(self),
+            attempt_id: record.attempt_id,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn prepare_renice(
+        self: &Arc<Self>,
+        action: &PlanAction,
+        metadata: ReniceReversalMetadata,
+    ) -> Result<PreparedReversal, ActionError> {
+        ensure_renice_target(&action.target)?;
+        let namespace = fs::metadata("/proc/self/ns/pid")
+            .map_err(|error| failed(format!("cannot bind renice PID namespace: {error}")))?;
+        let record = self.insert(
+            action,
+            ReversalOperation::Renice {
+                metadata,
+                pid_namespace_device: namespace.dev(),
+                pid_namespace_inode: namespace.ino(),
+            },
+            ReversalStatus::Prepared,
+        )?;
         Ok(PreparedReversal {
             journal: Arc::clone(self),
             attempt_id: record.attempt_id,
@@ -515,9 +583,7 @@ impl ReversalJournal {
         status: ReversalStatus,
     ) -> Result<ReversalRecord, ActionError> {
         if action.supervisor_restart.is_some() || action.routing == ActionRouting::Supervisor {
-            return Err(failed(
-                "cgroup undo cannot record a supervisor-routed operation",
-            ));
+            return Err(failed("undo cannot record a supervisor-routed operation"));
         }
         let _lock = self
             .lock
@@ -644,7 +710,7 @@ impl PreparedReversal {
         };
         if let Err(error) = update() {
             return Err(failed(format!(
-                "{error}; execution may have changed the controller; retained undo receipt {}",
+                "{error}; execution may have changed the target; retained undo receipt {}",
                 self.attempt_id
             )));
         }
@@ -789,6 +855,32 @@ fn validate_record(record: &ReversalRecord) -> Result<(), ActionError> {
                 }
             }
         }
+        ReversalOperation::Renice {
+            metadata,
+            pid_namespace_inode,
+            ..
+        } => {
+            let boot_id = record
+                .target
+                .start_id
+                .0
+                .split(':')
+                .next()
+                .unwrap_or_default();
+            validate_target(&record.target, boot_id)?;
+            super::renice::validate_reversal_metadata(metadata)?;
+            if record.action != Action::Renice
+                || record.routing != ActionRouting::Direct
+                || record.original_zombie_target.is_some()
+                || metadata.identity.as_ref() != Some(&record.target)
+                || *pid_namespace_inode == 0
+                || record.status == ReversalStatus::Unsupported
+            {
+                return Err(failed(
+                    "renice receipt does not match its action, target, or namespace",
+                ));
+            }
+        }
         ReversalOperation::Unsupported { reason } => {
             if record.status != ReversalStatus::Unsupported || reason.is_empty() {
                 return Err(failed("malformed unsupported undo receipt"));
@@ -857,7 +949,7 @@ fn refuse_newer_control(
     {
         if operations_share_control(&selected.operation, &later.operation) {
             return Err(failed(format!(
-                "a later recorded action controls this cgroup; undo receipt {} first",
+                "a later recorded action controls this target; undo receipt {} first",
                 later.attempt_id
             )));
         }
@@ -896,7 +988,10 @@ fn latest_recorded_restoration<'a>(
     };
     if record.status != ReversalStatus::Verified
         || restored.status != RestorationStatus::Restored
-        || !matches!(record.operation, ReversalOperation::CgroupV2 { .. })
+        || !matches!(
+            record.operation,
+            ReversalOperation::CgroupV2 { .. } | ReversalOperation::Renice { .. }
+        )
     {
         return Err(failed(
             "latest recorded execution/restoration is not a verified action followed by a completed undo",
@@ -948,6 +1043,25 @@ fn operations_share_control(left: &ReversalOperation, right: &ReversalOperation)
                 && a.device == b.device
                 && a.inode == b.inode
                 && control_a.same_control(control_b)
+        }
+        (
+            ReversalOperation::Renice {
+                metadata: a,
+                pid_namespace_device: device_a,
+                pid_namespace_inode: inode_a,
+            },
+            ReversalOperation::Renice {
+                metadata: b,
+                pid_namespace_device: device_b,
+                pid_namespace_inode: inode_b,
+            },
+        ) => {
+            device_a == device_b
+                && inode_a == inode_b
+                && a.identity
+                    .as_ref()
+                    .zip(b.identity.as_ref())
+                    .is_some_and(|(a, b)| a.matches(b))
         }
         _ => false,
     }
@@ -1132,6 +1246,25 @@ pub(crate) fn ensure_control_unowned(
             before: control.clone(),
             applied: control,
             verify_timeout_ms: 0,
+        },
+        None,
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn ensure_renice_unowned(
+    sessions_root: &Path,
+    metadata: &ReniceReversalMetadata,
+) -> Result<(), ActionError> {
+    super::renice::validate_reversal_metadata(metadata)?;
+    let namespace = fs::metadata("/proc/self/ns/pid")
+        .map_err(|error| failed(format!("cannot identify renice PID namespace: {error}")))?;
+    refuse_other_session_owner(
+        sessions_root,
+        &ReversalOperation::Renice {
+            metadata: metadata.clone(),
+            pid_namespace_device: namespace.dev(),
+            pid_namespace_inode: namespace.ino(),
         },
         None,
     )
@@ -1401,6 +1534,13 @@ impl ReversalScope {
 
 #[cfg(target_os = "linux")]
 fn restore_live(record: &ReversalRecord) -> Result<bool, ActionError> {
+    if let ReversalOperation::Renice { metadata, .. } = &record.operation {
+        validate_renice_scope(record)?;
+        let changed = super::renice::ReniceActionRunner::with_defaults()
+            .restore_recorded(metadata, !record.is_restored())?;
+        validate_renice_scope(record)?;
+        return Ok(changed);
+    }
     let ReversalOperation::CgroupV2 { scope, .. } = &record.operation else {
         return Err(failed("unsupported recorded undo operation"));
     };
@@ -1432,6 +1572,11 @@ fn restore_live(record: &ReversalRecord) -> Result<bool, ActionError> {
 /// updater. It proves the same complete live scope before reading old values.
 #[cfg(target_os = "linux")]
 fn observe_restored_control(record: &ReversalRecord) -> Result<(), ActionError> {
+    if let ReversalOperation::Renice { metadata, .. } = &record.operation {
+        validate_renice_scope(record)?;
+        super::renice::ReniceActionRunner::with_defaults().observe_restored(metadata)?;
+        return validate_renice_scope(record);
+    }
     let ReversalOperation::CgroupV2 { scope, before, .. } = &record.operation else {
         return Err(failed("unsupported recorded restoration"));
     };
@@ -1459,6 +1604,49 @@ fn observe_restored_control(record: &ReversalRecord) -> Result<(), ActionError> 
         super::dispatch::ensure_exclusive_cgroup_path(record.target.pid.0, &pinned)
     };
     observe_original_control_at(&pinned, before, revalidate)
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_renice_target(target: &ProcessIdentity) -> Result<(), ActionError> {
+    use super::executor::IdentityProvider;
+    super::signal::ensure_action_pid_namespace()?;
+    let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map_err(|error| failed(format!("cannot revalidate renice boot: {error}")))?;
+    validate_target(target, boot.trim())?;
+    // SAFETY: geteuid only reads the calling process's credentials.
+    if target.uid != unsafe { libc::geteuid() } {
+        return Err(ActionError::PermissionDenied);
+    }
+    if crate::collect::protected::live_invoker_chain_pids().contains(&target.pid.0) {
+        return Err(failed(
+            "renice undo refuses the invoker and its ancestor chain",
+        ));
+    }
+    if !super::signal::LiveIdentityProvider::new().revalidate(target)? {
+        return Err(ActionError::IdentityMismatch);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_renice_scope(record: &ReversalRecord) -> Result<(), ActionError> {
+    let ReversalOperation::Renice {
+        pid_namespace_device,
+        pid_namespace_inode,
+        ..
+    } = &record.operation
+    else {
+        return Err(failed("receipt is not a renice operation"));
+    };
+    ensure_renice_target(&record.target)?;
+    let namespace = fs::metadata("/proc/self/ns/pid")
+        .map_err(|error| failed(format!("cannot revalidate renice PID namespace: {error}")))?;
+    if namespace.dev() != *pid_namespace_device || namespace.ino() != *pid_namespace_inode {
+        return Err(failed(
+            "renice PID namespace differs from the recorded namespace",
+        ));
+    }
+    Ok(())
 }
 
 /// Read exact original values twice with scope guards surrounding each sample.
@@ -1752,6 +1940,300 @@ mod tests {
             ReversalValue::Freeze { requested: false },
             ReversalValue::Freeze { requested: true },
         )
+    }
+
+    fn renice_operation(action: &PlanAction) -> ReversalOperation {
+        ReversalOperation::Renice {
+            metadata: ReniceReversalMetadata {
+                pid: action.target.pid.0,
+                previous_nice: 0,
+                applied_nice: 10,
+                applied_at: now(),
+                identity: Some(action.target.clone()),
+                threads: vec![ReniceThreadReversal {
+                    tid: action.target.pid.0,
+                    start_ticks: 456,
+                    uid: action.target.uid,
+                    previous_nice: 0,
+                    applied_nice: 10,
+                }],
+            },
+            pid_namespace_device: 1,
+            pid_namespace_inode: 2,
+        }
+    }
+
+    #[test]
+    fn renice_receipts_preserve_exact_identity_and_per_thread_priorities() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = journal(directory.path());
+        let mut action = action(Action::Renice);
+        action.target.pgid = Some(101);
+        action.target.sid = Some(102);
+        let operation = renice_operation(&action);
+        let record = journal
+            .insert(&action, operation.clone(), ReversalStatus::Prepared)
+            .unwrap();
+        let reopened = ReversalJournal::new(
+            journal.directory().parent().unwrap(),
+            &journal.session_id,
+            &journal.plan_sha256,
+            &journal.sessions_root,
+        )
+        .unwrap();
+        let saved = reopened.inspect(&action).unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].operation, operation);
+        assert_eq!(saved[0].target, action.target);
+        assert_eq!(saved[0].attempt_id, record.attempt_id);
+        assert_eq!(saved[0].status, ReversalStatus::Prepared);
+        for changed in ["pid", "birth", "uid", "pgid", "sid", "action"] {
+            let mut changed_action = action.clone();
+            match changed {
+                "pid" => changed_action.target.pid.0 += 1,
+                "birth" => {
+                    changed_action.target.start_id = pt_common::StartId::from_linux(BOOT, 457, 123)
+                }
+                "uid" => changed_action.target.uid += 1,
+                "pgid" => changed_action.target.pgid = Some(999),
+                "sid" => changed_action.target.sid = Some(999),
+                "action" => changed_action.action = Action::Pause,
+                _ => unreachable!(),
+            }
+            assert!(reopened.inspect(&changed_action).is_err(), "{changed}");
+        }
+    }
+
+    #[test]
+    fn renice_receipts_refuse_unbound_duplicate_and_priority_raising_states() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = journal(directory.path());
+        let action = action(Action::Renice);
+        for changed in [
+            "identity",
+            "birth",
+            "uid",
+            "leader",
+            "duplicate",
+            "raise",
+            "namespace",
+        ] {
+            let mut operation = renice_operation(&action);
+            let ReversalOperation::Renice {
+                metadata,
+                pid_namespace_inode,
+                ..
+            } = &mut operation
+            else {
+                unreachable!();
+            };
+            match changed {
+                "identity" => metadata.identity = None,
+                "birth" => metadata.threads[0].start_ticks += 1,
+                "uid" => metadata.threads[0].uid += 1,
+                "leader" => metadata.applied_nice += 1,
+                "duplicate" => metadata.threads.push(metadata.threads[0].clone()),
+                "raise" => metadata.threads[0].applied_nice = -1,
+                "namespace" => *pid_namespace_inode = 0,
+                _ => unreachable!(),
+            }
+            assert!(
+                journal
+                    .insert(&action, operation, ReversalStatus::Prepared)
+                    .is_err(),
+                "{changed}"
+            );
+            assert!(journal.inspect(&action).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn renice_control_ownership_blocks_cross_session_and_unjournaled_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let sessions = directory.path().join("sessions");
+        let first = journal_in_sessions(&sessions, "session-a");
+        let second = journal_in_sessions(&sessions, "session-b");
+        let action = action(Action::Renice);
+        let operation = renice_operation(&action);
+        let mut record = first
+            .insert(&action, operation.clone(), ReversalStatus::Verified)
+            .unwrap();
+        assert!(second
+            .insert(&action, operation.clone(), ReversalStatus::Prepared)
+            .is_err());
+        assert!(refuse_other_session_owner(&sessions, &operation, None).is_err());
+        let mut different = operation.clone();
+        if let ReversalOperation::Renice { metadata, .. } = &mut different {
+            metadata.identity.as_mut().unwrap().start_id =
+                pt_common::StartId::from_linux(BOOT, 789, 123);
+            metadata.threads[0].start_ticks = 789;
+        }
+        assert!(!operations_share_control(&operation, &different));
+        assert!(!operations_share_control(&operation, &freeze_operation()));
+        record.restorations.push(restored_outcome(&record));
+        let stored = JournalDirectory::open(first.directory(), false)
+            .unwrap()
+            .unwrap();
+        first.write_record(&stored, &record, false).unwrap();
+        assert!(second
+            .insert(&action, operation, ReversalStatus::Prepared)
+            .is_ok());
+    }
+
+    struct OwnedReniceChild(std::process::Child);
+
+    impl Drop for OwnedReniceChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn owned_renice_target() -> (OwnedReniceChild, PlanAction) {
+        let child = OwnedReniceChild(
+            std::process::Command::new("sleep")
+                .arg("60")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("owned disposable process"),
+        );
+        let mut action = action(Action::Renice);
+        action.target = super::super::dispatch::read_cgroup_identity(child.0.id())
+            .expect("owned process full Linux identity");
+        (child, action)
+    }
+
+    #[test]
+    fn durable_renice_owned_child_roundtrips_and_observes_idempotent_restoration() {
+        use crate::action::{ActionRunner, ReniceActionRunner, ReniceConfig};
+        let (_child, action) = owned_renice_target();
+        let directory = tempfile::tempdir().unwrap();
+        let journal = journal(directory.path());
+        // No privilege is needed for this intentionally unchanged priority.
+        // Changed-priority restoration and permission failures have separate tests.
+        let runner = ReniceActionRunner::new(ReniceConfig {
+            nice_value: -20,
+            ..Default::default()
+        })
+        .with_reversal_journal(Arc::clone(&journal));
+        runner.execute(&action).unwrap();
+        runner.verify(&action).unwrap();
+        let saved = journal.inspect(&action).unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].status, ReversalStatus::Verified);
+        let ReversalOperation::Renice { metadata, .. } = &saved[0].operation else {
+            panic!("renice execution must capture its exact original state");
+        };
+        assert_eq!(metadata.identity.as_ref(), Some(&action.target));
+        assert_eq!(metadata.threads.len(), 1);
+        assert!(metadata
+            .threads
+            .iter()
+            .all(|thread| thread.previous_nice == thread.applied_nice));
+        for _ in 0..2 {
+            let restored = journal.restore(&action, None).unwrap();
+            assert_eq!(restored.status, RestorationStatus::Restored);
+            assert_eq!(restored.changed, Some(false));
+        }
+        let bytes = fs::read(
+            journal
+                .directory()
+                .join(format!("{}.json", saved[0].attempt_id)),
+        )
+        .unwrap();
+        let observed = journal.observe_restoration(&action).unwrap().unwrap();
+        assert_eq!(
+            observed.original_value,
+            RestorationValue::ThreadPriorities {
+                threads: metadata.threads.clone()
+            }
+        );
+        assert_eq!(
+            fs::read(
+                journal
+                    .directory()
+                    .join(format!("{}.json", saved[0].attempt_id))
+            )
+            .unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn durable_renice_never_changes_priority_when_receipt_persistence_is_unavailable() {
+        use crate::action::{ActionRunner, ReniceActionRunner};
+        let (_child, action) = owned_renice_target();
+        let directory = tempfile::tempdir().unwrap();
+        let journal = journal(directory.path());
+        fs::write(journal.directory(), b"not a private receipt directory").unwrap();
+        let runner = ReniceActionRunner::with_defaults().with_reversal_journal(journal);
+        let before = runner
+            .capture_reversal_metadata(action.target.pid.0)
+            .unwrap();
+        assert!(runner.execute(&action).is_err());
+        let after = runner
+            .capture_reversal_metadata(action.target.pid.0)
+            .unwrap();
+        assert_eq!(before.threads, after.threads);
+    }
+
+    #[test]
+    fn durable_renice_owned_priority_change_preserves_permission_failure_or_exact_undo() {
+        use crate::action::{ActionRunner, ReniceActionRunner, ReniceConfig};
+        let (_child, action) = owned_renice_target();
+        let baseline = ReniceActionRunner::with_defaults()
+            .capture_reversal_metadata(action.target.pid.0)
+            .unwrap();
+        if baseline.previous_nice == 19 {
+            eprintln!("SKIP changed-priority live restoration: test runner inherited nice 19; exact mutation/permission behavior is covered by task-state tests");
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let journal = journal(directory.path());
+        let runner = ReniceActionRunner::new(ReniceConfig {
+            nice_value: baseline.previous_nice + 1,
+            ..Default::default()
+        })
+        .with_reversal_journal(Arc::clone(&journal));
+        runner.execute(&action).unwrap();
+        runner.verify(&action).unwrap();
+        let lowered = runner
+            .capture_reversal_metadata(action.target.pid.0)
+            .unwrap();
+        assert_eq!(lowered.previous_nice, baseline.previous_nice + 1);
+        let restored = journal.restore(&action, None).unwrap();
+        let current = runner
+            .capture_reversal_metadata(action.target.pid.0)
+            .unwrap();
+        match restored.status {
+            RestorationStatus::Restored => {
+                assert_eq!(restored.changed, Some(true));
+                assert_eq!(current.previous_nice, baseline.previous_nice);
+                assert!(journal.observe_restoration(&action).unwrap().is_some());
+            }
+            RestorationStatus::Failed => {
+                assert!(
+                    restored
+                        .detail
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("permission denied"),
+                    "{restored:?}"
+                );
+                assert_eq!(restored.changed, None);
+                assert_eq!(current.previous_nice, lowered.previous_nice);
+                assert!(journal.observe_restoration(&action).is_err());
+                let records = journal.inspect(&action).unwrap();
+                assert_eq!(records[0].status, ReversalStatus::Verified);
+                assert_eq!(
+                    records[0].restorations.last().unwrap().status,
+                    RestorationStatus::Failed
+                );
+            }
+            RestorationStatus::Prepared => panic!("a completed restore cannot still be prepared"),
+        }
     }
 
     fn restored_outcome(record: &ReversalRecord) -> ReversalOutcome {

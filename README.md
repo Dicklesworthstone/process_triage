@@ -342,7 +342,7 @@ pt shadow stop                    # Stop observer
 | `pt agent explain` | Evidence for specific PIDs | `pt agent explain --session <id> --pids 1234` |
 | `pt agent label` | Record your kill/spare verdict | `pt agent label --pid 1234 --spare` |
 | `pt agent apply` | Execute a plan (robot mode) | `pt agent apply --session <id> --yes` |
-| `pt agent undo` | Inspect or restore a recorded cgroup control | `pt agent undo --session <id> --action-id <action-id>` |
+| `pt agent undo` | Inspect or restore recorded priorities or cgroup controls | `pt agent undo --session <id> --action-id <action-id>` |
 | `pt agent verify` | Confirm outcomes | `pt agent verify --session <id>` |
 | `pt agent watch` | Stream events | `pt agent watch --format jsonl` |
 | `pt agent report` | Generate HTML report | `pt agent report --session <id>` |
@@ -1458,14 +1458,16 @@ not implemented.
 
 ### Restoring a recorded control
 
-`agent apply` records durable undo receipts for Linux cgroup-v2 **Freeze,
-Unfreeze, Throttle, and Quarantine** actions. Each receipt saves the exact previous
-freezer request, CPU quota and period, or requested cpuset before the controller
-write. The receipt is bound to the complete saved plan, action ID, process
-incarnation, boot, namespace, mount, and cgroup directory identity.
+`agent apply` records durable undo receipts for Linux **Renice** and cgroup-v2
+**Freeze, Unfreeze, Throttle, and Quarantine** actions. Each receipt saves the
+original state before changing it: every thread's priority for Renice, or the
+freezer request, CPU quota and period, or requested cpuset for cgroup controls.
+Receipts are bound to the complete saved plan, action ID and process incarnation. Priority receipts also
+bind the PID namespace and each thread's birth time and owner; cgroup receipts
+bind the boot, namespaces, mount and cgroup directory identity.
 
 ```bash
-# Inspect the saved receipt without changing the controller.
+# Inspect the saved receipt without changing the process.
 pt agent undo --session <id> --action-id <action-id>
 
 # Revalidate the live target and restore the recorded value.
@@ -1479,19 +1481,28 @@ pt agent undo --session <id> --action-id <action-id> --attempt-id <uuid> --confi
 always keep this command read-only. Preview reports saved facts; confirmed
 restoration checks current eligibility under the same execution lock as apply.
 
-Restoration requires the original live process and its exclusive cgroup to
-remain identifiable. It refuses an unrelated controller value, changed scope,
-or a later unresolved control operation. If the original value is already
-present, undo verifies it without another write. Freezer undo also waits for
-the actual `cgroup.events` frozen state, including when the request is already
-correct. A completed receipt cannot authorize a second write after another
-actor changes the control again.
+Restoration requires the original live process to remain identifiable. For
+cgroup controls, its exclusive cgroup must also retain the recorded identity.
+Undo refuses an unrelated value, changed scope, or a later unresolved control
+operation. If the original value is already present, undo verifies it without
+another write. Freezer undo also waits for the actual `cgroup.events` frozen
+state, including when the request is already correct. A completed receipt cannot
+authorize a second write after another actor changes the control again.
 
 Quarantine undo restores the original requested CPU identities, including an
 empty assignment that inherits CPUs from the parent. It checks that effective
 CPUs remain nonempty and, for an explicit assignment, within the restored set.
 It never writes the effective CPU list or replaces inherited intent with a
 fixed snapshot of the parent's CPUs.
+
+Renice restoration checks every live thread against the receipt and restores
+each thread's own previous nice value. New or reused threads, unreadable evidence,
+or an unexpected priority prevent restoration. Recorded threads that have exited
+need no priority change; a PID or thread ID alone cannot authorize restoration.
+The kernel may require `CAP_SYS_NICE` or a sufficient `RLIMIT_NICE` allowance to
+raise priority again. If it denies restoration, the command reports failure and
+retains the receipt and any partial outcome for inspection. It never treats a
+permission failure as a successful undo.
 
 An unresolved durable receipt also reserves that physical control across
 sessions. A different session, or an unjournaled TUI action, cannot replace it
@@ -1522,12 +1533,13 @@ including completed restoration histories and incomplete or unreadable
 receipts. Cleanup uses the execution lock so it cannot remove a session while
 an action is preparing the state needed for undo.
 
-This command currently covers cgroup-v2 freezer, CPU bandwidth, and cpuset
-controls from `agent apply`. Hybrid v1 throttling and quarantine record that
-durable undo is unsupported. Renice, pause/resume, service restart, and TUI
-actions do not capture these receipts; TUI controller writes still respect
-existing receipt ownership. A bare Unquarantine action cannot reconstruct the
-old CPU set; restore the recorded Quarantine action with `agent undo`.
+This command currently covers Linux thread priorities and cgroup-v2 freezer,
+CPU bandwidth, and cpuset controls from `agent apply`. Hybrid v1 throttling and
+quarantine record that durable undo is unsupported. Pause/resume, service restart,
+macOS Renice, and TUI actions do not capture these receipts; TUI control writes
+still respect existing receipt ownership. A bare Unquarantine action cannot
+reconstruct the old CPU set; restore the recorded Quarantine action with
+`agent undo`.
 
 ### cpuset Quarantine
 
