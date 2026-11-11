@@ -216,8 +216,8 @@ pt-core mcp   # Start JSON-RPC 2.0 server over stdio
 
 Available tools:
 
-- `pt_plan`: the same engine, protections and output as `pt agent plan --format json`.
-- `pt_scan`: a process listing with signature-match scores.
+- `pt_plan`: the same engine, protections and output as `pt agent plan --format json`, including resource/pressure goals, process selection, predictions and session comparisons.
+- `pt_scan`: a process listing with Bayesian suspicion scores and signature matches.
 - `pt_explain`: a PID's evidence, including the learned-prior contribution.
 - `pt_label`: persist an explicitly user-confirmed kill/spare verdict through the same learning and shadow-label path as `pt agent label`; never sends a signal.
 - `pt_history`: recent sessions.
@@ -225,6 +225,14 @@ Available tools:
 - `pt_capabilities`
 
 AI agents can use these to query process state, run scans, and make triage decisions without CLI parsing.
+
+For a resource goal, pass the same `goal` text the CLI accepts, such as `free 4GB RAM`, `free port 3000`, `free 100 FDs`, `free-disk 4GB on /data`, or `relieve`:
+
+```json
+{"name":"pt_plan","arguments":{"goal":"free port 3000","include_predictions":true,"prediction_fields":["memory","diagnostics"]}}
+```
+
+`pids` is an optional nonempty array of unique process IDs that limits candidate inference; protection and resource ownership still use the complete process census. `max_candidates`, `min_score`, `min_age`, `deep` and `window_ms` control the same planner options as the CLI. To compare with a saved plan, use `since` with its session ID, or `since_time` with a duration such as `2h` or a past RFC3339 timestamp. These comparisons retain a complete fresh plan and preserve the baseline session. `prediction_fields` requires `include_predictions: true`; forecasts still require recorded observations. Invalid types, empty PID selections, conflicting comparison options and unknown arguments are errors rather than silently broadening the scan. Starting the server with `pt-core --robot mcp` preserves robot policy in its planner children. The tool returns the actual saved plan and never applies its actions.
 
 For feedback, call `pt_label` with exactly one of `pid` or `cmd`, a `verdict` of `"kill"` or `"spare"`, and `confirmed_by_user: true` only after the user explicitly chose that verdict. For example:
 

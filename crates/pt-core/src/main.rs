@@ -17353,6 +17353,7 @@ fn run_mcp(global: &GlobalOpts, args: &McpArgs) -> ExitCode {
     if let Some(dir) = global.config.as_ref() {
         pt_core::mcp::set_config_dir(PathBuf::from(dir));
     }
+    pt_core::mcp::set_robot_mode(global.robot);
 
     let mut server = pt_core::mcp::McpServer::new();
     if let Err(e) = server.run_stdio() {

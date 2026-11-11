@@ -1312,6 +1312,251 @@ fn actual_mcp_plan_child_uses_the_servers_explicit_config() {
 }
 
 #[test]
+fn actual_mcp_plan_validates_scope_and_goal_before_loading_config() {
+    use assert_cmd::cargo::cargo_bin_cmd;
+
+    let root = tempfile::tempdir().expect("isolated MCP validation root");
+    let config = root.path().join("config");
+    let data = root.path().join("data");
+    std::fs::create_dir(&config).unwrap();
+    std::fs::write(config.join("policy.json"), b"{").unwrap();
+    let session = pt_common::SessionId::new();
+    let invalid = [
+        (serde_json::json!({"pids": []}), "pids"),
+        (serde_json::json!({"pids": [42, 42]}), "pids"),
+        (serde_json::json!({"goal": "free port 0"}), "goal"),
+        (serde_json::json!({"min_score": 1.2}), "min_score"),
+        (serde_json::json!({"deep": "true"}), "deep"),
+        (
+            serde_json::json!({"since": session.0, "since_time": "2h"}),
+            "mutually exclusive",
+        ),
+        (
+            serde_json::json!({"prediction_fields": ["memory"]}),
+            "include_predictions",
+        ),
+        (
+            serde_json::json!({"robot": false}),
+            "unknown pt_plan argument",
+        ),
+        (
+            serde_json::json!({"session": session.0}),
+            "unknown pt_plan argument",
+        ),
+        (serde_json::json!({"yes": true}), "unknown pt_plan argument"),
+    ];
+    let mut requests = vec![serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {},
+    })];
+    for (arguments, _) in &invalid {
+        requests.push(serde_json::json!({
+            "jsonrpc": "2.0", "id": requests.len() + 1, "method": "tools/call",
+            "params": {"name": "pt_plan", "arguments": arguments},
+        }));
+    }
+    let input = requests
+        .iter()
+        .map(|request| format!("{request}\n"))
+        .collect::<String>();
+    let output = cargo_bin_cmd!("pt-core")
+        .arg("--config")
+        .arg(&config)
+        .arg("mcp")
+        .env("PROCESS_TRIAGE_DATA", &data)
+        .env("PROCESS_TRIAGE_RETENTION", "off")
+        .write_stdin(input)
+        .timeout(std::time::Duration::from_secs(30))
+        .output()
+        .expect("execute actual MCP argument validation");
+    assert!(output.status.success(), "{output:?}");
+    let responses: Vec<serde_json::Value> = std::str::from_utf8(&output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(responses.len(), requests.len());
+    let definitions = responses[0]["result"]["tools"].as_array().unwrap();
+    let definition = definitions
+        .iter()
+        .find(|tool| tool["name"] == "pt_plan")
+        .unwrap();
+    let properties = &definition["inputSchema"]["properties"];
+    for field in [
+        "goal",
+        "pids",
+        "max_candidates",
+        "since",
+        "since_time",
+        "include_predictions",
+        "prediction_fields",
+    ] {
+        assert!(!properties[field].is_null(), "{field}");
+    }
+    assert_eq!(properties["pids"]["minItems"], 1);
+    assert_eq!(properties["pids"]["uniqueItems"], true);
+    assert_eq!(properties["min_score"]["maximum"], 1.0);
+    assert_eq!(definition["inputSchema"]["additionalProperties"], false);
+    for (response, (_, expected)) in responses.iter().skip(1).zip(&invalid) {
+        assert!(response["error"].is_null(), "{response}");
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        let message = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(message.contains(expected), "{message}");
+        assert!(!message.contains("failed to load config"), "{message}");
+    }
+    assert!(
+        !data.join("sessions").exists(),
+        "invalid scope must not start a planner"
+    );
+}
+
+#[test]
+fn actual_mcp_plan_preserves_goals_scope_predictions_comparisons_and_robot_mode() {
+    use assert_cmd::cargo::cargo_bin_cmd;
+
+    let root = std::env::temp_dir().join(format!("pt-mcp-goals-{}", uuid::Uuid::new_v4()));
+    let config = root.join("config");
+    let data = root.join("data");
+    std::fs::create_dir_all(&config).expect("create retained MCP config");
+    std::fs::write(
+        config.join("policy.json"),
+        serde_json::to_vec_pretty(&pt_core::config::Policy::default()).unwrap(),
+    )
+    .unwrap();
+    let run = |label: &str, arguments: serde_json::Value, robot: bool| {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "pt_plan", "arguments": arguments},
+        });
+        std::fs::write(
+            root.join(format!("{label}.request.json")),
+            request.to_string(),
+        )
+        .unwrap();
+        let mut command = cargo_bin_cmd!("pt-core");
+        command
+            .arg("--config")
+            .arg(&config)
+            .env_remove("PT_CONFIG_DIR")
+            .env_remove("PT_SKIP_GLOBAL_LOCK")
+            .env("PROCESS_TRIAGE_DATA", &data)
+            .env("PROCESS_TRIAGE_RETENTION", "off")
+            .timeout(std::time::Duration::from_secs(120));
+        if robot {
+            command.arg("--robot");
+        }
+        let output = command
+            .arg("mcp")
+            .write_stdin(format!("{request}\n"))
+            .output()
+            .expect("execute MCP server and actual planner child");
+        std::fs::write(root.join(format!("{label}.stdout")), &output.stdout).unwrap();
+        std::fs::write(root.join(format!("{label}.stderr")), &output.stderr).unwrap();
+        assert!(output.status.success(), "{label}: {output:?}");
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(response["error"].is_null(), "{label}: {response}");
+        assert_eq!(response["result"]["isError"], false, "{label}: {response}");
+        let plan: serde_json::Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        let executable: pt_core::plan::Plan = serde_json::from_value(plan.clone()).unwrap();
+        assert!(executable.actions.is_empty(), "{label}: {plan}");
+        assert!(
+            plan["candidates"].as_array().unwrap().is_empty(),
+            "{label}: {plan}"
+        );
+        assert_eq!(plan["args"]["pids"], serde_json::json!([u32::MAX]));
+        assert_eq!(plan["args"]["robot"], robot);
+        assert_eq!(plan["args"]["yes"], false);
+        let saved: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                data.join("sessions")
+                    .join(&executable.session_id)
+                    .join("decision/plan.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            saved, plan,
+            "MCP must return the complete actual saved plan"
+        );
+        plan
+    };
+    eprintln!("retained MCP goal evidence: {}", root.display());
+
+    // An impossible PID selection cannot expand into unrelated live candidates.
+    let baseline = run(
+        "baseline",
+        serde_json::json!({
+            "goal": "free 1MB RAM",
+            "pids": [u32::MAX],
+            "min_score": 0.0,
+            "min_age": 0,
+            "max_candidates": 3,
+            "window_ms": 0,
+            "include_predictions": true,
+            "prediction_fields": ["memory", "diagnostics"],
+        }),
+        false,
+    );
+    assert_eq!(baseline["args"]["goal"], "free 1MB RAM");
+    assert_eq!(baseline["args"]["min_posterior"], 0.0);
+    assert_eq!(baseline["args"]["max_candidates"], 3);
+    assert_eq!(baseline["args"]["include_predictions"], true);
+    assert_eq!(baseline["args"]["prediction_fields"], "memory,diagnostics");
+    assert_eq!(baseline["summary"]["goal_achievable"], false);
+    let baseline_id = baseline["session_id"].as_str().unwrap();
+    let baseline_path = data
+        .join("sessions")
+        .join(baseline_id)
+        .join("decision/plan.json");
+    let original = std::fs::read(&baseline_path).unwrap();
+    // This boundary admits the first snapshot and excludes the second one.
+    let cutoff = chrono::Utc::now().to_rfc3339();
+
+    let comparison = run(
+        "pressure-comparison",
+        serde_json::json!({
+            "goal": "relieve",
+            "pids": [u32::MAX],
+            "since": baseline_id,
+            "window_ms": 0,
+        }),
+        true,
+    );
+    assert_eq!(comparison["args"]["goal"], "relieve");
+    assert_eq!(comparison["args"]["since"], baseline_id);
+    assert_eq!(
+        comparison["differential"]["baseline"]["session_id"],
+        baseline_id
+    );
+    assert_ne!(comparison["session_id"], baseline["session_id"]);
+
+    let disk_path = root.join("Build AND $(touch must-not-run); Cache");
+    std::fs::create_dir(&disk_path).unwrap();
+    let disk_goal = format!("free-disk 1MB on {}", serde_json::json!(disk_path));
+    let timed = run(
+        "disk-time-comparison",
+        serde_json::json!({
+            "goal": disk_goal,
+            "pids": [u32::MAX],
+            "since_time": cutoff,
+            "window_ms": 0,
+        }),
+        true,
+    );
+    assert_eq!(timed["args"]["goal"], disk_goal);
+    assert_eq!(timed["args"]["since_time"], cutoff);
+    assert_eq!(timed["differential"]["baseline"]["session_id"], baseline_id);
+    assert_ne!(timed["session_id"], baseline["session_id"]);
+    assert_eq!(
+        std::fs::read(&baseline_path).unwrap(),
+        original,
+        "comparison requests must never overwrite their baseline"
+    );
+}
+
+#[test]
 fn actual_mcp_scan_and_explain_preserve_config_and_invoker_protection() {
     use assert_cmd::cargo::cargo_bin_cmd;
 
@@ -1739,12 +1984,7 @@ fn actual_mcp_labels_require_confirmation_and_use_the_servers_store() {
 
     let mut confirmed = arguments;
     confirmed["confirmed_by_user"] = serde_json::json!(true);
-    let result = call_actual_mcp_label(
-        config.path(),
-        data.path(),
-        fallback.path(),
-        confirmed,
-    );
+    let result = call_actual_mcp_label(config.path(), data.path(), fallback.path(), confirmed);
     assert_eq!(result["isError"], false, "{result}");
     let label: serde_json::Value =
         serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
@@ -1780,7 +2020,12 @@ fn actual_mcp_live_labels_preserve_processes_and_record_shadow_identity() {
     let config = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     let fallback = tempfile::tempdir().unwrap();
-    let mut target = ChildGuard(std::process::Command::new("sleep").arg("631").spawn().unwrap());
+    let mut target = ChildGuard(
+        std::process::Command::new("sleep")
+            .arg("631")
+            .spawn()
+            .unwrap(),
+    );
     let pid = target.0.id();
     let mut identity = None;
     for verdict in ["kill", "spare"] {
@@ -1835,11 +2080,10 @@ fn actual_mcp_live_labels_preserve_processes_and_record_shadow_identity() {
         assert_eq!(details["verdict"], verdict);
         assert_eq!(observation.belief.recommendation, "human_verdict");
     }
-    let calibration =
-        pt_core::calibrate::validation::ValidationEngine::from_shadow_observations(
-            &observations,
-            0.5,
-        );
+    let calibration = pt_core::calibrate::validation::ValidationEngine::from_shadow_observations(
+        &observations,
+        0.5,
+    );
     assert!(
         calibration.records().is_empty(),
         "labels cannot invent predictions"

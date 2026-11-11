@@ -355,7 +355,32 @@ fn top_signature(process: &ProcessRecord, db: &SignatureDatabase) -> Option<Stri
 
 /// Arguments for `pt-core agent plan` derived from `pt_plan` tool params.
 fn plan_command_args(params: &serde_json::Value) -> Result<Vec<String>, String> {
+    let object = params
+        .as_object()
+        .ok_or_else(|| "pt_plan arguments must be an object".to_string())?;
     let window_ms = activity_window_ms(params)?;
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "deep"
+                | "min_score"
+                | "min_age"
+                | "window_ms"
+                | "goal"
+                | "pids"
+                | "max_candidates"
+                | "since"
+                | "since_time"
+                | "include_predictions"
+                | "prediction_fields"
+        ) {
+            return Err(format!("unknown pt_plan argument: {key}"));
+        }
+    }
+    if object.contains_key("since") && object.contains_key("since_time") {
+        return Err("since and since_time are mutually exclusive".to_string());
+    }
+
     let mut args = vec![
         "agent".to_string(),
         "plan".to_string(),
@@ -364,20 +389,114 @@ fn plan_command_args(params: &serde_json::Value) -> Result<Vec<String>, String> 
         "--window-ms".to_string(),
         window_ms.to_string(),
     ];
-    if params
-        .get("deep")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        args.push("--deep".to_string());
+    if crate::mcp::robot_mode() {
+        args.push("--robot".to_string());
     }
-    if let Some(min) = params.get("min_score").and_then(|v| v.as_f64()) {
+    for (parameter, flag) in [
+        ("deep", "--deep"),
+        ("include_predictions", "--include-predictions"),
+    ] {
+        if let Some(value) = object.get(parameter) {
+            if value
+                .as_bool()
+                .ok_or_else(|| format!("{parameter} must be a boolean"))?
+            {
+                args.push(flag.to_string());
+            }
+        }
+    }
+    if let Some(value) = object.get("min_score") {
+        let min = value
+            .as_f64()
+            .filter(|min| min.is_finite() && (0.0..=1.0).contains(min))
+            .ok_or("min_score must be a number between 0 and 1")?;
         args.push("--min-posterior".to_string());
-        args.push(min.clamp(0.0, 1.0).to_string());
+        args.push(min.to_string());
     }
-    if let Some(min_age) = params.get("min_age").and_then(|v| v.as_u64()) {
+    if let Some(value) = object.get("min_age") {
+        let min_age = value
+            .as_u64()
+            .ok_or("min_age must be a nonnegative integer")?;
         args.push("--min-age".to_string());
         args.push(min_age.to_string());
+    }
+    if let Some(value) = object.get("max_candidates") {
+        let max = value
+            .as_u64()
+            .and_then(|max| u32::try_from(max).ok())
+            .filter(|max| *max > 0)
+            .ok_or("max_candidates must be an integer between 1 and 4294967295")?;
+        args.push("--max-candidates".to_string());
+        args.push(max.to_string());
+    }
+    if let Some(value) = object.get("pids") {
+        let pids = value
+            .as_array()
+            .filter(|pids| !pids.is_empty())
+            .ok_or("pids must be a nonempty array of unique positive process IDs")?;
+        let mut seen = std::collections::HashSet::new();
+        let mut selection = Vec::with_capacity(pids.len());
+        for value in pids {
+            let pid = value
+                .as_u64()
+                .and_then(|pid| u32::try_from(pid).ok())
+                .filter(|pid| *pid > 0)
+                .ok_or("each pid must be an integer between 1 and 4294967295")?;
+            if !seen.insert(pid) {
+                return Err("pids must not contain duplicate process IDs".to_string());
+            }
+            selection.push(pid.to_string());
+        }
+        args.push(format!("--pids={}", selection.join(",")));
+    }
+    for (parameter, flag) in [
+        ("goal", "--goal"),
+        ("since", "--since"),
+        ("since_time", "--since-time"),
+    ] {
+        if let Some(value) = object.get(parameter) {
+            let text = value
+                .as_str()
+                .filter(|text| !text.trim().is_empty() && !text.contains('\0'))
+                .ok_or_else(|| {
+                    format!("{parameter} must be a nonempty string without NUL bytes")
+                })?;
+            if parameter == "goal" {
+                crate::decision::goal_parser::parse_goal(text)
+                    .map_err(|error| format!("invalid goal: {error}"))?
+                    .disk_target()
+                    .map_err(|error| format!("invalid goal: {error}"))?;
+            }
+            if parameter == "since" && pt_common::SessionId::parse(text).is_none() {
+                return Err("since must be a valid pt session ID".to_string());
+            }
+            // The CLI owns relative-time parsing and baseline selection. An
+            // equals argument preserves the whole literal value, including a
+            // filesystem path with spaces, without invoking a shell.
+            args.push(format!("{flag}={text}"));
+        }
+    }
+    if let Some(value) = object.get("prediction_fields") {
+        if object
+            .get("include_predictions")
+            .and_then(|value| value.as_bool())
+            != Some(true)
+        {
+            return Err("prediction_fields requires include_predictions=true".to_string());
+        }
+        let fields: Vec<crate::output::predictions::PredictionField> =
+            serde_json::from_value(value.clone()).map_err(|_| {
+                "prediction_fields must be an array containing memory, cpu, eta_abandoned, eta_resource_limit, trajectory or diagnostics".to_string()
+            })?;
+        let mut seen = std::collections::HashSet::new();
+        if fields.is_empty() || fields.iter().any(|field| !seen.insert(*field)) {
+            return Err("prediction_fields must be a nonempty array of unique fields".to_string());
+        }
+        let names: Vec<String> = serde_json::from_value(
+            serde_json::to_value(fields).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        args.push(format!("--prediction-fields={}", names.join(",")));
     }
     Ok(args)
 }
@@ -520,7 +639,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "pt_plan".to_string(),
             description: "Generate a triage plan with the same engine, protections and \
-                 output as `pt agent plan --format json`."
+                 output as `pt agent plan --format json`. Supports resource recovery, \
+                 pressure relief and comparisons with saved sessions; never applies actions."
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -532,15 +652,70 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "min_score": {
                         "type": "number",
-                        "description": "Minimum P(intervention warranted) in [0,1] (agent plan --min-posterior)"
+                        "description": "Minimum P(intervention warranted) in [0,1] (agent plan --min-posterior)",
+                        "minimum": 0.0,
+                        "maximum": 1.0
                     },
                     "min_age": {
                         "type": "integer",
-                        "description": "Minimum process age in seconds (default: policy guardrail, 1 hour)"
+                        "description": "Minimum process age in seconds (default: policy guardrail, 1 hour)",
+                        "minimum": 0,
+                        "maximum": u64::MAX
                     },
-                    "window_ms": activity_window_schema()
+                    "window_ms": activity_window_schema(),
+                    "goal": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Resource or pressure goal using the CLI grammar, e.g. free 4GB RAM, free port 3000, free 100 FDs, free-disk 4GB on /data, relieve, cpu-pressure, mem-pressure or io-pressure; goals never bypass safety gates"
+                    },
+                    "pids": {
+                        "type": "array",
+                        "minItems": 1,
+                        "uniqueItems": true,
+                        "items": {"type": "integer", "minimum": 1, "maximum": u32::MAX},
+                        "description": "Restrict candidate inference to these process IDs; ancestry, resource ownership and protection still use the full process census"
+                    },
+                    "max_candidates": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": u32::MAX,
+                        "default": 20,
+                        "description": "Maximum candidates in the plan"
+                    },
+                    "since": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Compare with this saved same-host session ID while retaining a complete fresh plan; mutually exclusive with since_time"
+                    },
+                    "since_time": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Compare with the latest same-host snapshot at or before a positive duration ago (e.g. 2h) or a past RFC3339 timestamp; mutually exclusive with since"
+                    },
+                    "include_predictions": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Include trajectory analysis from recorded process observations; unavailable or insufficient history stays unknown"
+                    },
+                    "prediction_fields": {
+                        "type": "array",
+                        "minItems": 1,
+                        "uniqueItems": true,
+                        "items": {
+                            "type": "string",
+                            "enum": ["memory", "cpu", "eta_abandoned", "eta_resource_limit", "trajectory", "diagnostics"]
+                        },
+                        "description": "Select prediction subfields; requires include_predictions=true"
+                    }
                 },
                 "required": [],
+                "allOf": [
+                    {"not": {"required": ["since", "since_time"]}},
+                    {"anyOf": [
+                        {"not": {"required": ["prediction_fields"]}},
+                        {"required": ["include_predictions"], "properties": {"include_predictions": {"const": true}}}
+                    ]}
+                ],
                 "additionalProperties": false
             }),
         },
@@ -1469,9 +1644,129 @@ mod tests {
             assert_eq!(args[4], "--window-ms");
             assert_eq!(args[5], window_ms.to_string());
         }
-        // Out-of-range scores are clamped into a valid posterior.
-        let args = plan_command_args(&serde_json::json!({"min_score": 7.0})).unwrap();
-        assert_eq!(args[args.len() - 1], "1");
+        // An invalid selection threshold must not silently change the request.
+        assert!(plan_command_args(&serde_json::json!({"min_score": 7.0})).is_err());
+    }
+
+    #[test]
+    fn plan_tool_forwards_scoped_goals_predictions_and_literal_paths() {
+        let session = pt_common::SessionId::new();
+        let goal = r#"free-disk 1GB on "/tmp/Build AND $(touch must-not-run); Cache""#;
+        let args = plan_command_args(&serde_json::json!({
+            "goal": goal,
+            "pids": [42, u32::MAX],
+            "max_candidates": 5,
+            "since": session.0,
+            "include_predictions": true,
+            "prediction_fields": ["memory", "diagnostics"],
+        }))
+        .unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "agent".to_string(),
+                "plan".to_string(),
+                "--format".to_string(),
+                "json".to_string(),
+                "--window-ms".to_string(),
+                "500".to_string(),
+                "--include-predictions".to_string(),
+                "--max-candidates".to_string(),
+                "5".to_string(),
+                format!("--pids=42,{}", u32::MAX),
+                format!("--goal={goal}"),
+                format!("--since={}", session.0),
+                "--prediction-fields=memory,diagnostics".to_string(),
+            ]
+        );
+        for goal in [
+            "free 4GB RAM",
+            "free port 3000",
+            "free 100 FDs",
+            "free 1GB RAM AND free port 3000",
+            "relieve",
+            "cpu-pressure",
+            "mem-pressure",
+            "io-pressure",
+        ] {
+            let args = plan_command_args(&serde_json::json!({
+                "goal": goal,
+                "since_time": "2h",
+            }))
+            .unwrap();
+            assert!(args.contains(&format!("--goal={goal}")), "{args:?}");
+            assert!(args.contains(&"--since-time=2h".to_string()), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn plan_tool_rejects_invalid_or_ambiguous_options_before_spawning() {
+        let session = pt_common::SessionId::new();
+        for arguments in [
+            serde_json::json!(null),
+            serde_json::json!([]),
+            serde_json::json!({"pid": 42}),
+            serde_json::json!({"pids": []}),
+            serde_json::json!({"pids": [42, 42]}),
+            serde_json::json!({"pids": "42,43"}),
+            serde_json::json!({"pids": [0]}),
+            serde_json::json!({"pids": [-1]}),
+            serde_json::json!({"pids": [u64::MAX]}),
+            serde_json::json!({"pids": [0.5]}),
+            serde_json::json!({"pids": ["42"]}),
+            serde_json::json!({"pids": [null]}),
+            serde_json::json!({"max_candidates": 0}),
+            serde_json::json!({"max_candidates": u64::MAX}),
+            serde_json::json!({"max_candidates": 0.5}),
+            serde_json::json!({"max_candidates": "5"}),
+            serde_json::json!({"min_age": -1}),
+            serde_json::json!({"min_age": "60"}),
+            serde_json::json!({"min_score": -0.1}),
+            serde_json::json!({"min_score": 1.1}),
+            serde_json::json!({"min_score": "0.9"}),
+            serde_json::json!({"deep": "true"}),
+            serde_json::json!({"include_predictions": 1}),
+            serde_json::json!({"goal": ""}),
+            serde_json::json!({"goal": " \t"}),
+            serde_json::json!({"goal": "relieve\0"}),
+            serde_json::json!({"goal": "free port 0"}),
+            serde_json::json!({"goal": "free-disk 1GB on relative/path"}),
+            serde_json::json!({"goal": "free-disk 1GB on /data AND free-disk 1GB on /tmp"}),
+            serde_json::json!({"goal": ["relieve"]}),
+            serde_json::json!({"since": "not-a-session"}),
+            serde_json::json!({"since": session.0, "since_time": "2h"}),
+            serde_json::json!({"since_time": ""}),
+            serde_json::json!({"since_time": 3600}),
+            serde_json::json!({"prediction_fields": ["memory"]}),
+            serde_json::json!({"prediction_fields": ["memory"], "include_predictions": false}),
+            serde_json::json!({"prediction_fields": [], "include_predictions": true}),
+            serde_json::json!({"prediction_fields": ["memory", "memory"], "include_predictions": true}),
+            serde_json::json!({"prediction_fields": ["invented"], "include_predictions": true}),
+            serde_json::json!({"prediction_fields": "memory,cpu", "include_predictions": true}),
+            serde_json::json!({"apply": true}),
+            serde_json::json!({"yes": true}),
+            serde_json::json!({"robot": false}),
+            serde_json::json!({"session": session.0}),
+        ] {
+            assert!(call_tool("pt_plan", &arguments).is_err(), "{arguments}");
+        }
+        for parameter in [
+            "deep",
+            "min_score",
+            "min_age",
+            "window_ms",
+            "goal",
+            "pids",
+            "max_candidates",
+            "since",
+            "since_time",
+            "include_predictions",
+            "prediction_fields",
+        ] {
+            let mut arguments = serde_json::json!({});
+            arguments[parameter] = serde_json::Value::Null;
+            assert!(call_tool("pt_plan", &arguments).is_err(), "{parameter}");
+        }
     }
 
     #[test]

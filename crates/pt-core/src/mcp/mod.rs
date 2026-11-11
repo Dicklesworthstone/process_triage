@@ -14,11 +14,22 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
+static ROBOT_MODE: OnceLock<bool> = OnceLock::new();
 
 /// Use `dir` (the `--config` / `PT_CONFIG_DIR` directory) for every config file the
 /// MCP tools and resources read, as the CLI commands do. Set once, before serving.
 pub fn set_config_dir(dir: PathBuf) {
     let _ = CONFIG_DIR.set(dir);
+}
+
+/// Preserve the server's robot policy for delegated planning. Tools cannot turn
+/// this off through their arguments. Set once, before accepting requests.
+pub fn set_robot_mode(enabled: bool) {
+    let _ = ROBOT_MODE.set(enabled);
+}
+
+pub(crate) fn robot_mode() -> bool {
+    ROBOT_MODE.get().copied().unwrap_or(false)
 }
 
 /// Config options for the MCP tools and resources: the directory given to
