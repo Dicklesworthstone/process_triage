@@ -781,7 +781,27 @@ impl SignalActionRunner {
             }
         };
         let receipt = journal.prepare_signal_stop(action, was_stopped)?;
-        let execution = (|| {
+        self.apply_prepared_pause(action, deadline, &pidfd, was_stopped, &receipt)?;
+        *applied = Some(AppliedPause {
+            action_id: action.action_id.clone(),
+            target: action.target.clone(),
+            receipt,
+        });
+        Ok(())
+    }
+
+    /// A refusal before the first signal attempt owns no process stop. Keep it
+    /// distinct from an attempted delivery whose effect may need recovery.
+    #[cfg(target_os = "linux")]
+    fn apply_prepared_pause(
+        &self,
+        action: &PlanAction,
+        deadline: &SignalDeadline,
+        pidfd: &PidFd,
+        was_stopped: bool,
+        receipt: &PreparedReversal,
+    ) -> Result<(), ActionError> {
+        let ready = (|| {
             deadline.remaining()?;
             let state = signal_state(&action.target)?;
             if !matches!(state, 'R' | 'S' | 'D' | 'I' | 'T') || (state == 'T') != was_stopped {
@@ -790,19 +810,21 @@ impl SignalActionRunner {
                 ));
             }
             deadline.remaining()?;
+            Ok(())
+        })();
+        if let Err(error) = ready {
+            return receipt.abort_signal_stop(error);
+        }
+        let execution = (|| {
             if !was_stopped {
+                // From this point even a syscall error remains an attempted
+                // actuation; do not release its conservative recovery receipt.
                 pidfd.send(libc::SIGSTOP)?;
                 self.note_path("pidfd");
             }
             Ok(())
         })();
-        receipt.finish(execution, ReversalStatus::Applied)?;
-        *applied = Some(AppliedPause {
-            action_id: action.action_id.clone(),
-            target: action.target.clone(),
-            receipt,
-        });
-        Ok(())
+        receipt.finish(execution, ReversalStatus::Applied)
     }
 
     /// Re-check start identity immediately before fallback signaling, including
@@ -2015,6 +2037,87 @@ mod tests {
                     signal_state(&action.target),
                     Ok('R' | 'S' | 'D' | 'I')
                 ));
+                assert!(runner.take_signal_path().is_none());
+                assert!(!runner.take_kill_signal_delivered());
+                assert!(!marker.exists());
+            }
+        }
+
+        #[test]
+        fn prepared_pause_aborts_unsent_stops_without_claiming_an_external_stop() {
+            for externally_stopped in [false, true] {
+                let dir = tempfile::tempdir().expect("pause session directory");
+                let marker = dir.path().join("term-handled");
+                let (child, mut action) = stopped_term_child(&marker, false, false);
+                let setup = SignalActionRunner::with_defaults();
+                setup
+                    .resume(child.0.id(), false, None)
+                    .expect("resume owned child before receipt preparation");
+                setup
+                    .wait_for_planned_state(
+                        &action.target,
+                        SignalExpectation::Resumed,
+                        Duration::from_secs(5),
+                    )
+                    .expect("original child is running");
+                action.action = Action::Pause;
+                let sessions_root = dir.path().join("sessions");
+                let session_id = "pt-unsent-pause";
+                let action_directory = sessions_root.join(session_id).join("action");
+                std::fs::create_dir_all(&action_directory).unwrap();
+                let journal = Arc::new(
+                    ReversalJournal::new(
+                        action_directory,
+                        session_id,
+                        "a".repeat(64),
+                        &sessions_root,
+                    )
+                    .unwrap(),
+                );
+                let runner =
+                    SignalActionRunner::with_defaults().with_reversal_journal(Arc::clone(&journal));
+                let pidfd = PidFd::open(child.0.id())
+                    .unwrap()
+                    .expect("kernel pidfd support");
+                let receipt = journal.prepare_signal_stop(&action, false).unwrap();
+                if externally_stopped {
+                    setup
+                        .send_signal(child.0.id(), libc::SIGSTOP, false)
+                        .expect("external stop after receipt preparation");
+                    setup
+                        .wait_for_planned_state(
+                            &action.target,
+                            SignalExpectation::Stopped,
+                            Duration::from_secs(5),
+                        )
+                        .expect("external stop completed");
+                }
+                let deadline = SignalDeadline::new(if externally_stopped { 5_000 } else { 0 });
+                let error = runner
+                    .apply_prepared_pause(&action, &deadline, &pidfd, false, &receipt)
+                    .expect_err("pre-delivery refusal must abort an unsent pause");
+                if externally_stopped {
+                    assert!(error.to_string().contains("job-control state changed"));
+                } else {
+                    let timeout_detail = ActionError::Timeout.to_string();
+                    assert!(error.to_string().contains(timeout_detail.as_str()));
+                }
+
+                let records = journal.inspect(&action).unwrap();
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].status, ReversalStatus::NotApplied);
+                assert!(records[0].restorations.is_empty());
+                assert!(journal.observe_restoration(&action).unwrap().is_none());
+                journal
+                    .ensure_signal_stop_unowned(&action.target)
+                    .expect("an unsent pause must not retain stop ownership");
+                assert!(journal.restore(&action, None).is_err());
+                let state = signal_state(&action.target).unwrap();
+                if externally_stopped {
+                    assert_eq!(state, 'T', "undo cannot release somebody else's stop");
+                } else {
+                    assert!(matches!(state, 'R' | 'S' | 'D' | 'I'));
+                }
                 assert!(runner.take_signal_path().is_none());
                 assert!(!runner.take_kill_signal_delivered());
                 assert!(!marker.exists());

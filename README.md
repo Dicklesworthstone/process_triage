@@ -1589,7 +1589,9 @@ Linux pidfd bound to the original process and checks its PID namespace, birth
 identity, owner and current job-control state before sending SIGCONT. If the
 process was already stopped before apply, undo preserves that stop and sends no
 signal. Tracing stops, missing or changed identities, and unreadable state are
-refused. An unresolved receipt for a previously running process requires a
+refused. A known failure before signal delivery is recorded as `not_applied`:
+its receipt remains inspectable but cannot authorize a resume or retain stop ownership.
+An unresolved receipt for a previously running process requires a
 currently observed job-control stop: a `prepared` record may precede a still
 pending SIGSTOP, so an apparently running process cannot be treated as safely
 restored. After a completed undo, a later stop cannot reuse the old receipt to

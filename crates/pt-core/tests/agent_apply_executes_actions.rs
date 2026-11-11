@@ -398,18 +398,20 @@ impl ForeignTarget {
         use std::os::unix::process::CommandExt;
         let tty_slave = terminal.as_ref().map(|(_, slave)| slave.as_raw_fd());
         let mut cmd = ProcessCommand::new("sh");
+        // This fixture represents an independent login's workload. Inherited
+        // agent or SSH session markers would correctly make it supervised or
+        // session-protected instead of the foreign target under test.
+        cmd.env_clear().env(
+            "PATH",
+            std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()),
+        );
         // stdio on /dev/null: an inherited log file open for writing would (rightly)
         // trip the data-loss gate.
         cmd.args([
             "-c",
             &format!("{script} </dev/null >/dev/null 2>&1 & echo $!; wait"),
         ])
-        .stdout(std::process::Stdio::piped())
-        // From another login: session safety protects whatever shares pt's own SSH
-        // connection (the test may itself run over ssh).
-        .env_remove("SSH_CONNECTION")
-        .env_remove("SSH_CLIENT")
-        .env_remove("SSH_TTY");
+        .stdout(std::process::Stdio::piped());
         // SAFETY: these calls only configure the child before exec. The borrowed
         // slave stays alive in the parent until spawn has completed.
         unsafe {
@@ -3805,6 +3807,101 @@ fn agent_undo_renice_uses_saved_priorities_and_reports_restoration_truthfully() 
         );
         assert!(victim.alive(), "undo and verify must not signal the target");
     }
+}
+
+/// Verification observes the planned incarnation without signaling a different
+/// process that happens to have the same numeric PID and job-control state.
+#[cfg(target_os = "linux")]
+#[test]
+fn signal_verification_requires_original_identity_and_live_resume() {
+    use pt_core::action::{ActionError, ActionRunner, SignalActionRunner};
+
+    let mut victim = ForeignTarget::spawn("sleep 369");
+    let identity = live_identity(victim.pid);
+    let mut pause = plan_action(Action::Pause, &identity);
+    pause.timeouts.verify_ms = 1_000;
+    let actor = SignalActionRunner::with_defaults();
+    let observer = SignalActionRunner::with_defaults();
+    actor.execute(&pause).expect("stop the owned target");
+    observer.verify(&pause).expect("original target is stopped");
+
+    let (birth, embedded_pid) = identity.start_id.0.rsplit_once(':').unwrap();
+    let (boot, ticks) = birth.rsplit_once(':').unwrap();
+    let ticks: u64 = ticks.parse().unwrap();
+    assert_eq!(embedded_pid.parse::<u32>().unwrap(), victim.pid);
+    let different_birth = pt_common::StartId::from_linux(boot, ticks + 1, victim.pid);
+    for changed in ["birth", "boot", "embedded_pid", "uid", "pgid", "sid"] {
+        let mut stale = pause.clone();
+        match changed {
+            "birth" => stale.target.start_id = different_birth.clone(),
+            "boot" => {
+                stale.target.start_id =
+                    pt_common::StartId::from_linux("different-boot", ticks, victim.pid);
+            }
+            "embedded_pid" => {
+                stale.target.start_id = pt_common::StartId::from_linux(boot, ticks, victim.pid + 1);
+            }
+            "uid" => stale.target.uid ^= 1,
+            "pgid" => stale.target.pgid = Some(identity.pgid.unwrap() + 1),
+            "sid" => stale.target.sid = Some(identity.sid.unwrap() + 1),
+            _ => unreachable!(),
+        }
+        assert!(
+            matches!(observer.verify(&stale), Err(ActionError::IdentityMismatch)),
+            "{changed}: a stopped numeric PID cannot verify another identity"
+        );
+    }
+
+    let mut replaced = plan_action(Action::Kill, &identity);
+    replaced.target.start_id = different_birth;
+    observer
+        .verify(&replaced)
+        .expect("a different birth proves the recorded target is gone");
+    let mut live_kill = plan_action(Action::Kill, &identity);
+    live_kill.timeouts.verify_ms = 100;
+    assert!(matches!(
+        observer.verify(&live_kill),
+        Err(ActionError::Timeout)
+    ));
+    let mut reap = plan_action(Action::Restart, &identity);
+    reap.routing = ActionRouting::ZombieToParent;
+    reap.original_zombie_target = Some(identity.clone());
+    reap.timeouts.verify_ms = 100;
+    assert!(
+        observer.verify_zombie_reaped(&reap).is_err(),
+        "a live original process has not been reaped"
+    );
+    assert_eq!(state_of(victim.pid), Some('T'));
+    assert_eq!(live_identity(victim.pid), identity);
+
+    let mut resume = plan_action(Action::Resume, &identity);
+    resume.timeouts.verify_ms = 1_000;
+    actor.execute(&resume).expect("resume the owned target");
+    observer
+        .verify(&resume)
+        .expect("the original target resumed");
+    let mut wrong_owner = resume.clone();
+    wrong_owner.target.uid ^= 1;
+    assert!(matches!(
+        observer.verify(&wrong_owner),
+        Err(ActionError::IdentityMismatch)
+    ));
+
+    let kill = plan_action(Action::Kill, &identity);
+    actor.execute(&kill).expect("terminate the owned target");
+    observer.verify(&kill).expect("the original target exited");
+    victim.leader.wait().expect("reap the owned session leader");
+    for action in [&pause, &resume] {
+        assert!(
+            matches!(
+                observer.verify(action),
+                Err(ActionError::ProcessNotFound | ActionError::IdentityMismatch)
+            ),
+            "exit must not confirm a live pause or resume"
+        );
+    }
+    assert!(!observer.take_kill_signal_delivered());
+    assert!(observer.take_signal_path().is_none());
 }
 
 /// A new CLI invocation can restore a SIGSTOP after the applying process exits.

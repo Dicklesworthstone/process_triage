@@ -43,6 +43,9 @@ pub enum ReversalStatus {
     Applied,
     Verified,
     Failed,
+    /// A prepared pause was aborted before any signal delivery was attempted.
+    /// This retains execution evidence without claiming a stop or restoration.
+    NotApplied,
     Unsupported,
 }
 
@@ -272,6 +275,13 @@ impl ReversalRecord {
             .any(|outcome| outcome.status == RestorationStatus::Restored)
     }
 
+    fn has_unresolved_control(&self) -> bool {
+        !matches!(
+            self.status,
+            ReversalStatus::Unsupported | ReversalStatus::NotApplied
+        ) && !self.is_restored()
+    }
+
     fn check_action(&self, action: &PlanAction) -> Result<(), ActionError> {
         if self.action_id != action.action_id
             || self.action != action.action
@@ -475,6 +485,11 @@ impl ReversalJournal {
             .ok_or_else(|| failed("no durable undo receipt exists for this action"))?;
         let records = self.read_records(&directory)?;
         let mut record = select_receipt(&records, action, attempt_id)?.clone();
+        if record.status == ReversalStatus::NotApplied {
+            return Err(failed(
+                "this pause was aborted before any signal attempt; its receipt cannot authorize undo",
+            ));
+        }
         if matches!(record.operation, ReversalOperation::Unsupported { .. }) {
             return Err(failed(
                 "this execution has no supported durable undo operation",
@@ -666,11 +681,10 @@ impl ReversalJournal {
         let directory = JournalDirectory::open(&self.directory, true)?
             .ok_or_else(|| failed("cannot create private undo directory"))?;
         let records = self.read_records(&directory)?;
-        if records.iter().any(|record| {
-            record.action_id == action.action_id
-                && record.status != ReversalStatus::Unsupported
-                && !record.is_restored()
-        }) {
+        if records
+            .iter()
+            .any(|record| record.action_id == action.action_id && record.has_unresolved_control())
+        {
             return Err(failed(format!(
                 "action {} already has an unresolved undo receipt; inspect or undo that attempt before retrying",
                 action.action_id
@@ -757,6 +771,31 @@ impl PreparedReversal {
         result: Result<T, ActionError>,
         success: ReversalStatus,
     ) -> Result<T, ActionError> {
+        if success == ReversalStatus::NotApplied {
+            return Err(failed(
+                "known-unsent pause failures require the explicit abort operation",
+            ));
+        }
+        self.finish_with_failure_status(result, success, ReversalStatus::Failed)
+    }
+
+    /// Record a failure known to precede every SIGSTOP delivery attempt. Never
+    /// use this for a failed syscall or after a crash: those remain uncertain.
+    /// The error is returned after persisting a terminal, non-owning receipt.
+    pub(crate) fn abort_signal_stop(&self, error: ActionError) -> Result<(), ActionError> {
+        self.finish_with_failure_status(
+            Err(error),
+            ReversalStatus::Applied,
+            ReversalStatus::NotApplied,
+        )
+    }
+
+    fn finish_with_failure_status<T>(
+        &self,
+        result: Result<T, ActionError>,
+        success: ReversalStatus,
+        failure: ReversalStatus,
+    ) -> Result<T, ActionError> {
         let update = || -> Result<(), ActionError> {
             let _lock = self
                 .journal
@@ -774,11 +813,19 @@ impl PreparedReversal {
             if record.is_restored() {
                 return Err(failed("cannot update an already restored execution"));
             }
-            record.status = if result.is_ok() {
-                success
-            } else {
-                ReversalStatus::Failed
-            };
+            if record.status == ReversalStatus::NotApplied {
+                return Err(failed("cannot reactivate a known-unsent pause receipt"));
+            }
+            if failure == ReversalStatus::NotApplied
+                && (record.status != ReversalStatus::Prepared
+                    || !matches!(record.operation, ReversalOperation::SignalStop { .. })
+                    || !record.restorations.is_empty())
+            {
+                return Err(failed(
+                    "only an untouched prepared pause can be aborted as known-unsent",
+                ));
+            }
+            record.status = if result.is_ok() { success } else { failure };
             record.detail = result.as_ref().err().map(ToString::to_string);
             record.updated_at = now();
             self.journal.write_record(&directory, &record, false)
@@ -866,6 +913,15 @@ fn validate_record(record: &ReversalRecord) -> Result<(), ActionError> {
         || (record.action != Action::CapMemory && record.memory_cap.is_some())
     {
         return Err(failed("invalid or unsupported undo receipt"));
+    }
+    if record.status == ReversalStatus::NotApplied
+        && (!matches!(record.operation, ReversalOperation::SignalStop { .. })
+            || !record.restorations.is_empty()
+            || record.detail.as_deref().is_none_or(str::is_empty))
+    {
+        return Err(failed(
+            "known-unsent status requires an aborted pause and no restoration claim",
+        ));
     }
     match &record.operation {
         ReversalOperation::CgroupV2 {
@@ -1052,7 +1108,7 @@ fn select_receipt<'a>(
     let unresolved: Vec<_> = matching
         .iter()
         .copied()
-        .filter(|record| !record.is_restored() && record.status != ReversalStatus::Unsupported)
+        .filter(|record| record.has_unresolved_control())
         .collect();
     match unresolved.as_slice() {
         [record] => Ok(record),
@@ -1071,7 +1127,7 @@ fn refuse_newer_control(
 ) -> Result<(), ActionError> {
     for later in records
         .iter()
-        .filter(|record| record.sequence > selected.sequence && !record.is_restored())
+        .filter(|record| record.sequence > selected.sequence && record.has_unresolved_control())
     {
         if operations_share_control(&selected.operation, &later.operation) {
             return Err(failed(format!(
@@ -1351,7 +1407,9 @@ fn refuse_other_session_owner(
             ));
         }
         for record in records {
-            if !record.is_restored() && operations_share_control(operation, &record.operation) {
+            if record.has_unresolved_control()
+                && operations_share_control(operation, &record.operation)
+            {
                 return Err(failed(format!(
                     "controller has an unresolved durable owner in session {} (receipt {}); undo that attempt first",
                     record.session_id, record.attempt_id
@@ -1692,6 +1750,9 @@ impl ReversalScope {
 
 #[cfg(target_os = "linux")]
 fn restore_live(record: &ReversalRecord) -> Result<bool, ActionError> {
+    if record.status == ReversalStatus::NotApplied {
+        return Err(failed("a known-unsent pause has no control to restore"));
+    }
     if record.memory_cap.is_some() {
         super::memory_cap::ensure_nonblocking_kernel()?;
     }
@@ -2426,6 +2487,116 @@ mod tests {
     }
 
     #[test]
+    fn known_unsent_pause_is_terminal_without_claiming_restoration() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = journal(directory.path());
+        let action = action(Action::Pause);
+        let original = journal
+            .insert(
+                &action,
+                pause_operation(&action, false),
+                ReversalStatus::Prepared,
+            )
+            .unwrap();
+        let receipt = PreparedReversal {
+            journal: Arc::clone(&journal),
+            attempt_id: original.attempt_id.clone(),
+        };
+        let error = receipt
+            .abort_signal_stop(failed("stop changed before delivery"))
+            .unwrap_err();
+        assert!(error.to_string().contains(&original.attempt_id));
+        let saved = journal.inspect(&action).unwrap().remove(0);
+        assert_eq!(saved.status, ReversalStatus::NotApplied);
+        assert_eq!(saved.operation, original.operation);
+        assert_eq!(saved.prepared_at, original.prepared_at);
+        assert!(saved.detail.as_deref().unwrap().contains("before delivery"));
+        assert!(!saved.has_unresolved_control());
+        assert!(!saved.is_restored());
+        assert!(saved.restorations.is_empty());
+        assert_eq!(
+            serde_json::to_value(&saved).unwrap()["status"],
+            "not_applied"
+        );
+        assert!(journal.observe_restoration(&action).unwrap().is_none());
+
+        let path = journal
+            .directory()
+            .join(format!("{}.json", saved.attempt_id));
+        let bytes = fs::read(&path).unwrap();
+        assert!(journal.restore(&action, None).is_err());
+        assert!(receipt.finish(Ok(()), ReversalStatus::Applied).is_err());
+        assert!(receipt
+            .finish::<()>(Err(ActionError::Timeout), ReversalStatus::Applied)
+            .is_err());
+        assert!(receipt.abort_signal_stop(ActionError::Timeout).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+
+        let mut false_restoration = saved.clone();
+        false_restoration
+            .restorations
+            .push(restored_outcome(&saved));
+        assert!(validate_record(&false_restoration).is_err());
+        let mut missing_reason = saved.clone();
+        missing_reason.detail = None;
+        assert!(validate_record(&missing_reason).is_err());
+        let mut wrong_control = saved;
+        wrong_control.action = Action::Freeze;
+        wrong_control.operation = freeze_operation();
+        assert!(validate_record(&wrong_control).is_err());
+
+        // A known-unsent attempt remains in history but does not block retry.
+        journal
+            .insert(
+                &action,
+                pause_operation(&action, true),
+                ReversalStatus::Prepared,
+            )
+            .unwrap();
+        assert_eq!(journal.inspect(&action).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn known_unsent_abort_cannot_revoke_uncertain_or_other_control_receipts() {
+        for status in [
+            ReversalStatus::Applied,
+            ReversalStatus::Verified,
+            ReversalStatus::Failed,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let journal = journal(directory.path());
+            let action = action(Action::Pause);
+            let original = journal
+                .insert(&action, pause_operation(&action, false), status)
+                .unwrap();
+            let receipt = PreparedReversal {
+                journal: Arc::clone(&journal),
+                attempt_id: original.attempt_id,
+            };
+            assert!(receipt.abort_signal_stop(ActionError::Timeout).is_err());
+            let saved = journal.inspect(&action).unwrap().remove(0);
+            assert_eq!(saved.status, status);
+            assert!(saved.has_unresolved_control());
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let journal = journal(directory.path());
+        let action = action(Action::Freeze);
+        let original = journal
+            .insert(&action, freeze_operation(), ReversalStatus::Prepared)
+            .unwrap();
+        let receipt = PreparedReversal {
+            journal: Arc::clone(&journal),
+            attempt_id: original.attempt_id,
+        };
+        assert!(receipt.abort_signal_stop(ActionError::Timeout).is_err());
+        assert_eq!(
+            journal.inspect(&action).unwrap()[0].status,
+            ReversalStatus::Prepared
+        );
+    }
+
+    #[test]
     fn pause_ownership_follows_incarnation_even_after_group_or_owner_changes() {
         let temp = tempfile::tempdir().unwrap();
         let first = journal_in_sessions(temp.path(), "pause-first");
@@ -2882,6 +3053,57 @@ mod tests {
         action.target = super::super::dispatch::read_cgroup_identity(child.0.id())
             .expect("owned process full Linux identity");
         (child, action)
+    }
+
+    #[test]
+    fn known_unsent_pause_releases_ownership_without_resuming_an_external_stop() {
+        use crate::action::{ActionRunner, SignalActionRunner};
+        let (_child, mut action) = owned_renice_target();
+        action.action = Action::Pause;
+        let directory = tempfile::tempdir().unwrap();
+        let first = journal_in_sessions(directory.path(), "aborted-pause");
+        let next = journal_in_sessions(directory.path(), "next-pause");
+        let prepared = first.prepare_signal_stop(&action, false).unwrap();
+        let original = first.inspect(&action).unwrap().remove(0);
+        assert_eq!(original.status, ReversalStatus::Prepared);
+
+        // This stop belongs to an independent actor and predates our own send.
+        let external = SignalActionRunner::with_defaults();
+        external.execute(&action).unwrap();
+        external.verify(&action).unwrap();
+        assert!(prepared
+            .abort_signal_stop(failed("external stop observed before delivery"))
+            .is_err());
+        let aborted = first.inspect(&action).unwrap().remove(0);
+        assert_eq!(aborted.status, ReversalStatus::NotApplied);
+        assert_eq!(aborted.operation, original.operation);
+        assert!(aborted.restorations.is_empty());
+        assert!(first.restore(&action, None).is_err());
+        assert!(first.observe_restoration(&action).unwrap().is_none());
+        assert_eq!(
+            super::super::signal::signal_state(&action.target).unwrap(),
+            'T'
+        );
+        assert!(first.ensure_signal_stop_unowned(&action.target).is_ok());
+        assert!(next.ensure_signal_stop_unowned(&action.target).is_ok());
+        assert!(ensure_signal_stop_unowned(directory.path(), &action.target).is_ok());
+
+        // A later legitimate action sees the existing stop as its original
+        // state. Its own successful no-op undo must also preserve that stop.
+        let runner = SignalActionRunner::with_defaults().with_reversal_journal(Arc::clone(&next));
+        runner.execute(&action).unwrap();
+        runner.verify(&action).unwrap();
+        let outcome = next.restore(&action, None).unwrap();
+        assert_eq!(outcome.status, RestorationStatus::Restored);
+        assert_eq!(outcome.changed, Some(false));
+        assert_eq!(
+            super::super::signal::signal_state(&action.target).unwrap(),
+            'T'
+        );
+        let retained = first.inspect(&action).unwrap().remove(0);
+        assert_eq!(retained.status, ReversalStatus::NotApplied);
+        assert_eq!(retained.attempt_id, original.attempt_id);
+        assert!(retained.restorations.is_empty());
     }
 
     #[test]

@@ -100,8 +100,6 @@ use pt_core::verify::resource_prediction::{
     PrivateMemoryPrediction, ResourcePredictionSnapshot, ValidatedResourcePredictions,
     RESOURCE_PREDICTION_SCHEMA_VERSION,
 };
-#[cfg(test)]
-use pt_core::verify::verify_plan;
 use pt_core::verify::{
     executed_plan_actions, observe_live_postcondition, parse_action_outcomes, parse_agent_plan,
     verify_plan_with_postconditions, VerifyOutcome,
@@ -33286,6 +33284,7 @@ impl WatchWorkloadState {
 #[cfg(test)]
 mod workload_diagnostics_tests {
     use super::*;
+    use pt_common::StartId;
     use pt_core::collect::duplicates::{DuplicateRole, ProcessWorkDiagnosis};
 
     fn diagnosis(role: DuplicateRole) -> ProcessWorkDiagnosis {
