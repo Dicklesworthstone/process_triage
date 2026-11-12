@@ -27,6 +27,8 @@ use pt_core::collect::ContainerRuntime;
 use pt_core::config::{
     get_preset, list_presets, load_config, ConfigError, ConfigOptions, PresetName, Priors,
 };
+#[cfg(feature = "daemon")]
+use pt_core::daemon::escalation::DaemonEscalationResult;
 use pt_core::decision::pressure_regime::{
     assess as assess_pressure, psi_evidence_available as watch_psi_available,
     regime_evidence_available as watch_regime_evidence_available, PressureThresholds,
@@ -16400,12 +16402,6 @@ fn save_daemon_state(path: &Path, state: &DaemonStateBundle) -> std::io::Result<
 }
 
 #[cfg(feature = "daemon")]
-struct DaemonEscalationResult {
-    session_id: String,
-    candidates_found: u32,
-}
-
-#[cfg(feature = "daemon")]
 fn run_daemon_escalation(
     global: &GlobalOpts,
     triggers: &[pt_core::daemon::triggers::FiredTrigger],
@@ -16461,7 +16457,30 @@ fn run_daemon_plan(
     pressure_relief: bool,
 ) -> Result<DaemonEscalationResult, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let mut cmd = std::process::Command::new(exe);
+    let spec = daemon_planner_spec(
+        global,
+        &exe,
+        session_id,
+        deep,
+        max_candidates,
+        pressure_relief,
+    )?;
+    pt_core::daemon::escalation::run_planner(&spec, session_id)
+}
+
+#[cfg(feature = "daemon")]
+fn daemon_planner_spec(
+    global: &GlobalOpts,
+    executable: &Path,
+    session_id: Option<&str>,
+    deep: bool,
+    max_candidates: u32,
+    pressure_relief: bool,
+) -> Result<pt_core::collect::tool_runner::ToolSpec, String> {
+    use pt_core::collect::tool_runner::ToolSpec;
+    use pt_core::daemon::escalation::PLAN_TIMEOUT_SECS;
+
+    let mut cmd = std::process::Command::new(executable);
     cmd.args(["--format", "json", "agent", "plan", "--max-candidates"])
         .arg(max_candidates.to_string());
     if pressure_relief {
@@ -16473,46 +16492,63 @@ fn run_daemon_plan(
     if let Some(session) = session_id {
         cmd.arg("--session").arg(session);
     }
-    cmd.stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .env("PT_SKIP_GLOBAL_LOCK", "1");
-
     apply_daemon_global_args(&mut cmd, global);
-
-    let output = cmd.output().map_err(|e| e.to_string())?;
-    let stdout = output.stdout;
-    if stdout.is_empty() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "daemon escalation: empty stdout (status {:?}): {}",
-            output.status.code(),
-            stderr.trim()
-        ));
+    if let Some(capabilities) = &global.capabilities {
+        cmd.arg("--capabilities").arg(capabilities);
     }
-
-    let json: serde_json::Value =
-        serde_json::from_slice(&stdout).map_err(|e| format!("invalid JSON: {}", e))?;
-    let session_id = json
-        .get("session_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "missing session_id in plan output".to_string())?
-        .to_string();
-    let candidates_found = json
-        .get("summary")
-        .and_then(|s| s.get("candidates_found"))
-        .and_then(|v| v.as_u64())
-        .or_else(|| {
-            json.get("candidates")
-                .and_then(|v| v.as_array())
-                .map(|a| a.len() as u64)
+    let timeout_secs = global.timeout.unwrap_or(PLAN_TIMEOUT_SECS);
+    cmd.arg("--timeout").arg(timeout_secs.to_string());
+    let executable = executable
+        .to_str()
+        .ok_or("daemon planner executable path is not UTF-8")?;
+    let args = cmd
+        .get_args()
+        .map(|argument| {
+            argument
+                .to_str()
+                .map(str::to_string)
+                .ok_or("daemon planner argument is not UTF-8")
         })
-        .unwrap_or(0) as u32;
-
-    Ok(DaemonEscalationResult {
-        session_id,
-        candidates_found,
-    })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut spec = ToolSpec::new(executable, args)
+        .with_timeout(std::time::Duration::from_millis(
+            timeout_secs.saturating_mul(1000),
+        ))
+        .with_env("PT_SKIP_GLOBAL_LOCK", "1");
+    // The bounded runner clears its environment. Preserve the daemon's storage
+    // and policy selection explicitly so the child cannot silently use another
+    // user's defaults or publish its session to a different data directory.
+    for key in [
+        "HOME",
+        "HOSTNAME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_STATE_HOME",
+        "XDG_RUNTIME_DIR",
+        "PROCESS_TRIAGE_DATA",
+        "PROCESS_TRIAGE_CONFIG",
+        "PROCESS_TRIAGE_CONFIG_DIR",
+        "PROCESS_TRIAGE_PRIORS",
+        "PROCESS_TRIAGE_POLICY",
+        "PROCESS_TRIAGE_RETENTION",
+        "KUBERNETES_SERVICE_HOST",
+        "PT_LOG",
+        "PT_LOG_FORMAT",
+        "RUST_LOG",
+        "TMPDIR",
+    ] {
+        match std::env::var(key) {
+            Ok(value) => {
+                spec.env.insert(key.to_string(), value);
+            }
+            Err(std::env::VarError::NotPresent) => {}
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(format!("daemon planner environment {key} is not UTF-8"));
+            }
+        }
+    }
+    Ok(spec)
 }
 
 #[cfg(feature = "daemon")]
@@ -16633,6 +16669,78 @@ mod daemon_pressure_tests {
                 std::ffi::OsStr::new("--dry-run")
             ]
         );
+    }
+
+    #[test]
+    fn daemon_planner_preserves_explicit_limits_policy_and_storage() {
+        let cli = Cli::try_parse_from([
+            "pt-core",
+            "--config",
+            "/tmp/daemon configuration",
+            "--capabilities",
+            "/tmp/daemon capabilities.json",
+            "--dry-run",
+            "--timeout",
+            "7",
+            "daemon",
+        ])
+        .unwrap();
+        let session = "pt-20261112-123456-abcd";
+        let spec = daemon_planner_spec(
+            &cli.global,
+            Path::new("/tmp/pt-core"),
+            Some(session),
+            true,
+            13,
+            true,
+        )
+        .unwrap();
+        assert_eq!(spec.timeout, Some(std::time::Duration::from_secs(7)));
+        assert_eq!(
+            spec.env.get("PT_SKIP_GLOBAL_LOCK").map(String::as_str),
+            Some("1")
+        );
+        for key in [
+            "HOME",
+            "HOSTNAME",
+            "PROCESS_TRIAGE_DATA",
+            "PROCESS_TRIAGE_CONFIG",
+            "XDG_DATA_HOME",
+            "KUBERNETES_SERVICE_HOST",
+        ] {
+            assert_eq!(spec.env.get(key), std::env::var(key).ok().as_ref());
+        }
+        let child = Cli::try_parse_from(
+            std::iter::once(spec.command.as_str()).chain(spec.args.iter().map(String::as_str)),
+        )
+        .unwrap();
+        assert_eq!(child.global.config, cli.global.config);
+        assert_eq!(child.global.capabilities, cli.global.capabilities);
+        assert!(child.global.dry_run);
+        assert_eq!(child.global.timeout, Some(7));
+        assert!(matches!(child.global.format, OutputFormat::Json));
+        let Some(Commands::Agent(AgentArgs {
+            command: AgentCommands::Plan(args),
+        })) = child.command
+        else {
+            panic!("daemon must invoke the real agent planner");
+        };
+        assert!(args.deep);
+        assert_eq!(args.session.as_deref(), Some(session));
+        assert_eq!(args.max_candidates, 13);
+        assert_eq!(args.goal.as_deref(), Some("relieve"));
+
+        let cli = Cli::try_parse_from(["pt-core", "daemon"]).unwrap();
+        let spec = daemon_planner_spec(
+            &cli.global,
+            Path::new("/tmp/pt-core"),
+            None,
+            false,
+            10,
+            false,
+        )
+        .unwrap();
+        assert_eq!(spec.timeout, Some(std::time::Duration::from_secs(60)));
     }
 
     fn critical_io_trigger() -> pt_core::daemon::triggers::FiredTrigger {
