@@ -45,6 +45,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, EnvFilter};
 
 static REDACTOR: OnceLock<RedactionEngine> = OnceLock::new();
+static HOST_ID: OnceLock<String> = OnceLock::new();
 
 /// Get the global redaction engine.
 ///
@@ -139,37 +140,81 @@ pub fn generate_run_id() -> String {
     format!("run-{}", &uuid.to_string()[..12])
 }
 
-/// Get the host ID for logging.
+/// Get the host ID shared by logs, session persistence and fleet bindings.
 ///
-/// Uses machine-id on Linux or generates a stable ID from hostname.
+/// Prefer the machine ID, then a native hostname. Reading the operating system
+/// directly keeps macOS and minimal Linux installations stable without requiring
+/// an exported `HOSTNAME`. A hostname fallback identifies a name, not a globally
+/// unique machine. If every source is unavailable, a process-local random ID
+/// avoids conflating unrelated unknown hosts while remaining stable within a run.
 pub fn get_host_id() -> String {
-    // Try to read machine-id
-    if let Ok(bytes) = std::fs::read("/etc/machine-id") {
-        let id_str = String::from_utf8_lossy(&bytes);
-        let id = id_str.trim();
-        if id.len() >= 8 {
-            return format!("host-{}", &id[..8]);
-        }
-    }
-
-    // Fallback: use hostname hash
-    if let Ok(hostname) = std::env::var("HOSTNAME") {
-        let hash = hash_string(&hostname);
-        return format!("host-{}", &hash[..8]);
-    }
-
-    // Last resort: random
-    format!("host-{}", &uuid::Uuid::new_v4().to_string()[..8])
+    HOST_ID
+        .get_or_init(|| {
+            let machine_id = std::fs::read_to_string("/etc/machine-id").ok();
+            let hostname = native_hostname();
+            let environment_hostname = std::env::var("HOSTNAME").ok();
+            host_id_from_sources(
+                machine_id.as_deref(),
+                hostname.as_deref(),
+                environment_hostname.as_deref(),
+            )
+            .unwrap_or_else(|| format!("host-{}", uuid::Uuid::new_v4().simple()))
+        })
+        .clone()
 }
 
-/// Simple hash for hostname fallback.
-fn hash_string(s: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+fn host_id_from_sources(
+    machine_id: Option<&str>,
+    native_hostname: Option<&[u8]>,
+    environment_hostname: Option<&str>,
+) -> Option<String> {
+    if let Some(id) = machine_id.map(str::trim).filter(|id| {
+        id.len() == 32
+            && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && id.bytes().any(|byte| byte != b'0')
+    }) {
+        // Retain the established representation for valid machine IDs.
+        return Some(format!("host-{}", id[..8].to_ascii_lowercase()));
+    }
+    native_hostname
+        .and_then(hostname_id)
+        .or_else(|| environment_hostname.and_then(|name| hostname_id(name.as_bytes())))
+}
 
-    let mut hasher = DefaultHasher::new();
-    s.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+fn hostname_id(name: &[u8]) -> Option<String> {
+    use sha2::{Digest, Sha256};
+
+    let name = name.trim_ascii();
+    if name.is_empty()
+        || name.iter().any(|byte| byte.is_ascii_control())
+        || name.eq_ignore_ascii_case(b"localhost")
+        || name.eq_ignore_ascii_case(b"localhost.localdomain")
+        || name.eq_ignore_ascii_case(b"(none)")
+    {
+        return None;
+    }
+    // Hash the original bytes rather than lossy UTF-8; distinct hostnames must
+    // not collapse to the same replacement characters. SHA-256 also remains
+    // deterministic across Rust releases, unlike the unspecified DefaultHasher.
+    let digest = hex::encode(Sha256::digest(name));
+    Some(format!("host-{}", &digest[..32]))
+}
+
+#[cfg(unix)]
+fn native_hostname() -> Option<Vec<u8>> {
+    let mut name = [0_u8; 256];
+    // SAFETY: gethostname receives a writable buffer with the supplied length.
+    // Require an actual terminator; a truncated prefix is not a host identity.
+    if unsafe { libc::gethostname(name.as_mut_ptr().cast(), name.len()) } != 0 {
+        return None;
+    }
+    let end = name.iter().position(|byte| *byte == 0)?;
+    Some(name[..end].to_vec())
+}
+
+#[cfg(not(unix))]
+fn native_hostname() -> Option<Vec<u8>> {
+    None
 }
 
 /// Redact a potentially sensitive string for logging.
@@ -259,6 +304,75 @@ mod tests {
         let host_id = get_host_id();
         assert!(host_id.starts_with("host-"));
         assert!(host_id.len() >= 13); // "host-" + 8 chars
+        assert_eq!(host_id, get_host_id());
+        assert_eq!(host_id, std::thread::spawn(get_host_id).join().unwrap());
+    }
+
+    #[test]
+    fn native_hostname_keeps_sessions_stable_without_exported_hostname() {
+        let expected = "host-c9f9a446607afad5b9b7358c38a8d2a9";
+        for environment in [None, Some(""), Some("different-shell-context")] {
+            assert_eq!(
+                host_id_from_sources(None, Some(b"mac-mini-max.local"), environment).as_deref(),
+                Some(expected)
+            );
+        }
+        assert_ne!(
+            host_id_from_sources(None, Some(b"worker-one"), None),
+            host_id_from_sources(None, Some(b"worker-two"), None)
+        );
+        // A missing native source can still use a real exported hostname.
+        assert_eq!(
+            host_id_from_sources(None, None, Some("mac-mini-max.local")).as_deref(),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn valid_machine_id_wins_and_uninitialized_ids_do_not_mask_native_identity() {
+        assert_eq!(
+            host_id_from_sources(
+                Some("0123456789abcdef0123456789abcdef\n"),
+                Some(b"native-host"),
+                Some("environment-host"),
+            )
+            .as_deref(),
+            Some("host-01234567")
+        );
+        for invalid in [
+            "",
+            "uninitialized",
+            "01234567",
+            "00000000000000000000000000000000",
+            "non-hexadecimal-machine-identity!",
+            "éééééééééééééééé",
+        ] {
+            assert_eq!(
+                host_id_from_sources(Some(invalid), Some(b"worker-one"), None).as_deref(),
+                Some("host-a693dbb0ab8e4cef8faa032cea54716d")
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_hosts_are_not_merged_under_an_empty_or_placeholder_identity() {
+        for unknown in ["", " ", "localhost", "LOCALHOST.LOCALDOMAIN", "(none)"] {
+            assert!(host_id_from_sources(None, None, Some(unknown)).is_none());
+            assert!(host_id_from_sources(None, Some(unknown.as_bytes()), None).is_none());
+        }
+        assert!(host_id_from_sources(None, Some(b"host\0suffix"), None).is_none());
+        assert!(host_id_from_sources(None, Some(b"host\nother"), None).is_none());
+        // Avoid collisions introduced by lossy string conversion.
+        assert_ne!(hostname_id(b"host-\xff"), hostname_id(b"host-\xfe"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_hostname_reader_observes_a_complete_name() {
+        let first = native_hostname().expect("native hostname available on the test host");
+        assert!(!first.is_empty());
+        assert!(!first.contains(&0));
+        assert_eq!(Some(first), native_hostname());
     }
 
     #[test]
