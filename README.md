@@ -326,6 +326,7 @@ pt agent plan --format toon            # Token-optimized output
 pt agent plan --pids 1234,5678          # Score selected PIDs with full ancestry/protection checks
 pt agent apply --session <id> --yes    # Execute a plan (needs robot_mode.enabled=true in policy)
 pt agent verify --session <id>         # Confirm outcomes
+pt query actions --session <id>        # Read every saved attempt, refusal, and retry
 pt agent label --pid 1234 --kill       # Teach pt your verdict for this command pattern
 pt agent watch --format jsonl          # Stream events
 ```
@@ -354,6 +355,7 @@ pt shadow stop                    # Stop observer
 | `pt agent apply` | Execute a plan (robot mode) | `pt agent apply --session <id> --yes` |
 | `pt agent undo` | Inspect or restore a recorded pause, priorities, or cgroup controls | `pt agent undo --session <id> --action-id <action-id>` |
 | `pt agent verify` | Confirm outcomes | `pt agent verify --session <id>` |
+| `pt query actions` | Read saved execution history | `pt query actions --session <id> --limit 100` |
 | `pt agent watch` | Stream events | `pt agent watch --format jsonl` |
 | `pt agent report` | Generate HTML report | `pt agent report --session <id>` |
 | `pt diff` | Compare two sessions | `pt diff --last` |
@@ -365,6 +367,15 @@ pt shadow stop                    # Stop observer
 | `pt config validate` | Validate config files | `pt-core config validate policy.json` |
 | `pt --version` | Show version | `pt --version` |
 | `pt --help` | Full help | `pt --help` |
+
+`pt query actions` reads execution journals without executing or re-verifying actions.
+Without `--session`, it groups records by newest-created session, then shows the
+latest journal entries first within each session. Repeated attempts and refusal
+details are retained. JSON, JSONL, TOON, and human-readable output are supported;
+output is bounded by `--limit` (default 100) and 16 MiB of journal payloads, with
+explicit counts and truncation status. Corrupt or unreadable journals produce an
+error instead of a successful partial history. Use `pt agent verify --session <id>`
+when you need to check the effects that remain in force now.
 
 ---
 

@@ -3617,6 +3617,22 @@ fn agent_apply_executes_renice_then_kill_on_live_process() {
         false
     });
     assert!(exited, "target {pid} still running after apply kill");
+
+    // The public history command must consume the actual execution journal,
+    // including the identity and method used, without replaying the action.
+    let output = cargo_bin_cmd!("pt-core")
+        .timeout(Duration::from_secs(15))
+        .env("PROCESS_TRIAGE_DATA", &data_dir)
+        .args(["--format", "json", "query", "actions", "--session", &s2])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let history: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(history["total_count"], 1);
+    assert_eq!(history["actions"][0]["session_id"], s2);
+    assert_eq!(history["actions"][0]["outcome"], json["outcomes"][0]);
 }
 
 /// Exercise the real apply -> receipt -> undo -> verify commands. Unchanged

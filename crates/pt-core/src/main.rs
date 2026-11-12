@@ -612,6 +612,9 @@ enum QueryCommands {
         /// Filter by session ID
         #[arg(long)]
         session: Option<String>,
+        /// Maximum journal records to return (newest sessions, latest entries first)
+        #[arg(long, default_value = "100", value_parser = clap::value_parser!(u32).range(1..=10000))]
+        limit: u32,
     },
     /// Query telemetry data
     Telemetry {
@@ -9054,11 +9057,9 @@ fn run_deep_scan(global: &GlobalOpts, _args: &DeepScanArgs) -> ExitCode {
 fn run_query(global: &GlobalOpts, args: &QueryArgs) -> ExitCode {
     match &args.command {
         Some(QueryCommands::Sessions { limit }) => run_query_sessions(global, *limit),
-        Some(QueryCommands::Actions { .. }) => output_stub(
-            global,
-            "query actions",
-            "Query actions mode not yet implemented",
-        ),
+        Some(QueryCommands::Actions { session, limit }) => {
+            run_query_actions(global, session.as_deref(), *limit)
+        }
         Some(QueryCommands::Telemetry { .. }) => output_stub(
             global,
             "query telemetry",
@@ -9176,6 +9177,103 @@ fn run_query_sessions(global: &GlobalOpts, limit: u32) -> ExitCode {
         }
     }
 
+    ExitCode::Clean
+}
+
+fn run_query_actions(global: &GlobalOpts, session: Option<&str>, limit: u32) -> ExitCode {
+    let session_id = match session {
+        Some(value) => match SessionId::parse(value) {
+            Some(id) => Some(id),
+            None => {
+                eprintln!("query actions: invalid --session {value}");
+                return ExitCode::ArgsError;
+            }
+        },
+        None => None,
+    };
+    let store = match SessionStore::from_env() {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("query actions: {error}");
+            return ExitCode::IoError;
+        }
+    };
+    let history = match store.action_history(session_id.as_ref(), limit as usize) {
+        Ok(history) => history,
+        Err(error) => {
+            eprintln!("query actions: {error}");
+            return if matches!(error, pt_core::session::SessionError::NotFound { .. }) {
+                ExitCode::SessionError
+            } else {
+                ExitCode::IoError
+            };
+        }
+    };
+    let output = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "query": "actions",
+        "session": session,
+        "limit": limit,
+        "ordering": "session_created_desc_then_journal_reverse",
+        "max_journal_bytes": pt_core::session::ACTION_HISTORY_BYTE_LIMIT,
+        "actions": history.actions,
+        "total_count": history.total_count,
+        "returned_count": history.actions.len(),
+        "sessions_examined": history.sessions_examined,
+        "truncated": history.truncated,
+        "status": "ok",
+    });
+    match global.format {
+        OutputFormat::Json | OutputFormat::Toon => {
+            println!("{}", format_structured_output(global, output));
+        }
+        OutputFormat::Jsonl => {
+            for entry in &history.actions {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "schema_version": SCHEMA_VERSION,
+                        "type": "action",
+                        "session_id": entry.session_id,
+                        "journal_line": entry.journal_line,
+                        "outcome": entry.outcome,
+                    })
+                );
+            }
+            let mut summary = output;
+            summary
+                .as_object_mut()
+                .expect("query output is an object")
+                .remove("actions");
+            summary["type"] = serde_json::json!("summary");
+            println!("{summary}");
+        }
+        OutputFormat::Exitcode => {}
+        _ => {
+            println!(
+                "{} recorded attempt(s) in {} session(s); showing {}",
+                history.total_count,
+                history.sessions_examined,
+                history.actions.len()
+            );
+            for entry in &history.actions {
+                let outcome = &entry.outcome;
+                println!(
+                    "{} #{} pid={} {} {}",
+                    entry.session_id,
+                    entry.journal_line,
+                    outcome["pid"],
+                    outcome["action"].as_str().unwrap_or("action_unknown"),
+                    outcome["status"].as_str().unwrap_or("status_unknown")
+                );
+            }
+            if history.truncated {
+                println!("Output is bounded by --limit and 16 MiB of journal records; select --session to narrow the history.");
+            }
+            println!("Saved outcomes describe past attempts. Use `agent verify --session <id>` to check current effects.");
+        }
+    }
     ExitCode::Clean
 }
 

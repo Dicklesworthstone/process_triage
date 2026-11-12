@@ -1,7 +1,7 @@
 //! E2E tests for `agent diff` and `query` subcommands.
 //!
 //! `agent diff` compares candidates between two sessions (plan.json).
-//! `query sessions` lists persisted sessions; other query subcommands are stubs.
+//! `query sessions` lists persisted sessions; `query actions` reads execution journals.
 
 use assert_cmd::cargo::cargo_bin_cmd;
 use assert_cmd::Command;
@@ -818,7 +818,7 @@ fn diff_empty_candidates() {
 }
 
 // ============================================================================
-// query tests (sessions implemented; actions/telemetry remain stubs)
+// query tests (sessions and actions implemented; telemetry remains a stub)
 // ============================================================================
 
 #[test]
@@ -869,13 +869,227 @@ fn query_sessions_subcommand() {
 }
 
 #[test]
-fn query_actions_subcommand_reports_missing_capability() {
-    // Not implemented yet: must say so with exit 11 (CapabilityError), never exit 0.
-    pt_core_fast()
-        .args(["query", "actions"])
-        .assert()
-        .code(11)
-        .stdout(predicates::str::contains("not yet implemented"));
+fn query_actions_empty_store_and_session_without_attempts() {
+    with_temp_data_dir(|dir| {
+        let output = pt_core_fast()
+            .args(["query", "actions"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let empty: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(empty["actions"], serde_json::json!([]));
+        assert_eq!(empty["total_count"], 0);
+        assert!(
+            !dir.path().join("sessions").exists(),
+            "query must not create sessions"
+        );
+
+        let id = create_session_with_candidates(dir, &[], "2026-01-01T00:00:00Z");
+        let output = pt_core_fast()
+            .args(["query", "actions", "--session", &id.0])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let empty: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(empty["sessions_examined"], 1);
+        assert_eq!(empty["total_count"], 0);
+        assert_eq!(empty["truncated"], false);
+    });
+}
+
+#[test]
+fn query_actions_preserves_attempts_details_order_and_session_filter() {
+    with_temp_data_dir(|dir| {
+        let older = create_session_with_candidates(dir, &[], "2026-01-01T00:00:00Z");
+        let newer = create_session_with_candidates(dir, &[], "2026-01-02T00:00:00Z");
+        let store = SessionStore::from_env().unwrap();
+        for (id, timestamp) in [
+            (&older, "2026-01-01T01:00:00+02:00"),
+            (&newer, "2026-01-01T00:00:00Z"),
+        ] {
+            let handle = store.open(id).unwrap();
+            let mut manifest = handle.read_manifest().unwrap();
+            manifest.timing.created_at = timestamp.to_string();
+            handle.write_manifest(&manifest).unwrap();
+        }
+        let old_record = serde_json::json!({"action_id":"old", "pid":42, "status":"failed", "error":"permission denied"});
+        fs::write(
+            store.open(&older).unwrap().dir.join("action/outcomes.jsonl"),
+            format!("{old_record}\n"),
+        )
+        .unwrap();
+        let attempts = [
+            serde_json::json!({"action_id":"same", "pid":99, "action":"kill", "status":"precheck_blocked", "blocked_checks":["active_writer"]}),
+            serde_json::json!({"action_id":"same", "pid":99, "action":"kill", "status":"success", "executed_at":"2026-01-01T00:10:00Z"}),
+            serde_json::json!({"action_id":"same", "pid":99, "status":"already_completed"}),
+        ];
+        let journal = attempts.iter().map(|v| format!("{v}\n")).collect::<String>();
+        let path = store.open(&newer).unwrap().dir.join("action/outcomes.jsonl");
+        fs::write(&path, &journal).unwrap();
+
+        let output = pt_core_fast()
+            .args(["query", "actions", "--limit", "2"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let history: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(history["total_count"], 4);
+        assert_eq!(history["returned_count"], 2);
+        assert_eq!(history["truncated"], true);
+        assert_eq!(history["actions"][0]["session_id"], newer.0);
+        assert_eq!(history["actions"][0]["journal_line"], 3);
+        assert_eq!(history["actions"][0]["outcome"], attempts[2]);
+        assert_eq!(history["actions"][1]["outcome"], attempts[1]);
+
+        let output = pt_core_fast()
+            .args(["query", "actions", "--session", &older.0])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let scoped: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(scoped["sessions_examined"], 1);
+        assert_eq!(scoped["total_count"], 1);
+        assert_eq!(scoped["actions"][0]["outcome"], old_record);
+
+        let output = pt_core_fast()
+            .args([
+                "--format", "jsonl", "query", "actions", "--session", &newer.0,
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let records: Vec<Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[2]["outcome"], attempts[0]);
+        assert_eq!(records[3]["type"], "summary");
+        assert_eq!(records[3]["total_count"], 3);
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            journal,
+            "queries are read-only"
+        );
+    });
+}
+
+#[test]
+fn query_actions_rejects_missing_invalid_and_corrupt_history() {
+    with_temp_data_dir(|dir| {
+        pt_core_fast()
+            .args(["query", "actions", "--session", "../../etc"])
+            .assert()
+            .code(ExitCode::ArgsError.as_i32());
+        pt_core_fast()
+            .args(["query", "actions", "--session", &SessionId::new().0])
+            .assert()
+            .code(ExitCode::SessionError.as_i32());
+        for limit in ["0", "10001"] {
+            pt_core_fast()
+                .args(["query", "actions", "--limit", limit])
+                .assert()
+                .code(ExitCode::ArgsError.as_i32());
+        }
+        let id = create_session_with_candidates(dir, &[], "2026-01-01T00:00:00Z");
+        let path = SessionStore::from_env()
+            .unwrap()
+            .open(&id)
+            .unwrap()
+            .dir
+            .join("action/outcomes.jsonl");
+        let valid = r#"{"action_id":"a","pid":123,"status":"failed","error":"denied"}"#;
+        for bad in ["{", r#"{"pid":123,"status":"success"}"#] {
+            let journal = format!("{valid}\n{bad}\n");
+            fs::write(&path, &journal).unwrap();
+            pt_core_fast()
+                .args(["query", "actions", "--limit", "1"])
+                .assert()
+                .code(ExitCode::IoError.as_i32())
+                .stdout("")
+                .stderr(predicates::str::contains("journal line 2"));
+            assert_eq!(fs::read_to_string(&path).unwrap(), journal);
+        }
+        fs::write(&path, " ".repeat(1024 * 1024 + 1)).unwrap();
+        pt_core_fast()
+            .args(["query", "actions"])
+            .assert()
+            .code(ExitCode::IoError.as_i32())
+            .stderr(predicates::str::contains("exceeds 1 MiB"));
+
+        let manifest_path = path
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("manifest.json");
+        let mut manifest = fs::read_to_string(&manifest_path).unwrap();
+        manifest.push_str(&" ".repeat(1024 * 1024));
+        manifest.push_str("invalid trailing data");
+        fs::write(&manifest_path, manifest).unwrap();
+        pt_core_fast()
+            .args(["query", "actions", "--session", &id.0])
+            .assert()
+            .code(ExitCode::IoError.as_i32())
+            .stderr(predicates::str::contains("session manifest exceeds 1 MiB"));
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn query_actions_refuses_symlinked_journals() {
+    with_temp_data_dir(|dir| {
+        let id = create_session_with_candidates(dir, &[], "2026-01-01T00:00:00Z");
+        let path = SessionStore::from_env()
+            .unwrap()
+            .open(&id)
+            .unwrap()
+            .dir
+            .join("action/outcomes.jsonl");
+        std::os::unix::fs::symlink("/dev/zero", &path).unwrap();
+        pt_core_fast()
+            .timeout(Duration::from_secs(5))
+            .args(["query", "actions", "--session", &id.0])
+            .assert()
+            .code(ExitCode::IoError.as_i32())
+            .stdout("");
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn query_actions_refuses_fifo_journals_without_waiting_for_a_writer() {
+    use std::os::unix::ffi::OsStrExt;
+    with_temp_data_dir(|dir| {
+        let id = create_session_with_candidates(dir, &[], "2026-01-01T00:00:00Z");
+        let path = SessionStore::from_env()
+            .unwrap()
+            .open(&id)
+            .unwrap()
+            .dir
+            .join("action/outcomes.jsonl");
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: name is a valid, NUL-terminated path inside this owned fixture.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        pt_core_fast()
+            .timeout(Duration::from_secs(5))
+            .args(["query", "actions", "--session", &id.0])
+            .assert()
+            .code(ExitCode::IoError.as_i32())
+            .stdout("")
+            .stderr(predicates::str::contains("expected a regular history file"));
+    });
 }
 
 /// Every stub command reports `"status": "stub"` and exits 11 (CapabilityError),
@@ -884,7 +1098,6 @@ fn query_actions_subcommand_reports_missing_capability() {
 #[test]
 fn every_stub_command_exits_capability_error() {
     let mut stubs: Vec<Vec<&str>> = vec![
-        vec!["query", "actions"],
         vec!["query", "telemetry"],
         vec!["query", "last hour kills"],
         vec![

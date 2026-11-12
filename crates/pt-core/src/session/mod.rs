@@ -345,6 +345,26 @@ pub struct ListSessionsOptions {
     pub older_than: Option<Duration>,
 }
 
+/// An original journal record, including failure details and repeated attempts.
+/// A saved status is historical evidence, not a fresh verification of an effect.
+#[derive(Debug, Serialize)]
+pub struct ActionHistoryEntry {
+    pub session_id: String,
+    pub journal_line: u64,
+    pub outcome: serde_json::Value,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct ActionHistory {
+    pub actions: Vec<ActionHistoryEntry>,
+    pub total_count: u64,
+    pub sessions_examined: usize,
+    pub truncated: bool,
+}
+
+/// Bound retained raw journal payloads independently of the requested row limit.
+pub const ACTION_HISTORY_BYTE_LIMIT: usize = 16 * 1024 * 1024;
+
 /// Result of a cleanup operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CleanupResult {
@@ -456,6 +476,151 @@ impl SessionStore {
             id: session_id.clone(),
             dir,
         })
+    }
+
+    /// Read recorded action attempts without consulting or executing a plan.
+    /// Sessions are newest-created first, with reverse journal order inside each
+    /// session. This deliberately does not invent timestamps for blocked or
+    /// skipped records, which may have no execution time. Only `limit` records
+    /// are retained, but all selected journals are validated and counted.
+    pub fn action_history(
+        &self,
+        session_id: Option<&SessionId>,
+        limit: usize,
+    ) -> Result<ActionHistory, SessionError> {
+        let mut sessions = Vec::new();
+        if let Some(session_id) = session_id {
+            self.open(session_id)?;
+            sessions.push(session_id.clone());
+        } else {
+            let entries = match std::fs::read_dir(&self.sessions_root) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(ActionHistory::default());
+                }
+                Err(source) => {
+                    return Err(SessionError::Io {
+                        path: self.sessions_root.clone(),
+                        source,
+                    });
+                }
+            };
+            for entry in entries {
+                let entry = entry.map_err(|source| SessionError::Io {
+                    path: self.sessions_root.clone(),
+                    source,
+                })?;
+                if let Some(id) = entry.file_name().to_str().and_then(SessionId::parse) {
+                    sessions.push(id);
+                }
+            }
+        }
+
+        // Unlike list_sessions, discovery here never loads a plan or reads each
+        // complete journal merely to count it before reading it a second time.
+        let mut ordered = Vec::with_capacity(sessions.len());
+        for id in sessions {
+            let dir = self.session_dir(&id);
+            for path in [&self.sessions_root, &dir] {
+                let metadata =
+                    std::fs::symlink_metadata(path).map_err(|source| SessionError::Io {
+                        path: path.clone(),
+                        source,
+                    })?;
+                if !metadata.is_dir() {
+                    return Err(history_data_error(path, "expected a real session directory"));
+                }
+            }
+            let path = dir.join(MANIFEST_FILE);
+            let file = open_history_file(&path)?;
+            if file
+                .metadata()
+                .map_err(|source| SessionError::Io {
+                    path: path.clone(),
+                    source,
+                })?
+                .len()
+                > MAX_HISTORY_RECORD_BYTES
+            {
+                return Err(history_data_error(&path, "session manifest exceeds 1 MiB"));
+            }
+            let manifest: SessionManifest = serde_json::from_reader(std::io::Read::take(
+                file,
+                MAX_HISTORY_RECORD_BYTES,
+            ))
+            .map_err(|source| SessionError::Json {
+                path: path.clone(),
+                source,
+            })?;
+            if manifest.session_id != id.0 {
+                return Err(history_data_error(
+                    &path,
+                    "manifest session identity differs",
+                ));
+            }
+            let created_at = DateTime::parse_from_rfc3339(&manifest.timing.created_at).map_err(
+                |error| history_data_error(&path, &format!("invalid creation time: {error}")),
+            )?;
+            ordered.push((created_at, id));
+        }
+        ordered.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.0.cmp(&b.1.0)));
+
+        let mut history = ActionHistory::default();
+        let mut retained_bytes = 0;
+        let mut selection_complete = false;
+        for (_, id) in ordered {
+            let action_dir = self.session_dir(&id).join(ACTION_DIR);
+            match std::fs::symlink_metadata(&action_dir) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    history.sessions_examined += 1;
+                    continue;
+                }
+                Err(source) => {
+                    return Err(SessionError::Io {
+                        path: action_dir,
+                        source,
+                    });
+                }
+                Ok(metadata) if !metadata.is_dir() => {
+                    return Err(history_data_error(
+                        &action_dir,
+                        "expected a real action directory",
+                    ));
+                }
+                Ok(_) => {}
+            }
+            let path = action_dir.join("outcomes.jsonl");
+            let file = match open_history_file(&path) {
+                Ok(file) => file,
+                Err(SessionError::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    history.sessions_examined += 1;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let (entries, count, bytes) = read_action_history_journal(
+                file,
+                &path,
+                &id,
+                if selection_complete {
+                    0
+                } else {
+                    limit.saturating_sub(history.actions.len())
+                },
+                ACTION_HISTORY_BYTE_LIMIT.saturating_sub(retained_bytes),
+            )?;
+            // Once a newer session's records were omitted by either bound,
+            // including records from older sessions would break the ordering.
+            selection_complete |= count > entries.len() as u64;
+            retained_bytes += bytes;
+            history.actions.extend(entries);
+            history.total_count += count;
+            history.sessions_examined += 1;
+        }
+        history.truncated = history.total_count > history.actions.len() as u64;
+        Ok(history)
     }
 
     /// List sessions with optional filtering.
@@ -663,6 +828,120 @@ impl SessionStore {
 
         Ok(result)
     }
+}
+
+const MAX_HISTORY_RECORD_BYTES: u64 = 1024 * 1024;
+
+fn history_data_error(path: &Path, message: &str) -> SessionError {
+    SessionError::Io {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, message),
+    }
+}
+
+fn open_history_file(path: &Path) -> Result<std::fs::File, SessionError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let file = options.open(path).map_err(|source| SessionError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let metadata = file.metadata().map_err(|source| SessionError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Err(history_data_error(path, "expected a regular history file"));
+    }
+    Ok(file)
+}
+
+fn read_action_history_journal(
+    file: std::fs::File,
+    path: &Path,
+    session_id: &SessionId,
+    limit: usize,
+    byte_limit: usize,
+) -> Result<(Vec<ActionHistoryEntry>, u64, usize), SessionError> {
+    use std::io::{BufRead, Read};
+    let length = file
+        .metadata()
+        .map_err(|source| SessionError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .len();
+    // A concurrent append cannot make the query chase an ever-growing journal.
+    let mut reader = std::io::BufReader::new(file.take(length));
+    let mut latest = std::collections::VecDeque::new();
+    let mut line = Vec::new();
+    let mut line_number = 0_u64;
+    let mut count = 0_u64;
+    let mut retained_bytes = 0;
+    loop {
+        line.clear();
+        let bytes = (&mut reader)
+            .take(MAX_HISTORY_RECORD_BYTES + 1)
+            .read_until(b'\n', &mut line)
+            .map_err(|source| SessionError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if bytes == 0 {
+            break;
+        }
+        line_number += 1;
+        if bytes as u64 > MAX_HISTORY_RECORD_BYTES {
+            return Err(history_data_error(
+                path,
+                &format!("journal line {line_number} exceeds 1 MiB"),
+            ));
+        }
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let outcome: serde_json::Value = serde_json::from_slice(&line).map_err(|error| {
+            history_data_error(path, &format!("journal line {line_number}: {error}"))
+        })?;
+        // Validate the execution-record contract without dropping additional
+        // refusal reasons, guardrail diagnostics, or future audit fields.
+        serde_json::from_value::<crate::verify::SavedActionOutcome>(outcome.clone()).map_err(
+            |error| history_data_error(path, &format!("journal line {line_number}: {error}")),
+        )?;
+        count += 1;
+        if limit > 0 {
+            latest.push_back((
+                ActionHistoryEntry {
+                    session_id: session_id.0.clone(),
+                    journal_line: line_number,
+                    outcome,
+                },
+                bytes,
+            ));
+            retained_bytes += bytes;
+            while latest.len() > limit || retained_bytes > byte_limit {
+                if let Some((_, removed_bytes)) = latest.pop_front() {
+                    retained_bytes -= removed_bytes;
+                }
+            }
+        }
+    }
+    if reader.get_ref().limit() != 0 {
+        return Err(history_data_error(
+            path,
+            "journal was truncated while being read",
+        ));
+    }
+    Ok((
+        latest.into_iter().rev().map(|(entry, _)| entry).collect(),
+        count,
+        retained_bytes,
+    ))
 }
 
 /// This lock uses the same stable inode and flock protocol as main's
@@ -1620,6 +1899,31 @@ mod tests {
         // Can re-open
         let handle2 = store.open(&sid).unwrap();
         assert_eq!(handle.dir, handle2.dir);
+    }
+
+    #[test]
+    fn action_history_byte_budget_keeps_the_latest_complete_attempts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("outcomes.jsonl");
+        let row = |pid| {
+            format!("{{\"action_id\":\"a\",\"pid\":{pid},\"status\":\"failed\"}}\n")
+        };
+        let first = row(1);
+        std::fs::write(&path, format!("{}{}{}", first, row(2), row(3))).unwrap();
+        let id = SessionId::new();
+        let (entries, count, bytes) = read_action_history_journal(
+            open_history_file(&path).unwrap(),
+            &path,
+            &id,
+            10_000,
+            first.len() * 2,
+        )
+        .unwrap();
+        assert_eq!(count, 3);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(bytes, first.len() * 2);
+        assert_eq!(entries[0].outcome["pid"], 3);
+        assert_eq!(entries[1].outcome["pid"], 2);
     }
 
     #[test]
