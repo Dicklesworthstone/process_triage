@@ -17,6 +17,7 @@ use crate::config::priors::Priors;
 use crate::inference::prior_override::UserPriorOverrides;
 use crate::supervision::pattern_learning::{CommandNormalizer, SpecificityLevel};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -425,6 +426,7 @@ impl DecisionStore {
     /// Pattern keys for a process, most specific first.
     pub fn pattern_keys(comm: &str, cmdline: &str) -> Vec<String> {
         let normalizer = CommandNormalizer::new();
+        let inline_program = normalizer.has_inline_program(comm, cmdline);
         let mut candidates = normalizer.generate_candidates(comm, cmdline);
         candidates.sort_by_key(|c| c.level.priority_offset());
         candidates
@@ -435,7 +437,28 @@ impl DecisionStore {
                     SpecificityLevel::Standard => "standard",
                     SpecificityLevel::Broad => "broad",
                 };
-                format!("{level}|{}|{}", c.process_pattern, c.arg_patterns.join(" "))
+                let arguments = if inline_program && c.level != SpecificityLevel::Broad {
+                    // Inline programs can contain credentials and other private
+                    // literals. Retain their exact identity without copying the
+                    // source into the durable learning store. Length prefixes
+                    // distinguish argument boundaries independently of contents.
+                    let mut digest = Sha256::new();
+                    for argument in &c.arg_patterns {
+                        digest.update((argument.len() as u64).to_le_bytes());
+                        digest.update(argument.as_bytes());
+                    }
+                    format!("inline:{}", hex::encode(digest.finalize()))
+                } else if inline_program {
+                    // Previous broad keys mixed inline source with script jobs
+                    // and tracked source ids from the lossy old normalization.
+                    // Do not combine those votes with new opaque identities:
+                    // one job labeled before and after an upgrade is still one
+                    // source, not the two needed to establish a broad habit.
+                    format!("inline:{}", c.arg_patterns.join(" "))
+                } else {
+                    c.arg_patterns.join(" ")
+                };
+                format!("{level}|{}|{arguments}", c.process_pattern)
             })
             .collect()
     }
@@ -773,6 +796,136 @@ mod tests {
             "{}",
             learned.pattern_key
         );
+    }
+
+    #[test]
+    fn one_inline_job_cannot_train_an_unrelated_program_through_standard_fallback() {
+        for (comm, first, second) in [
+            (
+                "python3",
+                "python3 -c print('first')",
+                "python3 -c print('second')",
+            ),
+            (
+                "python3",
+                "python3 -Ic print('first')",
+                "python3 -Ic print('second')",
+            ),
+            (
+                "bash",
+                "bash -lc exec /srv/first",
+                "bash -lc exec /srv/second",
+            ),
+            ("node", "node -e doFirst()", "node -e doSecond()"),
+            ("node", "node --eval=doFirst()", "node --eval=doSecond()"),
+            (
+                "node",
+                "node -r /srv/first -e run()",
+                "node -r /srv/second -e run()",
+            ),
+            (
+                "python3",
+                "python3 -c print('a b')",
+                "python3 -c print('a  b')",
+            ),
+        ] {
+            let mut store = DecisionStore::default();
+            for _ in 0..50 {
+                store.record_at(comm, first, Verdict::Kill, test_time());
+            }
+            let learned = store
+                .learned_prior_at(comm, first, &global(), test_time())
+                .unwrap();
+            assert_eq!(learned.specificity, "exact");
+            assert_eq!(learned.kill, 50);
+            assert!(
+                store
+                    .learned_prior_at(comm, second, &global(), test_time())
+                    .is_none(),
+                "{first} must not label {second}"
+            );
+        }
+    }
+
+    #[test]
+    fn inline_generalization_requires_distinct_concordant_jobs() {
+        let mut store = DecisionStore::default();
+        let first = "python3 -c first_job()";
+        let second = "python3 -c second_job()";
+        let unseen = "python3 -c unseen_job()";
+        store.record_at("python3", first, Verdict::Kill, test_time());
+        assert!(store
+            .learned_prior_at("python3", unseen, &global(), test_time())
+            .is_none());
+        store.record_at("python3", second, Verdict::Spare, test_time());
+        assert!(store
+            .learned_prior_at("python3", unseen, &global(), test_time())
+            .is_none());
+        // One kill cancels the second source's spare; a second establishes its
+        // own material support, rather than reusing the first job's repetitions.
+        store.record_at("python3", second, Verdict::Kill, test_time());
+        assert!(store
+            .learned_prior_at("python3", unseen, &global(), test_time())
+            .is_none());
+        store.record_at("python3", second, Verdict::Kill, test_time());
+        let prior = store
+            .learned_prior_at("python3", unseen, &global(), test_time())
+            .unwrap();
+        assert_eq!(prior.specificity, "broad");
+        assert_eq!((prior.kill, prior.spare), (3, 1));
+    }
+
+    #[test]
+    fn inline_learning_roundtrip_does_not_persist_source_literals_or_use_unsafe_legacy_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(DECISIONS_FILE);
+        // An earlier store could have generalized an arbitrary Python program
+        // into this bare option. It must not silently regain that influence.
+        std::fs::write(&path, r#"{"standard|python.*|-c":{"kill":50,"spare":0}}"#).unwrap();
+        let mut store = DecisionStore::load(directory.path()).unwrap();
+        let cmdline = "python3 -c send_secret('INLINE_SECRET_CANARY_92731')";
+        assert!(store
+            .learned_prior_at("python3", cmdline, &global(), test_time())
+            .is_none());
+        store.record_at("python3", cmdline, Verdict::Spare, test_time());
+        store.save().unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("INLINE_SECRET_CANARY"));
+        assert!(!saved.contains("send_secret"));
+        let restored = DecisionStore::load(directory.path()).unwrap();
+        let prior = restored
+            .learned_prior_at("python3", cmdline, &global(), test_time())
+            .unwrap();
+        assert_eq!(prior.specificity, "exact");
+        assert_eq!((prior.kill, prior.spare), (0, 1));
+        assert!(restored
+            .learned_prior_at("python3", "python3 -c unrelated()", &global(), test_time())
+            .is_none());
+    }
+
+    #[test]
+    fn legacy_inline_source_ids_cannot_supply_a_second_generalization_vote() {
+        let mut store = DecisionStore::default();
+        let old_key = "broad|python.*|".to_string();
+        store.entries.insert(
+            old_key,
+            PatternCounts {
+                kill: 1,
+                updated_at: Some(test_time().to_rfc3339()),
+                source_weights: BTreeMap::from([(
+                    "old-inline-source".to_string(),
+                    SourceWeights {
+                        kill: 1.0,
+                        spare: 0.0,
+                    },
+                )]),
+                ..Default::default()
+            },
+        );
+        store.record_at("python3", "python3 -c first_job()", Verdict::Kill, test_time());
+        assert!(store
+            .learned_prior_at("python3", "python3 -c unseen_job()", &global(), test_time())
+            .is_none());
     }
 
     #[test]

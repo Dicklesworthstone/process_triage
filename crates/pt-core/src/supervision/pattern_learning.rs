@@ -242,6 +242,141 @@ impl CommandNormalizer {
         result.trim().to_string()
     }
 
+    /// Locate an interpreter's inline program without parsing it as shell syntax.
+    /// Process command lines are flattened argv, so quote and argument boundaries
+    /// cannot be recovered reliably. Once an execution option is found, the whole
+    /// remaining command is an opaque identity, including its whitespace.
+    fn inline_program_index(process_name: &str, args: &[&str]) -> Option<usize> {
+        let name = process_name.rsplit('/').next().unwrap_or(process_name);
+        let versioned = |prefix: &str| {
+            name.strip_prefix(prefix).is_some_and(|version| {
+                version.is_empty()
+                    || version
+                        .chars()
+                        .all(|character| character.is_ascii_digit() || character == '.')
+            })
+        };
+        let shell = matches!(
+            name,
+            "sh" | "bash" | "dash" | "ash" | "zsh" | "ksh" | "fish"
+        );
+        let python = versioned("python") || versioned("pypy");
+        let node = versioned("node") || matches!(name, "nodejs" | "bun");
+        let ruby = versioned("ruby");
+        let perl = versioned("perl");
+        let ruby_or_perl = ruby || perl;
+        if !(shell || python || node || ruby_or_perl) {
+            return None;
+        }
+
+        let mut skip_value = false;
+        for (index, argument) in args.iter().enumerate() {
+            if skip_value {
+                skip_value = false;
+                continue;
+            }
+            if *argument == "--" || !argument.starts_with('-') || *argument == "-" {
+                // Everything after a script/module or `--` belongs to that job,
+                // rather than to the interpreter's option parser.
+                break;
+            }
+            if python && *argument == "-m" {
+                break;
+            }
+            if (shell && matches!(*argument, "-o" | "-O" | "--rcfile" | "--init-file"))
+                || (python && matches!(*argument, "-W" | "-X"))
+                || (ruby && matches!(*argument, "-I" | "-r" | "-C" | "-E"))
+                || (perl && matches!(*argument, "-I" | "-M" | "-m"))
+                || (node
+                    && matches!(
+                        *argument,
+                        "-r" | "--require"
+                            | "--import"
+                            | "--loader"
+                            | "--experimental-loader"
+                            | "--input-type"
+                            | "--env-file"
+                            | "--inspect-port"
+                            | "--icu-data-dir"
+                            | "--openssl-config"
+                            | "--title"
+                    ))
+            {
+                skip_value = true;
+                continue;
+            }
+
+            if shell
+                && (*argument == "--command"
+                    || argument.starts_with("--command=")
+                    || (!argument.starts_with("--") && argument[1..].contains('c')))
+            {
+                return Some(index);
+            }
+            if python && !argument.starts_with("--") {
+                // Python accepts combined switches such as `-Ic` and an
+                // attached program (`-cprint(1)`). Stop at an option whose
+                // operand could merely contain the letter c.
+                for option in argument[1..].chars() {
+                    if option == 'c' {
+                        return Some(index);
+                    }
+                    if !"bBdEiIOPqRsSuUvVx".contains(option) {
+                        break;
+                    }
+                }
+            }
+            if node
+                && (*argument == "--eval"
+                    || argument.starts_with("--eval=")
+                    || *argument == "--print"
+                    || argument.starts_with("--print=")
+                    || argument.starts_with("-e")
+                    || argument.starts_with("-p"))
+            {
+                return Some(index);
+            }
+            if ruby_or_perl && !argument.starts_with("--") {
+                for option in argument[1..].chars() {
+                    if option == 'e' || (perl && option == 'E') {
+                        return Some(index);
+                    }
+                    if !"anplwW".contains(option) {
+                        break;
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Whether learning keys must treat this command's program as opaque data.
+    /// The decision store hashes those keys instead of persisting inline code.
+    pub(crate) fn has_inline_program(&self, process_name: &str, cmdline: &str) -> bool {
+        let args: Vec<&str> = cmdline.split_whitespace().collect();
+        let skip = Self::command_word_count(process_name, &args);
+        Self::inline_program_index(process_name, &args[skip..]).is_some()
+    }
+
+    fn command_word_count(process_name: &str, args: &[&str]) -> usize {
+        usize::from(args.first().is_some_and(|first| {
+            first.ends_with(process_name) || first.ends_with(&format!("/{process_name}"))
+        }))
+    }
+
+    /// Get a suffix by token position while retaining the original bytes.
+    fn argument_suffix<'a>(cmdline: &'a str, args: &[&str], index: usize) -> Option<&'a str> {
+        let mut offset = 0;
+        for (position, arg) in args.iter().enumerate() {
+            offset += cmdline[offset..].find(arg)?;
+            if position == index {
+                return Some(&cmdline[offset..]);
+            }
+            offset += arg.len();
+        }
+        None
+    }
+
     /// Generate pattern candidates at all specificity levels.
     pub fn generate_candidates(&self, process_name: &str, cmdline: &str) -> Vec<PatternCandidate> {
         let normalized_name = self.normalize_process_name(process_name);
@@ -249,27 +384,28 @@ impl CommandNormalizer {
         // Parse cmdline into components
         let args: Vec<&str> = cmdline.split_whitespace().collect();
 
-        // Skip the first arg if it's the command itself
-        let args_to_process: Vec<&str> = if !args.is_empty() {
-            // Check if first arg ends with the process name
-            let first = args[0];
-            if first.ends_with(process_name) || first.ends_with(&format!("/{}", process_name)) {
-                args[1..].to_vec()
-            } else {
-                args.to_vec()
-            }
-        } else {
-            vec![]
-        };
+        let skip = Self::command_word_count(process_name, &args);
+        let args_to_process = &args[skip..];
+        let inline_index = Self::inline_program_index(process_name, args_to_process);
+        let inline_program =
+            inline_index.and_then(|_| Self::argument_suffix(cmdline, &args, skip));
+        let ordinary_args = &args_to_process[..inline_index.unwrap_or(args_to_process.len())];
 
         let mut candidates = Vec::new();
 
         // Generate exact pattern
-        let exact_args: Vec<String> = args_to_process
-            .iter()
-            .filter(|a| self.is_significant_arg(a))
-            .map(|a| self.normalize_arg_exact(a))
-            .collect();
+        let exact_args: Vec<String> = if let Some(program) = inline_program {
+            // Preloads, rc files and options before the execution flag also
+            // change what inline code does. Preserve all argument bytes rather
+            // than discarding their paths or normalizing source literals.
+            vec![regex::escape(program)]
+        } else {
+            ordinary_args
+                .iter()
+                .filter(|a| self.is_significant_arg(a))
+                .map(|a| self.normalize_arg_exact(a))
+                .collect()
+        };
 
         if !exact_args.is_empty() {
             candidates.push(PatternCandidate {
@@ -285,7 +421,7 @@ impl CommandNormalizer {
         // `-m`). Without it every flagless `node <script>` shared one pattern, so a
         // verdict on `node x.js` spoke for `node y.js`.
         let mut identity_taken = false;
-        let std_args: Vec<String> = args_to_process
+        let mut std_args: Vec<String> = ordinary_args
             .iter()
             .enumerate()
             .filter(|(i, a)| {
@@ -301,6 +437,11 @@ impl CommandNormalizer {
             })
             .map(|(_, a)| self.normalize_arg_standard(a))
             .collect();
+        if let Some(program) = inline_program {
+            // Inline programs have no safely generalizable argument subset.
+            // Only the separately gated broad level can transfer their labels.
+            std_args = vec![regex::escape(program)];
+        }
 
         candidates.push(PatternCandidate {
             level: SpecificityLevel::Standard,
@@ -310,7 +451,7 @@ impl CommandNormalizer {
         });
 
         // Generate broad pattern
-        let broad_args: Vec<String> = args_to_process
+        let broad_args: Vec<String> = ordinary_args
             .iter()
             .filter(|a| self.is_primary_flag(a))
             .map(|a| self.normalize_arg_broad(a))
@@ -746,6 +887,106 @@ mod tests {
             .arg_patterns
             .iter()
             .any(|p| p.contains("-m") || p.contains("pytest")));
+    }
+
+    #[test]
+    fn inline_programs_keep_their_entire_identity_at_exact_and_standard_levels() {
+        let normalizer = CommandNormalizer::new();
+        for (comm, first, second) in [
+            (
+                "python3",
+                "python3 -c print('a b')",
+                "python3 -c print('a  b')",
+            ),
+            (
+                "python3",
+                "python3 -Ic print('first')",
+                "python3 -Ic print('second')",
+            ),
+            (
+                "python3",
+                "python3 -cprint('first')",
+                "python3 -cprint('second')",
+            ),
+            (
+                "bash",
+                "bash -lc exec /srv/first",
+                "bash -lc exec /srv/second",
+            ),
+            ("node", "node -e doFirst()", "node -e doSecond()"),
+            ("node", "node --eval=doFirst()", "node --eval=doSecond()"),
+            ("node", "node -p getFirst()", "node -p getSecond()"),
+            (
+                "node",
+                "node -r /srv/first -e run()",
+                "node -r /srv/second -e run()",
+            ),
+            (
+                "bash",
+                "bash --rcfile /srv/first -c run",
+                "bash --rcfile /srv/second -c run",
+            ),
+            ("perl", "perl -we print(1)", "perl -we print(2)"),
+            ("ruby", "ruby -e puts(1)", "ruby -e puts(2)"),
+        ] {
+            assert!(normalizer.has_inline_program(comm, first), "{first}");
+            let first_candidates = normalizer.generate_candidates(comm, first);
+            let second_candidates = normalizer.generate_candidates(comm, second);
+            for level in [SpecificityLevel::Exact, SpecificityLevel::Standard] {
+                let a = first_candidates
+                    .iter()
+                    .find(|candidate| candidate.level == level)
+                    .unwrap();
+                let b = second_candidates
+                    .iter()
+                    .find(|candidate| candidate.level == level)
+                    .unwrap();
+                assert_ne!(a.arg_patterns, b.arg_patterns, "{level:?}: {first}");
+                // These are still usable signature regexes, not hashes of code.
+                let program = a.arg_patterns.last().unwrap();
+                let expression = Regex::new(program).unwrap();
+                assert!(expression.is_match(first));
+                assert!(!expression.is_match(second));
+            }
+        }
+    }
+
+    #[test]
+    fn inline_detection_respects_interpreter_options_and_script_boundaries() {
+        let normalizer = CommandNormalizer::new();
+        for (comm, cmdline) in [
+            ("cc", "cc -c input.c"),
+            ("python3", "python3 -m unittest -c"),
+            ("python3", "python3 worker.py -c payload"),
+            ("python3", "python3 -- -c payload"),
+            ("python3", "python3 -W -cwarning worker.py"),
+            ("node", "node -r -ehelper worker.js"),
+            ("bash", "bash -o -coption worker.sh"),
+        ] {
+            assert!(!normalizer.has_inline_program(comm, cmdline), "{cmdline}");
+        }
+        for (comm, cmdline) in [
+            ("python3", "python3 -W ignore -c print(1)"),
+            ("node", "node -r helper --eval print(1)"),
+            ("node", "node --input-type module --eval print(1)"),
+            ("bash", "bash -o errexit -lc echo live"),
+            ("bash", "bash --rcfile /tmp/setup -c echo live"),
+            ("ruby", "ruby -I /srv/lib -e puts(1)"),
+            ("perl", "perl -I /srv/lib -we print(1)"),
+        ] {
+            assert!(normalizer.has_inline_program(comm, cmdline), "{cmdline}");
+        }
+    }
+
+    #[test]
+    fn inline_source_cannot_become_a_broad_operation_flag() {
+        let normalizer = CommandNormalizer::new();
+        let candidates = normalizer.generate_candidates("bash", "bash -c echo --watch secret");
+        let broad = candidates
+            .iter()
+            .find(|candidate| candidate.level == SpecificityLevel::Broad)
+            .unwrap();
+        assert!(broad.arg_patterns.is_empty());
     }
 
     #[test]
