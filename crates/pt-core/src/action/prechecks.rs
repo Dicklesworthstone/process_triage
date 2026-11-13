@@ -126,6 +126,32 @@ impl PreCheckResult {
     }
 }
 
+/// Command and owner rules need observed values. An unreadable or empty field
+/// cannot prove that a target does not match a configured protection rule.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn required_protection_metadata(
+    pid: u32,
+    comm: Option<String>,
+    cmdline: Option<String>,
+    user: Option<String>,
+) -> Result<(String, String, String), PreCheckResult> {
+    let required = |value: Option<String>, field: &str| {
+        value.filter(|value| !value.trim().is_empty()).ok_or_else(|| {
+            PreCheckResult::Blocked {
+                check: PreCheck::CheckNotProtected,
+                reason: format!(
+                    "protection evidence unavailable for PID {pid}: cannot read complete {field}; refusing to bypass configured protection rules"
+                ),
+            }
+        })
+    };
+    Ok((
+        required(comm, "process name")?,
+        required(cmdline, "command line")?,
+        required(user, "process owner")?,
+    ))
+}
+
 /// Recommended supervisor action for a managed process.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1462,7 +1488,8 @@ impl LivePreCheckProvider {
         #[cfg(target_os = "macos")]
         {
             // Full argv via ps (the command-line protection rules need the arguments,
-            // e.g. `ssh -M`, `-zsh`, `ssh host nc -U .../sock`); comm as a fallback.
+            // e.g. `ssh -M`, `-zsh`, `ssh host nc -U .../sock`). A basename is not
+            // a substitute when argv is unreadable: it could hide a protected rule.
             let pid_arg = pid.to_string();
             crate::collect::tool_runner::run_tool(
                 "ps",
@@ -1474,7 +1501,6 @@ impl LivePreCheckProvider {
             .filter(|out| out.success())
             .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
             .filter(|args| !args.is_empty())
-            .or_else(|| self.read_comm(pid))
         }
     }
 
@@ -1830,13 +1856,6 @@ impl LivePreCheckProvider {
     ) -> PreCheckResult {
         trace!(pid, "checking protection status");
 
-        // Read current process state from /proc for TOCTOU safety
-        let comm = self.read_comm(pid).unwrap_or_default();
-        let cmd = self.read_cmdline(pid).unwrap_or_default();
-        let user = self.read_user(pid).unwrap_or_default();
-
-        trace!(pid, %comm, "read process identity for protection check");
-
         if let Some(ref filter) = self.protected_filter {
             // Check protected PIDs first (fast lookup)
             if filter.protected_pids().contains(&pid) {
@@ -1846,6 +1865,19 @@ impl LivePreCheckProvider {
                     reason: format!("protected PID: {pid}"),
                 };
             }
+
+            // Custom rules remain binding when built-in protection is disabled.
+            // Do not let a missing read become an empty, non-matching string.
+            let (comm, cmd, user) = match required_protection_metadata(
+                pid,
+                self.read_comm(pid),
+                self.read_cmdline(pid),
+                self.read_user(pid),
+            ) {
+                Ok(metadata) => metadata,
+                Err(blocked) => return blocked,
+            };
+            trace!(pid, %comm, "read process identity for protection check");
 
             // Built-in live-infrastructure protection (same rules as the scan filter)
             let mut session_workload = false;
@@ -2486,6 +2518,43 @@ impl PreCheckProvider for NoopPreCheckProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protection_metadata_requires_each_complete_observation() {
+        let observed = ["sleep", "sleep 60", "worker"];
+        for (missing, field) in [
+            (0, "process name"),
+            (1, "command line"),
+            (2, "process owner"),
+        ] {
+            for unavailable in [None, Some(String::new()), Some(" \n".to_string())] {
+                let mut values = observed.map(|value| Some(value.to_string()));
+                values[missing] = unavailable;
+                let [comm, cmdline, user] = values;
+                let result = required_protection_metadata(42, comm, cmdline, user);
+                assert!(matches!(
+                    result,
+                    Err(PreCheckResult::Blocked { check: PreCheck::CheckNotProtected, reason })
+                        if reason.contains("PID 42") && reason.contains(field)
+                            && reason.contains("protection evidence unavailable")
+                ));
+            }
+        }
+        assert_eq!(
+            required_protection_metadata(
+                42,
+                Some("ssh".to_string()),
+                Some("ssh -M -N host".to_string()),
+                Some("worker".to_string()),
+            )
+            .unwrap(),
+            (
+                "ssh".to_string(),
+                "ssh -M -N host".to_string(),
+                "worker".to_string()
+            )
+        );
+    }
 
     #[test]
     fn isolated_service_session_exception_preserves_every_other_session_protection() {
@@ -5057,13 +5126,99 @@ while True:
         }
 
         #[test]
-        fn infrastructure_gate_refuses_unreadable_fuse_descriptors() {
+        fn infrastructure_gate_refuses_missing_process_metadata() {
             let provider = LivePreCheckProvider::with_defaults();
             assert!(matches!(
                 provider.check_not_protected(u32::MAX),
-                PreCheckResult::Blocked { reason, .. }
-                    if reason.contains("cannot inspect FUSE device descriptors")
+                PreCheckResult::Blocked { check: PreCheck::CheckNotProtected, reason }
+                    if reason.contains("protection evidence unavailable")
+                        && reason.contains("process name")
             ));
+        }
+
+        #[test]
+        fn custom_protection_refuses_missing_evidence_without_builtin_rules() {
+            let filter = ProtectedFilter::new(
+                &[(
+                    "^protected-job$".to_string(),
+                    "regex".to_string(),
+                    false,
+                    None,
+                )],
+                &["protected-owner".to_string()],
+                &[],
+                &[],
+            )
+            .unwrap()
+            .with_builtin_protection(false);
+            let mut provider =
+                LivePreCheckProvider::new(None, LivePreCheckConfig::default()).unwrap();
+            provider.protected_filter = Some(filter);
+            for action in [Action::Kill, Action::Pause, Action::Renice, Action::Restart] {
+                assert!(matches!(
+                    provider.check_not_protected_for_action(u32::MAX, action),
+                    PreCheckResult::Blocked { check: PreCheck::CheckNotProtected, reason }
+                        if reason.contains("protection evidence unavailable")
+                            && reason.contains(&u32::MAX.to_string())
+                ));
+            }
+        }
+
+        #[test]
+        fn live_custom_protection_preserves_command_and_owner_rules() {
+            struct OwnedChild(std::process::Child);
+            impl Drop for OwnedChild {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+            let child = OwnedChild(
+                std::process::Command::new("sleep")
+                    .arg("60")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+            let provider = |patterns: &[(String, String, bool, Option<String>)],
+                            users: &[String]| {
+                let mut provider =
+                    LivePreCheckProvider::new(None, LivePreCheckConfig::default()).unwrap();
+                provider.protected_filter = Some(
+                    ProtectedFilter::new(patterns, users, &[], &[])
+                        .unwrap()
+                        .with_builtin_protection(false),
+                );
+                provider
+            };
+            let control = provider(&[], &[]);
+            assert!(control.check_not_protected(child.0.id()).is_passed());
+            let cmdline = control.read_cmdline(child.0.id()).unwrap();
+            let comm = control.read_comm(child.0.id()).unwrap();
+            assert_ne!(
+                cmdline, comm,
+                "the command rule must require argv, not just comm"
+            );
+            let command_rule = format!("^{}$", regex::escape(&cmdline));
+            let command_protected = provider(
+                &[(command_rule.clone(), "regex".to_string(), false, None)],
+                &[],
+            );
+            assert!(matches!(
+                command_protected.check_not_protected(child.0.id()),
+                PreCheckResult::Blocked { check: PreCheck::CheckNotProtected, reason }
+                    if reason.contains(&command_rule)
+            ));
+            let owner = control.read_user(child.0.id()).unwrap();
+            let owner_protected = provider(&[], std::slice::from_ref(&owner));
+            assert!(matches!(
+                owner_protected.check_not_protected(child.0.id()),
+                PreCheckResult::Blocked { check: PreCheck::CheckNotProtected, reason }
+                    if reason.contains("owned by protected user") && reason.contains(&owner)
+            ));
+            assert!(control.check_not_protected(child.0.id()).is_passed());
         }
 
         #[test]
