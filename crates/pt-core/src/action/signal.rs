@@ -542,19 +542,14 @@ impl SignalActionRunner {
         let Some(fd) = PidFd::open(pid)? else {
             return Ok(None);
         };
-        // The pidfd now refers to whatever process holds `pid` right now. Confirm it
-        // is the planned one (exact start ticks). If the pid was reused after the
-        // open, /proc shows the newcomer and we refuse; if it is reused after this
-        // check, signals sent through the pidfd fail with ESRCH instead of hitting
-        // the newcomer.
-        match self.read_starttime(pid) {
-            Some(current) if ids_match_starttime(&action.target.start_id.0, current) => {
-                self.note_path("pidfd");
-                Ok(Some(fd))
-            }
-            Some(_) => Err(ActionError::IdentityMismatch),
-            None => Err(ActionError::ProcessNotFound),
-        }
+        // Opening the descriptor pins an incarnation, not its mutable owner,
+        // process group or session. Check every recorded identity field after
+        // the open, so a changed context cannot inherit the approved action.
+        // If the PID is reused after this check, the pinned descriptor still
+        // cannot signal the replacement.
+        self.check_identity_now(action)?;
+        self.note_path("pidfd");
+        Ok(Some(fd))
     }
 
     /// Check if a process exists.
@@ -589,25 +584,6 @@ impl SignalActionRunner {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn get_process_state(&self, _pid: u32) -> Option<char> {
         None
-    }
-
-    /// Read the starttime field for PID-reuse detection.
-    #[cfg(target_os = "linux")]
-    fn read_starttime(&self, pid: u32) -> Option<u64> {
-        let stat_path = format!("/proc/{pid}/stat");
-        let content_bytes = std::fs::read(stat_path).ok()?;
-        let content = String::from_utf8_lossy(&content_bytes);
-        let comm_end = content.rfind(')')?;
-        let after_comm = content.get(comm_end + 2..)?;
-        let fields: Vec<&str> = after_comm.split_whitespace().collect();
-        // Field 19 (0-indexed from after comm) is starttime
-        fields.get(19)?.parse::<u64>().ok()
-    }
-
-    /// Exact start time in microseconds (the value macOS start ids carry).
-    #[cfg(target_os = "macos")]
-    fn read_starttime(&self, pid: u32) -> Option<u64> {
-        crate::collect::macos::read_bsd_info(pid).map(|info| info.start_us)
     }
 
     /// Wait for a process to reach a target state or exit.
@@ -734,12 +710,9 @@ impl SignalActionRunner {
                 return pidfd.send(libc::SIGSTOP);
             }
         }
-        // Without a pidfd (macOS, or a Linux kernel before 5.3), re-check the
-        // start identity right before the plain kill(2).
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        if !use_group {
-            self.check_identity_now(action)?;
-        }
+        // Bind a fallback signal to every recorded identity field, including
+        // the leader's current group/session when group signaling is requested.
+        self.check_identity_now(action)?;
         deadline.remaining()?;
         self.send_signal(target, libc::SIGSTOP, use_group)?;
         Ok(())
@@ -827,14 +800,25 @@ impl SignalActionRunner {
         receipt.finish(execution, ReversalStatus::Applied)
     }
 
-    /// Re-check start identity immediately before fallback signaling, including
-    /// escalation when a Linux pidfd is unavailable.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    /// Re-check the recorded incarnation and its owner/group/session immediately
+    /// before delivery. A matching start tick alone does not bind those fields.
+    #[cfg(unix)]
     fn check_identity_now(&self, action: &PlanAction) -> Result<(), ActionError> {
-        match self.read_starttime(action.target.pid.0) {
-            Some(current) if ids_match_starttime(&action.target.start_id.0, current) => Ok(()),
-            Some(_) => Err(ActionError::IdentityMismatch),
-            None => Err(ActionError::ProcessNotFound),
+        match observe_signal_target(&action.target)? {
+            SignalObservation::Present(_) => Ok(()),
+            SignalObservation::Replaced => Err(ActionError::IdentityMismatch),
+            SignalObservation::Gone => Err(ActionError::ProcessNotFound),
+        }
+    }
+
+    /// Once TERM was delivered, disappearance/replacement means the original
+    /// target exited. Changed ownership or job-control context is still an error
+    /// and must not authorize a follow-up CONT or KILL, even through a pidfd.
+    #[cfg(unix)]
+    fn original_target_still_present(&self, action: &PlanAction) -> Result<bool, ActionError> {
+        match observe_signal_target(&action.target)? {
+            SignalObservation::Present(_) => Ok(true),
+            SignalObservation::Gone | SignalObservation::Replaced => Ok(false),
         }
     }
 
@@ -857,6 +841,9 @@ impl SignalActionRunner {
                 pidfd.send(libc::SIGTERM)?;
                 self.note_delivered_signal(libc::SIGTERM);
                 if resume_stopped {
+                    if !self.original_target_still_present(action)? {
+                        return Ok(());
+                    }
                     deadline.remaining()?;
                     match pidfd.send(libc::SIGCONT) {
                         Ok(()) => {}
@@ -867,6 +854,9 @@ impl SignalActionRunner {
                 return if self.wait_for_term_grace(action, &deadline)? {
                     Ok(())
                 } else {
+                    if !self.original_target_still_present(action)? {
+                        return Ok(());
+                    }
                     deadline.remaining()?;
                     match pidfd.send(libc::SIGKILL) {
                         Ok(()) => {
@@ -881,10 +871,7 @@ impl SignalActionRunner {
             }
         }
 
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        if !use_group {
-            self.check_identity_now(action)?;
-        }
+        self.check_identity_now(action)?;
 
         // Stage 1: SIGTERM
         deadline.remaining()?;
@@ -894,8 +881,9 @@ impl SignalActionRunner {
             // Without a pidfd, revalidate immediately before the additional
             // signal just as for TERM and KILL. CONT always targets this one
             // process, never an unverified group or a tracing-stop subject.
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            self.check_identity_now(action)?;
+            if !self.original_target_still_present(action)? {
+                return Ok(());
+            }
             deadline.remaining()?;
             match self.send_signal(pid, libc::SIGCONT, false) {
                 Ok(()) => {}
@@ -909,16 +897,9 @@ impl SignalActionRunner {
             return Ok(());
         }
 
-        // Stage 2: SIGKILL (only if process still exists)
-        // TOCTOU window: the process may have exited and its PID may have been
-        // reused between the grace-period timeout and the SIGKILL below.
-        // Re-validate the starttime to guard against killing a replacement process.
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        if self.process_exists(pid) {
-            self.check_identity_now(action)?;
-        }
-
-        if self.process_exists(pid) {
+        // Revalidate all recorded identity fields after the grace period.
+        // A new occupant or an exited original needs no further signal.
+        if self.original_target_still_present(action)? {
             deadline.remaining()?;
             self.send_signal(target, libc::SIGKILL, use_group)?;
         }
@@ -938,7 +919,6 @@ impl SignalActionRunner {
             deadline.remaining()?;
             return pidfd.send(libc::SIGCHLD);
         }
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
         self.check_identity_now(action)?;
         deadline.remaining()?;
         self.send_signal(action.target.pid.0, libc::SIGCHLD, false)
@@ -1054,10 +1034,7 @@ impl SignalActionRunner {
                 return pidfd.send(libc::SIGCONT);
             }
         }
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        if !use_group {
-            self.check_identity_now(action)?;
-        }
+        self.check_identity_now(action)?;
         deadline.remaining()?;
         self.send_signal(target, libc::SIGCONT, use_group)?;
         Ok(())
@@ -1239,16 +1216,15 @@ impl super::executor::IdentityProvider for LiveIdentityProvider {
             return Ok(false); // Can't read identity
         }
 
-        // Validate UID
-        if let Some(current_uid) = self.read_uid(pid) {
-            if current_uid != target.uid {
-                return Ok(false); // UID mismatch
-            }
-        } else {
-            return Ok(false); // Can't read UID; identity cannot be confirmed
+        // Bracket ownership and job-control facts with birth observations, just
+        // as the delivery boundary does. A PID can keep its start time while
+        // changing UID, process group or session after the plan was approved.
+        match observe_signal_target(target) {
+            Ok(SignalObservation::Present(_)) => Ok(true),
+            Ok(SignalObservation::Gone | SignalObservation::Replaced)
+            | Err(ActionError::IdentityMismatch) => Ok(false),
+            Err(error) => Err(error),
         }
-
-        Ok(true)
     }
 }
 
@@ -1268,14 +1244,12 @@ impl LiveIdentityProvider {
 #[cfg(target_os = "macos")]
 impl super::executor::IdentityProvider for LiveIdentityProvider {
     fn revalidate(&self, target: &pt_common::ProcessIdentity) -> Result<bool, ActionError> {
-        let pid = target.pid.0;
-        let Some(info) = crate::collect::macos::read_bsd_info(pid) else {
-            return Ok(false); // gone, or identity cannot be confirmed
-        };
-        let (_, expected_start, expected_pid) = parse_start_id(&target.start_id.0);
-        Ok(expected_start == Some(info.start_us)
-            && expected_pid.is_none_or(|p| p == pid)
-            && info.uid == target.uid)
+        match observe_signal_target(target) {
+            Ok(SignalObservation::Present(_)) => Ok(true),
+            Ok(SignalObservation::Gone | SignalObservation::Replaced)
+            | Err(ActionError::IdentityMismatch) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -1376,27 +1350,6 @@ fn ids_match(expected: &str, current: &str) -> bool {
         }
     }
     matches!((e_ticks, c_ticks), (Some(a), Some(b)) if a == b)
-}
-
-/// Check whether a start_id string matches a raw starttime value (u64).
-///
-/// Used for lightweight revalidation where we have the numeric starttime
-/// from the OS but the original identity stores a composite start_id string.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn ids_match_starttime(start_id: &str, current_starttime: u64) -> bool {
-    fn extract_starttime(id: &str) -> Option<u64> {
-        let parts: Vec<&str> = id.split(':').collect();
-        let st = match parts.len() {
-            1 => parts[0],
-            3 => parts[1],
-            _ => return None,
-        };
-        st.parse::<u64>().ok()
-    }
-
-    // Exact: start ids carry the kernel's start ticks (Linux) or the exact start time in
-    // microseconds from proc_pidinfo (macOS); a tolerance only widens PID reuse.
-    extract_starttime(start_id) == Some(current_starttime)
 }
 
 #[cfg(test)]
@@ -1901,6 +1854,153 @@ mod tests {
         }
 
         #[test]
+        fn planned_signal_delivery_refuses_stale_owner_group_session_and_quality() {
+            let dir = tempfile::tempdir().expect("marker directory");
+            let marker = dir.path().join("term-handled");
+            let (mut child, mut action) = stopped_term_child(&marker, false, true);
+            let stat = crate::collect::proc_parsers::read_required_proc_stat(child.0.id())
+                .expect("owned child identity");
+            action.target.pgid = Some(stat.pgrp as u32);
+            action.target.sid = Some(stat.session as u32);
+            let runner = SignalActionRunner::with_defaults();
+            let provider = LiveIdentityProvider::new();
+            assert!(provider.revalidate(&action.target).unwrap());
+
+            for changed in [
+                "birth",
+                "boot",
+                "pid",
+                "uid",
+                "pgid",
+                "sid",
+                "pid_only",
+                "missing_boot",
+                "missing_pid",
+            ] {
+                let mut stale = action.clone();
+                match changed {
+                    "birth" => {
+                        let (boot, ticks, pid) = parse_start_id(&stale.target.start_id.0);
+                        stale.target.start_id = pt_common::StartId::from_linux(
+                            boot.unwrap(),
+                            ticks.unwrap() + 1,
+                            pid.unwrap(),
+                        );
+                    }
+                    "boot" => {
+                        let (_, ticks, pid) = parse_start_id(&stale.target.start_id.0);
+                        stale.target.start_id = pt_common::StartId::from_linux(
+                            "different-boot",
+                            ticks.unwrap(),
+                            pid.unwrap(),
+                        );
+                    }
+                    "pid" => {
+                        let (boot, ticks, pid) = parse_start_id(&stale.target.start_id.0);
+                        stale.target.start_id = pt_common::StartId::from_linux(
+                            boot.unwrap(),
+                            ticks.unwrap(),
+                            pid.unwrap() + 1,
+                        );
+                    }
+                    "uid" => stale.target.uid ^= 1,
+                    "pgid" => stale.target.pgid = Some(stat.pgrp as u32 + 1),
+                    "sid" => stale.target.sid = Some(stat.session as u32 + 1),
+                    "pid_only" => stale.target.quality = pt_common::IdentityQuality::PidOnly,
+                    "missing_boot" => {
+                        stale.target.start_id =
+                            pt_common::StartId::from_linux("unknown", stat.starttime, child.0.id());
+                    }
+                    "missing_pid" => {
+                        stale.target.start_id = pt_common::StartId(stat.starttime.to_string());
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(
+                    !provider.revalidate(&stale.target).unwrap(),
+                    "{changed}: executor identity revalidation must refuse"
+                );
+                // The fallback path and later TERM escalation use the same full
+                // observation. A different birth proves exit; mutable identity
+                // drift must remain an error rather than permission to escalate.
+                assert!(runner.check_identity_now(&stale).is_err(), "{changed}");
+                if changed == "birth" {
+                    assert!(!runner.original_target_still_present(&stale).unwrap());
+                } else {
+                    assert!(runner.original_target_still_present(&stale).is_err());
+                }
+                // Process groups are disabled here: even a regression must only
+                // ever signal the owned child, never the deliberately stale PGID.
+                for kind in [Action::Pause, Action::Kill, Action::Resume] {
+                    stale.action = kind;
+                    assert!(
+                        runner.execute(&stale).is_err(),
+                        "{changed}: {kind:?} must refuse before signal delivery"
+                    );
+                    assert_eq!(runner.get_process_state(child.0.id()), Some('T'));
+                    assert!(!runner.take_kill_signal_delivered());
+                    assert!(!marker.exists());
+                }
+            }
+
+            // Optional unknown fields retain their documented weaker identity
+            // contract; Full quality, in contrast, cannot omit boot or PID.
+            let mut partial = action.target.clone();
+            partial.quality = pt_common::IdentityQuality::NoBootId;
+            partial.start_id =
+                pt_common::StartId::from_linux("unknown", stat.starttime, child.0.id());
+            partial.pgid = None;
+            partial.sid = None;
+            assert!(provider.revalidate(&partial).unwrap());
+
+            action.action = Action::Resume;
+            runner
+                .execute(&action)
+                .expect("resume unchanged owned child");
+            runner.verify(&action).expect("verify owned child resumed");
+            action.action = Action::Pause;
+            runner
+                .execute(&action)
+                .expect("pause unchanged owned child");
+            runner.verify(&action).expect("verify owned child paused");
+            action.action = Action::Kill;
+            runner
+                .execute(&action)
+                .expect("terminate unchanged owned child");
+            runner.verify(&action).expect("verify owned child exited");
+            assert!(child.0.wait().unwrap().success());
+            assert_eq!(std::fs::read_to_string(&marker).unwrap(), "term handled\n");
+            assert!(runner.take_kill_signal_delivered());
+        }
+
+        #[test]
+        fn planned_group_delivery_requires_the_recorded_leader_context() {
+            let dir = tempfile::tempdir().expect("marker directory");
+            let marker = dir.path().join("term-handled");
+            let (child, mut action) = stopped_term_child(&marker, false, true);
+            let stat = crate::collect::proc_parsers::read_required_proc_stat(child.0.id())
+                .expect("owned child identity");
+            action.target.sid = Some(stat.session as u32 + 1);
+            let runner = SignalActionRunner::new(SignalConfig {
+                use_process_groups: true,
+                ..SignalConfig::default()
+            });
+            // The child has its own group and that PGID is never altered. Even
+            // unfixed code can only affect this test's owned process group.
+            assert_eq!(action.target.pgid, Some(child.0.id()));
+            for kind in [Action::Pause, Action::Kill, Action::Resume] {
+                action.action = kind;
+                assert!(matches!(
+                    runner.execute(&action),
+                    Err(ActionError::IdentityMismatch)
+                ));
+                assert_eq!(runner.get_process_state(child.0.id()), Some('T'));
+                assert!(!runner.take_kill_signal_delivered());
+                assert!(!marker.exists());
+            }
+        }
+
+        #[test]
         fn kill_verification_recognizes_a_replaced_incarnation() {
             let dir = tempfile::tempdir().expect("marker directory");
             let marker = dir.path().join("term-handled");
@@ -2345,7 +2445,10 @@ mod tests {
             let (child, mut action) = stopped_term_child(&marker, false, false);
             let runner = SignalActionRunner::with_defaults();
             let pid = child.0.id();
-            let other_start = runner.read_starttime(pid).unwrap() + 1;
+            let other_start = crate::collect::proc_parsers::read_required_proc_stat(pid)
+                .unwrap()
+                .starttime
+                + 1;
             action.target.start_id = pt_common::StartId(format!("unknown:{other_start}:{pid}"));
 
             assert!(matches!(
