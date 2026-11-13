@@ -133,8 +133,40 @@ pub struct PatternCounts {
 }
 
 impl PatternCounts {
-    fn total(&self) -> u32 {
-        self.kill + self.spare
+    fn total(&self) -> u64 {
+        u64::from(self.kill) + u64::from(self.spare)
+    }
+
+    /// Validate the whole entry before any source is trimmed or used as a prior.
+    /// Raw counts saturate independently, so legitimate effective weights can
+    /// exceed them. Their nonnegative, finite sums are the numerical invariant.
+    fn validate(&self) -> Result<(), &'static str> {
+        if self.updated_at.is_some() && parse_ts(self.updated_at.as_deref()).is_none() {
+            return Err("updated_at must be an RFC 3339 timestamp");
+        }
+        let kill = self.kill_weight.unwrap_or(f64::from(self.kill));
+        let spare = self.spare_weight.unwrap_or(f64::from(self.spare));
+        if !kill.is_finite() || kill < 0.0 {
+            return Err("kill_weight must be finite and nonnegative");
+        }
+        if !spare.is_finite() || spare < 0.0 {
+            return Err("spare_weight must be finite and nonnegative");
+        }
+        if !(kill + spare).is_finite() {
+            return Err("combined kill and spare weights must be finite");
+        }
+        for source in self.source_weights.values() {
+            if !source.kill.is_finite() || source.kill < 0.0 {
+                return Err("source_weights.kill must be finite and nonnegative");
+            }
+            if !source.spare.is_finite() || source.spare < 0.0 {
+                return Err("source_weights.spare must be finite and nonnegative");
+            }
+            if !(source.kill + source.spare).is_finite() {
+                return Err("combined source weights must be finite");
+            }
+        }
+        Ok(())
     }
 
     /// Decayed (kill, spare) weights at `now`.
@@ -200,6 +232,13 @@ pub enum DecisionStoreError {
     },
     #[error("decision store at {path} is not a JSON object: {message}")]
     Parse { path: PathBuf, message: String },
+    #[error("decision store at {path} has invalid entry {entry_id}: {message}")]
+    InvalidData {
+        path: PathBuf,
+        /// An opaque key identifier; command patterns may contain private text.
+        entry_id: String,
+        message: String,
+    },
 }
 
 /// What the learned prior was derived from (for explanations / plan JSON).
@@ -227,6 +266,20 @@ pub struct DecisionStore {
     pending: BTreeMap<String, PatternCounts>,
 }
 
+fn validate_entry(
+    path: &Path,
+    key: &str,
+    counts: &PatternCounts,
+) -> Result<(), DecisionStoreError> {
+    counts
+        .validate()
+        .map_err(|message| DecisionStoreError::InvalidData {
+            path: path.to_path_buf(),
+            entry_id: source_id(key),
+            message: message.to_string(),
+        })
+}
+
 fn read_entries(path: &Path) -> Result<BTreeMap<String, PatternCounts>, DecisionStoreError> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -247,7 +300,7 @@ fn read_entries(path: &Path) -> Result<BTreeMap<String, PatternCounts>, Decision
             return Err(DecisionStoreError::Io {
                 path: path.to_path_buf(),
                 source,
-            })
+            });
         }
     };
     if text.trim().is_empty() {
@@ -258,8 +311,7 @@ fn read_entries(path: &Path) -> Result<BTreeMap<String, PatternCounts>, Decision
             path: path.to_path_buf(),
             message: e.to_string(),
         })?;
-    Ok(raw
-        .into_iter()
+    raw.into_iter()
         .map(|(k, v)| {
             let mut counts = match v {
                 StoredEntry::Counts(c) => c,
@@ -274,10 +326,11 @@ fn read_entries(path: &Path) -> Result<BTreeMap<String, PatternCounts>, Decision
                     ..Default::default()
                 },
             };
+            validate_entry(path, &k, &counts)?;
             counts.bound_sources();
-            (k, counts)
+            Ok((k, counts))
         })
-        .collect())
+        .collect()
 }
 
 /// Add `delta`'s verdicts to `into`: both weight sums are decayed to the later of the
@@ -325,7 +378,6 @@ fn add_counts(into: &mut PatternCounts, delta: &PatternCounts) {
         merged.kill += source.kill * delta_decay;
         merged.spare += source.spare * delta_decay;
     }
-    into.bound_sources();
 }
 
 /// Exclusive advisory lock on `<store>.lock`, held until dropped.
@@ -387,7 +439,14 @@ impl DecisionStore {
         let _lock = StoreLock::acquire(&self.path)?;
         let mut merged = read_entries(&self.path)?;
         for (key, delta) in &self.pending {
-            add_counts(merged.entry(key.clone()).or_default(), delta);
+            validate_entry(&self.path, key, delta)?;
+            let counts = merged.entry(key.clone()).or_default();
+            add_counts(counts, delta);
+            // Two finite inputs can overflow when concurrent writers merge.
+            // Refuse before serialization can replace nonfinite weights with
+            // null, which would reload as unweighted raw counts.
+            validate_entry(&self.path, key, counts)?;
+            counts.bound_sources();
         }
         let tmp = self
             .path
@@ -495,8 +554,12 @@ impl DecisionStore {
             )]),
         };
         for key in keys {
-            add_counts(self.entries.entry(key.clone()).or_default(), &delta);
-            add_counts(self.pending.entry(key).or_default(), &delta);
+            let counts = self.entries.entry(key.clone()).or_default();
+            add_counts(counts, &delta);
+            counts.bound_sources();
+            let pending = self.pending.entry(key).or_default();
+            add_counts(pending, &delta);
+            pending.bound_sources();
         }
     }
 
@@ -549,7 +612,8 @@ impl DecisionStore {
                     pattern_key: key,
                     kill: c.kill,
                     spare: c.spare,
-                    weight: (kill_w + spare_w) / f64::from(c.total()),
+                    // Two u32 counts fit exactly in f64, including their sum.
+                    weight: (kill_w + spare_w) / c.total() as f64,
                     effective_sample_count: kill_w + spare_w,
                     abandonment_prior: p,
                 }
@@ -623,6 +687,261 @@ mod tests {
         .unwrap();
         let store = DecisionStore::load(dir.path()).unwrap();
         assert_eq!(store.len(), 2);
+    }
+
+    #[test]
+    fn malformed_statistics_reject_the_whole_store_at_every_specificity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DECISIONS_FILE);
+        let keys = DecisionStore::pattern_keys("node", "node /srv/PRIVATE_PATTERN_CANARY.js");
+        assert_eq!(keys.len(), 3);
+        let invalid_fields = [
+            ("kill_weight", serde_json::json!({"kill_weight": -1.0})),
+            ("spare_weight", serde_json::json!({"spare_weight": -1.0})),
+            (
+                "updated_at",
+                serde_json::json!({"updated_at": "not-a-timestamp"}),
+            ),
+            (
+                "combined kill and spare weights",
+                serde_json::json!({"kill_weight": f64::MAX, "spare_weight": f64::MAX}),
+            ),
+            (
+                "source_weights.kill",
+                serde_json::json!({"source_weights": {"source": {"kill": -1.0, "spare": 0.0}}}),
+            ),
+            (
+                "source_weights.spare",
+                serde_json::json!({"source_weights": {"source": {"kill": 0.0, "spare": -1.0}}}),
+            ),
+            (
+                "combined source weights",
+                serde_json::json!({"source_weights": {"source": {"kill": f64::MAX, "spare": f64::MAX}}}),
+            ),
+        ];
+        for key in keys {
+            for (field, invalid) in &invalid_fields {
+                let mut counts = serde_json::json!({"kill": 1, "spare": 1});
+                counts
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(invalid.as_object().unwrap().clone());
+                let file = serde_json::json!({
+                    (key.clone()): counts,
+                    "exact|unrelated|safe": {"kill": 0, "spare": 1},
+                });
+                let bytes = file.to_string();
+                std::fs::write(&path, &bytes).unwrap();
+                let error = DecisionStore::load(dir.path()).unwrap_err();
+                assert!(matches!(&error, DecisionStoreError::InvalidData { .. }));
+                assert!(error.to_string().contains(*field), "{key}: {error}");
+                assert!(!error.to_string().contains("PRIVATE_PATTERN_CANARY"));
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_sources_are_validated_before_retention_trims_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sources = serde_json::Map::new();
+        for index in 0..MAX_TRACKED_SOURCES {
+            sources.insert(
+                format!("{index:04}"),
+                serde_json::json!({"kill": 1.0, "spare": 0.0}),
+            );
+        }
+        sources.insert(
+            "zz-invalid".into(),
+            serde_json::json!({"kill": -1.0, "spare": 0.0}),
+        );
+        std::fs::write(
+            dir.path().join(DECISIONS_FILE),
+            serde_json::json!({
+                (broad_key()): {"kill": 16, "spare": 0, "source_weights": sources},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let error = DecisionStore::load(dir.path()).unwrap_err();
+        assert!(error.to_string().contains("source_weights.kill"));
+    }
+
+    #[test]
+    fn large_legacy_counts_remain_visible_at_every_specificity() {
+        let cmd = "node /srv/review.js";
+        for key in DecisionStore::pattern_keys("node", cmd) {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join(DECISIONS_FILE),
+                serde_json::json!({
+                    (key.clone()): {
+                        "kill": u32::MAX,
+                        "spare": 1,
+                        "source_weights": {
+                            "source-a": {"kill": 1.0, "spare": 0.0},
+                            "source-b": {"kill": 1.0, "spare": 0.0},
+                        },
+                    },
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let mut store = DecisionStore::load(dir.path()).unwrap();
+            let before = store.entries[&key].clone();
+            assert_eq!(before.total(), u64::from(u32::MAX) + 1);
+            let prior = store
+                .learned_prior_at("node", cmd, &global(), test_time())
+                .unwrap();
+            assert_eq!(prior.pattern_key, key);
+            assert_eq!((prior.kill, prior.spare), (u32::MAX, 1));
+            assert_eq!(prior.weight, 1.0);
+            assert_eq!(prior.effective_sample_count, f64::from(u32::MAX) + 1.0);
+            assert_eq!(prior.abandonment_prior, LEARNED_PRIOR_MAX);
+
+            store.record_at("sleep", "sleep 600", Verdict::Spare, test_time());
+            store.save().unwrap();
+            let loaded = DecisionStore::load(dir.path()).unwrap();
+            assert_eq!(loaded.entries[&key], before);
+            let prior = loaded
+                .learned_prior_at("node", cmd, &global(), test_time())
+                .unwrap();
+            assert_eq!(prior.pattern_key, key);
+            assert_eq!(prior.weight, 1.0);
+        }
+    }
+
+    #[test]
+    fn saturated_counts_allow_larger_weights_and_future_times_do_not_amplify_them() {
+        let cmd = "node /srv/review.js";
+        let max = f64::from(u32::MAX);
+        let now = test_time();
+        let future = now + chrono::Duration::days(30);
+        for key in DecisionStore::pattern_keys("node", cmd) {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join(DECISIONS_FILE),
+                serde_json::json!({
+                    (key.clone()): {
+                        "kill": u32::MAX,
+                        "spare": u32::MAX,
+                        "kill_weight": max * 2.0,
+                        "spare_weight": max,
+                        "updated_at": future.to_rfc3339(),
+                        "source_weights": {
+                            "source-a": {"kill": max, "spare": 0.0},
+                            "source-b": {"kill": max, "spare": 0.0},
+                        },
+                    },
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let mut store = DecisionStore::load(dir.path()).unwrap();
+            let prior = store.learned_prior_at("node", cmd, &global(), now).unwrap();
+            assert_eq!(prior.pattern_key, key);
+            assert_eq!(prior.weight, 1.5);
+            assert_eq!(prior.effective_sample_count, max * 3.0);
+            let global_ab =
+                global().classes.abandoned.prior_prob + global().classes.zombie.prior_prob;
+            let expected = (max * 2.0 + PRIOR_STRENGTH * global_ab) / (max * 3.0 + PRIOR_STRENGTH);
+            assert!((prior.abandonment_prior - expected).abs() < 1e-12);
+
+            store.record_at("node", cmd, Verdict::Spare, now);
+            store.save().unwrap();
+            let loaded = DecisionStore::load(dir.path()).unwrap();
+            let counts = &loaded.entries[&key];
+            assert_eq!(counts.total(), u64::from(u32::MAX) * 2);
+            assert_eq!(counts.kill_weight, Some(max * 2.0));
+            let added_weight = 0.5_f64.powf(30.0 / DECAY_HALF_LIFE_DAYS);
+            assert!((counts.spare_weight.unwrap() - (max + added_weight)).abs() < 1e-6);
+            assert_eq!(parse_ts(counts.updated_at.as_deref()), Some(future));
+        }
+    }
+
+    #[test]
+    fn failed_save_preserves_corrupt_disk_and_pending_verdicts_for_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DECISIONS_FILE);
+        let cmd = "node /srv/review.js";
+        let mut store = DecisionStore::load(dir.path()).unwrap();
+        store.record_at("node", cmd, Verdict::Kill, test_time());
+        store.save().unwrap();
+        let valid = std::fs::read_to_string(&path).unwrap();
+        store.record_at("node", cmd, Verdict::Spare, test_time());
+        let pending = store.pending.clone();
+        let key = DecisionStore::pattern_keys("node", cmd).remove(0);
+        let mut corrupt: serde_json::Value = serde_json::from_str(&valid).unwrap();
+        corrupt[&key]["spare_weight"] = serde_json::json!(-1.0);
+        let corrupt = corrupt.to_string();
+        std::fs::write(&path, &corrupt).unwrap();
+
+        let error = store.save().unwrap_err();
+        assert!(matches!(error, DecisionStoreError::InvalidData { .. }));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), corrupt);
+        assert_eq!(store.pending, pending);
+
+        std::fs::write(&path, valid).unwrap();
+        store.save().unwrap();
+        assert!(store.pending.is_empty());
+        let restored = DecisionStore::load(dir.path()).unwrap();
+        let prior = restored
+            .learned_prior_at("node", cmd, &global(), test_time())
+            .unwrap();
+        assert_eq!((prior.kill, prior.spare), (1, 1));
+        assert_eq!(prior.effective_sample_count, 2.0);
+    }
+
+    #[test]
+    fn save_refuses_overflowing_merges_and_nonfinite_weights_before_serializing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DECISIONS_FILE);
+        let key = DecisionStore::pattern_keys("sleep", "sleep 600").remove(0);
+        let counts = PatternCounts {
+            kill: u32::MAX,
+            kill_weight: Some(f64::MAX * 0.75),
+            ..Default::default()
+        };
+        let file = serde_json::to_string(&BTreeMap::from([(key.clone(), counts.clone())])).unwrap();
+        std::fs::write(&path, &file).unwrap();
+        let mut store = DecisionStore::load(dir.path()).unwrap();
+        let before = store.entries[&key].clone();
+        store.pending.insert(key.clone(), counts.clone());
+        assert!(matches!(
+            store.save(),
+            Err(DecisionStoreError::InvalidData { .. })
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), file);
+        assert_eq!(store.entries[&key], before);
+        assert_eq!(store.pending[&key], counts);
+
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for source_weight in [false, true] {
+                let mut store = DecisionStore::load(dir.path()).unwrap();
+                let mut pending = PatternCounts {
+                    kill: 1,
+                    ..Default::default()
+                };
+                if source_weight {
+                    pending.source_weights.insert(
+                        "source".into(),
+                        SourceWeights {
+                            kill: invalid,
+                            spare: 0.0,
+                        },
+                    );
+                } else {
+                    pending.kill_weight = Some(invalid);
+                }
+                store.pending.insert(key.clone(), pending);
+                assert!(matches!(
+                    store.save(),
+                    Err(DecisionStoreError::InvalidData { .. })
+                ));
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), file);
+                assert!(!store.pending.is_empty());
+            }
+        }
     }
 
     #[test]
@@ -922,7 +1241,12 @@ mod tests {
                 ..Default::default()
             },
         );
-        store.record_at("python3", "python3 -c first_job()", Verdict::Kill, test_time());
+        store.record_at(
+            "python3",
+            "python3 -c first_job()",
+            Verdict::Kill,
+            test_time(),
+        );
         assert!(store
             .learned_prior_at("python3", "python3 -c unseen_job()", &global(), test_time())
             .is_none());
