@@ -17,7 +17,8 @@
 //!
 //! Linux sources read from a root directory (`/` on a live system) so the parsers
 //! and window math are testable against recorded files. macOS obtains native load
-//! averages with `getloadavg`; unsupported pressure sensors remain unavailable.
+//! averages, VM counters, RAM/swap sizes and the kernel's qualitative memory
+//! pressure level. Linux-only PSI and MemAvailable remain unavailable there.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -228,7 +229,20 @@ pub struct LoadAvg {
     pub total: Option<u32>,
 }
 
-/// `/proc/meminfo`, in bytes. Fields a kernel does not report are `None`.
+/// The dispatch pressure level reported by macOS's
+/// `kern.memorystatus_vm_pressure_level`. These are qualitative kernel states,
+/// not PSI percentages or estimates of available RAM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MacosPressureLevel {
+    Normal,
+    Warning,
+    Critical,
+}
+
+/// Memory accounting, in bytes. Fields a kernel does not report are `None`.
+/// On macOS `free` includes speculative pages and `cached` reports file-backed
+/// pages; neither is a Linux MemAvailable estimate.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct MemInfo {
     pub total: Option<u64>,
@@ -248,6 +262,8 @@ pub struct MemInfo {
     pub swap_free: Option<u64>,
     pub committed_as: Option<u64>,
     pub commit_limit: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub macos_pressure: Option<MacosPressureLevel>,
 }
 
 impl MemInfo {
@@ -602,14 +618,161 @@ fn apply_native_loadavg(snapshot: &mut PressureSnapshot, load: Result<LoadAvg, S
     });
 }
 
-/// Read native macOS load averages and observed online CPU capacity. Other
-/// pressure sources that require Linux procfs remain explicitly unavailable.
+#[cfg(any(target_os = "macos", test))]
+fn native_reading<T>(
+    result: Result<T, String>,
+    source: &str,
+    unavailable: &mut Vec<Unavailable>,
+) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(reason) => {
+            unavailable.push(Unavailable {
+                source: source.to_string(),
+                reason,
+            });
+            None
+        }
+    }
+}
+
+/// Keep the native probe boundary injectable so recorded output and individual
+/// command failures exercise the same assembly path as a live macOS scan.
+#[cfg(any(target_os = "macos", test))]
+fn read_macos_pressure_snapshot_with(
+    mut run: impl FnMut(&str, &[&str]) -> Result<String, String>,
+    load: Result<LoadAvg, String>,
+) -> PressureSnapshot {
+    use super::pressure_macos::{
+        parse_logical_cpus, parse_memsize, parse_pressure_level, parse_swap_usage, parse_vm_stat,
+    };
+
+    let mut unavailable = Vec::new();
+    let cpus = native_reading(
+        run("/usr/sbin/sysctl", &["-n", "hw.logicalcpu"])
+            .and_then(|text| parse_logical_cpus(&text)),
+        "hw.logicalcpu",
+        &mut unavailable,
+    )
+    .unwrap_or(0);
+    // Read severity early: a later missing accounting source must not conceal a
+    // kernel-reported critical state or turn it into a healthy observation.
+    let level = native_reading(
+        run(
+            "/usr/sbin/sysctl",
+            &["-n", "kern.memorystatus_vm_pressure_level"],
+        )
+        .and_then(|text| parse_pressure_level(&text)),
+        "kern.memorystatus_vm_pressure_level",
+        &mut unavailable,
+    );
+    let total = native_reading(
+        run("/usr/sbin/sysctl", &["-n", "hw.memsize"]).and_then(|text| parse_memsize(&text)),
+        "hw.memsize",
+        &mut unavailable,
+    );
+    let vm = native_reading(
+        run("/usr/bin/vm_stat", &[]).and_then(|text| parse_vm_stat(&text)),
+        "vm_stat",
+        &mut unavailable,
+    );
+    let swap = native_reading(
+        run("/usr/sbin/sysctl", &["-n", "vm.swapusage"]).and_then(|text| parse_swap_usage(&text)),
+        "vm.swapusage",
+        &mut unavailable,
+    );
+    let macos_pressure = level.and_then(|value| match value {
+        1 => Some(MacosPressureLevel::Normal),
+        2 => Some(MacosPressureLevel::Warning),
+        4 => Some(MacosPressureLevel::Critical),
+        _ => None, // The native parser refuses unknown dispatch flags.
+    });
+    let mut memory = MemInfo {
+        total,
+        free: vm.as_ref().map(|vm| vm.free),
+        cached: vm.as_ref().and_then(|vm| vm.file_backed),
+        anon: vm.as_ref().and_then(|vm| vm.anonymous),
+        swap_total: swap.as_ref().map(|swap| swap.total),
+        swap_free: swap.as_ref().map(|swap| swap.free),
+        macos_pressure,
+        ..MemInfo::default()
+    };
+    if let Some(total) = total {
+        for (name, value) in [
+            ("free", &mut memory.free),
+            ("file_backed", &mut memory.cached),
+            ("anonymous", &mut memory.anon),
+        ] {
+            if value.is_some_and(|bytes| bytes > total) {
+                *value = None;
+                unavailable.push(Unavailable {
+                    source: format!("vm_stat.{name}"),
+                    reason: "observed page count exceeds hw.memsize".to_string(),
+                });
+            }
+        }
+    }
+    let meminfo = (total.is_some() || vm.is_some() || swap.is_some() || macos_pressure.is_some())
+        .then_some(memory);
+    let vmstat = vm.as_ref().and_then(|vm| {
+        (vm.swapins.is_some() || vm.swapouts.is_some()).then_some(VmStat {
+            pswpin: vm.swapins,
+            pswpout: vm.swapouts,
+            ..VmStat::default()
+        })
+    });
+    for source in [
+        "/proc/pressure/cpu",
+        "/proc/pressure/memory",
+        "/proc/pressure/io",
+    ] {
+        unavailable.push(Unavailable {
+            source: source.to_string(),
+            reason: "macOS does not expose Linux Pressure Stall Information".to_string(),
+        });
+    }
+    unavailable.push(Unavailable {
+        source: "meminfo.available".to_string(),
+        reason: "macOS has no Linux MemAvailable equivalent; free, inactive and compressed pages are not substituted for available RAM".to_string(),
+    });
+    unavailable.push(Unavailable {
+        source: "/proc/sys/fs/file-nr".to_string(),
+        reason: "system file-handle table is not collected on macOS".to_string(),
+    });
+    if vm
+        .as_ref()
+        .is_some_and(|vm| vm.swapins.is_none() || vm.swapouts.is_none())
+    {
+        unavailable.push(Unavailable {
+            source: "vm_stat.swap_counters".to_string(),
+            reason: "vm_stat did not report both cumulative swap counters".to_string(),
+        });
+    }
+    let mut snapshot = PressureSnapshot {
+        sampled_at_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_millis() as u64),
+        cpus,
+        cpu: None,
+        memory: None,
+        io: None,
+        irq: None,
+        load: None,
+        meminfo,
+        vmstat,
+        file_handles: None,
+        unavailable,
+    };
+    apply_native_loadavg(&mut snapshot, load);
+    snapshot
+}
+
+/// Read native macOS load, VM accounting and qualitative memory pressure.
+/// Every external read has a deadline/output cap and shares a one-second budget.
 #[cfg(target_os = "macos")]
 pub fn read_pressure_snapshot() -> PressureSnapshot {
-    let mut snapshot = read_pressure_snapshot_from(
-        Path::new("/"),
-        super::cpu_capacity::observed_logical_cpus().unwrap_or(0),
-    );
+    use super::tool_runner::{ToolConfig, ToolRunner, ToolSpec};
+
     let mut values = [f64::NAN; 3];
     // SAFETY: values has space for exactly the three doubles requested, and
     // getloadavg writes only within that buffer for the duration of this call.
@@ -622,8 +785,29 @@ pub fn read_pressure_snapshot() -> PressureSnapshot {
     } else {
         checked_native_loadavg(sample_count, values)
     };
-    apply_native_loadavg(&mut snapshot, load);
-    snapshot
+    let runner = ToolRunner::new(ToolConfig {
+        default_timeout: Duration::from_millis(250),
+        max_output_bytes: 32 * 1024,
+        budget_ms: 1_000,
+        use_nice: false,
+        ..ToolConfig::default()
+    });
+    read_macos_pressure_snapshot_with(
+        |program, args| {
+            let spec = ToolSpec::new(program, args.iter().map(|arg| (*arg).to_string()).collect())
+                .with_env("LC_ALL", "C");
+            let output = runner.run(&spec).map_err(|error| error.to_string())?;
+            if !output.success() {
+                return Err(format!(
+                    "native probe incomplete (exit {:?}, timed_out {}, truncated {})",
+                    output.exit_code, output.timed_out, output.truncated
+                ));
+            }
+            String::from_utf8(output.stdout)
+                .map_err(|_| "native probe output is not UTF-8".to_string())
+        },
+        load,
+    )
 }
 
 /// Read a pressure snapshot on other platforms. Without procfs every source
@@ -1067,6 +1251,150 @@ mod tests {
             .unavailable
             .iter()
             .any(|source| source.source == "getloadavg" && source.reason.contains("all 3")));
+    }
+
+    fn macos_probe_fixture(program: &str, args: &[&str]) -> Result<String, String> {
+        let output = match (program, args) {
+            ("/usr/sbin/sysctl", ["-n", "hw.logicalcpu"]) => "8\n",
+            ("/usr/sbin/sysctl", ["-n", "hw.memsize"]) => "17179869184\n",
+            ("/usr/sbin/sysctl", ["-n", "kern.memorystatus_vm_pressure_level"]) => "4\n",
+            ("/usr/sbin/sysctl", ["-n", "vm.swapusage"]) => {
+                "total = 2048.00M  used = 512.00M  free = 1536.00M  (encrypted)\n"
+            }
+            ("/usr/bin/vm_stat", []) => {
+                "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
+                 Pages free: 100.\nPages speculative: 20.\nPages inactive: 500000.\n\
+                 Pages purgeable: 400000.\nFile-backed pages: 300.\n\
+                 Anonymous pages: 400.\nSwapins: 10.\nSwapouts: 25.\n"
+            }
+            _ => return Err(format!("unexpected native probe: {program} {args:?}")),
+        };
+        Ok(output.to_string())
+    }
+
+    #[test]
+    fn macos_snapshot_preserves_native_accounting_without_inventing_availability() {
+        let snapshot = read_macos_pressure_snapshot_with(
+            macos_probe_fixture,
+            checked_native_loadavg(3, [2.0, 1.0, 0.5]),
+        );
+        assert_eq!(snapshot.cpus, 8);
+        assert_eq!(snapshot.load_ratio(), Some(0.25));
+        let memory = snapshot.meminfo.unwrap();
+        assert_eq!(memory.total, Some(16 * 1024 * 1024 * 1024));
+        assert_eq!(memory.free, Some(120 * 16384));
+        assert_eq!(memory.cached, Some(300 * 16384));
+        assert_eq!(memory.anon, Some(400 * 16384));
+        assert_eq!(memory.available, None);
+        assert_eq!(memory.used_fraction(), None);
+        assert_eq!(memory.swap_used(), Some(512 * 1024 * 1024));
+        assert_eq!(memory.macos_pressure, Some(MacosPressureLevel::Critical));
+        let vm = snapshot.vmstat.unwrap();
+        assert_eq!(vm.pswpin, Some(10));
+        assert_eq!(vm.pswpout, Some(25));
+        assert_eq!(vm.pgmajfault, None);
+        assert_eq!(vm.oom_kill, None);
+        assert_eq!(snapshot.memory, None);
+        assert!(snapshot
+            .unavailable
+            .iter()
+            .any(|entry| entry.source == "meminfo.available"));
+        assert!(!snapshot
+            .unavailable
+            .iter()
+            .any(|entry| { matches!(entry.source.as_str(), "/proc/meminfo" | "/proc/vmstat") }));
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(json["meminfo"]["macos_pressure"], "critical");
+        assert_eq!(
+            serde_json::from_value::<PressureSnapshot>(json).unwrap(),
+            snapshot
+        );
+
+        let legacy = serde_json::to_value(MemInfo::default()).unwrap();
+        assert!(legacy.get("macos_pressure").is_none());
+        assert_eq!(
+            serde_json::from_value::<MemInfo>(legacy)
+                .unwrap()
+                .macos_pressure,
+            None
+        );
+    }
+
+    #[test]
+    fn macos_snapshot_retains_independent_evidence_after_probe_failure() {
+        for failed in [
+            "hw.logicalcpu",
+            "hw.memsize",
+            "vm_stat",
+            "vm.swapusage",
+            "kern.memorystatus_vm_pressure_level",
+        ] {
+            let snapshot = read_macos_pressure_snapshot_with(
+                |program, args| {
+                    let source = args.last().copied().unwrap_or("vm_stat");
+                    if source == failed {
+                        Err("native probe timed out".to_string())
+                    } else {
+                        macos_probe_fixture(program, args)
+                    }
+                },
+                checked_native_loadavg(3, [2.0, 1.0, 0.5]),
+            );
+            assert!(snapshot
+                .unavailable
+                .iter()
+                .any(|entry| { entry.source == failed && entry.reason.contains("timed out") }));
+            let memory = snapshot.meminfo.unwrap();
+            assert_eq!(
+                memory.macos_pressure,
+                (failed != "kern.memorystatus_vm_pressure_level")
+                    .then_some(MacosPressureLevel::Critical)
+            );
+            match failed {
+                "hw.logicalcpu" => assert_eq!(snapshot.load_ratio(), None),
+                "hw.memsize" => assert_eq!(memory.total, None),
+                "vm_stat" => {
+                    assert_eq!(memory.free, None);
+                    assert_eq!(snapshot.vmstat, None);
+                }
+                "vm.swapusage" => assert_eq!(memory.swap_used(), None),
+                _ => {}
+            }
+        }
+        let missing = read_macos_pressure_snapshot_with(
+            |_, _| Err("budget exhausted".to_string()),
+            Err("getloadavg failed".to_string()),
+        );
+        assert_eq!(missing.cpus, 0);
+        assert!(missing.load.is_none() && missing.meminfo.is_none() && missing.vmstat.is_none());
+    }
+
+    #[test]
+    fn macos_snapshot_rejects_impossible_ram_counts_without_hiding_pressure() {
+        let snapshot = read_macos_pressure_snapshot_with(
+            |program, args| {
+                if args.last() == Some(&"hw.memsize") {
+                    Ok("1\n".to_string())
+                } else {
+                    macos_probe_fixture(program, args)
+                }
+            },
+            checked_native_loadavg(3, [2.0, 1.0, 0.5]),
+        );
+        let memory = snapshot.meminfo.unwrap();
+        assert_eq!(
+            (memory.free, memory.cached, memory.anon),
+            (None, None, None)
+        );
+        assert_eq!(memory.macos_pressure, Some(MacosPressureLevel::Critical));
+        assert_eq!(
+            snapshot
+                .unavailable
+                .iter()
+                .filter(|entry| entry.reason.contains("exceeds hw.memsize"))
+                .count(),
+            3
+        );
     }
 
     #[test]

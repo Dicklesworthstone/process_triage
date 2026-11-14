@@ -18,7 +18,7 @@
 //! Classification is deterministic and stateless; [`RegimeTracker`] adds hysteresis
 //! for repeated sampling (the daemon) so a regime neither flaps nor lingers.
 
-use crate::collect::pressure::{PressureSnapshot, PressureWindow};
+use crate::collect::pressure::{MacosPressureLevel, PressureSnapshot, PressureWindow};
 use serde::{Deserialize, Serialize};
 
 /// How bad a regime is.
@@ -331,6 +331,24 @@ pub fn assess(
             ),
         };
         push(&mut regimes, kind, level, sustained, explanation);
+    } else if let Some(native) = snapshot.meminfo.and_then(|memory| memory.macos_pressure) {
+        // Darwin reports a qualitative kernel pressure state. Do not invent a
+        // PSI percentage or derive "available" RAM from inactive/cache pages.
+        let (level, resource_severity, label) = match native {
+            MacosPressureLevel::Normal => (Severity::Ok, 0.0, "normal"),
+            MacosPressureLevel::Warning => (Severity::Warn, 0.5, "warning"),
+            MacosPressureLevel::Critical => (Severity::Crit, 1.0, "critical"),
+        };
+        severity.memory = resource_severity;
+        push(
+            &mut regimes,
+            RegimeKind::MemoryExhaustion,
+            level,
+            false,
+            format!(
+                "macOS kernel reports {label} memory pressure (kern.memorystatus_vm_pressure_level); available RAM and PSI stall percentages are unavailable"
+            ),
+        );
     }
 
     // Kernel OOM kills during the window are memory crit whatever the averages say.
@@ -489,9 +507,14 @@ pub fn regime_evidence_available(
                 && (!cpu_load_required || load)
         }
         RegimeKind::IoBound => psi_evidence_available(snapshot.io),
-        RegimeKind::MemoryExhaustion | RegimeKind::CacheBloat => {
-            psi_evidence_available(snapshot.memory) && memory
+        RegimeKind::MemoryExhaustion => {
+            (psi_evidence_available(snapshot.memory) && memory)
+                || (snapshot.memory.is_none()
+                    && snapshot
+                        .meminfo
+                        .is_some_and(|memory| memory.macos_pressure.is_some()))
         }
+        RegimeKind::CacheBloat => psi_evidence_available(snapshot.memory) && memory,
         RegimeKind::SwapThrash => window.is_some_and(|window| {
             window
                 .swap_in_per_s
@@ -672,6 +695,74 @@ mod tests {
         assert_eq!(a.worst, Severity::Ok, "{:?}", a.regimes);
         assert!(a.regimes.is_empty());
         assert_eq!(a.severity, ResourceSeverity::default());
+    }
+
+    #[test]
+    fn native_macos_memory_pressure_drives_regimes_without_synthetic_psi() {
+        let mut snap = snapshot(8, 0.0);
+        snap.memory = None;
+        snap.meminfo = Some(MemInfo {
+            total: Some(16 * GB),
+            ..MemInfo::default()
+        });
+        for (native, expected) in [
+            (MacosPressureLevel::Normal, Severity::Ok),
+            (MacosPressureLevel::Warning, Severity::Warn),
+            (MacosPressureLevel::Critical, Severity::Crit),
+        ] {
+            snap.meminfo.as_mut().unwrap().macos_pressure = Some(native);
+            let assessment = assess(&snap, None, None, &PressureThresholds::default());
+            assert_eq!(assessment.worst, expected);
+            assert_eq!(assessment.memory_some, None);
+            assert_eq!(assessment.memory_used_fraction, None);
+            assert_eq!(
+                assessment.regimes.len(),
+                usize::from(expected != Severity::Ok)
+            );
+            if expected != Severity::Ok {
+                assert_eq!(assessment.regimes[0].kind, RegimeKind::MemoryExhaustion);
+                assert!(!assessment.regimes[0].sustained);
+                assert!(assessment.regimes[0].explanation.contains("macOS kernel"));
+                assert!(assessment.severity.memory > 0.0);
+            }
+            assert!(regime_evidence_available(
+                RegimeKind::MemoryExhaustion,
+                &snap,
+                None,
+                None,
+                false,
+                false
+            ));
+            assert!(!regime_evidence_available(
+                RegimeKind::CacheBloat,
+                &snap,
+                None,
+                None,
+                false,
+                false
+            ));
+        }
+        snap.meminfo.as_mut().unwrap().macos_pressure = None;
+        assert!(!regime_evidence_available(
+            RegimeKind::MemoryExhaustion,
+            &snap,
+            None,
+            None,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn native_level_does_not_override_observed_linux_memory_stalls() {
+        let mut snap = snapshot(8, 0.0);
+        snap.memory = psi(30.0, 30.0);
+        snap.meminfo.as_mut().unwrap().available = Some(GB);
+        snap.meminfo.as_mut().unwrap().macos_pressure = Some(MacosPressureLevel::Normal);
+        let assessment = assess(&snap, None, None, &PressureThresholds::default());
+        assert_eq!(assessment.worst, Severity::Crit);
+        assert_eq!(assessment.memory_some, Some(30.0));
+        assert!(assessment.regimes[0].explanation.contains("tasks stalled"));
     }
 
     #[test]

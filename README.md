@@ -1154,6 +1154,25 @@ PSI thresholds use the `some avg10` percentage from `/proc/pressure/memory`. The
 
 The `memory_pressure` section of `daemon.json` configures the thresholds, `transition_count`, and `normal_interval_secs` / `warning_interval_secs` / `emergency_interval_secs`. Polling never becomes slower than `tick_interval_secs` and never uses a zero-second loop. Pressure responses generate plans and notifications only; execution still requires an explicit apply.
 
+On macOS, the shared pressure snapshot collects enabled logical CPUs, physical
+RAM, free/speculative and file-backed pages, swap occupancy, cumulative swap
+page counters, and the kernel's `normal` / `warning` / `critical` memory-pressure
+level. The kernel level feeds the shared memory-pressure diagnosis in plans,
+watch, daemon regime triggers, and fleet health. It is stored as
+`meminfo.macos_pressure`; it does not manufacture a Linux PSI percentage.
+These native probes use 250 ms command deadlines and a shared one-second
+probe budget. A failed source stays unavailable while independent readings
+remain usable.
+
+macOS has no Linux `MemAvailable` equivalent, so `meminfo.available` remains
+unknown. Inactive pages, file-backed pages, and compressed memory are not
+counted as immediately available RAM. `vm_stat`'s reported page size controls
+byte conversion on both Intel and Apple Silicon; swap sizes retain the
+precision of `sysctl`'s rounded MiB output. The graded utilization modes in
+the table above remain Linux-specific. A normal native memory reading cannot
+make missing CPU/I/O PSI or other unavailable sensors into a complete healthy
+fleet assessment.
+
 ---
 
 ## Host Hygiene Audit (`pt doctor`)

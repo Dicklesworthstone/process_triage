@@ -40,6 +40,8 @@ pub mod network;
 #[cfg(target_os = "linux")]
 pub mod network_resource_collector;
 pub mod pressure;
+#[cfg(any(target_os = "macos", test))]
+mod pressure_macos;
 #[cfg(target_os = "linux")]
 pub mod prober;
 pub mod proc_parsers;

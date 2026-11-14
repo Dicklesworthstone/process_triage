@@ -474,7 +474,7 @@ fn remote_health(system_state: Option<&serde_json::Value>, total_processes: u64)
     // numbers. Keep the raw block, but never assess those as observations.
     for issue in &snapshot.unavailable {
         match issue.source.as_str() {
-            "online_cpu_count" => snapshot.cpus = 0,
+            "online_cpu_count" | "hw.logicalcpu" => snapshot.cpus = 0,
             "/proc/pressure/cpu" => snapshot.cpu = None,
             "/proc/pressure/memory" => snapshot.memory = None,
             "/proc/pressure/io" => snapshot.io = None,
@@ -483,6 +483,30 @@ fn remote_health(system_state: Option<&serde_json::Value>, total_processes: u64)
             "/proc/meminfo" => snapshot.meminfo = None,
             "/proc/vmstat" => snapshot.vmstat = None,
             "/proc/sys/fs/file-nr" => snapshot.file_handles = None,
+            "kern.memorystatus_vm_pressure_level" => {
+                if let Some(memory) = &mut snapshot.meminfo {
+                    memory.macos_pressure = None;
+                }
+            }
+            "hw.memsize" => {
+                if let Some(memory) = &mut snapshot.meminfo {
+                    memory.total = None;
+                }
+            }
+            "vm.swapusage" => {
+                if let Some(memory) = &mut snapshot.meminfo {
+                    memory.swap_total = None;
+                    memory.swap_free = None;
+                }
+            }
+            "vm_stat" => {
+                snapshot.vmstat = None;
+                if let Some(memory) = &mut snapshot.meminfo {
+                    memory.free = None;
+                    memory.cached = None;
+                    memory.anon = None;
+                }
+            }
             _ => {}
         }
     }
@@ -490,9 +514,11 @@ fn remote_health(system_state: Option<&serde_json::Value>, total_processes: u64)
         || snapshot.memory.and_then(|resource| resource.some).is_some()
         || snapshot.io.and_then(|resource| resource.some).is_some()
         || snapshot.load_ratio().is_some()
-        || snapshot
-            .meminfo
-            .is_some_and(|memory| memory.used_fraction().is_some() || memory.swap_used().is_some())
+        || snapshot.meminfo.is_some_and(|memory| {
+            memory.used_fraction().is_some()
+                || memory.swap_used().is_some()
+                || memory.macos_pressure.is_some()
+        })
         || snapshot.file_handles.is_some()
         || census.is_some();
     let assessment = observed.then(|| {
@@ -1446,6 +1472,50 @@ mod tests {
             .unavailable
             .iter()
             .any(|item| item.reason == "remote permission denied"));
+    }
+
+    #[test]
+    fn fleet_preserves_native_macos_pressure_with_explicit_partial_coverage() {
+        use crate::collect::pressure::MacosPressureLevel;
+        use crate::decision::pressure_regime::RegimeKind;
+
+        let mut document = pressure_plan("mac.local", 0.0, 0.0);
+        for field in ["cpu", "memory", "io", "file_handles"] {
+            document["system_state"]["pressure"][field] = serde_json::Value::Null;
+        }
+        document["system_state"]["pressure"]["meminfo"]["available"] = serde_json::Value::Null;
+        document["system_state"]["pressure"]["meminfo"]["macos_pressure"] =
+            serde_json::json!("critical");
+        let input = scan_result_to_host_input(&scan_from_document("mac", &document));
+        assert_eq!(input.health.status, HostHealthStatus::Crit);
+        assert_eq!(input.health.coverage, PressureCoverage::Partial);
+        let memory = input.health.pressure.as_ref().unwrap().meminfo.unwrap();
+        assert_eq!(memory.macos_pressure, Some(MacosPressureLevel::Critical));
+        assert_eq!(memory.available, None);
+        let assessment = input.health.assessment.as_ref().unwrap();
+        assert_eq!(assessment.regimes[0].kind, RegimeKind::MemoryExhaustion);
+        assert_eq!(assessment.memory_some, None);
+        assert_eq!(assessment.memory_used_fraction, None);
+
+        document["system_state"]["pressure"]["meminfo"]["macos_pressure"] =
+            serde_json::json!("normal");
+        let quiet = scan_result_to_host_input(&scan_from_document("mac", &document));
+        assert_eq!(quiet.health.status, HostHealthStatus::Unknown);
+        assert_eq!(quiet.health.coverage, PressureCoverage::Partial);
+
+        document["system_state"]["pressure"]["meminfo"]["macos_pressure"] =
+            serde_json::json!("critical");
+        document["system_state"]["pressure"]["unavailable"] = serde_json::json!([
+            {"source": "kern.memorystatus_vm_pressure_level", "reason": "query timed out"},
+            {"source": "vm.swapusage", "reason": "query failed"},
+            {"source": "hw.logicalcpu", "reason": "query failed"}
+        ]);
+        let failed = scan_result_to_host_input(&scan_from_document("mac", &document));
+        assert_eq!(failed.health.status, HostHealthStatus::Unknown);
+        let snapshot = failed.health.pressure.as_ref().unwrap();
+        assert_eq!(snapshot.cpus, 0);
+        assert_eq!(snapshot.meminfo.unwrap().macos_pressure, None);
+        assert_eq!(snapshot.meminfo.unwrap().swap_used(), None);
     }
 
     #[test]
