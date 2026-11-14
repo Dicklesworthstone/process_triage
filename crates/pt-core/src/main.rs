@@ -43,7 +43,11 @@ use pt_core::fleet::apply::{
     ApplyBindingReceipt, FleetApplyConfig, HostApplyStatus,
 };
 use pt_core::fleet::discovery::{
-    FleetDiscoveryConfig, InventoryProvider, ProviderRegistry, StaticInventoryProvider,
+    FleetDiscoveryConfig, InventoryProvider, ProviderRegistry, SshConfigInventoryProvider,
+    StaticInventoryProvider,
+};
+use pt_core::fleet::inventory::{
+    select_ssh_hosts, FleetInventory, HostRecord, INVENTORY_SCHEMA_VERSION,
 };
 use pt_core::fleet::ssh_scan::{scan_result_to_host_input, ssh_scan_fleet, SshScanConfig};
 #[cfg(feature = "ui")]
@@ -893,6 +897,8 @@ struct AgentFleetArgs {
 
 #[derive(Subcommand, Debug)]
 enum AgentFleetCommands {
+    /// Preview fleet hosts without connecting (defaults to ~/.ssh/config)
+    Inventory(AgentFleetTargets),
     /// Generate a fleet-wide plan across multiple hosts
     Plan(AgentFleetPlanArgs),
     /// Apply a fleet plan for a fleet session
@@ -906,18 +912,32 @@ enum AgentFleetCommands {
 }
 
 #[derive(Args, Debug)]
-struct AgentFleetPlanArgs {
+struct AgentFleetTargets {
     /// Hosts spec (comma-separated list or file path)
-    #[arg(long, conflicts_with_all = ["inventory", "discovery_config"])]
+    #[arg(long, conflicts_with_all = ["inventory", "discovery_config", "ssh_config"])]
     hosts: Option<String>,
 
     /// Inventory file path (TOML/YAML/JSON)
-    #[arg(long, conflicts_with_all = ["hosts", "discovery_config"])]
+    #[arg(long, conflicts_with_all = ["hosts", "discovery_config", "ssh_config"])]
     inventory: Option<String>,
 
     /// Discovery config file path (TOML/YAML/JSON)
-    #[arg(long, conflicts_with_all = ["hosts", "inventory"])]
+    #[arg(long, conflicts_with_all = ["hosts", "inventory", "ssh_config"])]
     discovery_config: Option<String>,
+
+    /// Discover literal Host aliases from an SSH config and use it for connections
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["hosts", "inventory", "discovery_config"])]
+    ssh_config: Option<String>,
+
+    /// Select host aliases with comma-separated patterns (*, ?, and ! exclusions)
+    #[arg(long, value_delimiter = ',', value_name = "PATTERNS")]
+    host_filter: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+struct AgentFleetPlanArgs {
+    #[command(flatten)]
+    targets: AgentFleetTargets,
 
     /// Max concurrent host connections
     #[arg(long, default_value = "10", value_parser = clap::value_parser!(u32).range(1..=32))]
@@ -11019,6 +11039,7 @@ fn run_agent(global: &GlobalOpts, args: &AgentArgs) -> ExitCode {
 
 fn run_agent_fleet(global: &GlobalOpts, args: &AgentFleetArgs) -> ExitCode {
     match &args.command {
+        AgentFleetCommands::Inventory(args) => run_agent_fleet_inventory(global, args),
         AgentFleetCommands::Plan(args) => run_agent_fleet_plan(global, args),
         AgentFleetCommands::Apply(args) => run_agent_fleet_apply(global, args),
         AgentFleetCommands::Report(args) => run_agent_fleet_report(global, args),
@@ -11066,79 +11087,169 @@ fn parse_fleet_hosts(spec: &str) -> Result<Vec<String>, String> {
     Ok(vec![trimmed.to_string()])
 }
 
+struct FleetTargetSelection {
+    hosts: Vec<String>,
+    inventory: FleetInventory,
+    source: &'static str,
+    ssh_config: Option<String>,
+}
+
+/// Resolve once for both local preview and remote planning. Selection honors
+/// exclusions before making any connection and preserves aliases for OpenSSH.
+fn resolve_fleet_targets(
+    args: &AgentFleetTargets,
+    default_ssh_config: bool,
+) -> Result<FleetTargetSelection, String> {
+    let (inventory, source, ssh_config) = match (
+        &args.hosts,
+        &args.inventory,
+        &args.discovery_config,
+        &args.ssh_config,
+    ) {
+        (Some(spec), None, None, None) => {
+            let hosts = parse_fleet_hosts(spec)?
+                .into_iter()
+                .map(|hostname| HostRecord {
+                    hostname,
+                    tags: HashMap::new(),
+                    access_method: None,
+                    credentials_ref: None,
+                    last_seen: None,
+                    status: None,
+                })
+                .collect();
+            (
+                FleetInventory {
+                    schema_version: INVENTORY_SCHEMA_VERSION.to_string(),
+                    generated_at: chrono::Utc::now().to_rfc3339(),
+                    hosts,
+                },
+                "hosts",
+                None,
+            )
+        }
+        (None, Some(path), None, None) => (
+            StaticInventoryProvider::from_path(Path::new(path))
+                .discover()
+                .map_err(|error| error.to_string())?,
+            "inventory",
+            None,
+        ),
+        (None, None, Some(path), None) => {
+            let discovery = FleetDiscoveryConfig::load_from_path(Path::new(path))
+                .map_err(|error| error.to_string())?;
+            let registry =
+                ProviderRegistry::from_config(&discovery).map_err(|error| error.to_string())?;
+            (
+                registry.discover_all().map_err(|error| error.to_string())?,
+                "discovery_config",
+                None,
+            )
+        }
+        (None, None, None, path) if path.is_some() || default_ssh_config => {
+            let path = match path.as_deref() {
+                Some("~") => dirs::home_dir().ok_or("cannot determine the home directory")?,
+                Some(path) if path.starts_with("~/") => dirs::home_dir()
+                    .ok_or("cannot determine the home directory")?
+                    .join(&path[2..]),
+                Some(path) => PathBuf::from(path),
+                None => dirs::home_dir()
+                    .ok_or("cannot determine the home directory")?
+                    .join(".ssh/config"),
+            };
+            // Keep an absolute path in the persisted transport, so applying a
+            // saved session from a different working directory uses this file.
+            let path = fs::canonicalize(&path)
+                .map_err(|error| format!("cannot read SSH config {}: {error}", path.display()))?;
+            let config_file = path
+                .to_str()
+                .ok_or("SSH config path is not valid UTF-8")?
+                .to_string();
+            (
+                SshConfigInventoryProvider::from_path(&path)
+                    .discover()
+                    .map_err(|error| error.to_string())?,
+                "ssh_config",
+                Some(config_file),
+            )
+        }
+        (None, None, None, None) => {
+            return Err(
+                "either --hosts, --inventory, --discovery-config, or --ssh-config is required"
+                    .to_string(),
+            );
+        }
+        _ => {
+            return Err(
+                "--hosts, --inventory, --discovery-config, and --ssh-config are mutually exclusive"
+                    .to_string(),
+            );
+        }
+    };
+    let hosts =
+        select_ssh_hosts(&inventory, &args.host_filter).map_err(|error| error.to_string())?;
+    if hosts.is_empty() {
+        return Err("no eligible SSH hosts match the selection".to_string());
+    }
+    Ok(FleetTargetSelection {
+        hosts,
+        inventory,
+        source,
+        ssh_config,
+    })
+}
+
+fn run_agent_fleet_inventory(global: &GlobalOpts, args: &AgentFleetTargets) -> ExitCode {
+    let selection = match resolve_fleet_targets(args, true) {
+        Ok(selection) => selection,
+        Err(error) => return output_agent_error(global, "fleet inventory", &error),
+    };
+    let response = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "command": "agent fleet inventory",
+        "status": "ok",
+        "inventory_source": selection.source,
+        "ssh_config": selection.ssh_config,
+        "host_filter": args.host_filter,
+        "selected_hosts": selection.hosts,
+        "selected_count": selection.hosts.len(),
+        "inventory": selection.inventory,
+    });
+    match global.format {
+        OutputFormat::Json | OutputFormat::Toon => {
+            println!("{}", format_structured_output(global, response));
+        }
+        OutputFormat::Jsonl => println!("{response}"),
+        OutputFormat::Exitcode => {}
+        _ => {
+            println!("# pt-core agent fleet inventory");
+            println!(
+                "{} SSH hosts selected from {} ({} records)",
+                selection.hosts.len(),
+                selection.source,
+                selection.inventory.hosts.len(),
+            );
+            for host in &selection.hosts {
+                println!("  {host}");
+            }
+        }
+    }
+    ExitCode::Clean
+}
+
 fn run_agent_fleet_plan(global: &GlobalOpts, args: &AgentFleetPlanArgs) -> ExitCode {
-    let (hosts, inventory, source_label) =
-        match (&args.hosts, &args.inventory, &args.discovery_config) {
-            (Some(hosts_spec), None, None) => {
-                let hosts = match parse_fleet_hosts(hosts_spec) {
-                    Ok(h) => h,
-                    Err(err) => {
-                        return output_agent_error(global, "fleet plan", &err);
-                    }
-                };
-                (hosts, None, Some("hosts"))
-            }
-            (None, Some(path), None) => {
-                let provider = StaticInventoryProvider::from_path(Path::new(path));
-                let inventory = match provider.discover() {
-                    Ok(inv) => inv,
-                    Err(err) => {
-                        return output_agent_error(global, "fleet plan", &err.to_string());
-                    }
-                };
-                let hosts: Vec<String> =
-                    inventory.hosts.iter().map(|h| h.hostname.clone()).collect();
-                if hosts.is_empty() {
-                    return output_agent_error(global, "fleet plan", "inventory contains no hosts");
-                }
-                (hosts, Some(inventory), Some("inventory"))
-            }
-            (None, None, Some(path)) => {
-                let discovery = match FleetDiscoveryConfig::load_from_path(Path::new(path)) {
-                    Ok(cfg) => cfg,
-                    Err(err) => {
-                        return output_agent_error(global, "fleet plan", &err.to_string());
-                    }
-                };
-                let registry = match ProviderRegistry::from_config(&discovery) {
-                    Ok(registry) => registry,
-                    Err(err) => {
-                        return output_agent_error(global, "fleet plan", &err.to_string());
-                    }
-                };
-                let inventory = match registry.discover_all() {
-                    Ok(inv) => inv,
-                    Err(err) => {
-                        return output_agent_error(global, "fleet plan", &err.to_string());
-                    }
-                };
-                let hosts: Vec<String> =
-                    inventory.hosts.iter().map(|h| h.hostname.clone()).collect();
-                if hosts.is_empty() {
-                    return output_agent_error(global, "fleet plan", "discovery found no hosts");
-                }
-                (hosts, Some(inventory), Some("discovery_config"))
-            }
-            (None, None, None) => {
-                return output_agent_error(
-                    global,
-                    "fleet plan",
-                    "either --hosts, --inventory, or --discovery-config is required",
-                );
-            }
-            _ => {
-                return output_agent_error(
-                    global,
-                    "fleet plan",
-                    "--hosts, --inventory, and --discovery-config are mutually exclusive",
-                );
-            }
-        };
+    let selection = match resolve_fleet_targets(&args.targets, false) {
+        Ok(selection) => selection,
+        Err(error) => return output_agent_error(global, "fleet plan", &error),
+    };
+    let hosts = &selection.hosts;
+    let inventory = &selection.inventory;
 
     // Run each host's own `agent plan` over SSH.
     let parallel = args.parallel.max(1) as usize;
     let defaults = SshScanConfig::default();
     let ssh_config = SshScanConfig {
+        config_file: selection.ssh_config.clone(),
         connect_timeout: args.timeout.min(30),
         command_timeout: args.timeout,
         parallel,
@@ -11157,7 +11268,7 @@ fn run_agent_fleet_plan(global: &GlobalOpts, args: &AgentFleetPlanArgs) -> ExitC
         ssh_config.command_timeout,
     );
 
-    let scan_result = ssh_scan_fleet(&hosts, &ssh_config);
+    let scan_result = ssh_scan_fleet(hosts, &ssh_config);
 
     eprintln!(
         "[fleet] Plans complete: {}/{} succeeded in {}ms",
@@ -11256,9 +11367,11 @@ fn run_agent_fleet_plan(global: &GlobalOpts, args: &AgentFleetPlanArgs) -> ExitC
             })
         }).collect::<Vec<_>>(),
         "inputs": {
-            "hosts_spec": args.hosts,
-            "inventory_path": args.inventory,
-            "discovery_config": args.discovery_config,
+            "hosts_spec": args.targets.hosts,
+            "inventory_path": args.targets.inventory,
+            "discovery_config": args.targets.discovery_config,
+            "ssh_config": selection.ssh_config,
+            "host_filter": args.targets.host_filter,
             "hosts": hosts,
             "parallel": args.parallel,
             "timeout_secs": args.timeout,
@@ -11267,14 +11380,13 @@ fn run_agent_fleet_plan(global: &GlobalOpts, args: &AgentFleetPlanArgs) -> ExitC
             "label": args.label,
             "max_fdr": args.max_fdr,
         },
-        "inventory": inventory.as_ref().map(|inv| {
-            serde_json::json!({
-                "schema_version": inv.schema_version,
-                "generated_at": inv.generated_at,
-                "host_count": inv.hosts.len(),
-            })
-        }),
-        "inventory_source": source_label,
+        "inventory": {
+            "schema_version": inventory.schema_version,
+            "generated_at": inventory.generated_at,
+            "host_count": inventory.hosts.len(),
+            "selected_count": hosts.len(),
+        },
+        "inventory_source": selection.source,
         "fleet_session": fleet_session,
     });
 

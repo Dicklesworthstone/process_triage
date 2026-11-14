@@ -136,6 +136,186 @@ fn inventory_json_simple_hosts() {
 }
 
 #[test]
+fn fleet_inventory_cli_previews_ssh_aliases_without_running_match_commands() {
+    use assert_cmd::cargo::cargo_bin_cmd;
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("ssh-config");
+    let marker = dir.path().join("match-must-not-execute");
+    std::fs::write(
+        &config,
+        format!(
+            "Host dev-a dev-b\n  HostName example.invalid\n  User operator\n\
+             Host worker-a\n  Port 2222\n\
+             Match exec \"touch {}\"\n  User conditional\n",
+            marker.display(),
+        ),
+    )
+    .unwrap();
+    let output = cargo_bin_cmd!("pt-core")
+        .args([
+            "--format",
+            "json",
+            "agent",
+            "fleet",
+            "inventory",
+            "--ssh-config",
+        ])
+        .arg(&config)
+        .args(["--host-filter", "dev-*,!dev-b"])
+        .timeout(std::time::Duration::from_secs(10))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let result: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(result["command"], "agent fleet inventory");
+    assert_eq!(result["selected_hosts"], serde_json::json!(["dev-a"]));
+    assert_eq!(result["selected_count"], 1);
+    assert_eq!(result["inventory"]["hosts"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        result["ssh_config"],
+        config.canonicalize().unwrap().to_str().unwrap()
+    );
+    assert!(
+        !marker.exists(),
+        "inventory preview must not evaluate Match exec"
+    );
+}
+
+#[test]
+fn fleet_inventory_cli_preserves_exclusions_across_duplicate_records() {
+    use assert_cmd::cargo::cargo_bin_cmd;
+
+    let dir = tempfile::tempdir().unwrap();
+    let inventory = dir.path().join("inventory.json");
+    std::fs::write(
+        &inventory,
+        r#"{"hosts":[
+            {"hostname":"dev-a","access_method":"ssh"},
+            {"hostname":"dev-b","status":"excluded"},
+            {"hostname":"dev-b","status":"active"},
+            {"hostname":"api-a","access_method":"api"}
+        ]}"#,
+    )
+    .unwrap();
+    let output = cargo_bin_cmd!("pt-core")
+        .args([
+            "--format",
+            "json",
+            "agent",
+            "fleet",
+            "inventory",
+            "--inventory",
+        ])
+        .arg(&inventory)
+        .args(["--host-filter", "dev-*"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let result: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(result["selected_hosts"], serde_json::json!(["dev-a"]));
+    cargo_bin_cmd!("pt-core")
+        .args(["agent", "fleet", "inventory", "--inventory"])
+        .arg(&inventory)
+        .args(["--host-filter", "api-*"])
+        .assert()
+        .failure();
+}
+
+#[cfg(unix)]
+#[test]
+fn fleet_plan_uses_discovered_alias_and_retains_explicit_ssh_config() {
+    use assert_cmd::cargo::cargo_bin_cmd;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("ssh config");
+    let ssh = dir.path().join("ssh");
+    let argv = dir.path().join("ssh-argv");
+    let response = dir.path().join("remote-plan.json");
+    let data = dir.path().join("data");
+    std::fs::write(
+        &config,
+        "Host worker-a worker-b\n  HostName never-connect.invalid\n  Port 2222\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &ssh,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$PT_TEST_SSH_ARGV\"\n/bin/cat \"$PT_TEST_REMOTE_PLAN\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let remote_session = pt_common::SessionId::new().0;
+    std::fs::write(
+        &response,
+        serde_json::to_vec(&serde_json::json!({
+            "command": "agent plan",
+            "plan_id": "fleet-inventory-test",
+            "session_id": remote_session,
+            "host_id": "fleet-inventory-test-host",
+            "generated_at": "2026-11-13T12:00:00Z",
+            "pt_version": env!("CARGO_PKG_VERSION"),
+            "policy_id": null,
+            "policy_version": "1.0.0",
+            "actions": [],
+            "pre_toggled": [],
+            "gates_summary": {"total_candidates": 0, "blocked_candidates": 0, "pre_toggled_actions": 0},
+            "summary": {"total_processes_scanned": 5},
+            "candidates": [],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut search_path = vec![dir.path().to_path_buf()];
+    if let Some(existing) = std::env::var_os("PATH") {
+        search_path.extend(std::env::split_paths(&existing));
+    }
+    let search_path = std::env::join_paths(search_path).unwrap();
+    let output = cargo_bin_cmd!("pt-core")
+        .args(["--format", "json", "agent", "fleet", "plan", "--ssh-config"])
+        .arg(&config)
+        .args(["--host-filter", "worker-*,!worker-b", "--parallel", "1"])
+        .env("PATH", search_path)
+        .env("PROCESS_TRIAGE_DATA", &data)
+        .env("PT_TEST_SSH_ARGV", &argv)
+        .env("PT_TEST_REMOTE_PLAN", &response)
+        .timeout(std::time::Duration::from_secs(15))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let result: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let path = config.canonicalize().unwrap();
+    let path = path.to_str().unwrap();
+    assert_eq!(result["inputs"]["hosts"], serde_json::json!(["worker-a"]));
+    assert_eq!(result["scan_summary"]["successful"], 1);
+    assert_eq!(
+        result["fleet_session"]["execution"]["transport"]["config_file"],
+        path
+    );
+    let arguments = std::fs::read_to_string(&argv).unwrap();
+    let arguments: Vec<_> = arguments.lines().collect();
+    assert_eq!(&arguments[..2], &["-F", path]);
+    let separator = arguments
+        .iter()
+        .position(|argument| *argument == "--")
+        .unwrap();
+    assert_eq!(arguments[separator + 1], "worker-a");
+    assert_eq!(arguments.len(), separator + 3, "only one host is contacted");
+    let session_dir = result["session_dir"].as_str().unwrap();
+    let saved: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(std::path::Path::new(session_dir).join("fleet.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved["execution"]["transport"]["config_file"], path);
+}
+
+#[test]
 fn inventory_toml_detailed_hosts_with_tags() {
     let toml = r#"
 schema_version = "1.0.0"

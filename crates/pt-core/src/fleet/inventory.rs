@@ -4,7 +4,7 @@
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -91,6 +91,130 @@ pub enum InventoryError {
     Parse { format: String, message: String },
     #[error("inventory contains no hosts")]
     EmptyHosts,
+    #[error("invalid fleet host filter: {pattern:?}")]
+    InvalidFilter { pattern: String },
+    #[error("invalid SSH inventory target: {hostname:?}")]
+    InvalidHost { hostname: String },
+    #[error("fleet host {hostname:?} uses unsupported access method {access_method:?}; this command requires SSH")]
+    UnsupportedAccess {
+        hostname: String,
+        access_method: AccessMethod,
+    },
+}
+
+/// Select concrete SSH destinations without resolving aliases or inventing
+/// hosts from wildcard patterns. Positive filters are ORed and any matching
+/// `!pattern` excludes a host. With only negative filters, the positive set is
+/// the whole inventory. An explicit excluded record wins over every duplicate.
+///
+/// The order and spelling of the first selected occurrence are retained. SSH
+/// resolves HostName, User, ProxyJump and credentials using the original alias.
+pub fn select_ssh_hosts(
+    inventory: &FleetInventory,
+    patterns: &[String],
+) -> Result<Vec<String>, InventoryError> {
+    for pattern in patterns {
+        let value = pattern.strip_prefix('!').unwrap_or(pattern);
+        if value.is_empty()
+            || value.len() > 1024
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-._@:%[]*?".contains(&byte))
+        {
+            return Err(InventoryError::InvalidFilter {
+                pattern: pattern.clone(),
+            });
+        }
+    }
+    let excluded: HashSet<_> = inventory
+        .hosts
+        .iter()
+        .filter(|host| host.status == Some(InventoryStatus::Excluded))
+        .map(|host| host.hostname.as_str())
+        .collect();
+    let mut seen = HashSet::new();
+    let mut selected = Vec::new();
+    for host in &inventory.hosts {
+        if excluded.contains(host.hostname.as_str())
+            || !host_patterns_match(&host.hostname, patterns, true)
+        {
+            continue;
+        }
+        if !valid_ssh_inventory_target(&host.hostname) {
+            return Err(InventoryError::InvalidHost {
+                hostname: host.hostname.clone(),
+            });
+        }
+        if let Some(access_method @ (AccessMethod::Agent | AccessMethod::Api)) = host.access_method
+        {
+            return Err(InventoryError::UnsupportedAccess {
+                hostname: host.hostname.clone(),
+                access_method,
+            });
+        }
+        if seen.insert(host.hostname.as_str()) {
+            selected.push(host.hostname.clone());
+        }
+    }
+    if selected.is_empty() {
+        return Err(InventoryError::EmptyHosts);
+    }
+    Ok(selected)
+}
+
+fn valid_ssh_inventory_target(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 1024
+        && host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-._@:%[]".contains(&byte))
+        && host.matches('@').count() <= 1
+        && host
+            .split('@')
+            .all(|part| !part.is_empty() && !part.starts_with('-'))
+}
+
+/// OpenSSH Host patterns use `*` and `?`, not regular expressions or bracket
+/// ranges. Arguments, including aliases, are case-sensitive as in ssh_config.
+pub(super) fn host_pattern_matches(host: &str, pattern: &str) -> bool {
+    let host = host.as_bytes();
+    let pattern = pattern.as_bytes();
+    let (mut h, mut p) = (0, 0);
+    let (mut star, mut retry) = (None, 0);
+    while h < host.len() {
+        if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == host[h]) {
+            h += 1;
+            p += 1;
+        } else if p < pattern.len() && pattern[p] == b'*' {
+            star = Some(p);
+            p += 1;
+            retry = h;
+        } else if let Some(position) = star {
+            retry += 1;
+            h = retry;
+            p = position + 1;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+    p == pattern.len()
+}
+
+pub(super) fn host_patterns_match(host: &str, patterns: &[String], implicit_all: bool) -> bool {
+    let mut positive = implicit_all && !patterns.iter().any(|pattern| !pattern.starts_with('!'));
+    for pattern in patterns {
+        if let Some(exclusion) = pattern.strip_prefix('!') {
+            if host_pattern_matches(host, exclusion) {
+                return false;
+            }
+        } else if host_pattern_matches(host, pattern) {
+            positive = true;
+        }
+    }
+    positive
 }
 
 #[derive(Debug, Deserialize)]
@@ -221,6 +345,141 @@ pub fn parse_inventory_str(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn select_ssh_hosts_filters_concrete_aliases_and_deduplicates() {
+        let inventory = parse_inventory_str(
+            r#"{"hosts":["worker-1","dev-a","worker-2","worker-1","DEV-A","mac-mini"]}"#,
+            InventoryFormat::Json,
+        )
+        .unwrap();
+        let selected = select_ssh_hosts(
+            &inventory,
+            &["worker-?".into(), "dev-*".into(), "!worker-2".into()],
+        )
+        .unwrap();
+        assert_eq!(selected, ["worker-1", "dev-a"]);
+        assert_eq!(
+            select_ssh_hosts(&inventory, &["!worker-*".into()]).unwrap(),
+            ["dev-a", "DEV-A", "mac-mini"]
+        );
+        assert_eq!(
+            select_ssh_hosts(&inventory, &[]).unwrap(),
+            ["worker-1", "dev-a", "worker-2", "DEV-A", "mac-mini"]
+        );
+    }
+
+    #[test]
+    fn select_ssh_hosts_exclusion_wins_in_either_duplicate_order() {
+        for hosts in [
+            r#"[{"host":"node","status":"active"},{"host":"node","status":"excluded"},"other"]"#,
+            r#"[{"host":"node","status":"excluded"},{"host":"node","status":"active"},"other"]"#,
+        ] {
+            let inventory =
+                parse_inventory_str(&format!("{{\"hosts\":{hosts}}}"), InventoryFormat::Json)
+                    .unwrap();
+            assert_eq!(select_ssh_hosts(&inventory, &[]).unwrap(), ["other"]);
+        }
+    }
+
+    #[test]
+    fn select_ssh_hosts_refuses_unsupported_only_when_selected() {
+        let inventory = parse_inventory_str(
+            r#"{"hosts":["ssh-node",{"host":"api-node","access_method":"api"},{"host":"agent-node","access_method":"agent"},"-bad"]}"#,
+            InventoryFormat::Json,
+        ).unwrap();
+        assert_eq!(
+            select_ssh_hosts(&inventory, &["ssh-*".into()]).unwrap(),
+            ["ssh-node"]
+        );
+        for name in ["api-node", "agent-node"] {
+            assert!(matches!(
+                select_ssh_hosts(&inventory, &[name.into()]),
+                Err(InventoryError::UnsupportedAccess { .. })
+            ));
+        }
+        assert!(matches!(
+            select_ssh_hosts(&inventory, &["-bad".into()]),
+            Err(InventoryError::InvalidHost { .. })
+        ));
+    }
+
+    #[test]
+    fn select_ssh_hosts_does_not_let_duplicate_ssh_mask_an_api_record() {
+        let inventory = parse_inventory_str(
+            r#"{"hosts":["node",{"host":"node","access_method":"api"}]}"#,
+            InventoryFormat::Json,
+        )
+        .unwrap();
+        assert!(matches!(
+            select_ssh_hosts(&inventory, &[]),
+            Err(InventoryError::UnsupportedAccess { .. })
+        ));
+    }
+
+    #[test]
+    fn select_ssh_hosts_rejects_unsafe_targets_and_invalid_filters() {
+        for host in [
+            "",
+            "-oProxyCommand=x",
+            "user@-node",
+            "@node",
+            "user@",
+            "a@@b",
+            "node name",
+            "node;command",
+            "node\nsecond",
+        ] {
+            let inventory = parse_inventory_str(
+                &serde_json::json!({"hosts": [host]}).to_string(),
+                InventoryFormat::Json,
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    select_ssh_hosts(&inventory, &[]),
+                    Err(InventoryError::InvalidHost { .. })
+                ),
+                "{host:?}"
+            );
+        }
+        let inventory =
+            parse_inventory_str(r#"{"hosts":["node"]}"#, InventoryFormat::Json).unwrap();
+        for pattern in ["", "!", "!!node", "two hosts", "node,other", "node;command"] {
+            assert!(
+                matches!(
+                    select_ssh_hosts(&inventory, &[pattern.into()]),
+                    Err(InventoryError::InvalidFilter { .. })
+                ),
+                "{pattern}"
+            );
+        }
+        assert!(matches!(
+            select_ssh_hosts(&inventory, &["missing-*".into()]),
+            Err(InventoryError::EmptyHosts)
+        ));
+    }
+
+    #[test]
+    fn ssh_pattern_matching_preserves_openssh_negation_semantics() {
+        assert!(host_pattern_matches("worker-12", "w*r?er-??"));
+        assert!(!host_pattern_matches("worker-12", "WORKER-*"));
+        assert!(!host_pattern_matches("worker-12", "worker-?"));
+        assert!(!host_pattern_matches("worker-1", "worker-[12]"));
+        assert!(!host_patterns_match("node", &["!other".into()], false));
+        assert!(host_patterns_match(
+            "node",
+            &["!other".into(), "*".into()],
+            false
+        ));
+        assert!(!host_patterns_match(
+            "node",
+            &["node".into(), "!node".into()],
+            false
+        ));
+        assert!(host_pattern_matches("", "*"));
+        assert!(!host_pattern_matches("", "?"));
+    }
 
     #[test]
     fn parse_toml_simple_hosts() {

@@ -896,6 +896,13 @@ pt report --session <id> --output report.html --include-ledger --embed-assets
 `pt` can plan across several hosts over SSH and apply the approved targets through each host's existing safety checks. Each host needs a `pt-core` version that supports the host and plan binding flags, and must retain its saved session between planning and application:
 
 ```bash
+# Preview SSH aliases locally; reads ~/.ssh/config without connecting
+pt-core agent fleet inventory --host-filter 'dev-*,vmi*,!vmi-retired'
+
+# Use the same explicit SSH config for discovery, planning, and saved apply
+pt-core agent fleet plan --ssh-config ~/.ssh/config \
+  --host-filter 'dev-*,vmi*,!vmi-retired' --parallel 10
+
 # Plan across hosts (inventory: TOML, YAML or JSON by extension)
 pt-core agent fleet plan --inventory hosts.toml --parallel 10
 
@@ -912,6 +919,10 @@ pt-core agent fleet apply --session pt-YYYYMMDD-HHMMSS-xxxx \
 # Confirmation plus dry-run still produces only a local preview
 pt-core --dry-run agent fleet apply --session pt-YYYYMMDD-HHMMSS-xxxx --confirm
 ```
+
+`fleet inventory` previews exactly the host selection that `fleet plan` uses. Both accept `--hosts`, `--inventory`, `--discovery-config`, or `--ssh-config` as mutually exclusive sources, plus case-sensitive `--host-filter` patterns (`*`, `?`, and `!` exclusions). The preview defaults to `~/.ssh/config`; planning requires an explicit source. Inventory entries marked `excluded` are never contacted, even if another record names the same alias. Selected non-SSH access methods are rejected instead of being sent through SSH.
+
+SSH discovery enumerates concrete `Host` aliases and reads bounded `Include` files; wildcard-only `Host` rules do not create destinations. It never runs `Match exec` or another command during discovery. Conditional includes that cannot be resolved safely are reported as errors. Connections use each original alias with `ssh -F` and the selected config, leaving `HostName`, `User`, `Port`, `ProxyJump`, and credentials to OpenSSH. The absolute config path is retained in the fleet session for apply. Any SSH option tags shown in the inventory are informational observations; conditional SSH settings remain OpenSSH's responsibility.
 
 Each host runs its own `pt-core agent plan`, evaluating protection, cgroup placement and the posterior on that host. Fleet planning pools direct kill recommendations by Bayesian expected FDR: it keeps the largest set, most probable first, whose posterior expected share of wrong kills stays within `--max-fdr`. The saved fleet session retains the complete remote plans, their real session and host identities, the approved process identities and a SHA-256 digest of each complete plan. Apply recomputes that pooled selection and refuses changed evidence, host aliases that name the same recorded machine, or older sessions that contain summaries without executable evidence.
 

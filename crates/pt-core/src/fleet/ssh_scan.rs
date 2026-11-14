@@ -23,6 +23,10 @@ use crate::session::fleet::{HostHealth, HostHealthStatus, PressureCoverage};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SshScanConfig {
+    /// Explicit SSH config used for alias discovery and subsequent connections.
+    /// Retained with fleet execution so apply uses the same alias configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_file: Option<String>,
     /// SSH user (if different from current user).
     pub user: Option<String>,
     /// Path to SSH identity file.
@@ -46,6 +50,7 @@ pub struct SshScanConfig {
 impl Default for SshScanConfig {
     fn default() -> Self {
         Self {
+            config_file: None,
             user: None,
             identity_file: None,
             port: None,
@@ -568,6 +573,13 @@ pub(super) fn build_ssh_command_args(
         return Err("invalid remote command argument".to_string());
     }
     let mut args = Vec::new();
+    if let Some(ref path) = config.config_file {
+        if path.is_empty() || path.contains('\0') {
+            return Err("invalid SSH config path".to_string());
+        }
+        args.push("-F".to_string());
+        args.push(path.clone());
+    }
     args.push("-o".to_string());
     args.push(format!("ConnectTimeout={}", config.connect_timeout));
     for option in &config.ssh_options {
@@ -927,6 +939,47 @@ mod tests {
             args.last().map(String::as_str),
             Some("pt-core --format json agent plan")
         );
+    }
+
+    #[test]
+    fn explicit_ssh_config_preserves_the_alias_and_literal_path() {
+        let config = SshScanConfig {
+            config_file: Some("/tmp/fleet config;literal".to_string()),
+            ..SshScanConfig::default()
+        };
+        let args = build_ssh_args("worker-alias", &config).unwrap();
+        assert_eq!(&args[..2], &["-F", "/tmp/fleet config;literal"]);
+        let separator = args.iter().position(|argument| argument == "--").unwrap();
+        assert_eq!(args[separator + 1], "worker-alias");
+        assert_eq!(args.len(), separator + 3);
+    }
+
+    #[test]
+    fn ssh_config_path_survives_transport_serialization() {
+        let config = SshScanConfig {
+            config_file: Some("/tmp/fleet/config".to_string()),
+            ..SshScanConfig::default()
+        };
+        let restored: SshScanConfig =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert_eq!(restored.config_file, config.config_file);
+        // Previously saved fleet sessions still use the normal SSH configuration.
+        let previous: SshScanConfig = serde_json::from_str("{}").unwrap();
+        assert!(previous.config_file.is_none());
+        assert!(!build_ssh_args("worker", &previous)
+            .unwrap()
+            .contains(&"-F".to_string()));
+    }
+
+    #[test]
+    fn invalid_ssh_config_paths_are_rejected_before_connecting() {
+        for path in ["", "/tmp/config\0suffix"] {
+            let config = SshScanConfig {
+                config_file: Some(path.to_string()),
+                ..SshScanConfig::default()
+            };
+            assert!(build_ssh_args("worker", &config).is_err());
+        }
     }
 
     #[test]
