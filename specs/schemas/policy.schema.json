@@ -59,6 +59,9 @@
     "data_loss_gates": {
       "$ref": "#/$defs/data_loss_gates"
     },
+    "signal": {
+      "$ref": "#/$defs/signal"
+    },
     "load_aware": {
       "$ref": "#/$defs/load_aware"
     },
@@ -230,6 +233,20 @@
           "items": { "type": "string" }
         },
         "alpha_investing": { "$ref": "#/$defs/alpha_investing" }
+      }
+    },
+    "signal": {
+      "type": "object",
+      "description": "Signal execution settings copied into each approved kill action",
+      "additionalProperties": false,
+      "properties": {
+        "term_grace_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 300000,
+          "default": 5000,
+          "description": "SIGTERM cleanup allowance in milliseconds. A shorter execution deadline times out without early SIGKILL; confirmed SIGTERM ignore may bypass the wait."
+        }
       }
     },
     "data_loss_gates": {

@@ -743,6 +743,9 @@ pub fn parse_agent_plan(content: &str) -> Result<Plan, VerifyError> {
         .map_err(|error| VerifyError::InvalidPlan(error.to_string()))?;
     let mut seen = HashSet::new();
     for action in &plan.actions {
+        action
+            .validate_signal_timing()
+            .map_err(|reason| VerifyError::InvalidPlan(reason.to_string()))?;
         if action.action_id.is_empty() || !seen.insert(&action.action_id) {
             return Err(VerifyError::InvalidPlan(
                 "empty or duplicate action_id".to_string(),
@@ -2075,6 +2078,54 @@ mod tests {
         let mut duplicated = plan.clone();
         duplicated.actions.push(duplicated.actions[0].clone());
         assert!(parse_agent_plan(&serde_json::to_string(&duplicated).unwrap()).is_err());
+    }
+
+    #[test]
+    fn canonical_plan_validates_approved_sigterm_grace_before_execution() {
+        let mut plan = make_plan(vec![make_action(123, Action::Kill)]);
+        for grace_ms in [None, Some(1), Some(5_000), Some(300_000)] {
+            plan.actions[0].timeouts.term_grace_ms = grace_ms;
+            // A short deadline can be approved; it cannot shorten TERM grace.
+            plan.actions[0].timeouts.execute_ms = 1;
+            let parsed = parse_agent_plan(&serde_json::to_string(&plan).unwrap()).unwrap();
+            assert_eq!(parsed.actions[0].timeouts.term_grace_ms, grace_ms);
+        }
+        for grace_ms in [0, 300_001, u64::MAX] {
+            plan.actions[0].timeouts.term_grace_ms = Some(grace_ms);
+            assert!(matches!(
+                parse_agent_plan(&serde_json::to_string(&plan).unwrap()),
+                Err(VerifyError::InvalidPlan(reason)) if reason.contains("SIGTERM grace")
+            ));
+        }
+        plan.actions[0].timeouts.term_grace_ms = Some(5_000);
+        for action in [Action::Pause, Action::Resume, Action::Restart] {
+            plan.actions[0].action = action;
+            assert!(matches!(
+                parse_agent_plan(&serde_json::to_string(&plan).unwrap()),
+                Err(VerifyError::InvalidPlan(reason)) if reason.contains("direct kill")
+            ));
+        }
+        plan.actions[0].action = Action::Kill;
+        for routing in [
+            ActionRouting::Supervisor,
+            ActionRouting::ZombieToParent,
+            ActionRouting::ZombieToSupervisor,
+            ActionRouting::ZombieInvestigateOnly,
+        ] {
+            plan.actions[0].routing = routing;
+            assert!(matches!(
+                parse_agent_plan(&serde_json::to_string(&plan).unwrap()),
+                Err(VerifyError::InvalidPlan(reason)) if reason.contains("direct kill")
+            ));
+        }
+        plan.actions[0].routing = ActionRouting::DStateLowConfidence;
+        parse_agent_plan(&serde_json::to_string(&plan).unwrap()).unwrap();
+        plan.actions[0].routing = ActionRouting::Direct;
+        plan.actions[0].original_zombie_target = Some(plan.actions[0].target.clone());
+        assert!(matches!(
+            parse_agent_plan(&serde_json::to_string(&plan).unwrap()),
+            Err(VerifyError::InvalidPlan(reason)) if reason.contains("direct kill")
+        ));
     }
 
     #[test]

@@ -486,7 +486,7 @@ pub struct SignalConfig {
 impl Default for SignalConfig {
     fn default() -> Self {
         Self {
-            term_grace_ms: 5_000,
+            term_grace_ms: crate::config::policy::DEFAULT_TERM_GRACE_MS,
             poll_interval_ms: 100,
             verify_timeout_ms: 10_000,
             use_process_groups: false,
@@ -758,9 +758,10 @@ impl SignalActionRunner {
         &self,
         action: &PlanAction,
         deadline: &SignalDeadline,
+        term_grace_ms: u64,
     ) -> Result<bool, ActionError> {
         let remaining = deadline.remaining()?;
-        let grace = Duration::from_millis(self.config.term_grace_ms);
+        let grace = Duration::from_millis(term_grace_ms);
         match self.wait_for_planned_state(
             &action.target,
             SignalExpectation::Exited,
@@ -829,7 +830,7 @@ impl SignalActionRunner {
                 return Ok(false);
             }
         }
-        if self.wait_for_term_grace(action, deadline)? {
+        if self.wait_for_term_grace(action, deadline, outcome.configured_grace_ms)? {
             Ok(true)
         } else {
             outcome.escalation_reason = Some(SignalEscalationReason::GraceExpired);
@@ -987,12 +988,20 @@ impl SignalActionRunner {
     /// Execute a kill action (SIGTERM → SIGKILL).
     #[cfg(unix)]
     fn execute_kill(&self, action: &PlanAction) -> Result<(), ActionError> {
+        // Read the reviewed value from the immutable plan, never a later policy
+        // configuration. Legacy library callers may still supply runner defaults.
+        let term_grace_ms = action
+            .timeouts
+            .term_grace_ms
+            .unwrap_or(self.config.term_grace_ms);
+        crate::config::policy::validate_term_grace_ms(term_grace_ms)
+            .map_err(|reason| ActionError::Failed(reason.to_string()))?;
         let started = Instant::now();
         let mut term_started = None;
         let mut outcome = SignalExecutionOutcome {
             sigterm_disposition: SignalDisposition::Unknown,
             sigterm_recheck: None,
-            configured_grace_ms: self.config.term_grace_ms,
+            configured_grace_ms: term_grace_ms,
             observed_grace_ms: None,
             sigterm_delivered: false,
             sigcont_delivered: false,
@@ -1114,6 +1123,9 @@ impl SignalActionRunner {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub fn nudge_parent_to_reap(&self, action: &PlanAction) -> Result<(), ActionError> {
         let _ = self.take_signal_outcome();
+        action
+            .validate_signal_timing()
+            .map_err(|reason| ActionError::Failed(reason.to_string()))?;
         let deadline = SignalDeadline::new(action.timeouts.execute_ms);
         deadline.remaining()?;
         #[cfg(target_os = "linux")]
@@ -1266,6 +1278,9 @@ impl ActionRunner for SignalActionRunner {
 
     fn execute(&self, action: &PlanAction) -> Result<(), ActionError> {
         let _ = self.take_signal_outcome();
+        action
+            .validate_signal_timing()
+            .map_err(|reason| ActionError::Failed(reason.to_string()))?;
         match action.action {
             Action::Pause => self.execute_pause(action),
             Action::Resume => self.execute_resume(action),
@@ -2000,6 +2015,7 @@ mod tests {
     mod linux_tests {
         use super::*;
         use crate::action::executor::IdentityProvider;
+        use crate::plan::ActionRouting;
         use std::os::unix::process::{CommandExt, ExitStatusExt};
 
         struct OwnedSignalChild(std::process::Child);
@@ -2514,7 +2530,11 @@ mod tests {
                 pt_common::StartId::from_linux(boot.unwrap(), ticks.unwrap() + 1, pid.unwrap());
             let runner = SignalActionRunner::with_defaults();
             assert!(runner
-                .wait_for_term_grace(&action, &SignalDeadline::new(100))
+                .wait_for_term_grace(
+                    &action,
+                    &SignalDeadline::new(100),
+                    runner.config.term_grace_ms,
+                )
                 .unwrap());
             assert_eq!(runner.get_process_state(child.0.id()), Some('T'));
             assert!(!runner.take_kill_signal_delivered());
@@ -2628,6 +2648,149 @@ mod tests {
             assert!(!outcome.sigkill_delivered);
             assert!(outcome.escalation_reason.is_none());
             assert!(outcome.observed_grace_ms.unwrap() >= 2_000);
+        }
+
+        #[test]
+        fn approved_grace_overrides_later_runner_config_for_slow_cleanup() {
+            let dir = tempfile::tempdir().expect("marker directory");
+            let marker = dir.path().join("term-handled");
+            let (mut child, mut action) = stopped_signal_child(
+                "trap 'sleep 2; printf \"term handled\\n\" > \"$1\"; exit 0' TERM\nkill -STOP \"$$\"\nwhile :; do read -r line || :; done",
+                &marker,
+                false,
+            );
+            action.timeouts.term_grace_ms = Some(12_500);
+            action.timeouts.execute_ms = 17_500;
+            let saved = serde_json::to_string(&action).unwrap();
+            let approved: PlanAction = serde_json::from_str(&saved).unwrap();
+            // Even an explicitly shorter later runner configuration cannot
+            // replace the cleanup allowance saved with the approved action.
+            let runner = SignalActionRunner::new(SignalConfig {
+                term_grace_ms: 25,
+                poll_interval_ms: 10,
+                ..SignalConfig::default()
+            });
+            runner.execute(&approved).expect("honor approved cleanup");
+            runner.verify(&approved).expect("cleanup finished");
+            assert!(child.0.wait().unwrap().success());
+            assert_eq!(std::fs::read_to_string(&marker).unwrap(), "term handled\n");
+            let outcome = runner.take_signal_outcome().unwrap();
+            assert_eq!(outcome.configured_grace_ms, 12_500);
+            assert_eq!(outcome.sigterm_disposition, SignalDisposition::Caught);
+            assert!(outcome.sigterm_delivered);
+            assert!(!outcome.sigkill_delivered);
+            assert!(outcome.escalation_reason.is_none());
+            assert!(outcome.observed_grace_ms.unwrap() >= 2_000);
+        }
+
+        #[test]
+        fn approved_short_grace_escalates_a_caught_nonexiting_handler() {
+            let dir = tempfile::tempdir().expect("marker directory");
+            let marker = dir.path().join("term-handled");
+            let (mut child, mut action) = stopped_signal_child(
+                "trap ':' TERM\nkill -STOP \"$$\"\nwhile :; do read -r line || :; done",
+                &marker,
+                false,
+            );
+            action.timeouts.term_grace_ms = Some(100);
+            let runner = SignalActionRunner::new(SignalConfig {
+                poll_interval_ms: 10,
+                ..SignalConfig::default()
+            });
+            let started = Instant::now();
+            runner.execute(&action).expect("use approved shorter grace");
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "the saved 100ms allowance must replace the five-second default"
+            );
+            runner.verify(&action).expect("verify escalated exit");
+            assert_eq!(child.0.wait().unwrap().signal(), Some(libc::SIGKILL));
+            let outcome = runner.take_signal_outcome().unwrap();
+            assert_eq!(outcome.configured_grace_ms, 100);
+            assert_eq!(outcome.sigterm_disposition, SignalDisposition::Caught);
+            assert!(outcome.sigterm_delivered);
+            assert!(outcome.sigkill_delivered);
+            assert_eq!(
+                outcome.escalation_reason,
+                Some(SignalEscalationReason::GraceExpired)
+            );
+            assert!(outcome.observed_grace_ms.unwrap() >= 100);
+        }
+
+        #[test]
+        fn approved_grace_exceeding_execution_budget_never_sends_early_kill() {
+            let dir = tempfile::tempdir().expect("marker directory");
+            let marker = dir.path().join("term-handled");
+            let (mut child, mut action) = stopped_signal_child(
+                "trap ':' TERM\nkill -STOP \"$$\"\nwhile :; do read -r line || :; done",
+                &marker,
+                false,
+            );
+            action.timeouts.term_grace_ms = Some(5_000);
+            action.timeouts.execute_ms = 30;
+            let runner = SignalActionRunner::new(SignalConfig {
+                term_grace_ms: 1,
+                poll_interval_ms: 5_000,
+                ..SignalConfig::default()
+            });
+            let started = Instant::now();
+            assert!(matches!(runner.execute(&action), Err(ActionError::Timeout)));
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(child.0.try_wait().unwrap().is_none(), "no early SIGKILL");
+            let outcome = runner.take_signal_outcome().unwrap();
+            assert_eq!(outcome.configured_grace_ms, 5_000);
+            assert!(outcome.sigterm_delivered);
+            assert!(!outcome.sigkill_delivered);
+            assert!(outcome.escalation_reason.is_none());
+        }
+
+        #[test]
+        fn malformed_approved_grace_is_rejected_before_any_signal() {
+            let dir = tempfile::tempdir().expect("marker directory");
+            let marker = dir.path().join("term-handled");
+            let (child, mut action) = stopped_term_child(&marker, false, false);
+            let runner = SignalActionRunner::with_defaults();
+            for (kind, grace_ms) in [
+                (Action::Kill, 0),
+                (Action::Kill, 300_001),
+                (Action::Kill, u64::MAX),
+                (Action::Pause, 5_000),
+                (Action::Resume, 5_000),
+            ] {
+                action.action = kind;
+                action.timeouts.term_grace_ms = Some(grace_ms);
+                assert!(matches!(runner.execute(&action), Err(ActionError::Failed(_))));
+                assert_eq!(runner.get_process_state(child.0.id()), Some('T'));
+                assert!(!runner.take_kill_signal_delivered());
+                assert!(runner.take_signal_path().is_none());
+                assert!(runner.take_signal_outcome().is_none());
+                assert!(!marker.exists());
+            }
+            action.action = Action::Kill;
+            action.timeouts.term_grace_ms = Some(5_000);
+            for routing in [
+                ActionRouting::Supervisor,
+                ActionRouting::ZombieToParent,
+                ActionRouting::ZombieToSupervisor,
+                ActionRouting::ZombieInvestigateOnly,
+            ] {
+                action.routing = routing;
+                assert!(matches!(runner.execute(&action), Err(ActionError::Failed(_))));
+                assert!(matches!(
+                    runner.nudge_parent_to_reap(&action),
+                    Err(ActionError::Failed(_))
+                ));
+                assert_eq!(runner.get_process_state(child.0.id()), Some('T'));
+                assert!(!runner.take_kill_signal_delivered());
+                assert!(runner.take_signal_path().is_none());
+                assert!(runner.take_signal_outcome().is_none());
+                assert!(!marker.exists());
+            }
+            action.routing = ActionRouting::Direct;
+            action.original_zombie_target = Some(action.target.clone());
+            assert!(matches!(runner.execute(&action), Err(ActionError::Failed(_))));
+            assert_eq!(runner.get_process_state(child.0.id()), Some('T'));
+            assert!(runner.take_signal_outcome().is_none());
         }
 
         #[test]

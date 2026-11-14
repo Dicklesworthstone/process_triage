@@ -33,12 +33,48 @@ pub struct Policy {
     pub fdr_control: FdrControl,
     pub data_loss_gates: DataLossGates,
     #[serde(default)]
+    pub signal: SignalPolicy,
+    #[serde(default)]
     pub load_aware: LoadAwareDecision,
     #[serde(default)]
     pub decision_time_bound: DecisionTimeBound,
 
     #[serde(default)]
     pub notes: Option<String>,
+}
+
+/// Default cleanup allowance after delivering SIGTERM.
+pub const DEFAULT_TERM_GRACE_MS: u64 = 5_000;
+
+/// Upper bound on an explicitly configured cleanup allowance (five minutes).
+pub const MAX_TERM_GRACE_MS: u64 = 300_000;
+
+/// Signal execution settings copied into each approved kill action.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct SignalPolicy {
+    /// Milliseconds allowed for SIGTERM cleanup before SIGKILL is considered.
+    /// Must be in 1..=300_000. A shorter execution deadline never shortens this
+    /// grace; it ends the attempt without sending an early SIGKILL.
+    #[schemars(range(min = 1, max = 300_000))]
+    pub term_grace_ms: u64,
+}
+
+impl Default for SignalPolicy {
+    fn default() -> Self {
+        Self {
+            term_grace_ms: DEFAULT_TERM_GRACE_MS,
+        }
+    }
+}
+
+/// Shared validation for configuration and the immutable saved action.
+pub fn validate_term_grace_ms(grace_ms: u64) -> Result<(), &'static str> {
+    if (1..=MAX_TERM_GRACE_MS).contains(&grace_ms) {
+        Ok(())
+    } else {
+        Err("SIGTERM grace must be between 1 and 300000 milliseconds")
+    }
 }
 
 /// Time-to-decision bound configuration.
@@ -628,6 +664,7 @@ impl Default for Policy {
             signature_fast_path: SignatureFastPath::default(),
             fdr_control: FdrControl::default(),
             data_loss_gates: DataLossGates::default(),
+            signal: SignalPolicy::default(),
             load_aware: LoadAwareDecision::default(),
             decision_time_bound: DecisionTimeBound::default(),
             notes: None,
@@ -764,6 +801,38 @@ mod tests {
         assert!(!policy.is_robot_enabled());
         assert_eq!(policy.loss("useful", "kill"), Some(100.0));
         assert_eq!(policy.loss("zombie", "kill"), Some(1.0));
+        assert_eq!(policy.signal.term_grace_ms, DEFAULT_TERM_GRACE_MS);
+    }
+
+    #[test]
+    fn signal_policy_defaults_and_explicit_grace_round_trip() {
+        let empty: SignalPolicy = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty.term_grace_ms, 5_000);
+        let schema = serde_json::to_value(schemars::schema_for!(SignalPolicy)).unwrap();
+        let timing = &schema["properties"]["term_grace_ms"];
+        assert_eq!(timing["minimum"].as_f64(), Some(1.0));
+        assert_eq!(timing["maximum"].as_f64(), Some(MAX_TERM_GRACE_MS as f64));
+
+        let mut document = serde_json::to_value(Policy::default()).unwrap();
+        document["signal"] = serde_json::json!({"term_grace_ms": 12_500});
+        let policy: Policy = serde_json::from_value(document).unwrap();
+        assert_eq!(policy.signal.term_grace_ms, 12_500);
+        let restored: Policy =
+            serde_json::from_str(&serde_json::to_string(&policy).unwrap()).unwrap();
+        assert_eq!(restored.signal.term_grace_ms, 12_500);
+
+        for invalid in [
+            r#"{"term_grace_ms": -1}"#,
+            r#"{"term_grace_ms": 1.5}"#,
+            r#"{"term_grace_ms": "5000"}"#,
+            r#"{"term_grace_ms": null}"#,
+            r#"{"term_grace_milliseconds": 5000}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<SignalPolicy>(invalid).is_err(),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]

@@ -105,6 +105,9 @@
       "alpha_earn": 0.01
     }
   },
+  "signal": {
+    "term_grace_ms": 5000
+  },
   "data_loss_gates": {
     "block_if_open_write_fds": true,
     "max_open_write_fds": 0,

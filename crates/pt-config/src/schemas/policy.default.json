@@ -52,6 +52,9 @@
     "method": "bh",
     "alpha": 0.05
   },
+  "signal": {
+    "term_grace_ms": 5000
+  },
   "data_loss_gates": {
     "block_if_open_write_fds": true,
     "block_if_locked_files": true,

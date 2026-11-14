@@ -9,7 +9,7 @@
 use crate::policy::{
     AlphaInvesting, ConfidenceLevel, DataLossGates, DecisionTimeBound, FdrControl, FdrMethod,
     Guardrails, LoadAwareDecision, LossMatrix, LossRow, PatternEntry, PatternKind, Policy,
-    RobotMode, SignatureFastPath,
+    RobotMode, SignalPolicy, SignatureFastPath,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -139,6 +139,7 @@ pub fn get_preset(name: PresetName) -> Policy {
 /// - Relaxed data loss gates
 fn developer_preset() -> Policy {
     Policy {
+        signal: SignalPolicy::default(),
         schema_version: "1.0.0".to_string(),
         policy_id: Some("preset:developer".to_string()),
         description: Some(
@@ -275,6 +276,7 @@ fn developer_preset() -> Policy {
 /// - Strict data loss gates
 fn server_preset() -> Policy {
     Policy {
+        signal: SignalPolicy::default(),
         schema_version: "1.0.0".to_string(),
         policy_id: Some("preset:server".to_string()),
         description: Some(
@@ -499,6 +501,7 @@ fn server_preset() -> Policy {
 /// - Conservative to avoid breaking builds
 fn ci_preset() -> Policy {
     Policy {
+        signal: SignalPolicy::default(),
         schema_version: "1.0.0".to_string(),
         policy_id: Some("preset:ci".to_string()),
         description: Some("CI preset: headless operation for CI/CD pipelines".to_string()),
@@ -655,6 +658,7 @@ fn ci_preset() -> Policy {
 /// - Detailed audit logging
 fn paranoid_preset() -> Policy {
     Policy {
+        signal: SignalPolicy::default(),
         schema_version: "1.0.0".to_string(),
         policy_id: Some("preset:paranoid".to_string()),
         description: Some("Paranoid preset: maximum safety for critical systems".to_string()),

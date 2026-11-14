@@ -220,6 +220,12 @@ pub fn validate_policy(policy: &crate::policy::Policy) -> ValidationResult<()> {
     }
 
     validate_load_aware(&policy.load_aware)?;
+    crate::policy::validate_term_grace_ms(policy.signal.term_grace_ms).map_err(|message| {
+        ValidationError::InvalidValue {
+            field: "signal.term_grace_ms".to_string(),
+            message: message.to_string(),
+        }
+    })?;
 
     Ok(())
 }
@@ -668,6 +674,22 @@ mod tests {
     fn default_policy_pass() {
         let policy = crate::policy::Policy::default();
         assert!(validate_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn policy_signal_grace_requires_a_positive_bounded_cleanup_window() {
+        let mut policy = crate::policy::Policy::default();
+        for grace_ms in [1, 5_000, 12_500, crate::policy::MAX_TERM_GRACE_MS] {
+            policy.signal.term_grace_ms = grace_ms;
+            validate_policy(&policy).expect("valid explicit cleanup window");
+        }
+        for grace_ms in [0, crate::policy::MAX_TERM_GRACE_MS + 1, u64::MAX] {
+            policy.signal.term_grace_ms = grace_ms;
+            assert!(matches!(
+                validate_policy(&policy),
+                Err(ValidationError::InvalidValue { field, .. }) if field == "signal.term_grace_ms"
+            ));
+        }
     }
 
     #[test]

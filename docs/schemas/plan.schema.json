@@ -281,6 +281,16 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0
+        },
+        "term_grace_ms": {
+          "description": "Approved SIGTERM cleanup allowance for kill. Newly generated kill plans always record it; older plans retain the runner's five-second default.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 1,
+          "maximum": 300000
         }
       },
       "required": [

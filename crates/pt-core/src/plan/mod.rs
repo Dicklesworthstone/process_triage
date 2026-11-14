@@ -118,6 +118,27 @@ pub struct PlanAction {
     pub memory_cap: Option<crate::action::memory_cap::MemoryCapPlan>,
 }
 
+impl PlanAction {
+    /// Reject malformed cleanup timing before any action can send a signal.
+    /// Manager restarts and zombie-parent nudges do not use direct TERM grace.
+    pub fn validate_signal_timing(&self) -> Result<(), &'static str> {
+        if let Some(grace_ms) = self.timeouts.term_grace_ms {
+            if self.action != Action::Kill
+                || !matches!(
+                    self.routing,
+                    ActionRouting::Direct | ActionRouting::DStateLowConfidence
+                )
+                || self.original_zombie_target.is_some()
+                || self.supervisor_restart.is_some()
+            {
+                return Err("SIGTERM grace is only valid for a direct kill action");
+            }
+            crate::config::policy::validate_term_grace_ms(grace_ms)?;
+        }
+        Ok(())
+    }
+}
+
 fn is_direct_routing(routing: &ActionRouting) -> bool {
     *routing == ActionRouting::Direct
 }
@@ -132,6 +153,11 @@ pub struct ActionTimeouts {
     pub preflight_ms: u64,
     pub execute_ms: u64,
     pub verify_ms: u64,
+    /// Approved SIGTERM cleanup allowance for kill. Newly generated kill plans
+    /// always record it; older plans retain the runner's five-second default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 300_000))]
+    pub term_grace_ms: Option<u64>,
 }
 
 impl Default for ActionTimeouts {
@@ -140,6 +166,7 @@ impl Default for ActionTimeouts {
             preflight_ms: 2_000,
             execute_ms: 10_000,
             verify_ms: 5_000,
+            term_grace_ms: None,
         }
     }
 }
@@ -304,6 +331,15 @@ pub fn generate_plan(bundle: &DecisionBundle) -> Plan {
                     fnv1a64(&binding)
                 );
                 format!("act-{:016x}", fnv1a64(key.as_bytes()))
+            } else if action == Action::Kill {
+                // Cleanup timing is part of the reviewed operation. Changing
+                // policy must not reuse the ID of an earlier approved attempt.
+                let key = format!(
+                    "{}:term_grace_ms={}",
+                    action_id_for(action, &candidate.identity, stage),
+                    bundle.policy.signal.term_grace_ms
+                );
+                format!("act-{:016x}", fnv1a64(key.as_bytes()))
             } else {
                 action_id_for(action, &candidate.identity, stage)
             };
@@ -351,21 +387,31 @@ pub fn generate_plan(bundle: &DecisionBundle) -> Plan {
                 pre_checks.push(PreCheck::VerifyProcessState);
             }
 
+            let mut timeouts = if routing == ActionRouting::Supervisor {
+                ActionTimeouts {
+                    preflight_ms: 5_000,
+                    execute_ms: 30_000,
+                    verify_ms: 10_000,
+                    ..ActionTimeouts::default()
+                }
+            } else {
+                ActionTimeouts::default()
+            };
+            if action == Action::Kill {
+                let grace_ms = bundle.policy.signal.term_grace_ms;
+                timeouts.term_grace_ms = Some(grace_ms);
+                // Keep the existing execution budget, extending it only when
+                // needed to preserve five seconds beyond the approved grace.
+                timeouts.execute_ms = timeouts.execute_ms.max(grace_ms.saturating_add(5_000));
+            }
+
             actions.push(PlanAction {
                 action_id,
                 target: candidate.identity.clone(),
                 action,
                 order: 0,
                 stage,
-                timeouts: if routing == ActionRouting::Supervisor {
-                    ActionTimeouts {
-                        preflight_ms: 5_000,
-                        execute_ms: 30_000,
-                        verify_ms: 10_000,
-                    }
-                } else {
-                    ActionTimeouts::default()
-                },
+                timeouts,
                 pre_checks,
                 rationale,
                 on_success: vec![],
@@ -1053,6 +1099,75 @@ mod tests {
         assert_eq!(plan.actions.len(), 2);
         assert_eq!(plan.actions[0].action, Action::Pause);
         assert_eq!(plan.actions[1].action, Action::Kill);
+    }
+
+    #[test]
+    fn kill_grace_is_bound_to_saved_plan_and_changes_action_identity() {
+        let mut input = candidate(30, Action::Kill, 100.0, 1.0);
+        input.stage_pause_before_kill = true;
+        let mut bundle = DecisionBundle {
+            session_id: SessionId("pt-20260115-120000-abcd".into()),
+            policy: Policy::default(),
+            generated_at: Some("2026-01-15T12:00:00Z".into()),
+            candidates: vec![input],
+        };
+        bundle.policy.signal.term_grace_ms = 12_500;
+        let reviewed = generate_plan(&bundle);
+        assert_eq!(reviewed.actions.len(), 2);
+        assert_eq!(reviewed.actions[0].action, Action::Pause);
+        assert_eq!(reviewed.actions[0].timeouts.term_grace_ms, None);
+        assert_eq!(reviewed.actions[0].timeouts.execute_ms, 10_000);
+        let kill = &reviewed.actions[1];
+        assert_eq!(kill.action, Action::Kill);
+        assert_eq!(kill.timeouts.term_grace_ms, Some(12_500));
+        assert_eq!(kill.timeouts.execute_ms, 17_500);
+        let saved = serde_json::to_string(&reviewed).unwrap();
+
+        // A later policy edit changes future plans, not an already reviewed one.
+        bundle.policy.signal.term_grace_ms = 50;
+        let later = generate_plan(&bundle);
+        assert_eq!(later.actions[1].timeouts.term_grace_ms, Some(50));
+        assert_eq!(later.actions[1].timeouts.execute_ms, 10_000);
+        assert_ne!(later.actions[1].action_id, kill.action_id);
+        assert_eq!(later.actions[0].action_id, reviewed.actions[0].action_id);
+        let restored = crate::verify::parse_agent_plan(&saved).unwrap();
+        assert_eq!(restored.actions[1].timeouts.term_grace_ms, Some(12_500));
+        assert_eq!(restored.actions[1].timeouts.execute_ms, 17_500);
+        assert_eq!(restored.actions[1].action_id, kill.action_id);
+    }
+
+    #[test]
+    fn kill_grace_defaults_and_shorter_values_preserve_execution_budget() {
+        let mut bundle = DecisionBundle {
+            session_id: SessionId("pt-20260115-120000-abcd".into()),
+            policy: Policy::default(),
+            generated_at: Some("2026-01-15T12:00:00Z".into()),
+            candidates: vec![candidate(30, Action::Kill, 100.0, 1.0)],
+        };
+        let default_plan = generate_plan(&bundle);
+        assert_eq!(default_plan.actions[0].timeouts.term_grace_ms, Some(5_000));
+        assert_eq!(default_plan.actions[0].timeouts.execute_ms, 10_000);
+        for (grace_ms, execute_ms) in [
+            (1, 10_000),
+            (5_000, 10_000),
+            (12_500, 17_500),
+            (300_000, 305_000),
+        ] {
+            bundle.policy.signal.term_grace_ms = grace_ms;
+            let plan = generate_plan(&bundle);
+            assert_eq!(plan.actions[0].timeouts.term_grace_ms, Some(grace_ms));
+            assert_eq!(plan.actions[0].timeouts.execute_ms, execute_ms);
+            plan.actions[0].validate_signal_timing().unwrap();
+        }
+        let old: ActionTimeouts = serde_json::from_str(
+            r#"{"preflight_ms":2000,"execute_ms":10000,"verify_ms":5000}"#,
+        )
+        .unwrap();
+        assert_eq!(old.term_grace_ms, None);
+        let schema = serde_json::to_value(schemars::schema_for!(ActionTimeouts)).unwrap();
+        let timing = &schema["properties"]["term_grace_ms"];
+        assert_eq!(timing["minimum"].as_f64(), Some(1.0));
+        assert_eq!(timing["maximum"].as_f64(), Some(300_000.0));
     }
 
     #[test]

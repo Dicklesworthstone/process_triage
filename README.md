@@ -617,6 +617,20 @@ A policy file is a complete document (`schema_version`, `loss_matrix`, `guardrai
 
 Check a file with `pt-core config validate policy.json`.
 
+#### Termination cleanup grace
+
+Set `signal.term_grace_ms` in a complete policy to control how long a process may clean up after SIGTERM before escalation to SIGKILL. The default is 5,000 milliseconds; accepted values range from 1 to 300,000 milliseconds. For example:
+
+```json
+{
+  "signal": {
+    "term_grace_ms": 30000
+  }
+}
+```
+
+New kill plans save that value in `actions[].timeouts.term_grace_ms` and reserve execution time for the cleanup window. Agent and TUI execution honor the saved value, even if policy changes after planning. Signal outcomes record the effective grace used. A shorter execution deadline reports a timeout instead of accelerating SIGKILL. The existing Linux shortcut still applies when complete identity-bound observations confirm SIGTERM is ignored; a caught handler retains its configured cleanup time. This setting does not change the confirmation or protection rules.
+
 #### Pressure-aware decisions
 
 `load_aware.enabled` opts into an additive pressure cost for each observed process:
