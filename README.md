@@ -913,6 +913,12 @@ pt report --session <id> --output report.html --include-ledger --embed-assets
 # Preview SSH aliases locally; reads ~/.ssh/config without connecting
 pt-core agent fleet inventory --host-filter 'dev-*,vmi*,!vmi-retired'
 
+# Inspect current pressure and workload attribution without creating action plans
+pt-core --format json agent fleet health --hosts trj,ts1,hz3 --parallel 4
+
+# Collect host hygiene findings and suggested fixes without executing them
+pt-core --format json agent fleet doctor --inventory hosts.toml
+
 # Use the same explicit SSH config for discovery, planning, and saved apply
 pt-core agent fleet plan --ssh-config ~/.ssh/config \
   --host-filter 'dev-*,vmi*,!vmi-retired' --parallel 10
@@ -935,6 +941,10 @@ pt-core --dry-run agent fleet apply --session pt-YYYYMMDD-HHMMSS-xxxx --confirm
 ```
 
 `fleet inventory` previews exactly the host selection that `fleet plan` uses. Both accept `--hosts`, `--inventory`, `--discovery-config`, or `--ssh-config` as mutually exclusive sources, plus case-sensitive `--host-filter` patterns (`*`, `?`, and `!` exclusions). The preview defaults to `~/.ssh/config`; planning requires an explicit source. Inventory entries marked `excluded` are never contacted, even if another record names the same alias. Selected non-SSH access methods are rejected instead of being sent through SSH.
+
+`fleet health` and `fleet doctor` use the same host selection and default to `~/.ssh/config` when no source is supplied. Health requests a compact observational snapshot, including system pressure and responsible-unit attribution. Doctor retains each host's findings, evidence, and suggested commands as report data. Neither command applies a remedy or approves a kill set. Snapshot collection may save its ordinary observation session on the remote host.
+
+Inspections use four concurrent SSH slots by default (`--parallel 1..32`), a 60-second per-host command deadline (`--timeout`), and a separate 10-second connection deadline (`--connect-timeout`). A finished host immediately frees its slot. Three consecutive failed inspections stop new connections by default; `--max-consecutive-failures 0` disables that limit. Already-running inspections are retained, skipped hosts remain in the result, and no host is retried automatically. Doctor's exit code 1 means findings that need attention when its report agrees; it is not treated as an SSH failure. Missing, malformed, timed-out, or truncated observations remain explicitly unavailable. Results put critical and warning hosts first and report coverage and remote version differences; a quiet partial health snapshot or static doctor audit does not establish complete host health.
 
 SSH discovery enumerates concrete `Host` aliases and reads bounded `Include` files; wildcard-only `Host` rules do not create destinations. It never runs `Match exec` or another command during discovery. Conditional includes that cannot be resolved safely are reported as errors. Connections use each original alias with `ssh -F` and the selected config, leaving `HostName`, `User`, `Port`, `ProxyJump`, and credentials to OpenSSH. The absolute config path is retained in the fleet session for apply. Any SSH option tags shown in the inventory are informational observations; conditional SSH settings remain OpenSSH's responsibility.
 

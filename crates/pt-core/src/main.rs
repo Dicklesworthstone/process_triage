@@ -46,6 +46,7 @@ use pt_core::fleet::discovery::{
     FleetDiscoveryConfig, InventoryProvider, ProviderRegistry, SshConfigInventoryProvider,
     StaticInventoryProvider,
 };
+use pt_core::fleet::health::{inspect_fleet, InspectionKind};
 use pt_core::fleet::inventory::{
     select_ssh_hosts, FleetInventory, HostRecord, INVENTORY_SCHEMA_VERSION,
 };
@@ -899,6 +900,10 @@ struct AgentFleetArgs {
 enum AgentFleetCommands {
     /// Preview fleet hosts without connecting (defaults to ~/.ssh/config)
     Inventory(AgentFleetTargets),
+    /// Inspect current pressure and responsible units on remote hosts (read-only)
+    Health(AgentFleetInspectArgs),
+    /// Audit remote host hygiene and show suggested remedies (never executed)
+    Doctor(AgentFleetInspectArgs),
     /// Generate a fleet-wide plan across multiple hosts
     Plan(AgentFleetPlanArgs),
     /// Apply a fleet plan for a fleet session
@@ -966,6 +971,32 @@ struct AgentFleetPlanArgs {
     /// Fleet-wide max FDR budget
     #[arg(long, default_value = "0.05", value_parser = parse_probability)]
     max_fdr: f64,
+}
+
+#[derive(Args, Debug)]
+struct AgentFleetInspectArgs {
+    #[command(flatten)]
+    targets: AgentFleetTargets,
+
+    /// Max concurrent host connections
+    #[arg(long, default_value = "4", value_parser = clap::value_parser!(u32).range(1..=32))]
+    parallel: u32,
+
+    /// Per-host command timeout in seconds, including connection time
+    #[arg(long, default_value = "60", value_parser = clap::value_parser!(u64).range(1..=3600))]
+    timeout: u64,
+
+    /// SSH connection timeout in seconds (bounded by --timeout)
+    #[arg(long, default_value = "10", value_parser = clap::value_parser!(u64).range(1..=120))]
+    connect_timeout: u64,
+
+    /// Stop new connections after this many consecutive failed hosts; 0 disables
+    #[arg(long, default_value = "3", value_parser = clap::value_parser!(u32).range(0..=1024))]
+    max_consecutive_failures: u32,
+
+    /// Remote pt-core command (default: `pt-core` on the host's PATH)
+    #[arg(long)]
+    remote_binary: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -1539,8 +1570,8 @@ struct AgentSnapshotArgs {
     #[arg(long)]
     include_network: bool,
 
-    /// Minimal JSON output (host info and basic stats only)
-    #[arg(long)]
+    /// Observe pressure and the top ten responsible units without process inference
+    #[arg(long, conflicts_with_all = ["top", "include_env", "include_network"])]
     minimal: bool,
 
     /// Pretty-print JSON output
@@ -7193,8 +7224,7 @@ mod executable_goal_tests {
         let (mut candidates, mut plan) =
             fixture(&[(100, 99999, 90.0), (200, 1, 0.0), (300, 1, 0.0)]);
         for (candidate, loss) in candidates.iter_mut().zip([4.0, 1.0, 2.0]) {
-            candidate["expected_loss"] =
-                serde_json::json!([{"action": "kill", "loss": loss}]);
+            candidate["expected_loss"] = serde_json::json!([{"action": "kill", "loss": loss}]);
         }
         let resources = GoalResourceSnapshot {
             process_count: Some(100),
@@ -7352,21 +7382,17 @@ mod executable_goal_tests {
         };
         for value in [-1.0, 1.5, f64::NAN, f64::INFINITY, 4_294_967_296.0] {
             target.value = value;
-            assert!(resource_goal_from_target(
-                &target,
-                f64::NAN,
-                &GoalResourceSnapshot::default(),
-            )
-            .is_err());
+            assert!(
+                resource_goal_from_target(&target, f64::NAN, &GoalResourceSnapshot::default(),)
+                    .is_err()
+            );
         }
         target.value = 1.0;
         target.comparator = Comparator::Release;
-        assert!(resource_goal_from_target(
-            &target,
-            f64::NAN,
-            &GoalResourceSnapshot::default(),
-        )
-        .is_err());
+        assert!(
+            resource_goal_from_target(&target, f64::NAN, &GoalResourceSnapshot::default(),)
+                .is_err()
+        );
     }
 
     #[test]
@@ -7387,9 +7413,12 @@ mod executable_goal_tests {
                 "weak_identity" => action.target.quality = pt_common::IdentityQuality::PidOnly,
                 _ => unreachable!(),
             }
-            assert!(ExpectedGoalContribution::from_saved(&action, None, case.into())
-                .process_count
-                .is_none(), "{case}");
+            assert!(
+                ExpectedGoalContribution::from_saved(&action, None, case.into())
+                    .process_count
+                    .is_none(),
+                "{case}"
+            );
         }
     }
 
@@ -10691,7 +10720,13 @@ fn run_doctor_cmd(global: &GlobalOpts, args: &DoctorArgs) -> ExitCode {
     } else {
         match global.format {
             OutputFormat::Json | OutputFormat::Toon => {
-                let value = serde_json::to_value(&report).unwrap_or_default();
+                let mut value = serde_json::to_value(&report).unwrap_or_default();
+                value["schema_version"] = serde_json::json!(SCHEMA_VERSION);
+                value["command"] = serde_json::json!("doctor");
+                value["status"] = serde_json::json!("ok");
+                value["pt_version"] = serde_json::json!(env!("CARGO_PKG_VERSION"));
+                value["generated_at"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
+                value["host_id"] = serde_json::json!(pt_core::logging::get_host_id());
                 println!("{}", format_structured_output(global, value));
             }
             OutputFormat::Summary => {
@@ -11312,6 +11347,12 @@ fn run_agent(global: &GlobalOpts, args: &AgentArgs) -> ExitCode {
 fn run_agent_fleet(global: &GlobalOpts, args: &AgentFleetArgs) -> ExitCode {
     match &args.command {
         AgentFleetCommands::Inventory(args) => run_agent_fleet_inventory(global, args),
+        AgentFleetCommands::Health(args) => {
+            run_agent_fleet_inspection(global, args, InspectionKind::Health)
+        }
+        AgentFleetCommands::Doctor(args) => {
+            run_agent_fleet_inspection(global, args, InspectionKind::Doctor)
+        }
         AgentFleetCommands::Plan(args) => run_agent_fleet_plan(global, args),
         AgentFleetCommands::Apply(args) => run_agent_fleet_apply(global, args),
         AgentFleetCommands::Report(args) => run_agent_fleet_report(global, args),
@@ -11507,6 +11548,203 @@ fn run_agent_fleet_inventory(global: &GlobalOpts, args: &AgentFleetTargets) -> E
         }
     }
     ExitCode::Clean
+}
+
+fn run_agent_fleet_inspection(
+    global: &GlobalOpts,
+    args: &AgentFleetInspectArgs,
+    kind: InspectionKind,
+) -> ExitCode {
+    let selection = match resolve_fleet_targets(&args.targets, true) {
+        Ok(selection) => selection,
+        Err(error) => return output_agent_error(global, kind.command(), &error),
+    };
+    let defaults = SshScanConfig::default();
+    let config = SshScanConfig {
+        config_file: selection.ssh_config.clone(),
+        connect_timeout: args.connect_timeout.min(args.timeout),
+        command_timeout: args.timeout,
+        parallel: args.parallel as usize,
+        remote_binary: args
+            .remote_binary
+            .clone()
+            .unwrap_or_else(|| defaults.remote_binary.clone()),
+        ..defaults
+    };
+    let report = inspect_fleet(
+        &selection.hosts,
+        &config,
+        kind,
+        args.max_consecutive_failures as usize,
+    );
+    let response = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "command": kind.command(),
+        "status": if report.completed == report.total_hosts { "ok" } else if report.completed > 0 { "partial" } else { "error" },
+        "read_only": true,
+        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "pt_version": env!("CARGO_PKG_VERSION"),
+        "inventory_source": selection.source,
+        "ssh_config": selection.ssh_config,
+        "limits": {
+            "parallel": config.parallel,
+            "connect_timeout_seconds": config.connect_timeout,
+            "command_timeout_seconds": config.command_timeout,
+            "max_consecutive_failures": args.max_consecutive_failures,
+            "attempts_per_host": 1,
+        },
+        "summary": {
+            "total_hosts": report.total_hosts,
+            "completed": report.completed,
+            "failed": report.failed,
+            "skipped": report.skipped,
+            "circuit_open": report.circuit_open,
+            "duration_ms": report.duration_ms,
+            "warning_hosts": report.warning_hosts,
+            "critical_hosts": report.critical_hosts,
+            "unknown_hosts": report.unknown_hosts,
+            "complete_hosts": report.complete_hosts,
+            "partial_hosts": report.partial_hosts,
+            "unavailable_hosts": report.unavailable_hosts,
+            "worst_observed": report.worst_observed,
+            "version_mismatches": report.version_mismatches,
+            "version_unavailable": report.version_unavailable,
+        },
+        "hosts": report.results,
+        "note": match kind {
+            InspectionKind::Health => "Pressure is assessed from each host's own snapshot; absent readings remain unknown. Responsible-unit data is observational, not approval to act on a group.",
+            InspectionKind::Doctor => "Doctor findings and suggested commands are report data only. Static audits do not certify complete live host health; a quiet or unsupported audit remains unknown.",
+        },
+    });
+    match global.format {
+        OutputFormat::Json | OutputFormat::Toon => {
+            println!("{}", format_structured_output(global, response));
+        }
+        OutputFormat::Jsonl => println!("{response}"),
+        OutputFormat::Exitcode => {}
+        _ => {
+            println!("# pt-core {}", kind.command());
+            println!(
+                "{} of {} hosts inspected; {} critical, {} warning, {} unknown; {} failed, {} skipped.",
+                report.completed, report.total_hosts, report.critical_hosts, report.warning_hosts,
+                report.unknown_hosts, report.failed, report.skipped,
+            );
+            for host in &report.results {
+                println!(
+                    "\n{}: {:?}, coverage {:?}; inspection {:?}, version {}{}",
+                    host.host,
+                    host.observed_status,
+                    host.coverage,
+                    host.status,
+                    fleet_inspection_text(host.pt_version.as_deref().unwrap_or("unknown")),
+                    if host.matches_local_version == Some(false) {
+                        " (differs from local)"
+                    } else {
+                        ""
+                    },
+                );
+                if let Some(health) = &host.health {
+                    if let Some(assessment) = &health.assessment {
+                        for regime in &assessment.regimes {
+                            println!(
+                                "  {:?}: {}",
+                                regime.severity,
+                                fleet_inspection_text(&regime.explanation)
+                            );
+                        }
+                        let number = |value: Option<f64>| {
+                            value
+                                .map(|value| format!("{value:.2}"))
+                                .unwrap_or_else(|| "unknown".into())
+                        };
+                        println!(
+                            "  load ratio {}; PSI cpu/memory/io: {}/{}/{}%",
+                            number(assessment.load_ratio),
+                            number(assessment.cpu_some),
+                            number(assessment.memory_some),
+                            number(assessment.io_some),
+                        );
+                    }
+                    if !health.unavailable.is_empty() {
+                        println!(
+                            "  {} unavailable pressure sources (full diagnostics in JSON).",
+                            health.unavailable.len()
+                        );
+                    }
+                }
+                if let Some(units) = host
+                    .responsible_units
+                    .as_ref()
+                    .and_then(|table| table["units"].as_array())
+                {
+                    for unit in units.iter().take(3) {
+                        println!(
+                            "  unit: {} ({} observed members)",
+                            fleet_inspection_text(unit["label"].as_str().unwrap_or("unknown")),
+                            unit["member_count"],
+                        );
+                    }
+                }
+                if let Some(doctor) = &host.doctor {
+                    println!(
+                        "  Doctor: {:?}, {} checks",
+                        doctor.worst,
+                        doctor.findings.len()
+                    );
+                    for finding in doctor.findings.iter().filter(|finding| {
+                        finding.level >= pt_core::fleet::health::DoctorLevel::Info
+                    }) {
+                        println!(
+                            "  [{:?}] {}: {}",
+                            finding.level,
+                            fleet_inspection_text(&finding.id),
+                            fleet_inspection_text(&finding.summary)
+                        );
+                        for command in &finding.commands {
+                            println!("    suggested: {}", fleet_inspection_text(command));
+                        }
+                    }
+                }
+                for warning in &host.warnings {
+                    println!("  {}", fleet_inspection_text(warning));
+                }
+                if let Some(error) = &host.error {
+                    println!("  {}", fleet_inspection_text(error));
+                }
+                if !host.stderr.is_empty() {
+                    println!(
+                        "  remote diagnostic: {}",
+                        fleet_inspection_text(&host.stderr)
+                    );
+                }
+            }
+            if report.circuit_open {
+                println!("\nThe consecutive-failure limit stopped new connections; running hosts were retained.");
+            }
+        }
+    }
+    if report.completed == 0 && report.total_hosts > 0 {
+        ExitCode::IoError
+    } else if report.failed > 0 || report.skipped > 0 {
+        ExitCode::PartialFail
+    } else if report.warning_hosts > 0
+        || report.critical_hosts > 0
+        || report.version_mismatches > 0
+        || (kind == InspectionKind::Health && report.unknown_hosts > 0)
+    {
+        ExitCode::PlanReady
+    } else {
+        ExitCode::Clean
+    }
+}
+
+/// Remote diagnostics are data, including when rendered in a terminal.
+fn fleet_inspection_text(value: &str) -> String {
+    value
+        .chars()
+        .take(2048)
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect()
 }
 
 fn run_agent_fleet_plan(global: &GlobalOpts, args: &AgentFleetPlanArgs) -> ExitCode {
@@ -22609,22 +22847,6 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
         eprintln!("agent snapshot: warning: {warning}");
     }
     let policy = config.policy;
-    let protected_filter = match ProtectedFilter::from_guardrails(&policy.guardrails) {
-        Ok(filter) => filter,
-        Err(error) => {
-            eprintln!("agent snapshot: protected filter error: {error}");
-            return ExitCode::InternalError;
-        }
-    };
-    let rate_limit_path = resolve_data_dir_for_lock().map(|dir| dir.join("rate_limit.json"));
-    let enforcer = match pt_core::decision::PolicyEnforcer::new(&policy, rate_limit_path.as_deref())
-    {
-        Ok(enforcer) => enforcer,
-        Err(error) => {
-            eprintln!("agent snapshot: policy enforcer error: {error}");
-            return ExitCode::InternalError;
-        }
-    };
     let session_id = SessionId::new();
 
     let store = match SessionStore::from_env() {
@@ -22678,8 +22900,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
         }
     }
 
-    // Collect system state and capabilities
-    let caps = get_capabilities();
+    // Collect system state before optional inference and capability probes.
     let host_id = pt_core::logging::get_host_id();
     let timestamp = chrono::Utc::now();
 
@@ -22700,7 +22921,10 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
         }
     };
 
-    let system_state = match &scan_result {
+    let mut system_state = match &scan_result {
+        Some(scan) if args.minimal => {
+            collect_observational_activity(&mut scorer, &scan.processes, args.window_ms)
+        }
         Some(scan) => collect_planning_activity(
             &mut scorer,
             &scan.processes,
@@ -22709,6 +22933,16 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
         ),
         None => collect_system_state(None),
     };
+    if args.minimal {
+        if let Some(system) = system_state.as_object_mut() {
+            if scan_result
+                .as_ref()
+                .is_none_or(|scan| !scan.metadata.warnings.is_empty())
+            {
+                system.insert("census".into(), serde_json::Value::Null);
+            }
+        }
+    }
     if let Err(error) = write_system_state_to_session(&handle, &system_state) {
         eprintln!("agent snapshot: {error}");
         return ExitCode::InternalError;
@@ -22717,6 +22951,87 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
     let responsible_units = scan_result
         .as_ref()
         .map(|scan| collect_responsible_units(scan, &scorer, &pressure));
+    if args.minimal {
+        let units = responsible_units.as_ref().map(|table| {
+            serde_json::json!({
+                "rank_by": table.rank_by,
+                "total_units": table.units.len(),
+                "omitted_units": table.units.len().saturating_sub(10),
+                "input_processes": table.input_processes,
+                "attributed_processes": table.attributed_processes,
+                "sampling_window_ms": table.sampling_window_ms,
+                "unavailable": table.unavailable,
+                "limitations": table.limitations,
+                "units": table.units.iter().take(10)
+                    .map(|unit| responsible_unit_summary(Some(unit)))
+                    .collect::<Vec<_>>(),
+            })
+        });
+        let output = serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "command": "agent snapshot",
+            "status": "ok",
+            "pt_version": env!("CARGO_PKG_VERSION"),
+            "session_id": session_id.0,
+            "host_id": host_id,
+            "generated_at": timestamp.to_rfc3339(),
+            "timestamp": timestamp.to_rfc3339(),
+            "session_dir": handle.dir.display().to_string(),
+            "label": args.label,
+            "minimal": true,
+            "read_only": true,
+            "activity_window_ms": args.window_ms,
+            "system_state": system_state,
+            "responsible_units": units,
+            "scan": {
+                "complete": scan_result.as_ref().is_some_and(|scan| scan.metadata.warnings.is_empty()),
+                "processes_observed": scan_result.as_ref().map(|scan| scan.processes.len()),
+                "warnings": scan_result.as_ref().map(|scan| &scan.metadata.warnings),
+            },
+        });
+        if let Err(error) =
+            pt_core::session::write_json_pretty(&handle.dir.join("scan/health.json"), &output)
+        {
+            eprintln!("agent snapshot: persist minimal health observation: {error}");
+            return ExitCode::IoError;
+        }
+        match global.format {
+            OutputFormat::Json | OutputFormat::Toon => {
+                println!("{}", format_structured_output(global, output))
+            }
+            OutputFormat::Jsonl => println!("{output}"),
+            OutputFormat::Exitcode => {}
+            _ => {
+                println!("agent snapshot {}: host observations only", session_id);
+                println!("Session: {}", handle.dir.display());
+                if let Some(assessment) = system_state.get("assessment") {
+                    println!("Pressure: {}", assessment["worst"]);
+                }
+                if let Some(table) = &responsible_units {
+                    print_responsible_units(table);
+                }
+            }
+        }
+        return ExitCode::Clean;
+    }
+
+    let caps = get_capabilities();
+    let protected_filter = match ProtectedFilter::from_guardrails(&policy.guardrails) {
+        Ok(filter) => filter,
+        Err(error) => {
+            eprintln!("agent snapshot: protected filter error: {error}");
+            return ExitCode::InternalError;
+        }
+    };
+    let rate_limit_path = resolve_data_dir_for_lock().map(|dir| dir.join("rate_limit.json"));
+    let enforcer = match pt_core::decision::PolicyEnforcer::new(&policy, rate_limit_path.as_deref())
+    {
+        Ok(enforcer) => enforcer,
+        Err(error) => {
+            eprintln!("agent snapshot: policy enforcer error: {error}");
+            return ExitCode::InternalError;
+        }
+    };
     if let Some(table) = &responsible_units {
         let artifact = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
@@ -23059,6 +23374,9 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
         OutputFormat::Json | OutputFormat::Toon => {
             let mut output = serde_json::json!({
                 "schema_version": SCHEMA_VERSION,
+                "command": "agent snapshot",
+                "status": "ok",
+                "pt_version": env!("CARGO_PKG_VERSION"),
                 "session_id": session_id.0,
                 "host_id": host_id,
                 "timestamp": timestamp.to_rfc3339(),
@@ -24094,6 +24412,19 @@ fn collect_planning_activity(
     window_ms: u64,
     census_complete: bool,
 ) -> serde_json::Value {
+    let mut system = collect_observational_activity(scorer, population, window_ms);
+    system["respawn_history"] = collect_planning_respawn_history(scorer, population);
+    system["workloads"] = collect_planning_workloads(scorer, population, census_complete);
+    system
+}
+
+/// A shared rate window for read-only health observations, without collecting
+/// per-process model, respawn-history or duplicate-work diagnosis artifacts.
+fn collect_observational_activity(
+    scorer: &mut Scorer,
+    population: &[ProcessRecord],
+    window_ms: u64,
+) -> serde_json::Value {
     use pt_core::collect::pressure::{
         host_cpu_window, read_host_cpu_counters, read_pressure_snapshot,
     };
@@ -24144,8 +24475,6 @@ fn collect_planning_activity(
     let window = planning_pressure_window(&mut snapshot, baseline, requested);
     let mut system = system_state_from_pressure(snapshot, window, Some(population));
     system["cpu_usage"] = serde_json::json!(cpu_usage.ok());
-    system["respawn_history"] = collect_planning_respawn_history(scorer, population);
-    system["workloads"] = collect_planning_workloads(scorer, population, census_complete);
     system
 }
 

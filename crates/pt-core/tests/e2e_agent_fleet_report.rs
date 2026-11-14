@@ -808,3 +808,234 @@ fn fleet_status_and_report_prose_distinguish_partial_pressure_from_healthy() {
         }
     });
 }
+
+#[cfg(unix)]
+mod live_inspection {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    fn install_ssh_fixture(directory: &Path) -> PathBuf {
+        let bin = directory.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let script = bin.join("ssh");
+        fs::write(&script, r#"#!/bin/sh
+set -eu
+while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done
+[ "$#" -eq 3 ] || exit 98
+shift
+host=$1
+command=$2
+printf '%s\t%s\n' "$host" "$command" >> "$PT_FLEET_TEST_LOG"
+case "$host" in
+  bad*) printf 'connection refused by fixture\n' >&2; exit 255 ;;
+  slow) sleep 10 ;;
+esac
+case "$command" in
+  *' --format json agent snapshot --minimal') cat "$PT_FLEET_TEST_ROOT/$host.health.json"; exit 0 ;;
+  *' --format json doctor') cat "$PT_FLEET_TEST_ROOT/$host.doctor.json"; exit "$(cat "$PT_FLEET_TEST_ROOT/$host.exit")" ;;
+  *) printf 'unexpected remote command\n' >&2; exit 99 ;;
+esac
+"#).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    fn command(directory: &Path, bin: &Path, mode: &str, hosts: &str) -> Command {
+        let path = env::join_paths(
+            std::iter::once(bin.to_path_buf())
+                .chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
+        )
+        .unwrap();
+        let mut cmd = pt_core_fast();
+        cmd.env("PROCESS_TRIAGE_DATA", directory.join("data"))
+            .env("PT_FLEET_TEST_ROOT", directory)
+            .env("PT_FLEET_TEST_LOG", directory.join("calls.log"))
+            .env("PATH", path)
+            .args([
+                "--format",
+                "json",
+                "agent",
+                "fleet",
+                mode,
+                "--hosts",
+                hosts,
+                "--parallel",
+                "1",
+                "--remote-binary",
+                "/opt/pt tools/pt-core",
+            ]);
+        cmd
+    }
+
+    fn snapshot(cpu: f64) -> Value {
+        serde_json::json!({
+            "schema_version": pt_common::SCHEMA_VERSION,
+            "command": "agent snapshot", "status": "ok",
+            "pt_version": env!("CARGO_PKG_VERSION"),
+            "host_id": "remote-host", "generated_at": "2026-02-08T12:00:00Z",
+            "minimal": true,
+            "system_state": {
+                "process_count": 100,
+                "census": {"zombies": 0, "dstate": 0},
+                "pressure": {
+                    "sampled_at_ms": HEALTH_SAMPLE_MS, "cpus": 8,
+                    "cpu": {"some": {"avg10": cpu, "avg60": cpu, "avg300": cpu, "total_us": 100}},
+                    "memory": {"some": {"avg10": 0.0, "avg60": 0.0, "avg300": 0.0, "total_us": 0}},
+                    "io": {"some": {"avg10": 0.0, "avg60": 0.0, "avg300": 0.0, "total_us": 0}},
+                    "load": {"one": 1.0, "five": 1.0, "fifteen": 1.0},
+                    "meminfo": {"total": 16_u64 << 30, "available": 8_u64 << 30, "swap_total": 0, "swap_free": 0},
+                    "file_handles": {"allocated": 10, "max": 10000}, "unavailable": []
+                }
+            },
+            "responsible_units": {"units": [{"id": "compile", "label": "compiler scope", "member_count": 3, "usage": {"cpu_cores": {"value": 3.0}}}]}
+        })
+    }
+
+    fn save(directory: &Path, host: &str, kind: &str, document: &Value) {
+        fs::write(
+            directory.join(format!("{host}.{kind}.json")),
+            serde_json::to_vec(document).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn fleet_health_runs_only_minimal_snapshots_and_preserves_unknown_and_failed_hosts() {
+        let dir = TempDir::new().unwrap();
+        let bin = install_ssh_fixture(dir.path());
+        save(dir.path(), "quiet", "health", &snapshot(0.0));
+        save(dir.path(), "busy", "health", &snapshot(45.0));
+        let mut partial = snapshot(0.0);
+        partial["system_state"]["pressure"]["memory"] = Value::Null;
+        partial["pt_version"] = serde_json::json!("older-release");
+        save(dir.path(), "partial", "health", &partial);
+        let bytes = command(dir.path(), &bin, "health", "quiet,bad-ssh,busy,partial")
+            .assert()
+            .code(3)
+            .get_output()
+            .stdout
+            .clone();
+        let report: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(report["command"], "agent fleet health");
+        assert_eq!(report["read_only"], true);
+        assert_eq!(report["status"], "partial");
+        assert_eq!(report["summary"]["completed"], 3);
+        assert_eq!(report["summary"]["failed"], 1);
+        assert_eq!(report["summary"]["critical_hosts"], 1);
+        assert_eq!(report["summary"]["unknown_hosts"], 2);
+        assert_eq!(report["summary"]["version_mismatches"], 1);
+        let hosts = report["hosts"].as_array().unwrap();
+        assert_eq!(hosts[0]["host"], "busy");
+        assert_eq!(
+            hosts[0]["responsible_units"]["units"][0]["label"],
+            "compiler scope"
+        );
+        let failed = hosts.iter().find(|host| host["host"] == "bad-ssh").unwrap();
+        assert_eq!(failed["exit_code"], 255);
+        assert!(failed["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("connection refused"));
+        assert_eq!(failed["observed_status"], "unknown");
+        let calls = fs::read_to_string(dir.path().join("calls.log")).unwrap();
+        assert_eq!(calls.lines().count(), 4);
+        assert!(calls
+            .lines()
+            .all(|line| line
+                .ends_with("'/opt/pt tools/pt-core' --format json agent snapshot --minimal")));
+        assert!(report.get("fleet_session_id").is_none());
+    }
+
+    #[test]
+    fn fleet_doctor_accepts_findings_exit_and_never_runs_reported_remedies() {
+        let dir = TempDir::new().unwrap();
+        let bin = install_ssh_fixture(dir.path());
+        let forbidden = dir.path().join("remedy-must-not-run");
+        let remedy = format!("touch {}", forbidden.display());
+        let document = serde_json::json!({
+            "schema_version": pt_common::SCHEMA_VERSION,
+            "command": "doctor", "status": "ok",
+            "pt_version": env!("CARGO_PKG_VERSION"),
+            "host_id": "doctor-host", "generated_at": "2026-02-08T12:00:00Z",
+            "worst": "crit", "facts": {"memory_high": "infinity"},
+            "pressure": {"worst": "ok", "regimes": [], "severity": {"cpu": 0.0, "memory": 0.0, "io": 0.0, "fd": 0.0}},
+            "findings": [{"id": "oomd.limit", "level": "crit", "summary": "Memory limit overridden", "observed": "infinity", "recommended": "Review the drop-in", "rationale": "Effective static configuration", "commands": [remedy]}]
+        });
+        save(dir.path(), "worker", "doctor", &document);
+        fs::write(dir.path().join("worker.exit"), "1\n").unwrap();
+        let bytes = command(dir.path(), &bin, "doctor", "worker")
+            .assert()
+            .code(1)
+            .get_output()
+            .stdout
+            .clone();
+        let report: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(report["status"], "ok");
+        assert_eq!(report["summary"]["completed"], 1);
+        assert_eq!(report["summary"]["critical_hosts"], 1);
+        assert_eq!(report["hosts"][0]["exit_code"], 1);
+        assert_eq!(
+            report["hosts"][0]["doctor"]["findings"][0]["commands"][0],
+            remedy
+        );
+        assert!(!forbidden.exists());
+        let calls = fs::read_to_string(dir.path().join("calls.log")).unwrap();
+        assert_eq!(calls.lines().count(), 1);
+        assert!(calls.ends_with("--format json doctor\n"));
+    }
+
+    #[test]
+    fn fleet_inspection_rejects_incompatible_schema_and_stops_after_repeated_failures() {
+        let dir = TempDir::new().unwrap();
+        let bin = install_ssh_fixture(dir.path());
+        let mut wrong = snapshot(0.0);
+        wrong["schema_version"] = serde_json::json!("99.0.0");
+        save(dir.path(), "wrong", "health", &wrong);
+        let bytes = command(dir.path(), &bin, "health", "wrong,bad-ssh,never-started")
+            .args(["--max-consecutive-failures", "2"])
+            .assert()
+            .code(21)
+            .get_output()
+            .stdout
+            .clone();
+        let report: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(report["summary"]["failed"], 2);
+        assert_eq!(report["summary"]["skipped"], 1);
+        assert_eq!(report["summary"]["circuit_open"], true);
+        let hosts = report["hosts"].as_array().unwrap();
+        let wrong = hosts.iter().find(|host| host["host"] == "wrong").unwrap();
+        assert!(wrong["error"].as_str().unwrap().contains("schema_version"));
+        let skipped = hosts
+            .iter()
+            .find(|host| host["host"] == "never-started")
+            .unwrap();
+        assert_eq!(skipped["status"], "skipped");
+        assert!(skipped["exit_code"].is_null());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("calls.log"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn fleet_inspection_deadline_keeps_timeout_distinct_from_a_quiet_host() {
+        let dir = TempDir::new().unwrap();
+        let bin = install_ssh_fixture(dir.path());
+        let bytes = command(dir.path(), &bin, "health", "slow")
+            .args(["--timeout", "1", "--connect-timeout", "1"])
+            .assert()
+            .code(21)
+            .get_output()
+            .stdout
+            .clone();
+        let report: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(report["summary"]["failed"], 1);
+        assert_eq!(report["hosts"][0]["timed_out"], true);
+        assert_eq!(report["hosts"][0]["observed_status"], "unknown");
+        assert!(report["hosts"][0]["health"].is_null());
+    }
+}

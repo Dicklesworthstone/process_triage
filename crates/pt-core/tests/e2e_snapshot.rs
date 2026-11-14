@@ -16,6 +16,78 @@ fn pt_core() -> Command {
     cmd
 }
 
+#[test]
+fn minimal_snapshot_is_bounded_observation_without_inference_or_executable_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config");
+    let data = dir.path().join("data");
+    std::fs::create_dir(&config).unwrap();
+    std::fs::create_dir(&data).unwrap();
+    // Reading host pressure must not depend on mutable execution accounting.
+    std::fs::write(data.join("rate_limit.json"), "invalid execution state").unwrap();
+    let bytes = pt_core()
+        .env("PROCESS_TRIAGE_DATA", &data)
+        .env("PROCESS_TRIAGE_RETENTION", "off")
+        .env("PT_SKIP_GLOBAL_LOCK", "1")
+        .arg("--config")
+        .arg(&config)
+        .args([
+            "--format",
+            "json",
+            "agent",
+            "snapshot",
+            "--minimal",
+            "--window-ms",
+            "0",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(report["command"], "agent snapshot");
+    assert_eq!(report["minimal"], true);
+    assert_eq!(report["read_only"], true);
+    assert_eq!(report["pt_version"], env!("CARGO_PKG_VERSION"));
+    assert!(report["system_state"].is_object());
+    assert!(report["scan"]["complete"].is_boolean());
+    for field in [
+        "process_snapshot",
+        "pressure_decisions",
+        "candidates",
+        "actions",
+        "capabilities",
+    ] {
+        assert!(report.get(field).is_none(), "unexpected {field}");
+    }
+    assert!(report["system_state"].get("workloads").is_none());
+    assert!(report["system_state"].get("respawn_history").is_none());
+    if let Some(units) = report["responsible_units"]["units"].as_array() {
+        assert!(units.len() <= 10);
+        for unit in units {
+            assert!(unit.get("members").is_none());
+            assert_eq!(unit["group_action_authorized"], false);
+        }
+    }
+    let session = std::path::Path::new(report["session_dir"].as_str().unwrap());
+    assert!(session.join("scan/health.json").exists());
+    assert!(session.join("scan/system_state.json").exists());
+    for path in [
+        "scan/inventory.json",
+        "inference/results.json",
+        "decision/plan.json",
+    ] {
+        assert!(
+            !session.join(path).exists(),
+            "minimal observation unexpectedly wrote {path}"
+        );
+    }
+    let saved: Value =
+        serde_json::from_slice(&std::fs::read(session.join("scan/health.json")).unwrap()).unwrap();
+    assert_eq!(saved, report);
+}
+
 // ============================================================================
 // Basic Snapshot Tests
 // ============================================================================

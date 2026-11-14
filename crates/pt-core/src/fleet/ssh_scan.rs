@@ -299,7 +299,10 @@ fn remote_psi(
 
 /// Recompute snapshot health from remote measurements, never from the remote
 /// `assessment` or a claimed severity. No local host readings fill remote gaps.
-fn remote_health(system_state: Option<&serde_json::Value>, total_processes: u64) -> HostHealth {
+pub(super) fn remote_health(
+    system_state: Option<&serde_json::Value>,
+    total_processes: u64,
+) -> HostHealth {
     let Some(system_state) = system_state.filter(|value| value.is_object()) else {
         return HostHealth::default();
     };
@@ -768,22 +771,70 @@ where
     F: Fn(&str, &SshScanConfig) -> HostScanResult + Sync,
 {
     let start = std::time::Instant::now();
+    let (collected, _) = run_host_pool(
+        hosts,
+        config.parallel,
+        usize::from(!config.continue_on_error),
+        |host| scan_host(host, config),
+        |result| result.success,
+        |host, duration_ms| HostScanResult {
+            host: host.to_string(),
+            success: false,
+            plan: None,
+            error: Some("fleet scan worker panicked while reading the remote plan".into()),
+            duration_ms,
+            provenance: None,
+        },
+    );
+    let results = complete_scan_results(hosts, collected);
+    let successful = results.iter().filter(|r| r.success).count();
+    let failed = results.iter().filter(|r| !r.success).count();
+
+    FleetScanResult {
+        total_hosts: hosts.len(),
+        successful,
+        failed,
+        results,
+        duration_ms: start.elapsed().as_millis() as u64,
+        provenance_aggregate: None, // Populated when remote hosts report provenance
+    }
+}
+
+/// Shared sliding pool for remote plans and read-only host inspections. Zero
+/// disables the failure limit. Otherwise consecutive completed failures stop
+/// new dispatch; an already running success cannot reopen the circuit.
+pub(super) fn run_host_pool<R, F, S, P>(
+    hosts: &[String],
+    parallel: usize,
+    max_consecutive_failures: usize,
+    run_host: F,
+    succeeded: S,
+    panicked: P,
+) -> (Vec<(usize, R)>, bool)
+where
+    R: Send,
+    F: Fn(&str) -> R + Sync,
+    S: Fn(&R) -> bool + Sync,
+    P: Fn(&str, u64) -> R + Sync,
+{
     let results = Mutex::new(Vec::with_capacity(hosts.len()));
     // Both assignment and failure publication use this lock. A worker cannot
     // take another host after a failure has stopped dispatch.
-    let dispatch = Mutex::new((0_usize, false));
-    let parallel = config.parallel.clamp(1, super::apply::MAX_FLEET_PARALLEL);
+    let dispatch = Mutex::new((0_usize, false, 0_usize));
+    let parallel = parallel.clamp(1, super::apply::MAX_FLEET_PARALLEL);
 
     std::thread::scope(|scope| {
         let handles: Vec<_> = (0..parallel.min(hosts.len()))
             .map(|_| {
                 let results = &results;
                 let dispatch = &dispatch;
-                let scan_host = &scan_host;
+                let run_host = &run_host;
+                let succeeded = &succeeded;
+                let panicked = &panicked;
                 scope.spawn(move || loop {
                     let index = {
                         let mut work = dispatch.lock().expect("dispatch lock poisoned");
-                        let (next, stopped) = &mut *work;
+                        let (next, stopped, _) = &mut *work;
                         if *stopped || *next >= hosts.len() {
                             break;
                         }
@@ -794,20 +845,21 @@ where
 
                     let host_started = std::time::Instant::now();
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        scan_host(&hosts[index], config)
+                        run_host(&hosts[index])
                     }))
-                    .unwrap_or_else(|_| HostScanResult {
-                        host: hosts[index].clone(),
-                        success: false,
-                        plan: None,
-                        error: Some(
-                            "fleet scan worker panicked while reading the remote plan".into(),
-                        ),
-                        duration_ms: host_started.elapsed().as_millis() as u64,
-                        provenance: None,
+                    .unwrap_or_else(|_| {
+                        panicked(&hosts[index], host_started.elapsed().as_millis() as u64)
                     });
-                    if !result.success && !config.continue_on_error {
-                        dispatch.lock().expect("dispatch lock poisoned").1 = true;
+                    {
+                        let mut work = dispatch.lock().expect("dispatch lock poisoned");
+                        if succeeded(&result) {
+                            work.2 = 0;
+                        } else {
+                            work.2 = work.2.saturating_add(1);
+                            if max_consecutive_failures > 0 && work.2 >= max_consecutive_failures {
+                                work.1 = true;
+                            }
+                        }
                     }
                     results
                         .lock()
@@ -821,19 +873,10 @@ where
         }
     });
 
-    let collected = results.into_inner().expect("results lock poisoned");
-    let results = complete_scan_results(hosts, collected);
-    let successful = results.iter().filter(|r| r.success).count();
-    let failed = results.iter().filter(|r| !r.success).count();
-
-    FleetScanResult {
-        total_hosts: hosts.len(),
-        successful,
-        failed,
-        results,
-        duration_ms: start.elapsed().as_millis() as u64,
-        provenance_aggregate: None, // Populated when remote hosts report provenance
-    }
+    (
+        results.into_inner().expect("results lock poisoned"),
+        dispatch.into_inner().expect("dispatch lock poisoned").1,
+    )
 }
 
 /// Preserve every requested host when an earlier failure stops dispatch or a
