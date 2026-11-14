@@ -360,6 +360,218 @@ pub struct Scorer {
     provenance: Option<ProvenanceInferenceBundle>,
 }
 
+/// Observed CPU/storage-I/O activity, not an abandonment or supervision verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentActivityState {
+    ActivityObserved,
+    NoActivityObservedInWindow,
+    Unknown,
+}
+
+/// A sum over observed members, with an independently reported complete total.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentActivityMeasurement {
+    /// Sum of usable measurements, or null when none were available or it overflowed.
+    pub observed: Option<f64>,
+    /// Present only when every member was measured and census/ancestry are complete.
+    pub total: Option<f64>,
+    pub observed_members: usize,
+}
+
+impl AgentActivityMeasurement {
+    fn observe(&mut self, value: Option<f64>) {
+        let Some(value) = value.filter(|value| value.is_finite() && *value >= 0.0) else {
+            return;
+        };
+        self.observed = if self.observed_members == 0 {
+            Some(value)
+        } else {
+            self.observed
+                .map(|sum| sum + value)
+                .filter(|sum| sum.is_finite())
+        };
+        self.observed_members += 1;
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentActivityUsage {
+    /// One fully occupied CPU core is 1.0.
+    pub cpu_cores: AgentActivityMeasurement,
+    pub read_bytes_per_second: AgentActivityMeasurement,
+    pub write_bytes_per_second: AgentActivityMeasurement,
+    /// Sum of snapshot RSS for attributed members; shared pages may be counted twice.
+    pub observed_rss_bytes: u64,
+    pub rss_sum_saturated: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentChildComposition {
+    /// Direct children in this unit; excludes separately reported nested agents.
+    pub direct_children: usize,
+    /// All attributed descendants, excluding the root and nested agent trees.
+    pub descendants: usize,
+    pub active_descendants: usize,
+    /// Descendants matching the existing built-in MCP server signature.
+    pub known_mcp_server_descendants: usize,
+    pub active_mcp_server_descendants: usize,
+    pub other_descendants: usize,
+    pub active_other_descendants: usize,
+    /// Nearest nested agent roots; their resources belong to their own units.
+    pub nested_agent_roots: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentActivityCoverage {
+    pub cpu_observed_members: usize,
+    pub storage_io_observed_members: usize,
+    pub fully_observed_members: usize,
+    pub active_members: usize,
+    /// Members with neither positive activity nor complete usable zero measurements.
+    pub unknown_activity_members: usize,
+    pub ancestry_complete: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentActivityUnit {
+    /// Includes the process incarnation so a reused PID cannot retain a unit ID.
+    pub id: String,
+    pub kind: String,
+    pub root: pt_common::ProcessIdentity,
+    pub root_state: crate::collect::ProcessState,
+    pub age_seconds: u64,
+    pub activity: AgentActivityState,
+    pub member_count: usize,
+    pub composition: AgentChildComposition,
+    pub coverage: AgentActivityCoverage,
+    pub usage: AgentActivityUsage,
+    pub unavailable: Vec<String>,
+}
+
+/// Read-only activity of recognized agent CLIs and their observed same-user trees.
+/// No field changes inference, inherited supervision, protection, or action gates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentActivityReport {
+    pub units: Vec<AgentActivityUnit>,
+    pub input_processes: usize,
+    pub census_complete: bool,
+    pub attributed_processes: usize,
+    pub excluded_duplicate_pids: usize,
+    pub ancestry_unavailable_processes: usize,
+    pub sampling_window_ms: Option<u64>,
+    pub limitations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AgentLineage {
+    owner: Option<u32>,
+    parent_agent: Option<u32>,
+    unavailable: bool,
+    cyclic: bool,
+}
+
+/// Validate start tokens before using them to order a parent/child observation.
+fn agent_start_parts(process: &ProcessRecord) -> Option<(&str, u64)> {
+    let mut parts = process.start_id.0.split(':');
+    let boot = parts.next().filter(|boot| !boot.is_empty())?;
+    let start = parts.next()?.parse::<u64>().ok()?;
+    let pid = parts.next()?.parse::<u32>().ok()?;
+    (parts.next().is_none() && pid == process.pid.0).then_some((boot, start))
+}
+
+/// Resolve the census once, retaining nearest-agent boundaries and rejecting
+/// ambiguous parents. Iterative memoization also bounds long chains and cycles.
+fn agent_lineages(
+    processes: &BTreeMap<u32, Option<&ProcessRecord>>,
+    roots: &BTreeMap<u32, &str>,
+) -> BTreeMap<u32, AgentLineage> {
+    let mut resolved: BTreeMap<u32, AgentLineage> = BTreeMap::new();
+    for (&pid, process) in processes {
+        if process.is_none() || resolved.contains_key(&pid) {
+            continue;
+        }
+        let mut path = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut current = pid;
+        let mut terminal = loop {
+            if let Some(known) = resolved.get(&current) {
+                break *known;
+            }
+            if !seen.insert(current) {
+                break AgentLineage {
+                    owner: None,
+                    parent_agent: None,
+                    unavailable: true,
+                    cyclic: true,
+                };
+            }
+            let Some(process) = processes.get(&current).copied().flatten() else {
+                break AgentLineage {
+                    owner: None,
+                    parent_agent: None,
+                    unavailable: true,
+                    cyclic: false,
+                };
+            };
+            path.push(current);
+            let parent_pid = process.ppid.0;
+            if parent_pid == 0 || (parent_pid == 1 && !processes.contains_key(&1)) {
+                break AgentLineage {
+                    owner: None,
+                    parent_agent: None,
+                    unavailable: false,
+                    cyclic: false,
+                };
+            }
+            let Some(parent) = processes.get(&parent_pid).copied().flatten() else {
+                break AgentLineage {
+                    owner: None,
+                    parent_agent: None,
+                    unavailable: true,
+                    cyclic: false,
+                };
+            };
+            // Ownership does not cross an observed user boundary. This says
+            // nothing about the independent supervision/protection evidence.
+            if parent.uid != process.uid {
+                break AgentLineage {
+                    owner: None,
+                    parent_agent: None,
+                    unavailable: false,
+                    cyclic: false,
+                };
+            }
+            let ordered = agent_start_parts(process)
+                .zip(agent_start_parts(parent))
+                .is_some_and(|((boot, start), (parent_boot, parent_start))| {
+                    boot == parent_boot && parent_start <= start
+                });
+            if !ordered {
+                break AgentLineage {
+                    owner: None,
+                    parent_agent: None,
+                    unavailable: true,
+                    cyclic: false,
+                };
+            }
+            current = parent_pid;
+        };
+        while let Some(member) = path.pop() {
+            let parent_agent = terminal.owner;
+            if roots.contains_key(&member) && !terminal.cyclic {
+                // A recognized root establishes its own observed unit even if
+                // its upstream shell is absent from this census.
+                terminal.owner = Some(member);
+                terminal.unavailable = false;
+            }
+            terminal.parent_agent = parent_agent;
+            resolved.insert(member, terminal);
+        }
+    }
+    resolved
+}
+
 #[derive(Debug, Clone)]
 struct SupervisorRestartObservation {
     target: pt_common::ProcessIdentity,
@@ -632,6 +844,262 @@ impl Scorer {
                 "process was not included in the activity sampling window",
             ),
         })
+    }
+
+    /// Describe recognized agent trees using only this census and activity that
+    /// was already sampled. Pass the full census before candidate/protection
+    /// filters, and report an incomplete scan as `census_complete = false`.
+    /// No collector, inference update, or action policy is invoked here.
+    pub fn agent_activity_report(
+        &self,
+        processes: &[ProcessRecord],
+        census_complete: bool,
+    ) -> AgentActivityReport {
+        let mut by_pid = BTreeMap::new();
+        for process in processes {
+            by_pid
+                .entry(process.pid.0)
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(process));
+        }
+        let excluded_duplicate_pids = by_pid.values().filter(|record| record.is_none()).count();
+        let roots: BTreeMap<u32, &str> = by_pid
+            .iter()
+            .filter_map(|(&pid, process)| {
+                crate::collect::protected::agent_kind(&process.as_ref()?.cmd)
+                    .map(|kind| (pid, kind))
+            })
+            .collect();
+        let lineages = agent_lineages(&by_pid, &roots);
+        let ancestry_unavailable_processes = lineages
+            .values()
+            .filter(|lineage| lineage.unavailable)
+            .count();
+        let ancestry_complete = excluded_duplicate_pids == 0 && ancestry_unavailable_processes == 0;
+        let sampling_window_ms = self
+            .activity_window
+            .filter(|window| !window.is_zero())
+            .map(|window| u64::try_from(window.as_millis()).unwrap_or(u64::MAX));
+        let mut units: BTreeMap<u32, AgentActivityUnit> = roots
+            .iter()
+            .filter_map(|(&pid, &kind)| {
+                let process = by_pid.get(&pid).copied().flatten()?;
+                let quality = match agent_start_parts(process) {
+                    Some(("unknown" | "synthetic", _)) => pt_common::IdentityQuality::NoBootId,
+                    Some(_) => pt_common::IdentityQuality::Full,
+                    None => pt_common::IdentityQuality::PidOnly,
+                };
+                Some((
+                    pid,
+                    AgentActivityUnit {
+                        id: format!("agent:{}:{}:{}", process.uid, pid, process.start_id),
+                        kind: kind.to_string(),
+                        root: pt_common::ProcessIdentity::full(
+                            pid,
+                            process.start_id.clone(),
+                            process.uid,
+                            process.pgid,
+                            process.sid,
+                            quality,
+                        ),
+                        root_state: process.state,
+                        age_seconds: process.elapsed_seconds(),
+                        activity: AgentActivityState::Unknown,
+                        member_count: 0,
+                        composition: AgentChildComposition::default(),
+                        coverage: AgentActivityCoverage {
+                            ancestry_complete,
+                            ..AgentActivityCoverage::default()
+                        },
+                        usage: AgentActivityUsage::default(),
+                        unavailable: Vec::new(),
+                    },
+                ))
+            })
+            .collect();
+
+        for process in by_pid.values().filter_map(|record| *record) {
+            let owner = if roots.contains_key(&process.pid.0) {
+                Some(process.pid.0)
+            } else {
+                lineages
+                    .get(&process.pid.0)
+                    .and_then(|lineage| lineage.owner)
+            };
+            let Some(unit) = owner.and_then(|owner| units.get_mut(&owner)) else {
+                continue;
+            };
+            unit.member_count += 1;
+            match unit.usage.observed_rss_bytes.checked_add(process.rss_bytes) {
+                Some(sum) => unit.usage.observed_rss_bytes = sum,
+                None => {
+                    unit.usage.observed_rss_bytes = u64::MAX;
+                    unit.usage.rss_sum_saturated = true;
+                }
+            }
+
+            // Lifetime-averaged `ps` CPU, stale incarnations, malformed counters,
+            // and samples from another window must not be described as recent work.
+            let sample = self.activity.get(&process.pid.0).filter(|sample| {
+                sampling_window_ms
+                    .is_some_and(|window| window > 0 && sample.requested_window_ms == window)
+                    && sample.source == "procfs_window"
+                    && sample.matches_record(process)
+                    && agent_start_parts(process).is_some()
+            });
+            let cpu = sample.and_then(|sample| {
+                if sample.cpu_error.is_none()
+                    && sample.cpu_ticks.is_some()
+                    && sample
+                        .cpu_window_seconds
+                        .is_some_and(|seconds| seconds.is_finite() && seconds > 0.0)
+                {
+                    sample
+                        .cpu_percent
+                        .filter(|percent| percent.is_finite() && *percent >= 0.0)
+                } else {
+                    None
+                }
+            });
+            let io = sample.and_then(|sample| {
+                if sample.io_error.is_none()
+                    && sample.io_active.is_some()
+                    && sample
+                        .io_window_seconds
+                        .is_some_and(|seconds| seconds.is_finite() && seconds > 0.0)
+                {
+                    sample
+                        .read_bytes_per_second
+                        .zip(sample.write_bytes_per_second)
+                        .filter(|(read, write)| {
+                            read.is_finite() && *read >= 0.0 && write.is_finite() && *write >= 0.0
+                        })
+                } else {
+                    None
+                }
+            });
+            let active = cpu.is_some_and(|percent| percent > 0.0)
+                || io.is_some_and(|(read, write)| read > 0.0 || write > 0.0)
+                || (io.is_some() && sample.is_some_and(|sample| sample.io_active == Some(true)));
+            unit.coverage.cpu_observed_members += usize::from(cpu.is_some());
+            unit.coverage.storage_io_observed_members += usize::from(io.is_some());
+            unit.coverage.fully_observed_members += usize::from(cpu.is_some() && io.is_some());
+            unit.coverage.active_members += usize::from(active);
+            unit.coverage.unknown_activity_members +=
+                usize::from(!active && (cpu.is_none() || io.is_none()));
+            unit.usage
+                .cpu_cores
+                .observe(cpu.map(|percent| percent / 100.0));
+            unit.usage
+                .read_bytes_per_second
+                .observe(io.map(|(read, _)| read));
+            unit.usage
+                .write_bytes_per_second
+                .observe(io.map(|(_, write)| write));
+
+            if process.pid.0 != unit.root.pid.0 {
+                unit.composition.descendants += 1;
+                unit.composition.direct_children += usize::from(process.ppid == unit.root.pid);
+                unit.composition.active_descendants += usize::from(active);
+                let context = ProcessMatchContext::with_comm(&process.comm).cmdline(&process.cmd);
+                let mcp = self
+                    .signatures
+                    .match_process(&context)
+                    .iter()
+                    .any(|matched| {
+                        matched.signature.builtin && matched.signature.name == "mcp-server"
+                    });
+                if mcp {
+                    unit.composition.known_mcp_server_descendants += 1;
+                    unit.composition.active_mcp_server_descendants += usize::from(active);
+                } else {
+                    unit.composition.other_descendants += 1;
+                    unit.composition.active_other_descendants += usize::from(active);
+                }
+            }
+        }
+        for &root in roots.keys() {
+            if let Some(parent) = lineages
+                .get(&root)
+                .filter(|lineage| !lineage.cyclic)
+                .and_then(|lineage| lineage.parent_agent)
+                .and_then(|pid| units.get_mut(&pid))
+            {
+                parent.composition.nested_agent_roots += 1;
+            }
+        }
+
+        for unit in units.values_mut() {
+            let complete = census_complete && ancestry_complete;
+            unit.activity = if unit.coverage.active_members > 0 {
+                AgentActivityState::ActivityObserved
+            } else if complete && unit.coverage.fully_observed_members == unit.member_count {
+                AgentActivityState::NoActivityObservedInWindow
+            } else {
+                AgentActivityState::Unknown
+            };
+            for measurement in [
+                &mut unit.usage.cpu_cores,
+                &mut unit.usage.read_bytes_per_second,
+                &mut unit.usage.write_bytes_per_second,
+            ] {
+                if complete && measurement.observed_members == unit.member_count {
+                    measurement.total = measurement.observed;
+                }
+            }
+            if [
+                &unit.usage.cpu_cores,
+                &unit.usage.read_bytes_per_second,
+                &unit.usage.write_bytes_per_second,
+            ]
+            .iter()
+            .any(|measurement| measurement.observed_members > 0 && measurement.observed.is_none())
+            {
+                unit.unavailable
+                    .push("an activity rate sum exceeded finite numeric capacity".to_string());
+            }
+            if !census_complete {
+                unit.unavailable
+                    .push("process census is incomplete".to_string());
+            }
+            if !ancestry_complete {
+                unit.unavailable
+                    .push("ambiguous or missing ancestry may omit additional members".to_string());
+            }
+            if unit.coverage.cpu_observed_members != unit.member_count {
+                unit.unavailable.push(format!(
+                    "windowed CPU unavailable for {} of {} members",
+                    unit.member_count - unit.coverage.cpu_observed_members,
+                    unit.member_count
+                ));
+            }
+            if unit.coverage.storage_io_observed_members != unit.member_count {
+                unit.unavailable.push(format!(
+                    "windowed storage I/O unavailable for {} of {} members",
+                    unit.member_count - unit.coverage.storage_io_observed_members,
+                    unit.member_count
+                ));
+            }
+            if unit.usage.rss_sum_saturated {
+                unit.unavailable
+                    .push("snapshot RSS sum exceeded u64 capacity".to_string());
+            }
+        }
+
+        AgentActivityReport {
+            attributed_processes: units.values().map(|unit| unit.member_count).sum(),
+            units: units.into_values().collect(),
+            input_processes: processes.len(),
+            census_complete,
+            excluded_duplicate_pids,
+            ancestry_unavailable_processes,
+            sampling_window_ms,
+            limitations: vec![
+                "No observed CPU/storage I/O during one short window does not establish abandonment; agents may be waiting for input, network traffic, or remote tools.".to_string(),
+                "Nearest recognized agent roots own separate same-user trees; nested agent resources are not counted in their parent unit.".to_string(),
+                "Snapshot RSS sums may count shared pages repeatedly and do not estimate reclaimable memory.".to_string(),
+            ],
+        }
     }
 
     /// Score one process from its evidence (usually `Evidence::from_snapshot`, plus
@@ -1532,6 +2000,310 @@ mod tests {
     }
 
     const FOUR_DAYS: Duration = Duration::from_secs(4 * 24 * 3600);
+
+    fn agent_record(pid: u32, parent: u32, command: &str) -> ProcessRecord {
+        let mut process = record(
+            pid,
+            command.split_whitespace().next().unwrap(),
+            command,
+            FOUR_DAYS,
+        );
+        process.ppid = ProcessId(parent);
+        process.rss_bytes = u64::from(pid) * 1024;
+        process
+    }
+
+    fn agent_activity_sample(process: &ProcessRecord, cpu: f64, read: f64) -> ProcessActivity {
+        ProcessActivity {
+            pid: process.pid.0,
+            start_id: process.start_id.clone(),
+            uid: process.uid,
+            source: "procfs_window".to_string(),
+            requested_window_ms: 500,
+            cpu_percent: Some(cpu),
+            cpu_ticks: Some(if cpu > 0.0 { 1 } else { 0 }),
+            cpu_window_seconds: Some(0.5),
+            io_window_seconds: Some(0.5),
+            read_bytes_per_second: Some(read),
+            write_bytes_per_second: Some(0.0),
+            io_active: Some(read > 0.0),
+            cpu_error: None,
+            io_error: None,
+            pressure: None,
+        }
+    }
+
+    fn agent_activity_scorer(processes: &[ProcessRecord]) -> Scorer {
+        let mut result = scorer(SignatureDatabase::with_defaults());
+        result.activity_window = Some(Duration::from_millis(500));
+        result.activity = processes
+            .iter()
+            .map(|process| (process.pid.0, agent_activity_sample(process, 0.0, 0.0)))
+            .collect();
+        result
+    }
+
+    #[test]
+    fn agent_activity_attributes_child_work_without_double_counting_nested_agents() {
+        let processes = vec![
+            agent_record(100, 1, "claude --continue"),
+            agent_record(101, 100, "cargo build"),
+            agent_record(
+                102,
+                100,
+                "node /usr/lib/@modelcontextprotocol/server-filesystem/index.js",
+            ),
+            agent_record(103, 100, "codex exec review"),
+            agent_record(104, 103, "rustc lib.rs"),
+        ];
+        let mut measured = agent_activity_scorer(&processes);
+        measured
+            .activity
+            .insert(101, agent_activity_sample(&processes[1], 100.0, 4096.0));
+        measured
+            .activity
+            .insert(103, agent_activity_sample(&processes[3], 300.0, 0.0));
+        measured
+            .activity
+            .insert(104, agent_activity_sample(&processes[4], 200.0, 0.0));
+        let report = measured.agent_activity_report(&processes, true);
+        assert_eq!(report.units.len(), 2);
+        assert_eq!(report.attributed_processes, processes.len());
+        let parent = &report.units[0];
+        assert_eq!(parent.root.pid.0, 100);
+        assert_eq!(parent.kind, "claude");
+        assert_eq!(parent.age_seconds, FOUR_DAYS.as_secs());
+        assert_eq!(parent.activity, AgentActivityState::ActivityObserved);
+        assert_eq!(parent.member_count, 3);
+        assert_eq!(parent.composition.direct_children, 2);
+        assert_eq!(parent.composition.descendants, 2);
+        assert_eq!(parent.composition.active_descendants, 1);
+        assert_eq!(parent.composition.known_mcp_server_descendants, 1);
+        assert_eq!(parent.composition.active_mcp_server_descendants, 0);
+        assert_eq!(parent.composition.other_descendants, 1);
+        assert_eq!(parent.composition.active_other_descendants, 1);
+        assert_eq!(parent.composition.nested_agent_roots, 1);
+        assert_eq!(parent.usage.cpu_cores.total, Some(1.0));
+        assert_eq!(parent.usage.read_bytes_per_second.total, Some(4096.0));
+        assert_eq!(parent.usage.observed_rss_bytes, (100 + 101 + 102) * 1024);
+        let nested = &report.units[1];
+        assert_eq!(nested.root.pid.0, 103);
+        assert_eq!(nested.member_count, 2);
+        assert_eq!(nested.usage.cpu_cores.total, Some(5.0));
+        assert_eq!(nested.composition.nested_agent_roots, 0);
+
+        let mut reordered = processes.clone();
+        reordered.reverse();
+        assert_eq!(
+            serde_json::to_value(&report).unwrap(),
+            serde_json::to_value(measured.agent_activity_report(&reordered, true)).unwrap()
+        );
+    }
+
+    #[test]
+    fn agent_activity_zero_window_is_only_an_observation_and_requires_complete_evidence() {
+        let processes = vec![
+            agent_record(100, 1, "claude"),
+            agent_record(
+                101,
+                100,
+                "node /usr/lib/@modelcontextprotocol/server-filesystem/index.js",
+            ),
+        ];
+        let measured = agent_activity_scorer(&processes);
+        let report = measured.agent_activity_report(&processes, true);
+        let unit = &report.units[0];
+        assert_eq!(
+            unit.activity,
+            AgentActivityState::NoActivityObservedInWindow
+        );
+        assert_eq!(unit.coverage.fully_observed_members, 2);
+        assert_eq!(unit.composition.known_mcp_server_descendants, 1);
+        assert_eq!(unit.composition.other_descendants, 0);
+        assert_eq!(unit.usage.cpu_cores.total, Some(0.0));
+        assert!(unit.unavailable.is_empty());
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            value["units"][0]["activity"],
+            "no_activity_observed_in_window"
+        );
+        assert!(report
+            .limitations
+            .iter()
+            .any(|text| text.contains("does not establish abandonment")));
+
+        let partial = measured.agent_activity_report(&processes, false);
+        assert_eq!(partial.units[0].activity, AgentActivityState::Unknown);
+        assert_eq!(partial.units[0].usage.cpu_cores.observed, Some(0.0));
+        assert_eq!(partial.units[0].usage.cpu_cores.total, None);
+
+        let unsampled =
+            scorer(SignatureDatabase::with_defaults()).agent_activity_report(&processes, true);
+        assert_eq!(unsampled.sampling_window_ms, None);
+        assert_eq!(unsampled.units[0].activity, AgentActivityState::Unknown);
+        assert_eq!(unsampled.units[0].usage.cpu_cores.observed, None);
+        assert_eq!(unsampled.units[0].coverage.unknown_activity_members, 2);
+    }
+
+    #[test]
+    fn agent_activity_keeps_partial_positive_evidence_but_never_fills_missing_rates_with_zero() {
+        let processes = vec![
+            agent_record(100, 1, "claude"),
+            agent_record(101, 100, "cargo build"),
+        ];
+        let mut measured = agent_activity_scorer(&processes);
+        measured.activity.remove(&100);
+        let mut child = agent_activity_sample(&processes[1], 25.0, 0.0);
+        child.io_error = Some("permission denied".to_string());
+        child.read_bytes_per_second = None;
+        child.write_bytes_per_second = None;
+        child.io_active = None;
+        measured.activity.insert(101, child);
+        let report = measured.agent_activity_report(&processes, true);
+        let unit = &report.units[0];
+        assert_eq!(unit.activity, AgentActivityState::ActivityObserved);
+        assert_eq!(unit.coverage.cpu_observed_members, 1);
+        assert_eq!(unit.coverage.storage_io_observed_members, 0);
+        assert_eq!(unit.coverage.fully_observed_members, 0);
+        assert_eq!(unit.coverage.unknown_activity_members, 1);
+        assert_eq!(unit.composition.active_other_descendants, 1);
+        assert_eq!(unit.usage.cpu_cores.observed, Some(0.25));
+        assert_eq!(unit.usage.cpu_cores.total, None);
+        assert_eq!(unit.usage.read_bytes_per_second.observed, None);
+
+        measured.activity.get_mut(&101).unwrap().cpu_percent = Some(0.0);
+        assert_eq!(
+            measured.agent_activity_report(&processes, true).units[0].activity,
+            AgentActivityState::Unknown
+        );
+    }
+
+    #[test]
+    fn agent_activity_rejects_stale_native_and_invalid_window_measurements() {
+        let process = agent_record(100, 1, "codex");
+        let mut measured = agent_activity_scorer(std::slice::from_ref(&process));
+        for variant in 0..7 {
+            let mut sample = agent_activity_sample(&process, 100.0, 1024.0);
+            match variant {
+                0 => sample.start_id = StartId::from_linux("test-boot-id", 999, 100),
+                1 => sample.uid += 1,
+                2 => sample.source = "ps_lifetime_fallback".to_string(),
+                3 => sample.requested_window_ms = 1000,
+                4 => {
+                    sample.cpu_percent = Some(f64::NAN);
+                    sample.read_bytes_per_second = Some(f64::INFINITY);
+                }
+                5 => {
+                    sample.cpu_window_seconds = Some(0.0);
+                    sample.io_window_seconds = Some(-1.0);
+                }
+                _ => {
+                    sample.cpu_error = Some("counter moved backwards".to_string());
+                    sample.io_error = Some("permission denied".to_string());
+                }
+            }
+            measured.activity.insert(100, sample);
+            let report = measured.agent_activity_report(std::slice::from_ref(&process), true);
+            assert_eq!(
+                report.units[0].activity,
+                AgentActivityState::Unknown,
+                "variant {variant}"
+            );
+            assert_eq!(
+                report.units[0].coverage.fully_observed_members, 0,
+                "variant {variant}"
+            );
+            assert_eq!(
+                report.units[0].usage.cpu_cores.observed, None,
+                "variant {variant}"
+            );
+            assert_eq!(
+                report.units[0].usage.read_bytes_per_second.observed, None,
+                "variant {variant}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_activity_missing_reused_and_cyclic_ancestry_cannot_claim_a_complete_tree() {
+        let root = agent_record(100, 1, "claude");
+        let child = agent_record(101, 100, "cargo build");
+        let mut missing = agent_record(102, 999, "rustc lib.rs");
+        let mut processes = vec![root.clone(), child.clone(), missing.clone()];
+        let measured = agent_activity_scorer(&processes);
+        let report = measured.agent_activity_report(&processes, true);
+        assert_eq!(report.ancestry_unavailable_processes, 1);
+        assert_eq!(report.units[0].member_count, 2);
+        assert_eq!(report.units[0].activity, AgentActivityState::Unknown);
+
+        missing.ppid = ProcessId(100);
+        missing.start_id = StartId::from_linux("test-boot-id", 1, 102);
+        processes[2] = missing;
+        let report = measured.agent_activity_report(&processes, true);
+        assert_eq!(report.ancestry_unavailable_processes, 1);
+        assert_eq!(report.units[0].member_count, 2);
+        assert!(!report.units[0].coverage.ancestry_complete);
+
+        processes = vec![root, child];
+        processes[0].ppid = ProcessId(101);
+        let report = measured.agent_activity_report(&processes, true);
+        assert_eq!(report.ancestry_unavailable_processes, 2);
+        assert_eq!(report.units[0].member_count, 1);
+        assert_eq!(report.units[0].activity, AgentActivityState::Unknown);
+        assert_eq!(report.units[0].composition.nested_agent_roots, 0);
+    }
+
+    #[test]
+    fn agent_activity_excludes_duplicate_pid_records_and_preserves_incarnation_ids() {
+        let root = agent_record(100, 1, "claude");
+        let child = agent_record(101, 100, "cargo build");
+        let mut duplicate = child.clone();
+        duplicate.start_id = StartId::from_linux("test-boot-id", 2_000_000_000, 101);
+        let processes = vec![root.clone(), child, duplicate];
+        let measured = agent_activity_scorer(&processes);
+        let report = measured.agent_activity_report(&processes, true);
+        assert_eq!(report.excluded_duplicate_pids, 1);
+        assert_eq!(report.units[0].member_count, 1);
+        assert_eq!(report.units[0].activity, AgentActivityState::Unknown);
+        assert_eq!(report.units[0].usage.cpu_cores.total, None);
+
+        let before = measured.agent_activity_report(std::slice::from_ref(&root), true);
+        let mut reused = root;
+        reused.start_id = StartId::from_linux("test-boot-id", 2_000_000_000, 100);
+        let after = measured.agent_activity_report(std::slice::from_ref(&reused), true);
+        assert_ne!(before.units[0].id, after.units[0].id);
+        assert_eq!(after.units[0].activity, AgentActivityState::Unknown);
+        assert_eq!(after.units[0].usage.cpu_cores.observed, None);
+    }
+
+    #[test]
+    fn agent_activity_keeps_user_boundaries_and_reports_saturated_resource_sums() {
+        let mut root = agent_record(100, 1, "claude");
+        root.rss_bytes = u64::MAX;
+        let child = agent_record(101, 100, "cargo build");
+        let mut different_user = agent_record(102, 100, "rustc lib.rs");
+        different_user.uid = 2000;
+        let processes = vec![root, child, different_user];
+        let mut measured = agent_activity_scorer(&processes);
+        for process in &processes {
+            measured
+                .activity
+                .insert(process.pid.0, agent_activity_sample(process, 0.0, f64::MAX));
+        }
+        let report = measured.agent_activity_report(&processes, true);
+        assert_eq!(report.attributed_processes, 2);
+        let unit = &report.units[0];
+        assert_eq!(unit.member_count, 2);
+        assert_eq!(unit.composition.descendants, 1);
+        assert_eq!(unit.activity, AgentActivityState::ActivityObserved);
+        assert_eq!(unit.usage.observed_rss_bytes, u64::MAX);
+        assert!(unit.usage.rss_sum_saturated);
+        assert_eq!(unit.usage.read_bytes_per_second.observed_members, 2);
+        assert_eq!(unit.usage.read_bytes_per_second.observed, None);
+        assert_eq!(unit.usage.read_bytes_per_second.total, None);
+        assert_eq!(unit.unavailable.len(), 2);
+        serde_json::to_string(&report).expect("no non-finite value reaches JSON");
+    }
 
     fn work_diagnosis(process: &ProcessRecord) -> ProcessWorkDiagnosis {
         use crate::collect::duplicates::record_command_digest;

@@ -107,6 +107,7 @@ pub struct HostInspection {
     pub system_state: Option<Value>,
     pub responsible_units: Option<Value>,
     pub memory_limits: Option<Value>,
+    pub agent_activity: Option<Value>,
     pub doctor: Option<RemoteDoctorReport>,
     pub warnings: Vec<String>,
 }
@@ -132,6 +133,7 @@ impl HostInspection {
             system_state: None,
             responsible_units: None,
             memory_limits: None,
+            agent_activity: None,
             doctor: None,
             warnings: Vec::new(),
         }
@@ -245,6 +247,35 @@ fn parse_health(document: &Value, result: &mut HostInspection) -> Result<(), Str
             .push("responsible-unit attribution unavailable or malformed".into()),
     }
     parse_memory_limits(document.get("memory_limits"), result);
+    if let Some(report) = document
+        .get("agent_activity")
+        .filter(|value| !value.is_null())
+    {
+        let valid = serde_json::from_value::<crate::scoring::AgentActivityReport>(report.clone())
+            .ok()
+            .is_some_and(|parsed| {
+                let total = report["total_units"].as_u64();
+                total.is_some_and(|total| {
+                    total >= parsed.units.len() as u64
+                        && report["omitted_units"].as_u64()
+                            == Some(total - parsed.units.len() as u64)
+                }) && parsed.units.len() <= 10
+                    && parsed.attributed_processes <= parsed.input_processes
+                    && parsed
+                        .units
+                        .iter()
+                        .all(|unit| unit.root.pid.0 > 0 && unit.member_count > 0)
+                    && report["review_only"].as_bool() == Some(true)
+                    && report["automatic_action_authorized"].as_bool() == Some(false)
+            });
+        if valid {
+            result.agent_activity = Some(report.clone());
+        } else {
+            result
+                .warnings
+                .push("agent activity report is malformed".into());
+        }
+    }
     Ok(())
 }
 
@@ -820,6 +851,31 @@ mod tests {
             let busy = parse_output("host", InspectionKind::Health, &output(&document, 0));
             assert_eq!(busy.observed_status, HostHealthStatus::Crit);
         }
+    }
+
+    #[test]
+    fn health_retains_optional_agent_activity_without_turning_it_into_action_authority() {
+        let mut document = snapshot(0.0);
+        document["agent_activity"] = json!({
+            "units": [], "total_units": 0, "omitted_units": 0,
+            "input_processes": 100, "census_complete": true, "attributed_processes": 0,
+            "excluded_duplicate_pids": 0, "ancestry_unavailable_processes": 0,
+            "sampling_window_ms": 500, "limitations": [],
+            "review_only": true, "automatic_action_authorized": false,
+        });
+        let result = parse_output("host", InspectionKind::Health, &output(&document, 0));
+        assert_eq!(
+            result.agent_activity.as_ref(),
+            Some(&document["agent_activity"])
+        );
+        assert_eq!(result.observed_status, HostHealthStatus::Ok);
+        document["agent_activity"]["automatic_action_authorized"] = json!(true);
+        let invalid = parse_output("host", InspectionKind::Health, &output(&document, 0));
+        assert!(invalid.agent_activity.is_none());
+        assert!(invalid
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("agent activity")));
     }
 
     #[test]

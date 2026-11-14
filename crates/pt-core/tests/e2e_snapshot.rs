@@ -52,6 +52,12 @@ fn minimal_snapshot_is_bounded_observation_without_inference_or_executable_plan(
     assert_eq!(report["pt_version"], env!("CARGO_PKG_VERSION"));
     assert!(report["system_state"].is_object());
     assert!(report["scan"]["complete"].is_boolean());
+    assert_eq!(report["agent_activity"]["review_only"], true);
+    assert_eq!(
+        report["agent_activity"]["automatic_action_authorized"],
+        false
+    );
+    assert!(report["agent_activity"]["units"].as_array().unwrap().len() <= 10);
     for field in [
         "process_snapshot",
         "pressure_decisions",
@@ -86,6 +92,75 @@ fn minimal_snapshot_is_bounded_observation_without_inference_or_executable_plan(
     let saved: Value =
         serde_json::from_slice(&std::fs::read(session.join("scan/health.json")).unwrap()).unwrap();
     assert_eq!(saved, report);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn snapshot_reports_a_young_headless_agent_without_treating_unsampled_activity_as_idle() {
+    struct OwnedAgent(std::process::Child);
+    impl Drop for OwnedAgent {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let agent = OwnedAgent(
+        std::process::Command::new("/bin/bash")
+            .args(["-c", "exec -a claude sleep 60"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let pid = agent.0.id();
+    let command_path = format!("/proc/{pid}/cmdline");
+    let mut ready = false;
+    for _ in 0..100 {
+        if std::fs::read(&command_path).is_ok_and(|bytes| bytes.starts_with(b"claude\0")) {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        ready,
+        "owned agent must have entered its named process image"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config");
+    std::fs::create_dir(&config).unwrap();
+    let bytes = pt_core()
+        .env("PROCESS_TRIAGE_DATA", dir.path().join("data"))
+        .env("PROCESS_TRIAGE_RETENTION", "off")
+        .env("PT_SKIP_GLOBAL_LOCK", "1")
+        .arg("--config")
+        .arg(&config)
+        .args(["--format", "json", "agent", "snapshot", "--window-ms", "0"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&bytes).unwrap();
+    let row = report["agent_activity"]["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|unit| unit["root"]["pid"].as_u64() == Some(u64::from(pid)))
+        .expect("the full census report must include a young, headless agent");
+    assert_eq!(row["activity"], "unknown");
+    assert!(row["usage"]["cpu_cores"]["total"].is_null());
+    assert!(row["usage"]["cpu_cores"]["observed"].is_null());
+    assert!(row["age_seconds"].as_u64().unwrap() < 3600);
+    assert_eq!(
+        report["agent_activity"]["automatic_action_authorized"],
+        false
+    );
+    let artifact = std::path::Path::new(report["session_dir"].as_str().unwrap())
+        .join("scan/responsible_units.json");
+    let saved: Value = serde_json::from_slice(&std::fs::read(artifact).unwrap()).unwrap();
+    assert_eq!(saved["agent_activity"], report["agent_activity"]);
 }
 
 // ============================================================================

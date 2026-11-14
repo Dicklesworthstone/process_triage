@@ -739,6 +739,31 @@ with reasons; observed zero remains zero. Tree-only groups have no exclusive
 kernel accounting scope. Verified pane IDs and automatic group actions remain
 unimplemented.
 
+#### Agent activity and child work
+
+Plan and snapshot reports include `agent_activity`, a separate review view of
+recognized agent CLIs and their observed process trees. It uses the same CPU and
+storage-I/O sampling window as the rest of the scan and includes young and
+protected processes. Each agent row shows measured activity, member coverage,
+observed resource totals, active descendants, known MCP-server descendants, and
+nested agents. A nested agent owns its own resources; its work is not also added
+to its parent agent's totals.
+
+The states are `activity_observed`, `no_activity_observed_in_window`, and
+`unknown`. A quiet half-second window does not establish that an agent has been
+idle for hours or is abandoned. Missing samples, uncertain ancestry, incomplete
+censuses, and lifetime CPU readings cannot produce a complete quiet-tree claim.
+Positive work remains visible when other measurements are unavailable; complete
+totals stay null. RSS is an observed sum that may include shared pages, not an
+estimate of memory that stopping an agent would reclaim.
+
+Full reports retain every recognized agent. Minimal snapshots and brief/minimal
+plans keep the ten largest observed RSS totals with an explicit omission count.
+Fleet health retains the remote agent report. Watch emits `agent_activity`
+events when activity, membership, child composition, or coverage changes, and
+does not repeat events merely because an age or resource counter moved. These
+reports do not relax agent protection or authorize group actions.
+
 #### Live memory-limit headroom
 
 Linux cgroup diagnostics also read the visible ancestor chain's `memory.high`,

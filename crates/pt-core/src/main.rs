@@ -12038,6 +12038,9 @@ fn run_agent_fleet_inspection(
                 if let Some(memory_limits) = &host.memory_limits {
                     print_memory_limit_report(memory_limits);
                 }
+                if let Some(agent_activity) = &host.agent_activity {
+                    print_agent_activity(agent_activity);
+                }
                 if let Some(doctor) = &host.doctor {
                     println!(
                         "  Doctor: {:?}, {} checks",
@@ -24079,6 +24082,9 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
     let responsible_units = scan_result
         .as_ref()
         .map(|scan| collect_responsible_units(scan, &scorer, &pressure));
+    let agent_activity = scan_result.as_ref().map(|scan| {
+        scorer.agent_activity_report(&scan.processes, scan.metadata.warnings.is_empty())
+    });
     if args.minimal {
         let units = responsible_units.as_ref().map(|table| {
             serde_json::json!({
@@ -24112,6 +24118,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
             "system_state": system_state,
             "responsible_units": units,
             "memory_limits": responsible_units.as_ref().map(memory_limit_report),
+            "agent_activity": agent_activity.as_ref().map(|report| agent_activity_output(report, Some(10))),
             "scan": {
                 "complete": scan_result.as_ref().is_some_and(|scan| scan.metadata.warnings.is_empty()),
                 "processes_observed": scan_result.as_ref().map(|scan| scan.processes.len()),
@@ -24138,6 +24145,9 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                 }
                 if let Some(table) = &responsible_units {
                     print_responsible_units(table);
+                }
+                if let Some(report) = &agent_activity {
+                    print_agent_activity(&agent_activity_output(report, Some(10)));
                 }
             }
         }
@@ -24168,6 +24178,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
             "host_id": host_id,
             "generated_at": timestamp.to_rfc3339(),
             "responsible_units": table,
+            "agent_activity": agent_activity.as_ref().map(|report| agent_activity_output(report, None)),
         });
         if let Err(error) = std::fs::write(
             handle.dir.join("scan/responsible_units.json"),
@@ -24519,6 +24530,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                 "pressure_decisions": pressure_decisions,
                 "responsible_units": responsible_units,
                 "memory_limits": responsible_units.as_ref().map(memory_limit_report),
+                "agent_activity": agent_activity.as_ref().map(|report| agent_activity_output(report, None)),
             });
             if let Some(procs) = &process_snapshot {
                 if let Some(out_mut) = output.as_object_mut() {
@@ -24596,6 +24608,9 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
 
             if let Some(table) = &responsible_units {
                 print_responsible_units(table);
+            }
+            if let Some(report) = &agent_activity {
+                print_agent_activity(&agent_activity_output(report, Some(10)));
             }
             print_workload_summary(&system_state);
 
@@ -25902,6 +25917,87 @@ fn memory_limit_report(table: &ResponsibleUnitTable) -> serde_json::Value {
     })
 }
 
+/// Resource order is for human review only. RSS can contain shared pages and
+/// must not be presented as recoverable memory or an action recommendation.
+fn agent_activity_output(
+    report: &pt_core::scoring::AgentActivityReport,
+    max_units: Option<usize>,
+) -> serde_json::Value {
+    let mut units: Vec<_> = report.units.iter().collect();
+    units.sort_by(|left, right| {
+        right
+            .usage
+            .observed_rss_bytes
+            .cmp(&left.usage.observed_rss_bytes)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let total_units = units.len();
+    if let Some(limit) = max_units {
+        units.truncate(limit);
+    }
+    serde_json::json!({
+        "units": units,
+        "total_units": total_units,
+        "omitted_units": total_units.saturating_sub(units.len()),
+        "rank_by": "observed_rss_bytes",
+        "input_processes": report.input_processes,
+        "census_complete": report.census_complete,
+        "attributed_processes": report.attributed_processes,
+        "excluded_duplicate_pids": report.excluded_duplicate_pids,
+        "ancestry_unavailable_processes": report.ancestry_unavailable_processes,
+        "sampling_window_ms": report.sampling_window_ms,
+        "limitations": report.limitations,
+        "review_only": true,
+        "automatic_action_authorized": false,
+    })
+}
+
+fn print_agent_activity(report: &serde_json::Value) {
+    let Some(units) = report["units"].as_array().filter(|units| !units.is_empty()) else {
+        return;
+    };
+    println!("\n## Agent Activity\n");
+    println!("Observed CPU and storage I/O in the sampling window; agents remain review-only.");
+    for unit in units.iter().take(8) {
+        let activity = match unit["activity"].as_str() {
+            Some("activity_observed") => "activity observed",
+            Some("no_activity_observed_in_window") => "no activity observed in this window",
+            _ => "activity unknown",
+        };
+        let cpu = unit["usage"]["cpu_cores"]["observed"]
+            .as_f64()
+            .map(|value| format!("{value:.2} observed CPU cores"))
+            .unwrap_or_else(|| "CPU unknown".into());
+        println!(
+            "- {} PID {}: {}; {} members; {}; {:.1} MiB observed RSS",
+            fleet_inspection_text(unit["kind"].as_str().unwrap_or("agent")),
+            unit["root"]["pid"],
+            activity,
+            unit["member_count"],
+            cpu,
+            unit["usage"]["observed_rss_bytes"].as_u64().unwrap_or(0) as f64 / 1_048_576.0,
+        );
+        println!(
+            "  Children: {} active other descendants; {} known MCP-server descendants; {} nested agents reported separately.",
+            unit["composition"]["active_other_descendants"],
+            unit["composition"]["known_mcp_server_descendants"],
+            unit["composition"]["nested_agent_roots"],
+        );
+    }
+    let total = report["total_units"].as_u64().unwrap_or(units.len() as u64);
+    if total > 8 {
+        println!("- {} more agents in the full report", total - 8);
+    }
+    if report["census_complete"].as_bool() != Some(true)
+        || report["ancestry_unavailable_processes"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+    {
+        println!("Agent membership is incomplete; unobserved work remains unknown.");
+    }
+}
+
 fn print_memory_limit_report(report: &serde_json::Value) {
     if let Some(warnings) = report["warnings"].as_array() {
         for warning in warnings.iter().take(8) {
@@ -27042,6 +27138,10 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     });
     let pressure = PlanningPressure::from_system_state(&system_state);
     let responsible_units = collect_responsible_units(&scan_result, &scorer, &pressure);
+    let agent_activity = scorer.agent_activity_report(
+        &scan_result.processes,
+        scan_result.metadata.warnings.is_empty(),
+    );
 
     // --deep: one batched deep scan (sockets, I/O, queue backlog, GPU observations) over the
     // candidates, overlaid onto the quick-scan evidence below.
@@ -28155,6 +28255,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         "scan": scan_info,
         "responsible_units": responsible_units,
         "memory_limits": memory_limit_report(&responsible_units),
+        "agent_activity": agent_activity_output(&agent_activity, None),
         "command": "agent plan",
         "args": {
             "max_candidates": args.max_candidates,
@@ -28373,6 +28474,10 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             if let Some(comparison) = &differential {
                 output_json["differential"] = comparison.clone();
             }
+            if args.brief || args.minimal {
+                output_json["agent_activity"] = agent_activity_output(&agent_activity, Some(10));
+                output_json["memory_limits"] = memory_limit_report(&responsible_units);
+            }
 
             // Apply pretty-printing or compact based on --pretty flag
             let output_str = if args.pretty {
@@ -28436,6 +28541,10 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             if let Some(comparison) = &differential {
                 output_json["differential"] = comparison.clone();
             }
+            if args.brief || args.minimal {
+                output_json["agent_activity"] = agent_activity_output(&agent_activity, Some(10));
+                output_json["memory_limits"] = memory_limit_report(&responsible_units);
+            }
 
             let output_value = if args.pretty {
                 output_json
@@ -28479,6 +28588,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 println!("\n{}", agent_plan_differential_summary(comparison));
             }
             print_responsible_units(&responsible_units);
+            print_agent_activity(&agent_activity_output(&agent_activity, Some(10)));
             print_workload_summary(&system_state);
             println!("\n## Candidates\n");
             for candidate in &candidates {
@@ -35374,6 +35484,7 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
     let mut pressure_watch = WatchPressureState::new();
     let mut workload_watch = WatchWorkloadState::default();
     let mut memory_limit_watch = WatchMemoryLimitState::default();
+    let mut agent_activity_watch = WatchAgentActivityState::default();
     let mut previous: HashMap<u32, WatchCandidate> = HashMap::new();
     let interval = Duration::from_secs(args.interval.max(1));
     let notify_cmd = args.notify_cmd.as_deref();
@@ -35443,6 +35554,13 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
         // a zombie leak or D-state storm.
         let census = watch_process_census(&scan_result.processes, &scan_result.metadata.warnings);
         let timestamp = chrono::Utc::now().to_rfc3339();
+        let agent_activity = scorer.agent_activity_report(
+            &scan_result.processes,
+            scan_result.metadata.warnings.is_empty(),
+        );
+        if let Some(event) = agent_activity_watch.update(&agent_activity, &timestamp) {
+            emit_watch_event(&event, notify_exec, notify_cmd, notify_args);
+        }
         let memory_limits = memory_limit_report(&responsible_units);
         if let Some(event) = memory_limit_watch.update(&memory_limits, &timestamp) {
             emit_watch_event(&event, notify_exec, notify_cmd, notify_args);
@@ -35464,6 +35582,7 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
                 "limitations": responsible_units.limitations,
             });
             event["memory_limits"] = memory_limits.clone();
+            event["agent_activity"] = agent_activity_output(&agent_activity, Some(10));
             emit_watch_event(&event, notify_exec, notify_cmd, notify_args);
         }
         if baseline.is_none() {
@@ -35708,6 +35827,156 @@ fn severity_label(severity: WatchSeverity) -> &'static str {
 struct WatchBaseline {
     load1: f64,
     available_gb: f64,
+}
+
+#[derive(Default)]
+struct WatchAgentActivityState {
+    previous: Option<serde_json::Value>,
+    saw_units: bool,
+}
+
+impl WatchAgentActivityState {
+    fn update(
+        &mut self,
+        report: &pt_core::scoring::AgentActivityReport,
+        timestamp: &str,
+    ) -> Option<serde_json::Value> {
+        let units: BTreeMap<_, _> = report
+            .units
+            .iter()
+            .map(|unit| {
+                (
+                    &unit.id,
+                    serde_json::json!({
+                        "kind": unit.kind,
+                        "activity": unit.activity,
+                        "member_count": unit.member_count,
+                        "composition": unit.composition,
+                        "coverage": unit.coverage,
+                    }),
+                )
+            })
+            .collect();
+        let complete = report.census_complete
+            && report.excluded_duplicate_pids == 0
+            && report.ancestry_unavailable_processes == 0;
+        let signature = serde_json::json!({"units": units, "complete": complete});
+        if self.previous.as_ref() == Some(&signature) {
+            return None;
+        }
+        self.previous = Some(signature);
+        let has_units = !report.units.is_empty();
+        if !has_units && !self.saw_units {
+            return None;
+        }
+        if complete {
+            self.saw_units = has_units;
+        } else {
+            self.saw_units |= has_units;
+        }
+        Some(serde_json::json!({
+            "event": "agent_activity",
+            "timestamp": timestamp,
+            "status": if !complete { "incomplete" } else if has_units { "observed" } else { "no_longer_observed" },
+            "agent_activity": agent_activity_output(report, Some(10)),
+            "automatic_action_authorized": false,
+        }))
+    }
+}
+
+#[cfg(test)]
+mod agent_activity_output_tests {
+    use super::*;
+    use pt_core::scoring::{
+        AgentActivityCoverage, AgentActivityReport, AgentActivityState, AgentActivityUnit,
+        AgentActivityUsage, AgentChildComposition,
+    };
+
+    fn report() -> AgentActivityReport {
+        AgentActivityReport {
+            units: [41, 42]
+                .into_iter()
+                .map(|pid| AgentActivityUnit {
+                    id: format!("agent:{pid}"),
+                    kind: "claude".into(),
+                    root: ProcessIdentity::full(
+                        pid,
+                        pt_common::StartId::from_linux("agent-output", 100, pid),
+                        1000,
+                        Some(pid),
+                        Some(pid),
+                        IdentityQuality::Full,
+                    ),
+                    root_state: ProcessState::Sleeping,
+                    age_seconds: 10,
+                    activity: AgentActivityState::ActivityObserved,
+                    member_count: 1,
+                    composition: AgentChildComposition::default(),
+                    coverage: AgentActivityCoverage {
+                        active_members: 1,
+                        ..AgentActivityCoverage::default()
+                    },
+                    usage: AgentActivityUsage {
+                        observed_rss_bytes: u64::from(pid) * 1024,
+                        ..AgentActivityUsage::default()
+                    },
+                    unavailable: vec!["storage I/O was not observed".into()],
+                })
+                .collect(),
+            input_processes: 20,
+            census_complete: true,
+            attributed_processes: 2,
+            excluded_duplicate_pids: 0,
+            ancestry_unavailable_processes: 0,
+            sampling_window_ms: Some(500),
+            limitations: vec!["RSS is not reclaimable memory".into()],
+        }
+    }
+
+    #[test]
+    fn compact_agent_report_keeps_identity_coverage_and_explicit_omissions() {
+        let report = report();
+        let output = agent_activity_output(&report, Some(1));
+        assert_eq!(output["units"][0]["root"]["pid"], 42);
+        assert_eq!(output["total_units"], 2);
+        assert_eq!(output["omitted_units"], 1);
+        assert_eq!(output["sampling_window_ms"], 500);
+        assert_eq!(output["review_only"], true);
+        assert_eq!(output["automatic_action_authorized"], false);
+        assert!(output["units"][0]["usage"]["cpu_cores"]["total"].is_null());
+        assert_eq!(
+            agent_activity_output(&report, None)["units"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn watch_reports_activity_changes_without_inventing_recovery_from_a_missing_census() {
+        let mut report = report();
+        let mut state = WatchAgentActivityState::default();
+        assert_eq!(
+            state.update(&report, "t1").unwrap()["event"],
+            "agent_activity"
+        );
+        report.units[0].usage.observed_rss_bytes += 1024;
+        report.units[0].age_seconds += 1;
+        assert!(state.update(&report, "t2").is_none());
+        report.units[0].activity = AgentActivityState::Unknown;
+        assert!(state.update(&report, "t3").is_some());
+        report.units.clear();
+        report.census_complete = false;
+        assert_eq!(state.update(&report, "t4").unwrap()["status"], "incomplete");
+        assert!(state.saw_units);
+        report.census_complete = true;
+        assert_eq!(
+            state.update(&report, "t5").unwrap()["status"],
+            "no_longer_observed"
+        );
+        assert!(!state.saw_units);
+    }
 }
 
 /// A missing hierarchy cannot establish recovery from an observed limit.
