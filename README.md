@@ -739,6 +739,29 @@ with reasons; observed zero remains zero. Tree-only groups have no exclusive
 kernel accounting scope. Verified pane IDs and automatic group actions remain
 unimplemented.
 
+#### Live memory-limit headroom
+
+Linux cgroup diagnostics also read the visible ancestor chain's `memory.high`,
+`memory.max`, and `memory.swap.max`, together with **each ancestor's own charged
+usage**. This reveals a shared user slice running out of headroom even when an
+individual workload and the host's available RAM look comfortable. Numeric
+limits, `max` (unlimited), and unavailable readings remain distinct. The full
+`cgroup_usage.memory_headroom` includes observed scope identities and per-control
+coverage; compact summaries retain the tightest known constraints and warnings.
+Hidden ancestors, incomplete walks, and changed bindings prevent a complete
+hierarchy claim. Headroom is an observation, not reserved capacity or a forecast
+of when an OOM will occur.
+
+Plan and snapshot output include a separate `memory_limits` summary across all
+observed workloads before top-workload truncation. It warns at 90% of an observed
+finite limit, deduplicates shared ancestor controls, and distinguishes a hard
+`memory.max` boundary from `memory.high` reclaim/throttling. Disabled swap with
+zero usage is not a warning. `agent watch` emits `memory_limit_diagnostics` when
+the warning set or limit band changes; missing evidence cannot establish that a
+previous warning cleared. Fleet health preserves these warnings and marks a
+host at its observed hard memory limit critical even when its global PSI is
+quiet. These diagnostics do not authorize automatic actions.
+
 #### Duplicate and competing builds
 
 On Linux, full `agent plan` and `agent snapshot` output includes

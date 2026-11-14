@@ -19,6 +19,212 @@ const MAX_UNIT_DIAGNOSTICS: usize = 8;
 #[cfg(target_os = "linux")]
 const MAX_CGROUP_SAMPLES: usize = 256;
 
+/// Each unit observes at most this many cgroup directories, including the root.
+const MAX_MEMORY_HIERARCHY_DEPTH: usize = 32;
+
+/// A kernel `max` is different from an unreadable or malformed limit (`None`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CgroupMemoryLimit {
+    Finite { bytes: u64 },
+    Unlimited,
+}
+
+/// One directory's own subtree usage and limits. Ancestor usage includes its
+/// other descendants; subtracting a leaf's usage from an ancestor limit would
+/// overstate the memory still available to the workload.
+#[derive(Debug, Clone, Serialize)]
+pub struct CgroupMemoryScope {
+    pub path: String,
+    pub directory_device: u64,
+    pub directory_inode: u64,
+    pub memory_current_bytes: Option<u64>,
+    pub memory_high: Option<CgroupMemoryLimit>,
+    pub memory_max: Option<CgroupMemoryLimit>,
+    pub swap_current_bytes: Option<u64>,
+    pub swap_max: Option<CgroupMemoryLimit>,
+    pub high_headroom_bytes: Option<u64>,
+    pub max_headroom_bytes: Option<u64>,
+    pub swap_headroom_bytes: Option<u64>,
+    pub unavailable: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CgroupMemoryConstraint {
+    pub path: String,
+    pub directory_device: u64,
+    pub directory_inode: u64,
+    pub current_bytes: u64,
+    pub limit_bytes: u64,
+    pub headroom_bytes: u64,
+}
+
+/// A diagnostic observation near a finite boundary, not an OOM prediction.
+/// `memory.high` throttles/reclaims; it does not itself invoke the OOM killer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CgroupMemoryWarning {
+    pub path: String,
+    pub directory_device: u64,
+    pub directory_inode: u64,
+    pub control: &'static str,
+    pub current_bytes: u64,
+    pub limit_bytes: u64,
+    pub headroom_bytes: u64,
+    pub at_or_above_limit: bool,
+    pub hierarchy_complete: bool,
+}
+
+/// Read-only headroom through the visible ancestry. The complete summaries are
+/// absent when an ancestor is hidden, a path changed, or a required measurement
+/// is unknown. Observed scopes can still identify a known limiting ancestor.
+/// Headroom is a point-in-time difference, never a reservation or a promise that
+/// further allocations will succeed; global pressure and sibling growth remain.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CgroupMemoryHeadroom {
+    pub scopes: Vec<CgroupMemoryScope>,
+    pub hierarchy_complete: bool,
+    pub high_complete: bool,
+    pub max_complete: bool,
+    pub swap_complete: bool,
+    pub tightest_high: Option<CgroupMemoryConstraint>,
+    pub tightest_max: Option<CgroupMemoryConstraint>,
+    pub tightest_swap: Option<CgroupMemoryConstraint>,
+    pub unavailable: Vec<String>,
+    #[cfg(target_os = "linux")]
+    #[serde(skip)]
+    observation_paths: Vec<std::path::PathBuf>,
+}
+
+impl CgroupMemoryScope {
+    fn constraint(
+        &self,
+        limit: Option<CgroupMemoryLimit>,
+        current: Option<u64>,
+    ) -> Option<CgroupMemoryConstraint> {
+        let CgroupMemoryLimit::Finite { bytes } = limit? else {
+            return None;
+        };
+        let current = current?;
+        Some(CgroupMemoryConstraint {
+            path: self.path.clone(),
+            directory_device: self.directory_device,
+            directory_inode: self.directory_inode,
+            current_bytes: current,
+            limit_bytes: bytes,
+            headroom_bytes: bytes.saturating_sub(current),
+        })
+    }
+}
+
+impl CgroupMemoryHeadroom {
+    #[cfg(target_os = "linux")]
+    fn summarize(&mut self) {
+        let complete = |limit: Option<CgroupMemoryLimit>, current: Option<u64>| match limit {
+            Some(CgroupMemoryLimit::Unlimited) => true,
+            Some(CgroupMemoryLimit::Finite { .. }) => current.is_some(),
+            None => false,
+        };
+        self.high_complete = self.hierarchy_complete
+            && self
+                .scopes
+                .iter()
+                .all(|scope| complete(scope.memory_high, scope.memory_current_bytes));
+        self.max_complete = self.hierarchy_complete
+            && self
+                .scopes
+                .iter()
+                .all(|scope| complete(scope.memory_max, scope.memory_current_bytes));
+        self.swap_complete = self.hierarchy_complete
+            && self
+                .scopes
+                .iter()
+                .all(|scope| complete(scope.swap_max, scope.swap_current_bytes));
+        let tightest = |values: Vec<CgroupMemoryConstraint>| {
+            values.into_iter().min_by(|a, b| {
+                a.headroom_bytes
+                    .cmp(&b.headroom_bytes)
+                    .then(a.path.cmp(&b.path))
+            })
+        };
+        self.tightest_high = self
+            .high_complete
+            .then(|| {
+                tightest(
+                    self.scopes
+                        .iter()
+                        .filter_map(|scope| {
+                            scope.constraint(scope.memory_high, scope.memory_current_bytes)
+                        })
+                        .collect(),
+                )
+            })
+            .flatten();
+        self.tightest_max = self
+            .max_complete
+            .then(|| {
+                tightest(
+                    self.scopes
+                        .iter()
+                        .filter_map(|scope| {
+                            scope.constraint(scope.memory_max, scope.memory_current_bytes)
+                        })
+                        .collect(),
+                )
+            })
+            .flatten();
+        self.tightest_swap = self
+            .swap_complete
+            .then(|| {
+                tightest(
+                    self.scopes
+                        .iter()
+                        .filter_map(|scope| {
+                            scope.constraint(scope.swap_max, scope.swap_current_bytes)
+                        })
+                        .collect(),
+                )
+            })
+            .flatten();
+    }
+
+    /// Report observed usage at least 90% of a finite limit. This fixed display
+    /// threshold is diagnostic only and has no effect on decisions or actions.
+    /// Zero limits warn only for positive usage (disabled swap alone is normal).
+    /// At most 32 scopes x 3 controls are returned, including partial hierarchies.
+    pub fn observed_limit_warnings(&self) -> Vec<CgroupMemoryWarning> {
+        let mut warnings = Vec::new();
+        for scope in self.scopes.iter().take(MAX_MEMORY_HIERARCHY_DEPTH) {
+            for (control, limit, current) in [
+                ("memory.high", scope.memory_high, scope.memory_current_bytes),
+                ("memory.max", scope.memory_max, scope.memory_current_bytes),
+                ("memory.swap.max", scope.swap_max, scope.swap_current_bytes),
+            ] {
+                let Some(value) = scope.constraint(limit, current) else {
+                    continue;
+                };
+                // limit - floor(limit/10) = ceil(0.9 * limit), without overflow.
+                if (value.limit_bytes == 0 && value.current_bytes == 0)
+                    || value.current_bytes < value.limit_bytes - value.limit_bytes / 10
+                {
+                    continue;
+                }
+                warnings.push(CgroupMemoryWarning {
+                    path: value.path,
+                    directory_device: value.directory_device,
+                    directory_inode: value.directory_inode,
+                    control,
+                    current_bytes: value.current_bytes,
+                    limit_bytes: value.limit_bytes,
+                    headroom_bytes: value.headroom_bytes,
+                    at_or_above_limit: value.current_bytes >= value.limit_bytes,
+                    hierarchy_complete: self.hierarchy_complete,
+                });
+            }
+        }
+        warnings
+    }
+}
+
 /// Cumulative CPU accounting from one cgroup-v2 `cpu.stat` read. These are
 /// counters, not a CPU rate; a single observation cannot establish a delta.
 #[derive(Debug, Clone, Serialize)]
@@ -65,6 +271,7 @@ pub struct CgroupResourceUsage {
     pub memory_current_bytes: Option<u64>,
     pub memory_peak_bytes: Option<u64>,
     pub memory_swap_current_bytes: Option<u64>,
+    pub memory_headroom: Option<CgroupMemoryHeadroom>,
     pub cpu_stat: Option<CgroupCpuAccounting>,
     pub cpu_pressure: Option<super::pressure::PsiResource>,
     pub memory_pressure: Option<super::pressure::PsiResource>,
@@ -83,6 +290,7 @@ impl CgroupResourceUsage {
             memory_current_bytes: None,
             memory_peak_bytes: None,
             memory_swap_current_bytes: None,
+            memory_headroom: None,
             cpu_stat: None,
             cpu_pressure: None,
             memory_pressure: None,
@@ -295,6 +503,9 @@ mod linux_cgroup_usage {
     const MAX_CONTROL_BYTES: usize = 65_536;
     const MAX_MOUNTINFO_BYTES: usize = 1_048_576;
     const MAX_WITNESSES: usize = 32;
+    const MAX_MEMORY_COUNTER_BYTES: usize = 64;
+    const MAX_MEMORY_SCOPE_SAMPLES: usize = 512;
+    const MEMORY_OBSERVATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
     struct Context {
         boot: String,
@@ -307,6 +518,77 @@ mod linux_cgroup_usage {
         identity: AttributionIdentity,
         binding: Binding,
         membership: String,
+    }
+
+    struct MemoryObservation {
+        handle: File,
+        path: String,
+        /// The actual memory-controller root has no local memory limits.
+        /// A namespace root is still a non-root cgroup and retains these files.
+        scope: Option<CgroupMemoryScope>,
+    }
+
+    /// Cache ancestors across units without losing the physical directory pin.
+    /// At most 512 directories/3072 scalar reads and 32 levels per unit are
+    /// admitted; a two-second soft work budget stops further new observations.
+    /// Already-issued kernel reads and final binding checks can finish afterward.
+    struct MemoryObservations {
+        values: BTreeMap<PathBuf, Result<MemoryObservation, String>>,
+        started: std::time::Instant,
+        max_samples: usize,
+    }
+
+    impl MemoryObservations {
+        fn new(max_samples: usize) -> Self {
+            Self {
+                values: BTreeMap::new(),
+                started: std::time::Instant::now(),
+                max_samples,
+            }
+        }
+
+        fn observe(
+            &mut self,
+            directory: &Path,
+            path: &str,
+            pinned: Option<&File>,
+            verify: &impl Fn(&File) -> Result<(), String>,
+        ) -> Result<&MemoryObservation, String> {
+            if !self.values.contains_key(directory) {
+                if self.values.len() >= self.max_samples {
+                    return Err("memory hierarchy directory observation limit reached".into());
+                }
+                if self.started.elapsed() >= MEMORY_OBSERVATION_BUDGET {
+                    return Err("memory hierarchy observation time budget reached".into());
+                }
+                let observation = read_memory_scope(directory, path, pinned, verify);
+                self.values.insert(directory.to_path_buf(), observation);
+            }
+            let value = self
+                .values
+                .get(directory)
+                .ok_or("memory hierarchy cache entry unavailable")?
+                .as_ref()
+                .map_err(Clone::clone)?;
+            if value.path != path {
+                return Err("memory hierarchy path mapping changed".into());
+            }
+            same_directory(&value.handle, directory)?;
+            Ok(value)
+        }
+
+        fn validate(&self) -> BTreeMap<PathBuf, Result<(), String>> {
+            self.values
+                .iter()
+                .map(|(path, value)| {
+                    let valid = value
+                        .as_ref()
+                        .map_err(Clone::clone)
+                        .and_then(|value| same_directory(&value.handle, path));
+                    (path.clone(), valid)
+                })
+                .collect()
+        }
     }
 
     fn namespace(path: &Path) -> Result<CgroupNamespaceIdentity, String> {
@@ -535,6 +817,190 @@ mod linux_cgroup_usage {
         }
     }
 
+    fn memory_limit(text: &str) -> Result<CgroupMemoryLimit, String> {
+        let value = text.trim();
+        if value == "max" {
+            return Ok(CgroupMemoryLimit::Unlimited);
+        }
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err("expected max or one nonnegative integer byte limit".into());
+        }
+        value
+            .parse::<u64>()
+            .map(|bytes| CgroupMemoryLimit::Finite { bytes })
+            .map_err(|_| "memory limit exceeds the integer range".into())
+    }
+
+    fn memory_metric<T>(
+        directory: &Path,
+        name: &str,
+        parser: impl FnOnce(&str) -> Result<T, String>,
+        unavailable: &mut Vec<String>,
+    ) -> Option<T> {
+        match read_text(&directory.join(name), MAX_MEMORY_COUNTER_BYTES)
+            .and_then(|text| parser(&text))
+        {
+            Ok(value) => Some(value),
+            Err(reason) => {
+                unavailable.push(format!("{name}: {reason}"));
+                None
+            }
+        }
+    }
+
+    /// A mount-root string of `/` is insufficient: cgroup namespaces can hide
+    /// constrained ancestors. With the memory controller available, its actual
+    /// root lacks the CFTYPE_NOT_ON_ROOT files; an ordinary namespace root does
+    /// not. Permission failures and an unavailable controller prove neither.
+    fn memory_controller_root(directory: &Path) -> Result<bool, String> {
+        let controllers = read_text(&directory.join("cgroup.controllers"), 4096)?;
+        if !controllers.split_whitespace().any(|name| name == "memory") {
+            return Ok(false);
+        }
+        for name in ["memory.current", "memory.high", "memory.max"] {
+            match fs::symlink_metadata(directory.join(name)) {
+                Ok(_) => return Ok(false),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "memory controller root cannot be verified: {error}"
+                    ))
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn read_memory_scope(
+        physical: &Path,
+        path: &str,
+        pinned: Option<&File>,
+        verify: &impl Fn(&File) -> Result<(), String>,
+    ) -> Result<MemoryObservation, String> {
+        let handle = match pinned {
+            Some(handle) => handle.try_clone().map_err(|error| error.to_string())?,
+            None => {
+                let handle = open_directory(physical)?;
+                verify(&handle)?;
+                handle
+            }
+        };
+        let metadata = handle.metadata().map_err(|error| error.to_string())?;
+        let directory = PathBuf::from(format!("/proc/self/fd/{}", handle.as_raw_fd()));
+        if path == "/" && memory_controller_root(&directory).unwrap_or(false) {
+            same_directory(&handle, physical)?;
+            return Ok(MemoryObservation {
+                handle,
+                path: path.to_string(),
+                scope: None,
+            });
+        }
+        let mut unavailable = Vec::new();
+        let current = memory_metric(&directory, "memory.current", scalar, &mut unavailable);
+        let high = memory_metric(&directory, "memory.high", memory_limit, &mut unavailable);
+        let max = memory_metric(&directory, "memory.max", memory_limit, &mut unavailable);
+        let swap_current =
+            memory_metric(&directory, "memory.swap.current", scalar, &mut unavailable);
+        let swap_max = memory_metric(
+            &directory,
+            "memory.swap.max",
+            memory_limit,
+            &mut unavailable,
+        );
+        let headroom = |limit, current| match (limit, current) {
+            (Some(CgroupMemoryLimit::Finite { bytes }), Some(current)) => {
+                Some(bytes.saturating_sub(current))
+            }
+            _ => None,
+        };
+        same_directory(&handle, physical)?;
+        Ok(MemoryObservation {
+            handle,
+            path: path.to_string(),
+            scope: Some(CgroupMemoryScope {
+                path: path.to_string(),
+                directory_device: metadata.dev(),
+                directory_inode: metadata.ino(),
+                memory_current_bytes: current,
+                memory_high: high,
+                memory_max: max,
+                swap_current_bytes: swap_current,
+                swap_max,
+                high_headroom_bytes: headroom(high, current),
+                max_headroom_bytes: headroom(max, current),
+                swap_headroom_bytes: headroom(swap_max, swap_current),
+                unavailable,
+            }),
+        })
+    }
+
+    fn memory_headroom(
+        path: &str,
+        mount: &CgroupMount,
+        pinned: &File,
+        observations: &mut MemoryObservations,
+        verify: &impl Fn(&File) -> Result<(), String>,
+    ) -> CgroupMemoryHeadroom {
+        let mut result = CgroupMemoryHeadroom::default();
+        let mut logical = PathBuf::from(path);
+        let mut physical = mount.directory.clone();
+        for depth in 0..MAX_MEMORY_HIERARCHY_DEPTH {
+            if !physical.starts_with(&mount.mount_point) || !logical.starts_with(&mount.mount_root)
+            {
+                result
+                    .unavailable
+                    .push("memory hierarchy escaped its observed mount boundary".into());
+                break;
+            }
+            let Some(scope_path) = logical.to_str() else {
+                result
+                    .unavailable
+                    .push("memory hierarchy path is not UTF-8".into());
+                break;
+            };
+            let observed = match observations.observe(
+                &physical,
+                scope_path,
+                (depth == 0).then_some(pinned),
+                verify,
+            ) {
+                Ok(value) => value,
+                Err(reason) => {
+                    result.unavailable.push(format!("{scope_path}: {reason}"));
+                    break;
+                }
+            };
+            result.observation_paths.push(physical.clone());
+            if let Some(scope) = &observed.scope {
+                result.scopes.push(scope.clone());
+            }
+            if physical == mount.mount_point {
+                result.hierarchy_complete =
+                    mount.mount_root == Path::new("/") && observed.scope.is_none();
+                if !result.hierarchy_complete {
+                    result.unavailable.push(
+                        "ancestors above the visible cgroup mount/namespace root are hidden or the memory-controller root is unverified".into(),
+                    );
+                }
+                break;
+            }
+            if depth + 1 == MAX_MEMORY_HIERARCHY_DEPTH {
+                result
+                    .unavailable
+                    .push("memory hierarchy depth limit reached".into());
+                break;
+            }
+            if !physical.pop() || !logical.pop() {
+                result
+                    .unavailable
+                    .push("memory hierarchy parent is unavailable".into());
+                break;
+            }
+        }
+        result.summarize();
+        result
+    }
+
     fn read_usage(
         path: &str,
         mount: &CgroupMount,
@@ -542,6 +1008,7 @@ mod linux_cgroup_usage {
         context: &Context,
         proc_root: &Path,
         verify: &impl Fn(&File) -> Result<(), String>,
+        memory_observations: &mut MemoryObservations,
     ) -> Result<CgroupResourceUsage, String> {
         let handle = open_directory(&mount.directory)?;
         verify(&handle)?;
@@ -580,6 +1047,13 @@ mod linux_cgroup_usage {
                     .push(format!("{name}: full stall data unavailable"));
             }
         }
+        result.memory_headroom = Some(memory_headroom(
+            path,
+            mount,
+            &handle,
+            memory_observations,
+            verify,
+        ));
         validate_witness(proc_root, witness, context)?;
         same_directory(&handle, &mount.directory)?;
         result.available = result.memory_current_bytes.is_some()
@@ -612,6 +1086,22 @@ mod linux_cgroup_usage {
         proc_root: &Path,
         verify: impl Fn(&File) -> Result<(), String>,
     ) {
+        collect_from_with_memory_limit(
+            table,
+            processes,
+            proc_root,
+            verify,
+            MAX_MEMORY_SCOPE_SAMPLES,
+        );
+    }
+
+    pub(super) fn collect_from_with_memory_limit(
+        table: &mut ResponsibleUnitTable,
+        processes: &[ProcessRecord],
+        proc_root: &Path,
+        verify: impl Fn(&File) -> Result<(), String>,
+        max_memory_scopes: usize,
+    ) {
         let mut groups: BTreeMap<&str, BTreeMap<u32, &AttributionIdentity>> = BTreeMap::new();
         for unit in &table.units {
             if let Some(path) = unit.cgroup_path.as_deref() {
@@ -627,6 +1117,7 @@ mod linux_cgroup_usage {
         let (process_index, _) = unique_index(processes, |process| process.pid.0);
         let before = context(proc_root);
         let mut observations = BTreeMap::new();
+        let mut memory_observations = MemoryObservations::new(max_memory_scopes);
         for (index, (path, members)) in groups.iter().enumerate() {
             let observed = (|| {
                 if index >= MAX_CGROUP_SAMPLES {
@@ -644,7 +1135,15 @@ mod linux_cgroup_usage {
                     };
                     match witness(proc_root, process, path, context) {
                         Ok(witness) => {
-                            return read_usage(path, &mount, &witness, context, proc_root, &verify);
+                            return read_usage(
+                                path,
+                                &mount,
+                                &witness,
+                                context,
+                                proc_root,
+                                &verify,
+                                &mut memory_observations,
+                            );
                         }
                         Err(reason) if reasons.len() < MAX_UNIT_DIAGNOSTICS => {
                             reasons.push(format!("PID {}: {reason}", member.pid));
@@ -665,6 +1164,7 @@ mod linux_cgroup_usage {
         // The mapping must still belong to the reader's original namespaces.
         // A changed namespace or mount mapping invalidates, rather than relabels,
         // measurements that were already read from a different physical scope.
+        let memory_validation = memory_observations.validate();
         let after = context(proc_root);
         for (path, observed) in &mut observations {
             if observed.binding.is_none() {
@@ -693,6 +1193,26 @@ mod linux_cgroup_usage {
             })();
             if let Err(reason) = valid {
                 *observed = CgroupResourceUsage::unavailable(path, reason);
+                continue;
+            }
+            if let Some(headroom) = &mut observed.memory_headroom {
+                let error =
+                    headroom
+                        .observation_paths
+                        .iter()
+                        .find_map(|directory| match memory_validation.get(directory) {
+                            Some(Ok(())) => None,
+                            Some(Err(reason)) => Some(reason.clone()),
+                            None => Some("memory hierarchy binding was not retained".into()),
+                        });
+                if let Some(reason) = error {
+                    *headroom = CgroupMemoryHeadroom {
+                        unavailable: vec![format!(
+                            "memory hierarchy changed during collection: {reason}"
+                        )],
+                        ..CgroupMemoryHeadroom::default()
+                    };
+                }
             }
         }
         let unavailable = observations
@@ -2128,6 +2648,27 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn write_memory_scope(
+        directory: &Path,
+        current: &str,
+        high: &str,
+        max: &str,
+        swap_current: &str,
+        swap_max: &str,
+    ) {
+        std::fs::create_dir_all(directory).unwrap();
+        for (name, value) in [
+            ("memory.current", current),
+            ("memory.high", high),
+            ("memory.max", max),
+            ("memory.swap.current", swap_current),
+            ("memory.swap.max", swap_max),
+        ] {
+            std::fs::write(directory.join(name), format!("{value}\n")).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     fn telemetry_fixture(processes: &[ProcessRecord]) -> tempfile::TempDir {
         let fixture = tempfile::tempdir().unwrap();
         let proc_root = fixture.path().join("proc");
@@ -2136,6 +2677,20 @@ mod tests {
         std::fs::create_dir_all(proc_root.join("sys/kernel/random")).unwrap();
         std::fs::create_dir_all(proc_root.join("self/ns")).unwrap();
         std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(mount_point.join("cgroup.controllers"), "cpu memory io\n").unwrap();
+        for ancestor in Path::new(AGENT_SCOPE)
+            .ancestors()
+            .filter(|path| *path != Path::new("/"))
+        {
+            write_memory_scope(
+                &mount_point.join(ancestor.strip_prefix("/").unwrap()),
+                "1048576",
+                "max",
+                "max",
+                "0",
+                "max",
+            );
+        }
         std::fs::write(proc_root.join("sys/kernel/random/boot_id"), "boot\n").unwrap();
         std::fs::write(proc_root.join("self/ns/cgroup"), "namespace fixture").unwrap();
         std::fs::write(proc_root.join("self/ns/mnt"), "mount namespace fixture").unwrap();
@@ -2171,6 +2726,411 @@ mod tests {
     fn telemetry_table(root: &Path, processes: &[ProcessRecord]) -> ResponsibleUnitTable {
         let groups = collect_cgroup_memberships_from(processes, &root.join("proc"));
         table(processes, &[], &groups)
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn memory_headroom_uses_each_ancestors_own_usage_and_keeps_root_semantics() {
+        let processes = vec![process(100, 1, "worker", 100)];
+        let fixture = telemetry_fixture(&processes);
+        let mount = fixture.path().join("cgroup");
+        write_memory_scope(
+            &mount.join(AGENT_SCOPE.trim_start_matches('/')),
+            "100",
+            "10000",
+            "10000",
+            "0",
+            "max",
+        );
+        let parent_path = "/user.slice/user-1000.slice";
+        write_memory_scope(
+            &mount.join(parent_path.trim_start_matches('/')),
+            "950",
+            "900",
+            "1000",
+            "90",
+            "100",
+        );
+        let mut observed = telemetry_table(fixture.path(), &processes);
+        linux_cgroup_usage::collect_from(
+            &mut observed,
+            &processes,
+            &fixture.path().join("proc"),
+            |_| Ok(()),
+        );
+        let headroom = observed.units[0]
+            .cgroup_usage
+            .as_ref()
+            .unwrap()
+            .memory_headroom
+            .as_ref()
+            .unwrap();
+        assert!(headroom.hierarchy_complete);
+        assert!(headroom.high_complete && headroom.max_complete && headroom.swap_complete);
+        assert!(headroom.unavailable.is_empty());
+        assert!(headroom
+            .scopes
+            .iter()
+            .all(|scope| scope.path != "/" && scope.unavailable.is_empty()));
+        let high = headroom.tightest_high.as_ref().unwrap();
+        assert_eq!(
+            (
+                &*high.path,
+                high.current_bytes,
+                high.limit_bytes,
+                high.headroom_bytes
+            ),
+            (parent_path, 950, 900, 0)
+        );
+        let max = headroom.tightest_max.as_ref().unwrap();
+        assert_eq!(
+            (
+                &*max.path,
+                max.current_bytes,
+                max.limit_bytes,
+                max.headroom_bytes
+            ),
+            (parent_path, 950, 1000, 50),
+            "the leaf's 100 bytes cannot be subtracted from the parent's 1000-byte limit"
+        );
+        assert_eq!(headroom.tightest_swap.as_ref().unwrap().headroom_bytes, 10);
+        let warnings = headroom.observed_limit_warnings();
+        assert_eq!(warnings.len(), 3);
+        assert!(warnings.iter().all(|warning| warning.path == parent_path
+            && warning.hierarchy_complete
+            && warning.directory_inode > 0));
+        assert!(
+            warnings
+                .iter()
+                .find(|warning| warning.control == "memory.high")
+                .unwrap()
+                .at_or_above_limit
+        );
+        assert!(
+            !warnings
+                .iter()
+                .find(|warning| warning.control == "memory.max")
+                .unwrap()
+                .at_or_above_limit
+        );
+        let json = serde_json::to_value(headroom).unwrap();
+        assert_eq!(
+            json["scopes"][0]["memory_high"],
+            serde_json::json!({"kind":"finite","bytes":10000})
+        );
+        assert!(
+            json.get("observation_paths").is_none(),
+            "private fd binding paths are not report data"
+        );
+    }
+
+    #[test]
+    fn memory_limit_warnings_are_bounded_overflow_safe_and_do_not_alarm_on_disabled_swap() {
+        for (current, limit, expected) in [
+            (0, 0, false),
+            (1, 0, true),
+            (89, 100, false),
+            (90, 100, true),
+            (4, 5, false),
+            (5, 5, true),
+            (u64::MAX, u64::MAX, true),
+            (u64::MAX - u64::MAX / 10 - 1, u64::MAX, false),
+            (u64::MAX - u64::MAX / 10, u64::MAX, true),
+        ] {
+            let mut headroom = CgroupMemoryHeadroom::default();
+            let scope = CgroupMemoryScope {
+                path: "/scope".into(),
+                directory_device: 1,
+                directory_inode: 2,
+                memory_current_bytes: None,
+                memory_high: None,
+                memory_max: None,
+                swap_current_bytes: Some(current),
+                swap_max: Some(CgroupMemoryLimit::Finite { bytes: limit }),
+                high_headroom_bytes: None,
+                max_headroom_bytes: None,
+                swap_headroom_bytes: Some(limit.saturating_sub(current)),
+                unavailable: Vec::new(),
+            };
+            headroom.scopes = vec![scope; MAX_MEMORY_HIERARCHY_DEPTH + 4];
+            let warnings = headroom.observed_limit_warnings();
+            assert_eq!(
+                warnings.len(),
+                if expected {
+                    MAX_MEMORY_HIERARCHY_DEPTH
+                } else {
+                    0
+                },
+                "current={current}, limit={limit}"
+            );
+            for warning in warnings {
+                assert_eq!(warning.control, "memory.swap.max");
+                assert_eq!(warning.headroom_bytes, limit.saturating_sub(current));
+                assert_eq!(warning.at_or_above_limit, current >= limit);
+                assert!(
+                    !warning.hierarchy_complete,
+                    "a known warning does not certify hidden ancestors"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn memory_limits_distinguish_unlimited_invalid_and_missing_usage() {
+        let processes = vec![process(100, 1, "worker", 100)];
+        let fixture = telemetry_fixture(&processes);
+        let directory = fixture
+            .path()
+            .join("cgroup")
+            .join(AGENT_SCOPE.trim_start_matches('/'));
+        for invalid in ["", "-1", "+1", "1 2", "1G", "18446744073709551616"] {
+            std::fs::write(directory.join("memory.high"), invalid).unwrap();
+            let mut observed = telemetry_table(fixture.path(), &processes);
+            linux_cgroup_usage::collect_from(
+                &mut observed,
+                &processes,
+                &fixture.path().join("proc"),
+                |_| Ok(()),
+            );
+            let headroom = observed.units[0]
+                .cgroup_usage
+                .as_ref()
+                .unwrap()
+                .memory_headroom
+                .as_ref()
+                .unwrap();
+            assert!(headroom.hierarchy_complete);
+            assert!(!headroom.high_complete);
+            assert!(headroom.max_complete && headroom.swap_complete);
+            assert!(headroom.tightest_high.is_none() && headroom.tightest_max.is_none());
+            assert_eq!(headroom.scopes[0].memory_high, None, "{invalid:?}");
+            assert_eq!(
+                headroom.scopes[0].memory_max,
+                Some(CgroupMemoryLimit::Unlimited)
+            );
+            assert!(headroom.scopes[0]
+                .unavailable
+                .iter()
+                .any(|reason| reason.starts_with("memory.high:")));
+            assert!(headroom.observed_limit_warnings().is_empty());
+        }
+        std::fs::write(directory.join("memory.high"), "max\n").unwrap();
+        let parent = directory.parent().unwrap();
+        std::fs::write(parent.join("memory.max"), "1000\n").unwrap();
+        std::fs::rename(
+            parent.join("memory.current"),
+            parent.join("saved-memory.current"),
+        )
+        .unwrap();
+        let mut observed = telemetry_table(fixture.path(), &processes);
+        linux_cgroup_usage::collect_from(
+            &mut observed,
+            &processes,
+            &fixture.path().join("proc"),
+            |_| Ok(()),
+        );
+        let headroom = observed.units[0]
+            .cgroup_usage
+            .as_ref()
+            .unwrap()
+            .memory_headroom
+            .as_ref()
+            .unwrap();
+        assert!(headroom.hierarchy_complete && headroom.high_complete);
+        assert!(!headroom.max_complete);
+        assert!(
+            headroom.tightest_max.is_none(),
+            "missing parent usage is never measured zero"
+        );
+        let parent = headroom
+            .scopes
+            .iter()
+            .find(|scope| scope.path.ends_with("app.slice"))
+            .unwrap();
+        assert_eq!(parent.memory_current_bytes, None);
+        assert_eq!(parent.max_headroom_bytes, None);
+        assert!(headroom.observed_limit_warnings().is_empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn hidden_mount_and_namespace_ancestors_keep_headroom_unknown_but_preserve_observed_warnings() {
+        let processes = vec![process(100, 1, "worker", 100)];
+        for subtree_mount in [true, false] {
+            let fixture = telemetry_fixture(&processes);
+            let proc_root = fixture.path().join("proc");
+            let cgroup_root = fixture.path().join("cgroup");
+            let (visible_root, mount_root) = if subtree_mount {
+                (cgroup_root.join("user.slice"), "/user.slice")
+            } else {
+                (cgroup_root.clone(), "/")
+            };
+            // A namespaced '/' retains the non-root memory interfaces.
+            write_memory_scope(&visible_root, "950", "max", "1000", "0", "max");
+            std::fs::write(
+                proc_root.join("self/mountinfo"),
+                format!(
+                    "42 25 0:27 {mount_root} {} rw - cgroup2 cgroup rw\n",
+                    visible_root.display(),
+                ),
+            )
+            .unwrap();
+            let mut observed = telemetry_table(fixture.path(), &processes);
+            linux_cgroup_usage::collect_from(&mut observed, &processes, &proc_root, |_| Ok(()));
+            let headroom = observed.units[0]
+                .cgroup_usage
+                .as_ref()
+                .unwrap()
+                .memory_headroom
+                .as_ref()
+                .unwrap();
+            assert!(!headroom.hierarchy_complete, "{mount_root}");
+            assert!(!headroom.high_complete && !headroom.max_complete && !headroom.swap_complete);
+            assert!(headroom.tightest_max.is_none());
+            let warnings = headroom.observed_limit_warnings();
+            assert_eq!(warnings.len(), 1);
+            assert_eq!(warnings[0].path, mount_root);
+            assert_eq!(warnings[0].headroom_bytes, 50);
+            assert!(!warnings[0].hierarchy_complete);
+            assert!(headroom
+                .unavailable
+                .iter()
+                .any(|reason| reason.contains("hidden")));
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn replaced_ancestor_invalidates_headroom_even_when_the_leaf_identity_survives() {
+        use std::os::unix::fs::MetadataExt;
+
+        let processes = vec![process(100, 1, "worker", 100)];
+        let fixture = telemetry_fixture(&processes);
+        let directory = fixture
+            .path()
+            .join("cgroup")
+            .join(AGENT_SCOPE.trim_start_matches('/'));
+        let parent = directory.parent().unwrap();
+        let grandparent_inode = std::fs::metadata(parent.parent().unwrap()).unwrap().ino();
+        let leaf_inode = std::fs::metadata(&directory).unwrap().ino();
+        write_memory_scope(parent, "950", "900", "1000", "0", "max");
+        let replaced = std::cell::Cell::new(false);
+        let mut observed = telemetry_table(fixture.path(), &processes);
+        linux_cgroup_usage::collect_from(
+            &mut observed,
+            &processes,
+            &fixture.path().join("proc"),
+            |handle| {
+                // The parent was already sampled. Replace it while moving the
+                // same leaf inode back under its original pathname.
+                if handle.metadata().unwrap().ino() == grandparent_inode && !replaced.replace(true)
+                {
+                    let previous = parent.with_extension("previous");
+                    std::fs::rename(parent, &previous).unwrap();
+                    std::fs::create_dir(parent).unwrap();
+                    std::fs::rename(previous.join(directory.file_name().unwrap()), &directory)
+                        .unwrap();
+                    write_memory_scope(parent, "0", "max", "max", "0", "max");
+                }
+                Ok(())
+            },
+        );
+        assert!(replaced.get());
+        assert_eq!(std::fs::metadata(&directory).unwrap().ino(), leaf_inode);
+        let usage = observed.units[0].cgroup_usage.as_ref().unwrap();
+        assert!(
+            usage.available,
+            "the unchanged leaf accounting remains bound"
+        );
+        assert_eq!(usage.memory_current_bytes, Some(1_048_576));
+        let headroom = usage.memory_headroom.as_ref().unwrap();
+        assert!(!headroom.hierarchy_complete && !headroom.max_complete);
+        assert!(headroom.scopes.is_empty() && headroom.tightest_max.is_none());
+        assert!(headroom.observed_limit_warnings().is_empty());
+        assert!(headroom
+            .unavailable
+            .iter()
+            .any(|reason| reason.contains("hierarchy changed")));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn memory_hierarchy_sampling_limits_keep_partial_evidence_explicit() {
+        let processes = vec![process(100, 1, "worker", 100)];
+        let fixture = telemetry_fixture(&processes);
+        let directory = fixture
+            .path()
+            .join("cgroup")
+            .join(AGENT_SCOPE.trim_start_matches('/'));
+        write_memory_scope(&directory, "950", "max", "1000", "0", "max");
+        for budget in [0, 2] {
+            let mut observed = telemetry_table(fixture.path(), &processes);
+            let verified = std::cell::Cell::new(0);
+            linux_cgroup_usage::collect_from_with_memory_limit(
+                &mut observed,
+                &processes,
+                &fixture.path().join("proc"),
+                |_| {
+                    verified.set(verified.get() + 1);
+                    Ok(())
+                },
+                budget,
+            );
+            let usage = observed.units[0].cgroup_usage.as_ref().unwrap();
+            assert!(usage.available);
+            let headroom = usage.memory_headroom.as_ref().unwrap();
+            assert_eq!(headroom.scopes.len(), budget);
+            // The leaf is opened once for existing accounting, even at a zero
+            // headroom budget; additional observations use pinned ancestors.
+            assert_eq!(verified.get(), budget.max(1));
+            assert!(!headroom.hierarchy_complete && !headroom.max_complete);
+            assert!(headroom.tightest_max.is_none());
+            assert!(headroom
+                .unavailable
+                .iter()
+                .any(|reason| reason.contains("directory observation limit")));
+            assert_eq!(
+                headroom.observed_limit_warnings().len(),
+                usize::from(budget > 0)
+            );
+        }
+
+        let proc_root = fixture.path().join("proc");
+        let deep_path = format!(
+            "/user.slice/{}/worker.scope",
+            vec!["nested.slice"; MAX_MEMORY_HIERARCHY_DEPTH].join("/")
+        );
+        let mount_point = fixture.path().join("cgroup");
+        for ancestor in Path::new(&deep_path)
+            .ancestors()
+            .filter(|path| *path != Path::new("/"))
+        {
+            write_memory_scope(
+                &mount_point.join(ancestor.strip_prefix("/").unwrap()),
+                "0",
+                "max",
+                "max",
+                "0",
+                "max",
+            );
+        }
+        std::fs::write(proc_root.join("100/cgroup"), format!("0::{deep_path}\n")).unwrap();
+        let mut observed = telemetry_table(fixture.path(), &processes);
+        linux_cgroup_usage::collect_from(&mut observed, &processes, &proc_root, |_| Ok(()));
+        let headroom = observed.units[0]
+            .cgroup_usage
+            .as_ref()
+            .unwrap()
+            .memory_headroom
+            .as_ref()
+            .unwrap();
+        assert_eq!(headroom.scopes.len(), MAX_MEMORY_HIERARCHY_DEPTH);
+        assert!(!headroom.hierarchy_complete && headroom.tightest_max.is_none());
+        assert!(headroom
+            .unavailable
+            .iter()
+            .any(|reason| reason.contains("depth limit")));
     }
 
     #[test]
@@ -2219,6 +3179,8 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn shared_cgroup_is_read_once_without_combining_owner_specific_member_totals() {
+        use std::os::unix::fs::MetadataExt;
+
         let mut processes = vec![
             process(100, 1, "worker", 100),
             process(101, 1, "worker", 101),
@@ -2227,17 +3189,25 @@ mod tests {
         let fixture = telemetry_fixture(&processes);
         let mut observed = telemetry_table(fixture.path(), &processes);
         assert_eq!(observed.units.len(), 2);
-        let reads = std::cell::Cell::new(0);
+        let reads = std::cell::RefCell::new(BTreeSet::new());
         linux_cgroup_usage::collect_from(
             &mut observed,
             &processes,
             &fixture.path().join("proc"),
-            |_| {
-                reads.set(reads.get() + 1);
+            |handle| {
+                let metadata = handle.metadata().unwrap();
+                assert!(
+                    reads.borrow_mut().insert((metadata.dev(), metadata.ino())),
+                    "a physical scope must not be sampled again for another owner"
+                );
                 Ok(())
             },
         );
-        assert_eq!(reads.get(), 1, "one physical subtree must be sampled once");
+        assert_eq!(
+            reads.borrow().len(),
+            Path::new(AGENT_SCOPE).ancestors().count(),
+            "one shared subtree and its ancestor chain must each be sampled once"
+        );
         for unit in &observed.units {
             assert_eq!(unit.member_count, 1);
             let kernel = unit.cgroup_usage.as_ref().unwrap();

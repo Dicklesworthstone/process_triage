@@ -395,7 +395,11 @@ pub(crate) fn resolve_cgroup_mount(
         "cpu.pressure",
         "memory.current",
         "memory.peak",
+        "memory.high",
+        "memory.max",
         "memory.swap.current",
+        "memory.swap.max",
+        "cgroup.controllers",
         "memory.pressure",
         "io.pressure",
     ];
@@ -1541,6 +1545,10 @@ mod tests {
             "22 21 0:21 /source /sys/fs/cgroup/cpu.max rw - ext4 /dev/sda rw\n",
             "22 21 0:21 /source /sys/fs/cgroup/job/cpu.max rw - ext4 /dev/sda rw\n",
             "22 21 0:21 /source /sys/fs/cgroup/job/child/memory.current rw - ext4 /dev/sda rw\n",
+            "22 21 0:21 /source /sys/fs/cgroup/job/memory.high rw - ext4 /dev/sda rw\n",
+            "22 21 0:21 /source /sys/fs/cgroup/job/memory.max rw - ext4 /dev/sda rw\n",
+            "22 21 0:21 /source /sys/fs/cgroup/job/child/memory.swap.max rw - ext4 /dev/sda rw\n",
+            "22 21 0:21 /source /sys/fs/cgroup/cgroup.controllers rw - ext4 /dev/sda rw\n",
         ] {
             let hidden = format!("{mount}{replacement}");
             assert!(resolve_cgroup_mount("/job/child", &hidden, "cgroup2", None).is_err());

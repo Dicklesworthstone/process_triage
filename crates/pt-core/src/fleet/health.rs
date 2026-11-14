@@ -101,10 +101,12 @@ pub struct HostInspection {
     pub generated_at: Option<String>,
     /// Greatest observed problem; unknown when a quiet report has evidence gaps.
     pub observed_status: HostHealthStatus,
+    /// Combined observation coverage. Raw pressure coverage remains in `health`.
     pub coverage: PressureCoverage,
     pub health: Option<HostHealth>,
     pub system_state: Option<Value>,
     pub responsible_units: Option<Value>,
+    pub memory_limits: Option<Value>,
     pub doctor: Option<RemoteDoctorReport>,
     pub warnings: Vec<String>,
 }
@@ -129,6 +131,7 @@ impl HostInspection {
             health: None,
             system_state: None,
             responsible_units: None,
+            memory_limits: None,
             doctor: None,
             warnings: Vec::new(),
         }
@@ -241,7 +244,121 @@ fn parse_health(document: &Value, result: &mut HostInspection) -> Result<(), Str
             .warnings
             .push("responsible-unit attribution unavailable or malformed".into()),
     }
+    parse_memory_limits(document.get("memory_limits"), result);
     Ok(())
+}
+
+/// Recompute warning bands from numeric observations; do not trust a remote
+/// severity label or silently drop ancestor warnings outside the top workloads.
+fn parse_memory_limits(report: Option<&Value>, result: &mut HostInspection) {
+    let validated = report.filter(|report| {
+        let Some(warnings) = report["warnings"].as_array() else {
+            return false;
+        };
+        let Some(count) = report["warning_count"].as_u64() else {
+            return false;
+        };
+        let (Some(total), Some(observed), Some(complete), Some(hard)) = (
+            report["total_units"].as_u64(),
+            report["observed_units"].as_u64(),
+            report["complete_units"].as_u64(),
+            report["hard_limit_count"].as_u64(),
+        ) else {
+            return false;
+        };
+        let claimed_complete = report["complete"].as_bool() == Some(true);
+        report["warning_threshold_percent"].as_u64() == Some(90)
+            && report["complete"].is_boolean()
+            && complete <= observed
+            && observed <= total
+            && (!claimed_complete || (total > 0 && complete == total))
+            && (count == 0 || observed > 0)
+            && hard <= count
+            && warnings
+                .iter()
+                .filter(|warning| {
+                    warning["control"].as_str() == Some("memory.max")
+                        && warning["at_or_above_limit"].as_bool() == Some(true)
+                })
+                .count() as u64
+                == hard.min(32)
+            && warnings.len() <= 32
+            && count.min(32) == warnings.len() as u64
+            && report["omitted_warnings"].as_u64() == Some(count - warnings.len() as u64)
+            && warnings.iter().all(|warning| {
+                let (Some(current), Some(limit), Some(headroom)) = (
+                    warning["current_bytes"].as_u64(),
+                    warning["limit_bytes"].as_u64(),
+                    warning["headroom_bytes"].as_u64(),
+                ) else {
+                    return false;
+                };
+                matches!(
+                    warning["control"].as_str(),
+                    Some("memory.high" | "memory.max" | "memory.swap.max")
+                ) && warning["path"].as_str().is_some_and(|path| {
+                    path.starts_with('/')
+                        && path.len() <= 4096
+                        && !path.chars().any(char::is_control)
+                }) && warning["scope_id"].as_str().is_some_and(|id| {
+                    !id.is_empty() && id.len() <= 1024 && !id.chars().any(char::is_control)
+                }) && warning["directory_device"].as_u64().is_some()
+                    && warning["directory_inode"].as_u64().is_some()
+                    && warning["hierarchy_complete"].is_boolean()
+                    && (!claimed_complete || warning["hierarchy_complete"].as_bool() == Some(true))
+                    && headroom == limit.saturating_sub(current)
+                    && warning["at_or_above_limit"].as_bool() == Some(current >= limit)
+                    && if limit == 0 {
+                        current > 0
+                    } else {
+                        current >= limit - limit / 10
+                    }
+            })
+    });
+    let Some(report) = validated else {
+        result
+            .warnings
+            .push("memory-limit observations unavailable or malformed".into());
+        if result.observed_status == HostHealthStatus::Ok {
+            result.observed_status = HostHealthStatus::Unknown;
+        }
+        if result.coverage == PressureCoverage::Complete {
+            result.coverage = PressureCoverage::Partial;
+        }
+        return;
+    };
+    let Some(warnings) = report["warnings"].as_array() else {
+        return;
+    };
+    let hard_limit = warnings.iter().any(|warning| {
+        warning["control"].as_str() == Some("memory.max")
+            && warning["at_or_above_limit"].as_bool() == Some(true)
+    });
+    if hard_limit {
+        result.observed_status = HostHealthStatus::Crit;
+    } else if !warnings.is_empty() && result.observed_status != HostHealthStatus::Crit {
+        result.observed_status = HostHealthStatus::Warn;
+    } else if report["complete"].as_bool() != Some(true)
+        && result.observed_status == HostHealthStatus::Ok
+    {
+        result.observed_status = HostHealthStatus::Unknown;
+    }
+    if report["complete"].as_bool() != Some(true) {
+        if result.coverage == PressureCoverage::Complete {
+            result.coverage = PressureCoverage::Partial;
+        }
+        result.warnings.push(
+            "memory-limit hierarchy coverage is incomplete; hidden limits remain unknown".into(),
+        );
+    }
+    if result.coverage == PressureCoverage::Unavailable
+        && report["observed_units"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    {
+        result.coverage = PressureCoverage::Partial;
+    }
+    result.memory_limits = Some(report.clone());
 }
 
 fn parse_doctor(document: &Value, result: &mut HostInspection) -> Result<(), String> {
@@ -516,6 +633,12 @@ mod tests {
             "responsible_units": {
                 "rank_by": "cpu",
                 "units": [{"id": "build-unit", "label": "compiler scope", "member_count": 2, "usage": {"cpu_cores": {"value": 4.0}}}]
+            },
+            "memory_limits": {
+                "warning_threshold_percent": 90, "complete": true,
+                "total_units": 1, "observed_units": 1, "complete_units": 1, "hard_limit_count": 0,
+                "warning_count": 0, "omitted_warnings": 0,
+                "warnings": []
             }
         })
     }
@@ -591,7 +714,7 @@ mod tests {
         let unavailable = parse_output("unavailable", InspectionKind::Health, &output(&quiet, 0));
         assert_eq!(unavailable.status, InspectionStatus::Completed);
         assert_eq!(unavailable.observed_status, HostHealthStatus::Unknown);
-        assert_eq!(unavailable.coverage, PressureCoverage::Unavailable);
+        assert_eq!(unavailable.coverage, PressureCoverage::Partial);
     }
 
     #[test]
@@ -607,6 +730,96 @@ mod tests {
         assert!(result.health.as_ref().unwrap().census.is_none());
         assert!(result.responsible_units.is_none());
         assert!(!result.warnings.is_empty());
+    }
+
+    fn memory_warning(control: &str, current: u64, limit: u64) -> Value {
+        json!({
+            "scope_id": "boot:1:2:3:4:5:6:memory.max",
+            "path": "/user.slice/user-1000.slice", "directory_device": 5,
+            "directory_inode": 6, "control": control,
+            "current_bytes": current, "limit_bytes": limit,
+            "headroom_bytes": limit.saturating_sub(current),
+            "at_or_above_limit": current >= limit, "hierarchy_complete": true,
+        })
+    }
+
+    #[test]
+    fn ancestor_memory_limit_warns_even_when_host_pressure_is_quiet() {
+        for (current, expected) in [(95, HostHealthStatus::Warn), (100, HostHealthStatus::Crit)] {
+            let mut document = snapshot(0.0);
+            document["memory_limits"] = json!({
+                "warning_threshold_percent": 90, "complete": false,
+                "total_units": 1, "observed_units": 1, "complete_units": 0,
+                "hard_limit_count": u64::from(current >= 100),
+                "warning_count": 1, "omitted_warnings": 0,
+                "warnings": [memory_warning("memory.max", current, 100)],
+            });
+            let result = parse_output("host", InspectionKind::Health, &output(&document, 0));
+            assert_eq!(result.observed_status, expected);
+            assert_eq!(result.status, InspectionStatus::Completed);
+            assert_eq!(
+                result.memory_limits.as_ref(),
+                Some(&document["memory_limits"])
+            );
+            assert!(result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("hidden limits")));
+            assert_eq!(
+                result
+                    .health
+                    .as_ref()
+                    .unwrap()
+                    .assessment
+                    .as_ref()
+                    .unwrap()
+                    .worst,
+                Severity::Ok
+            );
+        }
+    }
+
+    #[test]
+    fn memory_high_and_disabled_swap_do_not_claim_a_hard_oom_limit() {
+        let mut document = snapshot(0.0);
+        document["memory_limits"] = json!({
+            "warning_threshold_percent": 90, "complete": true,
+            "total_units": 1, "observed_units": 1, "complete_units": 1, "hard_limit_count": 0,
+            "warning_count": 1, "omitted_warnings": 0,
+            "warnings": [memory_warning("memory.high", 110, 100)],
+        });
+        let result = parse_output("host", InspectionKind::Health, &output(&document, 0));
+        assert_eq!(result.observed_status, HostHealthStatus::Warn);
+        document["memory_limits"]["warnings"] = json!([memory_warning("memory.swap.max", 0, 0)]);
+        let result = parse_output("host", InspectionKind::Health, &output(&document, 0));
+        assert_eq!(result.observed_status, HostHealthStatus::Unknown);
+        assert!(result.memory_limits.is_none());
+    }
+
+    #[test]
+    fn incomplete_or_malformed_memory_limits_cannot_certify_a_quiet_host() {
+        for bad in [
+            Value::Null,
+            json!({"warning_threshold_percent": 90, "complete": false,
+                "total_units": 1, "observed_units": 1, "complete_units": 0, "hard_limit_count": 0,
+                "warning_count": 0, "omitted_warnings": 0, "warnings": []}),
+            json!({"warning_threshold_percent": 90, "complete": true,
+                "warning_count": 1, "omitted_warnings": 0,
+                "warnings": [memory_warning("memory.max", 50, 100)]}),
+            json!({"warning_threshold_percent": 90, "complete": true,
+                "warning_count": 1, "omitted_warnings": 1, "warnings": []}),
+            json!({"warning_threshold_percent": 90, "complete": true,
+                "total_units": 2, "observed_units": 1, "complete_units": 1, "hard_limit_count": 0,
+                "warning_count": 0, "omitted_warnings": 0, "warnings": []}),
+        ] {
+            let mut document = snapshot(0.0);
+            document["memory_limits"] = bad;
+            let result = parse_output("host", InspectionKind::Health, &output(&document, 0));
+            assert_eq!(result.observed_status, HostHealthStatus::Unknown);
+            document["system_state"]["pressure"]["cpu"]["some"]["avg10"] = json!(45.0);
+            let busy = parse_output("host", InspectionKind::Health, &output(&document, 0));
+            assert_eq!(busy.observed_status, HostHealthStatus::Crit);
+        }
     }
 
     #[test]

@@ -12035,6 +12035,9 @@ fn run_agent_fleet_inspection(
                         );
                     }
                 }
+                if let Some(memory_limits) = &host.memory_limits {
+                    print_memory_limit_report(memory_limits);
+                }
                 if let Some(doctor) = &host.doctor {
                     println!(
                         "  Doctor: {:?}, {} checks",
@@ -24108,6 +24111,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
             "activity_window_ms": args.window_ms,
             "system_state": system_state,
             "responsible_units": units,
+            "memory_limits": responsible_units.as_ref().map(memory_limit_report),
             "scan": {
                 "complete": scan_result.as_ref().is_some_and(|scan| scan.metadata.warnings.is_empty()),
                 "processes_observed": scan_result.as_ref().map(|scan| scan.processes.len()),
@@ -24514,6 +24518,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                 "activity_window_ms": args.window_ms,
                 "pressure_decisions": pressure_decisions,
                 "responsible_units": responsible_units,
+                "memory_limits": responsible_units.as_ref().map(memory_limit_report),
             });
             if let Some(procs) = &process_snapshot {
                 if let Some(out_mut) = output.as_object_mut() {
@@ -25762,17 +25767,169 @@ fn collect_responsible_units(
 /// appears once in the top-level table, avoiding quadratic output for big units.
 fn responsible_unit_summary(unit: Option<&ResponsibleUnit>) -> serde_json::Value {
     unit.map_or(serde_json::Value::Null, |unit| {
+        let mut cgroup =
+            serde_json::to_value(&unit.cgroup_usage).unwrap_or(serde_json::Value::Null);
+        if let Some(headroom) = unit
+            .cgroup_usage
+            .as_ref()
+            .and_then(|usage| usage.memory_headroom.as_ref())
+        {
+            // Full ancestor rows are retained once in the attribution table.
+            // Candidate summaries must not multiply them by every member PID.
+            cgroup["memory_headroom"] = serde_json::json!({
+                "hierarchy_complete": headroom.hierarchy_complete,
+                "high_complete": headroom.high_complete,
+                "max_complete": headroom.max_complete,
+                "swap_complete": headroom.swap_complete,
+                "observed_scopes": headroom.scopes.len(),
+                "tightest_high": headroom.tightest_high,
+                "tightest_max": headroom.tightest_max,
+                "tightest_swap": headroom.tightest_swap,
+                "warnings": headroom.observed_limit_warnings(),
+                "unavailable": headroom.unavailable,
+            });
+        }
         serde_json::json!({
             "id": unit.id,
             "kind": unit.kind,
             "label": unit.label,
             "member_count": unit.member_count,
             "usage": unit.usage,
-            "cgroup_usage": unit.cgroup_usage,
+            "cgroup_usage": cgroup,
             "scope": "observed_census_members",
             "group_action_authorized": false,
         })
     })
+}
+
+/// Inspect every attributed cgroup before any top-N output truncation. Several
+/// workloads can share a constrained ancestor; report that control only once.
+fn memory_limit_report(table: &ResponsibleUnitTable) -> serde_json::Value {
+    let mut warnings = BTreeMap::<String, serde_json::Value>::new();
+    let mut observed_units = 0usize;
+    let mut complete_units = 0usize;
+    for unit in &table.units {
+        let Some(usage) = unit.cgroup_usage.as_ref().filter(|usage| usage.available) else {
+            continue;
+        };
+        let Some(binding) = usage.binding.as_ref() else {
+            continue;
+        };
+        let Some(headroom) = usage.memory_headroom.as_ref() else {
+            continue;
+        };
+        observed_units += 1;
+        if headroom.hierarchy_complete
+            && headroom.high_complete
+            && headroom.max_complete
+            && headroom.swap_complete
+        {
+            complete_units += 1;
+        }
+        for warning in headroom.observed_limit_warnings() {
+            let key = format!(
+                "{}:{}:{}:{}:{}:{}:{}:{}",
+                binding.boot_id,
+                binding.mount_namespace.device,
+                binding.mount_namespace.inode,
+                binding.cgroup_namespace.device,
+                binding.cgroup_namespace.inode,
+                warning.directory_device,
+                warning.directory_inode,
+                warning.control,
+            );
+            let mut value = serde_json::to_value(&warning).unwrap_or(serde_json::Value::Null);
+            value["scope_id"] = serde_json::json!(key);
+            // Ancestors can be sampled through more than one leaf. Preserve
+            // the smallest observed headroom rather than summing shared usage.
+            let replace = warnings.get(&key).is_none_or(|prior| {
+                prior["headroom_bytes"]
+                    .as_u64()
+                    .is_none_or(|bytes| warning.headroom_bytes < bytes)
+                    || (warning.at_or_above_limit
+                        && prior["at_or_above_limit"].as_bool() != Some(true))
+            });
+            if replace {
+                warnings.insert(key, value);
+            }
+        }
+    }
+    let mut warnings: Vec<_> = warnings.into_values().collect();
+    warnings.sort_by(|left, right| {
+        let priority = |value: &serde_json::Value| {
+            let at_limit = value["at_or_above_limit"].as_bool() == Some(true);
+            match (value["control"].as_str(), at_limit) {
+                (Some("memory.max"), true) => 0,
+                (Some("memory.max"), false) => 1,
+                (Some("memory.high"), true) => 2,
+                (Some("memory.high"), false) => 3,
+                (_, true) => 4,
+                _ => 5,
+            }
+        };
+        priority(left)
+            .cmp(&priority(right))
+            .then_with(|| {
+                left["headroom_bytes"]
+                    .as_u64()
+                    .cmp(&right["headroom_bytes"].as_u64())
+            })
+            .then_with(|| left["scope_id"].as_str().cmp(&right["scope_id"].as_str()))
+    });
+    let warning_count = warnings.len();
+    let hard_limit_count = warnings
+        .iter()
+        .filter(|warning| {
+            warning["control"].as_str() == Some("memory.max")
+                && warning["at_or_above_limit"].as_bool() == Some(true)
+        })
+        .count();
+    warnings.truncate(32);
+    serde_json::json!({
+        "warning_threshold_percent": 90,
+        "complete": !table.units.is_empty()
+            && complete_units == table.units.len()
+            && table.unavailable.is_empty(),
+        "total_units": table.units.len(),
+        "observed_units": observed_units,
+        "complete_units": complete_units,
+        "warning_count": warning_count,
+        "hard_limit_count": hard_limit_count,
+        "omitted_warnings": warning_count.saturating_sub(warnings.len()),
+        "warnings": warnings,
+        "automatic_action_authorized": false,
+        "scope": "observed_cgroup_limits_and_ancestor_usage",
+    })
+}
+
+fn print_memory_limit_report(report: &serde_json::Value) {
+    if let Some(warnings) = report["warnings"].as_array() {
+        for warning in warnings.iter().take(8) {
+            println!(
+                "  Memory limit: {} {} — {:.1} MiB charged of {:.1} MiB; {:.1} MiB headroom{}",
+                fleet_inspection_text(warning["path"].as_str().unwrap_or("unknown")),
+                warning["control"].as_str().unwrap_or("unknown"),
+                warning["current_bytes"].as_u64().unwrap_or(0) as f64 / 1_048_576.0,
+                warning["limit_bytes"].as_u64().unwrap_or(0) as f64 / 1_048_576.0,
+                warning["headroom_bytes"].as_u64().unwrap_or(0) as f64 / 1_048_576.0,
+                if warning["at_or_above_limit"].as_bool() == Some(true) {
+                    " (at or above this limit)"
+                } else {
+                    " (at least 90% used)"
+                },
+            );
+        }
+        let total = report["warning_count"].as_u64().unwrap_or(0);
+        if total > 8 {
+            println!(
+                "  {} more observed memory-limit warnings in JSON.",
+                total - 8
+            );
+        }
+    }
+    if report["complete"].as_bool() != Some(true) {
+        println!("  Memory-limit coverage is incomplete; unobserved ancestors or workloads remain unknown.");
+    }
 }
 
 fn print_responsible_units(table: &ResponsibleUnitTable) {
@@ -25802,6 +25959,7 @@ fn print_responsible_units(table: &ResponsibleUnitTable) {
             table.units.len() - 8
         );
     }
+    print_memory_limit_report(&memory_limit_report(table));
 }
 
 fn filter_planning_scan(
@@ -27996,6 +28154,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         "system_state": system_state,
         "scan": scan_info,
         "responsible_units": responsible_units,
+        "memory_limits": memory_limit_report(&responsible_units),
         "command": "agent plan",
         "args": {
             "max_candidates": args.max_candidates,
@@ -35214,6 +35373,7 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
     let mut baseline: Option<WatchBaseline> = None;
     let mut pressure_watch = WatchPressureState::new();
     let mut workload_watch = WatchWorkloadState::default();
+    let mut memory_limit_watch = WatchMemoryLimitState::default();
     let mut previous: HashMap<u32, WatchCandidate> = HashMap::new();
     let interval = Duration::from_secs(args.interval.max(1));
     let notify_cmd = args.notify_cmd.as_deref();
@@ -35283,6 +35443,10 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
         // a zombie leak or D-state storm.
         let census = watch_process_census(&scan_result.processes, &scan_result.metadata.warnings);
         let timestamp = chrono::Utc::now().to_rfc3339();
+        let memory_limits = memory_limit_report(&responsible_units);
+        if let Some(event) = memory_limit_watch.update(&memory_limits, &timestamp) {
+            emit_watch_event(&event, notify_exec, notify_cmd, notify_args);
+        }
         if let Some(event) = workload_watch.update(&system_state, &timestamp) {
             emit_watch_event(&event, notify_exec, notify_cmd, notify_args);
         }
@@ -35299,6 +35463,7 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
                 "unavailable": responsible_units.unavailable,
                 "limitations": responsible_units.limitations,
             });
+            event["memory_limits"] = memory_limits.clone();
             emit_watch_event(&event, notify_exec, notify_cmd, notify_args);
         }
         if baseline.is_none() {
@@ -35543,6 +35708,233 @@ fn severity_label(severity: WatchSeverity) -> &'static str {
 struct WatchBaseline {
     load1: f64,
     available_gb: f64,
+}
+
+/// A missing hierarchy cannot establish recovery from an observed limit.
+/// Numeric movement within the same warning band does not flood the stream.
+#[derive(Default)]
+struct WatchMemoryLimitState {
+    previous: Option<serde_json::Value>,
+    saw_warnings: bool,
+}
+
+impl WatchMemoryLimitState {
+    fn update(&mut self, report: &serde_json::Value, timestamp: &str) -> Option<serde_json::Value> {
+        let warnings = report["warnings"].as_array()?;
+        let count = report["warning_count"].as_u64()?;
+        let complete = report["complete"].as_bool() == Some(true);
+        let signature: BTreeMap<_, _> = warnings
+            .iter()
+            .filter_map(|warning| {
+                Some((
+                    warning["scope_id"].as_str()?,
+                    warning["at_or_above_limit"].as_bool()?,
+                ))
+            })
+            .collect();
+        let observed = serde_json::json!({
+            "warnings": signature,
+            "warning_count": count,
+            "hard_limit_count": report["hard_limit_count"],
+            "complete": complete,
+        });
+        if self.previous.as_ref() == Some(&observed) {
+            return None;
+        }
+        self.previous = Some(observed);
+        if count == 0 && !self.saw_warnings {
+            return None;
+        }
+        if complete {
+            self.saw_warnings = count > 0;
+        } else {
+            self.saw_warnings |= count > 0;
+        }
+        Some(serde_json::json!({
+            "event": "memory_limit_diagnostics",
+            "timestamp": timestamp,
+            "status": if count > 0 {
+                if complete { "observed" } else { "observed_partial" }
+            } else if complete {
+                "no_longer_observed"
+            } else {
+                "incomplete"
+            },
+            "memory_limits": report,
+            "automatic_action_authorized": false,
+        }))
+    }
+}
+
+#[cfg(test)]
+mod memory_limit_diagnostic_tests {
+    use super::*;
+    use pt_core::collect::responsible_units::{
+        AttributionIdentity, CgroupMemoryHeadroom, CgroupMemoryLimit, CgroupMemoryScope,
+        CgroupNamespaceIdentity, CgroupResourceUsage, CgroupUsageBinding, ObservedTotal,
+        ResponsibleUnitKind, UnitResourceUsage,
+    };
+
+    fn unit(inode: u64, current: u64) -> ResponsibleUnit {
+        let mut headroom = CgroupMemoryHeadroom::default();
+        headroom.hierarchy_complete = true;
+        headroom.high_complete = true;
+        headroom.max_complete = true;
+        headroom.swap_complete = true;
+        headroom.scopes.push(CgroupMemoryScope {
+            path: format!("/user.slice/limit-{inode}"),
+            directory_device: 2,
+            directory_inode: inode,
+            memory_current_bytes: Some(current),
+            memory_high: Some(CgroupMemoryLimit::Unlimited),
+            memory_max: Some(CgroupMemoryLimit::Finite { bytes: 100 }),
+            swap_current_bytes: Some(0),
+            swap_max: Some(CgroupMemoryLimit::Finite { bytes: 0 }),
+            high_headroom_bytes: None,
+            max_headroom_bytes: Some(100u64.saturating_sub(current)),
+            swap_headroom_bytes: Some(0),
+            unavailable: Vec::new(),
+        });
+        let identity = AttributionIdentity {
+            pid: 41,
+            start_id: pt_common::StartId::from_linux("memory-report-test", 100, 41),
+            uid: 1000,
+        };
+        ResponsibleUnit {
+            id: format!("unit-{inode}"),
+            kind: ResponsibleUnitKind::TransientScope,
+            label: format!("unit-{inode}"),
+            cgroup_path: Some(format!("/unit-{inode}")),
+            root: None,
+            member_count: 1,
+            members: vec![identity.clone()],
+            usage: UnitResourceUsage {
+                cpu_cores: ObservedTotal::default(),
+                cpu_capacity_fraction: None,
+                observed_cpu_capacity_fraction: None,
+                rss_bytes: ObservedTotal::default(),
+                swap_bytes: ObservedTotal::default(),
+                read_bytes_per_second: ObservedTotal::default(),
+                write_bytes_per_second: ObservedTotal::default(),
+                major_faults_per_second: ObservedTotal::default(),
+                leader_run_queue_wait_seconds_per_second: ObservedTotal::default(),
+                leader_blkio_delay_seconds_per_second: ObservedTotal::default(),
+            },
+            cgroup_usage: Some(CgroupResourceUsage {
+                available: true,
+                path: format!("/unit-{inode}"),
+                scope: "cgroup_subtree",
+                observed_at_ms: Some(1000),
+                binding: Some(CgroupUsageBinding {
+                    directory_device: 2,
+                    directory_inode: inode,
+                    mount_root: "/".into(),
+                    mount_point: "/sys/fs/cgroup".into(),
+                    mount_namespace: CgroupNamespaceIdentity {
+                        device: 1,
+                        inode: 2,
+                    },
+                    cgroup_namespace: CgroupNamespaceIdentity {
+                        device: 1,
+                        inode: 3,
+                    },
+                    boot_id: "memory-report-test".into(),
+                    witness: identity,
+                }),
+                memory_current_bytes: Some(current),
+                memory_peak_bytes: None,
+                memory_swap_current_bytes: Some(0),
+                memory_headroom: Some(headroom),
+                cpu_stat: None,
+                cpu_pressure: None,
+                memory_pressure: None,
+                io_pressure: None,
+                unavailable: Vec::new(),
+            }),
+            top_processes: Vec::new(),
+            unavailable: Vec::new(),
+        }
+    }
+
+    fn table() -> ResponsibleUnitTable {
+        attribute_responsible_units(&[], &[], &[], Some(4), AttributionResource::Cpu)
+    }
+
+    #[test]
+    fn memory_warnings_survive_top_workload_truncation_and_shared_ancestors() {
+        let mut table = table();
+        table.units = (0..10).map(|inode| unit(inode, 10)).collect();
+        table.units.push(unit(99, 95));
+        table.units.push(unit(99, 100));
+        let report = memory_limit_report(&table);
+        assert_eq!(report["warning_count"], 1);
+        assert_eq!(report["hard_limit_count"], 1);
+        assert_eq!(report["warnings"][0]["current_bytes"], 100);
+        assert_eq!(report["warnings"][0]["headroom_bytes"], 0);
+        assert_eq!(report["complete"], true);
+        assert_eq!(report["automatic_action_authorized"], false);
+        table.units[0].cgroup_usage = None;
+        let partial = memory_limit_report(&table);
+        assert_eq!(partial["complete"], false);
+        assert_eq!(partial["warning_count"], 1);
+    }
+
+    #[test]
+    fn compact_workload_summary_keeps_warnings_without_repeating_ancestor_rows() {
+        let unit = unit(99, 95);
+        let summary = responsible_unit_summary(Some(&unit));
+        assert_eq!(
+            summary["cgroup_usage"]["memory_headroom"]["observed_scopes"],
+            1
+        );
+        assert!(summary["cgroup_usage"]["memory_headroom"]
+            .get("scopes")
+            .is_none());
+        assert_eq!(
+            summary["cgroup_usage"]["memory_headroom"]["warnings"][0]["current_bytes"],
+            95
+        );
+        assert_eq!(
+            unit.cgroup_usage
+                .as_ref()
+                .unwrap()
+                .memory_headroom
+                .as_ref()
+                .unwrap()
+                .scopes
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn watch_preserves_memory_warning_across_missing_evidence_and_avoids_numeric_noise() {
+        let mut table = table();
+        table.units.push(unit(99, 95));
+        let mut state = WatchMemoryLimitState::default();
+        assert_eq!(
+            state.update(&memory_limit_report(&table), "t1").unwrap()["status"],
+            "observed"
+        );
+        table.units[0] = unit(99, 96);
+        assert!(state.update(&memory_limit_report(&table), "t2").is_none());
+        table.units[0] = unit(99, 100);
+        let boundary = state.update(&memory_limit_report(&table), "t3").unwrap();
+        assert_eq!(boundary["memory_limits"]["hard_limit_count"], 1);
+        table.units[0].cgroup_usage = None;
+        assert_eq!(
+            state.update(&memory_limit_report(&table), "t4").unwrap()["status"],
+            "incomplete"
+        );
+        assert!(state.saw_warnings);
+        assert!(state.update(&memory_limit_report(&table), "t5").is_none());
+        table.units[0] = unit(99, 10);
+        assert_eq!(
+            state.update(&memory_limit_report(&table), "t6").unwrap()["status"],
+            "no_longer_observed"
+        );
+        assert!(!state.saw_warnings);
+    }
 }
 
 /// Workload findings are independent of age/posterior filters. Publish changes

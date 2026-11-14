@@ -888,7 +888,10 @@ esac
                     "file_handles": {"allocated": 10, "max": 10000}, "unavailable": []
                 }
             },
-            "responsible_units": {"units": [{"id": "compile", "label": "compiler scope", "member_count": 3, "usage": {"cpu_cores": {"value": 3.0}}}]}
+            "responsible_units": {"units": [{"id": "compile", "label": "compiler scope", "member_count": 3, "usage": {"cpu_cores": {"value": 3.0}}}]},
+            "memory_limits": {"warning_threshold_percent": 90, "complete": true,
+                "total_units": 1, "observed_units": 1, "complete_units": 1, "hard_limit_count": 0,
+                "warning_count": 0, "omitted_warnings": 0, "warnings": []}
         })
     }
 
@@ -945,6 +948,45 @@ esac
             .all(|line| line
                 .ends_with("'/opt/pt tools/pt-core' --format json agent snapshot --minimal")));
         assert!(report.get("fleet_session_id").is_none());
+    }
+
+    #[test]
+    fn fleet_health_surfaces_ancestor_limit_with_quiet_host_pressure() {
+        let dir = TempDir::new().unwrap();
+        let bin = install_ssh_fixture(dir.path());
+        let mut constrained = snapshot(0.0);
+        constrained["memory_limits"] = serde_json::json!({
+            "warning_threshold_percent": 90, "complete": false,
+            "total_units": 1, "observed_units": 1, "complete_units": 0, "hard_limit_count": 1,
+            "warning_count": 1, "omitted_warnings": 0,
+            "warnings": [{
+                "scope_id": "boot:1:2:3:4:5:6:memory.max",
+                "path": "/user.slice/user-1000.slice", "directory_device": 5,
+                "directory_inode": 6, "control": "memory.max",
+                "current_bytes": 100, "limit_bytes": 100, "headroom_bytes": 0,
+                "at_or_above_limit": true, "hierarchy_complete": false,
+            }],
+        });
+        save(dir.path(), "constrained", "health", &constrained);
+        save(dir.path(), "quiet", "health", &snapshot(0.0));
+        let bytes = command(dir.path(), &bin, "health", "quiet,constrained")
+            .assert()
+            .code(1)
+            .get_output()
+            .stdout
+            .clone();
+        let report: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(report["summary"]["critical_hosts"], 1);
+        assert_eq!(report["hosts"][0]["host"], "constrained");
+        assert_eq!(
+            report["hosts"][0]["memory_limits"]["warnings"][0]["path"],
+            "/user.slice/user-1000.slice"
+        );
+        let calls = fs::read_to_string(dir.path().join("calls.log")).unwrap();
+        assert_eq!(calls.lines().count(), 2);
+        assert!(calls
+            .lines()
+            .all(|line| line.ends_with("agent snapshot --minimal")));
     }
 
     #[test]
