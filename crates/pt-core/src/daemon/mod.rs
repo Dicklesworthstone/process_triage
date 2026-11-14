@@ -191,6 +191,9 @@ pub enum DaemonEventType {
     LoadEvidenceUnavailable,
     MemoryPressureChanged,
     MemoryPressureUnavailable,
+    FreezeRecoveryCompleted,
+    FreezeRecoveryDeferred,
+    FreezeRecoveryFailed,
 }
 
 /// Running state of the daemon core loop.

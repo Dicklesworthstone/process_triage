@@ -21,8 +21,11 @@ use std::{
     io::{Read, Write},
     os::{fd::AsRawFd, unix::fs::MetadataExt, unix::fs::OpenOptionsExt},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+#[cfg(target_os = "linux")]
+use sha2::{Digest, Sha256};
 
 #[cfg(target_os = "linux")]
 const JOURNAL_VERSION: u32 = 1;
@@ -34,6 +37,256 @@ const MAX_RECEIPTS: usize = 4096;
 const MAX_RESTORATIONS: usize = 64;
 #[cfg(target_os = "linux")]
 const MAX_RESTORE_VERIFY_MS: u64 = 10_000;
+
+/// New journaled freezes schedule recovery after this many seconds. The daemon
+/// or next mutating invocation attempts the conditional thaw; read-only scans do not.
+pub const DEFAULT_FREEZE_TTL_SECS: u64 = 30 * 60;
+
+#[cfg(target_os = "linux")]
+const MAX_RECOVERY_SESSIONS: usize = 64;
+#[cfg(target_os = "linux")]
+const MAX_RECOVERY_RECEIPTS: usize = MAX_RECEIPTS;
+#[cfg(target_os = "linux")]
+const MAX_RECOVERY_ACTIONS: usize = 16;
+#[cfg(target_os = "linux")]
+const RECOVERY_WALL_BUDGET: Duration = Duration::from_secs(2);
+#[cfg(target_os = "linux")]
+const MAX_AUTOMATIC_THAW_ATTEMPTS: u8 = 8;
+
+/// A deadline in Linux's suspend-aware boot clock. The cgroup receipt supplies
+/// the boot identity; the time namespace also has to match before clocks compare.
+/// This authorizes clearing only a freeze request that pt changed from 0 to 1.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreezeLease {
+    pub created_boottime_ms: u64,
+    pub expires_boottime_ms: u64,
+    pub time_namespace_device: u64,
+    pub time_namespace_inode: u64,
+    /// The exact approved action survives later edits of the session plan.
+    pub approved_action: PlanAction,
+    pub approved_action_sha256: String,
+    pub approved_plan_sha256: String,
+    /// Bound repeated failures without consuming the manual undo attempt budget.
+    #[serde(default)]
+    pub recovery_attempts: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_recovery_boottime_ms: Option<u64>,
+}
+
+/// A due receipt found by the bounded recovery scan. Discovery alone is not a
+/// claim that its current process or cgroup is eligible for restoration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FreezeRecoveryCandidate {
+    pub session_id: String,
+    pub action_id: String,
+    pub attempt_id: String,
+    pub target: ProcessIdentity,
+    pub expires_boottime_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FreezeRecoveryResult {
+    pub session_id: String,
+    pub action_id: String,
+    pub attempt_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<ReversalOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Recovery preserves its ordinary durable undo results, including actual
+/// refusals. A cursor lets a daemon continue through older sessions fairly.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FreezeRecoveryReport {
+    pub sessions_inspected: usize,
+    pub receipts_inspected: usize,
+    pub candidates: Vec<FreezeRecoveryCandidate>,
+    pub outcomes: Vec<FreezeRecoveryResult>,
+    pub errors: Vec<String>,
+    pub budget_exhausted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_session: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+struct FreezeRecoveryClock {
+    boot_id: String,
+    boottime_ms: u64,
+    time_namespace_device: u64,
+    time_namespace_inode: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl FreezeRecoveryClock {
+    fn read() -> Result<Self, ActionError> {
+        let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .map_err(|error| failed(format!("cannot read freeze lease boot: {error}")))?
+            .trim()
+            .to_string();
+        if !canonical_uuid(&boot_id) {
+            return Err(failed("freeze lease requires a known boot identity"));
+        }
+        let namespace = fs::metadata("/proc/self/ns/time")
+            .map_err(|error| failed(format!("cannot bind freeze lease time namespace: {error}")))?;
+        let mut clock = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: clock_gettime writes into a valid stack-allocated timespec.
+        if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut clock) } != 0 {
+            return Err(failed(format!(
+                "cannot read freeze lease boot clock: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let seconds =
+            u64::try_from(clock.tv_sec).map_err(|_| failed("negative freeze lease boot clock"))?;
+        let nanos = u64::try_from(clock.tv_nsec)
+            .map_err(|_| failed("negative freeze lease clock nanoseconds"))?;
+        if nanos >= 1_000_000_000 {
+            return Err(failed("invalid freeze lease clock nanoseconds"));
+        }
+        let boottime_ms = seconds
+            .checked_mul(1000)
+            .and_then(|value| value.checked_add(nanos / 1_000_000))
+            .ok_or_else(|| failed("freeze lease clock overflow"))?;
+        let after = fs::metadata("/proc/self/ns/time").map_err(|error| {
+            failed(format!(
+                "cannot recheck freeze lease time namespace: {error}"
+            ))
+        })?;
+        if namespace.dev() != after.dev() || namespace.ino() != after.ino() {
+            return Err(failed(
+                "time namespace changed while reading freeze lease clock",
+            ));
+        }
+        Ok(Self {
+            boot_id,
+            boottime_ms,
+            time_namespace_device: namespace.dev(),
+            time_namespace_inode: namespace.ino(),
+        })
+    }
+
+    fn lease(&self, action: &PlanAction, plan_sha256: &str) -> Result<FreezeLease, ActionError> {
+        let expires_boottime_ms = self
+            .boottime_ms
+            .checked_add(DEFAULT_FREEZE_TTL_SECS * 1000)
+            .ok_or_else(|| failed("freeze lease deadline overflow"))?;
+        Ok(FreezeLease {
+            created_boottime_ms: self.boottime_ms,
+            expires_boottime_ms,
+            time_namespace_device: self.time_namespace_device,
+            time_namespace_inode: self.time_namespace_inode,
+            approved_action: action.clone(),
+            approved_action_sha256: action_digest(action)?,
+            approved_plan_sha256: plan_sha256.to_string(),
+            recovery_attempts: 0,
+            last_recovery_boottime_ms: None,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn action_digest(action: &PlanAction) -> Result<String, ActionError> {
+    let bytes = serde_json::to_vec(action)
+        .map_err(|error| failed(format!("cannot bind freeze lease action: {error}")))?;
+    Ok(hex::encode(Sha256::digest(&bytes)))
+}
+
+#[cfg(target_os = "linux")]
+impl FreezeLease {
+    fn validate(&self, record: &ReversalRecord) -> Result<(), ActionError> {
+        if record.action != Action::Freeze
+            || !matches!(
+                record.operation,
+                ReversalOperation::CgroupV2 {
+                    before: ReversalValue::Freeze { requested: false },
+                    applied: ReversalValue::Freeze { requested: true },
+                    ..
+                }
+            )
+            || self.time_namespace_inode == 0
+            || self
+                .expires_boottime_ms
+                .checked_sub(self.created_boottime_ms)
+                != Some(DEFAULT_FREEZE_TTL_SECS * 1000)
+            || self.approved_action.blocked
+            || self.approved_action_sha256 != action_digest(&self.approved_action)?
+            || self.approved_plan_sha256 != record.plan_sha256
+            || self.recovery_attempts > MAX_AUTOMATIC_THAW_ATTEMPTS
+            || usize::from(self.recovery_attempts) > record.restorations.len()
+            || (self.recovery_attempts == 0) != self.last_recovery_boottime_ms.is_none()
+            || self
+                .last_recovery_boottime_ms
+                .is_some_and(|last| last < self.expires_boottime_ms)
+        {
+            return Err(failed("invalid or unowned automatic freeze lease"));
+        }
+        self.approved_action
+            .validate_signal_timing()
+            .map_err(failed)?;
+        record.check_action(&self.approved_action)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn freeze_lease_due(
+    record: &ReversalRecord,
+    clock: &FreezeRecoveryClock,
+) -> Result<bool, ActionError> {
+    let Some(lease) = &record.freeze_lease else {
+        return Ok(false);
+    };
+    lease.validate(record)?;
+    if !record.has_unresolved_control() {
+        return Ok(false);
+    }
+    let ReversalOperation::CgroupV2 { scope, .. } = &record.operation else {
+        return Err(failed("automatic thaw requires a recorded cgroup freeze"));
+    };
+    if clock.boot_id != scope.boot_id {
+        // A freeze from an earlier boot cannot own a control in this boot.
+        return Ok(false);
+    }
+    if clock.time_namespace_device != lease.time_namespace_device
+        || clock.time_namespace_inode != lease.time_namespace_inode
+        || clock.boottime_ms < lease.created_boottime_ms
+    {
+        return Err(failed(
+            "freeze lease clock or time namespace is not comparable",
+        ));
+    }
+    if lease.recovery_attempts >= MAX_AUTOMATIC_THAW_ATTEMPTS {
+        return Err(failed("automatic thaw attempt budget exhausted; inspect the retained receipt and use agent undo"));
+    }
+    if let Some(last) = lease.last_recovery_boottime_ms {
+        if clock.boottime_ms < last {
+            return Err(failed(
+                "freeze recovery clock moved before its last attempt",
+            ));
+        }
+        // One minute, then exponential backoff capped at an hour. A daemon
+        // cannot exhaust durable/manual recovery storage by polling a refusal.
+        let delay_ms = (60_000_u64 << (lease.recovery_attempts - 1)).min(3_600_000);
+        if clock.boottime_ms - last < delay_ms {
+            return Ok(false);
+        }
+    }
+    Ok(clock.boottime_ms >= lease.expires_boottime_ms)
+}
+
+#[cfg(target_os = "linux")]
+fn check_recovery_deadline(deadline: Option<Instant>) -> Result<(), ActionError> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        Err(ActionError::Timeout)
+    } else {
+        Ok(())
+    }
+}
 
 /// Execution status is independent of subsequent undo attempts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -259,6 +512,10 @@ pub struct ReversalRecord {
     pub original_zombie_target: Option<ProcessIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_cap: Option<super::memory_cap::MemoryCapPlan>,
+    /// Present only for a new, owned freeze. Older unleased records and a
+    /// pre-existing freeze never acquire automatic thaw authority on read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freeze_lease: Option<FreezeLease>,
     pub operation: ReversalOperation,
     pub status: ReversalStatus,
     pub detail: Option<String>,
@@ -477,14 +734,55 @@ impl ReversalJournal {
         action: &PlanAction,
         attempt_id: Option<&str>,
     ) -> Result<ReversalOutcome, ActionError> {
+        self.restore_before(action, attempt_id, None)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn restore_before(
+        &self,
+        action: &PlanAction,
+        attempt_id: Option<&str>,
+        recovery: Option<(&FreezeRecoveryClock, Instant)>,
+    ) -> Result<ReversalOutcome, ActionError> {
+        self.restore_before_with(action, attempt_id, recovery, restore_live_before)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn restore_before_with(
+        &self,
+        action: &PlanAction,
+        attempt_id: Option<&str>,
+        recovery: Option<(&FreezeRecoveryClock, Instant)>,
+        restore_effect: impl FnOnce(&ReversalRecord, Option<Instant>) -> Result<bool, ActionError>,
+    ) -> Result<ReversalOutcome, ActionError> {
+        let deadline = recovery.map(|(_, deadline)| deadline);
+        check_recovery_deadline(deadline)?;
         let _lock = self
             .lock
             .lock()
             .map_err(|_| failed("undo journal lock unavailable"))?;
         let directory = JournalDirectory::open(&self.directory, false)?
             .ok_or_else(|| failed("no durable undo receipt exists for this action"))?;
-        let records = self.read_records(&directory)?;
+        let records = read_stored_records_with(
+            &directory,
+            &self.session_id,
+            Some(&self.plan_sha256),
+            || check_recovery_deadline(deadline),
+        )?;
         let mut record = select_receipt(&records, action, attempt_id)?.clone();
+        if let Some((clock, _)) = recovery {
+            if !freeze_lease_due(&record, clock)? {
+                return Err(failed(
+                    "freeze receipt has no due, unresolved automatic lease",
+                ));
+            }
+            let lease = record.freeze_lease.as_ref().expect("due lease");
+            if lease.approved_action_sha256 != action_digest(action)? {
+                return Err(failed(
+                    "automatic thaw action differs from its approved snapshot",
+                ));
+            }
+        }
         if record.status == ReversalStatus::NotApplied {
             return Err(failed(
                 "this pause was aborted before any signal attempt; its receipt cannot authorize undo",
@@ -510,18 +808,25 @@ impl ReversalJournal {
             timestamp: now(),
         };
         record.restorations.push(outcome.clone());
+        if let Some((clock, _)) = recovery {
+            let lease = record.freeze_lease.as_mut().expect("due lease");
+            lease.recovery_attempts += 1;
+            lease.last_recovery_boottime_ms = Some(clock.boottime_ms);
+        }
         record.updated_at = now();
+        check_recovery_deadline(deadline)?;
         self.write_record(&directory, &record, false)?;
 
         let restored = refuse_newer_control(&records, &record)
             .and_then(|()| {
-                refuse_other_session_owner(
+                refuse_other_session_owner_before(
                     &self.sessions_root,
                     &record.operation,
                     Some(&self.session_id),
+                    deadline,
                 )
             })
-            .and_then(|()| restore_live(&record));
+            .and_then(|()| restore_effect(&record, deadline));
         match restored {
             Ok(changed) => {
                 outcome.status = RestorationStatus::Restored;
@@ -569,13 +874,29 @@ impl ReversalJournal {
     ) -> Result<PreparedReversal, ActionError> {
         let scope = ReversalScope::capture(cgroup_path, handle)?;
         validate_target(&action.target, &scope.boot_id)?;
+        let freeze_lease = if matches!(
+            (&before, &applied),
+            (
+                ReversalValue::Freeze { requested: false },
+                ReversalValue::Freeze { requested: true }
+            )
+        ) {
+            let clock = FreezeRecoveryClock::read()?;
+            if clock.boot_id != scope.boot_id {
+                return Err(failed("boot changed before preparing the freeze lease"));
+            }
+            Some(clock.lease(action, &self.plan_sha256)?)
+        } else {
+            None
+        };
         let operation = ReversalOperation::CgroupV2 {
             scope,
             before,
             applied,
             verify_timeout_ms: verify_timeout_ms.min(MAX_RESTORE_VERIFY_MS),
         };
-        let record = self.insert(action, operation, ReversalStatus::Prepared)?;
+        let record =
+            self.insert_with_lease(action, operation, ReversalStatus::Prepared, freeze_lease)?;
         Ok(PreparedReversal {
             journal: Arc::clone(self),
             attempt_id: record.attempt_id,
@@ -671,6 +992,17 @@ impl ReversalJournal {
         operation: ReversalOperation,
         status: ReversalStatus,
     ) -> Result<ReversalRecord, ActionError> {
+        self.insert_with_lease(action, operation, status, None)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn insert_with_lease(
+        &self,
+        action: &PlanAction,
+        operation: ReversalOperation,
+        status: ReversalStatus,
+        freeze_lease: Option<FreezeLease>,
+    ) -> Result<ReversalRecord, ActionError> {
         if action.supervisor_restart.is_some() || action.routing == ActionRouting::Supervisor {
             return Err(failed("undo cannot record a supervisor-routed operation"));
         }
@@ -710,6 +1042,7 @@ impl ReversalJournal {
             routing: action.routing.clone(),
             original_zombie_target: action.original_zombie_target.clone(),
             memory_cap: action.memory_cap.clone(),
+            freeze_lease,
             operation,
             status,
             detail: None,
@@ -753,6 +1086,299 @@ impl ReversalJournal {
         let temporary = (!create).then(|| format!("{}.tmp", uuid::Uuid::new_v4()));
         write_receipt_bytes(directory, &destination, temporary.as_deref(), &bytes)
     }
+}
+
+/// Release due, owned freeze requests using their immutable approved action.
+///
+/// The caller must hold the same execution-policy lock as apply/undo for this
+/// entire call and must not invoke it from dry-run, shadow, or read-only paths.
+/// A missing current plan does not remove the obligation to thaw; the private
+/// receipt retains the approved action and its original plan digest. Ordinary
+/// undo continues to require the current canonical plan's exact digest.
+///
+/// Work stops at bounded session, receipt, restoration, and wall-time budgets.
+/// One pass inspects at most 64 sessions and 4096 discovery receipts, and starts
+/// at most 16 restorations within a two-second work window. The complete session
+/// root also has the existing 4096-entry ownership ceiling: exceeding it is an
+/// explicit error, not permission to ignore older controller owners.
+/// The wall budget prevents further reads/writes and bounds transition polling;
+/// already-issued filesystem operations and durable outcome synchronization can
+/// finish after it. Pass `next_session` to the next daemon tick for fair progress.
+#[cfg(target_os = "linux")]
+pub fn recover_expired_freezes(
+    sessions_root: &Path,
+    after_session: Option<&str>,
+) -> Result<FreezeRecoveryReport, ActionError> {
+    if fs::symlink_metadata(sessions_root)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Ok(FreezeRecoveryReport::default());
+    }
+    let clock = FreezeRecoveryClock::read()?;
+    recover_expired_freezes_with(
+        sessions_root,
+        after_session,
+        &clock,
+        &FreezeRecoveryLimits::default(),
+        |journal, action, attempt_id, clock, deadline| {
+            journal.restore_before(action, Some(attempt_id), Some((clock, deadline)))
+        },
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn recover_expired_freezes(
+    _sessions_root: &Path,
+    _after_session: Option<&str>,
+) -> Result<FreezeRecoveryReport, ActionError> {
+    Err(failed(
+        "automatic freeze recovery is supported only on Linux",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+struct FreezeRecoveryLimits {
+    session_entries: usize,
+    sessions: usize,
+    receipts: usize,
+    actions: usize,
+    wall: Duration,
+}
+
+#[cfg(target_os = "linux")]
+impl Default for FreezeRecoveryLimits {
+    fn default() -> Self {
+        Self {
+            session_entries: MAX_RECEIPTS,
+            sessions: MAX_RECOVERY_SESSIONS,
+            receipts: MAX_RECOVERY_RECEIPTS,
+            actions: MAX_RECOVERY_ACTIONS,
+            wall: RECOVERY_WALL_BUDGET,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn check_recovery_directory(path: &Path, pinned: &File) -> Result<(), ActionError> {
+    let original = pinned
+        .metadata()
+        .map_err(|error| failed(error.to_string()))?;
+    let current = fs::symlink_metadata(path)
+        .map_err(|error| failed(format!("freeze recovery directory changed: {error}")))?;
+    check_owned_directory(&original, false)?;
+    check_owned_directory(&current, false)?;
+    if original.dev() != current.dev() || original.ino() != current.ino() {
+        return Err(failed("freeze recovery directory identity changed"));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn recover_expired_freezes_with(
+    sessions_root: &Path,
+    after_session: Option<&str>,
+    clock: &FreezeRecoveryClock,
+    limits: &FreezeRecoveryLimits,
+    mut restore: impl FnMut(
+        &ReversalJournal,
+        &PlanAction,
+        &str,
+        &FreezeRecoveryClock,
+        Instant,
+    ) -> Result<ReversalOutcome, ActionError>,
+) -> Result<FreezeRecoveryReport, ActionError> {
+    let deadline = Instant::now()
+        .checked_add(limits.wall)
+        .ok_or_else(|| failed("freeze recovery deadline overflow"))?;
+    let mut report = FreezeRecoveryReport {
+        next_session: after_session.map(str::to_string),
+        ..FreezeRecoveryReport::default()
+    };
+    let root = open_directory(sessions_root)?;
+    check_recovery_directory(sessions_root, &root)?;
+    let mut names = Vec::new();
+    for (index, entry) in fs::read_dir(pinned_directory(&root))
+        .map_err(|error| {
+            failed(format!(
+                "cannot enumerate freeze recovery sessions: {error}"
+            ))
+        })?
+        .enumerate()
+    {
+        if check_recovery_deadline(Some(deadline)).is_err() {
+            report.budget_exhausted = true;
+            return Ok(report);
+        }
+        if index >= limits.session_entries {
+            return Err(failed(format!(
+                "session-entry ceiling ({}) prevents a complete freeze recovery ownership scan; existing leases are retained",
+                limits.session_entries
+            )));
+        }
+        let entry =
+            entry.map_err(|error| failed(format!("cannot read recovery session: {error}")))?;
+        let kind = entry
+            .file_type()
+            .map_err(|error| failed(error.to_string()))?;
+        if !kind.is_dir() && !kind.is_symlink() {
+            continue;
+        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| failed("invalid freeze recovery session name"))?;
+        if name.is_empty()
+            || name.len() > 128
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(failed("invalid freeze recovery session name"));
+        }
+        names.push(name);
+    }
+    names.sort();
+    let start = after_session
+        .map(|cursor| names.partition_point(|name| name.as_str() <= cursor))
+        .unwrap_or(0);
+    for name in names.iter().skip(start).chain(names.iter().take(start)) {
+        if report.sessions_inspected >= limits.sessions
+            || report.receipts_inspected >= limits.receipts
+            || report.outcomes.len() >= limits.actions
+            || check_recovery_deadline(Some(deadline)).is_err()
+        {
+            report.budget_exhausted = true;
+            return Ok(report);
+        }
+        report.sessions_inspected += 1;
+        report.next_session = Some(name.clone());
+        let session_path = pinned_directory(&root).join(name);
+        let opened: Result<_, ActionError> = (|| {
+            check_recovery_directory(sessions_root, &root)?;
+            let session = open_directory(&session_path)?;
+            check_recovery_directory(&session_path, &session)?;
+            let action_path = pinned_directory(&session).join("action");
+            if fs::symlink_metadata(&action_path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            {
+                return Ok(None);
+            }
+            let action = open_directory(&action_path)?;
+            check_recovery_directory(&action_path, &action)?;
+            let Some(directory) =
+                JournalDirectory::open(&pinned_directory(&action).join("reversals"), false)?
+            else {
+                return Ok(None);
+            };
+            Ok(Some((session, action, directory)))
+        })();
+        let (session, action_directory, directory) = match opened {
+            Ok(Some(opened)) => opened,
+            Ok(None) => continue,
+            Err(error) => {
+                report.errors.push(format!("{name}: {error}"));
+                continue;
+            }
+        };
+        let records = match read_stored_records_with(&directory, name, None, || {
+            check_recovery_deadline(Some(deadline))?;
+            if report.receipts_inspected >= limits.receipts {
+                return Err(ActionError::Timeout);
+            }
+            report.receipts_inspected += 1;
+            Ok(())
+        }) {
+            Ok(records) => records,
+            Err(ActionError::Timeout) => {
+                report.budget_exhausted = true;
+                return Ok(report);
+            }
+            Err(error) => {
+                report.errors.push(format!("{name}: {error}"));
+                continue;
+            }
+        };
+        if records.first().is_some_and(|first| {
+            records
+                .iter()
+                .any(|record| record.plan_sha256 != first.plan_sha256)
+        }) {
+            report.errors.push(format!(
+                "{name}: mixed canonical-plan hashes in one undo journal; automatic thaw refused"
+            ));
+            continue;
+        }
+        let mut due = Vec::new();
+        for record in &records {
+            match freeze_lease_due(record, clock) {
+                Ok(true) => due.push(record),
+                Ok(false) => {}
+                Err(error) => report
+                    .errors
+                    .push(format!("{name}/{}: {error}", record.attempt_id)),
+            }
+        }
+        // A repeatedly refused receipt cannot monopolize the action budget.
+        due.sort_by_key(|record| (record.restorations.len(), record.sequence));
+        for record in due {
+            let lease = record.freeze_lease.as_ref().expect("due lease");
+            report.candidates.push(FreezeRecoveryCandidate {
+                session_id: name.clone(),
+                action_id: record.action_id.clone(),
+                attempt_id: record.attempt_id.clone(),
+                target: record.target.clone(),
+                expires_boottime_ms: lease.expires_boottime_ms,
+            });
+            if report.outcomes.len() >= limits.actions
+                || check_recovery_deadline(Some(deadline)).is_err()
+            {
+                report.budget_exhausted = true;
+                return Ok(report);
+            }
+            let result = (|| {
+                check_recovery_directory(sessions_root, &root)?;
+                check_recovery_directory(&session_path, &session)?;
+                check_recovery_directory(
+                    &pinned_directory(&session).join("action"),
+                    &action_directory,
+                )?;
+                directory.revalidate()?;
+                let mut journal = ReversalJournal::new(
+                    sessions_root.join(name).join("action"),
+                    name,
+                    &record.plan_sha256,
+                    sessions_root,
+                )?;
+                // Retain the opened action directory through restoration; a
+                // replaced pathname cannot redirect either receipt write.
+                journal.directory = directory.path.clone();
+                // The trailing component lets O_NOFOLLOW open the pinned root
+                // itself. Ownership checks must inspect this same physical
+                // session collection even if its pathname is replaced.
+                journal.sessions_root = pinned_directory(&root).join(".");
+                restore(
+                    &journal,
+                    &lease.approved_action,
+                    &record.attempt_id,
+                    clock,
+                    deadline,
+                )
+            })();
+            let (outcome, error) = match result {
+                Ok(outcome) => (Some(outcome), None),
+                Err(error) => (None, Some(error.to_string())),
+            };
+            report.outcomes.push(FreezeRecoveryResult {
+                session_id: name.clone(),
+                action_id: record.action_id.clone(),
+                attempt_id: record.attempt_id.clone(),
+                outcome,
+                error,
+            });
+        }
+    }
+    report.next_session = None;
+    Ok(report)
 }
 
 #[cfg(target_os = "linux")]
@@ -1069,6 +1695,9 @@ fn validate_record(record: &ReversalRecord) -> Result<(), ActionError> {
             }
         }
     }
+    if let Some(lease) = &record.freeze_lease {
+        lease.validate(record)?;
+    }
     for outcome in &record.restorations {
         if outcome.attempt_id != record.attempt_id
             || outcome.action_id != record.action_id
@@ -1273,6 +1902,16 @@ fn read_stored_records(
     session_id: &str,
     plan_sha256: Option<&str>,
 ) -> Result<Vec<ReversalRecord>, ActionError> {
+    read_stored_records_with(directory, session_id, plan_sha256, || Ok(()))
+}
+
+#[cfg(target_os = "linux")]
+fn read_stored_records_with(
+    directory: &JournalDirectory,
+    session_id: &str,
+    plan_sha256: Option<&str>,
+    mut before_read: impl FnMut() -> Result<(), ActionError>,
+) -> Result<Vec<ReversalRecord>, ActionError> {
     directory.revalidate()?;
     let mut records = Vec::new();
     for (index, entry) in fs::read_dir(directory.pinned())
@@ -1297,6 +1936,7 @@ fn read_stored_records(
         if records.len() >= MAX_RECEIPTS {
             return Err(failed("undo receipt limit exceeded"));
         }
+        before_read()?;
         let bytes = read_bounded(open_private_file(&entry.path())?, MAX_RECEIPT_BYTES)?;
         let record: ReversalRecord = serde_json::from_slice(&bytes)
             .map_err(|error| failed(format!("malformed undo receipt {id}: {error}")))?;
@@ -1331,6 +1971,17 @@ fn refuse_other_session_owner(
     operation: &ReversalOperation,
     own_session: Option<&str>,
 ) -> Result<(), ActionError> {
+    refuse_other_session_owner_before(sessions_root, operation, own_session, None)
+}
+
+#[cfg(target_os = "linux")]
+fn refuse_other_session_owner_before(
+    sessions_root: &Path,
+    operation: &ReversalOperation,
+    own_session: Option<&str>,
+    deadline: Option<Instant>,
+) -> Result<(), ActionError> {
+    check_recovery_deadline(deadline)?;
     if matches!(operation, ReversalOperation::Unsupported { .. }) {
         return Ok(());
     }
@@ -1342,6 +1993,7 @@ fn refuse_other_session_owner(
         .map_err(|error| failed(format!("cannot inspect shared undo ownership: {error}")))?
         .enumerate()
     {
+        check_recovery_deadline(deadline)?;
         if index >= MAX_RECEIPTS {
             return Err(failed(
                 "session limit prevents a complete undo ownership check",
@@ -1397,7 +2049,8 @@ fn refuse_other_session_owner(
         };
         // Foreign plans may have changed or disappeared. Their unresolved
         // receipts still own a controller; a current plan mismatch must not hide them.
-        let records = read_stored_records(&directory, name, None)?;
+        let records =
+            read_stored_records_with(&directory, name, None, || check_recovery_deadline(deadline))?;
         receipts_read = receipts_read
             .checked_add(records.len())
             .ok_or_else(|| failed("undo ownership count overflow"))?;
@@ -1749,7 +2402,11 @@ impl ReversalScope {
 }
 
 #[cfg(target_os = "linux")]
-fn restore_live(record: &ReversalRecord) -> Result<bool, ActionError> {
+fn restore_live_before(
+    record: &ReversalRecord,
+    deadline: Option<Instant>,
+) -> Result<bool, ActionError> {
+    check_recovery_deadline(deadline)?;
     if record.status == ReversalStatus::NotApplied {
         return Err(failed("a known-unsent pause has no control to restore"));
     }
@@ -1777,6 +2434,7 @@ fn restore_live(record: &ReversalRecord) -> Result<bool, ActionError> {
     let handle = open_directory(&directory)?;
     let pinned = pinned_directory(&handle);
     let revalidate = || -> Result<(), ActionError> {
+        check_recovery_deadline(deadline)?;
         if let Some(plan) = &record.memory_cap {
             super::memory_cap::validate_live_scope(&record.target, plan)?;
         }
@@ -1791,9 +2449,40 @@ fn restore_live(record: &ReversalRecord) -> Result<bool, ActionError> {
                 "recorded cgroup directory, mount, namespace, or boot changed",
             ));
         }
-        super::dispatch::ensure_exclusive_cgroup_path(record.target.pid.0, &pinned)
+        super::dispatch::ensure_exclusive_cgroup_path(record.target.pid.0, &pinned)?;
+        check_recovery_deadline(deadline)
     };
-    restore_record_at(record, &pinned, revalidate)
+    if let Some(deadline) = deadline {
+        let remaining_ms = u64::try_from(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        if remaining_ms == 0 {
+            return Err(ActionError::Timeout);
+        }
+        let ReversalOperation::CgroupV2 {
+            before,
+            applied,
+            verify_timeout_ms,
+            ..
+        } = &record.operation
+        else {
+            return Err(failed("automatic thaw requires a cgroup control"));
+        };
+        restore_control_before(
+            &pinned,
+            before,
+            applied,
+            (*verify_timeout_ms).min(remaining_ms),
+            !record.is_restored(),
+            Some(deadline),
+            revalidate,
+        )
+    } else {
+        restore_record_at(record, &pinned, revalidate)
+    }
 }
 
 /// The observation path deliberately invokes no restoration writer or journal
@@ -2222,6 +2911,28 @@ fn restore_control_at(
     allow_write: bool,
     revalidate: impl Fn() -> Result<(), ActionError>,
 ) -> Result<bool, ActionError> {
+    restore_control_before(
+        directory,
+        before,
+        applied,
+        verify_timeout_ms,
+        allow_write,
+        None,
+        revalidate,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn restore_control_before(
+    directory: &Path,
+    before: &ReversalValue,
+    applied: &ReversalValue,
+    verify_timeout_ms: u64,
+    allow_write: bool,
+    deadline: Option<Instant>,
+    revalidate: impl Fn() -> Result<(), ActionError>,
+) -> Result<bool, ActionError> {
+    check_recovery_deadline(deadline)?;
     revalidate()?;
     let current = read_control(directory, applied)?;
     let changed = needs_restore(before, applied, &current)?;
@@ -2249,6 +2960,7 @@ fn restore_control_at(
         )?;
     }
     if changed {
+        check_recovery_deadline(deadline)?;
         if let ReversalValue::MemoryHigh { limit_bytes } = before {
             super::memory_cap::check_restore_floor(directory, *limit_bytes)?;
             super::memory_cap::write_memory_high(directory, *limit_bytes)?;
@@ -2386,6 +3098,464 @@ mod tests {
             ReversalValue::Freeze { requested: false },
             ReversalValue::Freeze { requested: true },
         )
+    }
+
+    fn freeze_clock(boottime_ms: u64) -> FreezeRecoveryClock {
+        FreezeRecoveryClock {
+            boot_id: BOOT.to_string(),
+            boottime_ms,
+            time_namespace_device: 71,
+            time_namespace_inode: 72,
+        }
+    }
+
+    fn leased_freeze(
+        journal: &ReversalJournal,
+        pid: u32,
+        status: ReversalStatus,
+    ) -> (PlanAction, ReversalRecord) {
+        let mut action = action(Action::Freeze);
+        action.action_id = format!("freeze-{pid}");
+        action.target =
+            ProcessIdentity::new(pid, pt_common::StartId::from_linux(BOOT, 456, pid), 1000);
+        let mut operation = freeze_operation();
+        if let ReversalOperation::CgroupV2 { scope, .. } = &mut operation {
+            scope.inode = u64::from(pid);
+            scope.cgroup_path = format!("/owned-{pid}");
+        }
+        let lease = freeze_clock(1000)
+            .lease(&action, &journal.plan_sha256)
+            .unwrap();
+        let record = journal
+            .insert_with_lease(&action, operation, status, Some(lease))
+            .unwrap();
+        (action, record)
+    }
+
+    #[test]
+    fn freeze_leases_expire_on_boot_time_and_preserve_clock_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = journal(temp.path());
+        let (_, record) = leased_freeze(&journal, 123, ReversalStatus::Prepared);
+        let expires = 1000 + DEFAULT_FREEZE_TTL_SECS * 1000;
+        assert!(!freeze_lease_due(&record, &freeze_clock(expires - 1)).unwrap());
+        assert!(freeze_lease_due(&record, &freeze_clock(expires)).unwrap());
+        assert!(freeze_lease_due(&record, &freeze_clock(expires + 1)).unwrap());
+
+        let mut rebooted = freeze_clock(expires);
+        rebooted.boot_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee".into();
+        assert!(!freeze_lease_due(&record, &rebooted).unwrap());
+        let mut other_namespace = freeze_clock(expires);
+        other_namespace.time_namespace_inode += 1;
+        assert!(freeze_lease_due(&record, &other_namespace).is_err());
+        assert!(freeze_lease_due(&record, &freeze_clock(999)).is_err());
+        assert!(freeze_clock(u64::MAX)
+            .lease(&action(Action::Freeze), &journal.plan_sha256)
+            .is_err());
+
+        // Wall-clock jumps do not decide whether the boot-clock lease is due.
+        let mut wall_clock_changed = record.clone();
+        wall_clock_changed.prepared_at = "2099-01-01T00:00:00Z".into();
+        wall_clock_changed.updated_at = "1970-01-01T00:00:00Z".into();
+        assert!(freeze_lease_due(&wall_clock_changed, &freeze_clock(expires)).unwrap());
+    }
+
+    #[test]
+    fn freeze_lease_cannot_authorize_another_action_or_a_preexisting_freeze() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = journal(temp.path());
+        let (action, record) = leased_freeze(&journal, 123, ReversalStatus::Verified);
+        for altered in [
+            "target",
+            "snapshot",
+            "plan",
+            "duration",
+            "preexisting",
+            "kind",
+        ] {
+            let mut changed = record.clone();
+            match altered {
+                "target" => changed.target.uid += 1,
+                "snapshot" => changed.freeze_lease.as_mut().unwrap().approved_action.order += 1,
+                "plan" => {
+                    changed.freeze_lease.as_mut().unwrap().approved_plan_sha256 = "b".repeat(64)
+                }
+                "duration" => changed.freeze_lease.as_mut().unwrap().expires_boottime_ms += 1,
+                "preexisting" => {
+                    if let ReversalOperation::CgroupV2 { before, .. } = &mut changed.operation {
+                        *before = ReversalValue::Freeze { requested: true };
+                    }
+                }
+                _ => changed.action = Action::Unfreeze,
+            }
+            assert!(
+                validate_record(&changed).is_err(),
+                "accepted changed {altered}"
+            );
+        }
+        let clock = freeze_clock(1000 + DEFAULT_FREEZE_TTL_SECS * 1000);
+        let mut old = serde_json::to_value(&record).unwrap();
+        old.as_object_mut().unwrap().remove("freeze_lease");
+        let old: ReversalRecord = serde_json::from_value(old).unwrap();
+        validate_record(&old).unwrap();
+        assert!(!freeze_lease_due(&old, &clock).unwrap());
+
+        let mut restored = record;
+        restored.restorations.push(restored_outcome(&restored));
+        assert!(!freeze_lease_due(&restored, &clock).unwrap());
+        assert!(journal.inspect(&action).unwrap()[0].restorations.is_empty());
+    }
+
+    #[test]
+    fn expired_freeze_recovery_uses_the_durable_snapshot_and_restores_only_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = journal(temp.path());
+        let (action, record) = leased_freeze(&journal, 123, ReversalStatus::Prepared);
+        // The crash-recovery evidence is durable before any fixture control is
+        // changed. The mutable session plan is deliberately unrelated now.
+        let saved = journal.inspect(&action).unwrap();
+        assert_eq!(saved[0].status, ReversalStatus::Prepared);
+        assert!(saved[0].freeze_lease.is_some());
+        let decision = journal
+            .sessions_root
+            .join(&journal.session_id)
+            .join("decision");
+        fs::create_dir_all(&decision).unwrap();
+        fs::write(decision.join("plan.json"), "a later, unrelated plan").unwrap();
+        let control = temp.path().join("fixture-control");
+        fs::create_dir(&control).unwrap();
+        fs::write(control.join("cgroup.freeze"), "1").unwrap();
+        fs::write(control.join("cgroup.events"), "populated 1\nfrozen 1\n").unwrap();
+        let expired = freeze_clock(record.freeze_lease.as_ref().unwrap().expires_boottime_ms);
+
+        let early = recover_expired_freezes_with(
+            &journal.sessions_root,
+            None,
+            &freeze_clock(expired.boottime_ms - 1),
+            &FreezeRecoveryLimits::default(),
+            |_, _, _, _, _| panic!("early thaw"),
+        )
+        .unwrap();
+        assert!(early.outcomes.is_empty());
+        assert_eq!(
+            fs::read_to_string(control.join("cgroup.freeze")).unwrap(),
+            "1"
+        );
+
+        let report = recover_expired_freezes_with(
+            &journal.sessions_root,
+            None,
+            &expired,
+            &FreezeRecoveryLimits::default(),
+            |journal, action, attempt, clock, deadline| {
+                journal.restore_before_with(
+                    action,
+                    Some(attempt),
+                    Some((clock, deadline)),
+                    |record, _| {
+                        // This fixture models acknowledgement after a real ordinary
+                        // file write; it does not pretend to be a kernel cgroup.
+                        restore_record_at(record, &control, || {
+                            if fs::read_to_string(control.join("cgroup.freeze")).unwrap() == "0" {
+                                fs::write(control.join("cgroup.events"), "populated 1\nfrozen 0\n")
+                                    .unwrap();
+                            }
+                            Ok(())
+                        })
+                    },
+                )
+            },
+        )
+        .unwrap();
+        assert!(report.errors.is_empty());
+        assert_eq!(report.candidates.len(), 1);
+        assert_eq!(report.outcomes.len(), 1);
+        let restored = report.outcomes[0].outcome.as_ref().unwrap();
+        assert_eq!(restored.status, RestorationStatus::Restored);
+        assert_eq!(restored.changed, Some(true));
+        assert_eq!(
+            fs::read_to_string(control.join("cgroup.freeze")).unwrap(),
+            "0"
+        );
+        assert_eq!(
+            journal.inspect(&action).unwrap()[0].restorations[0].restore_id,
+            restored.restore_id
+        );
+        let repeat = recover_expired_freezes_with(
+            &journal.sessions_root,
+            None,
+            &expired,
+            &FreezeRecoveryLimits::default(),
+            |_, _, _, _, _| panic!("a restored lease cannot authorize another thaw"),
+        )
+        .unwrap();
+        assert!(repeat.candidates.is_empty());
+        assert!(repeat.outcomes.is_empty());
+
+        let different_plan = ReversalJournal::new(
+            journal
+                .sessions_root
+                .join(&journal.session_id)
+                .join("action"),
+            &journal.session_id,
+            "b".repeat(64),
+            &journal.sessions_root,
+        )
+        .unwrap();
+        assert!(
+            different_plan.inspect(&action).is_err(),
+            "ordinary undo retains exact plan binding"
+        );
+    }
+
+    #[test]
+    fn automatic_thaw_persists_real_identity_refusal_without_touching_a_control() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = journal(temp.path());
+        let (action, record) = leased_freeze(&journal, u32::MAX, ReversalStatus::Failed);
+        let clock = freeze_clock(record.freeze_lease.as_ref().unwrap().expires_boottime_ms);
+        let report = recover_expired_freezes_with(
+            &journal.sessions_root,
+            None,
+            &clock,
+            &FreezeRecoveryLimits::default(),
+            |journal, action, attempt, clock, deadline| {
+                journal.restore_before(action, Some(attempt), Some((clock, deadline)))
+            },
+        )
+        .unwrap();
+        let outcome = report.outcomes[0].outcome.as_ref().unwrap();
+        assert_eq!(outcome.status, RestorationStatus::Failed);
+        assert!(outcome.changed.is_none());
+        assert!(outcome.detail.as_ref().unwrap().contains("identity"));
+        let persisted = journal.inspect(&action).unwrap();
+        assert_eq!(persisted[0].restorations[0].restore_id, outcome.restore_id);
+    }
+
+    #[test]
+    fn automatic_thaw_refuses_newer_owners_before_the_controller_writer() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = journal(temp.path());
+        let (action, record) = leased_freeze(&journal, 123, ReversalStatus::Verified);
+        let mut later = action.clone();
+        later.action_id = "later-unfreeze".into();
+        later.action = Action::Unfreeze;
+        let mut operation = record.operation.clone();
+        if let ReversalOperation::CgroupV2 {
+            before, applied, ..
+        } = &mut operation
+        {
+            *before = ReversalValue::Freeze { requested: true };
+            *applied = ReversalValue::Freeze { requested: false };
+        }
+        journal
+            .insert(&later, operation, ReversalStatus::Applied)
+            .unwrap();
+        let clock = freeze_clock(record.freeze_lease.as_ref().unwrap().expires_boottime_ms);
+        let report = recover_expired_freezes_with(
+            &journal.sessions_root,
+            None,
+            &clock,
+            &FreezeRecoveryLimits::default(),
+            |journal, action, attempt, clock, deadline| {
+                journal.restore_before_with(
+                    action,
+                    Some(attempt),
+                    Some((clock, deadline)),
+                    |_, _| panic!("a newer owner must block the controller writer"),
+                )
+            },
+        )
+        .unwrap();
+        let outcome = report.outcomes[0].outcome.as_ref().unwrap();
+        assert_eq!(outcome.status, RestorationStatus::Failed);
+        assert!(outcome
+            .detail
+            .as_ref()
+            .unwrap()
+            .contains("later recorded action"));
+    }
+
+    #[test]
+    fn automatic_thaw_backs_off_failures_and_preserves_manual_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = journal(temp.path());
+        let (action, record) = leased_freeze(&journal, 123, ReversalStatus::Prepared);
+        let mut clock = freeze_clock(record.freeze_lease.as_ref().unwrap().expires_boottime_ms);
+        for attempt in 1..=MAX_AUTOMATIC_THAW_ATTEMPTS {
+            let outcome = journal
+                .restore_before_with(
+                    &action,
+                    Some(&record.attempt_id),
+                    Some((&clock, Instant::now() + Duration::from_secs(60))),
+                    |_, _| Err(failed("temporary fixture refusal")),
+                )
+                .unwrap();
+            assert_eq!(outcome.status, RestorationStatus::Failed);
+            let saved = journal.inspect(&action).unwrap().remove(0);
+            assert_eq!(
+                saved.freeze_lease.as_ref().unwrap().recovery_attempts,
+                attempt
+            );
+            if attempt < MAX_AUTOMATIC_THAW_ATTEMPTS {
+                assert!(!freeze_lease_due(&saved, &clock).unwrap());
+                // Recovery remains deferred even just before the exact retry
+                // boundary; neither daemon polling nor wall time can bypass it.
+                clock.boottime_ms += (60_000_u64 << (attempt - 1)).min(3_600_000) - 1;
+                assert!(!freeze_lease_due(&saved, &clock).unwrap());
+                clock.boottime_ms += 1;
+                assert!(freeze_lease_due(&saved, &clock).unwrap());
+            } else {
+                assert!(freeze_lease_due(&saved, &clock).is_err());
+            }
+        }
+        let outcome = journal
+            .restore_before_with(&action, Some(&record.attempt_id), None, |_, _| Ok(false))
+            .unwrap();
+        assert_eq!(outcome.status, RestorationStatus::Restored);
+        let saved = journal.inspect(&action).unwrap().remove(0);
+        assert_eq!(
+            saved.restorations.len(),
+            usize::from(MAX_AUTOMATIC_THAW_ATTEMPTS) + 1
+        );
+        assert!(!freeze_lease_due(&saved, &clock).unwrap());
+    }
+
+    #[test]
+    fn freeze_recovery_budgets_rotate_sessions_and_do_not_starve_untried_receipts() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        let first = journal_in_sessions(&sessions, "pt-20261108-120000-abcd");
+        let second = journal_in_sessions(&sessions, "pt-20261108-120001-abcd");
+        leased_freeze(&first, 123, ReversalStatus::Prepared);
+        leased_freeze(&first, 124, ReversalStatus::Prepared);
+        leased_freeze(&second, 125, ReversalStatus::Prepared);
+        let clock = freeze_clock(1000 + DEFAULT_FREEZE_TTL_SECS * 1000);
+        let limits = FreezeRecoveryLimits {
+            actions: 1,
+            ..FreezeRecoveryLimits::default()
+        };
+        let refuse = |journal: &ReversalJournal,
+                      action: &PlanAction,
+                      attempt: &str,
+                      clock: &FreezeRecoveryClock,
+                      deadline| {
+            journal.restore_before_with(action, Some(attempt), Some((clock, deadline)), |_, _| {
+                Err(failed("fixture live scope refused"))
+            })
+        };
+        let one = recover_expired_freezes_with(&sessions, None, &clock, &limits, refuse).unwrap();
+        assert!(one.budget_exhausted);
+        assert_eq!(one.outcomes.len(), 1);
+        let two = recover_expired_freezes_with(
+            &sessions,
+            one.next_session.as_deref(),
+            &clock,
+            &limits,
+            refuse,
+        )
+        .unwrap();
+        assert_eq!(two.outcomes.len(), 1);
+        assert_ne!(one.outcomes[0].session_id, two.outcomes[0].session_id);
+        let three = recover_expired_freezes_with(
+            &sessions,
+            two.next_session.as_deref(),
+            &clock,
+            &limits,
+            refuse,
+        )
+        .unwrap();
+        assert_eq!(three.outcomes[0].session_id, one.outcomes[0].session_id);
+        assert_ne!(three.outcomes[0].attempt_id, one.outcomes[0].attempt_id);
+
+        for limits in [
+            FreezeRecoveryLimits {
+                wall: Duration::ZERO,
+                ..FreezeRecoveryLimits::default()
+            },
+            FreezeRecoveryLimits {
+                receipts: 1,
+                ..FreezeRecoveryLimits::default()
+            },
+        ] {
+            let report =
+                recover_expired_freezes_with(&sessions, None, &clock, &limits, |_, _, _, _, _| {
+                    panic!("an exhausted or partial scan cannot begin a restoration")
+                })
+                .unwrap();
+            assert!(report.budget_exhausted);
+            assert!(report.outcomes.is_empty());
+            assert!(report.receipts_inspected <= limits.receipts);
+        }
+    }
+
+    #[test]
+    fn automatic_thaw_rejects_mixed_plan_hashes_and_expired_write_budgets() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = journal(temp.path());
+        let (action, record) = leased_freeze(&journal, 123, ReversalStatus::Prepared);
+        let clock = freeze_clock(record.freeze_lease.as_ref().unwrap().expires_boottime_ms);
+        assert!(matches!(
+            journal.restore_before_with(
+                &action,
+                Some(&record.attempt_id),
+                Some((&clock, Instant::now())),
+                |_, _| panic!("expired recovery cannot write"),
+            ),
+            Err(ActionError::Timeout)
+        ));
+        assert!(journal.inspect(&action).unwrap()[0].restorations.is_empty());
+
+        let mut mixed = record;
+        mixed.attempt_id = uuid::Uuid::new_v4().to_string();
+        mixed.sequence += 1;
+        mixed.plan_sha256 = "b".repeat(64);
+        mixed.freeze_lease.as_mut().unwrap().approved_plan_sha256 = mixed.plan_sha256.clone();
+        let directory = JournalDirectory::open(journal.directory(), false)
+            .unwrap()
+            .unwrap();
+        journal.write_record(&directory, &mixed, true).unwrap();
+        let report = recover_expired_freezes_with(
+            &journal.sessions_root,
+            None,
+            &clock,
+            &FreezeRecoveryLimits::default(),
+            |_, _, _, _, _| panic!("mixed plans cannot authorize automatic recovery"),
+        )
+        .unwrap();
+        assert!(report.outcomes.is_empty());
+        assert!(report.errors[0].contains("mixed canonical-plan hashes"));
+    }
+
+    #[test]
+    fn freeze_recovery_keeps_the_complete_ownership_session_ceiling() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        let journal = journal_in_sessions(&sessions, "pt-20261108-120000-abcd");
+        let (action, record) = leased_freeze(&journal, 123, ReversalStatus::Prepared);
+        journal_in_sessions(&sessions, "pt-20261108-120001-abcd");
+        journal_in_sessions(&sessions, "pt-20261108-120002-abcd");
+        let limits = FreezeRecoveryLimits {
+            session_entries: 2,
+            ..FreezeRecoveryLimits::default()
+        };
+        let clock = freeze_clock(record.freeze_lease.as_ref().unwrap().expires_boottime_ms);
+        let error =
+            recover_expired_freezes_with(&sessions, None, &clock, &limits, |_, _, _, _, _| {
+                panic!("a partial ownership history cannot authorize a thaw")
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("session-entry ceiling (2)"));
+        let retained = journal.inspect(&action).unwrap();
+        assert!(retained[0].restorations.is_empty());
+        assert_eq!(
+            retained[0].freeze_lease.as_ref().unwrap().recovery_attempts,
+            0
+        );
+        assert_eq!(
+            FreezeRecoveryLimits::default().session_entries,
+            MAX_RECEIPTS
+        );
     }
 
     fn renice_operation(action: &PlanAction) -> ReversalOperation {

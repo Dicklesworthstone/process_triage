@@ -111,7 +111,7 @@ Every process on your system passes through a five-stage pipeline:
 
 **Decide** picks the action with the lowest expected loss under the policy's loss matrix, among the actions feasible for the process state, then applies protection, supervision and policy enforcement. It evaluates Keep, Renice, Pause, Freeze, Throttle, CapMemory, Quarantine, Restart and Kill.
 
-**Act** re-verifies identity (exact start time; a pidfd on Linux) and runs live pre-checks immediately before each signal, then escalates SIGTERM → SIGKILL. Renice, pause/resume and kill run on Linux and macOS; freeze, throttle and quarantine are Linux-only and refused unless the target owns its cgroup. Failures are reported; there is no automatic rollback.
+**Act** re-verifies identity (exact start time; a pidfd on Linux) and runs live pre-checks immediately before each signal, then escalates SIGTERM → SIGKILL. Renice, pause/resume and kill run on Linux and macOS; freeze, throttle and quarantine are Linux-only and refused unless the target owns its cgroup. Failures are reported. New journaled freezes have an expiry lease; other controls require explicit restoration.
 
 Kill execution always tries `SIGTERM` first. For an individual Linux target, two complete identity-bound observations of `SigIgn` and `SigCgt` can establish that TERM is ignored and skip the otherwise futile grace period. Caught handlers, unavailable or changed evidence, weaker identities, and process-group actions retain the configured grace, bounded by the saved action timeout. The saved `signal_outcome` records successful signal deliveries, the escalation reason, and measured timing; these delivery facts remain separate from verification that the process exited.
 
@@ -1710,6 +1710,34 @@ Plans with retained receipts keep their original bytes. To plan again, create
 a new session by omitting `agent plan --session`; replacing the old plan would
 invalidate the evidence needed for undo and verification.
 
+**Expiring freezes.** A new Linux `Freeze` from `agent apply` records a fixed
+30-minute lease before changing `cgroup.freeze` from `0` to `1`. The deadline
+uses the suspend-aware boot clock and records its time namespace, so wall-clock
+adjustments cannot bring the thaw forward. A request that was already frozen,
+an old receipt without a lease, and an unjournaled TUI freeze acquire no automatic
+thaw authority.
+
+The running daemon attempts recovery after expiry, including ticks on which
+normal planning is deferred by its overhead budget. Recovery holds the same
+execution lock as apply and undo, checks the original process identity, cgroup,
+boot and namespaces, and refuses conflicting owners or changed controls. It
+retains the exact approved action in the receipt, so later plan-file changes
+cannot strand that lease. Successful and refused restorations remain in the
+durable journal, and daemon state retains the recovery report and continuation
+cursor. Work is bounded per tick; lock contention, budget limits, and failed
+identity checks are reported rather than claimed as successful thaws. No
+background timer is created by `agent apply`: without a running recovery path,
+the deadline alone does not change the kernel's freezer state. Dry-run, shadow,
+and read-only inspection paths never perform recovery.
+
+Refused automatic thaws use persisted exponential backoff, starting at one
+minute and capped at one hour, with at most eight automatic attempts per lease.
+Manual `agent undo` remains available afterward. Each pass inspects at most 64
+sessions and 4,096 receipts, attempts at most 16 restorations, and stops starting
+work after two seconds. The existing complete ownership check also has a
+4,096-entry session-history ceiling; exceeding it reports an error and requires
+attention instead of skipping ownership evidence.
+
 `agent verify` distinguishes a **confirmed restoration** from a missing
 original action effect. After a successful undo, it independently checks the
 saved original control and current process/cgroup binding, then reports
@@ -1763,7 +1791,7 @@ Kill action failed (Timeout)
 | Identity mismatch | Abort (PID reused; wrong process) | Re-scan and re-plan |
 | Resource conflict | Wait and retry with backoff | Skip |
 
-Recovery is always *forward* (escalate to more forceful actions), never backward (no automatic undo). Reversal metadata is captured so a human can manually undo if needed.
+These failure-recovery trees describe escalation and diagnosis. Explicit undo restores recorded controls; the separate freeze-lease recovery path conditionally releases only an expired, owned freeze request.
 
 ---
 

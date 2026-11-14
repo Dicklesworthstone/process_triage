@@ -14739,6 +14739,17 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
             }
         }
 
+        // Expired, owned freezes must be recoverable even while planning backs
+        // off for overhead. The bounded pass releases the execution lock before
+        // metric collection or any new planning work.
+        #[cfg(target_os = "linux")]
+        daemon_recover_expired_freezes(
+            global,
+            resolve_data_dir_for_lock().as_deref(),
+            &mut state_bundle,
+            recover_expired_freezes_locked,
+        );
+
         let metrics = collect_daemon_metrics();
         let now_secs = daemon_now_secs();
 
@@ -14910,7 +14921,9 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
 
         // Persist notification escalation state.
         state_bundle.notifications = notify_mgr.persisted_state();
-        let _ = save_daemon_state(&state_path, &state_bundle);
+        if let Err(error) = save_daemon_state(&state_path, &state_bundle) {
+            eprintln!("daemon: cannot persist state and recovery events: {error}");
+        }
 
         if DAEMON_SIGNALS.should_stop() {
             break;
@@ -16984,6 +16997,23 @@ fn cleanup_daemon_pid_if_owned(pid: u32) {
     }
 }
 
+/// Run only while the caller holds this data directory's execution-policy
+/// lock, after dry-run/shadow guards. Top-level scan failures retain the cursor
+/// and remain visible to callers; discovery never implies restoration.
+#[cfg(all(target_os = "linux", feature = "daemon"))]
+fn recover_expired_freezes_locked(
+    sessions_root: &Path,
+    after_session: Option<&str>,
+) -> pt_core::action::reversal::FreezeRecoveryReport {
+    pt_core::action::reversal::recover_expired_freezes(sessions_root, after_session).unwrap_or_else(
+        |error| pt_core::action::reversal::FreezeRecoveryReport {
+            errors: vec![format!("automatic freeze recovery failed: {error}")],
+            next_session: after_session.map(str::to_owned),
+            ..pt_core::action::reversal::FreezeRecoveryReport::default()
+        },
+    )
+}
+
 #[cfg(feature = "daemon")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DaemonStateBundle {
@@ -16992,6 +17022,13 @@ struct DaemonStateBundle {
     escalation: pt_core::daemon::escalation::EscalationState,
     #[serde(default)]
     notifications: pt_core::decision::escalation::PersistedEscalationState,
+    /// Continue bounded recovery across ticks and daemon restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    freeze_recovery_cursor: Option<String>,
+    /// Actual results of the most recent recovery pass, including refusals and
+    /// diagnostics. Lock contention leaves this previous pass intact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_freeze_recovery: Option<pt_core::action::reversal::FreezeRecoveryReport>,
 }
 
 #[cfg(feature = "daemon")]
@@ -17013,6 +17050,8 @@ fn load_daemon_state(path: &Path, config: &pt_core::daemon::DaemonConfig) -> Dae
         triggers: pt_core::daemon::triggers::TriggerState::new(&config.triggers),
         escalation: pt_core::daemon::escalation::EscalationState::new(),
         notifications: pt_core::decision::escalation::PersistedEscalationState::default(),
+        freeze_recovery_cursor: None,
+        last_freeze_recovery: None,
     }
 }
 
@@ -17027,6 +17066,113 @@ fn save_daemon_state(path: &Path, state: &DaemonStateBundle) -> std::io::Result<
     std::fs::write(&tmp, content)?;
     std::fs::rename(tmp, path)?;
     Ok(())
+}
+
+#[cfg(all(feature = "daemon", target_os = "linux"))]
+fn daemon_recover_expired_freezes(
+    global: &GlobalOpts,
+    data_dir: Option<&Path>,
+    state: &mut DaemonStateBundle,
+    recover: impl FnOnce(&Path, Option<&str>) -> pt_core::action::reversal::FreezeRecoveryReport,
+) {
+    use pt_core::daemon::DaemonEventType;
+
+    // Preview modes do not even create an execution lock or inspect receipts.
+    if global.dry_run || global.shadow {
+        return;
+    }
+    let Some(data_dir) = data_dir else {
+        state.daemon.record_event(
+            DaemonEventType::FreezeRecoveryFailed,
+            "freeze recovery not attempted: cannot resolve execution data directory",
+        );
+        return;
+    };
+    let lock = match GlobalLock::try_acquire(&data_dir.join(".execution-policy-lock")) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            state.daemon.record_event(
+                DaemonEventType::FreezeRecoveryDeferred,
+                "freeze recovery deferred: execution-policy lock held; cursor retained",
+            );
+            return;
+        }
+        Err(error) => {
+            state.daemon.record_event(
+                DaemonEventType::FreezeRecoveryFailed,
+                &format!("freeze recovery not attempted: execution-policy lock error: {error}"),
+            );
+            return;
+        }
+    };
+    let sessions = pt_core::session::SessionStore::at_data_dir(data_dir);
+    let report = recover(
+        sessions.sessions_root(),
+        state.freeze_recovery_cursor.as_deref(),
+    );
+    drop(lock);
+    record_daemon_freeze_recovery(state, report);
+}
+
+#[cfg(all(feature = "daemon", target_os = "linux"))]
+fn record_daemon_freeze_recovery(
+    state: &mut DaemonStateBundle,
+    report: pt_core::action::reversal::FreezeRecoveryReport,
+) {
+    use pt_core::action::reversal::RestorationStatus;
+    use pt_core::daemon::DaemonEventType;
+
+    let mut restored = 0;
+    let mut changed = 0;
+    let mut refused_or_failed = 0;
+    let mut errors = report.errors.len();
+    let mut deferred_known = report
+        .candidates
+        .len()
+        .saturating_sub(report.outcomes.len());
+    for result in &report.outcomes {
+        if result.error.is_some() {
+            errors += 1;
+            refused_or_failed += 1;
+            continue;
+        }
+        match &result.outcome {
+            Some(outcome) if outcome.status == RestorationStatus::Restored => {
+                restored += 1;
+                changed += usize::from(outcome.changed == Some(true));
+            }
+            Some(outcome) if outcome.status == RestorationStatus::Failed => {
+                refused_or_failed += 1;
+            }
+            // An incomplete/unexpected result never counts as a thaw.
+            _ => deferred_known += 1,
+        }
+    }
+    let event_type = if refused_or_failed > 0 || errors > 0 {
+        DaemonEventType::FreezeRecoveryFailed
+    } else if report.budget_exhausted || deferred_known > 0 {
+        DaemonEventType::FreezeRecoveryDeferred
+    } else {
+        DaemonEventType::FreezeRecoveryCompleted
+    };
+    state.daemon.record_event(
+        event_type,
+        &format!(
+            "freeze recovery: sessions={} receipts={} due={} restored={} changed={} \
+             refused_or_failed={} errors={} deferred_known={} budget_exhausted={}",
+            report.sessions_inspected,
+            report.receipts_inspected,
+            report.candidates.len(),
+            restored,
+            changed,
+            refused_or_failed,
+            errors,
+            deferred_known,
+            report.budget_exhausted,
+        ),
+    );
+    state.freeze_recovery_cursor = report.next_session.clone();
+    state.last_freeze_recovery = Some(report);
 }
 
 #[cfg(feature = "daemon")]
@@ -17223,6 +17369,262 @@ fn daemon_metrics_from_pressure(
         // state machine consumes this observed snapshot and never those fallbacks.
         pressure: Some(pressure),
         pressure_observed_at: None,
+    }
+}
+
+#[cfg(all(test, feature = "daemon", target_os = "linux"))]
+mod daemon_freeze_recovery_tests {
+    use super::*;
+    use pt_core::action::reversal::{
+        FreezeRecoveryCandidate, FreezeRecoveryReport, FreezeRecoveryResult, RestorationStatus,
+        ReversalOutcome,
+    };
+    use pt_core::daemon::DaemonEventType;
+
+    fn state(directory: &Path) -> DaemonStateBundle {
+        load_daemon_state(
+            &directory.join("daemon-state.json"),
+            &pt_core::daemon::DaemonConfig::default(),
+        )
+    }
+
+    #[test]
+    fn previews_never_lock_inspect_or_advance_recovery() {
+        for (dry_run, shadow) in [(true, false), (false, true), (true, true)] {
+            let directory = tempfile::tempdir().unwrap();
+            let data_dir = directory.path().join("must-remain-absent");
+            let mut global = Cli::try_parse_from(["pt-core", "daemon"]).unwrap().global;
+            global.dry_run = dry_run;
+            global.shadow = shadow;
+            let mut bundle = state(directory.path());
+            bundle.freeze_recovery_cursor = Some("retained-session".into());
+            let events = bundle.daemon.recent_events.len();
+            daemon_recover_expired_freezes(&global, Some(&data_dir), &mut bundle, |_, _| {
+                panic!("preview must not inspect recovery receipts")
+            });
+            assert!(!data_dir.exists());
+            assert_eq!(
+                bundle.freeze_recovery_cursor.as_deref(),
+                Some("retained-session")
+            );
+            assert!(bundle.last_freeze_recovery.is_none());
+            assert_eq!(bundle.daemon.recent_events.len(), events);
+        }
+    }
+
+    #[test]
+    fn contention_defers_then_holds_the_execution_lock_for_the_whole_pass() {
+        let directory = tempfile::tempdir().unwrap();
+        let lock_path = directory.path().join(".execution-policy-lock");
+        let guard = GlobalLock::try_acquire(&lock_path).unwrap().unwrap();
+        let global = Cli::try_parse_from(["pt-core", "daemon"]).unwrap().global;
+        let mut bundle = state(directory.path());
+        bundle.freeze_recovery_cursor = Some("old-session".into());
+        daemon_recover_expired_freezes(&global, Some(directory.path()), &mut bundle, |_, _| {
+            panic!("contended recovery must not run")
+        });
+        assert_eq!(
+            bundle.freeze_recovery_cursor.as_deref(),
+            Some("old-session")
+        );
+        assert!(bundle.last_freeze_recovery.is_none());
+        assert_eq!(
+            bundle.daemon.recent_events.back().unwrap().event_type,
+            DaemonEventType::FreezeRecoveryDeferred
+        );
+        drop(guard);
+
+        let mut calls = 0;
+        daemon_recover_expired_freezes(
+            &global,
+            Some(directory.path()),
+            &mut bundle,
+            |root, cursor| {
+                calls += 1;
+                assert_eq!(root, directory.path().join("sessions"));
+                assert_eq!(cursor, Some("old-session"));
+                assert!(GlobalLock::try_acquire(&lock_path).unwrap().is_none());
+                FreezeRecoveryReport {
+                    sessions_inspected: 64,
+                    budget_exhausted: true,
+                    next_session: Some("next-session".into()),
+                    ..FreezeRecoveryReport::default()
+                }
+            },
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(
+            bundle.freeze_recovery_cursor.as_deref(),
+            Some("next-session")
+        );
+        assert!(GlobalLock::try_acquire(&lock_path).unwrap().is_some());
+        assert_eq!(
+            bundle.daemon.recent_events.back().unwrap().event_type,
+            DaemonEventType::FreezeRecoveryDeferred
+        );
+        assert!(bundle
+            .daemon
+            .recent_events
+            .back()
+            .unwrap()
+            .detail
+            .contains("budget_exhausted=true"));
+    }
+
+    fn candidate(attempt: &str) -> FreezeRecoveryCandidate {
+        FreezeRecoveryCandidate {
+            session_id: "fixture-session".into(),
+            action_id: format!("action-{attempt}"),
+            attempt_id: attempt.into(),
+            target: pt_common::ProcessIdentity::new(
+                42,
+                pt_common::StartId("fixture-identity".into()),
+                1000,
+            ),
+            expires_boottime_ms: 1_800_000,
+        }
+    }
+
+    fn outcome(
+        attempt: &str,
+        status: RestorationStatus,
+        changed: Option<bool>,
+    ) -> FreezeRecoveryResult {
+        FreezeRecoveryResult {
+            session_id: "fixture-session".into(),
+            action_id: format!("action-{attempt}"),
+            attempt_id: attempt.into(),
+            outcome: Some(ReversalOutcome {
+                attempt_id: attempt.into(),
+                restore_id: format!("restore-{attempt}"),
+                action_id: format!("action-{attempt}"),
+                status,
+                changed,
+                detail: Some("recorded controller result".into()),
+                timestamp: "2026-11-14T00:00:00Z".into(),
+            }),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn actual_outcomes_errors_and_cursor_survive_daemon_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut bundle = state(directory.path());
+        let report = FreezeRecoveryReport {
+            sessions_inspected: 2,
+            receipts_inspected: 6,
+            candidates: ["a", "b", "c", "d", "e"]
+                .into_iter()
+                .map(candidate)
+                .collect(),
+            outcomes: vec![
+                outcome("a", RestorationStatus::Restored, Some(true)),
+                outcome("b", RestorationStatus::Restored, Some(false)),
+                outcome("c", RestorationStatus::Failed, None),
+                FreezeRecoveryResult {
+                    session_id: "fixture-session".into(),
+                    action_id: "action-d".into(),
+                    attempt_id: "d".into(),
+                    outcome: None,
+                    error: Some("process identity changed; no restoration".into()),
+                },
+            ],
+            errors: vec!["other-session: malformed receipt".into()],
+            budget_exhausted: true,
+            next_session: Some("next-session".into()),
+        };
+        record_daemon_freeze_recovery(&mut bundle, report);
+        let event = bundle.daemon.recent_events.back().unwrap();
+        assert_eq!(event.event_type, DaemonEventType::FreezeRecoveryFailed);
+        assert_eq!(
+            event.detail,
+            "freeze recovery: sessions=2 receipts=6 due=5 restored=2 changed=1 refused_or_failed=2 errors=2 deferred_known=1 budget_exhausted=true"
+        );
+        let path = directory.path().join("daemon-state.json");
+        save_daemon_state(&path, &bundle).unwrap();
+        let restored = state(directory.path());
+        assert_eq!(
+            restored.freeze_recovery_cursor.as_deref(),
+            Some("next-session")
+        );
+        let report = restored.last_freeze_recovery.as_ref().unwrap();
+        assert_eq!(report.outcomes.len(), 4);
+        assert_eq!(
+            report.outcomes[0].outcome.as_ref().unwrap().changed,
+            Some(true)
+        );
+        assert_eq!(report.outcomes[2].outcome.as_ref().unwrap().changed, None);
+        assert!(report.outcomes[3]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("identity changed"));
+        assert_eq!(report.errors, ["other-session: malformed receipt"]);
+        assert_eq!(
+            restored.daemon.recent_events.back().unwrap().detail,
+            event.detail
+        );
+
+        // A completed sweep clears the cursor, so new sessions are not skipped.
+        record_daemon_freeze_recovery(&mut bundle, FreezeRecoveryReport::default());
+        assert!(bundle.freeze_recovery_cursor.is_none());
+        assert_eq!(
+            bundle.daemon.recent_events.back().unwrap().event_type,
+            DaemonEventType::FreezeRecoveryCompleted
+        );
+    }
+
+    #[test]
+    fn old_daemon_state_has_no_invented_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut old = serde_json::to_value(state(directory.path())).unwrap();
+        old.as_object_mut()
+            .unwrap()
+            .remove("freeze_recovery_cursor");
+        old.as_object_mut().unwrap().remove("last_freeze_recovery");
+        let restored: DaemonStateBundle = serde_json::from_value(old).unwrap();
+        assert!(restored.freeze_recovery_cursor.is_none());
+        assert!(restored.last_freeze_recovery.is_none());
+    }
+
+    #[test]
+    fn scan_failures_remain_errors_and_do_not_reset_the_cursor() {
+        let directory = tempfile::tempdir().unwrap();
+        let _guard = GlobalLock::try_acquire(&directory.path().join(".execution-policy-lock"))
+            .unwrap()
+            .unwrap();
+        let sessions = directory.path().join("sessions");
+        std::fs::write(&sessions, "not a session directory").unwrap();
+        let report = recover_expired_freezes_locked(&sessions, Some("retained-session"));
+        assert!(report.outcomes.is_empty());
+        assert!(!report.errors.is_empty());
+        assert_eq!(report.next_session.as_deref(), Some("retained-session"));
+        let mut bundle = state(directory.path());
+        record_daemon_freeze_recovery(&mut bundle, report);
+        assert_eq!(
+            bundle.daemon.recent_events.back().unwrap().event_type,
+            DaemonEventType::FreezeRecoveryFailed
+        );
+    }
+
+    #[test]
+    fn missing_or_unusable_lock_location_never_runs_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let blocked = directory.path().join("not-a-directory");
+        std::fs::write(&blocked, "fixture").unwrap();
+        let global = Cli::try_parse_from(["pt-core", "daemon"]).unwrap().global;
+        for data_dir in [None, Some(blocked.as_path())] {
+            let mut bundle = state(directory.path());
+            daemon_recover_expired_freezes(&global, data_dir, &mut bundle, |_, _| {
+                panic!("recovery without a held execution lock")
+            });
+            assert!(bundle.last_freeze_recovery.is_none());
+            assert_eq!(
+                bundle.daemon.recent_events.back().unwrap().event_type,
+                DaemonEventType::FreezeRecoveryFailed
+            );
+        }
     }
 }
 

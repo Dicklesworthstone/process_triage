@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 #[cfg(target_os = "linux")]
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 /// The requested freezer state and the kernel's completed effective state.
 ///
@@ -343,6 +343,13 @@ impl FreezeActionRunner {
         debug!(pid, frozen, "executing freezer request");
 
         if self.reversal_journal.is_none() {
+            if frozen {
+                warn!(
+                    pid,
+                    auto_thaw = false,
+                    "freeze has no durable journal; automatic TTL recovery is unavailable"
+                );
+            }
             if let Some(sessions_root) = &self.reversal_ownership_root {
                 super::reversal::ensure_control_unowned(
                     sessions_root,
