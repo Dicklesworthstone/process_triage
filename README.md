@@ -113,6 +113,8 @@ Every process on your system passes through a five-stage pipeline:
 
 **Act** re-verifies identity (exact start time; a pidfd on Linux) and runs live pre-checks immediately before each signal, then escalates SIGTERM → SIGKILL. Renice, pause/resume and kill run on Linux and macOS; freeze, throttle and quarantine are Linux-only and refused unless the target owns its cgroup. Failures are reported; there is no automatic rollback.
 
+Kill execution always tries `SIGTERM` first. For an individual Linux target, two complete identity-bound observations of `SigIgn` and `SigCgt` can establish that TERM is ignored and skip the otherwise futile grace period. Caught handlers, unavailable or changed evidence, weaker identities, and process-group actions retain the configured grace, bounded by the saved action timeout. The saved `signal_outcome` records successful signal deliveries, the escalation reason, and measured timing; these delivery facts remain separate from verification that the process exited.
+
 **Report** produces JSON, TOON (token-optimized), Markdown, HTML reports, or the interactive TUI, with the evidence ledger and Bayes factors.
 
 ### Experimental Library Models

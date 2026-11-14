@@ -11,6 +11,7 @@ use super::executor::{ActionError, ActionRunner};
 use super::reversal::{PreparedReversal, ReversalJournal, ReversalStatus};
 use crate::decision::Action;
 use crate::plan::PlanAction;
+use serde::Serialize;
 use std::thread;
 use std::time::{Duration, Instant};
 #[cfg(target_os = "linux")]
@@ -353,6 +354,97 @@ fn should_resume_after_sigterm(state: Option<char>, use_group: bool) -> bool {
     cfg!(target_os = "linux") && !use_group && state == Some('T')
 }
 
+/// Observed disposition of SIGTERM. Unavailable or inconsistent kernel evidence
+/// stays unknown and never shortens the approved graceful-shutdown interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignalDisposition {
+    Unknown,
+    Default,
+    Caught,
+    Ignored,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignalEscalationReason {
+    SigtermIgnored,
+    GraceExpired,
+}
+
+/// Delivery evidence and monotonic timings from one attempted kill. These facts
+/// describe the signal sequence, not proof that the target has exited; final
+/// effect verification remains separate. Failed attempts retain their evidence.
+#[derive(Debug, Clone, Serialize)]
+pub struct SignalExecutionOutcome {
+    pub sigterm_disposition: SignalDisposition,
+    pub sigterm_recheck: Option<SignalDisposition>,
+    pub configured_grace_ms: u64,
+    /// Elapsed after successful TERM delivery until execution returned, including
+    /// any resume, disposition recheck and escalation overhead. Not an exit time.
+    pub observed_grace_ms: Option<u64>,
+    pub sigterm_delivered: bool,
+    pub sigcont_delivered: bool,
+    pub sigkill_delivered: bool,
+    /// Why escalation was selected. A final identity/deadline check can still
+    /// prevent delivery; sigkill_delivered records whether the syscall succeeded.
+    pub escalation_reason: Option<SignalEscalationReason>,
+    pub execution_elapsed_ms: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn sigterm_disposition_from_status(status: &str) -> SignalDisposition {
+    let mut ignored = None;
+    let mut caught = None;
+    for line in status.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let field = match name {
+            "SigIgn" => &mut ignored,
+            "SigCgt" => &mut caught,
+            _ => continue,
+        };
+        let value = value.trim();
+        if field.is_some()
+            || value.is_empty()
+            || value.len() > 16
+            || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return SignalDisposition::Unknown;
+        }
+        *field = u64::from_str_radix(value, 16).ok();
+    }
+    let (Some(ignored), Some(caught)) = (ignored, caught) else {
+        return SignalDisposition::Unknown;
+    };
+    let term_bit = 1_u64 << (libc::SIGTERM - 1);
+    match (ignored & term_bit != 0, caught & term_bit != 0) {
+        (true, false) => SignalDisposition::Ignored,
+        (false, true) => SignalDisposition::Caught,
+        (false, false) => SignalDisposition::Default,
+        (true, true) => SignalDisposition::Unknown,
+    }
+}
+
+/// A group leader's disposition says nothing about its other members. Requiring
+/// two complete observations also preserves grace if a target changes handlers
+/// or the second observation becomes unavailable after TERM.
+fn may_skip_term_grace(
+    use_group: bool,
+    before: SignalDisposition,
+    after: SignalDisposition,
+) -> bool {
+    cfg!(target_os = "linux")
+        && !use_group
+        && before == SignalDisposition::Ignored
+        && after == SignalDisposition::Ignored
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 /// A phase budget from the approved plan. Elapsed time is measured monotonically;
 /// using a duration instead of adding to Instant also accepts large saved budgets
 /// without overflowing the platform's clock representation.
@@ -410,6 +502,7 @@ pub struct SignalActionRunner {
     last_path: std::sync::Mutex<Option<&'static str>>,
     /// A successful SIGTERM/SIGKILL delivery, even if later verification fails.
     kill_signal_delivered: std::sync::atomic::AtomicBool,
+    last_outcome: std::sync::Mutex<Option<SignalExecutionOutcome>>,
     #[cfg(target_os = "linux")]
     reversal_journal: Option<Arc<ReversalJournal>>,
     #[cfg(target_os = "linux")]
@@ -432,6 +525,7 @@ impl SignalActionRunner {
             config,
             last_path: std::sync::Mutex::new(None),
             kill_signal_delivered: std::sync::atomic::AtomicBool::new(false),
+            last_outcome: std::sync::Mutex::new(None),
             #[cfg(target_os = "linux")]
             reversal_journal: None,
             #[cfg(target_os = "linux")]
@@ -486,6 +580,15 @@ impl SignalActionRunner {
     pub fn take_kill_signal_delivered(&self) -> bool {
         self.kill_signal_delivered
             .swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Consume the most recent kill attempt's signal evidence. Non-kill action
+    /// execution clears it, so it cannot be attributed to the next action.
+    pub fn take_signal_outcome(&self) -> Option<SignalExecutionOutcome> {
+        self.last_outcome
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
     }
 
     #[cfg(unix)]
@@ -675,6 +778,65 @@ impl SignalActionRunner {
         }
     }
 
+    /// Bind the signal masks to the complete recorded incarnation before and
+    /// after the status read. The masks are advisory only: unavailable evidence
+    /// keeps the ordinary grace path, and delivery still revalidates identity.
+    fn observed_sigterm_disposition(&self, action: &PlanAction) -> SignalDisposition {
+        #[cfg(target_os = "linux")]
+        {
+            if action.target.quality != pt_common::IdentityQuality::Full
+                || self.check_identity_now(action).is_err()
+            {
+                return SignalDisposition::Unknown;
+            }
+            let disposition =
+                std::fs::read_to_string(format!("/proc/{}/status", action.target.pid.0))
+                    .map(|status| sigterm_disposition_from_status(&status))
+                    .unwrap_or(SignalDisposition::Unknown);
+            if self.check_identity_now(action).is_err() {
+                return SignalDisposition::Unknown;
+            }
+            disposition
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = action;
+            SignalDisposition::Unknown
+        }
+    }
+
+    /// TERM is always delivered first. Only an individually identified target
+    /// observed to ignore it both before and after delivery can bypass waiting.
+    /// A caught, default, changed, or unavailable disposition gets the full grace.
+    #[cfg(unix)]
+    fn wait_for_term_or_escalation(
+        &self,
+        action: &PlanAction,
+        deadline: &SignalDeadline,
+        use_group: bool,
+        outcome: &mut SignalExecutionOutcome,
+    ) -> Result<bool, ActionError> {
+        if !use_group && outcome.sigterm_disposition == SignalDisposition::Ignored {
+            if !self.original_target_still_present(action)? {
+                return Ok(true);
+            }
+            deadline.remaining()?;
+            let recheck = self.observed_sigterm_disposition(action);
+            outcome.sigterm_recheck = Some(recheck);
+            if may_skip_term_grace(use_group, outcome.sigterm_disposition, recheck) {
+                deadline.remaining()?;
+                outcome.escalation_reason = Some(SignalEscalationReason::SigtermIgnored);
+                return Ok(false);
+            }
+        }
+        if self.wait_for_term_grace(action, deadline)? {
+            Ok(true)
+        } else {
+            outcome.escalation_reason = Some(SignalEscalationReason::GraceExpired);
+            Ok(false)
+        }
+    }
+
     fn verification_timeout(&self, action: &PlanAction) -> Duration {
         Duration::from_millis(self.config.verify_timeout_ms.min(action.timeouts.verify_ms))
     }
@@ -825,10 +987,43 @@ impl SignalActionRunner {
     /// Execute a kill action (SIGTERM → SIGKILL).
     #[cfg(unix)]
     fn execute_kill(&self, action: &PlanAction) -> Result<(), ActionError> {
+        let started = Instant::now();
+        let mut term_started = None;
+        let mut outcome = SignalExecutionOutcome {
+            sigterm_disposition: SignalDisposition::Unknown,
+            sigterm_recheck: None,
+            configured_grace_ms: self.config.term_grace_ms,
+            observed_grace_ms: None,
+            sigterm_delivered: false,
+            sigcont_delivered: false,
+            sigkill_delivered: false,
+            escalation_reason: None,
+            execution_elapsed_ms: 0,
+        };
+        let result = self.execute_kill_observed(action, &mut outcome, &mut term_started);
+        outcome.observed_grace_ms = term_started.map(elapsed_millis);
+        outcome.execution_elapsed_ms = elapsed_millis(started);
+        *self
+            .last_outcome
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(outcome);
+        result
+    }
+
+    #[cfg(unix)]
+    fn execute_kill_observed(
+        &self,
+        action: &PlanAction,
+        outcome: &mut SignalExecutionOutcome,
+        term_started: &mut Option<Instant>,
+    ) -> Result<(), ActionError> {
         let deadline = SignalDeadline::new(action.timeouts.execute_ms);
         deadline.remaining()?;
         let pid = action.target.pid.0;
         let (target, use_group) = self.resolve_group_target(pid, action.target.pgid);
+        if !use_group {
+            outcome.sigterm_disposition = self.observed_sigterm_disposition(action);
+        }
         let resume_stopped = should_resume_after_sigterm(self.get_process_state(pid), use_group);
 
         // Linux: TERM, any CONT needed for graceful shutdown, and KILL all go
@@ -839,6 +1034,8 @@ impl SignalActionRunner {
             if let Some(pidfd) = self.pinned_pidfd(action)? {
                 deadline.remaining()?;
                 pidfd.send(libc::SIGTERM)?;
+                *term_started = Some(Instant::now());
+                outcome.sigterm_delivered = true;
                 self.note_delivered_signal(libc::SIGTERM);
                 if resume_stopped {
                     if !self.original_target_still_present(action)? {
@@ -846,12 +1043,12 @@ impl SignalActionRunner {
                     }
                     deadline.remaining()?;
                     match pidfd.send(libc::SIGCONT) {
-                        Ok(()) => {}
+                        Ok(()) => outcome.sigcont_delivered = true,
                         Err(ActionError::ProcessNotFound) => return Ok(()),
                         Err(error) => return Err(error),
                     }
                 }
-                return if self.wait_for_term_grace(action, &deadline)? {
+                return if self.wait_for_term_or_escalation(action, &deadline, use_group, outcome)? {
                     Ok(())
                 } else {
                     if !self.original_target_still_present(action)? {
@@ -860,6 +1057,7 @@ impl SignalActionRunner {
                     deadline.remaining()?;
                     match pidfd.send(libc::SIGKILL) {
                         Ok(()) => {
+                            outcome.sigkill_delivered = true;
                             self.note_delivered_signal(libc::SIGKILL);
                             Ok(())
                         }
@@ -876,6 +1074,8 @@ impl SignalActionRunner {
         // Stage 1: SIGTERM
         deadline.remaining()?;
         self.send_signal(target, libc::SIGTERM, use_group)?;
+        *term_started = Some(Instant::now());
+        outcome.sigterm_delivered = true;
 
         if resume_stopped {
             // Without a pidfd, revalidate immediately before the additional
@@ -886,14 +1086,14 @@ impl SignalActionRunner {
             }
             deadline.remaining()?;
             match self.send_signal(pid, libc::SIGCONT, false) {
-                Ok(()) => {}
+                Ok(()) => outcome.sigcont_delivered = true,
                 Err(ActionError::ProcessNotFound) => return Ok(()),
                 Err(error) => return Err(error),
             }
         }
 
         // Wait for graceful termination
-        if self.wait_for_term_grace(action, &deadline)? {
+        if self.wait_for_term_or_escalation(action, &deadline, use_group, outcome)? {
             return Ok(());
         }
 
@@ -902,6 +1102,7 @@ impl SignalActionRunner {
         if self.original_target_still_present(action)? {
             deadline.remaining()?;
             self.send_signal(target, libc::SIGKILL, use_group)?;
+            outcome.sigkill_delivered = true;
         }
 
         Ok(())
@@ -912,6 +1113,7 @@ impl SignalActionRunner {
     /// itself is never signaled and the parent is never killed or restarted here.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub fn nudge_parent_to_reap(&self, action: &PlanAction) -> Result<(), ActionError> {
+        let _ = self.take_signal_outcome();
         let deadline = SignalDeadline::new(action.timeouts.execute_ms);
         deadline.remaining()?;
         #[cfg(target_os = "linux")]
@@ -1063,6 +1265,7 @@ impl ActionRunner for SignalActionRunner {
     }
 
     fn execute(&self, action: &PlanAction) -> Result<(), ActionError> {
+        let _ = self.take_signal_outcome();
         match action.action {
             Action::Pause => self.execute_pause(action),
             Action::Resume => self.execute_resume(action),
@@ -1355,6 +1558,75 @@ fn ids_match(expected: &str, current: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sigterm_disposition_requires_complete_consistent_kernel_masks() {
+        assert_eq!(
+            sigterm_disposition_from_status(
+                "Name:\tworker\nSigIgn:\t0000000000004000\nSigCgt:\t0000000000000000\n"
+            ),
+            SignalDisposition::Ignored
+        );
+        assert_eq!(
+            sigterm_disposition_from_status(
+                "SigIgn:\t0000000000000000\nSigCgt:\t0000000000004000\n"
+            ),
+            SignalDisposition::Caught
+        );
+        assert_eq!(
+            sigterm_disposition_from_status(
+                "SigIgn:\t0000000000000001\nSigCgt:\t0000000180000000\n"
+            ),
+            SignalDisposition::Default,
+            "unrelated ignored/caught signals cannot shorten TERM grace"
+        );
+        for malformed in [
+            "",
+            "SigIgn:\t0000000000004000\n",
+            "SigCgt:\t0000000000000000\n",
+            "SigIgn:\t4000\nSigCgt:\t4000\n",
+            "SigIgn:\t4000\nSigCgt:\t\n",
+            "SigIgn:\t4000\nSigCgt:\tnot-hex\n",
+            "SigIgn:\t4000\nSigCgt:\t+0\n",
+            "SigIgn:\t0x4000\nSigCgt:\t0\n",
+            "SigIgn:\t10000000000004000\nSigCgt:\t0\n",
+            "SigIgn:\t4000\nSigIgn:\t4000\nSigCgt:\t0\n",
+            "SigIgn:\t4000\nSigCgt:\t0\nSigCgt:\t0\n",
+        ] {
+            assert_eq!(
+                sigterm_disposition_from_status(malformed),
+                SignalDisposition::Unknown,
+                "malformed or incomplete status: {malformed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn skipped_term_grace_requires_two_ignored_reads_and_an_individual_target() {
+        for before in [
+            SignalDisposition::Unknown,
+            SignalDisposition::Default,
+            SignalDisposition::Caught,
+            SignalDisposition::Ignored,
+        ] {
+            for after in [
+                SignalDisposition::Unknown,
+                SignalDisposition::Default,
+                SignalDisposition::Caught,
+                SignalDisposition::Ignored,
+            ] {
+                assert!(
+                    !may_skip_term_grace(true, before, after),
+                    "leader-only evidence must never shorten group grace"
+                );
+                let expected = cfg!(target_os = "linux")
+                    && before == SignalDisposition::Ignored
+                    && after == SignalDisposition::Ignored;
+                assert_eq!(may_skip_term_grace(false, before, after), expected);
+            }
+        }
+    }
 
     #[cfg(unix)]
     #[test]
@@ -1752,6 +2024,14 @@ mod tests {
             } else {
                 "trap 'printf \"term handled\\n\" > \"$1\"; exit 0' TERM\nkill -STOP \"$$\"\nwhile :; do read -r line || exit; done"
             };
+            stopped_signal_child(script, marker, own_group)
+        }
+
+        fn stopped_signal_child(
+            script: &str,
+            marker: &std::path::Path,
+            own_group: bool,
+        ) -> (OwnedSignalChild, PlanAction) {
             let mut command = std::process::Command::new("sh");
             command
                 .arg("-c")
@@ -2275,22 +2555,37 @@ mod tests {
             );
             assert_eq!(std::fs::read_to_string(&marker).unwrap(), "term handled\n");
             assert!(runner.take_kill_signal_delivered());
+            let outcome = runner.take_signal_outcome().expect("delivery evidence");
+            assert_eq!(outcome.sigterm_disposition, SignalDisposition::Caught);
+            assert!(outcome.sigterm_delivered);
+            assert!(outcome.sigcont_delivered);
+            assert!(!outcome.sigkill_delivered);
+            assert!(outcome.escalation_reason.is_none());
+            assert!(outcome.observed_grace_ms.is_some());
+            assert!(
+                runner.take_signal_outcome().is_none(),
+                "consumed exactly once"
+            );
         }
 
         #[test]
-        fn stopped_kill_escalates_when_sigterm_is_ignored() {
+        fn stopped_kill_skips_futile_grace_only_after_delivering_ignored_sigterm() {
             let dir = tempfile::tempdir().expect("marker directory");
             let marker = dir.path().join("term-handled");
             let (mut child, action) = stopped_term_child(&marker, true, false);
             let runner = SignalActionRunner::new(SignalConfig {
-                term_grace_ms: 100,
                 poll_interval_ms: 10,
                 ..SignalConfig::default()
             });
 
+            let started = Instant::now();
             runner
                 .execute(&action)
                 .expect("terminate TERM-ignoring child");
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "explicit SIGTERM ignore must not wait the normal five-second grace"
+            );
             runner
                 .verify(&action)
                 .expect("child exited after escalation");
@@ -2298,6 +2593,153 @@ mod tests {
             assert_eq!(status.signal(), Some(libc::SIGKILL));
             assert!(!marker.exists());
             assert!(runner.take_kill_signal_delivered());
+            let outcome = runner.take_signal_outcome().expect("delivery evidence");
+            assert_eq!(outcome.sigterm_disposition, SignalDisposition::Ignored);
+            assert_eq!(outcome.sigterm_recheck, Some(SignalDisposition::Ignored));
+            assert!(outcome.sigterm_delivered, "TERM always precedes escalation");
+            assert!(outcome.sigkill_delivered);
+            assert_eq!(
+                outcome.escalation_reason,
+                Some(SignalEscalationReason::SigtermIgnored)
+            );
+            assert_eq!(outcome.configured_grace_ms, 5_000);
+            assert!(outcome.observed_grace_ms.unwrap() < outcome.configured_grace_ms);
+            let json = serde_json::to_value(outcome).unwrap();
+            assert_eq!(json["escalation_reason"], "sigterm_ignored");
+        }
+
+        #[test]
+        fn caught_sigterm_retains_grace_for_a_slow_cleanup_handler() {
+            let dir = tempfile::tempdir().expect("marker directory");
+            let marker = dir.path().join("term-handled");
+            let (mut child, action) = stopped_signal_child(
+                "trap 'sleep 2; printf \"term handled\\n\" > \"$1\"; exit 0' TERM\nkill -STOP \"$$\"\nwhile :; do read -r line || :; done",
+                &marker,
+                false,
+            );
+            let runner = SignalActionRunner::with_defaults();
+            runner.execute(&action).expect("allow slow TERM cleanup");
+            runner.verify(&action).expect("cleanup finished");
+            assert!(child.0.wait().unwrap().success());
+            assert_eq!(std::fs::read_to_string(&marker).unwrap(), "term handled\n");
+            let outcome = runner.take_signal_outcome().expect("delivery evidence");
+            assert_eq!(outcome.sigterm_disposition, SignalDisposition::Caught);
+            assert!(outcome.sigterm_delivered);
+            assert!(!outcome.sigkill_delivered);
+            assert!(outcome.escalation_reason.is_none());
+            assert!(outcome.observed_grace_ms.unwrap() >= 2_000);
+        }
+
+        #[test]
+        fn changed_sigterm_handler_preserves_grace_after_an_ignored_delivery() {
+            use std::io::Write;
+
+            let dir = tempfile::tempdir().expect("marker directory");
+            let marker = dir.path().join("term-handled");
+            let (mut child, action) = stopped_signal_child(
+                "trap '' TERM\nkill -STOP \"$$\"\nread -r line\ntrap ':' TERM\nkill -STOP \"$$\"\nwhile :; do read -r line || :; done",
+                &marker,
+                false,
+            );
+            let runner = SignalActionRunner::new(SignalConfig {
+                term_grace_ms: 100,
+                poll_interval_ms: 5,
+                ..SignalConfig::default()
+            });
+            let before = runner.observed_sigterm_disposition(&action);
+            assert_eq!(before, SignalDisposition::Ignored);
+            runner
+                .send_signal(child.0.id(), libc::SIGTERM, false)
+                .unwrap();
+            runner
+                .send_signal(child.0.id(), libc::SIGCONT, false)
+                .unwrap();
+            child
+                .0
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(b"install handler\n")
+                .unwrap();
+            let ready = Instant::now();
+            loop {
+                if runner.observed_sigterm_disposition(&action) == SignalDisposition::Caught
+                    && runner.get_process_state(child.0.id()) == Some('T')
+                {
+                    break;
+                }
+                assert!(ready.elapsed() < Duration::from_secs(5), "handler changed");
+                thread::sleep(Duration::from_millis(5));
+            }
+
+            let mut outcome = SignalExecutionOutcome {
+                sigterm_disposition: before,
+                sigterm_recheck: None,
+                configured_grace_ms: 100,
+                observed_grace_ms: None,
+                sigterm_delivered: true,
+                sigcont_delivered: true,
+                sigkill_delivered: false,
+                escalation_reason: None,
+                execution_elapsed_ms: 0,
+            };
+            let started = Instant::now();
+            assert!(!runner
+                .wait_for_term_or_escalation(
+                    &action,
+                    &SignalDeadline::new(2_000),
+                    false,
+                    &mut outcome,
+                )
+                .unwrap());
+            assert!(started.elapsed() >= Duration::from_millis(100));
+            assert_eq!(outcome.sigterm_recheck, Some(SignalDisposition::Caught));
+            assert_eq!(
+                outcome.escalation_reason,
+                Some(SignalEscalationReason::GraceExpired)
+            );
+            assert!(child.0.try_wait().unwrap().is_none());
+            assert!(
+                !outcome.sigkill_delivered,
+                "waiting never sends SIGKILL itself"
+            );
+        }
+
+        #[test]
+        fn sigterm_disposition_cannot_be_borrowed_from_another_incarnation() {
+            let dir = tempfile::tempdir().expect("marker directory");
+            let marker = dir.path().join("term-handled");
+            let (_child, mut action) = stopped_term_child(&marker, true, false);
+            let runner = SignalActionRunner::with_defaults();
+            assert_eq!(
+                runner.observed_sigterm_disposition(&action),
+                SignalDisposition::Ignored
+            );
+            for quality in [
+                pt_common::IdentityQuality::NoBootId,
+                pt_common::IdentityQuality::PidOnly,
+            ] {
+                let mut weaker = action.clone();
+                weaker.target.quality = quality;
+                assert_eq!(
+                    runner.observed_sigterm_disposition(&weaker),
+                    SignalDisposition::Unknown,
+                    "weaker saved identities must retain ordinary TERM grace"
+                );
+            }
+            action.target.uid ^= 1;
+            assert_eq!(
+                runner.observed_sigterm_disposition(&action),
+                SignalDisposition::Unknown
+            );
+            assert!(matches!(
+                runner.execute(&action),
+                Err(ActionError::IdentityMismatch)
+            ));
+            let outcome = runner.take_signal_outcome().unwrap();
+            assert!(!outcome.sigterm_delivered);
+            assert!(!outcome.sigkill_delivered);
+            assert!(outcome.observed_grace_ms.is_none());
         }
 
         #[test]
@@ -2314,6 +2756,14 @@ mod tests {
                 assert_eq!(runner.get_process_state(child.0.id()), Some('T'));
                 assert!(!runner.take_kill_signal_delivered());
                 assert!(runner.take_signal_path().is_none());
+                if kind == Action::Kill {
+                    let outcome = runner.take_signal_outcome().unwrap();
+                    assert!(!outcome.sigterm_delivered);
+                    assert!(!outcome.sigkill_delivered);
+                    assert!(outcome.observed_grace_ms.is_none());
+                } else {
+                    assert!(runner.take_signal_outcome().is_none());
+                }
             }
             assert!(matches!(
                 runner.nudge_parent_to_reap(&action),
@@ -2327,7 +2777,17 @@ mod tests {
             for own_group in [false, true] {
                 let dir = tempfile::tempdir().expect("marker directory");
                 let marker = dir.path().join("term-handled");
-                let (mut child, mut action) = stopped_term_child(&marker, true, own_group);
+                let (mut child, mut action) = if own_group {
+                    stopped_term_child(&marker, true, true)
+                } else {
+                    // A handler that chooses not to exit is caught, not SIG_IGN;
+                    // it retains the configured grace even under a short budget.
+                    stopped_signal_child(
+                        "trap ':' TERM\nkill -STOP \"$$\"\nwhile :; do read -r line || :; done",
+                        &marker,
+                        false,
+                    )
+                };
                 let runner = SignalActionRunner::new(SignalConfig {
                     term_grace_ms: 5_000,
                     poll_interval_ms: 5_000,
@@ -2350,6 +2810,11 @@ mod tests {
                 );
                 assert!(runner.take_kill_signal_delivered(), "TERM still counts");
                 assert!(!marker.exists());
+                let outcome = runner.take_signal_outcome().unwrap();
+                assert!(outcome.sigterm_delivered);
+                assert!(!outcome.sigkill_delivered);
+                assert!(outcome.escalation_reason.is_none());
+                assert!(outcome.observed_grace_ms.is_some());
             }
         }
 
@@ -2436,6 +2901,15 @@ mod tests {
                 !marker.exists(),
                 "a leader's state must not authorize group CONT"
             );
+            let outcome = runner.take_signal_outcome().unwrap();
+            assert_eq!(outcome.sigterm_disposition, SignalDisposition::Unknown);
+            assert_eq!(outcome.sigterm_recheck, None);
+            assert_eq!(
+                outcome.escalation_reason,
+                Some(SignalEscalationReason::GraceExpired)
+            );
+            assert!(outcome.observed_grace_ms.unwrap() >= 100);
+            assert!(outcome.sigkill_delivered);
         }
 
         #[test]

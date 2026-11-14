@@ -117,6 +117,11 @@ impl CompositeActionRunner {
         self.signal.take_signal_path()
     }
 
+    /// Consume observed TERM handling and escalation facts for the last action.
+    pub fn take_signal_outcome(&self) -> Option<super::signal::SignalExecutionOutcome> {
+        self.signal.take_signal_outcome()
+    }
+
     /// Whether a destructive signal actually reached a target since the last call.
     pub fn take_kill_signal_delivered(&self) -> bool {
         self.signal.take_kill_signal_delivered()
@@ -580,6 +585,9 @@ fn shared_cgroup_members(procs_content: &str, pid: u32) -> Result<usize, ActionE
 
 impl ActionRunner for CompositeActionRunner {
     fn execute(&self, action: &PlanAction) -> Result<(), ActionError> {
+        // Non-signal actions must not inherit facts from an earlier kill when a
+        // caller does not consume the optional outcome between operations.
+        let _ = self.signal.take_signal_outcome();
         if action.action != Action::Keep {
             super::signal::ensure_action_pid_namespace()?;
         }

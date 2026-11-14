@@ -3911,6 +3911,7 @@ fn execute_plan_actions(
                 }
             }
             runner.evidence.borrow_mut().take();
+            let _ = runner.runner.take_signal_outcome();
             runner.runner.take_kill_signal_delivered();
             runner.runner.take_supervisor_restart_attempted();
             let accounting_started = action_uses_kill_budget(action) && !action.blocked;
@@ -3928,7 +3929,15 @@ fn execute_plan_actions(
                     break;
                 }
             }
-            let result = match executor.execute_plan(&single) {
+            let result = executor.execute_plan(&single);
+            let signal_outcome = runner.runner.take_signal_outcome();
+            if let Some(mut evidence) = runner.evidence.borrow().clone() {
+                if let Some(signal_outcome) = signal_outcome {
+                    evidence["signal_outcome"] = serde_json::json!(signal_outcome);
+                }
+                execution_evidence.insert(action.action_id.clone(), evidence);
+            }
+            let result = match result {
                 Ok(result) => result,
                 Err(error) => {
                     let may_have_stopped_target = runner.runner.take_kill_signal_delivered()
@@ -3951,9 +3960,6 @@ fn execute_plan_actions(
                     break;
                 }
             };
-            if let Some(evidence) = runner.evidence.borrow().as_ref() {
-                execution_evidence.insert(action.action_id.clone(), evidence.clone());
-            }
             let kill_signal_delivered = runner.runner.take_kill_signal_delivered();
             let supervisor_restart_attempted = runner.runner.take_supervisor_restart_attempted();
             if let Some(fields) = execution_evidence
@@ -29146,6 +29152,9 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     .and_then(|()| action_runner.verify(action));
                 // pidfd (bound to the verified process) or kill(2) with re-verify.
                 let signal_path = action_runner.take_signal_path();
+                if let Some(signal_outcome) = action_runner.take_signal_outcome() {
+                    execution_evidence["signal_outcome"] = serde_json::json!(signal_outcome);
+                }
                 let kill_signal_delivered = action_runner.take_kill_signal_delivered();
                 let supervisor_restart_attempted =
                     action_runner.take_supervisor_restart_attempted();
