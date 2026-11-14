@@ -21,8 +21,8 @@ use crate::decision::pressure_regime::{
 };
 use serde::Serialize;
 use serde_json::json;
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 const KIB: u64 = 1 << 10;
 const GIB: u64 = 1 << 30;
@@ -74,7 +74,7 @@ impl SwapDevice {
     }
 }
 
-/// A drop-in that sets a memory limit on the user slice / user manager.
+/// Memory-limit assignments from a unit file or a selected drop-in.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct DropIn {
     pub path: String,
@@ -82,6 +82,28 @@ pub struct DropIn {
     pub memory_max: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_high: Option<String>,
+}
+
+/// On-disk memory configuration for an actual user unit, or its defaults when no
+/// user instances can be found. These are the unit's own settings: parent cgroup
+/// limits and the running manager's state may differ from the files on disk.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct UserMemoryConfig {
+    pub unit: String,
+    pub defaults_only: bool,
+    pub masked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fragment_path: Option<String>,
+    /// Ordered assignments: the selected fragment first, then sorted drop-ins.
+    /// A source may appear repeatedly when it assigns several memory settings.
+    pub sources: Vec<DropIn>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub masked_drop_ins: Vec<String>,
+    /// Final configured values, absent when masked or inspection is incomplete.
+    pub memory_max: Option<String>,
+    pub memory_high: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unavailable: Vec<String>,
 }
 
 /// The effective journald settings that decide whether OOM post-mortems survive.
@@ -222,8 +244,9 @@ pub struct HostFacts {
     /// Whether a zram setup survives a reboot (zram-generator config or an enabled
     /// zram service).
     pub zram_persisted: bool,
-    pub user_slice_drop_ins: Vec<DropIn>,
-    pub user_manager_drop_ins: Vec<DropIn>,
+    pub user_memory: Vec<UserMemoryConfig>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub user_memory_unavailable: Vec<String>,
     pub journald: JournaldConf,
     pub file_handles: Option<FileHandles>,
     pub inotify_max_user_watches: Option<u64>,
@@ -353,67 +376,405 @@ pub fn parse_mount_types(text: &str) -> Vec<String> {
 fn parse_ini(text: &str) -> Vec<(String, String, String)> {
     let mut section = String::new();
     let mut out = Vec::new();
-    for line in text.lines() {
+    let mut continued = String::new();
+    let mut parse_line = |line: &str| {
         let line = line.trim();
+        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            section = name.trim().to_string();
+        } else if let Some((key, value)) = line.split_once('=') {
+            out.push((
+                section.clone(),
+                key.trim().to_string(),
+                value.trim().to_string(),
+            ));
+        }
+    };
+    for physical_line in text.lines() {
+        let line = physical_line.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             continue;
         }
-        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-            section = name.trim().to_string();
+        if let Some(prefix) = line.strip_suffix('\\') {
+            continued.push_str(prefix);
+            continued.push(' ');
             continue;
         }
-        if let Some((k, v)) = line.split_once('=') {
-            out.push((section.clone(), k.trim().to_string(), v.trim().to_string()));
-        }
+        continued.push_str(line);
+        parse_line(&continued);
+        continued.clear();
+    }
+    if !continued.is_empty() {
+        parse_line(&continued);
     }
     out
 }
 
-/// `*.conf` files of a drop-in directory across the unit search path, in the order
-/// systemd applies them: by file name, a name in /etc hiding the same name in /run,
-/// which hides it in /usr/lib (and /lib).
-fn drop_in_files(root: &Path, dir_name: &str) -> Vec<(String, std::path::PathBuf)> {
-    let mut by_name: BTreeMap<String, std::path::PathBuf> = BTreeMap::new();
-    // Lowest precedence first, so higher ones overwrite.
-    for base in [
-        "lib/systemd/system",
-        "usr/lib/systemd/system",
-        "run/systemd/system",
-        "etc/systemd/system",
-    ] {
-        let dir = root.join(base).join(dir_name);
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+// Highest precedence first, as documented by systemd.unit(5). /lib is the
+// legacy vendor location; on merged-/usr systems it aliases /usr/lib.
+const SYSTEM_UNIT_PATHS: &[&str] = &[
+    "etc/systemd/system.control",
+    "run/systemd/system.control",
+    "run/systemd/transient",
+    "run/systemd/generator.early",
+    "etc/systemd/system",
+    "etc/systemd/system.attached",
+    "run/systemd/system",
+    "run/systemd/system.attached",
+    "run/systemd/generator",
+    "usr/local/lib/systemd/system",
+    "usr/lib/systemd/system",
+    "lib/systemd/system",
+    "run/systemd/generator.late",
+];
+
+/// Validate directory traversal before inspecting an alternate root. A fixture's
+/// absolute symlink must never make its audit read the evaluator's live host.
+fn config_directory(root: &Path, rel: &str, unavailable: &mut Vec<String>) -> Option<PathBuf> {
+    let path = root.join(rel);
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            unavailable.push(format!("/{rel}: {error}"));
+            return None;
+        }
+        Ok(_) => {}
+    }
+    match std::fs::canonicalize(&path).and_then(|resolved| {
+        let root = std::fs::canonicalize(root)?;
+        if resolved.starts_with(root) && resolved.is_dir() {
+            Ok(path)
+        } else {
+            Err(std::io::Error::other(
+                "configuration directory leaves the inspected root or is not a directory",
+            ))
+        }
+    }) {
+        Ok(path) => Some(path),
+        Err(error) => {
+            unavailable.push(format!("/{rel}: {error}"));
+            None
+        }
+    }
+}
+
+fn user_unit_uid(name: &str) -> Option<u32> {
+    let name = name.strip_suffix(".d").unwrap_or(name);
+    let digits = name
+        .strip_prefix("user-")
+        .and_then(|rest| rest.strip_suffix(".slice"))
+        .or_else(|| {
+            name.strip_prefix("user@")
+                .and_then(|rest| rest.strip_suffix(".service"))
+        })?;
+    let uid = digits.parse::<u32>().ok()?;
+    (uid.to_string() == digits).then_some(uid)
+}
+
+fn read_user_memory_configs(root: &Path) -> (Vec<UserMemoryConfig>, Vec<String>) {
+    let mut unavailable = Vec::new();
+    let mut uids = BTreeSet::new();
+    // logind keeps one state file per live user. Configured instances are also
+    // useful when that user is logged out, including systemctl set-property.
+    for rel in std::iter::once("run/systemd/users").chain(SYSTEM_UNIT_PATHS.iter().copied()) {
+        let Some(dir) = config_directory(root, rel, &mut unavailable) else {
             continue;
         };
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.ends_with(".conf") {
-                by_name.insert(name, entry.path());
+        match std::fs::read_dir(dir) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = match entry {
+                        Ok(entry) => entry,
+                        Err(error) => {
+                            unavailable.push(format!("/{rel}: {error}"));
+                            continue;
+                        }
+                    };
+                    let name = entry.file_name();
+                    let Some(name) = name.to_str() else {
+                        continue;
+                    };
+                    let uid = if rel == "run/systemd/users" {
+                        name.parse::<u32>()
+                            .ok()
+                            .filter(|uid| uid.to_string() == name)
+                    } else {
+                        user_unit_uid(name)
+                    };
+                    if let Some(uid) = uid {
+                        uids.insert(uid);
+                    }
+                }
+            }
+            Err(error) => unavailable.push(format!("/{rel}: {error}")),
+        }
+    }
+    let mut units = Vec::new();
+    if uids.is_empty() {
+        // Retain the useful defaults audit on hosts without a logged-in user,
+        // while explicitly distinguishing it from an instantiated unit.
+        for unit in ["user-.slice", "user@.service"] {
+            let mut config = read_user_memory_config(root, unit, true);
+            if !unavailable.is_empty() {
+                config.unavailable.extend(unavailable.iter().cloned());
+                config.memory_max = None;
+                config.memory_high = None;
+            }
+            units.push(config);
+        }
+    } else {
+        for uid in uids {
+            for unit in [format!("user-{uid}.slice"), format!("user@{uid}.service")] {
+                units.push(read_user_memory_config(root, &unit, false));
             }
         }
     }
-    by_name.into_iter().collect()
+    (units, unavailable)
 }
 
-fn memory_drop_ins(root: &Path, dir_name: &str) -> Vec<DropIn> {
-    drop_in_files(root, dir_name)
-        .into_iter()
-        .filter_map(|(_, path)| {
-            let text = std::fs::read_to_string(&path).ok()?;
-            let mut d = DropIn {
-                path: format!("/{}", path.strip_prefix(root).unwrap_or(&path).display()),
-                ..DropIn::default()
-            };
-            for (_, key, value) in parse_ini(&text) {
-                match key.as_str() {
-                    "MemoryMax" => d.memory_max = Some(value),
-                    "MemoryHigh" => d.memory_high = Some(value),
-                    _ => {}
-                }
+/// A conservative subset of systemd's size syntax. None means the static audit
+/// cannot establish this assignment's meaning, not that it is unlimited.
+fn finite_memory_limit(value: &str) -> Option<bool> {
+    if value.is_empty() || value == "infinity" {
+        return Some(false);
+    }
+    let (number, scale, percentage) = if let Some(number) = value.strip_suffix('%') {
+        (number, 100_u128, true)
+    } else {
+        let suffix = value.as_bytes().last().copied()?;
+        match b"KMGTPE".iter().position(|candidate| *candidate == suffix) {
+            Some(index) => (
+                &value[..value.len() - 1],
+                1024_u128.pow(index as u32 + 1),
+                false,
+            ),
+            None => (value, 1, false),
+        }
+    };
+    let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        || fraction.len() > 18
+        || (number.contains('.') && fraction.is_empty())
+        || (percentage && fraction.len() > 2)
+    {
+        return None;
+    }
+    let divisor = 10_u128.checked_pow(fraction.len() as u32)?;
+    let fraction = if fraction.is_empty() {
+        0
+    } else {
+        fraction.parse::<u128>().ok()?
+    };
+    let scaled = whole
+        .parse::<u128>()
+        .ok()?
+        .checked_mul(scale)?
+        .checked_add(fraction.checked_mul(scale)? / divisor)?;
+    if percentage {
+        (scaled > 0 && scaled <= 10_000).then_some(true)
+    } else {
+        (scaled > 0 && scaled < u128::from(u64::MAX)).then_some(true)
+    }
+}
+
+fn memory_config_file(
+    root: &Path,
+    path: &Path,
+    section: &str,
+    unavailable: &mut Vec<String>,
+) -> Vec<DropIn> {
+    let display = format!("/{}", path.strip_prefix(root).unwrap_or(path).display());
+    let result = (|| {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() {
+            if std::fs::read_link(path)? == Path::new("/dev/null") {
+                return Ok(None);
             }
-            (d.memory_max.is_some() || d.memory_high.is_some()).then_some(d)
-        })
-        .collect()
+            // Aliases have their own drop-in hierarchy. Do not interpret their
+            // target as a plain fragment or follow fixture links out of root.
+            return Err(std::io::Error::other(
+                "non-mask symlink needs systemd alias/link resolution",
+            ));
+        }
+        if !metadata.is_file() {
+            return Err(std::io::Error::other("configuration is not a regular file"));
+        }
+        let text = std::fs::read_to_string(path)?;
+        Ok(Some(text))
+    })();
+    let text = match result {
+        Ok(Some(text)) => text,
+        Ok(None) => return Vec::new(),
+        Err(error) => {
+            unavailable.push(format!("{display}: {error}"));
+            return Vec::new();
+        }
+    };
+    let mut assignments = Vec::new();
+    for (actual_section, key, value) in parse_ini(&text) {
+        if actual_section != section || !matches!(key.as_str(), "MemoryMax" | "MemoryHigh") {
+            continue;
+        }
+        if finite_memory_limit(&value).is_none() {
+            unavailable.push(format!(
+                "{display}: {key}={value:?} cannot be resolved by the static memory-limit audit"
+            ));
+        }
+        let mut assignment = DropIn {
+            path: display.clone(),
+            ..DropIn::default()
+        };
+        match key.as_str() {
+            "MemoryMax" => assignment.memory_max = Some(value),
+            "MemoryHigh" => assignment.memory_high = Some(value),
+            _ => unreachable!(),
+        }
+        assignments.push(assignment);
+    }
+    assignments
+}
+
+fn config_file_is_masked(metadata: &std::fs::Metadata, path: &Path) -> bool {
+    (metadata.is_file() && metadata.len() == 0)
+        || (metadata.file_type().is_symlink()
+            && std::fs::read_link(path).ok().as_deref() == Some(Path::new("/dev/null")))
+}
+
+fn read_user_memory_config(root: &Path, unit: &str, defaults_only: bool) -> UserMemoryConfig {
+    let mut result = UserMemoryConfig {
+        unit: unit.into(),
+        defaults_only,
+        ..UserMemoryConfig::default()
+    };
+    let (section, type_name, generic) = if unit.ends_with(".slice") {
+        ("Slice", "slice", "user-.slice")
+    } else {
+        ("Service", "service", "user@.service")
+    };
+    let names = if unit == generic {
+        vec![unit]
+    } else {
+        vec![unit, generic]
+    };
+
+    // A literal instance fragment wins over its template across the whole load
+    // path. Prefix slice names contribute drop-ins only, never base fragments.
+    let fragment_count = if type_name == "service" {
+        names.len()
+    } else {
+        1
+    };
+    'fragment: for name in names.iter().take(fragment_count) {
+        for base in SYSTEM_UNIT_PATHS {
+            let Some(dir) = config_directory(root, base, &mut result.unavailable) else {
+                continue;
+            };
+            let path = dir.join(name);
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    result
+                        .unavailable
+                        .push(format!("{}: {error}", path.display()));
+                    break 'fragment;
+                }
+            };
+            result.fragment_path = Some(format!(
+                "/{}",
+                path.strip_prefix(root).unwrap_or(&path).display()
+            ));
+            if config_file_is_masked(&metadata, &path) {
+                result.masked = true;
+                return result;
+            }
+            result.sources.extend(memory_config_file(
+                root,
+                &path,
+                section,
+                &mut result.unavailable,
+            ));
+            break 'fragment;
+        }
+    }
+
+    let mut by_name = BTreeMap::new();
+    // systemd's src/shared/dropin.c searches load paths before expanding each
+    // instance/template/prefix name. Type-wide defaults come after ALL names.
+    let dirs = SYSTEM_UNIT_PATHS
+        .iter()
+        .flat_map(|base| names.iter().map(move |name| format!("{base}/{name}.d")))
+        .chain(
+            SYSTEM_UNIT_PATHS
+                .iter()
+                .map(|base| format!("{base}/{type_name}.d")),
+        );
+    for rel in dirs {
+        let Some(dir) = config_directory(root, &rel, &mut result.unavailable) else {
+            continue;
+        };
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                result.unavailable.push(format!("/{rel}: {error}"));
+                continue;
+            }
+        };
+        for entry in entries {
+            match entry {
+                Ok(entry) => {
+                    let name = entry.file_name();
+                    // systemd ignores hidden drop-ins, including names which
+                    // cannot be represented as UTF-8.
+                    if name.as_encoded_bytes().starts_with(b".") {
+                        continue;
+                    }
+                    match name.to_str() {
+                        Some(text) if text.ends_with(".conf") => {
+                            // A /dev/null or empty-file mask occupies its name too.
+                            by_name.entry(name).or_insert_with(|| entry.path());
+                        }
+                        Some(_) => {}
+                        None => result.unavailable.push(format!(
+                            "/{rel}: a drop-in filename is not valid UTF-8"
+                        )),
+                    }
+                }
+                Err(error) => result.unavailable.push(format!("/{rel}: {error}")),
+            }
+        }
+    }
+    for path in by_name.into_values() {
+        if std::fs::symlink_metadata(&path)
+            .is_ok_and(|metadata| config_file_is_masked(&metadata, &path))
+        {
+            result.masked_drop_ins.push(format!(
+                "/{}",
+                path.strip_prefix(root).unwrap_or(&path).display()
+            ));
+            continue;
+        }
+        result.sources.extend(memory_config_file(
+            root,
+            &path,
+            section,
+            &mut result.unavailable,
+        ));
+    }
+    if result.unavailable.is_empty() {
+        result.memory_max = Some("infinity".into());
+        result.memory_high = Some("infinity".into());
+        for source in &result.sources {
+            if let Some(value) = &source.memory_max {
+                result.memory_max = Some(if value.is_empty() { "infinity" } else { value }.into());
+            }
+            if let Some(value) = &source.memory_high {
+                result.memory_high = Some(if value.is_empty() { "infinity" } else { value }.into());
+            }
+        }
+    }
+    result
 }
 
 fn journald_conf(root: &Path) -> JournaldConf {
@@ -610,6 +971,7 @@ fn read_proc_table(root: &Path, clk_tck: u64) -> ProcTable {
 
 /// Gather the facts under `root` (`/` on a live system). Read-only.
 pub fn read_host_facts_from(root: &Path, clk_tck: u64) -> HostFacts {
+    let (user_memory, user_memory_unavailable) = read_user_memory_configs(root);
     HostFacts {
         meminfo: read_text(root, "proc/meminfo").and_then(|t| parse_meminfo(&t)),
         vfs_cache_pressure: read_u64(root, "proc/sys/vm/vfs_cache_pressure"),
@@ -623,8 +985,8 @@ pub fn read_host_facts_from(root: &Path, clk_tck: u64) -> HostFacts {
             .unwrap_or_default(),
         swaps: read_text(root, "proc/swaps").map(|t| parse_swaps(&t)),
         zram_persisted: zram_persisted(root),
-        user_slice_drop_ins: memory_drop_ins(root, "user-.slice.d"),
-        user_manager_drop_ins: memory_drop_ins(root, "user@.service.d"),
+        user_memory,
+        user_memory_unavailable,
         journald: journald_conf(root),
         file_handles: read_text(root, "proc/sys/fs/file-nr").and_then(|t| parse_file_nr(&t)),
         inotify_max_user_watches: read_u64(root, "proc/sys/fs/inotify/max_user_watches"),
@@ -882,12 +1244,27 @@ fn check_swap(f: &HostFacts, out: &mut Vec<Finding>) {
 }
 
 /// A limit value that bounds memory (`infinity` and an empty reset do not).
-fn is_finite_limit(value: &str) -> bool {
-    let v = value.trim();
-    !v.is_empty() && !v.eq_ignore_ascii_case("infinity")
-}
-
-fn check_negated_limits(id: &'static str, unit: &str, drop_ins: &[DropIn], out: &mut Vec<Finding>) {
+fn check_negated_limits(id: &'static str, config: &UserMemoryConfig, out: &mut Vec<Finding>) {
+    let unit = &config.unit;
+    if !config.unavailable.is_empty() {
+        out.push(
+            finding(
+                id,
+                Level::Info,
+                format!("{unit}: on-disk memory limits are unavailable or incomplete"),
+            )
+            .observed(json!({"configuration": config}))
+            .rationale("An unreadable file, alias or unsupported assignment cannot establish the final unit configuration. This audit does not infer the running manager's limits from incomplete files.")
+            .commands(&[
+                &format!("systemctl cat {unit}"),
+                &format!("systemctl show {unit} -p MemoryMax -p MemoryHigh -p EffectiveMemoryMax -p EffectiveMemoryHigh"),
+            ]),
+        );
+        return;
+    }
+    if config.masked {
+        return;
+    }
     for (key, pick) in [
         (
             "MemoryMax",
@@ -895,32 +1272,38 @@ fn check_negated_limits(id: &'static str, unit: &str, drop_ins: &[DropIn], out: 
         ),
         ("MemoryHigh", |d: &DropIn| d.memory_high.clone()),
     ] {
-        let settings: Vec<(&DropIn, String)> = drop_ins
+        let settings: Vec<(&DropIn, String)> = config
+            .sources
             .iter()
             .filter_map(|d| pick(d).map(|v| (d, v)))
             .collect();
-        let Some(limit_at) = settings.iter().position(|(_, v)| is_finite_limit(v)) else {
+        let Some((last, last_value)) = settings.last() else {
             continue;
         };
-        if let Some((later, value)) = settings[limit_at + 1..]
+        // Only the final assignment matters. An intermediate reset followed
+        // by another finite limit is not a loss of configured protection.
+        if finite_memory_limit(last_value) != Some(false) {
+            continue;
+        }
+        if let Some((first, first_value)) = settings
             .iter()
-            .find(|(_, v)| !is_finite_limit(v))
+            .find(|(_, value)| finite_memory_limit(value) == Some(true))
         {
-            let (first, first_value) = &settings[limit_at];
+            let scope = if config.defaults_only { " defaults" } else { "" };
             out.push(
                 finding(
                     id,
                     Level::Crit,
                     format!(
-                        "{unit}: {key}={first_value} in {} is negated by {key}={} in {}, which sorts later",
+                        "{unit}{scope}: {key}={first_value} in {} is negated by the final {key}={} in {}",
                         first.path,
-                        if value.is_empty() { "(reset)" } else { value.as_str() },
-                        later.path
+                        if last_value.is_empty() { "(reset)" } else { last_value.as_str() },
+                        last.path
                     ),
                 )
-                .observed(json!({"drop_ins": drop_ins}))
-                .recommended(format!("remove the later {key} assignment or rename the drop-ins so the limit sorts last"))
-                .rationale("systemd applies drop-ins in file-name order, so a later MemoryMax=infinity silently removes the per-user memory limit that protects the machine (and the oomd protection built on it).")
+                .observed(json!({"configuration": config, "setting": key, "final_value": "infinity"}))
+                .recommended(format!("review the final {key} assignment and restore the intended limit for {unit}"))
+                .rationale("systemd applies the selected unit fragment and then drop-ins in file-name order. A final infinity or empty reset removes this unit's configured memory limit; parent limits may still apply, and running values need separate verification.")
                 .commands(&[&format!("systemctl cat {unit}")]),
             );
         }
@@ -945,18 +1328,21 @@ fn check_oomd(f: &HostFacts, out: &mut Vec<Finding>) {
         .observed(json!({"oomd_running": f.procs.oomd_running}))
         .rationale("systemd-oomd kills by cgroup under sustained memory pressure before the kernel OOM killer picks a victim; whether that is wanted is a host policy decision."),
     );
-    check_negated_limits(
-        "oomd.user_slice_limits",
-        "user-.slice",
-        &f.user_slice_drop_ins,
-        out,
-    );
-    check_negated_limits(
-        "oomd.user_manager_limits",
-        "user@.service",
-        &f.user_manager_drop_ins,
-        out,
-    );
+    if !f.user_memory_unavailable.is_empty() {
+        out.push(
+            finding("oomd.user_units", Level::Info, "User-unit discovery is incomplete")
+                .observed(json!({"unavailable": f.user_memory_unavailable}))
+                .rationale("Some user units or configuration directories could not be inspected; unobserved instances are not assumed to have memory limits."),
+        );
+    }
+    for config in &f.user_memory {
+        let id = if config.unit.ends_with(".slice") {
+            "oomd.user_slice_limits"
+        } else {
+            "oomd.user_manager_limits"
+        };
+        check_negated_limits(id, config, out);
+    }
 }
 
 fn check_journald(f: &HostFacts, out: &mut Vec<Finding>) {
@@ -1876,6 +2262,353 @@ mod tests {
             "{:#?}",
             r.findings
         );
+    }
+
+    fn user_memory<'a>(report: &'a DoctorReport, unit: &str) -> &'a UserMemoryConfig {
+        report
+            .facts
+            .user_memory
+            .iter()
+            .find(|config| config.unit == unit)
+            .unwrap_or_else(|| panic!("missing memory configuration for {unit}"))
+    }
+
+    #[test]
+    fn actual_user_instances_report_only_the_unit_whose_limit_is_removed() {
+        let root = healthy();
+        root.write("run/systemd/users/1000", "UID=1000\n")
+            .write("run/systemd/users/1001", "UID=1001\n")
+            .write(
+                "etc/systemd/system/user-.slice.d/10-limit.conf",
+                "[Slice]\nMemoryMax=80%\nMemoryHigh=70%\n",
+            )
+            .write(
+                "etc/systemd/system/user-1000.slice.d/90-unbounded.conf",
+                "[Slice]\nMemoryMax=infinity\n",
+            )
+            .write(
+                "etc/systemd/system/user-1001.slice.d/90-local.conf",
+                "[Slice]\nMemoryMax=60%\n",
+            );
+        let report = root.report();
+        let failures: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|finding| finding.id == "oomd.user_slice_limits")
+            .collect();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].level, Level::Crit);
+        assert!(failures[0].summary.starts_with("user-1000.slice:"));
+        assert_eq!(
+            failures[0].commands,
+            vec!["systemctl cat user-1000.slice"]
+        );
+        let affected = user_memory(&report, "user-1000.slice");
+        assert!(!affected.defaults_only);
+        assert_eq!(affected.memory_max.as_deref(), Some("infinity"));
+        assert_eq!(affected.memory_high.as_deref(), Some("70%"));
+        assert_eq!(
+            user_memory(&report, "user-1001.slice").memory_max.as_deref(),
+            Some("60%")
+        );
+        assert_eq!(report.facts.user_memory.len(), 4);
+        let serialized = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            serialized["facts"]["user_memory"][0]["unit"],
+            "user-1000.slice"
+        );
+    }
+
+    #[test]
+    fn user_manager_template_and_instance_resets_respect_resource_sections() {
+        let root = healthy();
+        root.write(
+            "usr/lib/systemd/system/user@.service",
+            "[Service]\nMemoryMax=16G\nMemoryHigh=8G\n",
+        )
+        .write(
+            "etc/systemd/system/user@1000.service.d/90-instance.conf",
+            "[Unit]\nMemoryMax=infinity\n[Service]\nMemoryHigh=\n[Install]\nMemoryMax=infinity\n",
+        );
+        let report = root.report();
+        let config = user_memory(&report, "user@1000.service");
+        assert_eq!(
+            config.fragment_path.as_deref(),
+            Some("/usr/lib/systemd/system/user@.service")
+        );
+        assert_eq!(config.memory_max.as_deref(), Some("16G"));
+        assert_eq!(config.memory_high.as_deref(), Some("infinity"));
+        let findings: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|finding| finding.id == "oomd.user_manager_limits")
+            .collect();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].level, Level::Crit);
+        assert!(findings[0].summary.contains("MemoryHigh"));
+        assert!(findings[0].summary.contains("(reset)"));
+    }
+
+    #[test]
+    fn restored_finite_limit_after_an_intermediate_reset_is_not_a_regression() {
+        let root = healthy();
+        root.write(
+            "etc/systemd/system/user-.slice.d/10-limit.conf",
+            "[Slice]\nMemoryMax=80%\n",
+        )
+        .write(
+            "etc/systemd/system/user-1000.slice.d/50-reset.conf",
+            "[Slice]\nMemoryMax=infinity\n",
+        )
+        .write(
+            "usr/lib/systemd/system/user-1000.slice.d/99-restored.conf",
+            "[Slice]\nMemoryMax=60%\n",
+        );
+        let report = root.report();
+        assert!(find(&report, "oomd.user_slice_limits").is_none());
+        assert_eq!(
+            user_memory(&report, "user-1000.slice").memory_max.as_deref(),
+            Some("60%")
+        );
+    }
+
+    #[test]
+    fn repeated_assignments_in_one_source_preserve_the_effective_reset() {
+        let root = healthy();
+        root.write(
+            "etc/systemd/system/user@1000.service.d/50-limit.conf",
+            "[Service]\nMemoryMax=16G\nMemoryHigh=8G\nMemoryMax=infinity\n",
+        );
+        let report = root.report();
+        let config = user_memory(&report, "user@1000.service");
+        assert_eq!(config.memory_max.as_deref(), Some("infinity"));
+        assert_eq!(config.memory_high.as_deref(), Some("8G"));
+        let finding = find(&report, "oomd.user_manager_limits").unwrap();
+        assert_eq!(finding.level, Level::Crit);
+        assert!(finding.summary.contains("MemoryMax=16G"));
+        assert!(finding.summary.contains("final MemoryMax=infinity"));
+    }
+
+    #[test]
+    fn user_unit_drop_in_precedence_matches_load_path_specificity_and_type_defaults() {
+        let pairs = [
+            (
+                "usr/lib/systemd/system/user-1000.slice.d/50-limit.conf",
+                "run/systemd/system/user-1000.slice.d/50-limit.conf",
+            ),
+            (
+                "run/systemd/system/user-1000.slice.d/50-limit.conf",
+                "etc/systemd/system/user-.slice.d/50-limit.conf",
+            ),
+            (
+                "etc/systemd/system/user-.slice.d/50-limit.conf",
+                "etc/systemd/system/user-1000.slice.d/50-limit.conf",
+            ),
+            (
+                "etc/systemd/system/slice.d/50-limit.conf",
+                "usr/lib/systemd/system/user-.slice.d/50-limit.conf",
+            ),
+            (
+                "etc/systemd/system/user-1000.slice.d/50-limit.conf",
+                "run/systemd/system.control/user-1000.slice.d/50-limit.conf",
+            ),
+        ];
+        for (lower, higher) in pairs {
+            let root = healthy();
+            root.write(lower, "[Slice]\nMemoryMax=infinity\n")
+                .write(higher, "[Slice]\nMemoryMax=8G\n");
+            let config = read_user_memory_config(&root.path(), "user-1000.slice", false);
+            assert!(config.unavailable.is_empty(), "{config:?}");
+            assert_eq!(config.memory_max.as_deref(), Some("8G"), "{higher}");
+            assert_eq!(config.sources.len(), 1, "{config:?}");
+            assert_eq!(config.sources[0].path, format!("/{higher}"));
+        }
+    }
+
+    #[test]
+    fn hidden_drop_ins_cannot_override_observed_memory_limits() {
+        let root = healthy();
+        root.write(
+            "usr/lib/systemd/system/user@.service",
+            "[Service]\nMemoryMax=16G\n",
+        )
+        .write(
+            "etc/systemd/system/user@1000.service.d/.ignored.conf",
+            "[Service]\nMemoryMax=infinity\n",
+        )
+        .write(
+            "etc/systemd/system/service.d/.type-ignored.conf",
+            "[Service]\nMemoryMax=0\n",
+        );
+        let report = root.report();
+        let config = user_memory(&report, "user@1000.service");
+        assert!(config.unavailable.is_empty());
+        assert_eq!(config.memory_max.as_deref(), Some("16G"));
+        assert_eq!(config.sources.len(), 1);
+        assert!(find(&report, "oomd.user_manager_limits").is_none());
+    }
+
+    #[test]
+    fn literal_user_manager_fragment_wins_before_template_lookup() {
+        let root = healthy();
+        root.write(
+            "etc/systemd/system/user@.service",
+            "[Service]\nMemoryMax=16G\n",
+        )
+        .write(
+            "run/systemd/system/user@1000.service",
+            "[Service]\nMemoryMax=4G\n",
+        );
+        let report = root.report();
+        let config = user_memory(&report, "user@1000.service");
+        assert_eq!(
+            config.fragment_path.as_deref(),
+            Some("/run/systemd/system/user@1000.service")
+        );
+        assert_eq!(config.memory_max.as_deref(), Some("4G"));
+        assert_eq!(config.sources.len(), 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn masked_drop_ins_hide_lower_files_and_masked_units_skip_their_configuration() {
+        let root = healthy();
+        root.write(
+            "usr/lib/systemd/system/user@.service",
+            "[Service]\nMemoryMax=16G\n",
+        )
+        .write(
+            "run/systemd/system/user@1000.service.d/90-reset.conf",
+            "[Service]\nMemoryMax=infinity\n",
+        );
+        let mask = root
+            .path()
+            .join("etc/systemd/system/user@1000.service.d/90-reset.conf");
+        std::fs::create_dir_all(mask.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("/dev/null", &mask).unwrap();
+        let report = root.report();
+        let config = user_memory(&report, "user@1000.service");
+        assert_eq!(config.memory_max.as_deref(), Some("16G"));
+        assert_eq!(
+            config.masked_drop_ins,
+            vec!["/etc/systemd/system/user@1000.service.d/90-reset.conf"]
+        );
+        assert!(find(&report, "oomd.user_manager_limits").is_none());
+
+        for empty_file in [false, true] {
+            let root = healthy();
+            root.write(
+                "usr/lib/systemd/system/user@.service",
+                "[Service]\nMemoryMax=16G\n",
+            )
+            .write(
+                "etc/systemd/system/user@1000.service.d/90-reset.conf",
+                "[Service]\nMemoryMax=infinity\n",
+            );
+            let mask = root.path().join("etc/systemd/system/user@1000.service");
+            if empty_file {
+                std::fs::write(&mask, "").unwrap();
+            } else {
+                std::os::unix::fs::symlink("/dev/null", &mask).unwrap();
+            }
+            let report = root.report();
+            let config = user_memory(&report, "user@1000.service");
+            assert!(config.masked, "{config:?}");
+            assert_eq!(
+                config.fragment_path.as_deref(),
+                Some("/etc/systemd/system/user@1000.service")
+            );
+            assert!(config.sources.is_empty());
+            assert!(config.memory_max.is_none());
+            assert!(find(&report, "oomd.user_manager_limits").is_none());
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unit_aliases_and_links_outside_fixture_roots_are_explicitly_unavailable() {
+        let root = healthy();
+        root.write(
+            "etc/systemd/system/user@.service",
+            "[Service]\nMemoryMax=16G\n",
+        );
+        std::os::unix::fs::symlink(
+            "user@.service",
+            root.path().join("etc/systemd/system/user@1000.service"),
+        )
+        .unwrap();
+        let report = root.report();
+        let config = user_memory(&report, "user@1000.service");
+        assert!(config.memory_max.is_none());
+        assert!(config.unavailable.iter().any(|reason| reason.contains("alias")));
+        assert_eq!(
+            find(&report, "oomd.user_manager_limits").unwrap().level,
+            Level::Info
+        );
+
+        let outside = Root::new();
+        outside.write("50-limit.conf", "[Slice]\nMemoryMax=8G\n");
+        let link = root.path().join("etc/systemd/system/user-1000.slice.d");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        let config = read_user_memory_config(&root.path(), "user-1000.slice", false);
+        assert!(config.memory_max.is_none());
+        assert!(config
+            .unavailable
+            .iter()
+            .any(|reason| reason.contains("leaves the inspected root")));
+        assert!(config.sources.is_empty());
+    }
+
+    #[test]
+    fn unknown_memory_assignments_do_not_claim_a_finite_or_unlimited_limit() {
+        for value in ["nonsense", "INFINITY", "0", "101%", "18446744073709551615"] {
+            let root = healthy();
+            root.write(
+                "usr/lib/systemd/system/user@.service",
+                "[Service]\nMemoryMax=16G\n",
+            )
+            .write(
+                "etc/systemd/system/user@1000.service.d/50-unsupported.conf",
+                &format!("[Service]\nMemoryMax={value}\n"),
+            );
+            let report = root.report();
+            let config = user_memory(&report, "user@1000.service");
+            assert!(config.memory_max.is_none(), "{value}");
+            assert!(!config.unavailable.is_empty(), "{value}");
+            assert_eq!(
+                find(&report, "oomd.user_manager_limits").unwrap().level,
+                Level::Info
+            );
+        }
+        for value in ["1", "1.5G", "80%", "0.01%", "18446744073709551614"] {
+            assert_eq!(finite_memory_limit(value), Some(true), "{value}");
+        }
+        assert_eq!(finite_memory_limit("infinity"), Some(false));
+        assert_eq!(finite_memory_limit(""), Some(false));
+    }
+
+    #[test]
+    fn continued_memory_settings_and_unrecognized_unit_names_are_handled_conservatively() {
+        let root = healthy();
+        root.write(
+            "etc/systemd/system/user@1000.service.d/50-limit.conf",
+            "[Service]\nMemoryMax=\\\n# continued value\n 8G\nMemoryHigh=4G\n",
+        );
+        let report = root.report();
+        let config = user_memory(&report, "user@1000.service");
+        assert!(config.unavailable.is_empty());
+        assert_eq!(config.memory_max.as_deref(), Some("8G"));
+        assert_eq!(config.memory_high.as_deref(), Some("4G"));
+        for name in [
+            "user@.service",
+            "user-.slice.d",
+            "user@1000.service.wants",
+            "user-+1000.slice",
+            "user-1000.slice;false",
+            "user-4294967296.slice",
+        ] {
+            assert_eq!(user_unit_uid(name), None, "{name}");
+        }
     }
 
     #[test]

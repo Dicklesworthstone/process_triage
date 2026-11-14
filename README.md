@@ -1200,13 +1200,15 @@ Many incidents come from host configuration, not from any one process. `pt docto
 | `vm.min_free_kbytes` | below the reserve for the machine's RAM (≈256 MB at 16 GB, 512 MB at 32–64 GB, 1 GB at 256 GB, 2 GB at 512 GB) |
 | `vm.dirty_ratio` | percentage limits that allow tens of GB of dirty cache |
 | Swap | no swap; swap nearly full; zram active but not recreated at boot; swap paradox (swapped pages while available RAM is more than twice the swapped amount) |
-| systemd-oomd | whether it runs; a later `MemoryMax=infinity` (or reset) drop-in that negates an earlier `user-.slice` / `user@.service` limit |
+| systemd-oomd | whether it runs; final `MemoryMax` / `MemoryHigh` settings for discovered user slices and user managers, including per-user overrides that remove an earlier limit |
 | journald | volatile storage or retention under a day (OOM post-mortems lost) |
 | File handles / inotify | system file table above 75% (with the largest descriptor holders); `max_user_watches` below 524288 |
 | Process table | zombies grouped by parent (a parent with 5+ unreaped children), D-state count |
 | Filesystem capacity | available space at or below 10% (warning) or 5% (critical), measured per supported local filesystem; reserved blocks are not counted as available |
 | Deleted but open files | allocated blocks held by unlinked regular files, with all observed descriptor or mapping holders and ownership coverage; sparse apparent size does not inflate the estimate |
 | pt itself | PSI unavailable (regimes fall back to load and memory); session store past 1000 sessions or 1 GiB, or growing with retention switched off |
+
+The memory-limit audit resolves each discovered `user-UID.slice` and `user@UID.service` separately. Using the standard system load path, it considers the unit fragment, matching instance/template/prefix drop-ins, type-wide defaults, configuration-directory precedence, and masked files. Only the final applicable value determines whether an earlier finite limit was removed; a later finite setting restores protection for this check. Settings in unrelated sections are ignored. Unsupported or unreadable configuration is reported as unavailable. These findings describe on-disk unit configuration; they do not establish which settings the running manager has loaded or the limits inherited from parent cgroups.
 
 Exit code: 0 when nothing needs attention, 1 when there is a warning or critical finding (the severity is in `worst`). Not yet covered: multiplexer hygiene, a policy section for thresholds, macOS.
 
