@@ -231,7 +231,14 @@ pub fn check_cooldown(config: &EscalationConfig, state: &EscalationState) -> Opt
         if let Ok(last_dt) = DateTime::parse_from_rfc3339(last) {
             let last_utc = last_dt.with_timezone(&Utc);
             let elapsed = Utc::now().signed_duration_since(last_utc);
-            if elapsed < Duration::seconds(config.min_interval_secs as i64) {
+            // A u64 cooldown may exceed i64::MAX. Casting it to a signed
+            // chrono duration wraps negative and silently disables the gate.
+            // Compare elapsed whole seconds without ever narrowing the policy.
+            // A future timestamp is also pending, never elapsed cooldown.
+            if elapsed < Duration::zero()
+                || u64::try_from(elapsed.num_seconds())
+                    .is_ok_and(|seconds| seconds < config.min_interval_secs)
+            {
                 return Some(DeferReason::Cooldown);
             }
         }
@@ -254,8 +261,8 @@ where
 {
     // Check cooldown.
     if let Some(reason) = check_cooldown(config, state) {
-        state.total_deferrals += 1;
-        state.consecutive_deferrals += 1;
+        state.total_deferrals = state.total_deferrals.saturating_add(1);
+        state.consecutive_deferrals = state.consecutive_deferrals.saturating_add(1);
         return EscalationOutcome {
             status: EscalationStatus::Deferred,
             reason: format!("{:?}", reason),
@@ -266,8 +273,8 @@ where
 
     // Try to acquire lock.
     if !try_lock() {
-        state.total_deferrals += 1;
-        state.consecutive_deferrals += 1;
+        state.total_deferrals = state.total_deferrals.saturating_add(1);
+        state.consecutive_deferrals = state.consecutive_deferrals.saturating_add(1);
         return EscalationOutcome {
             status: EscalationStatus::Deferred,
             reason: format!("{:?}", DeferReason::LockContention),
@@ -278,7 +285,7 @@ where
 
     // Lock acquired — escalation proceeds.
     state.last_escalation_at = Some(Utc::now().to_rfc3339());
-    state.total_escalations += 1;
+    state.total_escalations = state.total_escalations.saturating_add(1);
     state.consecutive_deferrals = 0;
 
     EscalationOutcome {
@@ -511,6 +518,73 @@ mod tests {
         let r2 = decide_escalation(&config, &mut state, &triggers, || true);
         assert_eq!(r2.status, EscalationStatus::Deferred);
         assert!(r2.reason.contains("Cooldown"));
+    }
+
+    #[test]
+    fn cooldown_preserves_large_configured_intervals_without_signed_wrap() {
+        let mut state = EscalationState::new();
+        state.last_escalation_at = Some(Utc::now().to_rfc3339());
+        for seconds in [i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX] {
+            let config = EscalationConfig {
+                min_interval_secs: seconds,
+                ..EscalationConfig::default()
+            };
+            assert_eq!(
+                check_cooldown(&config, &state),
+                Some(DeferReason::Cooldown),
+                "oversized cooldown must not silently become negative: {seconds}"
+            );
+            let mut called = false;
+            let outcome = decide_escalation(&config, &mut state, &[], || {
+                called = true;
+                true
+            });
+            assert_eq!(outcome.status, EscalationStatus::Deferred);
+            assert!(!called, "cooldown must precede lock acquisition");
+        }
+    }
+
+    #[test]
+    fn cooldown_respects_expiry_zero_and_future_saved_timestamps() {
+        let config = EscalationConfig {
+            min_interval_secs: 300,
+            ..EscalationConfig::default()
+        };
+        let mut state = EscalationState::new();
+        state.last_escalation_at =
+            Some((Utc::now() - Duration::seconds(301)).to_rfc3339());
+        assert_eq!(check_cooldown(&config, &state), None);
+        state.last_escalation_at =
+            Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        assert_eq!(
+            check_cooldown(&config, &state),
+            Some(DeferReason::Cooldown)
+        );
+        let zero = EscalationConfig {
+            min_interval_secs: 0,
+            ..config
+        };
+        state.last_escalation_at = Some(Utc::now().to_rfc3339());
+        assert_eq!(check_cooldown(&zero, &state), None);
+    }
+
+    #[test]
+    fn persisted_escalation_counters_saturate_instead_of_panicking() {
+        let config = EscalationConfig::default();
+        let mut state = EscalationState {
+            last_escalation_at: None,
+            total_escalations: u32::MAX,
+            total_deferrals: u32::MAX,
+            consecutive_deferrals: u32::MAX,
+        };
+        let blocked = decide_escalation(&config, &mut state, &[], || false);
+        assert_eq!(blocked.status, EscalationStatus::Deferred);
+        assert_eq!(state.total_deferrals, u32::MAX);
+        assert_eq!(state.consecutive_deferrals, u32::MAX);
+        let successful = decide_escalation(&config, &mut state, &[], || true);
+        assert_eq!(successful.status, EscalationStatus::Completed);
+        assert_eq!(state.total_escalations, u32::MAX);
+        assert_eq!(state.consecutive_deferrals, 0);
     }
 
     #[test]
