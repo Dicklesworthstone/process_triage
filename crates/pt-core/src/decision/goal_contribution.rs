@@ -51,6 +51,9 @@ pub struct PortGoalResources {
 #[derive(Debug, Clone, Default)]
 pub struct GoalResourceSnapshot {
     pub processes: BTreeMap<u32, ProcessGoalResources>,
+    /// Full process-table count before candidate, age, protection or output
+    /// filtering. None means not requested or an incomplete census, never zero.
+    pub process_count: Option<u64>,
     pub ports: BTreeMap<u16, PortGoalResources>,
     /// Separate from descriptor observations so a memory-only collection never
     /// manufactures a zero descriptor count. Other goals leave this map empty.
@@ -69,8 +72,18 @@ impl GoalResourceSnapshot {
     pub fn collect(goal: &Goal, population: &[ProcessRecord]) -> Self {
         let mut need_fds = false;
         let mut need_memory = false;
+        let mut need_processes = false;
         let mut ports = BTreeMap::new();
-        requested_resources(goal, &mut need_fds, &mut need_memory, &mut ports);
+        requested_resources(
+            goal,
+            &mut need_fds,
+            &mut need_memory,
+            &mut need_processes,
+            &mut ports,
+        );
+        let process_count = need_processes
+            .then(|| u64::try_from(population.len()).ok())
+            .flatten();
         let disk_target = match goal.disk_target() {
             Ok(target) => target,
             Err(error) => {
@@ -82,7 +95,10 @@ impl GoalResourceSnapshot {
             }
         };
         if !need_fds && !need_memory && ports.is_empty() && disk_target.is_none() {
-            return Self::default();
+            return Self {
+                process_count,
+                ..Self::default()
+            };
         }
         #[cfg(target_os = "linux")]
         let mut snapshot = if need_fds || need_memory || !ports.is_empty() {
@@ -107,6 +123,7 @@ impl GoalResourceSnapshot {
                 ..Self::default()
             }
         };
+        snapshot.process_count = process_count;
         if let Some(target) = disk_target {
             match crate::collect::disk::resolve_mount(target.disk_path.as_deref()) {
                 Ok(mount) => {
@@ -135,6 +152,10 @@ impl GoalResourceSnapshot {
     }
 
     pub fn mark_census_incomplete(&mut self) {
+        if self.process_count.take().is_some() {
+            self.warnings
+                .push("process_count_unavailable: process scan reported missing evidence".into());
+        }
         if let Some(disk) = &mut self.disk {
             disk.mark_census_incomplete();
             if let Some(mount) = &mut self.disk_mount {
@@ -195,6 +216,7 @@ fn requested_resources(
     goal: &Goal,
     need_fds: &mut bool,
     need_memory: &mut bool,
+    need_processes: &mut bool,
     ports: &mut BTreeMap<u16, PortGoalResources>,
 ) {
     match goal {
@@ -204,6 +226,7 @@ fn requested_resources(
         Goal::Target(target) => match target.metric {
             Metric::FileDescriptors => *need_fds = true,
             Metric::Memory => *need_memory = true,
+            Metric::ProcessCount => *need_processes = true,
             Metric::Port => {
                 if let Some(port) = target.port {
                     ports.entry(port).or_default();
@@ -213,7 +236,7 @@ fn requested_resources(
         },
         Goal::And(parts) | Goal::Or(parts) => {
             for part in parts {
-                requested_resources(part, need_fds, need_memory, ports);
+                requested_resources(part, need_fds, need_memory, need_processes, ports);
             }
         }
     }
@@ -956,6 +979,51 @@ mod tests {
             snapshot.warnings,
             ["private_memory_goal_measurements_unavailable_on_this_platform"]
         );
+    }
+
+    #[test]
+    fn process_count_uses_the_full_population_without_extra_probes() {
+        let population: Vec<_> = [(1, 0, 0), (424242, 1, 1)]
+            .into_iter()
+            .map(|(pid, ppid, uid)| ProcessRecord {
+                pid: pt_common::ProcessId(pid),
+                ppid: pt_common::ProcessId(ppid),
+                uid,
+                user: uid.to_string(),
+                pgid: Some(pid),
+                sid: Some(pid),
+                start_id: pt_common::StartId::from_linux("count-test", 1, pid),
+                comm: "census-only".into(),
+                cmd: "census-only".into(),
+                state: crate::collect::ProcessState::Sleeping,
+                cpu_percent: 0.0,
+                rss_bytes: 0,
+                vsz_bytes: 0,
+                tty: None,
+                start_time_unix: 0,
+                elapsed: std::time::Duration::ZERO,
+                source: "test".into(),
+                container_info: None,
+            })
+            .collect();
+        let goal = super::super::goal_parser::parse_goal("processes < 100").unwrap();
+        let mut snapshot = GoalResourceSnapshot::collect(&goal, &population);
+        // Protected/root processes and very young processes still belong to
+        // the count; fake PIDs need no descriptor or private-memory probes.
+        assert_eq!(snapshot.process_count, Some(2));
+        assert!(snapshot.processes.is_empty());
+        assert!(snapshot.ports.is_empty());
+        assert!(snapshot.private_memory.is_empty());
+        assert!(snapshot.warnings.is_empty());
+        snapshot.mark_census_incomplete();
+        assert!(snapshot.process_count.is_none());
+        assert!(snapshot.warnings[0].starts_with("process_count_unavailable"));
+        assert_eq!(GoalResourceSnapshot::collect(&goal, &[]).process_count, Some(0));
+
+        let unrelated = super::super::goal_parser::parse_goal("free 20% CPU").unwrap();
+        assert!(GoalResourceSnapshot::collect(&unrelated, &population)
+            .process_count
+            .is_none());
     }
 
     fn private_memory_identity(pid: u32) -> ProcessIdentity {

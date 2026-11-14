@@ -20,6 +20,10 @@ pub struct MetricSnapshot {
     pub occupied_ports: Option<Vec<u16>>,
     /// Total open file descriptors in a consistent, completely observed scope.
     pub total_fds: Option<u64>,
+    /// Full process-table count in the same scan scope before and after actions.
+    /// Missing or partial censuses are unknown, not an observed empty table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_count: Option<u64>,
     /// Available space on the one filesystem selected by the saved disk goal.
     /// Its mount identity is required to compare two observations. Older
     /// snapshots have no disk observation, rather than a measured zero.
@@ -114,6 +118,7 @@ pub enum GoalMetric {
     Cpu,
     Port,
     FileDescriptors,
+    ProcessCount,
     Disk,
 }
 
@@ -322,6 +327,17 @@ fn compute_observed_delta(
                 .ok_or("A complete file-descriptor total is unavailable after application")?;
             Ok((i128::from(before) - i128::from(after)) as f64)
         }
+        GoalMetric::ProcessCount => {
+            let before = before
+                .process_count
+                .ok_or("A complete process census is unavailable before application")?;
+            let after = after
+                .process_count
+                .ok_or("A complete process census is unavailable after application")?;
+            // Preserve growth as negative progress: concurrent spawns and
+            // unreaped zombies can defeat the forecast even after a valid kill.
+            Ok((i128::from(before) - i128::from(after)) as f64)
+        }
         GoalMetric::Disk => {
             let before = before
                 .disk_space
@@ -452,6 +468,7 @@ mod tests {
             total_cpu_frac: Some(0.8),
             occupied_ports: Some(vec![3000, 8080]),
             total_fds: Some(5000),
+            process_count: Some(100),
             disk_space: Some(disk_observation(2_000_000_000)),
             timestamp: 1000.0,
         }
@@ -463,6 +480,7 @@ mod tests {
             total_cpu_frac: Some(0.5),
             occupied_ports: Some(vec![8080]), // Port 3000 freed
             total_fds: Some(4500),
+            process_count: Some(99),
             disk_space: Some(disk_observation(3_000_000_000)),
             timestamp: 1010.0,
         }
@@ -893,6 +911,7 @@ mod tests {
             GoalMetric::Cpu,
             GoalMetric::Port,
             GoalMetric::FileDescriptors,
+            GoalMetric::ProcessCount,
             GoalMetric::Disk,
         ] {
             for missing_before in [true, false] {
@@ -908,6 +927,7 @@ mod tests {
                     GoalMetric::Cpu => missing.total_cpu_frac = None,
                     GoalMetric::Port => missing.occupied_ports = None,
                     GoalMetric::FileDescriptors => missing.total_fds = None,
+                    GoalMetric::ProcessCount => missing.process_count = None,
                     GoalMetric::Disk => missing.disk_space = None,
                 }
                 let report = measure_progress(
@@ -944,6 +964,7 @@ mod tests {
             total_cpu_frac: Some(0.0),
             occupied_ports: Some(Vec::new()),
             total_fds: Some(0),
+            process_count: Some(0),
             disk_space: Some(disk_observation(0)),
             timestamp: 1.0,
         };
@@ -956,6 +977,7 @@ mod tests {
             GoalMetric::Cpu,
             GoalMetric::Port,
             GoalMetric::FileDescriptors,
+            GoalMetric::ProcessCount,
             GoalMetric::Disk,
         ] {
             let report = measure_progress(
@@ -977,6 +999,7 @@ mod tests {
             total_cpu_frac: Some(0.8),
             occupied_ports: None,
             total_fds: None,
+            process_count: None,
             disk_space: None,
             timestamp: 1.0,
         };
@@ -1197,18 +1220,58 @@ mod tests {
     }
 
     #[test]
+    fn process_count_progress_measures_departures_and_concurrent_growth() {
+        for (count, delta, classification) in [
+            (99, 1.0, DiscrepancyClass::AsExpected),
+            (100, 0.0, DiscrepancyClass::NoEffect),
+            (102, -2.0, DiscrepancyClass::Underperformance),
+        ] {
+            let before = make_before();
+            let after = MetricSnapshot {
+                process_count: Some(count),
+                ..make_after_good()
+            };
+            let report = measure_progress(
+                GoalMetric::ProcessCount,
+                None,
+                &before,
+                &after,
+                make_outcomes(1.0, true, false),
+                &ProgressConfig::default(),
+                None,
+            );
+            assert_eq!(report.observed_progress, Some(delta));
+            assert_eq!(report.expected_progress, Some(1.0));
+            assert_eq!(report.discrepancy, Some(delta - 1.0));
+            assert_eq!(report.classification, classification);
+        }
+        // Old saved snapshots have no process observation. Loading them cannot
+        // invent an empty process table and a successful reduction.
+        let mut old = serde_json::to_value(make_before()).unwrap();
+        old.as_object_mut().unwrap().remove("process_count");
+        let old: MetricSnapshot = serde_json::from_value(old).unwrap();
+        assert!(old.process_count.is_none());
+    }
+
+    #[test]
     fn integer_deltas_preserve_small_changes_in_large_counters() {
         let before = MetricSnapshot {
             available_memory_bytes: Some(u64::MAX - 1),
             total_fds: Some(u64::MAX),
+            process_count: Some(u64::MAX),
             ..make_before()
         };
         let after = MetricSnapshot {
             available_memory_bytes: Some(u64::MAX),
             total_fds: Some(u64::MAX - 1),
+            process_count: Some(u64::MAX - 1),
             ..make_after_good()
         };
-        for metric in [GoalMetric::Memory, GoalMetric::FileDescriptors] {
+        for metric in [
+            GoalMetric::Memory,
+            GoalMetric::FileDescriptors,
+            GoalMetric::ProcessCount,
+        ] {
             let report = measure_progress(
                 metric,
                 None,

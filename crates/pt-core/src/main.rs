@@ -6016,6 +6016,41 @@ fn resource_goal_from_target(
                 weight: 1.0,
             }
         }
+        Metric::ProcessCount => {
+            if target.value.fract() != 0.0 || target.value > f64::from(u32::MAX) {
+                return Err(
+                    "process-count goals require an integer between 0 and 4294967295".into(),
+                );
+            }
+            let required = match target.comparator {
+                Comparator::FreeAtLeast => {
+                    if resources.process_count.is_none() {
+                        warnings.push("process_census_unavailable".into());
+                    }
+                    target.value
+                }
+                Comparator::ReduceBelow => {
+                    let current = resources.process_count.ok_or(
+                        "process-count upper bound requires a complete full-process census",
+                    )?;
+                    let required = (current as f64 - target.value).max(0.0);
+                    if required == 0.0 {
+                        warnings.push("process_count_target_already_met".into());
+                    }
+                    required
+                }
+                Comparator::Release => {
+                    return Err(
+                        "process-count goals require a count to free or an upper bound".into(),
+                    );
+                }
+            };
+            ResourceGoal {
+                resource: "process_count".into(),
+                target: required,
+                weight: 1.0,
+            }
+        }
         Metric::Disk => {
             if target.comparator != Comparator::FreeAtLeast || target.value >= u64::MAX as f64 {
                 return Err("disk goals require a finite free-disk byte target".into());
@@ -6135,6 +6170,13 @@ fn build_opt_candidates_for_goals(
                         .as_ref()
                         .and_then(|identity| resources.fd_count(identity))
                         .unwrap_or(0) as f64,
+                    // Only the candidate itself is credited. Descendants,
+                    // zombies routed to parents and reversible actions cannot
+                    // manufacture extra departures from the process table.
+                    "process_count" => identity
+                        .as_ref()
+                        .filter(|identity| identity.can_safely_revalidate())
+                        .map_or(0.0, |_| 1.0),
                     "disk_bytes" => identity
                         .as_ref()
                         .and_then(|identity| resources.exclusive_disk_bytes(identity).ok())
@@ -6430,6 +6472,7 @@ fn build_goal_plan_from_candidates(
     let requests_cpu = goal_requests_metric(goal, Metric::Cpu);
     let requests_memory = goal_requests_metric(goal, Metric::Memory);
     let requests_disk = goal_requests_metric(goal, Metric::Disk);
+    let requests_processes = goal_requests_metric(goal, Metric::ProcessCount);
     if requests_disk {
         let unavailable = candidates
             .iter()
@@ -6485,6 +6528,15 @@ fn build_goal_plan_from_candidates(
         "port_scope": "current_network_namespace",
         "process_scope": "mounted_procfs",
         "ports": resources.ports,
+        "processes": requests_processes.then(|| serde_json::json!({
+            "count": resources.process_count,
+            "complete": resources.process_count.is_some(),
+            "basis": "full_scan_before_candidate_filters",
+            "unit": "processes",
+            "expected_departures_per_direct_kill": 1,
+            "includes_protected_processes": true,
+            "guaranteed_recovery": false,
+        })),
         "disk": requests_disk.then(|| serde_json::json!({
             "mount": resources.disk_mount,
             "error": resources.disk_error,
@@ -6537,6 +6589,17 @@ fn build_goal_plan_from_candidates(
                             && (0.0..=1.0).contains(&t.value) =>
                     {
                         warnings.push(format!("cpu_reduce_below_baseline_unavailable: {error}"));
+                        continue;
+                    }
+                    Err(error)
+                        if t.metric == Metric::ProcessCount
+                            && t.comparator == Comparator::ReduceBelow
+                            && resources.process_count.is_none()
+                            && t.value.is_finite()
+                            && (0.0..=f64::from(u32::MAX)).contains(&t.value)
+                            && t.value.fract() == 0.0 =>
+                    {
+                        warnings.push(format!("process_count_baseline_unavailable: {error}"));
                         continue;
                     }
                     Err(error) => return Err(error),
@@ -6640,6 +6703,7 @@ fn goal_summary_json(goal_str: &str, goal: &Goal, output: &GoalPlanOutput) -> se
                     "memory_mb" => "MiB",
                     "cpu_pct" => "percent_of_host_capacity",
                     "fd_count" => "descriptors",
+                    "process_count" => "processes",
                     "disk_bytes" => "bytes",
                     resource if resource.starts_with("port_") => "holder_processes",
                     _ => "unknown",
@@ -7120,6 +7184,213 @@ mod executable_goal_tests {
             actions,
         };
         (candidates, plan)
+    }
+
+    #[test]
+    fn process_goal_retains_full_census_after_candidate_filters_and_budgets() {
+        let goal_text = "processes < 99";
+        let goal = parse_goal(goal_text).unwrap();
+        let (mut candidates, mut plan) =
+            fixture(&[(100, 99999, 90.0), (200, 1, 0.0), (300, 1, 0.0)]);
+        for (candidate, loss) in candidates.iter_mut().zip([4.0, 1.0, 2.0]) {
+            candidate["expected_loss"] =
+                serde_json::json!([{"action": "kill", "loss": loss}]);
+        }
+        let resources = GoalResourceSnapshot {
+            process_count: Some(100),
+            ..Default::default()
+        };
+        let output = build_goal_plan_from_executable_actions(
+            goal_text,
+            &goal,
+            f64::NAN,
+            &mut candidates,
+            &plan,
+            &resources,
+        )
+        .unwrap();
+        assert!(output.result.feasible);
+        assert_eq!(output.goals[0].target, 2.0);
+        assert_eq!(output.result.total_contributions, vec![2.0]);
+        let mut selected = output.selected_pids.clone();
+        selected.sort_unstable();
+        assert_eq!(selected, vec![200, 300]);
+        let summary = goal_summary_json(goal_text, &goal, &output);
+        assert_eq!(summary["targets"][0]["unit"], "processes");
+        assert_eq!(summary["resource_observations"]["processes"]["count"], 100);
+
+        // A one-kill budget cannot shrink the original count to the number
+        // of remaining candidates or turn a two-departure goal into a no-op.
+        plan.actions.retain(|action| action.target.pid.0 == 200);
+        let output = build_goal_plan_from_executable_actions(
+            goal_text,
+            &goal,
+            f64::NAN,
+            &mut candidates,
+            &plan,
+            &resources,
+        )
+        .unwrap();
+        assert_eq!(output.goals[0].target, 2.0);
+        assert_eq!(output.selected_pids, vec![200]);
+        assert_eq!(output.result.goal_achievement[0].shortfall, 1.0);
+        assert!(!output.result.feasible);
+        assert_eq!(candidates[0]["goal_selected"], false);
+        assert_eq!(candidates[2]["goal_selected"], false);
+    }
+
+    #[test]
+    fn satisfied_process_goals_save_no_actions() {
+        for goal_text in ["free 0 processes", "processes <= 100"] {
+            let goal = parse_goal(goal_text).unwrap();
+            let (mut candidates, mut plan) = fixture(&[(100, 1000, 80.0)]);
+            let resources = GoalResourceSnapshot {
+                process_count: Some(100),
+                ..Default::default()
+            };
+            let output = finalize_goal_action_plan(
+                Some(&goal),
+                f64::NAN,
+                &mut candidates,
+                &mut plan,
+                &resources,
+                &[],
+                false,
+            )
+            .unwrap();
+            assert!(output.result.feasible);
+            assert_eq!(output.goals[0].target, 0.0);
+            assert_empty_saved_goal_plan(&plan, &candidates);
+        }
+    }
+
+    #[test]
+    fn process_upper_bound_requires_complete_census_but_or_can_use_a_free_count() {
+        let goal = parse_goal("processes < 100").unwrap();
+        let (mut candidates, mut plan) = fixture(&[(100, 1000, 0.0)]);
+        let mut resources = GoalResourceSnapshot {
+            process_count: Some(100),
+            ..Default::default()
+        };
+        resources.mark_census_incomplete();
+        let error = finalize_goal_action_plan(
+            Some(&goal),
+            f64::NAN,
+            &mut candidates,
+            &mut plan,
+            &resources,
+            &[],
+            false,
+        )
+        .err()
+        .expect("an incomplete census must refuse an absolute count target");
+        assert!(error.contains("complete full-process census"));
+        assert_empty_saved_goal_plan(&plan, &candidates);
+
+        let (mut candidates, plan) = fixture(&[(100, 1000, 0.0)]);
+        let goal_text = "processes < 100 OR free 1 process";
+        let either = parse_goal(goal_text).unwrap();
+        let output = build_goal_plan_from_executable_actions(
+            goal_text,
+            &either,
+            f64::NAN,
+            &mut candidates,
+            &plan,
+            &resources,
+        )
+        .unwrap();
+        assert!(output.result.feasible);
+        assert_eq!(output.selected_pids, vec![100]);
+        assert!(output
+            .warnings
+            .iter()
+            .any(|warning| warning.starts_with("process_count_baseline_unavailable")));
+        assert!(build_resource_goals(
+            &parse_goal("processes < 100 AND free 1 process").unwrap(),
+            f64::NAN,
+            &resources,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn process_goals_credit_only_matching_executable_direct_kills() {
+        let goal_text = "free 1 process";
+        let goal = parse_goal(goal_text).unwrap();
+        for case in ["blocked", "routed", "zombie", "pause", "stale", "review"] {
+            let (mut candidates, mut plan) = fixture(&[(100, 99999, 90.0)]);
+            match case {
+                "blocked" => plan.actions[0].blocked = true,
+                "routed" => plan.actions[0].routing = ActionRouting::ZombieToParent,
+                "zombie" => {
+                    plan.actions[0].original_zombie_target = Some(plan.actions[0].target.clone());
+                }
+                "pause" => plan.actions[0].action = Action::Pause,
+                "stale" => candidates[0]["start_id"] = serde_json::json!("reused-pid"),
+                "review" => candidates[0]["recommended_action"] = serde_json::json!("review"),
+                _ => unreachable!(),
+            }
+            let output = build_goal_plan_from_executable_actions(
+                goal_text,
+                &goal,
+                f64::NAN,
+                &mut candidates,
+                &plan,
+                &GoalResourceSnapshot::default(),
+            )
+            .unwrap();
+            assert!(output.selected_pids.is_empty(), "{case}");
+            assert_eq!(output.result.total_contributions, vec![0.0], "{case}");
+            assert!(!output.result.feasible, "{case}");
+        }
+    }
+
+    #[test]
+    fn process_count_typed_goals_reject_fractional_and_invalid_targets() {
+        let Goal::Target(mut target) = parse_goal("free 1 process").unwrap() else {
+            unreachable!();
+        };
+        for value in [-1.0, 1.5, f64::NAN, f64::INFINITY, 4_294_967_296.0] {
+            target.value = value;
+            assert!(resource_goal_from_target(
+                &target,
+                f64::NAN,
+                &GoalResourceSnapshot::default(),
+            )
+            .is_err());
+        }
+        target.value = 1.0;
+        target.comparator = Comparator::Release;
+        assert!(resource_goal_from_target(
+            &target,
+            f64::NAN,
+            &GoalResourceSnapshot::default(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn saved_process_departure_forecast_excludes_other_remedies_and_zombie_routes() {
+        let (_, plan) = fixture(&[(100, 1000, 0.0)]);
+        let direct = &plan.actions[0];
+        assert_eq!(
+            ExpectedGoalContribution::from_saved(direct, None, "direct".into()).process_count,
+            Some(1.0)
+        );
+        for case in ["blocked", "routed", "zombie", "pause", "weak_identity"] {
+            let mut action = direct.clone();
+            match case {
+                "blocked" => action.blocked = true,
+                "routed" => action.routing = ActionRouting::ZombieToParent,
+                "zombie" => action.original_zombie_target = Some(action.target.clone()),
+                "pause" => action.action = Action::Pause,
+                "weak_identity" => action.target.quality = pt_common::IdentityQuality::PidOnly,
+                _ => unreachable!(),
+            }
+            assert!(ExpectedGoalContribution::from_saved(&action, None, case.into())
+                .process_count
+                .is_none(), "{case}");
+        }
     }
 
     fn relief_fixture(rows: &[(u32, Action, [f64; 3])]) -> (Vec<serde_json::Value>, Plan) {
@@ -8952,6 +9223,7 @@ fn build_goal_advisory_from_scan(
             "disk_mount": resources.disk_mount,
             "disk_ownership_complete": resources.disk.as_ref().is_some_and(|disk| disk.complete),
             "census_processes": result.processes.len(),
+            "complete_process_count": resources.process_count,
             "guaranteed_recovery": false,
         },
         "achievements": achievements,
@@ -18638,6 +18910,7 @@ mod process_tree_safety_tests {
             total_cpu_frac: Some(0.0),
             occupied_ports: Some(Vec::new()),
             total_fds: Some(0),
+            process_count: None,
             disk_space: None,
             timestamp: 1.0,
         };
@@ -23632,6 +23905,7 @@ mod planning_pressure_tests {
                 total_cpu_frac: None,
                 occupied_ports: Some(vec![8080]),
                 total_fds: Some(100),
+                process_count: Some(10),
                 disk_space: None,
                 timestamp: 1.0,
             };
@@ -23668,6 +23942,7 @@ mod planning_pressure_tests {
             assert!(before.available_memory_bytes.is_none());
             assert!(before.occupied_ports.is_none());
             assert!(before.total_fds.is_none());
+            assert!(before.process_count.is_none());
         }
     }
 
@@ -27564,6 +27839,7 @@ fn capture_metric_snapshot_for_goal_progress(
         total_cpu_frac: None,
         occupied_ports: collect_occupied_ports_for_goal_progress(),
         total_fds: processes.and_then(collect_total_fds_for_goal_progress),
+        process_count: processes.and_then(|processes| u64::try_from(processes.len()).ok()),
         disk_space: None,
         timestamp: chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
     }
@@ -27630,6 +27906,8 @@ fn attach_measured_goal_resources(
         after.occupied_ports = None;
         before.total_fds = None;
         after.total_fds = None;
+        before.process_count = None;
+        after.process_count = None;
         before.disk_space = None;
         after.disk_space = None;
         return;
@@ -27765,6 +28043,7 @@ struct ExpectedGoalContribution {
     cpu_host_fraction: Option<f64>,
     ports: Option<f64>,
     file_descriptors: Option<f64>,
+    process_count: Option<f64>,
     disk_bytes: Option<f64>,
     disk_mount: Option<pt_core::collect::disk::DiskMountIdentity>,
     label: String,
@@ -27789,6 +28068,15 @@ impl ExpectedGoalContribution {
             file_descriptors: prediction
                 .and_then(|prediction| prediction.file_descriptors.as_ref())
                 .map(|descriptors| descriptors.count as f64),
+            // This forecast follows from the immutable saved action, without
+            // reading current resources. A direct kill targets one incarnation;
+            // whether it actually leaves the table is measured separately.
+            process_count: (!action.blocked
+                && action.action == Action::Kill
+                && action.routing == pt_core::plan::ActionRouting::Direct
+                && action.original_zombie_target.is_none()
+                && action.target.can_safely_revalidate())
+            .then_some(1.0),
             disk_bytes: prediction
                 .and_then(|prediction| prediction.disk.as_ref())
                 .map(|disk| disk.allocated_bytes as f64),
@@ -28368,7 +28656,12 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
 
     let goal_progress_scan_options = QuickScanOptions {
         pids: vec![],
-        include_kernel_threads: false,
+        // Keep the process-count baseline's scope even when planning explicitly
+        // included kernel threads. Candidate filters never define this census.
+        include_kernel_threads: saved_document
+            .pointer("/args/include_kernel_threads")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
         timeout: global.timeout.map(std::time::Duration::from_secs),
         progress: None,
     };
@@ -29487,6 +29780,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     let mut cpu_action_outcomes = Vec::new();
     let mut port_action_outcomes = Vec::new();
     let mut fd_action_outcomes = Vec::new();
+    let mut process_action_outcomes = Vec::new();
     let mut disk_action_outcomes = Vec::new();
     let mut credited_kill_targets = HashSet::new();
     for action in &actions_to_apply {
@@ -29543,6 +29837,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             expected.memory_bytes = expected.memory_bytes.map(|_| 0.0);
             expected.cpu_host_fraction = expected.cpu_host_fraction.map(|_| 0.0);
             expected.file_descriptors = expected.file_descriptors.map(|_| 0.0);
+            expected.process_count = expected.process_count.map(|_| 0.0);
             expected.disk_bytes = expected.disk_bytes.map(|_| 0.0);
         }
 
@@ -29574,6 +29869,13 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             success,
             respawn_detected,
             expected_contribution: expected.file_descriptors,
+        });
+        process_action_outcomes.push(GoalActionOutcome {
+            pid: action_pid,
+            label: expected.label.clone(),
+            success,
+            respawn_detected,
+            expected_contribution: expected.process_count,
         });
         disk_action_outcomes.push(GoalActionOutcome {
             pid: action_pid,
@@ -29622,6 +29924,16 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         Some(sid.0.clone()),
     );
 
+    let process_report = goal_progress::measure_progress(
+        GoalMetric::ProcessCount,
+        None,
+        &before_snapshot,
+        &after_snapshot,
+        process_action_outcomes,
+        &progress_config,
+        Some(sid.0.clone()),
+    );
+
     let planning_only = global.dry_run || global.shadow || !executed_attempt;
     let disk_report = goal_progress::measure_progress(
         GoalMetric::Disk,
@@ -29643,12 +29955,14 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         "resource_predictions": resource_predictions.as_ref().map(|predictions| predictions.snapshot()),
         "after_scan_error": after_scan_error,
         "scope": "host_observations_not_per_action_causal_relief",
-        "units": {"memory": "bytes", "cpu": "host_busy_fraction", "ports": "observer_network_namespace", "file_descriptors": "observed_process_census_fd_entries", "disk": "available_bytes_on_saved_filesystem"},
+        "units": {"memory": "bytes", "cpu": "host_busy_fraction", "ports": "observer_network_namespace", "file_descriptors": "observed_process_census_fd_entries", "processes": "full_process_census_entries", "disk": "available_bytes_on_saved_filesystem"},
+        "process_census_scope": {"include_kernel_threads": goal_progress_scan_options.include_kernel_threads, "candidate_filters_applied": false},
         "prediction_notes": [
             "Forecasts retain the exact planning-time evidence for successful saved actions; execution never substitutes current readings, RSS, or lifetime CPU.",
             "CPU predictions are measured fractions of whole-host capacity. Private-memory predictions use Private_Clean plus Private_Dirty and exclude shared pages and huge-TLB pools.",
             "CPU comparison additionally requires the observed online capacity to match the original planning window.",
             "Port-release forecasts require exclusive ownership in the observer network namespace and remain unavailable without it.",
+            "Process-count forecasts credit one departure per distinct successful direct kill, without descendant or routed-zombie credit. Unreaped zombies, respawns and concurrent process starts can prevent the observed total from falling; partial censuses remain unknown.",
             "Disk forecasts retain exclusive unlinked-inode allocated blocks from planning; progress compares available bytes on the same saved filesystem and may be negative. Shared holders, kernel-held references, snapshots, reflinks, and concurrent writes can prevent equivalent physical recovery.",
             "A host-wide before/after change is an association, not a causal per-action recovery measurement. Unsupported actions or missing forecasts keep the complete comparison unknown."
         ],
@@ -29657,6 +29971,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             "cpu": goal_report_json(&cpu_report, planning_only),
             "ports": goal_report_json(&port_report, planning_only),
             "file_descriptors": goal_report_json(&fd_report, planning_only),
+            "processes": goal_report_json(&process_report, planning_only),
             "disk": goal_report_json(&disk_report, planning_only)
         }
     });
@@ -29665,6 +29980,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         "cpu": goal_report_brief_json(&cpu_report, planning_only),
         "ports": goal_report_brief_json(&port_report, planning_only),
         "file_descriptors": goal_report_brief_json(&fd_report, planning_only),
+        "processes": goal_report_brief_json(&process_report, planning_only),
         "disk": goal_report_brief_json(&disk_report, planning_only),
         "respawn_loop_suspected": respawn_by_action.values().any(|detected| *detected == Some(true)),
         "respawn_observation_available": after_scan_processes.is_some(),

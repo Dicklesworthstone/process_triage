@@ -32,6 +32,7 @@ fn make_before() -> MetricSnapshot {
         total_cpu_frac: Some(0.8),
         occupied_ports: Some(vec![3000, 8080, 9090]),
         total_fds: Some(5000),
+        process_count: None,
         disk_space: None,
         timestamp: 1000.0,
     }
@@ -171,6 +172,7 @@ fn bench_measure_progress(c: &mut Criterion) {
         total_cpu_frac: Some(0.5),
         occupied_ports: Some(vec![8080]),
         total_fds: Some(4500),
+        process_count: None,
         disk_space: None,
         timestamp: 1010.0,
     };

@@ -3213,6 +3213,7 @@ proptest! {
             total_cpu_frac: Some(0.5),
             occupied_ports: Some(vec![]),
             total_fds: Some(1000),
+            process_count: None,
             disk_space: None,
             timestamp: 0.0,
         };
@@ -3221,6 +3222,7 @@ proptest! {
             total_cpu_frac: Some(0.5),
             occupied_ports: Some(vec![]),
             total_fds: Some(1000),
+            process_count: None,
             disk_space: None,
             timestamp: 1.0,
         };
@@ -3256,6 +3258,7 @@ proptest! {
             total_cpu_frac: Some(0.5),
             occupied_ports: Some(vec![]),
             total_fds: Some(1000),
+            process_count: None,
             disk_space: None,
             timestamp: 0.0,
         };
@@ -3292,6 +3295,7 @@ proptest! {
             total_cpu_frac: Some(0.5),
             occupied_ports: Some(vec![]),
             total_fds: Some(1000),
+            process_count: None,
             disk_space: None,
             timestamp: 0.0,
         };
@@ -3300,6 +3304,7 @@ proptest! {
             total_cpu_frac: Some(0.5),
             occupied_ports: Some(vec![]),
             total_fds: Some(1000),
+            process_count: None,
             disk_space: None,
             timestamp: 1.0,
         };
@@ -3331,6 +3336,7 @@ proptest! {
             total_cpu_frac: Some(before_cpu),
             occupied_ports: None,
             total_fds: None,
+            process_count: None,
             disk_space: None,
             timestamp: 0.0,
         };

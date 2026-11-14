@@ -73,6 +73,9 @@ impl ResourceTarget {
             Metric::Cpu => format!("cpu {} {:.2}%", self.comparator, self.value * 100.0),
             Metric::Port => format!("release port {}", self.port.unwrap_or(0)),
             Metric::FileDescriptors => format!("fds {} {:.0}", self.comparator, self.value),
+            Metric::ProcessCount => {
+                format!("processes {} {:.0}", self.comparator, self.value)
+            }
             Metric::Disk => {
                 let scope = self.disk_path.as_ref().map_or_else(String::new, |path| {
                     format!(" on {}", serde_json::Value::String(path.clone()))
@@ -90,6 +93,7 @@ pub enum Metric {
     Cpu,
     Port,
     FileDescriptors,
+    ProcessCount,
     Disk,
 }
 
@@ -138,7 +142,7 @@ impl std::fmt::Display for GoalParseError {
         match self {
             Self::EmptyInput => write!(f, "Empty goal string"),
             Self::UnrecognizedFormat(s) => {
-                write!(f, "Unrecognized goal format: \"{}\". Try: \"relieve\", \"cpu-pressure\", \"mem-pressure\", \"io-pressure\", \"free 4GB RAM\", \"free-disk 4GB on /data\", \"reduce CPU below 50%\", \"release port 3000\", \"free 100 FDs\"", s)
+                write!(f, "Unrecognized goal format: \"{}\". Try: \"relieve\", \"cpu-pressure\", \"mem-pressure\", \"io-pressure\", \"free 4GB RAM\", \"free-disk 4GB on /data\", \"reduce CPU below 50%\", \"release port 3000\", \"free 100 FDs\", \"free 10 processes\", \"processes < 100\"", s)
             }
             Self::InvalidUnit(u) => write!(f, "Invalid unit: \"{}\". Use: B, KB, MB, GB, TB", u),
             Self::InvalidNumber(n) => write!(f, "Invalid number: \"{}\"", n),
@@ -165,6 +169,9 @@ impl std::fmt::Display for GoalParseError {
 /// - "free port 3000"
 /// - "free 100 FDs"
 /// - "free 50 file descriptors"
+/// - "free 10 processes" (departures from the observed process table)
+/// - "processes < 100" or "processes <= 100" (full census, including protected processes)
+/// - "reduce processes below 100"
 /// - "free-disk 4GB" (filesystem containing the current directory)
 /// - "free-disk 4 GB on /data" (one filesystem per goal request)
 /// - Composition: "free 4GB RAM AND release port 3000"
@@ -316,6 +323,25 @@ fn parse_single_goal(input: &str) -> Result<ResourceTarget, GoalParseError> {
         }
     }
 
+    // Process counts are discrete: < N means at most N - 1. Preserve that
+    // distinction when converting to the optimizer's inclusive upper bound.
+    if let Some(rest) = lower.strip_prefix("processes") {
+        let rest = rest.trim_start();
+        if let Some(amount) = rest.strip_prefix("<=") {
+            return process_count_target(amount.trim(), Comparator::ReduceBelow, false);
+        }
+        if let Some(amount) = rest.strip_prefix('<') {
+            return process_count_target(amount.trim(), Comparator::ReduceBelow, true);
+        }
+    }
+    if tokens.len() == 4
+        && tokens[0] == "reduce"
+        && tokens[1] == "processes"
+        && tokens[2] == "below"
+    {
+        return process_count_target(tokens[3], Comparator::ReduceBelow, true);
+    }
+
     // "reduce CPU below <N>%"
     if tokens.len() == 4 && tokens[0] == "reduce" && tokens[1] == "cpu" && tokens[2] == "below" {
         return Ok(ResourceTarget {
@@ -330,6 +356,10 @@ fn parse_single_goal(input: &str) -> Result<ResourceTarget, GoalParseError> {
     // "free <N><unit> RAM/memory" or "free <N>% CPU" or "free <N> FDs"
     if tokens.len() >= 3 && tokens[0] == "free" {
         let amount_str = tokens[1];
+
+        if tokens.len() == 3 && matches!(tokens[2], "process" | "processes") {
+            return process_count_target(amount_str, Comparator::FreeAtLeast, false);
+        }
 
         // CPU percentage: "free 20% CPU"
         if tokens.len() == 3 && amount_str.ends_with('%') && tokens[2] == "cpu" {
@@ -382,6 +412,29 @@ fn parse_single_goal(input: &str) -> Result<ResourceTarget, GoalParseError> {
     }
 
     Err(GoalParseError::UnrecognizedFormat(input.to_string()))
+}
+
+fn process_count_target(
+    amount: &str,
+    comparator: Comparator,
+    strict_upper_bound: bool,
+) -> Result<ResourceTarget, GoalParseError> {
+    // A process count is an integer bounded by the PID representation; this
+    // also rejects NaN, infinity, fractional counts and lossy f64 rounding.
+    let invalid = || GoalParseError::InvalidNumber(amount.to_string());
+    let count = amount.parse::<u32>().map_err(|_| invalid())?;
+    let count = if strict_upper_bound {
+        count.checked_sub(1).ok_or_else(invalid)?
+    } else {
+        count
+    };
+    Ok(ResourceTarget {
+        metric: Metric::ProcessCount,
+        value: f64::from(count),
+        comparator,
+        port: None,
+        disk_path: None,
+    })
 }
 
 fn parse_disk_goal(input: &str) -> Result<ResourceTarget, GoalParseError> {
@@ -664,6 +717,64 @@ mod tests {
         for input in ["ﬃ AND free port 3000", "ſ OR free port 3000"] {
             assert!(parse_goal(input).is_err());
         }
+    }
+
+    #[test]
+    fn process_count_goals_preserve_discrete_upper_bounds() {
+        for (input, comparator, value) in [
+            ("free 10 processes", Comparator::FreeAtLeast, 10.0),
+            ("FrEe 1 PrOcEsS", Comparator::FreeAtLeast, 1.0),
+            ("free 0 processes", Comparator::FreeAtLeast, 0.0),
+            ("processes < 100", Comparator::ReduceBelow, 99.0),
+            ("processes<=100", Comparator::ReduceBelow, 100.0),
+            ("reduce processes below 1", Comparator::ReduceBelow, 0.0),
+            ("processes <= 0", Comparator::ReduceBelow, 0.0),
+        ] {
+            let Goal::Target(target) = parse_goal(input).unwrap() else {
+                panic!("expected process-count target for {input}");
+            };
+            assert_eq!(target.metric, Metric::ProcessCount, "{input}");
+            assert_eq!(target.comparator, comparator, "{input}");
+            assert_eq!(target.value, value, "{input}");
+            assert!(target.port.is_none());
+            assert!(target.disk_path.is_none());
+        }
+        assert_eq!(
+            parse_goal("processes < 100").unwrap().canonical(),
+            "processes <= 99"
+        );
+        assert!(matches!(
+            parse_goal("free 2 processes AND free 1GB RAM"),
+            Ok(Goal::And(parts)) if parts.len() == 2
+        ));
+        assert!(matches!(
+            parse_goal("processes < 100 OR free 20 FDs"),
+            Ok(Goal::Or(parts)) if parts.len() == 2
+        ));
+    }
+
+    #[test]
+    fn process_count_goals_reject_impossible_and_inexact_counts() {
+        for input in [
+            "processes < 0",
+            "reduce processes below 0",
+            "free -1 processes",
+            "free 1.5 processes",
+            "free 1e3 processes",
+            "free NaN processes",
+            "free inf processes",
+            "free 4294967296 processes",
+            "processes <= -1",
+            "processes < 1.5",
+            "free 2 processes extra",
+            "processes <= 2 extra",
+        ] {
+            assert!(parse_goal(input).is_err(), "{input}");
+        }
+        let Goal::Target(target) = parse_goal("free 4294967295 processes").unwrap() else {
+            unreachable!();
+        };
+        assert_eq!(target.value, f64::from(u32::MAX));
     }
 
     #[test]

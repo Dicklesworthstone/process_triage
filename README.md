@@ -1262,6 +1262,8 @@ pt agent plan --goal "free 4GB memory" --format json
 pt agent plan --goal "release port 8080" --format json
 pt agent plan --goal "free port 3000" --format json
 pt agent plan --goal "free 100 FDs" --format json
+pt agent plan --goal "free 10 processes" --format json
+pt agent plan --goal "processes < 100" --format json
 pt agent plan --goal "free-disk 4GB on /var" --format json
 pt agent plan --goal "CPU < 80%" --window-ms 1000 --format json
 ```
@@ -1277,6 +1279,10 @@ The plan's top-level `recommendations.expected_memory_freed_gb` and narrative us
 For `agent plan --goal`, the saved executable plan contains only that selected set and any preceding pause stage for the same identities. `agent apply --recommended`, default resume, and `agent plan --yes` use this restricted set. A goal that is already satisfied produces no executable actions; malformed goals and goals lacking required evidence cannot fall back to unrelated triage actions. The selected subset is checked again for live-child safety. Independent candidate advice remains visible, with `goal_selected` and `plan_action_ids` identifying what this session actually plans to execute.
 
 The interactive `pt run --goal "free 4GB memory"` uses the same executable-action and selected-subset checks. Its default selection and “select recommended” command choose only the goal set, including no actions for a satisfied or invalid goal. Refresh replaces the rows, forecast, and goal ranking together and clears prior selections. You can still select individual rows explicitly; execution requires confirmation and retains the normal identity, policy, and process-tree checks.
+
+Process-count goals use the visible process table before age, protection, candidate, or output filtering. `free 10 processes` requests a reduction of ten entries; `processes < 100` targets at most 99, while `processes <= 100` permits 100. Counts must be nonnegative integers. Each eligible direct kill contributes at most one departure; descendants and zombie-to-parent actions receive no extra count credit. An unavailable or incomplete census cannot establish an absolute count target. Existing safety gates determine which processes are eligible, so a target can remain unachievable even when many processes are visible.
+
+After apply, process-count progress compares complete before/after censuses in the same observation scope. The signed delta preserves increases caused by new work or respawns; missing observations remain unavailable. A process-table change is an observed result, not proof that every departure was caused by the selected actions.
 
 Each candidate's "efficiency" is `contribution / expected_loss`, measuring how much resource it frees per unit of risk. A completed branch-and-bound search proves the minimum cost within the eligible set; bounded and greedy results report their algorithm without claiming a proven optimum.
 
