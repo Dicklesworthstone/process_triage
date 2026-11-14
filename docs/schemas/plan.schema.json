@@ -291,6 +291,14 @@
           "format": "uint64",
           "minimum": 1,
           "maximum": 300000
+        },
+        "term_grace_command_sha256": {
+          "description": "Optional SHA256 binding to the exact Linux argument vector for a learned TERM grace. Revalidated before signal delivery.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[a-f0-9]{64}$"
         }
       },
       "required": [

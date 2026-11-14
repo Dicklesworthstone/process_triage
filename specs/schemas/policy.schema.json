@@ -253,6 +253,30 @@
           "maximum": 32,
           "default": 4,
           "description": "Maximum independent direct kills in flight. Safety checks and durable accounting stay serial; stages, related targets, other actions and abort-on-unknown require barriers."
+        },
+        "adaptive_term_grace": {
+          "type": "object",
+          "description": "Opt-in timing adaptation for newly created plans from verified executions of the exact command. Does not change termination eligibility.",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false
+            },
+            "min_grace_ms": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 300000,
+              "default": 1000,
+              "description": "Minimum learned cleanup allowance, clamped to term_grace_ms."
+            },
+            "min_samples": {
+              "type": "integer",
+              "minimum": 8,
+              "maximum": 64,
+              "default": 8
+            }
+          }
         }
       }
     },

@@ -449,6 +449,7 @@ fn make_kill_action(pid: u32, action_id: &str, pre_checks: Vec<PreCheck>) -> Pla
             execute_ms: 1000, // Short for testing
             verify_ms: 5000,
             term_grace_ms: None,
+            term_grace_command_sha256: None,
         },
         pre_checks,
         rationale: empty_rationale(),

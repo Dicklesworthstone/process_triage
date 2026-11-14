@@ -232,6 +232,18 @@ pub fn validate_policy(policy: &crate::policy::Policy) -> ValidationResult<()> {
             message: message.to_string(),
         },
     )?;
+    crate::policy::validate_term_grace_ms(policy.signal.adaptive_term_grace.min_grace_ms).map_err(
+        |message| ValidationError::InvalidValue {
+            field: "signal.adaptive_term_grace.min_grace_ms".to_string(),
+            message: message.to_string(),
+        },
+    )?;
+    if !(8..=64).contains(&policy.signal.adaptive_term_grace.min_samples) {
+        return Err(ValidationError::InvalidValue {
+            field: "signal.adaptive_term_grace.min_samples".to_string(),
+            message: "Must be between 8 and 64 verified outcomes".to_string(),
+        });
+    }
 
     Ok(())
 }
@@ -696,6 +708,46 @@ mod tests {
                 Err(ValidationError::InvalidValue { field, .. }) if field == "signal.term_grace_ms"
             ));
         }
+    }
+
+    #[test]
+    fn adaptive_term_grace_rejects_invalid_bounds_even_when_disabled() {
+        for enabled in [false, true] {
+            let mut policy = crate::policy::Policy::default();
+            policy.signal.adaptive_term_grace.enabled = enabled;
+            for invalid in [0, crate::policy::MAX_TERM_GRACE_MS + 1, u64::MAX] {
+                policy.signal.adaptive_term_grace.min_grace_ms = invalid;
+                assert!(matches!(
+                    validate_policy(&policy),
+                    Err(ValidationError::InvalidValue { field, .. })
+                        if field == "signal.adaptive_term_grace.min_grace_ms"
+                ));
+            }
+            policy.signal.adaptive_term_grace.min_grace_ms = 1_000;
+            for invalid in [0, 7, 65, usize::MAX] {
+                policy.signal.adaptive_term_grace.min_samples = invalid;
+                assert!(matches!(
+                    validate_policy(&policy),
+                    Err(ValidationError::InvalidValue { field, .. })
+                        if field == "signal.adaptive_term_grace.min_samples"
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn adaptive_term_grace_accepts_boundary_settings_and_a_lower_policy_cap() {
+        let mut policy = crate::policy::Policy::default();
+        policy.signal.adaptive_term_grace.enabled = true;
+        for minimum in [1, 1_000, crate::policy::MAX_TERM_GRACE_MS] {
+            for samples in [8, 64] {
+                policy.signal.adaptive_term_grace.min_grace_ms = minimum;
+                policy.signal.adaptive_term_grace.min_samples = samples;
+                validate_policy(&policy).expect("bounded adaptive settings");
+            }
+        }
+        policy.signal.term_grace_ms = 100;
+        validate_policy(&policy).expect("recommendation clamps its minimum to the upper cap");
     }
 
     #[test]

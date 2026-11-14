@@ -69,6 +69,32 @@ pub struct SignalPolicy {
     /// waits overlap. Stages, dependent targets and other actions are barriers.
     #[schemars(range(min = 1, max = 32))]
     pub max_parallel_kills: u32,
+    /// Optional timing adaptation from verified executions of the exact command.
+    /// This never changes whether a process is eligible for termination.
+    pub adaptive_term_grace: AdaptiveTermGracePolicy,
+}
+
+/// Bounded, opt-in learning of TERM cleanup time for future plans.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct AdaptiveTermGracePolicy {
+    pub enabled: bool,
+    /// Minimum learned grace, clamped to the policy's upper cleanup allowance.
+    #[schemars(range(min = 1, max = 300_000))]
+    pub min_grace_ms: u64,
+    /// Minimum verified outcomes before a timing recommendation is available.
+    #[schemars(range(min = 8, max = 64))]
+    pub min_samples: usize,
+}
+
+impl Default for AdaptiveTermGracePolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_grace_ms: 1_000,
+            min_samples: 8,
+        }
+    }
 }
 
 impl Default for SignalPolicy {
@@ -76,6 +102,7 @@ impl Default for SignalPolicy {
         Self {
             term_grace_ms: DEFAULT_TERM_GRACE_MS,
             max_parallel_kills: DEFAULT_MAX_PARALLEL_KILLS,
+            adaptive_term_grace: AdaptiveTermGracePolicy::default(),
         }
     }
 }
@@ -878,6 +905,56 @@ mod tests {
                 "{invalid}"
             );
         }
+    }
+
+    #[test]
+    fn adaptive_term_grace_is_opt_in_and_round_trips_explicit_settings() {
+        let empty: SignalPolicy = serde_json::from_str("{}").unwrap();
+        assert!(!empty.adaptive_term_grace.enabled);
+        assert_eq!(empty.adaptive_term_grace.min_grace_ms, 1_000);
+        assert_eq!(empty.adaptive_term_grace.min_samples, 8);
+        let configured: SignalPolicy = serde_json::from_value(serde_json::json!({
+            "term_grace_ms": 30_000,
+            "adaptive_term_grace": {
+                "enabled": true,
+                "min_grace_ms": 2_000,
+                "min_samples": 16
+            }
+        }))
+        .unwrap();
+        let restored: SignalPolicy =
+            serde_json::from_str(&serde_json::to_string(&configured).unwrap()).unwrap();
+        assert!(restored.adaptive_term_grace.enabled);
+        assert_eq!(restored.adaptive_term_grace.min_grace_ms, 2_000);
+        assert_eq!(restored.adaptive_term_grace.min_samples, 16);
+        assert_eq!(restored.term_grace_ms, 30_000);
+
+        for invalid in [
+            serde_json::json!({"enabled": "true"}),
+            serde_json::json!({"min_grace_ms": -1}),
+            serde_json::json!({"min_samples": 8.5}),
+            serde_json::json!({"minimum_samples": 8}),
+        ] {
+            assert!(serde_json::from_value::<AdaptiveTermGracePolicy>(invalid).is_err());
+        }
+
+        let schema = serde_json::to_value(schemars::schema_for!(AdaptiveTermGracePolicy)).unwrap();
+        assert_eq!(
+            schema["properties"]["min_grace_ms"]["minimum"].as_f64(),
+            Some(1.0)
+        );
+        assert_eq!(
+            schema["properties"]["min_grace_ms"]["maximum"].as_f64(),
+            Some(300_000.0)
+        );
+        assert_eq!(
+            schema["properties"]["min_samples"]["minimum"].as_f64(),
+            Some(8.0)
+        );
+        assert_eq!(
+            schema["properties"]["min_samples"]["maximum"].as_f64(),
+            Some(64.0)
+        );
     }
 
     #[test]

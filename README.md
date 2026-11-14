@@ -629,7 +629,55 @@ Set `signal.term_grace_ms` in a complete policy to control how long a process ma
 }
 ```
 
-New kill plans save that value in `actions[].timeouts.term_grace_ms` and reserve execution time for the cleanup window. Agent and TUI execution honor the saved value, even if policy changes after planning. Signal outcomes record the effective grace used. A shorter execution deadline reports a timeout instead of accelerating SIGKILL. The existing Linux shortcut still applies when complete identity-bound observations confirm SIGTERM is ignored; a caught handler retains its configured cleanup time. This setting does not change the confirmation or protection rules.
+New kill plans save their selected value in `actions[].timeouts.term_grace_ms` and reserve execution time for the cleanup window. Agent and TUI execution use that immutable saved value. A saved grace above either the recorded or current policy limit is refused and requires replanning; execution never silently shortens an approved cleanup window. Signal outcomes record the effective grace used. A shorter execution deadline reports a timeout instead of accelerating SIGKILL. The existing Linux shortcut still applies when complete identity-bound observations confirm SIGTERM is ignored; a caught handler retains its saved cleanup time. This setting does not change the confirmation or protection rules.
+
+#### Adaptive termination timing
+
+Set `signal.adaptive_term_grace.enabled` to learn a bounded cleanup allowance
+for future plans from verified terminations of the exact captured command:
+
+```json
+{
+  "signal": {
+    "term_grace_ms": 30000,
+    "adaptive_term_grace": {
+      "enabled": true,
+      "min_grace_ms": 1000,
+      "min_samples": 8
+    }
+  }
+}
+```
+
+Learning is disabled by default. The upper bound remains `term_grace_ms`;
+the learned minimum defaults to 1,000 ms and is clamped to that upper bound.
+At least eight verified outcomes are required (configurable from 8 to 64).
+Recommendations use at most the latest 64 matching receipts from the last
+30 days. Successful TERM exits retain the slowest observed cleanup time plus
+a margin of at least 500 ms or 25%. Repeated full-window escalations can select
+the minimum only when enough executions waited at least the current upper
+bound. Mixed successes and escalations retain the configured upper bound.
+
+Agent and TUI execution record confirmed outcomes in a private, bounded
+`signal-history.json` next to the configuration. Receipts bind the session,
+action and full process identity. On Linux, the command key incorporates the
+complete NUL-delimited argv read from an identity-checked `/proc/<pid>/cmdline`,
+without borrowing display strings or generalized interpreter patterns.
+Other platforms retain the configured grace. Replayed receipts do not train
+twice, and concurrent writers merge under a lock. Dry runs, unknown effects,
+ignored TERM, routed actions and ambiguous identity evidence cannot train
+this history. Missing history starts cold;
+unreadable or invalid history leaves the configured timing in effect and
+reports the learning error. A learning write failure never changes the
+reported result of an action that already completed.
+
+Timing is selected when a new plan is built, with recommendation provenance
+and a new action ID. Learned timing binds the full command fingerprint into
+the saved action; the signal runner rechecks it before TERM and refuses a
+changed or unreadable command, even when the PID and start time are unchanged.
+Applying a saved plan does not recompute its timeout. This feature does not
+learn abandonment labels, relax protection gates, or expand the set of
+processes eligible for cleanup.
 
 #### Parallel termination cleanup
 

@@ -11,7 +11,7 @@ use super::executor::{ActionError, ActionRunner};
 use super::reversal::{PreparedReversal, ReversalJournal, ReversalStatus};
 use crate::decision::Action;
 use crate::plan::PlanAction;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::thread;
 use std::time::{Duration, Instant};
 #[cfg(target_os = "linux")]
@@ -354,9 +354,69 @@ fn should_resume_after_sigterm(state: Option<char>, use_group: bool) -> bool {
     cfg!(target_os = "linux") && !use_group && state == Some('T')
 }
 
+/// Fingerprint complete Linux argv bytes for adaptive cleanup. The NUL
+/// separators are part of the digest; ps formatting and UTF-8 conversion must
+/// never merge different programs. Missing, partial or oversized data is unknown.
+pub fn capture_term_command_sha256(
+    target: &pt_common::ProcessIdentity,
+) -> Result<String, ActionError> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        if target.quality != pt_common::IdentityQuality::Full {
+            return Err(ActionError::IdentityMismatch);
+        }
+        let check = || match observe_signal_target(target)? {
+            SignalObservation::Present(_) => Ok(()),
+            SignalObservation::Gone => Err(ActionError::ProcessNotFound),
+            SignalObservation::Replaced => Err(ActionError::IdentityMismatch),
+        };
+        check()?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(format!("/proc/{}/cmdline", target.pid.0))
+            .map_err(|error| {
+                ActionError::Failed(format!("complete command evidence unavailable: {error}"))
+            })?;
+        let mut bytes = Vec::new();
+        file.take(65_537).read_to_end(&mut bytes).map_err(|error| {
+            ActionError::Failed(format!("complete command evidence unreadable: {error}"))
+        })?;
+        check()?;
+        term_command_sha256_from_bytes(&bytes)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = target;
+        Err(ActionError::Failed(
+            "exact argv evidence for adaptive SIGTERM grace is unavailable on this platform"
+                .to_string(),
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn term_command_sha256_from_bytes(bytes: &[u8]) -> Result<String, ActionError> {
+    use sha2::{Digest, Sha256};
+
+    if bytes.is_empty()
+        || bytes.len() > 65_536
+        || bytes.first() == Some(&0)
+        || bytes.last() != Some(&0)
+    {
+        return Err(ActionError::Failed(
+            "adaptive SIGTERM grace requires complete nonempty NUL-delimited argv within 65536 bytes".to_string(),
+        ));
+    }
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
 /// Observed disposition of SIGTERM. Unavailable or inconsistent kernel evidence
 /// stays unknown and never shortens the approved graceful-shutdown interval.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SignalDisposition {
     Unknown,
@@ -365,7 +425,7 @@ pub enum SignalDisposition {
     Ignored,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SignalEscalationReason {
     SigtermIgnored,
@@ -375,14 +435,28 @@ pub enum SignalEscalationReason {
 /// Delivery evidence and monotonic timings from one attempted kill. These facts
 /// describe the signal sequence, not proof that the target has exited; final
 /// effect verification remains separate. Failed attempts retain their evidence.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalExecutionOutcome {
+    /// Bind timing evidence to the executed operation. Older receipts lack this
+    /// binding and remain readable, but cannot teach future cleanup timing.
+    #[serde(default)]
+    pub action_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<pt_common::ProcessIdentity>,
+    /// Complete argv fingerprint captured immediately before TERM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub term_command_sha256: Option<String>,
     pub sigterm_disposition: SignalDisposition,
     pub sigterm_recheck: Option<SignalDisposition>,
     pub configured_grace_ms: u64,
     /// Elapsed after successful TERM delivery until execution returned, including
     /// any resume, disposition recheck and escalation overhead. Not an exit time.
     pub observed_grace_ms: Option<u64>,
+    /// Monotonic upper bound from TERM delivery to observing the original
+    /// incarnation exit, before selecting or delivering KILL. Absent on failed,
+    /// uncertain or escalated attempts; final effect verification is still needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub term_exit_observed_ms: Option<u64>,
     pub sigterm_delivered: bool,
     pub sigcont_delivered: bool,
     pub sigkill_delivered: bool,
@@ -512,7 +586,8 @@ fn complete_kill_worker(
     started: Instant,
     operation: impl FnOnce() -> Result<(), ActionError>,
 ) -> SignalKillCompletion {
-    let (result, panicked) = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)) {
+    let (result, panicked) = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation))
+    {
         Ok(result) => (result, false),
         Err(_) => (
             Err(ActionError::Failed(
@@ -1152,6 +1227,40 @@ impl SignalActionRunner {
         }
     }
 
+    /// Bind cleanup timing and learning evidence at the last command check
+    /// before TERM. An exec keeps PID birth identity but changes argv authority.
+    #[cfg(unix)]
+    fn prepare_term_command(
+        &self,
+        action: &PlanAction,
+        use_group: bool,
+        outcome: &mut SignalExecutionOutcome,
+    ) -> Result<(), ActionError> {
+        if use_group {
+            if action.timeouts.term_grace_command_sha256.is_some() {
+                return Err(ActionError::Failed(
+                    "one command's learned grace cannot authorize a process-group kill".to_string(),
+                ));
+            }
+        } else {
+            let command = capture_term_command_sha256(&action.target);
+            if let Some(expected) = &action.timeouts.term_grace_command_sha256 {
+                let observed = command?;
+                if &observed != expected {
+                    return Err(ActionError::Failed(
+                        "command changed since learned SIGTERM grace was approved; create a new plan".to_string(),
+                    ));
+                }
+                outcome.term_command_sha256 = Some(observed);
+            } else {
+                // Fixed grace remains usable when optional learning evidence
+                // cannot be collected. Such an attempt teaches no argv history.
+                outcome.term_command_sha256 = command.ok();
+            }
+        }
+        self.check_identity_now(action)
+    }
+
     /// Execute a kill action (SIGTERM → SIGKILL).
     #[cfg(unix)]
     fn execute_kill(&self, action: &PlanAction) -> Result<(), ActionError> {
@@ -1166,10 +1275,14 @@ impl SignalActionRunner {
         let started = Instant::now();
         let mut term_started = None;
         let mut outcome = SignalExecutionOutcome {
+            action_id: action.action_id.clone(),
+            target: Some(action.target.clone()),
+            term_command_sha256: None,
             sigterm_disposition: SignalDisposition::Unknown,
             sigterm_recheck: None,
             configured_grace_ms: term_grace_ms,
             observed_grace_ms: None,
+            term_exit_observed_ms: None,
             sigterm_delivered: false,
             sigcont_delivered: false,
             sigkill_delivered: false,
@@ -1178,6 +1291,13 @@ impl SignalActionRunner {
         };
         let result = self.execute_kill_observed(action, &mut outcome, &mut term_started);
         outcome.observed_grace_ms = term_started.map(elapsed_millis);
+        if result.is_ok()
+            && outcome.sigterm_delivered
+            && !outcome.sigkill_delivered
+            && outcome.escalation_reason.is_none()
+        {
+            outcome.term_exit_observed_ms = outcome.observed_grace_ms;
+        }
         outcome.execution_elapsed_ms = elapsed_millis(started);
         *self
             .last_outcome
@@ -1208,6 +1328,7 @@ impl SignalActionRunner {
         #[cfg(target_os = "linux")]
         if !use_group {
             if let Some(pidfd) = self.pinned_pidfd(action)? {
+                self.prepare_term_command(action, false, outcome)?;
                 deadline.remaining()?;
                 pidfd.send(libc::SIGTERM)?;
                 *term_started = Some(Instant::now());
@@ -1248,6 +1369,7 @@ impl SignalActionRunner {
         self.check_identity_now(action)?;
 
         // Stage 1: SIGTERM
+        self.prepare_term_command(action, use_group, outcome)?;
         deadline.remaining()?;
         self.send_signal(target, libc::SIGTERM, use_group)?;
         *term_started = Some(Instant::now());
@@ -2261,6 +2383,106 @@ mod tests {
         }
 
         #[test]
+        fn complete_argv_fingerprint_preserves_boundaries_and_refuses_partial_data() {
+            let digest = |bytes: &[u8]| term_command_sha256_from_bytes(bytes).unwrap();
+            assert_ne!(
+                digest(b"node\0/srv/slow.mjs\0--watch\0"),
+                digest(b"node\0/srv/fast.mjs\0--watch\0")
+            );
+            assert_ne!(
+                digest(b"sh\0-c\0printf 'a  b'\0"),
+                digest(b"sh\0-c\0printf 'a b'\0")
+            );
+            assert_ne!(digest(b"tool\0one two\0"), digest(b"tool\0one\0two\0"));
+            assert_ne!(digest(b"tool\0\xff\0"), digest(b"tool\0\xfe\0"));
+            for incomplete in [b"".as_slice(), b"\0", b"tool", b"tool\0partial"] {
+                assert!(term_command_sha256_from_bytes(incomplete).is_err());
+            }
+            let mut oversized = vec![b'x'; 65_537];
+            *oversized.last_mut().unwrap() = 0;
+            assert!(term_command_sha256_from_bytes(&oversized).is_err());
+        }
+
+        #[test]
+        fn learned_grace_refuses_a_different_command_after_same_pid_exec() {
+            use std::io::Write;
+
+            let dir = tempfile::tempdir().expect("marker directory");
+            let marker = dir.path().join("unused");
+            let (mut child, mut action) = stopped_signal_child(
+                "kill -STOP \"$$\"\nread -r line\nexec sleep 30",
+                &marker,
+                false,
+            );
+            let original =
+                capture_term_command_sha256(&action.target).expect("complete shell argv");
+            action.timeouts.term_grace_ms = Some(1_000);
+            action.timeouts.term_grace_command_sha256 = Some(original.clone());
+            child
+                .0
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(b"exec\n")
+                .unwrap();
+            let runner = SignalActionRunner::with_defaults();
+            runner
+                .send_signal(child.0.id(), libc::SIGCONT, false)
+                .unwrap();
+            let started = Instant::now();
+            loop {
+                if capture_term_command_sha256(&action.target)
+                    .is_ok_and(|current| current != original)
+                {
+                    break;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "owned child did not exec"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(
+                LiveIdentityProvider::new()
+                    .read_start_id(child.0.id())
+                    .unwrap(),
+                action.target.start_id.0,
+                "exec preserves the process birth identity"
+            );
+            let error = runner
+                .execute(&action)
+                .expect_err("different argv must refuse before TERM");
+            assert!(error.to_string().contains("command changed"));
+            assert!(child.0.try_wait().unwrap().is_none());
+            assert!(!runner.take_kill_signal_delivered());
+            let outcome = runner.take_signal_outcome().expect("refusal receipt");
+            assert!(!outcome.sigterm_delivered);
+            assert!(!outcome.sigkill_delivered);
+        }
+
+        #[test]
+        fn learned_grace_cannot_authorize_a_process_group_from_its_leader_command() {
+            let dir = tempfile::tempdir().expect("marker directory");
+            let marker = dir.path().join("term-handled");
+            let (mut child, mut action) = stopped_term_child(&marker, false, true);
+            action.timeouts.term_grace_ms = Some(1_000);
+            action.timeouts.term_grace_command_sha256 =
+                Some(capture_term_command_sha256(&action.target).unwrap());
+            let runner = SignalActionRunner::new(SignalConfig {
+                use_process_groups: true,
+                ..SignalConfig::default()
+            });
+            let error = runner
+                .execute(&action)
+                .expect_err("one argv is not a group timing contract");
+            assert!(error.to_string().contains("process-group"));
+            assert!(child.0.try_wait().unwrap().is_none());
+            assert_eq!(runner.get_process_state(child.0.id()), Some('T'));
+            assert!(!runner.take_kill_signal_delivered());
+            assert!(!marker.exists());
+        }
+
+        #[test]
         fn planned_signal_verification_requires_the_recorded_identity() {
             let dir = tempfile::tempdir().expect("marker directory");
             let marker = dir.path().join("term-handled");
@@ -2730,7 +2952,10 @@ mod tests {
         fn stopped_kill_runs_sigterm_handler_before_escalation() {
             let dir = tempfile::tempdir().expect("marker directory");
             let marker = dir.path().join("term-handled");
-            let (mut child, action) = stopped_term_child(&marker, false, false);
+            let (mut child, mut action) = stopped_term_child(&marker, false, false);
+            let command = capture_term_command_sha256(&action.target).expect("complete command");
+            action.timeouts.term_grace_ms = Some(5_000);
+            action.timeouts.term_grace_command_sha256 = Some(command.clone());
             let runner = SignalActionRunner::with_defaults();
 
             runner.execute(&action).expect("terminate stopped child");
@@ -2749,6 +2974,13 @@ mod tests {
             assert!(!outcome.sigkill_delivered);
             assert!(outcome.escalation_reason.is_none());
             assert!(outcome.observed_grace_ms.is_some());
+            assert_eq!(outcome.action_id, action.action_id);
+            assert_eq!(outcome.target.as_ref(), Some(&action.target));
+            assert_eq!(
+                outcome.term_command_sha256.as_deref(),
+                Some(command.as_str())
+            );
+            assert_eq!(outcome.term_exit_observed_ms, outcome.observed_grace_ms);
             assert!(
                 runner.take_signal_outcome().is_none(),
                 "consumed exactly once"
@@ -2791,6 +3023,7 @@ mod tests {
             );
             assert_eq!(outcome.configured_grace_ms, 5_000);
             assert!(outcome.observed_grace_ms.unwrap() < outcome.configured_grace_ms);
+            assert!(outcome.term_exit_observed_ms.is_none());
             let json = serde_json::to_value(outcome).unwrap();
             assert_eq!(json["escalation_reason"], "sigterm_ignored");
         }
@@ -2815,6 +3048,7 @@ mod tests {
             assert!(!outcome.sigkill_delivered);
             assert!(outcome.escalation_reason.is_none());
             assert!(outcome.observed_grace_ms.unwrap() >= 2_000);
+            assert!(outcome.term_exit_observed_ms.unwrap() >= 2_000);
         }
 
         #[test]
@@ -3012,6 +3246,7 @@ mod tests {
                 Some(SignalEscalationReason::GraceExpired)
             );
             assert!(outcome.observed_grace_ms.unwrap() >= 100);
+            assert!(outcome.term_exit_observed_ms.is_none());
         }
 
         #[test]
@@ -3039,6 +3274,7 @@ mod tests {
             assert!(outcome.sigterm_delivered);
             assert!(!outcome.sigkill_delivered);
             assert!(outcome.escalation_reason.is_none());
+            assert!(outcome.term_exit_observed_ms.is_none());
         }
 
         #[test]
@@ -3142,10 +3378,14 @@ mod tests {
             }
 
             let mut outcome = SignalExecutionOutcome {
+                action_id: action.action_id.clone(),
+                target: Some(action.target.clone()),
+                term_command_sha256: None,
                 sigterm_disposition: before,
                 sigterm_recheck: None,
                 configured_grace_ms: 100,
                 observed_grace_ms: None,
+                term_exit_observed_ms: None,
                 sigterm_delivered: true,
                 sigcont_delivered: true,
                 sigkill_delivered: false,

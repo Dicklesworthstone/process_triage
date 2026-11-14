@@ -76,6 +76,71 @@ pub struct Plan {
     pub gates_summary: GatesSummary,
 }
 
+impl Plan {
+    /// Bind a learned cleanup allowance while constructing a new plan, before
+    /// saving or approving it. Execution never invokes this method: saved timing
+    /// remains immutable even when later observations or policy change.
+    pub fn bind_term_grace(&mut self, action_id: &str, grace_ms: u64) -> Result<(), &'static str> {
+        self.bind_term_grace_inner(action_id, grace_ms, None)
+    }
+
+    /// Bind learned timing to the exact NUL-delimited argv observed for this
+    /// incarnation. A later exec must not inherit another command's shorter grace.
+    pub fn bind_term_grace_for_command(
+        &mut self,
+        action_id: &str,
+        grace_ms: u64,
+        command_sha256: &str,
+    ) -> Result<(), &'static str> {
+        self.bind_term_grace_inner(action_id, grace_ms, Some(command_sha256))
+    }
+
+    fn bind_term_grace_inner(
+        &mut self,
+        action_id: &str,
+        grace_ms: u64,
+        command_sha256: Option<&str>,
+    ) -> Result<(), &'static str> {
+        let mut matches = self
+            .actions
+            .iter()
+            .enumerate()
+            .filter(|(_, action)| action.action_id == action_id);
+        let (index, action) = matches
+            .next()
+            .ok_or("kill action is absent from the plan")?;
+        if matches.next().is_some() {
+            return Err("kill action ID is ambiguous in the plan");
+        }
+        let mut updated = action.clone();
+        updated.timeouts.term_grace_ms = Some(grace_ms);
+        updated.timeouts.term_grace_command_sha256 = command_sha256.map(str::to_string);
+        updated.validate_signal_timing()?;
+        updated.action_id = kill_action_id_for(&updated.target, updated.stage, grace_ms);
+        if let Some(command) = command_sha256 {
+            let key = format!("{}:argv_sha256={command}", updated.action_id);
+            updated.action_id = format!("act-{:016x}", fnv1a64(key.as_bytes()));
+        }
+        if self.actions.iter().enumerate().any(|(other_index, other)| {
+            other_index != index && other.action_id == updated.action_id
+        }) {
+            return Err("learned cleanup timing would duplicate another action ID");
+        }
+        // Shorter cleanup never shortens the already planned execution budget.
+        updated.timeouts.execute_ms = updated
+            .timeouts
+            .execute_ms
+            .max(grace_ms.saturating_add(5_000));
+        for selected in &mut self.pre_toggled {
+            if selected == action_id {
+                *selected = updated.action_id.clone();
+            }
+        }
+        self.actions[index] = updated;
+        Ok(())
+    }
+}
+
 /// High-level gate summary for the plan.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GatesSummary {
@@ -122,6 +187,18 @@ impl PlanAction {
     /// Reject malformed cleanup timing before any action can send a signal.
     /// Manager restarts and zombie-parent nudges do not use direct TERM grace.
     pub fn validate_signal_timing(&self) -> Result<(), &'static str> {
+        if let Some(command) = &self.timeouts.term_grace_command_sha256 {
+            if self.timeouts.term_grace_ms.is_none()
+                || self.routing != ActionRouting::Direct
+                || self.target.quality != pt_common::IdentityQuality::Full
+                || command.len() != 64
+                || !command
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err("learned SIGTERM grace requires a full direct target, explicit timing and a lowercase SHA256 command binding");
+            }
+        }
         if let Some(grace_ms) = self.timeouts.term_grace_ms {
             if self.action != Action::Kill
                 || !matches!(
@@ -158,6 +235,11 @@ pub struct ActionTimeouts {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = 300_000))]
     pub term_grace_ms: Option<u64>,
+    /// Exact NUL-delimited argv digest for a learned cleanup allowance.
+    /// The runner must revalidate it before TERM; fixed and legacy plans omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(regex(pattern = "^[a-f0-9]{64}$"))]
+    pub term_grace_command_sha256: Option<String>,
 }
 
 impl Default for ActionTimeouts {
@@ -167,6 +249,7 @@ impl Default for ActionTimeouts {
             execute_ms: 10_000,
             verify_ms: 5_000,
             term_grace_ms: None,
+            term_grace_command_sha256: None,
         }
     }
 }
@@ -334,12 +417,11 @@ pub fn generate_plan(bundle: &DecisionBundle) -> Plan {
             } else if action == Action::Kill {
                 // Cleanup timing is part of the reviewed operation. Changing
                 // policy must not reuse the ID of an earlier approved attempt.
-                let key = format!(
-                    "{}:term_grace_ms={}",
-                    action_id_for(action, &candidate.identity, stage),
-                    bundle.policy.signal.term_grace_ms
-                );
-                format!("act-{:016x}", fnv1a64(key.as_bytes()))
+                kill_action_id_for(
+                    &candidate.identity,
+                    stage,
+                    bundle.policy.signal.term_grace_ms,
+                )
             } else {
                 action_id_for(action, &candidate.identity, stage)
             };
@@ -638,6 +720,14 @@ fn action_id_for(action: Action, identity: &ProcessIdentity, stage: u8) -> Strin
     );
     let hash = fnv1a64(key.as_bytes());
     format!("act-{hash:016x}")
+}
+
+fn kill_action_id_for(identity: &ProcessIdentity, stage: u8, grace_ms: u64) -> String {
+    let key = format!(
+        "{}:term_grace_ms={grace_ms}",
+        action_id_for(Action::Kill, identity, stage)
+    );
+    format!("act-{:016x}", fnv1a64(key.as_bytes()))
 }
 
 fn zombie_parent_action_id_for(zombie: &ProcessIdentity, parent: &ProcessIdentity) -> String {
@@ -1137,6 +1227,139 @@ mod tests {
     }
 
     #[test]
+    fn learned_grace_binds_selection_and_survives_later_policy_changes() {
+        let mut input = candidate(30, Action::Kill, 100.0, 1.0);
+        input.stage_pause_before_kill = true;
+        let mut bundle = DecisionBundle {
+            session_id: SessionId("pt-20260115-120000-abcd".into()),
+            policy: Policy::default(),
+            generated_at: Some("2026-01-15T12:00:00Z".into()),
+            candidates: vec![input],
+        };
+        let mut reviewed = generate_plan(&bundle);
+        let original = reviewed.actions[1].action_id.clone();
+        let pause_id = reviewed.actions[0].action_id.clone();
+        reviewed.actions[1].timeouts.execute_ms = 25_000;
+        reviewed.bind_term_grace(&original, 2_500).unwrap();
+        assert_eq!(reviewed.actions[0].action_id, pause_id);
+        assert_eq!(reviewed.actions[1].timeouts.term_grace_ms, Some(2_500));
+        assert_eq!(reviewed.actions[1].timeouts.execute_ms, 25_000);
+        assert_ne!(reviewed.actions[1].action_id, original);
+        assert!(!reviewed.pre_toggled.contains(&original));
+        assert!(reviewed
+            .pre_toggled
+            .contains(&reviewed.actions[1].action_id));
+        let saved = serde_json::to_string(&reviewed).unwrap();
+        bundle.policy.signal.term_grace_ms = 1_000;
+        let future = generate_plan(&bundle);
+        assert_eq!(future.actions[1].timeouts.term_grace_ms, Some(1_000));
+        let restored = crate::verify::parse_agent_plan(&saved).unwrap();
+        assert_eq!(restored.actions[1].timeouts.term_grace_ms, Some(2_500));
+        assert_eq!(restored.actions[1].timeouts.execute_ms, 25_000);
+        assert_eq!(restored.pre_toggled, reviewed.pre_toggled);
+        // Rebinding during plan construction is canonical, not an accumulating
+        // hash chain; the same identity, stage and timing produce the same ID.
+        bundle.policy.signal.term_grace_ms = 2_500;
+        assert_eq!(
+            generate_plan(&bundle).actions[1].action_id,
+            restored.actions[1].action_id
+        );
+    }
+
+    #[test]
+    fn learned_grace_rejects_ambiguous_invalid_and_nonkill_actions_without_mutation() {
+        let bundle = DecisionBundle {
+            session_id: SessionId("pt-20260115-120000-abcd".into()),
+            policy: Policy::default(),
+            generated_at: Some("2026-01-15T12:00:00Z".into()),
+            candidates: vec![candidate(30, Action::Kill, 100.0, 1.0)],
+        };
+        let original = generate_plan(&bundle);
+        let id = original.actions[0].action_id.clone();
+        for grace in [0, 300_001] {
+            let mut plan = original.clone();
+            assert!(plan.bind_term_grace(&id, grace).is_err());
+            assert_eq!(
+                serde_json::to_value(plan).unwrap(),
+                serde_json::to_value(&original).unwrap()
+            );
+        }
+        let mut duplicate = original.clone();
+        duplicate.actions.push(duplicate.actions[0].clone());
+        assert!(duplicate.bind_term_grace(&id, 1_000).is_err());
+        let mut pause = original.clone();
+        pause.actions[0].action = Action::Pause;
+        let before = serde_json::to_value(&pause).unwrap();
+        assert!(pause.bind_term_grace(&id, 1_000).is_err());
+        assert_eq!(serde_json::to_value(pause).unwrap(), before);
+        let mut extended = original.clone();
+        extended.bind_term_grace(&id, 12_500).unwrap();
+        assert_eq!(extended.actions[0].timeouts.execute_ms, 17_500);
+    }
+
+    #[test]
+    fn learned_grace_is_bound_to_exact_command_and_rejects_malformed_bindings() {
+        let bundle = DecisionBundle {
+            session_id: SessionId("pt-20260115-120000-abcd".into()),
+            policy: Policy::default(),
+            generated_at: Some("2026-01-15T12:00:00Z".into()),
+            candidates: vec![candidate(30, Action::Kill, 100.0, 1.0)],
+        };
+        let base = generate_plan(&bundle);
+        let id = base.actions[0].action_id.clone();
+        let first_digest = "a".repeat(64);
+        let second_digest = "b".repeat(64);
+        let mut first = base.clone();
+        first
+            .bind_term_grace_for_command(&id, 1_000, &first_digest)
+            .unwrap();
+        let mut second = base.clone();
+        second
+            .bind_term_grace_for_command(&id, 1_000, &second_digest)
+            .unwrap();
+        assert_ne!(first.actions[0].action_id, second.actions[0].action_id);
+        assert_eq!(
+            first.actions[0]
+                .timeouts
+                .term_grace_command_sha256
+                .as_deref(),
+            Some(first_digest.as_str())
+        );
+        assert_eq!(first.pre_toggled, vec![first.actions[0].action_id.clone()]);
+        let saved = serde_json::to_string(&first).unwrap();
+        let restored = crate::verify::parse_agent_plan(&saved).unwrap();
+        assert_eq!(
+            restored.actions[0].timeouts.term_grace_command_sha256,
+            Some(first_digest.clone())
+        );
+        assert_eq!(restored.actions[0].action_id, first.actions[0].action_id);
+        for invalid in [
+            "".to_string(),
+            "a".repeat(63),
+            "A".repeat(64),
+            "g".repeat(64),
+        ] {
+            let mut plan = base.clone();
+            assert!(plan
+                .bind_term_grace_for_command(&id, 1_000, &invalid)
+                .is_err());
+            assert_eq!(plan.actions[0].action_id, id);
+            assert!(plan.actions[0].timeouts.term_grace_command_sha256.is_none());
+        }
+        let mut missing_grace = first.actions[0].clone();
+        missing_grace.timeouts.term_grace_ms = None;
+        assert!(missing_grace.validate_signal_timing().is_err());
+        let mut routed = first.actions[0].clone();
+        routed.routing = ActionRouting::DStateLowConfidence;
+        assert!(routed.validate_signal_timing().is_err());
+        let schema = serde_json::to_value(schemars::schema_for!(ActionTimeouts)).unwrap();
+        assert_eq!(
+            schema["properties"]["term_grace_command_sha256"]["pattern"],
+            "^[a-f0-9]{64}$"
+        );
+    }
+
+    #[test]
     fn kill_grace_defaults_and_shorter_values_preserve_execution_budget() {
         let mut bundle = DecisionBundle {
             session_id: SessionId("pt-20260115-120000-abcd".into()),
@@ -1159,10 +1382,9 @@ mod tests {
             assert_eq!(plan.actions[0].timeouts.execute_ms, execute_ms);
             plan.actions[0].validate_signal_timing().unwrap();
         }
-        let old: ActionTimeouts = serde_json::from_str(
-            r#"{"preflight_ms":2000,"execute_ms":10000,"verify_ms":5000}"#,
-        )
-        .unwrap();
+        let old: ActionTimeouts =
+            serde_json::from_str(r#"{"preflight_ms":2000,"execute_ms":10000,"verify_ms":5000}"#)
+                .unwrap();
         assert_eq!(old.term_grace_ms, None);
         let schema = serde_json::to_value(schemars::schema_for!(ActionTimeouts)).unwrap();
         let timing = &schema["properties"]["term_grace_ms"];

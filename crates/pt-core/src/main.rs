@@ -2514,7 +2514,10 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
     handle
         .update_state(SessionState::Planned)
         .map_err(|error| format!("persist interactive planned state: {error}"))?;
-    let execution_state = Arc::new(Mutex::new(TuiExecutionState::default()));
+    let execution_state = Arc::new(Mutex::new(TuiExecutionState {
+        term_grace_config_dir: Some(config.config_dir.clone()),
+        ..Default::default()
+    }));
     #[cfg(target_os = "linux")]
     {
         execution_state
@@ -2643,6 +2646,7 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
         let session_id_e = session_id.clone();
         let policy_e = policy.clone();
         let handle_e = handle.clone();
+        let term_grace_config_dir_e = config.config_dir.clone();
         let dry_run = global.dry_run;
         let shadow = global.shadow;
         let decisions_e = Arc::clone(&decisions);
@@ -2665,7 +2669,7 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
                         .map_err(|_| "plan cache lock poisoned".to_string())?;
                     // A confirmed spare-only review needs no executable plan. Keep
                     // the planner's rejection of empty/invalid action selections.
-                    let plan = if selected.is_empty() {
+                    let mut plan = if selected.is_empty() {
                         None
                     } else {
                         Some(build_plan_from_selection(
@@ -2675,6 +2679,24 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
                             &candidates,
                         )?)
                     };
+                    if let Some(plan) = plan.as_mut() {
+                        let report = bind_adaptive_term_grace(
+                            plan,
+                            &policy_e,
+                            &term_grace_config_dir_e,
+                            candidates.values().map(|candidate| (
+                                candidate.identity.clone(),
+                                candidate.comm.as_str(),
+                                candidate.cmd.as_str(),
+                            )),
+                        );
+                        if policy_e.signal.adaptive_term_grace.enabled {
+                            pt_core::session::write_json_pretty(
+                                &handle_e.dir.join("decision/adaptive_term_grace.json"),
+                                &report,
+                            ).map_err(|error| format!("persist adaptive cleanup plan evidence: {error}"))?;
+                        }
+                    }
                     let commands: HashMap<u32, TuiReviewedProcess> = selected
                         .iter()
                         .chain(explicitly_spared.iter())
@@ -2739,7 +2761,7 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
                         });
                     };
 
-                    let (result, _) =
+                    let (result, execution_evidence) =
                         execute_tui_plan_selection(&handle_e, &policy_e, &plan, &mut state)?;
                     if let Ok(mut guard) = decisions_e.lock() {
                         if let Some(store) = guard.as_mut() {
@@ -2760,8 +2782,16 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
                     }) {
                         return Err(error.clone());
                     }
+                    let learning_warning = execution_evidence.values().find_map(|evidence| {
+                        (evidence["adaptive_term_grace_learning"]["status"].as_str() == Some("unavailable"))
+                            .then(|| evidence["adaptive_term_grace_learning"]["error"].as_str())
+                            .flatten()
+                    });
                     Ok(ExecutionOutcome {
-                        mode: None,
+                        mode: learning_warning.map(|error| format!(
+                            "{} succeeded, {} failed; cleanup timing learning unavailable: {error}",
+                            result.summary.actions_succeeded, result.summary.actions_failed,
+                        )),
                         attempted: result.summary.actions_attempted,
                         succeeded: result.summary.actions_succeeded,
                         failed: result.summary.actions_failed,
@@ -3571,6 +3601,704 @@ fn planned_zombie_parent_refusal(
         })
 }
 
+/// Adapt only a newly constructed plan, before its action IDs are published.
+/// Captured command bytes are never taken from redacted display candidates.
+fn bind_adaptive_term_grace<'a>(
+    plan: &mut Plan,
+    policy: &pt_core::config::Policy,
+    config_dir: &Path,
+    commands: impl IntoIterator<Item = (ProcessIdentity, &'a str, &'a str)>,
+) -> serde_json::Value {
+    bind_adaptive_term_grace_with_digest(plan, policy, config_dir, commands, |target| {
+        #[cfg(unix)]
+        {
+            pt_core::action::signal::capture_term_command_sha256(target)
+                .map_err(|error| error.to_string())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = target;
+            Err("exact argv evidence is unavailable on this platform".to_string())
+        }
+    })
+}
+
+fn bind_adaptive_term_grace_with_digest<'a>(
+    plan: &mut Plan,
+    policy: &pt_core::config::Policy,
+    config_dir: &Path,
+    commands: impl IntoIterator<Item = (ProcessIdentity, &'a str, &'a str)>,
+    mut command_digest: impl FnMut(&ProcessIdentity) -> Result<String, String>,
+) -> serde_json::Value {
+    let adaptive = &policy.signal.adaptive_term_grace;
+    let mut report = serde_json::json!({
+        "enabled": adaptive.enabled,
+        "upper_grace_ms": policy.signal.term_grace_ms,
+        "min_grace_ms": adaptive.min_grace_ms.min(policy.signal.term_grace_ms),
+        "min_samples": adaptive.min_samples,
+        "actions": [],
+        "unavailable": [],
+    });
+    if !adaptive.enabled {
+        return report;
+    }
+    let history = match pt_core::decision::decision_store::TermGraceStore::load(config_dir) {
+        Ok(history) => history,
+        Err(error) => {
+            report["unavailable"] = serde_json::json!([error.to_string()]);
+            return report;
+        }
+    };
+    let mut by_identity = HashMap::new();
+    for (identity, comm, command) in commands {
+        by_identity
+            .entry(identity)
+            .and_modify(|entry| *entry = None)
+            .or_insert(Some((comm, command)));
+    }
+    for index in 0..plan.actions.len() {
+        let action = &plan.actions[index];
+        if action.blocked
+            || action.action != Action::Kill
+            || action.routing != pt_core::plan::ActionRouting::Direct
+            || action.original_zombie_target.is_some()
+            || action.supervisor_restart.is_some()
+        {
+            continue;
+        }
+        let action_id = action.action_id.clone();
+        let Some(&(comm, _display_command)) =
+            by_identity.get(&action.target).and_then(Option::as_ref)
+        else {
+            report["unavailable"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!(format!(
+                    "action {action_id} has no unambiguous captured command identity"
+                )));
+            continue;
+        };
+        let command = match command_digest(&action.target) {
+            Ok(command) => command,
+            Err(error) => {
+                report["unavailable"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!(format!("action {action_id}: {error}")));
+                continue;
+            }
+        };
+        let command_key = format!("linux-proc-argv-sha256:{command}");
+        let recommendation = match history.recommend(
+            comm,
+            &command_key,
+            policy.signal.term_grace_ms,
+            adaptive.min_grace_ms,
+            adaptive.min_samples,
+        ) {
+            Ok(Some(recommendation)) => recommendation,
+            Ok(None) => continue,
+            Err(error) => {
+                report["unavailable"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!(error));
+                break;
+            }
+        };
+        if recommendation.grace_ms >= policy.signal.term_grace_ms {
+            continue;
+        }
+        if let Err(error) =
+            plan.bind_term_grace_for_command(&action_id, recommendation.grace_ms, &command)
+        {
+            report["unavailable"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!(format!("action {action_id}: {error}")));
+            continue;
+        }
+        report["actions"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "previous_action_id": action_id,
+                "action_id": plan.actions[index].action_id,
+                "target": plan.actions[index].target,
+                "command_sha256": command,
+                "recommendation": recommendation,
+            }));
+    }
+    report
+}
+
+/// Goal selection already bound candidate IDs; update just the changed timing
+/// IDs without revisiting eligibility, ranking, or goal exclusions.
+fn remap_adaptive_term_action_ids(
+    candidates: &mut [serde_json::Value],
+    report: &serde_json::Value,
+) {
+    let changes: HashMap<_, _> = report["actions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|change| {
+            Some((
+                change["previous_action_id"].as_str()?,
+                change["action_id"].as_str()?,
+            ))
+        })
+        .collect();
+    for candidate in candidates {
+        if let Some(ids) = candidate
+            .get_mut("plan_action_ids")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for id in ids {
+                if let Some(updated) = id.as_str().and_then(|id| changes.get(id)) {
+                    *id = serde_json::json!(updated);
+                }
+            }
+        }
+    }
+}
+
+/// Relief provenance names the selected primary/prerequisite IDs separately
+/// from candidate associations. Rebind only those explicit references; ranking,
+/// exclusions, alternatives and modeled recovery stay unchanged.
+fn remap_adaptive_term_goal_action_ids(
+    summary: &mut serde_json::Value,
+    report: &serde_json::Value,
+) {
+    let changes: HashMap<_, _> = report["actions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|change| {
+            Some((
+                change["previous_action_id"].as_str()?,
+                change["action_id"].as_str()?,
+            ))
+        })
+        .collect();
+    let remap = |id: &mut serde_json::Value| {
+        if let Some(updated) = id.as_str().and_then(|id| changes.get(id)) {
+            *id = serde_json::json!(updated);
+        }
+    };
+    let remap_step = |step: &mut serde_json::Value| {
+        if let Some(id) = step.get_mut("action_id") {
+            remap(id);
+        }
+        if let Some(ids) = step
+            .get_mut("action_ids")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for id in ids {
+                remap(id);
+            }
+        }
+    };
+    if let Some(ids) = summary
+        .get_mut("selected_action_ids")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for id in ids {
+            remap(id);
+        }
+    }
+    if let Some(steps) = summary
+        .get_mut("remediation_ladder")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for step in steps {
+            remap_step(step);
+        }
+    }
+    if let Some(tiers) = summary
+        .get_mut("alternatives")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for tier in tiers {
+            if let Some(steps) = tier
+                .get_mut("remedies")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for step in steps {
+                    remap_step(step);
+                }
+            }
+        }
+    }
+}
+
+/// A tighter policy can refuse an old approval, but must never silently shorten
+/// the cleanup interval that approval promised to the target.
+fn validate_term_grace_policy_cap(
+    action: &PlanAction,
+    current: &pt_core::config::Policy,
+    recorded: Option<&pt_core::config::Policy>,
+) -> Result<(), String> {
+    action.validate_signal_timing().map_err(String::from)?;
+    if action.action != Action::Kill
+        || !matches!(
+            action.routing,
+            pt_core::plan::ActionRouting::Direct
+                | pt_core::plan::ActionRouting::DStateLowConfidence
+        )
+    {
+        return Ok(());
+    }
+    let grace_ms = action
+        .timeouts
+        .term_grace_ms
+        .unwrap_or(pt_core::config::policy::DEFAULT_TERM_GRACE_MS);
+    for (source, policy) in
+        std::iter::once(("current", current)).chain(recorded.map(|policy| ("recorded", policy)))
+    {
+        pt_core::config::policy::validate_term_grace_ms(policy.signal.term_grace_ms)
+            .map_err(|error| format!("invalid {source} SIGTERM grace policy: {error}"))?;
+        if grace_ms > policy.signal.term_grace_ms {
+            return Err(format!(
+                "saved SIGTERM grace {grace_ms}ms exceeds the {source} policy cap {}ms; create and approve a new plan",
+                policy.signal.term_grace_ms,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Record verified, individually bound execution facts without changing the
+/// action's success/failure or teaching abandonment priors.
+#[cfg(unix)]
+fn record_verified_term_grace(
+    config_dir: Option<&Path>,
+    policy: &pt_core::config::Policy,
+    session_id: &str,
+    action: &PlanAction,
+    result: &pt_core::action::ActionResult,
+    evidence: &mut serde_json::Value,
+) {
+    if !policy.signal.adaptive_term_grace.enabled
+        || action.action != Action::Kill
+        || result.status != pt_core::action::ActionStatus::Success
+    {
+        return;
+    }
+    let record = || -> Result<serde_json::Value, String> {
+        if evidence
+            .get("signal_delivery_unknown")
+            .is_some_and(|value| value != &serde_json::json!(false))
+            || evidence["kill_signal_delivered"].as_bool() != Some(true)
+        {
+            return Ok(
+                serde_json::json!({"status": "not_eligible", "reason": "signal delivery is not established"}),
+            );
+        }
+        let Some(signal) = evidence.get("signal_outcome") else {
+            return Ok(
+                serde_json::json!({"status": "not_eligible", "reason": "no signal receipt"}),
+            );
+        };
+        let signal: pt_core::action::signal::SignalExecutionOutcome =
+            serde_json::from_value(signal.clone())
+                .map_err(|error| format!("invalid signal receipt: {error}"))?;
+        let command_identity: ProcessIdentity =
+            serde_json::from_value(evidence["command_identity"].clone())
+                .map_err(|error| format!("captured command identity unavailable: {error}"))?;
+        let comm = evidence["command_comm"]
+            .as_str()
+            .ok_or("captured command name unavailable")?;
+        let command = signal
+            .term_command_sha256
+            .as_deref()
+            .filter(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            .ok_or("complete argv digest was unavailable at TERM delivery")?;
+        let executed_at = serde_json::from_value(evidence["executed_at"].clone())
+            .map_err(|error| format!("original execution timestamp unavailable: {error}"))?;
+        let command_key = format!("linux-proc-argv-sha256:{command}");
+        let Some(observation) =
+            pt_core::decision::decision_store::TermGraceObservation::from_execution(
+                session_id,
+                executed_at,
+                action,
+                &command_identity,
+                comm,
+                &command_key,
+                result,
+                &signal,
+            )
+        else {
+            return Ok(
+                serde_json::json!({"status": "not_eligible", "reason": "receipt is not a matching verified TERM observation"}),
+            );
+        };
+        let config_dir = config_dir.ok_or("signal history configuration directory unavailable")?;
+        let mut history = pt_core::decision::decision_store::TermGraceStore::load(config_dir)
+            .map_err(|error| error.to_string())?;
+        let recorded = history
+            .record(observation)
+            .map_err(|error| error.to_string())?;
+        history.save().map_err(|error| error.to_string())?;
+        Ok(
+            serde_json::json!({"status": if recorded { "recorded" } else { "already_recorded_or_expired" }}),
+        )
+    };
+    let update = record().unwrap_or_else(|error| {
+        tracing::warn!(action_id = %action.action_id, error = %error, "verified action completed but adaptive cleanup learning is unavailable");
+        serde_json::json!({"status": "unavailable", "error": error})
+    });
+    evidence["adaptive_term_grace_learning"] = update;
+}
+
+/// Agent checkpoints already contain their verified result and captured runner
+/// evidence. Resolve the exact saved action, never a PID-only display alias.
+#[cfg(unix)]
+fn record_adaptive_term_outcome(
+    config_dir: &Path,
+    policy: &pt_core::config::Policy,
+    plan: &Plan,
+    outcome: &mut serde_json::Value,
+) {
+    if !policy.signal.adaptive_term_grace.enabled || outcome["status"].as_str() != Some("success") {
+        return;
+    }
+    let Some(id) = outcome["action_id"].as_str() else {
+        return;
+    };
+    let mut actions = plan.actions.iter().filter(|action| action.action_id == id);
+    let Some(action) = actions.next() else {
+        return;
+    };
+    if actions.next().is_some() {
+        return;
+    }
+    let result = pt_core::action::ActionResult {
+        action_id: id.to_string(),
+        status: pt_core::action::ActionStatus::Success,
+        time_ms: u128::from(outcome["time_ms"].as_u64().unwrap_or(0)),
+        details: None,
+    };
+    record_verified_term_grace(
+        Some(config_dir),
+        policy,
+        &plan.session_id,
+        action,
+        &result,
+        outcome,
+    );
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod adaptive_term_grace_tests {
+    use super::*;
+    use pt_core::action::signal::{SignalDisposition, SignalExecutionOutcome};
+    use pt_core::decision::decision_store::{TermGraceStore, TERM_GRACE_FILE};
+
+    const SESSION: &str = "pt-20260601-000000-abcd";
+    const DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn enabled_policy() -> pt_core::config::Policy {
+        let mut policy = pt_core::config::Policy::default();
+        policy.signal.adaptive_term_grace.enabled = true;
+        policy
+    }
+
+    fn verified_execution(index: u32) -> (Plan, serde_json::Value) {
+        let pid = 10_000 + index;
+        let target = ProcessIdentity::new(
+            pid,
+            pt_common::StartId::from_linux("11111111-2222-4333-8444-555555555555", 100, pid),
+            1000,
+        );
+        let action: PlanAction = serde_json::from_value(serde_json::json!({
+            "action_id": format!("act-{index:016x}"),
+            "target": target,
+            "action": "kill",
+            "order": 0,
+            "stage": 0,
+            "timeouts": pt_core::plan::ActionTimeouts {
+                term_grace_ms: Some(5_000),
+                ..pt_core::plan::ActionTimeouts::default()
+            },
+            "pre_checks": [],
+            "rationale": {},
+            "on_success": [],
+            "on_failure": [],
+            "blocked": false,
+        }))
+        .unwrap();
+        let signal = SignalExecutionOutcome {
+            action_id: action.action_id.clone(),
+            target: Some(action.target.clone()),
+            term_command_sha256: Some(DIGEST.to_string()),
+            sigterm_disposition: SignalDisposition::Caught,
+            sigterm_recheck: None,
+            configured_grace_ms: 5_000,
+            observed_grace_ms: Some(100),
+            term_exit_observed_ms: Some(100),
+            sigterm_delivered: true,
+            sigcont_delivered: false,
+            sigkill_delivered: false,
+            escalation_reason: None,
+            execution_elapsed_ms: 110,
+        };
+        let outcome = serde_json::json!({
+            "action_id": action.action_id,
+            "status": "success",
+            "time_ms": 120,
+            "kill_signal_delivered": true,
+            "signal_outcome": signal,
+            "command_identity": action.target,
+            "command_comm": "node",
+            "command": "[redacted display is never a timing key]",
+            "executed_at": chrono::Utc::now() - chrono::Duration::minutes(1),
+        });
+        let plan = Plan {
+            plan_id: format!("plan-{index}"),
+            session_id: SESSION.to_string(),
+            generated_at: chrono::Utc::now().to_rfc3339(),
+            policy_id: None,
+            policy_version: "1.0.0".to_string(),
+            pre_toggled: vec![action.action_id.clone()],
+            actions: vec![action],
+            gates_summary: pt_core::plan::GatesSummary {
+                total_candidates: 1,
+                blocked_candidates: 0,
+                pre_toggled_actions: 1,
+            },
+        };
+        (plan, outcome)
+    }
+
+    #[test]
+    fn verified_receipts_teach_new_plans_with_immutable_command_and_action_bindings() {
+        let directory = tempfile::tempdir().unwrap();
+        let policy = enabled_policy();
+        for index in 0..8 {
+            let (plan, mut outcome) = verified_execution(index);
+            let original_time = outcome["executed_at"].clone();
+            record_adaptive_term_outcome(directory.path(), &policy, &plan, &mut outcome);
+            assert_eq!(
+                outcome["adaptive_term_grace_learning"]["status"],
+                "recorded"
+            );
+            record_adaptive_term_outcome(directory.path(), &policy, &plan, &mut outcome);
+            assert_eq!(
+                outcome["adaptive_term_grace_learning"]["status"],
+                "already_recorded_or_expired"
+            );
+            assert_eq!(outcome["executed_at"], original_time);
+            assert_eq!(outcome["status"], "success");
+        }
+        let history = TermGraceStore::load(directory.path()).unwrap();
+        assert!(history
+            .recommend(
+                "node",
+                "[redacted display is never a timing key]",
+                5_000,
+                1_000,
+                8
+            )
+            .unwrap()
+            .is_none());
+        let (mut plan, _) = verified_execution(100);
+        let identity = plan.actions[0].target.clone();
+        let previous_id = plan.actions[0].action_id.clone();
+        let report = bind_adaptive_term_grace_with_digest(
+            &mut plan,
+            &policy,
+            directory.path(),
+            [(identity.clone(), "node", "[different display alias]")],
+            |_| Ok(DIGEST.to_string()),
+        );
+        assert_eq!(plan.actions[0].timeouts.term_grace_ms, Some(1_000));
+        assert_eq!(plan.actions[0].timeouts.execute_ms, 10_000);
+        assert_eq!(
+            plan.actions[0]
+                .timeouts
+                .term_grace_command_sha256
+                .as_deref(),
+            Some(DIGEST)
+        );
+        assert_ne!(plan.actions[0].action_id, previous_id);
+        assert_eq!(report["actions"][0]["recommendation"]["sample_count"], 8);
+        assert_eq!(report["actions"][0]["command_sha256"], DIGEST);
+        let mut candidates = vec![
+            serde_json::json!({"plan_action_ids": [previous_id], "goal_selected": true}),
+            serde_json::json!({"plan_action_ids": [], "goal_selected": false}),
+        ];
+        remap_adaptive_term_action_ids(&mut candidates, &report);
+        assert_eq!(
+            candidates[0]["plan_action_ids"][0],
+            plan.actions[0].action_id
+        );
+        assert_eq!(candidates[1]["plan_action_ids"], serde_json::json!([]));
+        assert_eq!(candidates[1]["goal_selected"], false);
+        let mut relief = serde_json::json!({
+            "selected_action_ids": ["pause-prerequisite", previous_id],
+            "remediation_ladder": [{
+                "action_id": previous_id,
+                "action_ids": ["pause-prerequisite", previous_id],
+                "modeled_relief": 2.0,
+            }],
+            "alternatives": [{"requires_new_plan": true, "remedies": [{
+                "action_id": "unselected-alternative",
+                "action_ids": ["unselected-alternative"],
+            }]}],
+            "excluded": [{"reason": previous_id}],
+            "total_modeled_relief": 2.0,
+        });
+        let alternatives = relief["alternatives"].clone();
+        remap_adaptive_term_goal_action_ids(&mut relief, &report);
+        assert_eq!(relief["selected_action_ids"][0], "pause-prerequisite");
+        assert_eq!(relief["selected_action_ids"][1], plan.actions[0].action_id);
+        assert_eq!(
+            relief["remediation_ladder"][0]["action_id"],
+            plan.actions[0].action_id
+        );
+        assert_eq!(
+            relief["remediation_ladder"][0]["action_ids"][1],
+            plan.actions[0].action_id
+        );
+        assert_eq!(relief["alternatives"], alternatives);
+        assert_eq!(relief["excluded"][0]["reason"], previous_id);
+        assert_eq!(relief["total_modeled_relief"], 2.0);
+        let saved = serde_json::to_string(&plan).unwrap();
+        let restored = parse_agent_plan(&saved).unwrap();
+        assert_eq!(restored.actions[0].timeouts.term_grace_ms, Some(1_000));
+        assert_eq!(restored.actions[0].action_id, plan.actions[0].action_id);
+        let (mut unrelated, _) = verified_execution(101);
+        let unrelated_identity = unrelated.actions[0].target.clone();
+        bind_adaptive_term_grace_with_digest(
+            &mut unrelated,
+            &policy,
+            directory.path(),
+            [(unrelated_identity, "node", "[same display alias]")],
+            |_| Ok("b".repeat(64)),
+        );
+        assert_eq!(unrelated.actions[0].timeouts.term_grace_ms, Some(5_000));
+        assert!(unrelated.actions[0]
+            .timeouts
+            .term_grace_command_sha256
+            .is_none());
+    }
+
+    #[test]
+    fn disabled_unknown_and_unexecuted_paths_keep_fixed_grace_and_do_not_train() {
+        let directory = tempfile::tempdir().unwrap();
+        let disabled = pt_core::config::Policy::default();
+        let (mut plan, mut outcome) = verified_execution(1);
+        let identity = plan.actions[0].target.clone();
+        let report = bind_adaptive_term_grace_with_digest(
+            &mut plan,
+            &disabled,
+            directory.path(),
+            [(identity, "node", "[redacted]")],
+            |_| panic!("disabled learning must not read a live command"),
+        );
+        assert_eq!(report["enabled"], false);
+        record_adaptive_term_outcome(directory.path(), &disabled, &plan, &mut outcome);
+        assert!(!directory.path().join(TERM_GRACE_FILE).exists());
+        let policy = enabled_policy();
+        for status in ["dry_run", "shadow", "failed", "timeout", "skipped"] {
+            outcome["status"] = serde_json::json!(status);
+            record_adaptive_term_outcome(directory.path(), &policy, &plan, &mut outcome);
+        }
+        assert!(!directory.path().join(TERM_GRACE_FILE).exists());
+        let identity = plan.actions[0].target.clone();
+        let report = bind_adaptive_term_grace_with_digest(
+            &mut plan,
+            &policy,
+            directory.path(),
+            [(identity, "node", "[redacted]")],
+            |_| Err("complete argv unavailable".to_string()),
+        );
+        assert_eq!(plan.actions[0].timeouts.term_grace_ms, Some(5_000));
+        assert!(plan.actions[0].timeouts.term_grace_command_sha256.is_none());
+        assert!(report["unavailable"][0]
+            .as_str()
+            .unwrap()
+            .contains("complete argv unavailable"));
+    }
+
+    #[test]
+    fn uncertain_receipts_and_history_failures_remain_visible_without_rewriting_success() {
+        let directory = tempfile::tempdir().unwrap();
+        let policy = enabled_policy();
+        let (plan, original) = verified_execution(1);
+        let mut uncertain = original.clone();
+        uncertain["signal_delivery_unknown"] = serde_json::json!(true);
+        record_adaptive_term_outcome(directory.path(), &policy, &plan, &mut uncertain);
+        assert_eq!(
+            uncertain["adaptive_term_grace_learning"]["status"],
+            "not_eligible"
+        );
+        let mut mismatched = original.clone();
+        mismatched["command_identity"]["uid"] = serde_json::json!(2000);
+        record_adaptive_term_outcome(directory.path(), &policy, &plan, &mut mismatched);
+        assert_eq!(
+            mismatched["adaptive_term_grace_learning"]["status"],
+            "not_eligible"
+        );
+        let mut no_argv = original.clone();
+        no_argv["signal_outcome"]
+            .as_object_mut()
+            .unwrap()
+            .remove("term_command_sha256");
+        record_adaptive_term_outcome(directory.path(), &policy, &plan, &mut no_argv);
+        assert_eq!(
+            no_argv["adaptive_term_grace_learning"]["status"],
+            "unavailable"
+        );
+        assert!(!directory.path().join(TERM_GRACE_FILE).exists());
+        std::fs::write(directory.path().join(TERM_GRACE_FILE), "{broken").unwrap();
+        let mut failed_write = original;
+        record_adaptive_term_outcome(directory.path(), &policy, &plan, &mut failed_write);
+        assert_eq!(
+            failed_write["adaptive_term_grace_learning"]["status"],
+            "unavailable"
+        );
+        assert!(failed_write["adaptive_term_grace_learning"]["error"]
+            .as_str()
+            .is_some());
+        assert_eq!(failed_write["status"], "success");
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join(TERM_GRACE_FILE)).unwrap(),
+            "{broken"
+        );
+    }
+
+    #[test]
+    fn tighter_policy_refuses_saved_timing_without_silently_shortening_it() {
+        let (plan, _) = verified_execution(1);
+        let action = &plan.actions[0];
+        let original = serde_json::to_value(action).unwrap();
+        let current = enabled_policy();
+        validate_term_grace_policy_cap(action, &current, None).unwrap();
+        let mut tighter = current.clone();
+        tighter.signal.term_grace_ms = 1_000;
+        assert!(validate_term_grace_policy_cap(action, &tighter, None).is_err());
+        assert!(validate_term_grace_policy_cap(action, &current, Some(&tighter)).is_err());
+        assert_eq!(serde_json::to_value(action).unwrap(), original);
+        let mut legacy = action.clone();
+        legacy.timeouts.term_grace_ms = None;
+        assert!(validate_term_grace_policy_cap(&legacy, &tighter, None).is_err());
+        let mut learned = action.clone();
+        learned.timeouts.term_grace_ms = Some(1_000);
+        learned.timeouts.term_grace_command_sha256 = Some(DIGEST.to_string());
+        validate_term_grace_policy_cap(&learned, &tighter, None).unwrap();
+        tighter.signal.term_grace_ms = 500;
+        assert!(validate_term_grace_policy_cap(&learned, &tighter, None).is_err());
+        assert_eq!(learned.timeouts.term_grace_ms, Some(1_000));
+    }
+}
+
 /// Bind saved execution evidence to the current identity, before taking action.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn capture_action_execution_evidence(
@@ -3616,6 +4344,8 @@ fn capture_action_execution_evidence(
         "target": action.target,
         "supervisor_restart": action.supervisor_restart,
         "command": process.cmd,
+        "command_identity": process_identity_from_record(process),
+        "command_comm": process.comm,
         "parent_pid": process.ppid.0,
         "parent_identity": parent_identity,
         "executed_at": chrono::Utc::now(),
@@ -3925,6 +4655,7 @@ type RecordedExecution = (
 #[cfg(feature = "ui")]
 #[derive(Default)]
 struct TuiExecutionState {
+    term_grace_config_dir: Option<PathBuf>,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     enforcer: Option<pt_core::decision::PolicyEnforcer>,
     #[cfg(target_os = "linux")]
@@ -3979,8 +4710,24 @@ fn execute_tui_plan_selection(
     let execution = (|| {
         // Persist every earlier binding, but execute only this new selection.
         write_plan_to_session(handle, selection)?;
-        let ((result, evidence), lock) = execute_plan_actions(handle, policy, selection, state)?;
+        let ((result, mut evidence), lock) = execute_plan_actions(handle, policy, selection, state)?;
         execution_lock = Some(lock);
+        #[cfg(unix)]
+        for outcome in &result.outcomes {
+            if let (Some(action), Some(captured)) = (
+                selection.actions.iter().find(|action| action.action_id == outcome.action_id),
+                evidence.get_mut(&outcome.action_id),
+            ) {
+                record_verified_term_grace(
+                    state.term_grace_config_dir.as_deref(),
+                    policy,
+                    &selection.session_id,
+                    action,
+                    outcome,
+                    captured,
+                );
+            }
+        }
         let executions = write_outcomes_from_execution(handle, selection, &result, &evidence)?;
         if executions
             .iter()
@@ -4071,6 +4818,7 @@ fn execute_plan_actions(
             );
         }
         for action in &plan.actions {
+            validate_term_grace_policy_cap(action, policy, None)?;
             let mut saved = canonical
                 .actions
                 .iter()
@@ -27960,6 +28708,20 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 });
         }
     }
+    let adaptive_term_grace = bind_adaptive_term_grace(
+        &mut action_plan,
+        &decision_policy,
+        &config.config_dir,
+        scan_result.processes.iter().map(|process| (
+            process_identity_from_record(process),
+            process.comm.as_str(),
+            process.cmd.as_str(),
+        )),
+    );
+    remap_adaptive_term_action_ids(&mut candidates, &adaptive_term_grace);
+    if let Some(summary) = goal_summary.as_mut() {
+        remap_adaptive_term_goal_action_ids(summary, &adaptive_term_grace);
+    }
     let returned_pids: HashSet<u32> = candidates
         .iter()
         .filter_map(|candidate| {
@@ -28287,6 +29049,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         "goal_progress": goal_progress,
         "goal_summary": goal_summary,
         "resource_predictions": resource_predictions,
+        "adaptive_term_grace": adaptive_term_grace,
         "candidates": candidates,
         "recommendations": recommendations,
         "recommended": recommended,
@@ -30998,6 +31761,12 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                         {
                             fields.extend(evidence.clone());
                         }
+                        record_adaptive_term_outcome(
+                            &config.config_dir,
+                            &config.policy,
+                            &plan,
+                            &mut outcome,
+                        );
                         // After a failed append/sync, never retry possibly
                         // published bytes. Still join and report every already
                         // admitted action before releasing the execution lock.
@@ -31031,7 +31800,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             // macro is used only in the real execution loop below.
             macro_rules! checkpoint_outcome {
                 ($outcome:expr) => {{
-                    let outcome = $outcome;
+                    let mut outcome = $outcome;
                     if finish_pending!(usize::MAX) {
                         // The current refusal is already observed. Preserve it
                         // in the response even if an earlier worker's durable
@@ -31039,6 +31808,12 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                         outcomes.push(outcome);
                         break;
                     }
+                    record_adaptive_term_outcome(
+                        &config.config_dir,
+                        &config.policy,
+                        &plan,
+                        &mut outcome,
+                    );
                     let persisted =
                         append_action_outcomes(&action_dir, std::slice::from_ref(&outcome));
                     outcomes.push(outcome);
@@ -31188,6 +31963,24 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     && ancestors.is_some();
                 if !parallel && finish_pending!(usize::MAX) {
                     break;
+                }
+                if let Err(reason) = validate_term_grace_policy_cap(
+                    action,
+                    &config.policy,
+                    recorded_policy.as_ref(),
+                ) {
+                    blocked_by_prechecks += 1;
+                    checkpoint_outcome!(serde_json::json!({
+                        "action_id": action.action_id,
+                        "pid": action.target.pid.0,
+                        "status": "precheck_blocked",
+                        "check": "sigterm_grace_policy_cap",
+                        "reason": reason,
+                    }));
+                    if args.abort_on_unknown {
+                        break;
+                    }
+                    continue;
                 }
                 // A tree/stage barrier may wait through an earlier cleanup
                 // grace. Check identity and every live gate only after those
