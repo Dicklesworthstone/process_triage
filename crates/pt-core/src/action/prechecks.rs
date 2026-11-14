@@ -884,39 +884,235 @@ pub(super) fn parse_proc_tty(pid: u32, content: &str) -> Result<bool, String> {
         .ok_or_else(|| invalid("missing or invalid tty_nr"))
 }
 
-/// Whether an open-file target (a `/proc/<pid>/fd` link) is a file
-/// whose pending writes could be lost by killing the process.
-///
-/// memfds and unlinked files that had a name are excluded: nothing in them can
-/// outlive the process, and counting them refused every leaked Chromium or
-/// Electron process (they hold unlinked `/dev/shm` or `/tmp` segments and memfds
-/// open read-write). An `O_TMPFILE` file (`#<inode>`) is still being built and
-/// may be linked into place, so it stays protected, as do named `/dev/shm` files.
-/// `still_linked` is the file's own link count being nonzero: a " (deleted)" link
-/// only says the name it was opened by is gone, not that the file is.
-#[cfg(any(target_os = "linux", test))]
-fn is_persistent_file_target(target: &str, still_linked: bool) -> bool {
-    if !target.starts_with('/') || target.starts_with("/memfd:") {
-        return false;
-    }
-    let path = match target.strip_suffix(" (deleted)") {
-        Some(path) if !still_linked && !is_unnamed_tmpfile(path) => return false,
-        Some(path) => path,
-        None => target,
-    };
-    (path.starts_with("/dev/shm/") || !path.starts_with("/dev/"))
-        && !["/proc/", "/sys/"]
-            .iter()
-            .any(|prefix| path.starts_with(prefix))
+// Descriptor links and fdinfo are procfs observations. Following a descriptor
+// with metadata(), however, calls into its backing filesystem and can hang on a
+// stalled FUSE/NFS mount. Keep every such lookup in the bounded tool runner.
+#[cfg(target_os = "linux")]
+const WRITE_FD_INSPECTION_TIMEOUT: Duration = Duration::from_millis(500);
+#[cfg(target_os = "linux")]
+const MAX_WRITE_FD_INSPECTION: usize = 50_000;
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WriteFdObservation {
+    target: std::path::PathBuf,
+    flags: u32,
+    inode: u64,
+    mount_id: u64,
 }
 
-/// Linux names an `O_TMPFILE` descriptor `<dir>/#<inode>`.
-#[cfg(any(target_os = "linux", test))]
-fn is_unnamed_tmpfile(path: &str) -> bool {
-    path.rsplit('/')
-        .next()
-        .and_then(|name| name.strip_prefix('#'))
-        .is_some_and(|inode| !inode.is_empty() && inode.bytes().all(|b| b.is_ascii_digit()))
+#[cfg(target_os = "linux")]
+impl WriteFdObservation {
+    fn writable(&self) -> bool {
+        matches!(self.flags & libc::O_ACCMODE as u32, 1 | 2)
+    }
+}
+
+/// Read all required kernel fields, preserving unknown/duplicate/truncated
+/// evidence instead of making an unreadable access mode look read-only.
+#[cfg(target_os = "linux")]
+fn write_fd_flags_and_identity(content: &str) -> Option<(u32, u64, u64)> {
+    if !content.ends_with('\n') {
+        return None;
+    }
+    let (mut flags, mut inode, mut mount_id) = (None, None, None);
+    for line in content.lines() {
+        if let Some(value) = line.strip_prefix("flags:") {
+            let value = value.trim();
+            if value.is_empty() || !value.bytes().all(|byte| matches!(byte, b'0'..=b'7')) {
+                return None;
+            }
+            if flags.replace(u32::from_str_radix(value, 8).ok()?).is_some() {
+                return None;
+            }
+        } else if let Some(value) = line.strip_prefix("ino:") {
+            let value = value.trim();
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            if inode.replace(value.parse::<u64>().ok()?).is_some() {
+                return None;
+            }
+        } else if let Some(value) = line.strip_prefix("mnt_id:") {
+            let value = value.trim();
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            if mount_id.replace(value.parse::<u64>().ok()?).is_some() {
+                return None;
+            }
+        }
+    }
+    let flags = flags?;
+    // Mode 3 is a Linux-specific ioctl-only access mode. Do not guess that an
+    // unfamiliar mode proves there can be no pending writes.
+    if flags & libc::O_ACCMODE as u32 == 3 {
+        return None;
+    }
+    Some((flags, inode?, mount_id?))
+}
+
+#[cfg(target_os = "linux")]
+fn write_fd_snapshot(
+    pid: u32,
+    deadline: Instant,
+) -> Option<std::collections::BTreeMap<u32, WriteFdObservation>> {
+    use std::io::Read;
+
+    let mut observed = std::collections::BTreeMap::new();
+    let entries = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
+    for entry in entries {
+        if Instant::now() >= deadline || observed.len() >= MAX_WRITE_FD_INSPECTION {
+            return None;
+        }
+        let entry = entry.ok()?;
+        let fd = entry.file_name().to_str()?.parse::<u32>().ok()?;
+        let target = std::fs::read_link(entry.path()).ok()?;
+        // Large lock/event tables can make fdinfo arbitrarily long. Its required
+        // header must be observed completely, within a fixed per-file bound.
+        const MAX_FDINFO_BYTES: u64 = 64 * 1024;
+        let mut content = String::new();
+        std::fs::File::open(format!("/proc/{pid}/fdinfo/{fd}"))
+            .ok()?
+            .take(MAX_FDINFO_BYTES + 1)
+            .read_to_string(&mut content)
+            .ok()?;
+        if content.len() as u64 > MAX_FDINFO_BYTES {
+            return None;
+        }
+        let (flags, inode, mount_id) = write_fd_flags_and_identity(&content)?;
+        if observed
+            .insert(
+                fd,
+                WriteFdObservation {
+                    target,
+                    flags,
+                    inode,
+                    mount_id,
+                },
+            )
+            .is_some()
+        {
+            return None;
+        }
+    }
+    (Instant::now() < deadline).then_some(observed)
+}
+
+/// Count only a complete, successful metadata response for the exact requested
+/// writable descriptors. Paths in this protocol are generated /proc paths, not
+/// displayed filenames; a filename containing whitespace cannot inject a row.
+#[cfg(target_os = "linux")]
+fn count_write_fd_metadata(
+    requested: &std::collections::BTreeMap<String, &WriteFdObservation>,
+    output: &crate::collect::tool_runner::ToolOutput,
+) -> Option<u32> {
+    if !output.success() || !output.stderr.is_empty() {
+        return None;
+    }
+    let content = std::str::from_utf8(&output.stdout).ok()?;
+    if !content.ends_with('\n') {
+        return None;
+    }
+    let mut seen = HashSet::new();
+    let mut count = 0_u32;
+    for line in content.lines() {
+        let fields: Vec<_> = line.split_ascii_whitespace().collect();
+        if fields.len() != 4 || !seen.insert(fields[0]) {
+            return None;
+        }
+        let observation = requested.get(fields[0])?;
+        if fields[1].is_empty()
+            || !fields[1].bytes().all(|byte| byte.is_ascii_hexdigit())
+            || fields[2..]
+                .iter()
+                .any(|field| field.is_empty() || !field.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            return None;
+        }
+        let mode = u32::from_str_radix(fields[1], 16).ok()?;
+        let links = fields[2].parse::<u64>().ok()?;
+        let inode = fields[3].parse::<u64>().ok()?;
+        if inode != observation.inode
+            || mode & !0xffff != 0
+            || !matches!(
+                mode & libc::S_IFMT,
+                0 | libc::S_IFREG
+                    | libc::S_IFDIR
+                    | libc::S_IFCHR
+                    | libc::S_IFBLK
+                    | libc::S_IFIFO
+                    | libc::S_IFSOCK
+            )
+        {
+            return None;
+        }
+        // Linux anonymous-inode descriptors (eventfd/epoll/etc.) have no file
+        // type bits. That kernel link label is distinct from any absolute file
+        // path. A zero type elsewhere, or a symlink despite -L, is not proof of
+        // a harmless descriptor and must not turn into a successful zero.
+        if mode & libc::S_IFMT == 0
+            && !observation
+                .target
+                .as_os_str()
+                .as_encoded_bytes()
+                .starts_with(b"anon_inode:")
+        {
+            return None;
+        }
+        // File type and link count, not a pathname prefix, establish persistence.
+        // A regular file under /dev or a name ending in " (deleted)" can still
+        // have live links. Conversely memfds and unlinked named scratch files
+        // have no links. O_TMPFILE remains protected because it can be linked
+        // into place later; its kernel flag is stronger evidence than "#123".
+        if mode & libc::S_IFMT == libc::S_IFREG
+            && (links > 0 || observation.flags & libc::O_TMPFILE as u32 == libc::O_TMPFILE as u32)
+        {
+            count = count.checked_add(1)?;
+        }
+    }
+    (seen.len() == requested.len()).then_some(count)
+}
+
+#[cfg(target_os = "linux")]
+fn open_write_fd_count_with_probe<F>(pid: u32, probe: F) -> Option<u32>
+where
+    F: FnOnce(&[String], Duration) -> Option<crate::collect::tool_runner::ToolOutput>,
+{
+    let deadline = Instant::now().checked_add(WRITE_FD_INSPECTION_TIMEOUT)?;
+    let birth = read_io_birth(pid).ok()?;
+    let before = write_fd_snapshot(pid, deadline)?;
+    let requested: std::collections::BTreeMap<_, _> = before
+        .iter()
+        .filter(|(_, observation)| observation.writable())
+        .map(|(fd, observation)| (format!("/proc/{pid}/fd/{fd}"), observation))
+        .collect();
+    let count = if requested.is_empty() {
+        0
+    } else {
+        let remaining = deadline.checked_duration_since(Instant::now())?;
+        let paths: Vec<_> = requested.keys().cloned().collect();
+        count_write_fd_metadata(&requested, &probe(&paths, remaining)?)?
+    };
+    // The command inspected live numeric descriptors. Reject a close/reopen,
+    // changed access mode, mount, pathname, or process incarnation instead of
+    // mixing one file's metadata with another file's access flags.
+    if before != write_fd_snapshot(pid, deadline)? || read_io_birth(pid).ok()? != birth {
+        return None;
+    }
+    (Instant::now() < deadline).then_some(count)
+}
+
+#[cfg(target_os = "linux")]
+fn write_fd_probe_runner(remaining: Duration) -> crate::collect::tool_runner::ToolRunner {
+    use crate::collect::tool_runner::{ToolConfig, ToolRunner};
+    ToolRunner::new(ToolConfig {
+        default_timeout: remaining,
+        budget_ms: WRITE_FD_INSPECTION_TIMEOUT.as_millis() as u64,
+        max_output_bytes: MAX_WRITE_FD_INSPECTION * 128,
+        use_nice: false,
+        ..ToolConfig::default()
+    })
 }
 
 /// Number of persistent regular files `pid` holds open for writing: the data-loss
@@ -925,61 +1121,19 @@ fn is_unnamed_tmpfile(path: &str) -> bool {
 pub fn open_write_fd_count(pid: u32) -> Option<u32> {
     #[cfg(target_os = "linux")]
     {
-        let fd_dir = format!("/proc/{pid}/fd");
-        let fdinfo_dir = format!("/proc/{pid}/fdinfo");
-        let entries = std::fs::read_dir(&fd_dir).ok()?;
-        let mut write_count = 0;
-
-        for entry in entries {
-            let entry = entry.ok()?;
-            let fd_name = entry.file_name();
-            // Only writes to real, persistent files can lose data. stdout/stderr
-            // to a pty/pipe, sockets, /dev/null, anon inodes, memfds and unlinked
-            // named files do not (see is_persistent_file_target).
-            let target = match std::fs::read_link(entry.path()) {
-                Ok(target) => target,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(_) => return None,
-            };
-            let target = target.to_string_lossy();
-            let still_linked = if target.ends_with(" (deleted)") {
-                use std::os::unix::fs::MetadataExt;
-                match std::fs::metadata(entry.path()) {
-                    Ok(metadata) => metadata.nlink() > 0,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(_) => return None,
-                }
-            } else {
-                false
-            };
-            if !is_persistent_file_target(&target, still_linked) {
-                continue;
-            }
-            let metadata = match std::fs::metadata(entry.path()) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(_) => return None,
-            };
-            if !metadata.is_file() {
-                continue;
-            }
-            let fdinfo_path = format!("{fdinfo_dir}/{}", fd_name.to_string_lossy());
-            let content_bytes = match std::fs::read(&fdinfo_path) {
-                Ok(content) => content,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(_) => return None,
-            };
-            let content = String::from_utf8_lossy(&content_bytes);
-            let flags = content
-                .lines()
-                .find_map(|line| line.strip_prefix("flags:"))
-                .and_then(|v| u32::from_str_radix(v.trim(), 8).ok())?;
-            // O_WRONLY = 1, O_RDWR = 2
-            if matches!(flags & 0o3, 1 | 2) {
-                write_count += 1;
-            }
-        }
-        Some(write_count)
+        use crate::collect::tool_runner::ToolSpec;
+        open_write_fd_count_with_probe(pid, |paths, remaining| {
+            let mut args = vec![
+                "-L".to_string(),
+                "-c".to_string(),
+                "%n %f %h %i".to_string(),
+                "--".to_string(),
+            ];
+            args.extend_from_slice(paths);
+            write_fd_probe_runner(remaining)
+                .run(&ToolSpec::new("stat", args))
+                .ok()
+        })
     }
     #[cfg(target_os = "macos")]
     {
@@ -3170,38 +3324,166 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
+    fn write_fd_test_observation(target: &str, flags: i32) -> WriteFdObservation {
+        WriteFdObservation {
+            target: target.into(),
+            flags: flags as u32,
+            inode: 42,
+            mount_id: 7,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
-    fn persistent_file_targets_only() {
-        for t in [
+    fn writable_fd_identity_requires_complete_unique_kernel_fields() {
+        let valid = "pos:\t0\nflags:\t0100002\nmnt_id:\t7\nino:\t42\n";
+        assert_eq!(write_fd_flags_and_identity(valid), Some((0o100002, 42, 7)));
+        for invalid in [
+            "flags:\t0100002\nmnt_id:\t7\n",
+            "flags:\t0100002\nino:\t42\n",
+            "mnt_id:\t7\nino:\t42\n",
+            "flags:\t0100002\nmnt_id:\t7\nino:\t42",
+            "flags:\t+2\nmnt_id:\t7\nino:\t42\n",
+            "flags:\t0100002\nmnt_id:\t+7\nino:\t42\n",
+            "flags:\t0100002\nmnt_id:\t7\nino:\t+42\n",
+            "flags:\t0100003\nmnt_id:\t7\nino:\t42\n",
+            "flags:\t0100002\nflags:\t0\nmnt_id:\t7\nino:\t42\n",
+            "flags:\t0100002\nmnt_id:\t7\nmnt_id:\t8\nino:\t42\n",
+            "flags:\t0100002\nmnt_id:\t7\nino:\t42\nino:\t43\n",
+        ] {
+            assert_eq!(write_fd_flags_and_identity(invalid), None, "{invalid:?}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn writable_fd_metadata_uses_kernel_type_and_links_instead_of_path_prefixes() {
+        for target in [
             "/data/projects/app/db.sqlite",
-            "/home/ubuntu/.cache/x.log",
-            "/tmp/build.out",
             "/run/user/1000/work-in-progress.log",
             "/dev/shm/pending.data",
-            "/tmp/#5242881 (deleted)",
+            "/dev/regular-data-file",
+            "/proc/bind-mounted-file",
+            "/sys/bind-mounted-file",
+            "/memfd:ordinary-file",
+            "/data/app/a.log (deleted)",
         ] {
-            assert!(is_persistent_file_target(t, false), "{t}");
+            let observation = write_fd_test_observation(target, libc::O_WRONLY);
+            let requested =
+                std::collections::BTreeMap::from([("/proc/123/fd/3".to_string(), &observation)]);
+            assert_eq!(
+                count_write_fd_metadata(&requested, &lsof_output("/proc/123/fd/3 81a4 1 42\n")),
+                Some(1),
+                "linked regular file {target} must be protected"
+            );
+            // The same pathname never turns a FIFO, socket or character device
+            // into a persistent regular file.
+            for mode in [libc::S_IFIFO, libc::S_IFSOCK, libc::S_IFCHR] {
+                let row = format!("/proc/123/fd/3 {mode:x} 1 42\n");
+                assert_eq!(
+                    count_write_fd_metadata(&requested, &lsof_output(&row)),
+                    Some(0)
+                );
+            }
         }
-        // The opened name is gone but another hard link keeps the file (or the real
-        // name ends in " (deleted)"): its writes still land on disk.
-        assert!(is_persistent_file_target("/data/app/a.log (deleted)", true));
-        // Chromium/Electron hold these read-write; none of it outlives the process.
-        for t in [
+        let anonymous = write_fd_test_observation("anon_inode:[eventfd]", libc::O_RDWR);
+        let requested =
+            std::collections::BTreeMap::from([("/proc/123/fd/3".to_string(), &anonymous)]);
+        assert_eq!(
+            count_write_fd_metadata(&requested, &lsof_output("/proc/123/fd/3 180 1 42\n")),
+            Some(0)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn writable_fd_metadata_keeps_linkable_temporary_files_protected() {
+        for target in [
             "/tmp/old.log (deleted)",
             "/dev/shm/.org.chromium.Chromium.XyZ123 (deleted)",
-            "/tmp/.org.chromium.Chromium.AbC456 (deleted)",
             "/memfd:wayland-cursor (deleted)",
-            "/memfd:pulseaudio",
-            "/tmp/#notinode (deleted)",
-            "/dev/pts/3",
-            "/dev/null",
-            "pipe:[123]",
-            "socket:[456]",
-            "anon_inode:[eventfd]",
-            "/proc/1/status",
+            "/tmp/#5242881 (deleted)",
         ] {
-            assert!(!is_persistent_file_target(t, false), "{t}");
+            for temporary in [false, true] {
+                let observation = write_fd_test_observation(
+                    target,
+                    libc::O_RDWR | if temporary { libc::O_TMPFILE } else { 0 },
+                );
+                let requested = std::collections::BTreeMap::from([(
+                    "/proc/123/fd/3".to_string(),
+                    &observation,
+                )]);
+                assert_eq!(
+                    count_write_fd_metadata(&requested, &lsof_output("/proc/123/fd/3 81a4 0 42\n")),
+                    Some(u32::from(temporary)),
+                    "{target}: O_TMPFILE={temporary}"
+                );
+            }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn writable_fd_metadata_refuses_partial_malformed_and_changed_evidence() {
+        let observation = write_fd_test_observation("/tmp/data", libc::O_WRONLY);
+        let requested =
+            std::collections::BTreeMap::from([("/proc/123/fd/3".to_string(), &observation)]);
+        let valid = "/proc/123/fd/3 81a4 1 42\n";
+        assert_eq!(
+            count_write_fd_metadata(&requested, &lsof_output(valid)),
+            Some(1)
+        );
+        for content in [
+            "",
+            "/proc/123/fd/3 81a4 1 42",
+            "/proc/123/fd/3 81a4 1\n",
+            "/proc/123/fd/3 81a4 1 42 extra\n",
+            "/proc/123/fd/3 81a4 1 43\n",
+            "/proc/123/fd/4 81a4 1 42\n",
+            "/proc/123/fd/3 ffff 1 42\n",
+            "/proc/123/fd/3 181a4 1 42\n",
+            "/proc/123/fd/3 180 1 42\n",
+            "/proc/123/fd/3 a1ff 1 42\n",
+            "/proc/123/fd/3 81a4 +1 42\n",
+            "/proc/123/fd/3 81a4 1 +42\n",
+            "/proc/123/fd/3 81a4 1 42\n/proc/123/fd/3 81a4 1 42\n",
+        ] {
+            assert_eq!(
+                count_write_fd_metadata(&requested, &lsof_output(content)),
+                None,
+                "{content:?}"
+            );
+        }
+        for failure in [
+            "nonzero",
+            "signal",
+            "timeout",
+            "truncated",
+            "stderr",
+            "utf8",
+        ] {
+            let mut output = lsof_output(valid);
+            match failure {
+                "nonzero" => output.exit_code = Some(1),
+                "signal" => output.exit_code = None,
+                "timeout" => output.timed_out = true,
+                "truncated" => output.truncated = true,
+                "stderr" => output.stderr = b"stat: cannot read descriptor".to_vec(),
+                "utf8" => output.stdout.push(0xff),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                count_write_fd_metadata(&requested, &output),
+                None,
+                "{failure}"
+            );
+        }
+        let missing = std::collections::BTreeMap::from([
+            ("/proc/123/fd/3".to_string(), &observation),
+            ("/proc/123/fd/4".to_string(), &observation),
+        ]);
+        assert_eq!(count_write_fd_metadata(&missing, &lsof_output(valid)), None);
     }
 
     // ── PreCheckResult ──────────────────────────────────────────────
@@ -5116,6 +5398,127 @@ while True:
         }
 
         #[test]
+        fn data_loss_metadata_probe_has_one_deadline_and_preserves_the_target() {
+            use crate::collect::tool_runner::ToolSpec;
+
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/null")
+                .unwrap();
+            let mut fixture = descriptor_child(file, false);
+            let pid = fixture.child.id();
+            assert_eq!(open_write_fd_count(pid), Some(0));
+            let invoked = std::cell::Cell::new(false);
+            let began = Instant::now();
+            let count = open_write_fd_count_with_probe(pid, |paths, remaining| {
+                invoked.set(true);
+                assert!(!paths.is_empty());
+                assert!(remaining <= WRITE_FD_INSPECTION_TIMEOUT);
+                // The same runner used by the stat probe must return while its
+                // owned command is still asleep, without waiting for a target
+                // filesystem or substituting a successful empty response.
+                let output = write_fd_probe_runner(remaining)
+                    .run(&ToolSpec::new(
+                        "sh",
+                        vec!["-c".to_string(), "exec sleep 5".to_string()],
+                    ))
+                    .unwrap();
+                assert!(output.timed_out);
+                Some(output)
+            });
+            assert!(invoked.get());
+            assert_eq!(count, None);
+            assert!(began.elapsed() < Duration::from_secs(2));
+            assert!(fixture.child.try_wait().unwrap().is_none());
+            assert_eq!(open_write_fd_count(pid), Some(0));
+        }
+
+        #[test]
+        fn data_loss_refuses_a_read_only_descriptor_reopened_for_writing_during_the_probe() {
+            use crate::collect::tool_runner::ToolSpec;
+            use std::io::{BufRead, Write};
+            use std::process::{Command, Stdio};
+
+            let directory = tempfile::tempdir().unwrap().keep();
+            let path = directory.join("data.log");
+            std::fs::write(&path, b"valuable data").unwrap();
+            let mut fixture = DescriptorChild {
+                child: Command::new("sh")
+                    .args([
+                        "-c",
+                        "exec 3<\"$1\"; printf 'ready\\n'; read -r change; exec 3>>\"$1\"; printf 'changed\\n'; read -r finish",
+                        "pt-fd-reopen",
+                    ])
+                    .arg(&path)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+                reader: None,
+            };
+            let stdout = fixture.child.stdout.take().unwrap();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            fixture.reader = Some(std::thread::spawn(move || {
+                for line in std::io::BufReader::new(stdout).lines() {
+                    if sender.send(line).is_err() {
+                        break;
+                    }
+                }
+            }));
+            assert_eq!(
+                receiver
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap()
+                    .unwrap(),
+                "ready"
+            );
+            let pid = fixture.child.id();
+            assert_eq!(open_write_fd_count(pid), Some(0));
+            let before = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/3")).unwrap();
+            let (flags_before, inode_before, mount_before) =
+                write_fd_flags_and_identity(&before).unwrap();
+            assert_eq!(flags_before & libc::O_ACCMODE as u32, libc::O_RDONLY as u32);
+            let invoked = std::cell::Cell::new(false);
+            let count = open_write_fd_count_with_probe(pid, |paths, remaining| {
+                invoked.set(true);
+                assert!(!paths.iter().any(|path| path.ends_with("/3")));
+                let mut args = vec![
+                    "-L".to_string(),
+                    "-c".to_string(),
+                    "%n %f %h %i".to_string(),
+                    "--".to_string(),
+                ];
+                args.extend_from_slice(paths);
+                let output = write_fd_probe_runner(remaining)
+                    .run(&ToolSpec::new("stat", args))
+                    .unwrap();
+                assert!(output.success(), "{output:?}");
+                // Keep pathname, inode and mount unchanged. Only re-reading
+                // every descriptor's access flags catches this new writer.
+                writeln!(fixture.child.stdin.as_mut().unwrap(), "change").unwrap();
+                assert_eq!(
+                    receiver
+                        .recv_timeout(Duration::from_secs(10))
+                        .unwrap()
+                        .unwrap(),
+                    "changed"
+                );
+                Some(output)
+            });
+            assert!(invoked.get());
+            assert_eq!(count, None);
+            let after = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/3")).unwrap();
+            let (flags_after, inode_after, mount_after) =
+                write_fd_flags_and_identity(&after).unwrap();
+            assert_eq!(flags_after & libc::O_ACCMODE as u32, libc::O_WRONLY as u32);
+            assert_eq!((inode_after, mount_after), (inode_before, mount_before));
+            assert_eq!(open_write_fd_count(pid), Some(1));
+            assert_eq!(std::fs::read(&path).unwrap(), b"valuable data");
+            assert!(fixture.child.try_wait().unwrap().is_none());
+        }
+
+        #[test]
         fn data_loss_refuses_without_descriptor_evidence() {
             let provider = LivePreCheckProvider::with_defaults();
             assert_eq!(open_write_fd_count(u32::MAX), None);
@@ -5403,10 +5806,18 @@ while True:
         #[test]
         fn live_provider_detects_write_fds() {
             let provider = LivePreCheckProvider::with_defaults();
-            let pid = std::process::id();
-            let (_, count) = provider.has_open_write_fds(pid).expect("inspect own files");
-            // Should return a count without panicking
-            let _ = count;
+            // A parallel test runner opens/closes descriptors continuously; a
+            // changing table must now refuse. Inspect an owned stable process
+            // and require the actual no-writer result instead.
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/null")
+                .unwrap();
+            let fixture = descriptor_child(file, false);
+            assert_eq!(
+                provider.has_open_write_fds(fixture.child.id()),
+                Some((false, 0))
+            );
         }
 
         #[test]
