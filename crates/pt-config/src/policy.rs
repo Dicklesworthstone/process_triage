@@ -49,7 +49,13 @@ pub const DEFAULT_TERM_GRACE_MS: u64 = 5_000;
 /// Upper bound on an explicitly configured cleanup allowance (five minutes).
 pub const MAX_TERM_GRACE_MS: u64 = 300_000;
 
-/// Signal execution settings copied into each approved kill action.
+/// At most four independent targets wait for TERM cleanup at the same time.
+pub const DEFAULT_MAX_PARALLEL_KILLS: u32 = 4;
+
+/// Bound worker creation even when a policy file is edited by hand.
+pub const MAX_PARALLEL_KILLS: u32 = 32;
+
+/// Signal execution settings recorded with the approved plan's policy.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct SignalPolicy {
@@ -58,13 +64,42 @@ pub struct SignalPolicy {
     /// grace; it ends the attempt without sending an early SIGKILL.
     #[schemars(range(min = 1, max = 300_000))]
     pub term_grace_ms: u64,
+    /// Maximum independent direct kills in flight. Admission, fresh safety
+    /// checks and durable delivery accounting remain serial; only cleanup
+    /// waits overlap. Stages, dependent targets and other actions are barriers.
+    #[schemars(range(min = 1, max = 32))]
+    pub max_parallel_kills: u32,
 }
 
 impl Default for SignalPolicy {
     fn default() -> Self {
         Self {
             term_grace_ms: DEFAULT_TERM_GRACE_MS,
+            max_parallel_kills: DEFAULT_MAX_PARALLEL_KILLS,
         }
+    }
+}
+
+impl SignalPolicy {
+    /// Execution must obey both the current and the recorded concurrency cap.
+    /// Reject invalid values instead of silently raising a zero cap to one.
+    pub fn parallel_kill_limit(&self, recorded: Option<&Self>) -> Result<usize, &'static str> {
+        validate_max_parallel_kills(self.max_parallel_kills)?;
+        let limit = if let Some(recorded) = recorded {
+            validate_max_parallel_kills(recorded.max_parallel_kills)?;
+            self.max_parallel_kills.min(recorded.max_parallel_kills)
+        } else {
+            self.max_parallel_kills
+        };
+        Ok(limit as usize)
+    }
+}
+
+pub fn validate_max_parallel_kills(limit: u32) -> Result<(), &'static str> {
+    if (1..=MAX_PARALLEL_KILLS).contains(&limit) {
+        Ok(())
+    } else {
+        Err("parallel kill limit must be between 1 and 32")
     }
 }
 
@@ -808,10 +843,17 @@ mod tests {
     fn signal_policy_defaults_and_explicit_grace_round_trip() {
         let empty: SignalPolicy = serde_json::from_str("{}").unwrap();
         assert_eq!(empty.term_grace_ms, 5_000);
+        assert_eq!(empty.max_parallel_kills, 4);
         let schema = serde_json::to_value(schemars::schema_for!(SignalPolicy)).unwrap();
         let timing = &schema["properties"]["term_grace_ms"];
         assert_eq!(timing["minimum"].as_f64(), Some(1.0));
         assert_eq!(timing["maximum"].as_f64(), Some(MAX_TERM_GRACE_MS as f64));
+        let concurrency = &schema["properties"]["max_parallel_kills"];
+        assert_eq!(concurrency["minimum"].as_f64(), Some(1.0));
+        assert_eq!(
+            concurrency["maximum"].as_f64(),
+            Some(MAX_PARALLEL_KILLS as f64)
+        );
 
         let mut document = serde_json::to_value(Policy::default()).unwrap();
         document["signal"] = serde_json::json!({"term_grace_ms": 12_500});
@@ -827,11 +869,33 @@ mod tests {
             r#"{"term_grace_ms": "5000"}"#,
             r#"{"term_grace_ms": null}"#,
             r#"{"term_grace_milliseconds": 5000}"#,
+            r#"{"max_parallel_kills": -1}"#,
+            r#"{"max_parallel_kills": 1.5}"#,
+            r#"{"max_parallel_kills": "4"}"#,
         ] {
             assert!(
                 serde_json::from_str::<SignalPolicy>(invalid).is_err(),
                 "{invalid}"
             );
+        }
+    }
+
+    #[test]
+    fn parallel_kill_admission_obeys_both_current_and_saved_policy() {
+        let mut recorded = SignalPolicy::default();
+        recorded.max_parallel_kills = 2;
+        let saved = serde_json::to_string(&recorded).unwrap();
+        let mut current = recorded.clone();
+        current.max_parallel_kills = 8;
+        let restored: SignalPolicy = serde_json::from_str(&saved).unwrap();
+        assert_eq!(current.parallel_kill_limit(Some(&restored)), Ok(2));
+        current.max_parallel_kills = 1;
+        assert_eq!(current.parallel_kill_limit(Some(&restored)), Ok(1));
+        assert_eq!(SignalPolicy::default().parallel_kill_limit(None), Ok(4));
+        for invalid in [0, MAX_PARALLEL_KILLS + 1] {
+            recorded.max_parallel_kills = invalid;
+            assert!(current.parallel_kill_limit(Some(&recorded)).is_err());
+            assert!(recorded.parallel_kill_limit(Some(&current)).is_err());
         }
     }
 

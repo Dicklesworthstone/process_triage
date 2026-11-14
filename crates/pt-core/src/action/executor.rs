@@ -142,6 +142,39 @@ pub struct ActionExecutor<'a> {
     lock_path: PathBuf,
 }
 
+/// An execution lock held across both serial checks and pending signal waits.
+/// Parallel direct kills use `preflight` before starting a private runner; all
+/// other actions use the ordinary complete `execute_action` path.
+pub struct LockedActionExecution<'execution, 'providers> {
+    executor: &'execution ActionExecutor<'providers>,
+    _lock: ActionLock,
+}
+
+impl LockedActionExecution<'_, '_> {
+    pub fn preflight(&self, action: &PlanAction) -> Result<(), ActionResult> {
+        let start = Instant::now();
+        self.executor
+            .check_action(action)
+            .map_err(|(status, details)| ActionResult {
+                action_id: action.action_id.clone(),
+                status,
+                time_ms: start.elapsed().as_millis(),
+                details,
+            })
+    }
+
+    pub fn execute_action(&self, action: &PlanAction) -> ActionResult {
+        let start = Instant::now();
+        let (status, details) = self.executor.execute_action(action);
+        ActionResult {
+            action_id: action.action_id.clone(),
+            status,
+            time_ms: start.elapsed().as_millis(),
+            details,
+        }
+    }
+}
+
 impl<'a> ActionExecutor<'a> {
     pub fn new(
         runner: &'a dyn ActionRunner,
@@ -162,29 +195,28 @@ impl<'a> ActionExecutor<'a> {
         self
     }
 
-    pub fn execute_plan(&self, plan: &Plan) -> Result<ExecutionResult, ExecutionError> {
-        let _lock = ActionLock::acquire(&self.lock_path)?;
+    pub fn begin_execution(&self) -> Result<LockedActionExecution<'_, 'a>, ExecutionError> {
+        Ok(LockedActionExecution {
+            executor: self,
+            _lock: ActionLock::acquire(&self.lock_path)?,
+        })
+    }
 
+    pub fn execute_plan(&self, plan: &Plan) -> Result<ExecutionResult, ExecutionError> {
+        let execution = self.begin_execution()?;
         let mut outcomes = Vec::new();
         let mut succeeded = 0;
         let mut failed = 0;
 
         for action in &plan.actions {
-            let start = Instant::now();
-            let (result, details) = self.execute_action(action);
-            let time_ms = start.elapsed().as_millis();
-            match &result {
+            let outcome = execution.execute_action(action);
+            match &outcome.status {
                 ActionStatus::Success => succeeded += 1,
                 ActionStatus::Skipped => {}
                 _ => failed += 1,
             }
 
-            outcomes.push(ActionResult {
-                action_id: action.action_id.clone(),
-                status: result,
-                time_ms,
-                details,
-            });
+            outcomes.push(outcome);
         }
 
         Ok(ExecutionResult {
@@ -198,55 +230,8 @@ impl<'a> ActionExecutor<'a> {
     }
 
     fn execute_action(&self, action: &PlanAction) -> (ActionStatus, Option<String>) {
-        if action.blocked {
-            return (ActionStatus::Skipped, None);
-        }
-
-        if action.routing == crate::plan::ActionRouting::Supervisor
-            || action.supervisor_restart.is_some()
-        {
-            if let Err(error) = super::supervisor::restart_binding_for_action(action) {
-                return outcome_from_error(error);
-            }
-            if self.pre_check_provider.is_none() {
-                return outcome_from_error(ActionError::Failed(
-                    "supervisor restart requires the live plan-aware safety prechecks".to_string(),
-                ));
-            }
-        }
-
-        // The plan's pre-checks plus the ones pt requires for this action type.
-        let pre_checks = crate::plan::effective_pre_checks(action);
-
-        // Run identity verification pre-check first
-        if pre_checks.contains(&PreCheck::VerifyIdentity) {
-            match self.identity_provider.revalidate(&action.target) {
-                Ok(true) => {}
-                Ok(false) => return outcome_from_error(ActionError::IdentityMismatch),
-                Err(error) => {
-                    return (ActionStatus::IdentityMismatch, Some(error.to_string()));
-                }
-            }
-        }
-
-        // Just-in-time revalidation by the runner itself
-        match self.runner.revalidate(action, self.identity_provider) {
-            Ok(true) => {}
-            Ok(false) => return outcome_from_error(ActionError::IdentityMismatch),
-            Err(error) => return outcome_from_error(error),
-        }
-
-        // Run other pre-checks (protected, data-loss, supervisor, session safety)
-        if let Some(provider) = self.pre_check_provider {
-            let results = provider.run_checks_for_plan(action);
-
-            // If any pre-check fails, block the action
-            for result in results {
-                if let crate::action::prechecks::PreCheckResult::Blocked { check, reason } = result
-                {
-                    return (ActionStatus::PreCheckBlocked { check, reason }, None);
-                }
-            }
+        if let Err(refusal) = self.check_action(action) {
+            return refusal;
         }
 
         if let Err(err) = self.runner.execute(action) {
@@ -258,6 +243,61 @@ impl<'a> ActionExecutor<'a> {
         }
 
         (ActionStatus::Success, None)
+    }
+
+    fn check_action(&self, action: &PlanAction) -> Result<(), (ActionStatus, Option<String>)> {
+        if action.blocked {
+            return Err((ActionStatus::Skipped, None));
+        }
+
+        if action.routing == crate::plan::ActionRouting::Supervisor
+            || action.supervisor_restart.is_some()
+        {
+            if let Err(error) = super::supervisor::restart_binding_for_action(action) {
+                return Err(outcome_from_error(error));
+            }
+            if self.pre_check_provider.is_none() {
+                return Err(outcome_from_error(ActionError::Failed(
+                    "supervisor restart requires the live plan-aware safety prechecks".to_string(),
+                )));
+            }
+        }
+
+        // The plan's pre-checks plus the ones pt requires for this action type.
+        let pre_checks = crate::plan::effective_pre_checks(action);
+
+        // Run identity verification pre-check first
+        if pre_checks.contains(&PreCheck::VerifyIdentity) {
+            match self.identity_provider.revalidate(&action.target) {
+                Ok(true) => {}
+                Ok(false) => return Err(outcome_from_error(ActionError::IdentityMismatch)),
+                Err(error) => {
+                    return Err((ActionStatus::IdentityMismatch, Some(error.to_string())));
+                }
+            }
+        }
+
+        // Just-in-time revalidation by the runner itself
+        match self.runner.revalidate(action, self.identity_provider) {
+            Ok(true) => {}
+            Ok(false) => return Err(outcome_from_error(ActionError::IdentityMismatch)),
+            Err(error) => return Err(outcome_from_error(error)),
+        }
+
+        // Run other pre-checks (protected, data-loss, supervisor, session safety)
+        if let Some(provider) = self.pre_check_provider {
+            let results = provider.run_checks_for_plan(action);
+
+            // If any pre-check fails, block the action
+            for result in results {
+                if let crate::action::prechecks::PreCheckResult::Blocked { check, reason } = result
+                {
+                    return Err((ActionStatus::PreCheckBlocked { check, reason }, None));
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -407,6 +447,89 @@ mod tests {
         let executor = ActionExecutor::new(&runner, &identity_provider, dir.path().join("lock"));
         let result = executor.execute_plan(&plan).expect("execute");
         assert_eq!(result.outcomes[0].status, ActionStatus::IdentityMismatch);
+    }
+
+    #[test]
+    fn locked_preflight_does_not_execute_and_retains_the_action_lock() {
+        struct CountingRunner(std::cell::Cell<usize>);
+        impl ActionRunner for CountingRunner {
+            fn execute(&self, _: &PlanAction) -> Result<(), ActionError> {
+                self.0.set(self.0.get() + 1);
+                Ok(())
+            }
+            fn verify(&self, _: &PlanAction) -> Result<(), ActionError> {
+                Ok(())
+            }
+        }
+        let plan = make_plan();
+        let dir = tempdir().unwrap();
+        let identities =
+            StaticIdentityProvider::default().with_identity(plan.actions[0].target.clone());
+        let runner = CountingRunner(std::cell::Cell::new(0));
+        let executor = ActionExecutor::new(&runner, &identities, dir.path().join("lock"));
+        let execution = executor.begin_execution().unwrap();
+        execution.preflight(&plan.actions[0]).unwrap();
+        assert_eq!(runner.0.get(), 0, "preflight cannot send signals");
+        #[cfg(unix)]
+        assert!(matches!(
+            executor.begin_execution(),
+            Err(ExecutionError::LockUnavailable)
+        ));
+        let mut stale = plan.actions[0].clone();
+        stale.target.uid += 1;
+        assert_eq!(
+            execution.preflight(&stale).unwrap_err().status,
+            ActionStatus::IdentityMismatch
+        );
+        assert_eq!(runner.0.get(), 0);
+        assert_eq!(
+            execution.execute_action(&plan.actions[0]).status,
+            ActionStatus::Success
+        );
+        assert_eq!(runner.0.get(), 1);
+        drop(execution);
+        assert!(executor.begin_execution().is_ok());
+    }
+
+    #[test]
+    fn locked_preflight_preserves_the_required_live_protection_gate() {
+        use crate::action::prechecks::PreCheckResult;
+
+        struct Protected;
+        impl PreCheckProvider for Protected {
+            fn check_not_protected(&self, _: u32) -> PreCheckResult {
+                PreCheckResult::Blocked {
+                    check: PreCheck::CheckNotProtected,
+                    reason: "protected test target".into(),
+                }
+            }
+            fn check_data_loss(&self, _: u32) -> PreCheckResult {
+                panic!("protection must run before data-loss probes")
+            }
+            fn check_supervisor(&self, _: u32) -> PreCheckResult {
+                panic!("protection already refused this target")
+            }
+            fn check_session_safety(&self, _: u32, _: Option<u32>) -> PreCheckResult {
+                panic!("protection already refused this target")
+            }
+        }
+        let mut plan = make_plan();
+        plan.actions[0].pre_checks.clear();
+        let identities =
+            StaticIdentityProvider::default().with_identity(plan.actions[0].target.clone());
+        let runner = NoopActionRunner;
+        let prechecks = Protected;
+        let dir = tempdir().unwrap();
+        let executor = ActionExecutor::new(&runner, &identities, dir.path().join("lock"))
+            .with_pre_check_provider(&prechecks);
+        let execution = executor.begin_execution().unwrap();
+        assert!(matches!(
+            execution.preflight(&plan.actions[0]).unwrap_err().status,
+            ActionStatus::PreCheckBlocked {
+                check: PreCheck::CheckNotProtected,
+                ..
+            }
+        ));
     }
 
     #[cfg(target_os = "linux")]

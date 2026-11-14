@@ -226,6 +226,12 @@ pub fn validate_policy(policy: &crate::policy::Policy) -> ValidationResult<()> {
             message: message.to_string(),
         }
     })?;
+    crate::policy::validate_max_parallel_kills(policy.signal.max_parallel_kills).map_err(
+        |message| ValidationError::InvalidValue {
+            field: "signal.max_parallel_kills".to_string(),
+            message: message.to_string(),
+        },
+    )?;
 
     Ok(())
 }
@@ -688,6 +694,23 @@ mod tests {
             assert!(matches!(
                 validate_policy(&policy),
                 Err(ValidationError::InvalidValue { field, .. }) if field == "signal.term_grace_ms"
+            ));
+        }
+    }
+
+    #[test]
+    fn policy_parallel_kills_require_a_positive_bounded_worker_count() {
+        let mut policy = crate::policy::Policy::default();
+        for limit in [1, 4, crate::policy::MAX_PARALLEL_KILLS] {
+            policy.signal.max_parallel_kills = limit;
+            validate_policy(&policy).expect("valid bounded concurrency");
+        }
+        for limit in [0, crate::policy::MAX_PARALLEL_KILLS + 1, u32::MAX] {
+            policy.signal.max_parallel_kills = limit;
+            assert!(matches!(
+                validate_policy(&policy),
+                Err(ValidationError::InvalidValue { field, .. })
+                    if field == "signal.max_parallel_kills"
             ));
         }
     }

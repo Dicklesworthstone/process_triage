@@ -3642,6 +3642,249 @@ fn capture_current_action_execution_evidence(
     capture_action_execution_evidence(action, process)
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct PendingKillExecution {
+    action: PlanAction,
+    ancestors: Option<Vec<u32>>,
+    worker: pt_core::action::signal::PendingSignalKill,
+    evidence: serde_json::Value,
+    action_index: u64,
+    preflight_ms: u128,
+    accounting_error: Option<String>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct FinishedKillExecution {
+    action: PlanAction,
+    result: pt_core::action::ActionResult,
+    evidence: serde_json::Value,
+    action_index: u64,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl PendingKillExecution {
+    fn finish(self) -> FinishedKillExecution {
+        use pt_core::action::{ActionError, ActionStatus};
+
+        let completion = self.worker.finish();
+        let (status, mut details) = match completion.result {
+            Ok(()) => (ActionStatus::Success, None),
+            Err(error) => {
+                let details = error.to_string();
+                let status = match error {
+                    ActionError::IdentityMismatch => ActionStatus::IdentityMismatch,
+                    ActionError::ProcessNotFound => ActionStatus::ProcessNotFound,
+                    ActionError::PermissionDenied => ActionStatus::PermissionDenied,
+                    ActionError::Timeout => ActionStatus::Timeout,
+                    ActionError::Failed(_) => ActionStatus::Failed,
+                };
+                (status, Some(details))
+            }
+        };
+        let mut evidence = self.evidence;
+        evidence["kill_signal_delivered"] = serde_json::json!(completion.kill_signal_delivered);
+        evidence["supervisor_restart_attempted"] = serde_json::json!(false);
+        evidence["signal_path"] = serde_json::json!(completion.signal_path);
+        if let Some(outcome) = completion.signal_outcome {
+            evidence["signal_outcome"] = serde_json::json!(outcome);
+        }
+        if completion.delivery_unknown {
+            evidence["signal_delivery_unknown"] = serde_json::json!(true);
+        }
+        if let Some(error) = self.accounting_error {
+            evidence["rate_limit_recorded"] = serde_json::json!(false);
+            let explanation = format!(
+                "kill delivery={:?}; accounting completion failed: {error}",
+                (!completion.delivery_unknown).then_some(completion.kill_signal_delivered)
+            );
+            details = Some(match details {
+                Some(previous) => format!("{previous}; {explanation}"),
+                None => explanation,
+            });
+        }
+        FinishedKillExecution {
+            result: pt_core::action::ActionResult {
+                action_id: self.action.action_id.clone(),
+                status,
+                time_ms: self.preflight_ms.saturating_add(completion.elapsed_ms),
+                details,
+            },
+            action: self.action,
+            evidence,
+            action_index: self.action_index,
+        }
+    }
+}
+
+/// Unknown ancestry cannot establish that two cleanup operations are independent.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn execution_ancestors(pid: u32, processes: &[ProcessRecord]) -> Option<Vec<u32>> {
+    let parents: HashMap<_, _> = processes.iter().map(|p| (p.pid.0, p.ppid.0)).collect();
+    let mut current = pid;
+    let mut seen = HashSet::from([pid]);
+    let mut ancestors = Vec::new();
+    loop {
+        let parent = *parents.get(&current)?;
+        if parent <= 1 {
+            ancestors.push(parent);
+            return Some(ancestors);
+        }
+        if !seen.insert(parent) {
+            return None;
+        }
+        ancestors.push(parent);
+        current = parent;
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn direct_kills_require_barrier(
+    before: &PlanAction,
+    before_ancestors: Option<&[u32]>,
+    after: &PlanAction,
+    after_ancestors: Option<&[u32]>,
+) -> bool {
+    use pt_core::action::signal::PendingSignalKill;
+
+    if !PendingSignalKill::supports(before)
+        || !PendingSignalKill::supports(after)
+        || before.stage != after.stage
+        || before.target.pid == after.target.pid
+    {
+        return true;
+    }
+    match (before_ancestors, after_ancestors) {
+        (Some(before_ancestors), Some(after_ancestors)) => {
+            before_ancestors.contains(&after.target.pid.0)
+                || after_ancestors.contains(&before.target.pid.0)
+        }
+        _ => true,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn pending_kills_require_barrier(
+    pending: &std::collections::VecDeque<PendingKillExecution>,
+    action: &PlanAction,
+    ancestors: Option<&[u32]>,
+) -> bool {
+    pending.iter().any(|previous| {
+        direct_kills_require_barrier(
+            &previous.action,
+            previous.ancestors.as_deref(),
+            action,
+            ancestors,
+        )
+    })
+}
+
+#[cfg(all(feature = "ui", any(target_os = "linux", target_os = "macos")))]
+fn finish_tui_kills(
+    pending: &mut std::collections::VecDeque<PendingKillExecution>,
+    count: usize,
+    outcomes: &mut Vec<pt_core::action::ActionResult>,
+    evidence: &mut HashMap<String, serde_json::Value>,
+) {
+    for _ in 0..count.min(pending.len()) {
+        let finished = pending.pop_front().unwrap().finish();
+        evidence.insert(finished.action.action_id, finished.evidence);
+        outcomes.push(finished.result);
+    }
+}
+
+/// Advisory continuation for bounded recovery during confirmed execution.
+/// The caller holds the data directory's execution-policy lock; the cursor
+/// selects where to inspect and never authorizes restoration of a receipt.
+#[cfg(target_os = "linux")]
+fn recover_expired_freezes_for_execution(
+    sessions_root: &Path,
+    recover: impl FnOnce(&Path, Option<&str>) -> pt_core::action::reversal::FreezeRecoveryReport,
+) -> pt_core::action::reversal::FreezeRecoveryReport {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    #[derive(serde::Deserialize, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct Cursor {
+        next_session: Option<String>,
+    }
+
+    let Some(data_dir) = sessions_root.parent() else {
+        let mut report = pt_core::action::reversal::FreezeRecoveryReport::default();
+        report.errors.push(
+            "cannot resolve the data directory for freeze-recovery continuation".to_string(),
+        );
+        return report;
+    };
+    let cursor_path = data_dir.join("freeze_recovery_cursor.json");
+    let read_cursor = || -> Result<Option<String>, String> {
+        let file = match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&cursor_path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("read freeze-recovery cursor: {error}")),
+        };
+        if !file
+            .metadata()
+            .map_err(|error| format!("inspect freeze-recovery cursor: {error}"))?
+            .is_file()
+        {
+            return Err("freeze-recovery cursor must be a regular file".to_string());
+        }
+        let mut bytes = Vec::new();
+        file.take(4_097)
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("read freeze-recovery cursor: {error}"))?;
+        if bytes.len() > 4_096 {
+            return Err("freeze-recovery cursor exceeds its 4096-byte bound".to_string());
+        }
+        serde_json::from_slice::<Cursor>(&bytes)
+            .map(|cursor| cursor.next_session)
+            .map_err(|error| format!("decode freeze-recovery cursor: {error}"))
+    };
+    let (cursor, cursor_error) = match read_cursor() {
+        Ok(cursor) => (cursor, None),
+        Err(error) => (None, Some(error)),
+    };
+    let mut report = recover(sessions_root, cursor.as_deref());
+    if let Some(error) = cursor_error {
+        report.errors.push(error);
+    }
+    let persist = || -> Result<(), String> {
+        let content = serde_json::to_vec(&Cursor {
+            next_session: report.next_session.clone(),
+        })
+        .map_err(|error| format!("encode freeze-recovery cursor: {error}"))?;
+        // Unique, private temporary files avoid following a stale path left
+        // by another execution or overwriting a link during checkpointing.
+        let temporary = data_dir.join(format!(
+            ".freeze_recovery_cursor-{}.tmp",
+            SessionId::new().0
+        ));
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .map_err(|error| format!("create freeze-recovery cursor: {error}"))?;
+        file.write_all(&content)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| format!("persist freeze-recovery cursor: {error}"))?;
+        fs::rename(&temporary, &cursor_path)
+            .map_err(|error| format!("publish freeze-recovery cursor: {error}"))?;
+        fs::File::open(data_dir)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("sync freeze-recovery cursor directory: {error}"))
+    };
+    if let Err(error) = persist() {
+        report.errors.push(error);
+    }
+    report
+}
+
 /// Record the current context at runner entry, after the executor's safety checks.
 #[cfg(all(feature = "ui", any(target_os = "linux", target_os = "macos")))]
 struct RecordedActionRunner {
@@ -3861,6 +4104,17 @@ fn execute_plan_actions(
             .parent()
             .ok_or("cannot resolve session directory for control ownership checks")?
             .to_path_buf();
+        #[cfg(target_os = "linux")]
+        {
+            let recovery = recover_expired_freezes_for_execution(
+                &sessions_root,
+                recover_expired_freezes_locked,
+            );
+            let content = serde_json::to_vec_pretty(&recovery)
+                .map_err(|error| format!("encode expired-freeze recovery evidence: {error}"))?;
+            fs::write(action_dir.join("freeze_recovery.json"), content)
+                .map_err(|error| format!("persist expired-freeze recovery evidence: {error}"))?;
+        }
         let runner = RecordedActionRunner {
             // TUI selections append to their canonical plan. Guard existing
             // durable owners without binding undo receipts to mutable bytes.
@@ -3891,13 +4145,97 @@ fn execute_plan_actions(
 
         let executor = ActionExecutor::new(&runner, &identity_provider, lock_path)
             .with_pre_check_provider(&pre_checks);
+        let execution = executor
+            .begin_execution()
+            .map_err(|error| format!("cannot lock interactive actions: {error}"))?;
+        let parallel_limit = policy.signal.parallel_kill_limit(None).map_err(String::from)?;
         let mut outcomes = Vec::new();
         let mut execution_evidence = HashMap::new();
+        // Declared after both locks: dropping the queue joins every worker
+        // before either lock can be released, including early error returns.
+        let mut pending = std::collections::VecDeque::<PendingKillExecution>::new();
+        macro_rules! finish_pending {
+            ($count:expr) => {
+                finish_tui_kills(
+                    &mut pending,
+                    $count,
+                    &mut outcomes,
+                    &mut execution_evidence,
+                )
+            };
+        }
         for action in &plan.actions {
+            // Known relations and all non-kill/stage boundaries wait before
+            // the next policy check. Fresh ancestry is checked again below.
+            if pending_kills_require_barrier(&pending, action, Some(&[])) {
+                finish_pending!(usize::MAX);
+            }
+            let mut ancestors = None;
+            if action_uses_kill_budget(action) && !action.blocked {
+                let inspect_tree = || {
+                    quick_scan(&QuickScanOptions {
+                        pids: vec![],
+                        include_kernel_threads: false,
+                        timeout: None,
+                        progress: None,
+                    })
+                    .map_err(|error| format!("cannot revalidate process tree: {error}"))
+                    .and_then(|scan| {
+                        if !scan.metadata.warnings.is_empty() {
+                            return Err("incomplete process-tree snapshot".to_string());
+                        }
+                        Ok(scan.processes)
+                    })
+                };
+                let mut tree_check = inspect_tree();
+                let current_ancestors = tree_check
+                    .as_ref()
+                    .ok()
+                    .and_then(|processes| execution_ancestors(action.target.pid.0, processes));
+                if pending_kills_require_barrier(&pending, action, current_ancestors.as_deref()) {
+                    finish_pending!(usize::MAX);
+                    // A pending child may now have exited, or failed to exit.
+                    // The parent's safety decision must observe that result.
+                    tree_check = inspect_tree();
+                }
+                let reason = match tree_check {
+                    Ok(processes) => {
+                        ancestors = execution_ancestors(action.target.pid.0, &processes);
+                        execution_tree_refusal(
+                            action.target.pid.0,
+                            &processes,
+                            policy.guardrails.builtin_protection,
+                        )
+                    }
+                    Err(reason) => Some(reason),
+                };
+                if let Some(reason) = reason {
+                    finish_pending!(usize::MAX);
+                    outcomes.push(pt_core::action::ActionResult {
+                        action_id: action.action_id.clone(),
+                        status: pt_core::action::ActionStatus::PreCheckBlocked {
+                            check: pt_core::plan::PreCheck::CheckNotProtected,
+                            reason,
+                        },
+                        time_ms: 0,
+                        details: None,
+                    });
+                    continue;
+                }
+            }
+            let parallel = parallel_limit > 1
+                && pt_core::action::signal::PendingSignalKill::supports(action)
+                && ancestors.is_some();
+            if !parallel {
+                finish_pending!(usize::MAX);
+            }
+            // Policy evidence (including current groups and process state)
+            // must be collected after every possibly long cleanup barrier.
             if !action.blocked && action.action != Action::Keep {
                 let (check, _) = match check_execution_policy(enforcer, action, false) {
                     Ok(check) => check,
                     Err(error) => {
+                        finish_pending!(usize::MAX);
                         outcomes.push(pt_core::action::ActionResult {
                             action_id: action.action_id.clone(),
                             status: pt_core::action::ActionStatus::PreCheckBlocked {
@@ -3911,6 +4249,7 @@ fn execute_plan_actions(
                     }
                 };
                 if !check.allowed {
+                    finish_pending!(usize::MAX);
                     outcomes.push(pt_core::action::ActionResult {
                         action_id: action.action_id.clone(),
                         status: pt_core::action::ActionStatus::PreCheckBlocked {
@@ -3924,43 +4263,32 @@ fn execute_plan_actions(
                     continue;
                 }
             }
-            let mut single = plan.clone();
-            single.actions = vec![action.clone()];
-            if action_uses_kill_budget(action) && !action.blocked {
-                let tree_check = quick_scan(&QuickScanOptions {
-                    pids: vec![],
-                    include_kernel_threads: false,
-                    timeout: None,
-                    progress: None,
-                })
-                .map_err(|error| format!("cannot revalidate process tree: {error}"))
-                .and_then(|scan| {
-                    if !scan.metadata.warnings.is_empty() {
-                        return Err("incomplete process-tree snapshot".to_string());
-                    }
-                    Ok(execution_tree_refusal(
-                        action.target.pid.0,
-                        &scan.processes,
-                        policy.guardrails.builtin_protection,
-                    ))
-                });
-                let reason = match tree_check {
-                    Ok(None) => None,
-                    Ok(Some(reason)) | Err(reason) => Some(reason),
-                };
-                if let Some(reason) = reason {
-                    outcomes.push(pt_core::action::ActionResult {
-                        action_id: action.action_id.clone(),
-                        status: pt_core::action::ActionStatus::PreCheckBlocked {
-                            check: pt_core::plan::PreCheck::CheckNotProtected,
-                            reason,
-                        },
-                        time_ms: 0,
-                        details: None,
-                    });
+            let preflight_started = std::time::Instant::now();
+            let parallel_evidence = if parallel {
+                if let Err(refusal) = execution.preflight(action) {
+                    finish_pending!(usize::MAX);
+                    outcomes.push(refusal);
                     continue;
                 }
-            }
+                match capture_current_action_execution_evidence(action) {
+                    Ok(evidence) => Some(evidence),
+                    Err(reason) => {
+                        finish_pending!(usize::MAX);
+                        outcomes.push(pt_core::action::ActionResult {
+                            action_id: action.action_id.clone(),
+                            status: pt_core::action::ActionStatus::PreCheckBlocked {
+                                check: pt_core::plan::PreCheck::VerifyIdentity,
+                                reason,
+                            },
+                            time_ms: preflight_started.elapsed().as_millis(),
+                            details: None,
+                        });
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
             runner.evidence.borrow_mut().take();
             let _ = runner.runner.take_signal_outcome();
             runner.runner.take_kill_signal_delivered();
@@ -3968,6 +4296,7 @@ fn execute_plan_actions(
             let accounting_started = action_uses_kill_budget(action) && !action.blocked;
             if accounting_started {
                 if let Err(error) = enforcer.begin_kill_accounting() {
+                    finish_pending!(usize::MAX);
                     outcomes.push(pt_core::action::ActionResult {
                         action_id: action.action_id.clone(),
                         status: pt_core::action::ActionStatus::PreCheckBlocked {
@@ -3980,7 +4309,55 @@ fn execute_plan_actions(
                     break;
                 }
             }
-            let result = executor.execute_plan(&single);
+            if let Some(mut evidence) = parallel_evidence {
+                let preflight_ms = preflight_started.elapsed().as_millis();
+                let worker = match pt_core::action::signal::PendingSignalKill::start(action) {
+                    Ok(worker) => worker,
+                    Err(error) => {
+                        let accounting_error = enforcer.finish_kill_accounting(false).err();
+                        finish_pending!(usize::MAX);
+                        outcomes.push(pt_core::action::ActionResult {
+                            action_id: action.action_id.clone(),
+                            status: pt_core::action::ActionStatus::Failed,
+                            time_ms: preflight_started.elapsed().as_millis(),
+                            details: Some(format!(
+                                "{error}; accounting completion error: {accounting_error:?}"
+                            )),
+                        });
+                        if accounting_error.is_some() {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                let delivered = worker.first_delivery();
+                let accounting_error = enforcer
+                    .finish_kill_accounting(delivered.unwrap_or(true))
+                    .err()
+                    .map(|error| error.to_string());
+                let stop_admission = delivered.is_none() || accounting_error.is_some();
+                if delivered.is_none() {
+                    evidence["signal_delivery_unknown"] = serde_json::json!(true);
+                }
+                pending.push_back(PendingKillExecution {
+                    action: action.clone(),
+                    ancestors,
+                    worker,
+                    evidence,
+                    action_index: 0,
+                    preflight_ms,
+                    accounting_error,
+                });
+                if stop_admission {
+                    break;
+                }
+                if pending.len() >= parallel_limit {
+                    finish_pending!(1);
+                }
+                continue;
+            }
+
+            let mut outcome = execution.execute_action(action);
             let signal_outcome = runner.runner.take_signal_outcome();
             if let Some(mut evidence) = runner.evidence.borrow().clone() {
                 if let Some(signal_outcome) = signal_outcome {
@@ -3988,29 +4365,6 @@ fn execute_plan_actions(
                 }
                 execution_evidence.insert(action.action_id.clone(), evidence);
             }
-            let result = match result {
-                Ok(result) => result,
-                Err(error) => {
-                    let may_have_stopped_target = runner.runner.take_kill_signal_delivered()
-                        | runner.runner.take_supervisor_restart_attempted();
-                    let accounting_error = accounting_started
-                        .then(|| {
-                            enforcer
-                                .finish_kill_accounting(may_have_stopped_target)
-                                .err()
-                        })
-                        .flatten();
-                    outcomes.push(pt_core::action::ActionResult {
-                        action_id: action.action_id.clone(),
-                        status: pt_core::action::ActionStatus::Failed,
-                        time_ms: 0,
-                        details: Some(format!(
-                            "execute plan: {error}; accounting completion error: {accounting_error:?}"
-                        )),
-                    });
-                    break;
-                }
-            };
             let kill_signal_delivered = runner.runner.take_kill_signal_delivered();
             let supervisor_restart_attempted = runner.runner.take_supervisor_restart_attempted();
             if let Some(fields) = execution_evidence
@@ -4035,20 +4389,16 @@ fn execute_plan_actions(
                         .err()
                 })
                 .flatten();
-            for mut outcome in result.outcomes {
-                if let Some(error) = &accounting_error {
-                    outcome.details = Some(format!(
-                        "kill delivery={kill_signal_delivered}, restart attempted={supervisor_restart_attempted}, but accounting completion could not be persisted: {error}"
-                    ));
-                    outcomes.push(outcome);
-                    return Ok((
-                        (execution_result(outcomes), execution_evidence),
-                        execution_lock,
-                    ));
-                }
+            if let Some(error) = &accounting_error {
+                outcome.details = Some(format!(
+                    "kill delivery={kill_signal_delivered}, restart attempted={supervisor_restart_attempted}, but accounting completion could not be persisted: {error}"
+                ));
                 outcomes.push(outcome);
+                break;
             }
+            outcomes.push(outcome);
         }
+        finish_pending!(usize::MAX);
         Ok((
             (execution_result(outcomes), execution_evidence),
             execution_lock,
@@ -17000,7 +17350,7 @@ fn cleanup_daemon_pid_if_owned(pid: u32) {
 /// Run only while the caller holds this data directory's execution-policy
 /// lock, after dry-run/shadow guards. Top-level scan failures retain the cursor
 /// and remain visible to callers; discovery never implies restoration.
-#[cfg(all(target_os = "linux", feature = "daemon"))]
+#[cfg(target_os = "linux")]
 fn recover_expired_freezes_locked(
     sessions_root: &Path,
     after_session: Option<&str>,
@@ -18898,6 +19248,151 @@ mod process_tree_safety_tests {
 
     fn cand(pid: u32) -> serde_json::Value {
         serde_json::json!({"pid": pid, "recommended_action": "kill", "recommendation": "KILL"})
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn execution_freeze_recovery_advances_bounded_passes_and_restarts_after_completion() {
+        use pt_core::action::reversal::FreezeRecoveryReport;
+
+        let directory = tempfile::tempdir().unwrap();
+        let sessions_root = directory.path().join("sessions");
+        std::fs::create_dir_all(&sessions_root).unwrap();
+        let _lock = super::GlobalLock::try_acquire(
+            &directory.path().join(".execution-policy-lock"),
+        )
+        .unwrap()
+        .expect("own the same execution-policy lock as real callers");
+        for (expected, next) in [
+            (None, Some("session-064")),
+            (Some("session-064"), Some("session-128")),
+            (Some("session-128"), None),
+            (None, None),
+        ] {
+            let report = super::recover_expired_freezes_for_execution(
+                &sessions_root,
+                |root, cursor| {
+                    assert_eq!(root, sessions_root.as_path());
+                    assert_eq!(cursor, expected);
+                    FreezeRecoveryReport {
+                        next_session: next.map(str::to_string),
+                        budget_exhausted: next.is_some(),
+                        ..FreezeRecoveryReport::default()
+                    }
+                },
+            );
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+            assert_eq!(report.next_session.as_deref(), next);
+            assert_eq!(report.budget_exhausted, next.is_some());
+            let persisted: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(directory.path().join("freeze_recovery_cursor.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(persisted["next_session"].as_str(), next);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn execution_freeze_recovery_reports_cursor_errors_without_losing_recovery_evidence() {
+        use pt_core::action::reversal::FreezeRecoveryReport;
+
+        for blocked_write in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let sessions_root = directory.path().join("sessions");
+            std::fs::create_dir_all(&sessions_root).unwrap();
+            let cursor_path = directory.path().join("freeze_recovery_cursor.json");
+            if blocked_write {
+                std::fs::create_dir(&cursor_path).unwrap();
+            } else {
+                std::fs::write(&cursor_path, b"{ malformed advisory cursor").unwrap();
+            }
+            let _lock = super::GlobalLock::try_acquire(
+                &directory.path().join(".execution-policy-lock"),
+            )
+            .unwrap()
+            .expect("hold the execution-policy lock");
+            let report = super::recover_expired_freezes_for_execution(
+                &sessions_root,
+                |_, cursor| {
+                    assert_eq!(cursor, None, "unusable advisory state starts a bounded pass");
+                    FreezeRecoveryReport {
+                        next_session: Some("session-064".to_string()),
+                        budget_exhausted: true,
+                        errors: vec!["retained recovery observation".to_string()],
+                        ..FreezeRecoveryReport::default()
+                    }
+                },
+            );
+            assert_eq!(report.next_session.as_deref(), Some("session-064"));
+            assert!(report.budget_exhausted);
+            assert_eq!(report.errors[0], "retained recovery observation");
+            assert!(report.errors.iter().any(|error| error.contains("cursor")));
+            if blocked_write {
+                assert!(report.errors.iter().any(|error| error.contains("publish")));
+            } else {
+                let repaired: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(cursor_path).unwrap()).unwrap();
+                assert_eq!(repaired["next_session"], "session-064");
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn parallel_cleanup_preserves_tree_stage_and_target_barriers() {
+        use pt_core::plan::{ActionRouting, ActionTimeouts, PlanAction};
+
+        let make_action = |pid| -> PlanAction {
+            serde_json::from_value(serde_json::json!({
+                "action_id": format!("kill-{pid}"),
+                "target": process_identity_from_record(&rec(pid, 1, "worker", ProcessState::Sleeping)),
+                "action": "kill", "order": 0, "stage": 0,
+                "timeouts": ActionTimeouts::default(), "pre_checks": [],
+                "rationale": {}, "on_success": [], "on_failure": [], "blocked": false,
+            }))
+            .unwrap()
+        };
+        let before = make_action(200);
+        let mut after = make_action(300);
+        let barrier = |after: &PlanAction, before_ancestors, after_ancestors| {
+            super::direct_kills_require_barrier(
+                &before,
+                before_ancestors,
+                after,
+                after_ancestors,
+            )
+        };
+        assert!(!barrier(&after, Some(&[10, 1]), Some(&[20, 1])));
+        assert!(barrier(&after, Some(&[300, 1]), Some(&[1])));
+        assert!(barrier(&after, Some(&[1]), Some(&[200, 1])));
+        assert!(barrier(&after, None, Some(&[1])));
+        assert!(barrier(&after, Some(&[1]), None));
+        after.stage = 1;
+        assert!(barrier(&after, Some(&[1]), Some(&[1])));
+        after.stage = 0;
+        after.target.pid = before.target.pid;
+        assert!(barrier(&after, Some(&[1]), Some(&[1])));
+        after = make_action(300);
+        after.routing = ActionRouting::DStateLowConfidence;
+        assert!(barrier(&after, Some(&[1]), Some(&[1])));
+        after = make_action(300);
+        after.action = pt_core::decision::Action::Pause;
+        assert!(barrier(&after, Some(&[1]), Some(&[1])));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn parallel_cleanup_requires_complete_acyclic_ancestry() {
+        let mut processes = vec![
+            rec(200, 100, "worker", ProcessState::Sleeping),
+            rec(100, 1, "parent", ProcessState::Sleeping),
+        ];
+        assert_eq!(super::execution_ancestors(200, &processes), Some(vec![100, 1]));
+        assert_eq!(super::execution_ancestors(300, &processes), None);
+        assert_eq!(super::execution_ancestors(200, &processes[..1]), None);
+        processes[1].ppid = ProcessId(200);
+        assert_eq!(super::execution_ancestors(200, &processes), None);
     }
 
     #[cfg(feature = "ui")]
@@ -20810,10 +21305,33 @@ mod process_tree_safety_tests {
 
         impl DetachedTarget {
             pub(super) fn spawn() -> Self {
+                Self::spawn_reaper("sleep 600 </dev/null >/dev/null 2>&1 & echo $!; wait", &[])
+            }
+
+            pub(super) fn spawn_cleanup(marker: &std::path::Path) -> Self {
+                let script = "trap 'printf handled > \"$1\"; read -r release; exit 0' TERM\nkill -STOP \"$$\"\nwhile :; do read -r line || :; done";
+                let target = Self::spawn_reaper(
+                    "exec 3<&0; sh -c \"$1\" pt-owned-cleanup \"$2\" <&3 3<&- >/dev/null 2>&1 & echo $!; exec 3<&-; wait",
+                    &[script, marker.to_str().unwrap()],
+                );
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                loop {
+                    let stat = std::fs::read_to_string(format!("/proc/{}/stat", target.pid))
+                        .expect("observe owned cleanup handler");
+                    if stat.rsplit_once(") ").unwrap().1.starts_with('T') {
+                        return target;
+                    }
+                    assert!(std::time::Instant::now() < deadline, "handler did not stop");
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+
+            fn spawn_reaper(script: &str, arguments: &[&str]) -> Self {
                 let mut command = Command::new("sh");
                 command
-                    .args(["-c", "sleep 600 </dev/null >/dev/null 2>&1 & echo $!; wait"])
-                    .stdin(Stdio::null())
+                    .args(["-c", script, "pt-owned-reaper"])
+                    .args(arguments)
+                    .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::null())
                     .env_remove("SSH_CONNECTION")
@@ -21044,7 +21562,7 @@ mod process_tree_safety_tests {
             selection_for_pid(handle, policy, target.parent.pid, "sh")
         }
 
-        fn selection_for_pid(
+        pub(super) fn selection_for_pid(
             handle: &pt_core::session::SessionHandle,
             policy: &pt_core::config::Policy,
             pid: u32,
@@ -21747,6 +22265,211 @@ mod process_tree_safety_tests {
         record(
             &log_dir,
             serde_json::json!({"step": "final_run_budget", "budget": budget, "failure": state.failure}),
+        );
+    }
+
+    #[cfg(all(feature = "ui", target_os = "linux"))]
+    #[test]
+    fn tui_batch_overlaps_cleanup_with_a_bounded_worker_count_and_ordered_receipts() {
+        use pt_core::action::ActionStatus;
+        use std::io::Write;
+        use tui_live_fixtures::{case, policy, record, selection_for_pid, DetachedTarget};
+
+        let (handle, log_dir) = case("tui-parallel-cleanup");
+        let mut policy = policy(3);
+        policy.guardrails.max_kills_per_minute = Some(3);
+        policy.signal.max_parallel_kills = 2;
+        policy.signal.term_grace_ms = 30_000;
+        let markers: Vec<_> = (0..3)
+            .map(|index| log_dir.join(format!("term-{index}")))
+            .collect();
+        let mut targets: Vec<_> = markers
+            .iter()
+            .map(|marker| DetachedTarget::spawn_cleanup(marker))
+            .collect();
+        let selections: Vec<_> = targets
+            .iter()
+            .map(|target| selection_for_pid(&handle, &policy, target.pid, "sh"))
+            .collect();
+        let mut batch = selections[0].clone();
+        batch.actions = selections
+            .iter()
+            .flat_map(|plan| plan.actions.clone())
+            .collect();
+        for (order, action) in batch.actions.iter_mut().enumerate() {
+            action.order = order as u32;
+        }
+        batch.pre_toggled = batch
+            .actions
+            .iter()
+            .map(|action| action.action_id.clone())
+            .collect();
+        batch.gates_summary.total_candidates = 3;
+        batch.gates_summary.pre_toggled_actions = 3;
+        let wait_for_handler = |index: usize| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !markers[index].exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "handler {index} never entered cleanup"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        let mut state = super::TuiExecutionState::default();
+        let (result, evidence) = std::thread::scope(|scope| {
+            let execution = scope.spawn(|| {
+                super::execute_tui_plan_selection(&handle, &policy, &batch, &mut state)
+            });
+            wait_for_handler(0);
+            wait_for_handler(1);
+            // Both handlers are held open by owned input pipes. Their TERM
+            // receipts must coexist without waiting out either grace period.
+            assert!(targets[0].leader.try_wait().unwrap().is_none());
+            assert!(targets[1].leader.try_wait().unwrap().is_none());
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            assert!(
+                !markers[2].exists(),
+                "third cleanup exceeded the two-worker policy"
+            );
+            targets[0]
+                .leader
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(b"finish\n")
+                .unwrap();
+            wait_for_handler(2);
+            assert!(targets[1].leader.try_wait().unwrap().is_none());
+            for target in &mut targets[1..] {
+                target
+                    .leader
+                    .stdin
+                    .as_mut()
+                    .unwrap()
+                    .write_all(b"finish\n")
+                    .unwrap();
+            }
+            execution
+                .join()
+                .unwrap()
+                .expect("execute controlled parallel cleanup")
+        });
+        assert_eq!(result.summary.actions_succeeded, 3);
+        for (index, outcome) in result.outcomes.iter().enumerate() {
+            assert_eq!(outcome.action_id, batch.actions[index].action_id);
+            assert_eq!(outcome.status, ActionStatus::Success);
+            let receipt = &evidence[&outcome.action_id];
+            assert_eq!(
+                receipt["target"],
+                serde_json::to_value(&batch.actions[index].target).unwrap()
+            );
+            assert_eq!(receipt["kill_signal_delivered"], true);
+            assert_eq!(receipt["signal_outcome"]["sigterm_delivered"], true);
+            assert_eq!(receipt["signal_outcome"]["sigkill_delivered"], false);
+            assert!(targets[index].leader.wait().unwrap().success());
+        }
+        assert_eq!(state.enforcer.as_ref().unwrap().current_run_kill_count(), 3);
+        let saved = pt_core::verify::parse_action_outcomes(
+            &std::fs::read_to_string(handle.dir.join("action/outcomes.jsonl")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            saved
+                .iter()
+                .map(|outcome| outcome.action_id.as_str())
+                .collect::<Vec<_>>(),
+            batch
+                .actions
+                .iter()
+                .map(|action| action.action_id.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(handle.dir.join("action/freeze_recovery.json").exists());
+        record(
+            &log_dir,
+            serde_json::json!({
+                "step": "bounded_parallel_cleanup",
+                "plan": batch,
+                "result": result,
+                "evidence": evidence,
+                "saved": saved,
+            }),
+        );
+    }
+
+    #[cfg(all(feature = "ui", target_os = "linux"))]
+    #[test]
+    fn tui_batch_charges_inflight_delivery_before_admitting_the_next_kill() {
+        use pt_core::action::ActionStatus;
+        use std::io::Write;
+        use tui_live_fixtures::{case, policy, record, selection, selection_for_pid, DetachedTarget};
+
+        let (handle, log_dir) = case("tui-parallel-budget");
+        let mut policy = policy(1);
+        policy.signal.max_parallel_kills = 4;
+        policy.signal.term_grace_ms = 30_000;
+        let marker = log_dir.join("first-term");
+        let mut first = DetachedTarget::spawn_cleanup(&marker);
+        let second = DetachedTarget::spawn();
+        let mut batch = selection_for_pid(&handle, &policy, first.pid, "sh");
+        let spared = selection(&handle, &policy, &second);
+        let mut next = spared.actions[0].clone();
+        next.order = 1;
+        batch.pre_toggled.push(next.action_id.clone());
+        batch.actions.push(next);
+        batch.gates_summary.total_candidates = 2;
+        batch.gates_summary.pre_toggled_actions = 2;
+        let mut state = super::TuiExecutionState::default();
+        let (result, evidence) = std::thread::scope(|scope| {
+            let execution = scope.spawn(|| {
+                super::execute_tui_plan_selection(&handle, &policy, &batch, &mut state)
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !marker.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "first cleanup never started"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(first.leader.try_wait().unwrap().is_none());
+            first
+                .leader
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(b"finish\n")
+                .unwrap();
+            execution.join().unwrap().expect("record budget refusal")
+        });
+        assert_eq!(result.outcomes.len(), 2);
+        assert_eq!(result.outcomes[0].status, ActionStatus::Success);
+        assert!(
+            matches!(&result.outcomes[1].status, ActionStatus::PreCheckBlocked { reason, .. } if reason.contains("rate_limit"))
+        );
+        assert!(!evidence.contains_key(&spared.actions[0].action_id));
+        assert_eq!(state.enforcer.as_ref().unwrap().current_run_kill_count(), 1);
+        let identity = pt_core::action::LiveIdentityProvider::new();
+        assert!(
+            pt_core::action::IdentityProvider::revalidate(&identity, &spared.actions[0].target)
+                .unwrap()
+        );
+        let budget: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(log_dir.join("data/rate_limit.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(budget["kill_timestamps"].as_array().unwrap().len(), 1);
+        assert!(first.leader.wait().unwrap().success());
+        record(
+            &log_dir,
+            serde_json::json!({
+                "step": "inflight_budget_refusal",
+                "plan": batch,
+                "result": result,
+                "evidence": evidence,
+                "budget": budget,
+            }),
         );
     }
 
@@ -29655,6 +30378,10 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         }};
     }
     let mut resource_run: Option<ResourceRun> = None;
+    #[cfg(target_os = "linux")]
+    let mut freeze_recovery: Option<pt_core::action::reversal::FreezeRecoveryReport> = None;
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(unused_mut))]
+    let mut max_parallel_kills = 1usize;
     // Verification and retention use this same lock. Keep it through outcome
     // append, resource evidence and final state persistence, not just actuation.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -29857,6 +30584,23 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     }
                 };
             _execution_guard = Some(execution_lock);
+            max_parallel_kills = match config
+                .policy
+                .signal
+                .parallel_kill_limit(recorded_policy.as_ref().map(|policy| &policy.signal))
+            {
+                Ok(limit) => {
+                    if args.abort_on_unknown {
+                        1
+                    } else {
+                        limit
+                    }
+                }
+                Err(error) => {
+                    eprintln!("agent apply: invalid parallel-kill policy: {error}");
+                    return ExitCode::PolicyBlocked;
+                }
+            };
             // Approval and forecasts refer to these exact bytes. A replan may
             // have acquired the execution lock after our initial read; never
             // execute that old document or journal a hash no longer on disk.
@@ -29893,6 +30637,13 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             if let Err(error) = handle.update_state(SessionState::Executing) {
                 eprintln!("agent apply: cannot persist execution state before actuation: {error}");
                 return ExitCode::IoError;
+            }
+            #[cfg(target_os = "linux")]
+            {
+                freeze_recovery = Some(recover_expired_freezes_for_execution(
+                    store.sessions_root(),
+                    recover_expired_freezes_locked,
+                ));
             }
             let identity_provider = LiveIdentityProvider::new();
 
@@ -29945,7 +30696,95 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             }
             resource_run = Some(observations);
 
+            // Each worker owns its signal evidence. Admission, the durable
+            // intent and both robot budgets remain serial under the policy
+            // lock; only independent cleanup and verification waits overlap.
+            let mut pending = std::collections::VecDeque::<PendingKillExecution>::new();
+            macro_rules! finish_pending {
+                ($count:expr) => {{
+                    for _ in 0..($count).min(pending.len()) {
+                        let finished = pending.pop_front().unwrap().finish();
+                        let success = matches!(
+                            finished.result.status,
+                            pt_core::action::ActionStatus::Success
+                        );
+                        if success {
+                            succeeded += 1;
+                        } else {
+                            failed += 1;
+                        }
+                        let status = if success { "success" } else { "failed" };
+                        let elapsed_ms = finished.result.time_ms.min(u64::MAX as u128) as u64;
+                        let mut outcome = serde_json::json!({
+                            "action_id": finished.action.action_id,
+                            "pid": finished.action.target.pid.0,
+                            "status": status,
+                            "time_ms": elapsed_ms,
+                        });
+                        if let Some(error) = finished.result.details {
+                            outcome["error"] = serde_json::json!(error);
+                        }
+                        if let (Some(fields), Some(evidence)) =
+                            (outcome.as_object_mut(), finished.evidence.as_object())
+                        {
+                            fields.extend(evidence.clone());
+                        }
+                        // After a failed append/sync, never retry possibly
+                        // published bytes. Still join and report every already
+                        // admitted action before releasing the execution lock.
+                        if persistence_error.is_none() {
+                            if let Err(error) = append_action_outcomes(
+                                &action_dir,
+                                std::slice::from_ref(&outcome),
+                            ) {
+                                persistence_error = Some(error);
+                            }
+                        }
+                        outcomes.push(outcome);
+                        emit_action_event(
+                            if success {
+                                pt_core::events::event_names::ACTION_COMPLETE
+                            } else {
+                                pt_core::events::event_names::ACTION_FAILED
+                            },
+                            finished.action_index,
+                            Some(elapsed_ms),
+                            &finished.action,
+                            status,
+                            &[],
+                        );
+                    }
+                    persistence_error.is_some()
+                }};
+            }
+            // Immediate refusals and synchronous actions must follow all
+            // earlier outcomes in the canonical plan order. This shadowed
+            // macro is used only in the real execution loop below.
+            macro_rules! checkpoint_outcome {
+                ($outcome:expr) => {{
+                    let outcome = $outcome;
+                    if finish_pending!(usize::MAX) {
+                        // The current refusal is already observed. Preserve it
+                        // in the response even if an earlier worker's durable
+                        // checkpoint failed, without retrying uncertain bytes.
+                        outcomes.push(outcome);
+                        break;
+                    }
+                    let persisted =
+                        append_action_outcomes(&action_dir, std::slice::from_ref(&outcome));
+                    outcomes.push(outcome);
+                    if let Err(error) = persisted {
+                        persistence_error = Some(error);
+                        break;
+                    }
+                }};
+            }
             for action in &actions_to_apply {
+                if pending_kills_require_barrier(&pending, action, Some(&[]))
+                    && finish_pending!(usize::MAX)
+                {
+                    break;
+                }
                 action_index = action_index.saturating_add(1);
                 emit_action_event(
                     pt_core::events::event_names::ACTION_STARTED,
@@ -29998,6 +30837,92 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 }
 
                 let start = std::time::Instant::now();
+                let mut ancestors = None;
+                let mut tree_reason = tree_refusals.get(&action.target.pid.0).cloned();
+                if action_uses_kill_budget(action) && tree_reason.is_none() {
+                    // A selected child's action may have failed, or a new child
+                    // may have appeared. Refuse the parent while any live child
+                    // remains, even if that child was in the original kill set.
+                    let mut tree_scan = quick_scan(&goal_progress_scan_options);
+                    let current_ancestors = tree_scan.as_ref().ok().and_then(|scan| {
+                        execution_ancestors(action.target.pid.0, &scan.processes)
+                    });
+                    if pending_kills_require_barrier(
+                        &pending,
+                        action,
+                        current_ancestors.as_deref(),
+                    ) {
+                        if finish_pending!(usize::MAX) {
+                            break;
+                        }
+                        // A parent must observe whether the child's cleanup
+                        // actually completed before its own safety decision.
+                        tree_scan = quick_scan(&goal_progress_scan_options);
+                    }
+                    let current_tree = match tree_scan {
+                        Ok(scan) if scan.metadata.warnings.is_empty() => scan.processes,
+                        Ok(scan) => {
+                            failed += 1;
+                            checkpoint_outcome!(serde_json::json!({
+                                "action_id": action.action_id,
+                                "pid": action.target.pid.0,
+                                "status": "identity_check_failed",
+                                "error": "incomplete process-tree snapshot",
+                                "warnings": scan.metadata.warnings,
+                            }));
+                            break;
+                        }
+                        Err(error) => {
+                            eprintln!("agent apply: cannot revalidate process tree: {error}");
+                            failed += 1;
+                            checkpoint_outcome!(serde_json::json!({
+                                "action_id": action.action_id,
+                                "pid": action.target.pid.0,
+                                "status": "identity_check_failed",
+                                "error": format!("cannot revalidate process tree: {error}"),
+                            }));
+                            break;
+                        }
+                    };
+                    ancestors = execution_ancestors(action.target.pid.0, &current_tree);
+                    tree_reason = execution_tree_refusal(
+                        action.target.pid.0,
+                        &current_tree,
+                        builtin_protection,
+                    );
+                }
+                if let Some(reason) = tree_reason {
+                    blocked_by_prechecks += 1;
+                    checkpoint_outcome!(serde_json::json!({
+                        "action_id": action.action_id,
+                        "pid": action.target.pid.0,
+                        "status": "precheck_blocked",
+                        "check": "process_tree",
+                        "reason": reason,
+                    }));
+                    emit_action_event(
+                        pt_core::events::event_names::ACTION_COMPLETE,
+                        action_index,
+                        None,
+                        action,
+                        "precheck_blocked",
+                        &[("check", serde_json::json!("process_tree"))],
+                    );
+                    if args.abort_on_unknown {
+                        break;
+                    }
+                    continue;
+                }
+
+                let parallel = max_parallel_kills > 1
+                    && pt_core::action::signal::PendingSignalKill::supports(action)
+                    && ancestors.is_some();
+                if !parallel && finish_pending!(usize::MAX) {
+                    break;
+                }
+                // A tree/stage barrier may wait through an earlier cleanup
+                // grace. Check identity and every live gate only after those
+                // waits, immediately before serial admission and accounting.
                 match identity_provider.revalidate(&action.target) {
                     Ok(true) => {}
                     Ok(false) => {
@@ -30066,65 +30991,6 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     }
                     continue;
                 }
-                let mut tree_reason = tree_refusals.get(&action.target.pid.0).cloned();
-                if action_uses_kill_budget(action) && tree_reason.is_none() {
-                    // A selected child's action may have failed, or a new child
-                    // may have appeared. Refuse the parent while any live child
-                    // remains, even if that child was in the original kill set.
-                    let current_tree = match quick_scan(&goal_progress_scan_options) {
-                        Ok(scan) if scan.metadata.warnings.is_empty() => scan.processes,
-                        Ok(scan) => {
-                            failed += 1;
-                            checkpoint_outcome!(serde_json::json!({
-                                "action_id": action.action_id,
-                                "pid": action.target.pid.0,
-                                "status": "identity_check_failed",
-                                "error": "incomplete process-tree snapshot",
-                                "warnings": scan.metadata.warnings,
-                            }));
-                            break;
-                        }
-                        Err(error) => {
-                            eprintln!("agent apply: cannot revalidate process tree: {error}");
-                            failed += 1;
-                            checkpoint_outcome!(serde_json::json!({
-                                "action_id": action.action_id,
-                                "pid": action.target.pid.0,
-                                "status": "identity_check_failed",
-                                "error": format!("cannot revalidate process tree: {error}"),
-                            }));
-                            break;
-                        }
-                    };
-                    tree_reason = execution_tree_refusal(
-                        action.target.pid.0,
-                        &current_tree,
-                        builtin_protection,
-                    );
-                }
-                if let Some(reason) = tree_reason {
-                    blocked_by_prechecks += 1;
-                    checkpoint_outcome!(serde_json::json!({
-                        "action_id": action.action_id,
-                        "pid": action.target.pid.0,
-                        "status": "precheck_blocked",
-                        "check": "process_tree",
-                        "reason": reason,
-                    }));
-                    emit_action_event(
-                        pt_core::events::event_names::ACTION_COMPLETE,
-                        action_index,
-                        None,
-                        action,
-                        "precheck_blocked",
-                        &[("check", serde_json::json!("process_tree"))],
-                    );
-                    if args.abort_on_unknown {
-                        break;
-                    }
-                    continue;
-                }
-
                 let (policy_check, current_process) =
                     match check_execution_policy(&enforcer, action, true) {
                         Ok(check) => check,
@@ -30281,6 +31147,69 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 };
                 execution_evidence["resource_run_id"] =
                     serde_json::json!(resource_run.as_ref().map(|run| &run.run_id));
+                if parallel {
+                    let preflight_ms = start.elapsed().as_millis();
+                    let worker = match pt_core::action::signal::PendingSignalKill::start(action) {
+                        Ok(worker) => worker,
+                        Err(error) => {
+                            if let Err(error) = enforcer.finish_kill_accounting(false) {
+                                accounting_error = Some(error.to_string());
+                            }
+                            failed += 1;
+                            checkpoint_outcome!(serde_json::json!({
+                                "action_id": action.action_id,
+                                "pid": action.target.pid.0,
+                                "status": "failed",
+                                "error": error.to_string(),
+                                "kill_signal_delivered": false,
+                                "time_ms": start.elapsed().as_millis(),
+                                "accounting_error": accounting_error,
+                            }));
+                            if accounting_error.is_some() {
+                                break;
+                            }
+                            continue;
+                        }
+                    };
+                    let delivered = worker.first_delivery();
+                    // Only one durable intent is pending at a time. Settle it
+                    // and reserve both blast-radius budgets before inspecting
+                    // the next target, while this worker waits for cleanup.
+                    let charged = delivered.unwrap_or(true);
+                    if charged {
+                        checker.record_action(current_rss_bytes, true);
+                        if let Some(recorded) = &recorded_checker {
+                            recorded.record_action(current_rss_bytes, true);
+                        }
+                    }
+                    let completion_error = enforcer
+                        .finish_kill_accounting(charged)
+                        .err()
+                        .map(|error| error.to_string());
+                    if let Some(error) = &completion_error {
+                        accounting_error = Some(error.clone());
+                    }
+                    let stop_admission = delivered.is_none() || completion_error.is_some();
+                    if delivered.is_none() {
+                        execution_evidence["signal_delivery_unknown"] = serde_json::json!(true);
+                    }
+                    pending.push_back(PendingKillExecution {
+                        action: action.clone(),
+                        ancestors,
+                        worker,
+                        evidence: execution_evidence,
+                        action_index,
+                        preflight_ms,
+                        accounting_error: completion_error,
+                    });
+                    if stop_admission {
+                        break;
+                    }
+                    if pending.len() >= max_parallel_kills && finish_pending!(1usize) {
+                        break;
+                    }
+                    continue;
+                }
                 // "success" means the effect was observed (stopped, reniced, exited,
                 // zombie reaped), not merely that the syscall returned.
                 let result = action_runner
@@ -30371,6 +31300,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     }
                 }
             }
+            finish_pending!(usize::MAX);
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
@@ -30795,6 +31725,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             "resumed_skipped": resumed_skipped
         },
         "outcomes": outcomes,
+        "max_parallel_kills": max_parallel_kills,
         "accounting_error": accounting_error,
         "persistence_error": persistence_error,
         "session_state_error": session_state_error,
@@ -30813,6 +31744,10 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         "constraints_summary": constraints_summary,
         "resumed": args.resume
     });
+    #[cfg(target_os = "linux")]
+    if let Some(recovery) = freeze_recovery {
+        result["freeze_recovery"] = serde_json::json!(recovery);
+    }
     if let Some(binding) = &execution_binding {
         result["execution_binding"] = serde_json::json!(binding);
     }

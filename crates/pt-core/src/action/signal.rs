@@ -494,6 +494,157 @@ impl Default for SignalConfig {
     }
 }
 
+/// Completion evidence owned by one kill attempt, never a shared runner slot.
+#[derive(Debug)]
+pub struct SignalKillCompletion {
+    pub result: Result<(), ActionError>,
+    pub signal_path: Option<&'static str>,
+    pub signal_outcome: Option<SignalExecutionOutcome>,
+    pub kill_signal_delivered: bool,
+    /// A failed worker may not establish delivery. Callers must charge such an
+    /// attempt conservatively and stop admitting more work.
+    pub delivery_unknown: bool,
+    pub elapsed_ms: u128,
+}
+
+fn complete_kill_worker(
+    runner: &SignalActionRunner,
+    started: Instant,
+    operation: impl FnOnce() -> Result<(), ActionError>,
+) -> SignalKillCompletion {
+    let (result, panicked) = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)) {
+        Ok(result) => (result, false),
+        Err(_) => (
+            Err(ActionError::Failed(
+                "direct-kill worker panicked during execution".to_string(),
+            )),
+            true,
+        ),
+    };
+    let delivered = runner.take_kill_signal_delivered();
+    let delivery_unknown = panicked && !delivered;
+    // A panic can interrupt the gap between the syscall and its receipt. Do
+    // not turn missing evidence into proof that no destructive signal landed.
+    // Dropping the unanswered sender makes admission conservatively charge
+    // the attempt and stop; an already confirmed delivery remains confirmed.
+    if !delivery_unknown {
+        runner.notify_first_delivery(delivered);
+    }
+    SignalKillCompletion {
+        result,
+        signal_path: runner.take_signal_path(),
+        signal_outcome: runner.take_signal_outcome(),
+        kill_signal_delivered: delivered,
+        delivery_unknown,
+        elapsed_ms: started.elapsed().as_millis(),
+    }
+}
+
+/// A single already-authorized direct kill whose cleanup may overlap others.
+///
+/// The coordinator must perform all live policy and safety checks and prepare
+/// durable accounting BEFORE calling `start`. It must settle that accounting
+/// from `first_delivery` before admitting another action. This object owns its
+/// worker and joins on drop, including error returns, so no cleanup worker can
+/// outlive the caller's execution lock.
+#[derive(Debug)]
+pub struct PendingSignalKill {
+    worker: Option<thread::JoinHandle<SignalKillCompletion>>,
+    first_delivery: Option<bool>,
+    started: Instant,
+}
+
+impl PendingSignalKill {
+    /// Only independent direct kills use this path. Supervisor operations,
+    /// zombies, D-state routes and reversible actions remain serial.
+    pub fn supports(action: &PlanAction) -> bool {
+        !action.blocked
+            && action.action == Action::Kill
+            && action.routing == crate::plan::ActionRouting::Direct
+            && action.original_zombie_target.is_none()
+            && action.supervisor_restart.is_none()
+            && action.memory_cap.is_none()
+            && action.target.can_safely_revalidate()
+    }
+
+    /// Start one worker and return only once its first delivery is observed,
+    /// or the worker has completed without delivering a signal.
+    pub fn start(action: &PlanAction) -> Result<Self, ActionError> {
+        if !Self::supports(action) {
+            return Err(ActionError::Failed(
+                "parallel signal execution requires an unblocked direct kill with full identity"
+                    .to_string(),
+            ));
+        }
+        action
+            .validate_signal_timing()
+            .map_err(|reason| ActionError::Failed(reason.to_string()))?;
+        let action = action.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        let worker = thread::Builder::new()
+            .name(format!("pt-kill-{}", action.target.pid.0))
+            .spawn(move || {
+                // No receipt, delivery flag or pidfd is shared with another
+                // action. The ordinary runner retains all deadline, identity,
+                // ignored-TERM and stopped-process behavior.
+                let runner = SignalActionRunner::with_defaults();
+                *runner
+                    .first_delivery
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(sender);
+                complete_kill_worker(&runner, started, || {
+                    runner
+                        .execute(&action)
+                        .and_then(|()| runner.verify(&action))
+                })
+            })
+            .map_err(|error| ActionError::Failed(format!("cannot start kill worker: {error}")))?;
+        let first_delivery = receiver.recv().ok();
+        Ok(Self {
+            worker: Some(worker),
+            first_delivery,
+            started,
+        })
+    }
+
+    /// `Some(true)` is a confirmed TERM/KILL delivery; `Some(false)` proves
+    /// completion without one. `None` requires conservative accounting and an
+    /// admission stop, never a free budget slot.
+    pub fn first_delivery(&self) -> Option<bool> {
+        self.first_delivery
+    }
+
+    pub fn finish(mut self) -> SignalKillCompletion {
+        match self
+            .worker
+            .take()
+            .expect("kill worker is consumed once")
+            .join()
+        {
+            Ok(completion) => completion,
+            Err(_) => SignalKillCompletion {
+                result: Err(ActionError::Failed(
+                    "direct-kill worker terminated without completion evidence".to_string(),
+                )),
+                signal_path: None,
+                signal_outcome: None,
+                kill_signal_delivered: self.first_delivery == Some(true),
+                delivery_unknown: self.first_delivery.is_none(),
+                elapsed_ms: self.started.elapsed().as_millis(),
+            },
+        }
+    }
+}
+
+impl Drop for PendingSignalKill {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 /// Signal-based action runner.
 #[derive(Debug)]
 pub struct SignalActionRunner {
@@ -502,6 +653,9 @@ pub struct SignalActionRunner {
     last_path: std::sync::Mutex<Option<&'static str>>,
     /// A successful SIGTERM/SIGKILL delivery, even if later verification fails.
     kill_signal_delivered: std::sync::atomic::AtomicBool,
+    /// A private worker notifies its coordinator once, immediately after the
+    /// first destructive signal or after proving no signal was delivered.
+    first_delivery: std::sync::Mutex<Option<std::sync::mpsc::Sender<bool>>>,
     last_outcome: std::sync::Mutex<Option<SignalExecutionOutcome>>,
     #[cfg(target_os = "linux")]
     reversal_journal: Option<Arc<ReversalJournal>>,
@@ -525,6 +679,7 @@ impl SignalActionRunner {
             config,
             last_path: std::sync::Mutex::new(None),
             kill_signal_delivered: std::sync::atomic::AtomicBool::new(false),
+            first_delivery: std::sync::Mutex::new(None),
             last_outcome: std::sync::Mutex::new(None),
             #[cfg(target_os = "linux")]
             reversal_journal: None,
@@ -596,6 +751,18 @@ impl SignalActionRunner {
         if matches!(signal, libc::SIGTERM | libc::SIGKILL) {
             self.kill_signal_delivered
                 .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.notify_first_delivery(true);
+        }
+    }
+
+    fn notify_first_delivery(&self, delivered: bool) {
+        if let Some(sender) = self
+            .first_delivery
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            let _ = sender.send(delivered);
         }
     }
 
@@ -2684,6 +2851,136 @@ mod tests {
         }
 
         #[test]
+        fn worker_panic_never_claims_proven_non_delivery() {
+            for confirmed in [false, true] {
+                let runner = SignalActionRunner::with_defaults();
+                let (sender, receiver) = std::sync::mpsc::channel();
+                *runner.first_delivery.lock().unwrap() = Some(sender);
+                let completion = complete_kill_worker(&runner, Instant::now(), || {
+                    if confirmed {
+                        runner.note_delivered_signal(libc::SIGTERM);
+                    }
+                    panic!("injected failure while recording a syscall result");
+                });
+                assert!(matches!(completion.result, Err(ActionError::Failed(_))));
+                assert_eq!(completion.kill_signal_delivered, confirmed);
+                assert_eq!(completion.delivery_unknown, !confirmed);
+                drop(runner);
+                assert_eq!(receiver.recv().ok(), confirmed.then_some(true));
+            }
+        }
+
+        #[test]
+        fn kill_workers_admit_before_cleanup_and_keep_each_actions_evidence() {
+            use std::io::Write;
+
+            let dir = tempfile::tempdir().expect("marker directory");
+            let mut children = Vec::new();
+            let mut actions = Vec::new();
+            for index in 0..2 {
+                let marker = dir.path().join(format!("term-{index}"));
+                let (child, mut action) = stopped_signal_child(
+                    "trap 'printf handled > \"$1\"; read -r finish; exit 0' TERM\nkill -STOP \"$$\"\nwhile :; do read -r line || :; done",
+                    &marker,
+                    false,
+                );
+                action.action_id = format!("parallel-{index}");
+                action.timeouts.term_grace_ms = Some(5_000 + index * 1_000);
+                children.push(child);
+                actions.push(action);
+            }
+            let first = PendingSignalKill::start(&actions[0]).expect("first admission");
+            let second = PendingSignalKill::start(&actions[1]).expect("second admission");
+            assert_eq!(first.first_delivery(), Some(true));
+            assert_eq!(second.first_delivery(), Some(true));
+            // The handlers cannot finish until these owned input pipes are
+            // released. Waiting for the first grace here would kill it and
+            // fail this assertion instead of quietly serializing the cleanup.
+            for child in &mut children {
+                assert!(child.0.try_wait().unwrap().is_none());
+                child
+                    .0
+                    .stdin
+                    .as_mut()
+                    .unwrap()
+                    .write_all(b"finish\n")
+                    .unwrap();
+            }
+            for (index, task) in [first, second].into_iter().enumerate() {
+                let completion = task.finish();
+                completion.result.expect("TERM cleanup completed");
+                assert!(completion.kill_signal_delivered);
+                assert!(!completion.delivery_unknown);
+                let signal = completion.signal_outcome.unwrap();
+                assert_eq!(signal.configured_grace_ms, 5_000 + index as u64 * 1_000);
+                assert!(signal.sigterm_delivered);
+                assert!(!signal.sigkill_delivered);
+                assert!(children[index].0.wait().unwrap().success());
+                assert_eq!(
+                    std::fs::read_to_string(dir.path().join(format!("term-{index}"))).unwrap(),
+                    "handled"
+                );
+            }
+        }
+
+        #[test]
+        fn kill_worker_reports_refusal_without_spending_delivery_and_preserves_deadlines() {
+            let dir = tempfile::tempdir().expect("marker directory");
+            let marker = dir.path().join("term-handled");
+            let (mut child, mut action) = stopped_signal_child(
+                "trap ':' TERM\nkill -STOP \"$$\"\nwhile :; do read -r line || :; done",
+                &marker,
+                false,
+            );
+            let mut stale = action.clone();
+            stale.target.uid = stale.target.uid.wrapping_add(1);
+            let refused = PendingSignalKill::start(&stale).unwrap();
+            assert_eq!(refused.first_delivery(), Some(false));
+            let completion = refused.finish();
+            assert!(matches!(
+                completion.result,
+                Err(ActionError::IdentityMismatch)
+            ));
+            assert!(!completion.kill_signal_delivered);
+            assert!(!completion.delivery_unknown);
+            assert_eq!(signal_state(&action.target).unwrap(), 'T');
+
+            action.timeouts.term_grace_ms = Some(5_000);
+            action.timeouts.execute_ms = 30;
+            let started = PendingSignalKill::start(&action).unwrap();
+            assert_eq!(started.first_delivery(), Some(true));
+            let completion = started.finish();
+            assert!(matches!(completion.result, Err(ActionError::Timeout)));
+            assert!(completion.kill_signal_delivered);
+            let outcome = completion.signal_outcome.unwrap();
+            assert_eq!(outcome.configured_grace_ms, 5_000);
+            assert!(outcome.sigterm_delivered);
+            assert!(!outcome.sigkill_delivered);
+            assert!(child.0.try_wait().unwrap().is_none());
+        }
+
+        #[test]
+        fn dropping_a_pending_kill_joins_cleanup_before_releasing_its_scope() {
+            let dir = tempfile::tempdir().expect("marker directory");
+            let marker = dir.path().join("term-handled");
+            let (mut child, action) = stopped_signal_child(
+                "trap 'sleep 0.2; printf handled > \"$1\"; exit 0' TERM\nkill -STOP \"$$\"\nwhile :; do read -r line || :; done",
+                &marker,
+                false,
+            );
+            let pending = PendingSignalKill::start(&action).unwrap();
+            assert_eq!(pending.first_delivery(), Some(true));
+            drop(pending);
+            assert!(child
+                .0
+                .try_wait()
+                .unwrap()
+                .expect("cleanup was joined")
+                .success());
+            assert_eq!(std::fs::read_to_string(marker).unwrap(), "handled");
+        }
+
+        #[test]
         fn approved_short_grace_escalates_a_caught_nonexiting_handler() {
             let dir = tempfile::tempdir().expect("marker directory");
             let marker = dir.path().join("term-handled");
@@ -2759,7 +3056,10 @@ mod tests {
             ] {
                 action.action = kind;
                 action.timeouts.term_grace_ms = Some(grace_ms);
-                assert!(matches!(runner.execute(&action), Err(ActionError::Failed(_))));
+                assert!(matches!(
+                    runner.execute(&action),
+                    Err(ActionError::Failed(_))
+                ));
                 assert_eq!(runner.get_process_state(child.0.id()), Some('T'));
                 assert!(!runner.take_kill_signal_delivered());
                 assert!(runner.take_signal_path().is_none());
@@ -2775,7 +3075,10 @@ mod tests {
                 ActionRouting::ZombieInvestigateOnly,
             ] {
                 action.routing = routing;
-                assert!(matches!(runner.execute(&action), Err(ActionError::Failed(_))));
+                assert!(matches!(
+                    runner.execute(&action),
+                    Err(ActionError::Failed(_))
+                ));
                 assert!(matches!(
                     runner.nudge_parent_to_reap(&action),
                     Err(ActionError::Failed(_))
@@ -2788,7 +3091,10 @@ mod tests {
             }
             action.routing = ActionRouting::Direct;
             action.original_zombie_target = Some(action.target.clone());
-            assert!(matches!(runner.execute(&action), Err(ActionError::Failed(_))));
+            assert!(matches!(
+                runner.execute(&action),
+                Err(ActionError::Failed(_))
+            ));
             assert_eq!(runner.get_process_state(child.0.id()), Some('T'));
             assert!(runner.take_signal_outcome().is_none());
         }

@@ -53,7 +53,8 @@
     "alpha": 0.05
   },
   "signal": {
-    "term_grace_ms": 5000
+    "term_grace_ms": 5000,
+    "max_parallel_kills": 4
   },
   "data_loss_gates": {
     "block_if_open_write_fds": true,

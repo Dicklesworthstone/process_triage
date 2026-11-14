@@ -237,7 +237,7 @@
     },
     "signal": {
       "type": "object",
-      "description": "Signal execution settings copied into each approved kill action",
+      "description": "Signal execution settings recorded with the approved plan policy",
       "additionalProperties": false,
       "properties": {
         "term_grace_ms": {
@@ -246,6 +246,13 @@
           "maximum": 300000,
           "default": 5000,
           "description": "SIGTERM cleanup allowance in milliseconds. A shorter execution deadline times out without early SIGKILL; confirmed SIGTERM ignore may bypass the wait."
+        },
+        "max_parallel_kills": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 32,
+          "default": 4,
+          "description": "Maximum independent direct kills in flight. Safety checks and durable accounting stay serial; stages, related targets, other actions and abort-on-unknown require barriers."
         }
       }
     },

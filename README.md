@@ -631,6 +631,23 @@ Set `signal.term_grace_ms` in a complete policy to control how long a process ma
 
 New kill plans save that value in `actions[].timeouts.term_grace_ms` and reserve execution time for the cleanup window. Agent and TUI execution honor the saved value, even if policy changes after planning. Signal outcomes record the effective grace used. A shorter execution deadline reports a timeout instead of accelerating SIGKILL. The existing Linux shortcut still applies when complete identity-bound observations confirm SIGTERM is ignored; a caught handler retains its configured cleanup time. This setting does not change the confirmation or protection rules.
 
+#### Parallel termination cleanup
+
+`signal.max_parallel_kills` controls how many independent direct kills may wait
+for cleanup at once. It defaults to four and accepts values from 1 to 32; use
+`1` for sequential execution. Agent apply obeys the lower limit from the current
+policy and the policy saved with the approved plan. `--abort-on-unknown` also
+forces sequential execution so a failure can stop admission of the next target.
+
+Fresh identity, protection, data-loss, process-tree and budget checks remain
+serial. A worker must report its first signal delivery or a pre-signal refusal,
+and durable kill accounting must settle, before another target is admitted.
+Each worker owns its signal evidence and cleanup deadline. Parent/child targets,
+unknown ancestry, stage changes, supervisor routes and non-kill actions wait for
+earlier cleanup. Outcomes retain plan order, and every admitted worker is joined
+before the execution lock is released. Parallel waits therefore do not increase
+the approved kill count or bypass saved grace periods.
+
 #### Pressure-aware decisions
 
 `load_aware.enabled` opts into an additive pressure cost for each observed process:
@@ -1718,7 +1735,12 @@ an old receipt without a lease, and an unjournaled TUI freeze acquire no automat
 thaw authority.
 
 The running daemon attempts recovery after expiry, including ticks on which
-normal planning is deferred by its overhead budget. Recovery holds the same
+normal planning is deferred by its overhead budget. Real `agent apply` and
+confirmed TUI execution also attempt a bounded recovery pass before executing
+their new actions. Agent output includes `freeze_recovery`; the TUI session
+retains `action/freeze_recovery.json`. These invocations share an advisory
+continuation cursor, so bounded passes advance through session history even
+without a daemon. Recovery holds the same
 execution lock as apply and undo, checks the original process identity, cgroup,
 boot and namespaces, and refuses conflicting owners or changed controls. It
 retains the exact approved action in the receipt, so later plan-file changes
