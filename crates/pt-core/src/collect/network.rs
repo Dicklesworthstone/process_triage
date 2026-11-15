@@ -8,12 +8,13 @@
 //!
 //! # Data Sources
 //! - `/proc/[pid]/net/*` - Socket tables in the target's network namespace
-//! - `/proc/[pid]/fd/` - Per-process socket mappings
+//! - `/proc/[pid]/task/[tid]/fd/` - All task descriptor tables, including unshared ones
 
+use pt_common::{IdentityQuality, ProcessIdentity, StartId};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -49,16 +50,16 @@ pub struct NetworkInfo {
     /// Total socket count by protocol.
     pub socket_counts: SocketCounts,
     /// Active TCP connections.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tcp_connections: Vec<TcpConnection>,
     /// Active UDP sockets.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub udp_sockets: Vec<UdpSocket>,
     /// Listening ports (TCP and UDP).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub listen_ports: Vec<ListenPort>,
     /// Unix domain sockets.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unix_sockets: Vec<UnixSocket>,
 }
 
@@ -109,6 +110,17 @@ struct NetworkTables {
 
 type ObservedNetworkTables = Result<Arc<NetworkTables>, (std::io::ErrorKind, String)>;
 
+/// Hard limits for one pass over a process's complete thread group. Descriptor
+/// visits include inherited duplicates, while reported sockets are deduplicated.
+pub const NETWORK_MAX_TASKS: usize = 1024;
+pub const NETWORK_MAX_DESCRIPTORS: usize = 50_000;
+
+#[derive(Debug, PartialEq, Eq)]
+struct TaskNetworkInventory {
+    identities: Vec<(u32, (u64, u64, u64, u32))>,
+    socket_inodes: HashSet<u64>,
+}
+
 #[derive(Debug)]
 struct NamespaceTables {
     _namespace: fs::File,
@@ -124,6 +136,8 @@ struct NamespaceTables {
 pub struct NetworkSnapshot {
     proc_root: PathBuf,
     namespaces: Mutex<HashMap<NetworkNamespace, Arc<NamespaceTables>>>,
+    max_namespaces: usize,
+    max_namespace_bytes: usize,
 }
 
 impl Default for NetworkSnapshot {
@@ -131,6 +145,8 @@ impl Default for NetworkSnapshot {
         Self {
             proc_root: PathBuf::from("/proc"),
             namespaces: Mutex::new(HashMap::new()),
+            max_namespaces: usize::MAX,
+            max_namespace_bytes: 16 * 1024 * 1024,
         }
     }
 }
@@ -139,6 +155,17 @@ impl NetworkSnapshot {
     /// Start a scan-scoped snapshot. Each namespace is collected on first use.
     pub fn collect() -> Self {
         Self::default()
+    }
+
+    /// Bound the number of namespace tables retained and their aggregate input
+    /// bytes per namespace. Exhaustion is unavailable evidence, never an empty
+    /// socket inventory. A namespace is charged only on its first collection.
+    pub fn with_limits(max_namespaces: usize, max_namespace_bytes: usize) -> Self {
+        Self {
+            max_namespaces,
+            max_namespace_bytes,
+            ..Self::default()
+        }
     }
 
     /// Get complete network evidence, retaining diagnostics for inaccessible,
@@ -156,11 +183,51 @@ impl NetworkSnapshot {
     /// before exposing any result, including a partial one. Unreadable or
     /// malformed tables and changing process scopes remain errors.
     pub fn observe_process(&self, pid: u32) -> std::io::Result<NetworkObservation> {
+        self.observe_process_with_identity(pid, None)
+    }
+
+    /// Join network evidence only to the exact process incarnation recorded by
+    /// the caller. In addition to the live scope checks, validate boot ID,
+    /// kernel start ticks and owner UID before any socket table is read.
+    pub fn observe_identity(
+        &self,
+        expected: &ProcessIdentity,
+    ) -> std::io::Result<NetworkObservation> {
+        if expected.quality != IdentityQuality::Full {
+            return Err(invalid_network(
+                "network observation requires a complete process identity",
+            ));
+        }
+        self.observe_process_with_identity(expected.pid.0, Some(expected))
+    }
+
+    fn observe_process_with_identity(
+        &self,
+        pid: u32,
+        expected: Option<&ProcessIdentity>,
+    ) -> std::io::Result<NetworkObservation> {
         let process_dir = self.proc_root.join(pid.to_string());
         let before = read_network_process_identity(&process_dir, pid)?;
+        if let Some(expected) = expected {
+            let boot_id = fs::read_to_string(self.proc_root.join("sys/kernel/random/boot_id"))?;
+            let boot_id = boot_id.trim();
+            if uuid::Uuid::parse_str(boot_id).is_err()
+                || expected.start_id != StartId::from_linux(boot_id, before.2, pid)
+                || expected.uid != before.3
+            {
+                return Err(invalid_network(
+                    "process identity no longer matches the snapshot (boot ID, start time or UID)",
+                ));
+            }
+        }
         let namespace_handle = fs::File::open(process_dir.join("ns/net"))?;
         let namespace = NetworkNamespace::from_metadata(&namespace_handle.metadata()?);
-        let socket_inodes = get_process_socket_inodes_from(&process_dir.join("fd"), 50_000)?;
+        let inventory = read_task_network_inventory(
+            &process_dir,
+            namespace,
+            NETWORK_MAX_TASKS,
+            NETWORK_MAX_DESCRIPTORS,
+        )?;
         let mut observation = NetworkObservation {
             info: NetworkInfo {
                 namespace: Some(namespace),
@@ -169,12 +236,12 @@ impl NetworkSnapshot {
             unavailable: Vec::new(),
         };
 
-        if !socket_inodes.is_empty() {
+        if !inventory.socket_inodes.is_empty() {
             let tables = self.tables_for(&process_dir, namespace, namespace_handle)?;
-            observation = tables.process_observation(&socket_inodes, namespace);
+            observation = tables.process_observation(&inventory.socket_inodes, namespace);
         }
 
-        revalidate_network_observation(&process_dir, pid, namespace, before, &socket_inodes)?;
+        revalidate_network_observation(&process_dir, pid, namespace, before, &inventory)?;
         Ok(observation)
     }
 
@@ -195,6 +262,11 @@ impl NetworkSnapshot {
                 .namespaces
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !namespaces.contains_key(&namespace) && namespaces.len() >= self.max_namespaces {
+                return Err(invalid_network(
+                    "network namespace inspection limit reached",
+                ));
+            }
             Arc::clone(namespaces.entry(namespace).or_insert_with(|| {
                 Arc::new(NamespaceTables {
                     _namespace: handle,
@@ -205,10 +277,12 @@ impl NetworkSnapshot {
         // Serialize only readers of the same namespace. Different containers
         // can collect in parallel; a shared namespace is still parsed once.
         let observed = entry.tables.get_or_init(|| {
-            let result = NetworkTables::read_from(&process_dir.join("net")).and_then(|tables| {
-                check_network_namespace(process_dir, namespace)?;
-                Ok(Arc::new(tables))
-            });
+            let result =
+                NetworkTables::read_from(&process_dir.join("net"), self.max_namespace_bytes)
+                    .and_then(|tables| {
+                        check_network_namespace(process_dir, namespace)?;
+                        Ok(Arc::new(tables))
+                    });
             result.map_err(|error| (error.kind(), error.to_string()))
         });
         match observed {
@@ -253,24 +327,108 @@ fn revalidate_network_observation(
     pid: u32,
     namespace: NetworkNamespace,
     identity: (u64, u64, u64, u32),
-    sockets: &HashSet<u64>,
+    inventory: &TaskNetworkInventory,
 ) -> std::io::Result<()> {
     // Neither a namespace switch nor PID reuse may join evidence from two
-    // processes. FD churn also makes a negative socket observation unsafe.
-    let observed_sockets = get_process_socket_inodes_from(&process_dir.join("fd"), 50_000)?;
+    // processes. FD or task churn also makes a negative observation unsafe.
+    let observed = read_task_network_inventory(
+        process_dir,
+        namespace,
+        NETWORK_MAX_TASKS,
+        NETWORK_MAX_DESCRIPTORS,
+    )?;
     check_network_namespace(process_dir, namespace)?;
-    if read_network_process_identity(process_dir, pid)? != identity || &observed_sockets != sockets
-    {
+    if read_network_process_identity(process_dir, pid)? != identity || &observed != inventory {
         return Err(invalid_network(
-            "process or socket descriptors changed during collection",
+            "process, tasks or socket descriptors changed during collection",
         ));
     }
     Ok(())
 }
 
-fn read_optional_socket_table(path: &Path) -> std::io::Result<Option<String>> {
-    match fs::read_to_string(path) {
-        Ok(content) => Ok(Some(content)),
+fn read_task_ids(process_dir: &Path, max_tasks: usize) -> std::io::Result<Vec<u32>> {
+    let mut tids = Vec::new();
+    for entry in fs::read_dir(process_dir.join("task"))? {
+        if tids.len() >= max_tasks {
+            return Err(invalid_network("network task inspection limit exceeded"));
+        }
+        let entry = entry?;
+        let tid = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+            .filter(|tid| *tid != 0)
+            .ok_or_else(|| invalid_network("invalid task directory entry"))?;
+        tids.push(tid);
+    }
+    if tids.is_empty() {
+        return Err(invalid_network(
+            "process task inventory is empty or unavailable",
+        ));
+    }
+    tids.sort_unstable();
+    Ok(tids)
+}
+
+fn read_task_network_inventory(
+    process_dir: &Path,
+    namespace: NetworkNamespace,
+    max_tasks: usize,
+    max_descriptors: usize,
+) -> std::io::Result<TaskNetworkInventory> {
+    let tids = read_task_ids(process_dir, max_tasks)?;
+    let mut inventory = TaskNetworkInventory {
+        identities: Vec::with_capacity(tids.len()),
+        socket_inodes: HashSet::new(),
+    };
+    let mut remaining_descriptors = max_descriptors;
+    for &tid in &tids {
+        let task_dir = process_dir.join("task").join(tid.to_string());
+        let identity = read_network_process_identity(&task_dir, tid)?;
+        // A thread can unshare its descriptor table or network namespace.
+        // Different namespaces cannot be attributed using the leader's tables.
+        check_network_namespace(&task_dir, namespace)?;
+        inventory
+            .socket_inodes
+            .extend(read_socket_inodes_with_budget(
+                &task_dir.join("fd"),
+                &mut remaining_descriptors,
+            )?);
+        check_network_namespace(&task_dir, namespace)?;
+        if read_network_process_identity(&task_dir, tid)? != identity {
+            return Err(invalid_network("task identity changed during collection"));
+        }
+        inventory.identities.push((tid, identity));
+    }
+    if read_task_ids(process_dir, max_tasks)? != tids {
+        return Err(invalid_network(
+            "process task census changed during collection",
+        ));
+    }
+    Ok(inventory)
+}
+
+fn read_optional_socket_table(
+    path: &Path,
+    remaining_bytes: &mut usize,
+) -> std::io::Result<Option<String>> {
+    match fs::File::open(path) {
+        Ok(file) => {
+            let mut content = String::new();
+            file.take(remaining_bytes.saturating_add(1) as u64)
+                .read_to_string(&mut content)
+                .map_err(|error| {
+                    std::io::Error::new(error.kind(), format!("{}: {error}", path.display()))
+                })?;
+            if content.len() > *remaining_bytes {
+                return Err(invalid_network(&format!(
+                    "{}: network namespace table byte limit exceeded",
+                    path.display()
+                )));
+            }
+            *remaining_bytes -= content.len();
+            Ok(Some(content))
+        }
         // Protocol modules (notably IPv6) may be absent. This never proves
         // absence: every descriptor must still resolve through another table.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -282,7 +440,7 @@ fn read_optional_socket_table(path: &Path) -> std::io::Result<Option<String>> {
 }
 
 impl NetworkTables {
-    fn read_from(net_dir: &Path) -> std::io::Result<Self> {
+    fn read_from(net_dir: &Path, mut remaining_bytes: usize) -> std::io::Result<Self> {
         let mut tables = Self::default();
         for (name, ipv6, tcp) in [
             ("tcp", false, true),
@@ -290,7 +448,9 @@ impl NetworkTables {
             ("udp", false, false),
             ("udp6", true, false),
         ] {
-            let Some(content) = read_optional_socket_table(&net_dir.join(name))? else {
+            let Some(content) =
+                read_optional_socket_table(&net_dir.join(name), &mut remaining_bytes)?
+            else {
                 continue;
             };
             validate_inet_table(&content, ipv6)?;
@@ -304,7 +464,9 @@ impl NetworkTables {
                 }
             }
         }
-        if let Some(content) = read_optional_socket_table(&net_dir.join("unix"))? {
+        if let Some(content) =
+            read_optional_socket_table(&net_dir.join("unix"), &mut remaining_bytes)?
+        {
             for socket in parse_proc_net_unix_reader(content.as_bytes())? {
                 tables.unix_by_inode.insert(socket.inode, socket);
             }
@@ -315,7 +477,9 @@ impl NetworkTables {
             ("udplite", false),
             ("udplite6", true),
         ] {
-            if let Some(content) = read_optional_socket_table(&net_dir.join(name))? {
+            if let Some(content) =
+                read_optional_socket_table(&net_dir.join(name), &mut remaining_bytes)?
+            {
                 validate_inet_table(&content, ipv6)?;
                 tables
                     .other_inodes
@@ -323,7 +487,9 @@ impl NetworkTables {
             }
         }
         for name in ["netlink", "packet"] {
-            if let Some(content) = read_optional_socket_table(&net_dir.join(name))? {
+            if let Some(content) =
+                read_optional_socket_table(&net_dir.join(name), &mut remaining_bytes)?
+            {
                 tables.other_inodes.extend(named_inode_table(&content)?);
             }
         }
@@ -637,7 +803,7 @@ impl UnixSocketState {
 
 /// Collect network information for a specific process.
 ///
-/// This function reads /proc/\[pid\]/fd to find socket inodes, then
+/// This function reads every task's descriptor table to find socket inodes, then
 /// looks them up in the target's /proc/[pid]/net tables.
 ///
 /// Note: For bulk collection, use `NetworkSnapshot::collect()` and `get_process_info`
@@ -649,15 +815,25 @@ pub fn collect_network_info(pid: u32) -> Option<NetworkInfo> {
 
 /// Read the complete descriptor directory. An inspection budget or failed
 /// read is unavailable evidence, never a complete empty socket inventory.
+#[cfg(test)]
 fn get_process_socket_inodes_from(
     fd_path: &Path,
     max_inspect: usize,
 ) -> std::io::Result<HashSet<u64>> {
+    let mut remaining_descriptors = max_inspect;
+    read_socket_inodes_with_budget(fd_path, &mut remaining_descriptors)
+}
+
+fn read_socket_inodes_with_budget(
+    fd_path: &Path,
+    remaining_descriptors: &mut usize,
+) -> std::io::Result<HashSet<u64>> {
     let mut inodes = HashSet::new();
-    for (inspected_count, entry) in fs::read_dir(fd_path)?.enumerate() {
-        if inspected_count >= max_inspect {
+    for entry in fs::read_dir(fd_path)? {
+        if *remaining_descriptors == 0 {
             return Err(invalid_network("descriptor inspection limit exceeded"));
         }
+        *remaining_descriptors -= 1;
         let entry = entry?;
         let name = entry.file_name();
         if name
@@ -1109,6 +1285,34 @@ mod tests {
     const INET_HEADER: &str = "sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n";
     const UNIX_HEADER: &str = "Num RefCount Protocol Flags Type St Inode Path\n";
 
+    fn fixture_leader_task(process: &Path, pid: u32) {
+        let task = process.join("task").join(pid.to_string());
+        fs::create_dir_all(&task).unwrap();
+        fs::hard_link(process.join("stat"), task.join("stat")).unwrap();
+        std::os::unix::fs::symlink("../../fd", task.join("fd")).unwrap();
+        std::os::unix::fs::symlink("../../ns", task.join("ns")).unwrap();
+    }
+
+    fn fixture_worker_task(process: &Path, tid: u32, namespace: &Path, sockets: &[u64]) -> PathBuf {
+        let task = process.join("task").join(tid.to_string());
+        fs::create_dir_all(task.join("fd")).unwrap();
+        fs::create_dir_all(task.join("ns")).unwrap();
+        fs::hard_link(namespace, task.join("ns/net")).unwrap();
+        fs::write(
+            task.join("stat"),
+            format!("{tid} (worker) S 1 100 100 0 0 0 0 0 0 0 0 0 0 0 20 0 1 0 22345 4096 1\n",),
+        )
+        .unwrap();
+        for (fd, inode) in sockets.iter().enumerate() {
+            std::os::unix::fs::symlink(
+                format!("socket:[{inode}]"),
+                task.join("fd").join(fd.to_string()),
+            )
+            .unwrap();
+        }
+        task
+    }
+
     fn fixture_process(root: &Path, pid: u32, namespace: &Path, inode: u64, port: u16) -> PathBuf {
         let dir = root.join(pid.to_string());
         for child in ["fd", "net", "ns"] {
@@ -1128,7 +1332,162 @@ mod tests {
             format!("{INET_HEADER}0: 00000000:{port:04X} 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 {inode}\n"),
         ).unwrap();
         std::os::unix::fs::symlink(format!("socket:[{inode}]"), dir.join("fd/3")).unwrap();
+        fixture_leader_task(&dir, pid);
         dir
+    }
+
+    #[test]
+    fn identity_bound_observation_rejects_replaced_or_weak_scan_identities() {
+        const BOOT: &str = "12345678-1234-1234-1234-123456789abc";
+        let root = tempfile::tempdir().unwrap();
+        let namespace = root.path().join("namespace");
+        fs::write(&namespace, "namespace").unwrap();
+        let process = fixture_process(root.path(), 100, &namespace, 42, 8080);
+        let boot_dir = root.path().join("sys/kernel/random");
+        fs::create_dir_all(&boot_dir).unwrap();
+        fs::write(boot_dir.join("boot_id"), format!("{BOOT}\n")).unwrap();
+        let expected = ProcessIdentity::new(
+            100,
+            StartId::from_linux(BOOT, 12345, 100),
+            fs::metadata(&process).unwrap().uid(),
+        );
+        let snapshot = NetworkSnapshot {
+            proc_root: root.path().to_path_buf(),
+            ..NetworkSnapshot::default()
+        };
+        let observed = snapshot.observe_identity(&expected).unwrap();
+        assert!(observed.unavailable.is_empty());
+        assert_eq!(observed.info.listen_ports[0].port, 8080);
+
+        for changed in ["boot", "birth", "owner", "embedded_pid", "quality"] {
+            let mut stale = expected.clone();
+            match changed {
+                "boot" => {
+                    stale.start_id =
+                        StartId::from_linux("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 12345, 100)
+                }
+                "birth" => stale.start_id = StartId::from_linux(BOOT, 12344, 100),
+                "owner" => stale.uid = stale.uid.wrapping_add(1),
+                "embedded_pid" => stale.start_id = StartId::from_linux(BOOT, 12345, 101),
+                "quality" => stale.quality = IdentityQuality::NoBootId,
+                _ => unreachable!(),
+            }
+            let error = snapshot.observe_identity(&stale).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::InvalidData,
+                "{changed}: {error}"
+            );
+        }
+        fs::write(boot_dir.join("boot_id"), "unknown\n").unwrap();
+        assert!(snapshot.observe_identity(&expected).is_err());
+        fs::rename(boot_dir.join("boot_id"), boot_dir.join("saved_boot_id")).unwrap();
+        assert_eq!(
+            snapshot.observe_identity(&expected).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound,
+        );
+    }
+
+    #[test]
+    fn namespace_limits_preserve_cached_evidence_and_reject_excess_work() {
+        let root = tempfile::tempdir().unwrap();
+        let first_namespace = root.path().join("first");
+        let second_namespace = root.path().join("second");
+        fs::write(&first_namespace, "first").unwrap();
+        fs::write(&second_namespace, "second").unwrap();
+        let first = fixture_process(root.path(), 100, &first_namespace, 42, 8080);
+        fixture_process(root.path(), 101, &first_namespace, 42, 8080);
+        fixture_process(root.path(), 200, &second_namespace, 43, 9090);
+        let bytes = fs::read(first.join("net/tcp")).unwrap().len()
+            + fs::read(first.join("net/unix")).unwrap().len();
+        let snapshot = NetworkSnapshot {
+            proc_root: root.path().to_path_buf(),
+            ..NetworkSnapshot::with_limits(1, bytes)
+        };
+        assert_eq!(
+            snapshot.observe_process(100).unwrap().info.listen_ports[0].port,
+            8080
+        );
+        let error = snapshot.observe_process(200).unwrap_err();
+        assert!(
+            error.to_string().contains("namespace inspection limit"),
+            "{error}"
+        );
+        assert_eq!(
+            snapshot.observe_process(101).unwrap().info.listen_ports[0].port,
+            8080
+        );
+
+        // Both files individually fit. Their aggregate exceeds this budget,
+        // so partial protocol coverage cannot become a complete observation.
+        let too_small = NetworkSnapshot {
+            proc_root: root.path().to_path_buf(),
+            ..NetworkSnapshot::with_limits(1, bytes - 1)
+        };
+        let error = too_small.observe_process(100).unwrap_err();
+        assert!(
+            error.to_string().contains("table byte limit exceeded"),
+            "{error}"
+        );
+        assert!(too_small.get_process_info(100).is_none());
+    }
+
+    #[test]
+    fn empty_network_info_roundtrips_without_inventing_sockets() {
+        let encoded = serde_json::to_value(NetworkInfo::default()).unwrap();
+        assert!(encoded.get("tcp_connections").is_none());
+        let decoded: NetworkInfo = serde_json::from_value(encoded).unwrap();
+        assert!(decoded.tcp_connections.is_empty());
+        assert!(decoded.udp_sockets.is_empty());
+        assert!(decoded.listen_ports.is_empty());
+        assert!(decoded.unix_sockets.is_empty());
+        assert_eq!(decoded.socket_counts.tcp, 0);
+    }
+
+    #[test]
+    fn task_descriptor_union_finds_unshared_listeners_and_deduplicates_inherited_sockets() {
+        let root = tempfile::tempdir().unwrap();
+        let namespace = root.path().join("namespace");
+        fs::write(&namespace, "namespace").unwrap();
+        let process = fixture_process(root.path(), 100, &namespace, 42, 8080);
+        let worker = fixture_worker_task(&process, 101, &namespace, &[42, 43]);
+        let tcp = fs::read_to_string(process.join("net/tcp")).unwrap();
+        fs::write(process.join("net/tcp"), format!(
+            "{tcp}1: 0100007F:1F91 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 43\n",
+        )).unwrap();
+        let snapshot = NetworkSnapshot {
+            proc_root: root.path().to_path_buf(),
+            ..NetworkSnapshot::default()
+        };
+        let observed = snapshot.observe_process(100).unwrap();
+        assert!(observed.unavailable.is_empty());
+        assert_eq!(observed.info.socket_counts.tcp, 2);
+        assert_eq!(observed.info.listen_ports.len(), 2);
+        assert!(observed
+            .info
+            .listen_ports
+            .iter()
+            .any(|port| port.port == 8081));
+        let namespace_id = observed.info.namespace.unwrap();
+        let inventory = read_task_network_inventory(&process, namespace_id, 2, 3).unwrap();
+        assert_eq!(inventory.socket_inodes, HashSet::from([42, 43]));
+        assert_eq!(inventory.identities.len(), 2);
+        assert!(read_task_network_inventory(&process, namespace_id, 1, 3)
+            .unwrap_err()
+            .to_string()
+            .contains("task inspection limit"));
+        assert!(read_task_network_inventory(&process, namespace_id, 2, 2)
+            .unwrap_err()
+            .to_string()
+            .contains("descriptor inspection limit"));
+
+        // No permission/read failure or missing task directory may downgrade
+        // an unshared socket table to a proven zero observation.
+        fs::rename(worker.join("fd"), worker.join("saved-fd")).unwrap();
+        fs::write(worker.join("fd"), "unreadable descriptor directory").unwrap();
+        assert!(snapshot.observe_process(100).is_err());
+        fs::rename(process.join("task"), process.join("saved-tasks")).unwrap();
+        assert!(snapshot.observe_process(100).is_err());
     }
 
     #[test]
@@ -1261,11 +1620,19 @@ mod tests {
         use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
         use std::time::{Duration, Instant};
 
-        for changed in ["birth", "namespace", "descriptors"] {
+        for changed in [
+            "birth",
+            "namespace",
+            "descriptors",
+            "task_birth",
+            "task_census",
+            "task_namespace",
+        ] {
             let root = tempfile::tempdir().unwrap();
             let namespace = root.path().join("namespace");
             fs::write(&namespace, "namespace").unwrap();
             let dir = fixture_process(root.path(), 100, &namespace, 42, 8080);
+            fixture_worker_task(&dir, 101, &namespace, &[42]);
             std::os::unix::fs::symlink("socket:[43]", dir.join("fd/4")).unwrap();
             let tcp_path = dir.join("net/tcp");
             let tcp_contents = fs::read_to_string(&tcp_path).unwrap();
@@ -1309,6 +1676,23 @@ mod tests {
                     "descriptors" => {
                         std::os::unix::fs::symlink("socket:[44]", mutation_dir.join("fd/5"))
                             .unwrap();
+                    }
+                    "task_birth" => {
+                        let stat = mutation_dir.join("task/101/stat");
+                        let content = fs::read_to_string(&stat).unwrap();
+                        fs::write(stat, content.replace("22345", "23456")).unwrap();
+                    }
+                    "task_census" => {
+                        fs::rename(
+                            mutation_dir.join("task/101"),
+                            mutation_dir.join("saved-task"),
+                        )
+                        .unwrap();
+                    }
+                    "task_namespace" => {
+                        let task = mutation_dir.join("task/101/ns");
+                        fs::rename(task.join("net"), task.join("saved-net")).unwrap();
+                        fs::write(task.join("net"), "different namespace").unwrap();
                     }
                     _ => unreachable!(),
                 }
@@ -1404,6 +1788,7 @@ mod tests {
             "100 (fixture) S 1 100 100 0 0 0 0 0 0 0 0 0 0 0 20 0 1 0 12345 4096 1\n",
         )
         .unwrap();
+        fixture_leader_task(&process, 100);
         let snapshot = NetworkSnapshot {
             proc_root: root.path().to_path_buf(),
             ..NetworkSnapshot::default()
@@ -1422,11 +1807,13 @@ mod tests {
         let dir = fixture_process(root.path(), 100, &namespace_path, 42, 8080);
         let namespace = NetworkNamespace::from_metadata(&fs::metadata(&namespace_path).unwrap());
         let identity = read_network_process_identity(&dir, 100).unwrap();
-        let sockets = HashSet::from([42]);
-        revalidate_network_observation(&dir, 100, namespace, identity, &sockets).unwrap();
+        let inventory = read_task_network_inventory(&dir, namespace, 10, 10).unwrap();
+        revalidate_network_observation(&dir, 100, namespace, identity, &inventory).unwrap();
         let stat = fs::read_to_string(dir.join("stat")).unwrap();
         fs::write(dir.join("stat"), stat.replace("12345", "23456")).unwrap();
-        assert!(revalidate_network_observation(&dir, 100, namespace, identity, &sockets).is_err());
+        assert!(
+            revalidate_network_observation(&dir, 100, namespace, identity, &inventory).is_err()
+        );
         fs::write(dir.join("stat"), "100 (fixture) S 1\n").unwrap();
         assert!(read_network_process_identity(&dir, 100).is_err());
         let snapshot = NetworkSnapshot {

@@ -17,6 +17,301 @@ fn pt_core() -> Command {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn snapshot_network_listener_child() {
+    use std::io::{BufRead, Write};
+    if std::env::var_os("PT_SNAPSHOT_NETWORK_CHILD").is_none() {
+        return;
+    }
+    let tcp = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let tcp_port = tcp.local_addr().unwrap().port();
+    let _client = std::net::TcpStream::connect(("127.0.0.1", tcp_port)).unwrap();
+    let (_server, _) = tcp.accept().unwrap();
+    let udp = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let unix_path = directory.path().join("snapshot.sock");
+    let _unix = std::os::unix::net::UnixListener::bind(&unix_path).unwrap();
+    println!(
+        "\nPT_SNAPSHOT_NETWORK_READY {}",
+        serde_json::json!({
+            "pid": std::process::id(),
+            "tcp_port": tcp_port,
+            "udp_port": udp.local_addr().unwrap().port(),
+            "unix_path": unix_path,
+        })
+    );
+    std::io::stdout().flush().unwrap();
+    let mut command = String::new();
+    std::io::stdin().lock().read_line(&mut command).unwrap();
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn snapshot_network_reports_owned_endpoints_and_persists_identity_bound_evidence() {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::fs::MetadataExt;
+    use std::process::Stdio;
+
+    struct OwnedListener(std::process::Child);
+    impl Drop for OwnedListener {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = OwnedListener(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "snapshot_network_listener_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("PT_SNAPSHOT_NETWORK_CHILD", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let stdout = child.0.stdout.take().unwrap();
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if let Some(ready) = line.strip_prefix("PT_SNAPSHOT_NETWORK_READY ") {
+                let _ = send.send(serde_json::from_str::<Value>(ready).unwrap());
+                break;
+            }
+        }
+    });
+    let ready = receive.recv_timeout(Duration::from_secs(10)).unwrap();
+    let pid = child.0.id();
+    assert_eq!(ready["pid"], pid);
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config");
+    std::fs::create_dir(&config).unwrap();
+    let bytes = pt_core()
+        .env("PROCESS_TRIAGE_DATA", directory.path().join("data"))
+        .env("PROCESS_TRIAGE_RETENTION", "off")
+        .env("PT_SKIP_GLOBAL_LOCK", "1")
+        .arg("--config")
+        .arg(&config)
+        .args([
+            "--format",
+            "json",
+            "agent",
+            "snapshot",
+            "--include-network",
+            "--window-ms",
+            "0",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&bytes).unwrap();
+    let process = report["process_snapshot"]["processes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|process| process["pid"].as_u64() == Some(u64::from(pid)))
+        .expect("snapshot includes the owned listening process");
+    let birth = pt_core::collect::proc_parsers::read_required_proc_stat(pid).unwrap();
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+    assert_eq!(
+        process["start_id"],
+        format!("{}:{}:{pid}", boot.trim(), birth.starttime)
+    );
+    assert_eq!(
+        process["uid"],
+        std::fs::metadata(format!("/proc/{pid}")).unwrap().uid()
+    );
+    let network = &process["network"];
+    assert_eq!(network["status"], "complete", "{network}");
+    assert_eq!(process["socket_count"], network["socket_count"]);
+    assert!(network["socket_counts"]["tcp"].as_u64().unwrap() >= 3);
+    assert!(network["socket_counts"]["udp"].as_u64().unwrap() >= 1);
+    assert!(network["socket_counts"]["unix"].as_u64().unwrap() >= 1);
+    let namespace = std::fs::metadata(format!("/proc/{pid}/ns/net")).unwrap();
+    assert_eq!(network["namespace"]["inode"], namespace.ino());
+    assert_eq!(network["namespace"]["device"], namespace.dev());
+    for (protocol, port) in [("tcp", &ready["tcp_port"]), ("udp", &ready["udp_port"])] {
+        assert!(network["listen_ports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|listener| {
+                listener["protocol"] == protocol
+                    && &listener["port"] == port
+                    && listener["address"] == "127.0.0.1"
+            }));
+    }
+    assert!(network["tcp_connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|connection| {
+            connection["state"] == "ESTABLISHED"
+                && connection["remote_addr"] == "127.0.0.1"
+                && connection["rx_queue"].is_number()
+        }));
+    assert!(network["unix_sockets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|socket| { socket["path"] == ready["unix_path"] }));
+    let persisted: Value = serde_json::from_slice(
+        &std::fs::read(report["process_snapshot_path"].as_str().unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(persisted, report["process_snapshot"]);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn snapshot_unshared_thread_network_child() {
+    use std::io::{BufRead, Write};
+    use std::os::fd::AsRawFd;
+
+    if std::env::var_os("PT_SNAPSHOT_UNSHARED_NETWORK_CHILD").is_none() {
+        return;
+    }
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        // Only this owned fixture thread receives a separate descriptor table.
+        // A socket opened afterwards is invisible in /proc/PID/fd and must be
+        // discovered through /proc/PID/task/TID/fd instead.
+        // SAFETY: unshare only changes the calling thread's descriptor table.
+        assert_eq!(
+            unsafe { libc::unshare(libc::CLONE_FILES) },
+            0,
+            "unshare owned descriptor table: {}",
+            std::io::Error::last_os_error()
+        );
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        // SAFETY: gettid only reads the current kernel thread ID.
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
+        ready_tx
+            .send(serde_json::json!({
+                "pid": std::process::id(),
+                "tid": tid,
+                "fd": listener.as_raw_fd(),
+                "tcp_port": listener.local_addr().unwrap().port(),
+            }))
+            .unwrap();
+        release_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+        drop(listener);
+    });
+    let ready = ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    println!("\nPT_SNAPSHOT_TASK_NETWORK_READY {ready}");
+    std::io::stdout().flush().unwrap();
+    let mut command = String::new();
+    std::io::stdin().lock().read_line(&mut command).unwrap();
+    let _ = release_tx.send(());
+    worker.join().unwrap();
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn snapshot_network_includes_listener_in_unshared_thread_descriptor_table() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    struct OwnedListener(std::process::Child);
+    impl Drop for OwnedListener {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = OwnedListener(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "snapshot_unshared_thread_network_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("PT_SNAPSHOT_UNSHARED_NETWORK_CHILD", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let stdout = child.0.stdout.take().unwrap();
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if let Some(ready) = line.strip_prefix("PT_SNAPSHOT_TASK_NETWORK_READY ") {
+                let _ = send.send(serde_json::from_str::<Value>(ready).unwrap());
+                break;
+            }
+        }
+    });
+    let ready = receive.recv_timeout(Duration::from_secs(10)).unwrap();
+    let pid = child.0.id();
+    let tid = ready["tid"].as_u64().unwrap();
+    let fd = ready["fd"].as_u64().unwrap();
+    assert_eq!(ready["pid"], pid);
+    assert_ne!(tid, u64::from(pid));
+    let task_socket = std::fs::read_link(format!("/proc/{pid}/task/{tid}/fd/{fd}")).unwrap();
+    assert!(task_socket.to_string_lossy().starts_with("socket:["));
+    assert_ne!(
+        std::fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok(),
+        Some(task_socket),
+        "the fixture must prove the listener is absent from the leader's table"
+    );
+
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config");
+    std::fs::create_dir(&config).unwrap();
+    let bytes = pt_core()
+        .env("PROCESS_TRIAGE_DATA", directory.path().join("data"))
+        .env("PROCESS_TRIAGE_RETENTION", "off")
+        .env("PT_SKIP_GLOBAL_LOCK", "1")
+        .arg("--config")
+        .arg(&config)
+        .args([
+            "--format",
+            "json",
+            "agent",
+            "snapshot",
+            "--include-network",
+            "--window-ms",
+            "0",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&bytes).unwrap();
+    let process = report["process_snapshot"]["processes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|process| process["pid"].as_u64() == Some(u64::from(pid)))
+        .expect("snapshot includes the owned multithreaded process");
+    let network = &process["network"];
+    assert_eq!(network["status"], "complete", "{network}");
+    assert!(network["socket_count"].as_u64().unwrap() >= 1);
+    assert!(network["listen_ports"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|listener| {
+            listener["protocol"] == "tcp"
+                && listener["port"] == ready["tcp_port"]
+                && listener["address"] == "127.0.0.1"
+        }));
+}
+
+#[test]
 fn minimal_snapshot_is_bounded_observation_without_inference_or_executable_plan() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config");

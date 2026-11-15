@@ -25083,6 +25083,270 @@ fn generate_narrative_summary(
     output
 }
 
+const SNAPSHOT_NETWORK_MAX_PROCESSES: usize = 256;
+const SNAPSHOT_NETWORK_MAX_NAMESPACES: usize = 16;
+const SNAPSHOT_NETWORK_MAX_NAMESPACE_BYTES: usize = 8 * 1024 * 1024;
+const SNAPSHOT_NETWORK_MAX_ENDPOINTS: usize = 128;
+const SNAPSHOT_NETWORK_ADMISSION_MS: u64 = 2_000;
+
+/// A snapshot collects each namespace once and stops admitting more work when
+/// its budget is spent. Every omitted process keeps an explicit unknown row.
+struct SnapshotNetworkCollector {
+    #[cfg(target_os = "linux")]
+    snapshot: pt_core::collect::NetworkSnapshot,
+    started: std::time::Instant,
+    inspected: usize,
+    skipped: usize,
+}
+
+impl SnapshotNetworkCollector {
+    fn new() -> Self {
+        Self {
+            #[cfg(target_os = "linux")]
+            snapshot: pt_core::collect::NetworkSnapshot::with_limits(
+                SNAPSHOT_NETWORK_MAX_NAMESPACES,
+                SNAPSHOT_NETWORK_MAX_NAMESPACE_BYTES,
+            ),
+            started: std::time::Instant::now(),
+            inspected: 0,
+            skipped: 0,
+        }
+    }
+
+    fn observe(&mut self, process: &ProcessRecord) -> serde_json::Value {
+        if self.inspected >= SNAPSHOT_NETWORK_MAX_PROCESSES
+            || self.started.elapsed() >= Duration::from_millis(SNAPSHOT_NETWORK_ADMISSION_MS)
+        {
+            self.skipped += 1;
+            return snapshot_network_unavailable(
+                "inspection_budget_exhausted",
+                "network inspection budget exhausted before this process; use --top to focus the snapshot",
+            );
+        }
+        self.inspected += 1;
+        #[cfg(target_os = "linux")]
+        {
+            match self
+                .snapshot
+                .observe_identity(&process_identity_from_record(process))
+            {
+                Ok(observation) => snapshot_network_observation(observation),
+                Err(error) => {
+                    let reason = match error.kind() {
+                        std::io::ErrorKind::PermissionDenied => "permission_denied",
+                        std::io::ErrorKind::NotFound => "process_or_evidence_disappeared",
+                        std::io::ErrorKind::InvalidData => "incomplete_or_changed_evidence",
+                        _ => "collection_failed",
+                    };
+                    snapshot_network_unavailable(reason, &error.to_string())
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = process;
+            snapshot_network_unavailable(
+                "unsupported_platform",
+                "identity-bound network snapshots are currently available on Linux",
+            )
+        }
+    }
+
+    fn summary(&self) -> serde_json::Value {
+        #[cfg(target_os = "linux")]
+        let (max_tasks, max_descriptors) = (
+            pt_core::collect::network::NETWORK_MAX_TASKS,
+            pt_core::collect::network::NETWORK_MAX_DESCRIPTORS,
+        );
+        #[cfg(not(target_os = "linux"))]
+        let (max_tasks, max_descriptors) = (0, 0);
+        serde_json::json!({
+            "scope": "target_network_namespace",
+            "descriptor_scope": "all_tasks_in_thread_group",
+            "namespace_tables": "collected_once_per_namespace_during_this_snapshot",
+            "socket_count_semantics": "distinct_socket_inodes",
+            "queue_semantics": "point_in_time_bytes_not_transfer_rates",
+            "attempted_processes": self.inspected,
+            "skipped_processes": self.skipped,
+            "elapsed_ms": self.started.elapsed().as_millis(),
+            "limits": {
+                "processes": SNAPSHOT_NETWORK_MAX_PROCESSES,
+                "namespaces": SNAPSHOT_NETWORK_MAX_NAMESPACES,
+                "namespace_table_bytes": SNAPSHOT_NETWORK_MAX_NAMESPACE_BYTES,
+                "tasks_per_process": max_tasks,
+                "descriptor_visits_per_process_pass": max_descriptors,
+                "endpoints_per_kind": SNAPSHOT_NETWORK_MAX_ENDPOINTS,
+                "admission_window_ms": SNAPSHOT_NETWORK_ADMISSION_MS,
+            },
+        })
+    }
+}
+
+fn snapshot_network_unavailable(reason: &str, detail: &str) -> serde_json::Value {
+    serde_json::json!({
+        "status": "unavailable",
+        "available": false,
+        "source": if cfg!(target_os = "linux") { "proc_pid_net_and_fd" } else { "none" },
+        "reason": reason,
+        "observed_at": null,
+        "namespace": null,
+        "socket_count": null,
+        "socket_counts": null,
+        "observed_socket_count": null,
+        "observed_socket_counts": null,
+        "listener_count": null,
+        "observed_listener_count": null,
+        "listen_ports": null,
+        "tcp_connections": null,
+        "udp_sockets": null,
+        "unix_sockets": null,
+        "unavailable": [detail],
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn snapshot_network_observation(
+    observation: pt_core::collect::NetworkObservation,
+) -> serde_json::Value {
+    let pt_core::collect::NetworkObservation {
+        mut info,
+        unavailable,
+    } = observation;
+    let counts = &info.socket_counts;
+    let observed_socket_count =
+        counts.tcp + counts.tcp6 + counts.udp + counts.udp6 + counts.unix + counts.raw;
+    let complete = unavailable.is_empty();
+    let rx_queue_bytes = info.total_rx_queue();
+    let tx_queue_bytes = info.total_tx_queue();
+    let observed_listener_count = info.listen_ports.len();
+    let omitted = serde_json::json!({
+        "listen_ports": info.listen_ports.len().saturating_sub(SNAPSHOT_NETWORK_MAX_ENDPOINTS),
+        "tcp_connections": info.tcp_connections.len().saturating_sub(SNAPSHOT_NETWORK_MAX_ENDPOINTS),
+        "udp_sockets": info.udp_sockets.len().saturating_sub(SNAPSHOT_NETWORK_MAX_ENDPOINTS),
+        "unix_sockets": info.unix_sockets.len().saturating_sub(SNAPSHOT_NETWORK_MAX_ENDPOINTS),
+    });
+    let truncated = omitted
+        .as_object()
+        .is_some_and(|fields| fields.values().any(|count| count.as_u64().unwrap_or(0) > 0));
+    // Keep truncation deterministic, prioritize listener addresses, and retain
+    // uncapped totals. Positive partial evidence remains useful reconnaissance.
+    info.listen_ports.sort_by(|a, b| {
+        (&a.protocol, a.port, &a.address, a.inode).cmp(&(&b.protocol, b.port, &b.address, b.inode))
+    });
+    info.tcp_connections.sort_by_key(|socket| socket.inode);
+    info.udp_sockets.sort_by_key(|socket| socket.inode);
+    info.unix_sockets.sort_by_key(|socket| socket.inode);
+    info.listen_ports.truncate(SNAPSHOT_NETWORK_MAX_ENDPOINTS);
+    info.tcp_connections
+        .truncate(SNAPSHOT_NETWORK_MAX_ENDPOINTS);
+    info.udp_sockets.truncate(SNAPSHOT_NETWORK_MAX_ENDPOINTS);
+    info.unix_sockets.truncate(SNAPSHOT_NETWORK_MAX_ENDPOINTS);
+    serde_json::json!({
+        "status": if complete { "complete" } else { "partial" },
+        "available": true,
+        "source": "proc_pid_net_and_fd",
+        "observed_at": chrono::Utc::now().to_rfc3339(),
+        "namespace": info.namespace,
+        "socket_count": complete.then_some(observed_socket_count),
+        "socket_counts": complete.then_some(&info.socket_counts),
+        "observed_socket_count": observed_socket_count,
+        "observed_socket_counts": info.socket_counts,
+        "listener_count": complete.then_some(observed_listener_count),
+        "observed_listener_count": observed_listener_count,
+        "listen_ports": info.listen_ports,
+        "tcp_connections": info.tcp_connections,
+        "udp_sockets": info.udp_sockets,
+        "unix_sockets": info.unix_sockets,
+        "observed_tcp_rx_queue_bytes": rx_queue_bytes,
+        "observed_tcp_tx_queue_bytes": tx_queue_bytes,
+        "truncated": truncated,
+        "omitted": omitted,
+        "unavailable": unavailable,
+    })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod snapshot_network_tests {
+    use super::*;
+    use pt_core::collect::{ListenPort, NetworkInfo, NetworkObservation};
+
+    #[test]
+    fn network_unknown_is_distinct_from_a_validated_empty_inventory() {
+        let unavailable = snapshot_network_unavailable("permission_denied", "permission denied");
+        assert_eq!(unavailable["status"], "unavailable");
+        for field in [
+            "socket_count",
+            "socket_counts",
+            "observed_socket_count",
+            "listen_ports",
+        ] {
+            assert!(unavailable[field].is_null(), "{field}: {unavailable}");
+        }
+        let empty = snapshot_network_observation(NetworkObservation {
+            info: NetworkInfo::default(),
+            unavailable: Vec::new(),
+        });
+        assert_eq!(empty["status"], "complete");
+        assert_eq!(empty["socket_count"], 0);
+        assert_eq!(empty["listener_count"], 0);
+        assert_eq!(empty["listen_ports"], serde_json::json!([]));
+        assert_eq!(empty["unavailable"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn partial_network_retains_positive_listeners_without_claiming_complete_counts() {
+        let mut info = NetworkInfo::default();
+        info.socket_counts.tcp = 1;
+        info.listen_ports.push(ListenPort {
+            protocol: "tcp".to_string(),
+            port: 8080,
+            address: "127.0.0.1".to_string(),
+            inode: 42,
+        });
+        let observed = snapshot_network_observation(NetworkObservation {
+            info,
+            unavailable: vec!["another socket could not be attributed".to_string()],
+        });
+        assert_eq!(observed["status"], "partial");
+        assert!(observed["socket_count"].is_null());
+        assert!(observed["socket_counts"].is_null());
+        assert!(observed["listener_count"].is_null());
+        assert_eq!(observed["observed_socket_count"], 1);
+        assert_eq!(observed["observed_socket_counts"]["tcp"], 1);
+        assert_eq!(observed["listen_ports"][0]["port"], 8080);
+        assert_eq!(observed["unavailable"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn endpoint_output_is_bounded_deterministic_and_preserves_exact_totals() {
+        let count = SNAPSHOT_NETWORK_MAX_ENDPOINTS + 3;
+        let mut info = NetworkInfo::default();
+        info.socket_counts.tcp = count;
+        for port in (0..count).rev() {
+            info.listen_ports.push(ListenPort {
+                protocol: "tcp".to_string(),
+                port: 8000 + port as u16,
+                address: "0.0.0.0".to_string(),
+                inode: 100 + port as u64,
+            });
+        }
+        let observed = snapshot_network_observation(NetworkObservation {
+            info,
+            unavailable: Vec::new(),
+        });
+        assert_eq!(observed["status"], "complete");
+        assert_eq!(observed["socket_count"], count);
+        assert_eq!(observed["listener_count"], count);
+        assert_eq!(
+            observed["listen_ports"].as_array().unwrap().len(),
+            SNAPSHOT_NETWORK_MAX_ENDPOINTS
+        );
+        assert_eq!(observed["listen_ports"][0]["port"], 8000);
+        assert_eq!(observed["omitted"]["listen_ports"], 3);
+        assert_eq!(observed["truncated"], true);
+    }
+}
+
 fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode {
     let config_options = ConfigOptions {
         config_dir: global.config.as_ref().map(PathBuf::from),
@@ -25522,12 +25786,16 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                 processes.truncate(top_n);
             }
 
+            let mut network_collector = args.include_network.then(SnapshotNetworkCollector::new);
+
             // Build process summaries for output
             let summaries: Vec<serde_json::Value> = processes
                 .iter()
                 .map(|(p, activity, cpu_percent)| {
                     let mut obj = serde_json::json!({
                         "pid": p.pid.0,
+                        "start_id": p.start_id,
+                        "uid": p.uid,
                         "ppid": p.ppid.0,
                         "user": &p.user,
                         "comm": &p.comm,
@@ -25569,30 +25837,14 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                         }
                     }
 
-                    // Add network connections placeholder
-                    if args.include_network {
-                        // Count file descriptors that look like sockets
-                        let fd_path = format!("/proc/{}/fd", p.pid.0);
-                        let socket_count = std::fs::read_dir(&fd_path)
-                            .map(|entries| {
-                                entries
-                                    .filter_map(|e| e.ok())
-                                    .filter(|e| {
-                                        e.path()
-                                            .read_link()
-                                            .map(|target| {
-                                                target.to_string_lossy().starts_with("socket:")
-                                            })
-                                            .unwrap_or(false)
-                                    })
-                                    .count()
-                            })
-                            .unwrap_or(0);
+                    if let Some(collector) = network_collector.as_mut() {
+                        let network = collector.observe(p);
                         if let Some(obj_mut) = obj.as_object_mut() {
                             obj_mut.insert(
                                 "socket_count".to_string(),
-                                serde_json::json!(socket_count),
+                                network["socket_count"].clone(),
                             );
+                            obj_mut.insert("network".to_string(), network);
                         }
                     }
 
@@ -25606,6 +25858,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                 "window_ms": args.window_ms,
                 "include_env": args.include_env,
                 "include_network": args.include_network,
+                "network_collection": network_collector.as_ref().map(SnapshotNetworkCollector::summary),
                 "processes": summaries,
             }))
         } else {
@@ -25614,6 +25867,16 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
     } else {
         None
     };
+
+    if let Some(snapshot) = &process_snapshot {
+        if let Err(error) = pt_core::session::write_json_pretty(
+            &handle.dir.join("scan/process_snapshot.json"),
+            snapshot,
+        ) {
+            eprintln!("agent snapshot: failed to persist process observation: {error}");
+            return ExitCode::InternalError;
+        }
+    }
 
     // Build capabilities summary for output
     let capabilities_summary = serde_json::json!({
@@ -25657,6 +25920,10 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
             if let Some(procs) = &process_snapshot {
                 if let Some(out_mut) = output.as_object_mut() {
                     out_mut.insert("process_snapshot".to_string(), procs.clone());
+                    out_mut.insert(
+                        "process_snapshot_path".to_string(),
+                        serde_json::json!(handle.dir.join("scan/process_snapshot.json")),
+                    );
                 }
             }
             println!("{}", format_structured_output(global, output));
@@ -25758,6 +26025,33 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                             .unwrap_or_else(|| "unknown".to_string());
                         let rss = p.get("rss_mb").and_then(|v| v.as_u64()).unwrap_or(0);
                         println!("    {:>7} {:<20} {:>7} CPU {:>6}MB", pid, comm, cpu, rss);
+                        if let Some(network) = p.get("network") {
+                            let status = network["status"].as_str().unwrap_or("unavailable");
+                            let sockets = network["socket_count"]
+                                .as_u64()
+                                .map(|count| count.to_string())
+                                .unwrap_or_else(|| "unknown".to_string());
+                            println!("      Network: {sockets} sockets ({status})");
+                            if let Some(listeners) = network["listen_ports"].as_array() {
+                                for listener in listeners.iter().take(5) {
+                                    println!(
+                                        "        {} [{}]:{}",
+                                        listener["protocol"].as_str().unwrap_or("?"),
+                                        listener["address"].as_str().unwrap_or("?"),
+                                        listener["port"].as_u64().unwrap_or(0),
+                                    );
+                                }
+                            }
+                            if let Some(reason) = network["unavailable"][0].as_str() {
+                                println!("        Unavailable: {reason}");
+                            }
+                        }
+                    }
+                    if args.include_network {
+                        println!(
+                            "  Network details: {}",
+                            handle.dir.join("scan/process_snapshot.json").display()
+                        );
                     }
                     if procs.len() > 10 {
                         println!(
