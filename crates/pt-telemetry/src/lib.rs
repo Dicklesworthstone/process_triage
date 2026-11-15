@@ -9,6 +9,7 @@
 pub mod disruptor;
 pub mod query;
 pub mod recorder;
+pub mod redact;
 pub mod retention;
 pub mod schema;
 pub mod shadow;

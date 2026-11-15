@@ -4146,6 +4146,7 @@ dependencies = [
  "libc",
  "parquet",
  "pt-common",
+ "pt-redact",
  "serde",
  "serde_json",
  "tempfile",

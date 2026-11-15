@@ -1919,7 +1919,7 @@ These failure-recovery trees describe escalation and diagnosis. Explicit undo re
 
 ---
 
-## Querying and Exporting Stored Telemetry
+## Querying, Exporting, and Redacting Stored Telemetry
 
 `query telemetry` reads a Parquet telemetry table, filters by event time and
 optional session ID, and returns the newest matching rows across its partitions.
@@ -1932,21 +1932,33 @@ pt query telemetry --table audit --range 24h --limit 100 --format json
 pt query telemetry --table outcomes --session "$SESSION_ID" --range 7d
 pt telemetry export --table audit --range 7d --export-format json --output audit.json
 pt telemetry export --table proc_samples --export-format parquet --output samples.parquet
+pt telemetry redact --all --output ./telemetry-safe
+pt telemetry --telemetry-dir ./telemetry-safe export --table audit --export-format json --output audit-safe.json
 ```
 
-Both commands accept `--telemetry-dir`. Available tables are `runs`,
+These commands accept `--telemetry-dir`. Available tables are `runs`,
 `proc_samples`, `proc_features`, `proc_inference`, `outcomes`, `audit`, and
 `signature_matches`. Export streams one table to Parquet, CSV, JSON, or JSONL;
 without `--range` it includes all stored rows. Existing output files are
 refused, and destinations must be outside the input telemetry directory.
 A failed read or write does not publish a partial export.
 
+`telemetry redact --all --output DIR` creates a private, queryable Parquet copy
+of all seven tables using the `safe` sharing profile. `--profile minimal` is
+also available. Text and embedded JSON pass through the redaction engine;
+numeric, boolean, and null values retain their types. One fresh pseudonymization
+key is shared across the copy so related identifiers still join within it;
+identifier pseudonyms differ between copies. The original lake is unchanged. The output
+directory must be new and outside the source lake, and is published only after
+every table succeeds. The command reports file, row, and redacted-value counts.
+
 These commands read data already present in the Parquet lake. Normal triage
 sessions still use JSON/JSONL artifacts, and shadow observations use their
 separate storage; this feature does not enable the library-only recorder below.
-Exports preserve the stored values and redaction. They do not apply a new sharing
-profile; use a safe session bundle when sharing session evidence. Arbitrary query
-expressions and in-place `telemetry redact` remain unavailable.
+Single-table exports preserve the stored values and redaction. To apply a new
+sharing profile, first create a redacted copy and export or query that copy.
+Use a safe session bundle when sharing session evidence. Arbitrary query
+expressions and in-place redaction remain unavailable.
 
 ## Telemetry: Lock-Free Event Recording
 

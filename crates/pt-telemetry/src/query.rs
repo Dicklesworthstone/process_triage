@@ -14,15 +14,15 @@ use arrow::compute::filter_record_batch;
 use arrow::json::writer::{JsonArray, LineDelimited, WriterBuilder};
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
 
 use crate::schema::{TableName, TelemetrySchema};
 
-const READ_BATCH_SIZE: usize = 1024;
+pub(crate) const READ_BATCH_SIZE: usize = 1024;
 pub const MAX_QUERY_ROWS: usize = 10_000;
 
 #[derive(Debug, Error)]
@@ -291,6 +291,49 @@ fn scan_batches(
     mut visit: impl FnMut(&RecordBatch) -> Result<(), QueryError>,
 ) -> Result<ReadSummary, QueryError> {
     options.validate()?;
+    let mut matched = 0;
+    let mut summary = scan_table_batches(root, options.table, |batch| {
+        let times = timestamps(batch, options.table)?;
+        let sessions = batch
+            .column_by_name("session_id")
+            .and_then(|array| array.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| QueryError::Invalid("session_id must be UTF-8".into()))?;
+        let selected = BooleanArray::from(
+            (0..batch.num_rows())
+                .map(|index| {
+                    !times.is_null(index)
+                        && options
+                            .since
+                            .is_none_or(|time| times.value(index) >= time.timestamp_micros())
+                        && options
+                            .until
+                            .is_none_or(|time| times.value(index) <= time.timestamp_micros())
+                        && options.session_id.as_ref().is_none_or(|session| {
+                            !sessions.is_null(index) && sessions.value(index) == session
+                        })
+                })
+                .collect::<Vec<_>>(),
+        );
+        let batch = filter_record_batch(batch, &selected)?;
+        matched += batch.num_rows() as u64;
+        if batch.num_rows() > 0 {
+            visit(&batch)?;
+        }
+        Ok(())
+    })?;
+    summary.rows_matched = matched;
+    Ok(summary)
+}
+
+/// Shared schema-checked traversal for queries and complete sanitized copies.
+/// Empty Parquet files are validated before iteration; unfinished files are not
+/// read. Row filtering belongs to the caller, so a copy cannot silently discard
+/// observations merely because their event timestamp is absent.
+pub(crate) fn scan_table_batches(
+    root: &Path,
+    table: TableName,
+    mut visit: impl FnMut(&RecordBatch) -> Result<(), QueryError>,
+) -> Result<ReadSummary, QueryError> {
     let mut files = Vec::new();
     match fs::symlink_metadata(root) {
         Ok(metadata) if metadata.is_dir() => {}
@@ -298,15 +341,15 @@ fn scan_batches(
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(ReadSummary::default()),
         Err(err) => return Err(err.into()),
     }
-    collect_files(&root.join(options.table.as_str()), 0, &mut files)?;
+    collect_files(&root.join(table.as_str()), 0, &mut files)?;
     files.sort();
-    let expected = TelemetrySchema::new().get(options.table);
+    let expected = TelemetrySchema::new().get(table);
     let mut summary = ReadSummary::default();
     for path in files {
         let builder = ParquetRecordBatchReaderBuilder::try_new(open_regular_file(&path)?)?;
         if builder.schema().fields() != expected.fields() {
             return Err(QueryError::Schema {
-                table: options.table.to_string(),
+                table: table.to_string(),
                 path,
             });
         }
@@ -315,32 +358,8 @@ fn scan_batches(
         for batch in reader {
             let batch = batch?;
             summary.rows_scanned += batch.num_rows() as u64;
-            let times = timestamps(&batch, options.table)?;
-            let sessions = batch
-                .column_by_name("session_id")
-                .and_then(|array| array.as_any().downcast_ref::<StringArray>())
-                .ok_or_else(|| QueryError::Invalid("session_id must be UTF-8".into()))?;
-            let selected = BooleanArray::from(
-                (0..batch.num_rows())
-                    .map(|index| {
-                        !times.is_null(index)
-                            && options
-                                .since
-                                .is_none_or(|time| times.value(index) >= time.timestamp_micros())
-                            && options
-                                .until
-                                .is_none_or(|time| times.value(index) <= time.timestamp_micros())
-                            && options.session_id.as_ref().is_none_or(|session| {
-                                !sessions.is_null(index) && sessions.value(index) == session
-                            })
-                    })
-                    .collect::<Vec<_>>(),
-            );
-            let batch = filter_record_batch(&batch, &selected)?;
             summary.rows_matched += batch.num_rows() as u64;
-            if batch.num_rows() > 0 {
-                visit(&batch)?;
-            }
+            visit(&batch)?;
         }
     }
     Ok(summary)

@@ -1904,11 +1904,19 @@ enum TelemetryCommands {
         #[arg(long)]
         keep_everything: bool,
     },
-    /// Redact sensitive data
+    /// Create a private redacted copy of all persisted telemetry tables
     Redact {
-        /// Apply redaction to all stored telemetry
-        #[arg(long)]
+        /// Include all persisted tables (source data is never modified)
+        #[arg(long, required = true)]
         all: bool,
+
+        /// New output directory, outside the source telemetry directory
+        #[arg(short, long)]
+        output: String,
+
+        /// Sharing profile; one fresh pseudonymization key is used for the entire copy
+        #[arg(long, default_value = "safe", value_parser = ["safe", "minimal"])]
+        profile: String,
     },
 }
 
@@ -17211,10 +17219,75 @@ fn run_telemetry(global: &GlobalOpts, _args: &TelemetryArgs) -> ExitCode {
             keep_everything,
         } => run_telemetry_prune(global, _args, keep, *dry_run, *keep_everything),
         TelemetryCommands::Export { .. } => run_telemetry_export(global, _args),
-        TelemetryCommands::Redact { .. } => {
-            output_stub(global, "telemetry redact", "Redaction not yet implemented")
-        }
+        TelemetryCommands::Redact { .. } => run_telemetry_redact(global, _args),
     }
+}
+
+fn run_telemetry_redact(global: &GlobalOpts, args: &TelemetryArgs) -> ExitCode {
+    let TelemetryCommands::Redact {
+        all,
+        output,
+        profile,
+    } = &args.command
+    else {
+        return ExitCode::ArgsError;
+    };
+    if !all {
+        eprintln!("telemetry redact: select all persisted tables with --all");
+        return ExitCode::ArgsError;
+    }
+    let export_profile = match pt_redact::ExportProfile::parse_str(profile) {
+        Some(profile @ (pt_redact::ExportProfile::Safe | pt_redact::ExportProfile::Minimal)) => {
+            profile
+        }
+        _ => {
+            eprintln!("telemetry redact: profile must be safe or minimal");
+            return ExitCode::ArgsError;
+        }
+    };
+    let engine = match pt_redact::RedactionEngine::new(pt_redact::RedactionPolicy {
+        default_profile: export_profile,
+        ..Default::default()
+    }) {
+        Ok(engine) => engine,
+        Err(error) => {
+            eprintln!("telemetry redact: cannot initialize redaction: {error}");
+            return ExitCode::InternalError;
+        }
+    };
+    let summary = match pt_telemetry::redact::redact_telemetry(
+        &resolve_telemetry_dir(args),
+        Path::new(output),
+        &engine,
+    ) {
+        Ok(summary) => summary,
+        Err(error) => {
+            eprintln!("telemetry redact: {error}");
+            return ExitCode::IoError;
+        }
+    };
+    let response = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "command": "telemetry redact",
+        "status": "ok",
+        "output": output,
+        "profile": profile,
+        "source_modified": false,
+        "pseudonym_scope": "this_export",
+        "summary": summary,
+    });
+    match global.format {
+        OutputFormat::Json | OutputFormat::Toon => {
+            println!("{}", format_structured_output(global, response));
+        }
+        OutputFormat::Jsonl => println!("{response}"),
+        OutputFormat::Exitcode => {}
+        _ => println!(
+            "Created {} redacted table files in {}: {} rows, {} values redacted ({})",
+            summary.files_written, output, summary.rows_scanned, summary.values_redacted, profile
+        ),
+    }
+    ExitCode::Clean
 }
 
 fn run_telemetry_export(global: &GlobalOpts, args: &TelemetryArgs) -> ExitCode {

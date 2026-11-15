@@ -758,3 +758,160 @@ fn corrupt_telemetry_returns_failure_and_does_not_publish_an_export() {
         .stderr(predicate::str::contains("Parquet"));
     assert!(!output.exists());
 }
+
+#[test]
+fn telemetry_redact_cli_creates_queryable_private_copy_without_changing_source() {
+    let temp = tempdir().unwrap();
+    let lake = temp.path().join("lake");
+    let recorder = pt_telemetry::recorder::TelemetryRecorder::new(
+        16,
+        pt_telemetry::WriterConfig::new(
+            lake.clone(),
+            "private-review-session".into(),
+            "private-workstation".into(),
+        ),
+    );
+    let secret = "password=do-not-export-this-credential";
+    recorder.record_event(pt_telemetry::EventType::StateChange, 4242, secret);
+    drop(recorder);
+    let options = pt_telemetry::query::QueryOptions::new(pt_telemetry::TableName::Audit);
+    let original = pt_telemetry::query::query_rows(&lake, &options, 10)
+        .unwrap()
+        .rows;
+    assert_eq!(original[0]["message"], secret);
+
+    for profile in ["safe", "minimal"] {
+        let destination = temp.path().join(profile);
+        let output = pt_core()
+            .args(["--format", "json", "telemetry", "--telemetry-dir"])
+            .arg(&lake)
+            .args(["redact", "--all", "--profile", profile, "--output"])
+            .arg(&destination)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let report: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(report["command"], "telemetry redact");
+        assert_eq!(report["status"], "ok");
+        assert_eq!(report["profile"], profile);
+        assert_eq!(report["source_modified"], false);
+        assert_eq!(report["pseudonym_scope"], "this_export");
+        assert_eq!(report["summary"]["rows_scanned"], 1);
+        assert_eq!(report["summary"]["files_written"], 7);
+        assert!(report["summary"]["values_redacted"].as_u64().unwrap() > 0);
+
+        // A real CLI consumer must read the sanitized table without adapting
+        // its schema or interpreting a replacement manifest as telemetry.
+        let output = pt_core()
+            .args(["--format", "json", "query", "telemetry", "--telemetry-dir"])
+            .arg(&destination)
+            .args(["--table", "audit", "--range", "1d"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let sanitized: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(sanitized["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(sanitized["rows"][0]["target_pid"], 4242);
+        assert_eq!(sanitized["rows"][0]["audit_ts"], original[0]["audit_ts"]);
+        assert!(sanitized["rows"][0]["target_start_id"].is_null());
+        let text = serde_json::to_string(&sanitized).unwrap();
+        for sensitive in [
+            "do-not-export-this-credential",
+            "private-workstation",
+            "private-review-session",
+        ] {
+            assert!(!text.contains(sensitive), "{profile} leaked {sensitive}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&destination).unwrap().permissions().mode() & 0o077,
+                0
+            );
+        }
+        assert_eq!(
+            pt_telemetry::query::query_rows(&lake, &options, 10)
+                .unwrap()
+                .rows,
+            original
+        );
+    }
+}
+
+#[test]
+fn telemetry_redact_cli_requires_explicit_copy_and_refuses_unsafe_destinations() {
+    let temp = tempdir().unwrap();
+    let lake = temp.path().join("lake");
+    seed_queryable_telemetry(&lake);
+    let destination = temp.path().join("redacted");
+    for flags in [
+        vec!["redact"],
+        vec!["redact", "--all"],
+        vec!["redact", "--output", destination.to_str().unwrap()],
+        vec![
+            "redact",
+            "--all",
+            "--profile",
+            "forensic",
+            "--output",
+            destination.to_str().unwrap(),
+        ],
+    ] {
+        pt_core()
+            .args(["telemetry", "--telemetry-dir"])
+            .arg(&lake)
+            .args(flags)
+            .assert()
+            .code(10);
+        assert!(!destination.exists());
+    }
+    fs::create_dir(&destination).unwrap();
+    fs::write(destination.join("preserve.txt"), b"existing output").unwrap();
+    for refused in [&destination, &lake, &lake.join("redacted")] {
+        pt_core()
+            .args(["telemetry", "--telemetry-dir"])
+            .arg(&lake)
+            .args(["redact", "--all", "--output"])
+            .arg(refused)
+            .assert()
+            .failure();
+    }
+    assert_eq!(
+        fs::read(destination.join("preserve.txt")).unwrap(),
+        b"existing output"
+    );
+    assert!(!lake.join("redacted").exists());
+}
+
+#[test]
+fn telemetry_redact_cli_never_publishes_a_partial_copy() {
+    let temp = tempdir().unwrap();
+    let lake = temp.path().join("lake");
+    seed_queryable_telemetry(&lake);
+    let corrupt = lake.join("signature_matches/last.parquet");
+    create_fake_parquet(&corrupt, 64, 0).unwrap();
+    let original = fs::read(&corrupt).unwrap();
+    let destination = temp.path().join("redacted");
+    pt_core()
+        .args(["--format", "json", "telemetry", "--telemetry-dir"])
+        .arg(&lake)
+        .args(["redact", "--all", "--output"])
+        .arg(&destination)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Parquet"));
+    assert!(!destination.exists());
+    assert_eq!(fs::read(&corrupt).unwrap(), original);
+    let options = pt_telemetry::query::QueryOptions::new(pt_telemetry::TableName::Audit);
+    assert_eq!(
+        pt_telemetry::query::query_rows(&lake, &options, 1)
+            .unwrap()
+            .rows[0]["message"],
+        "known audit event"
+    );
+}
