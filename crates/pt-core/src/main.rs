@@ -623,12 +623,31 @@ enum QueryCommands {
         #[arg(long, default_value = "100", value_parser = clap::value_parser!(u32).range(1..=10000))]
         limit: u32,
     },
-    /// Query telemetry data
-    Telemetry {
-        /// Time range (e.g., "1h", "24h", "7d")
-        #[arg(long, default_value = "24h")]
-        range: String,
-    },
+    /// Query recent rows from a persisted Parquet telemetry table
+    Telemetry(TelemetryQueryArgs),
+}
+
+#[derive(Args, Debug)]
+struct TelemetryQueryArgs {
+    /// Event-time range (e.g., "1h", "24h", "7d")
+    #[arg(long, default_value = "24h")]
+    range: String,
+
+    /// Table: runs, proc_samples, proc_features, proc_inference, outcomes, audit, signature_matches
+    #[arg(long, default_value = "audit")]
+    table: pt_telemetry::TableName,
+
+    /// Filter rows by exact session ID
+    #[arg(long)]
+    session: Option<String>,
+
+    /// Maximum rows to return, newest event first
+    #[arg(long, default_value = "100", value_parser = clap::value_parser!(u32).range(1..=10000))]
+    limit: u32,
+
+    /// Telemetry root directory (defaults to XDG data dir)
+    #[arg(long)]
+    telemetry_dir: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -1849,16 +1868,27 @@ struct TelemetryArgs {
 enum TelemetryCommands {
     /// Show telemetry status
     Status,
-    /// Export telemetry data
+    /// Export one persisted telemetry table without changing its stored redaction
     Export {
-        /// Output path
+        /// Output path (must not exist, and must be outside the telemetry directory)
         #[arg(short, long)]
         output: String,
 
-        /// Export format (parquet, csv, json). (Named `--export-format`: a `format`
-        /// arg here collided with the global `--format` and panicked on every call.)
-        #[arg(long = "export-format", default_value = "parquet")]
+        /// Export format (separate from the global output format)
+        #[arg(long = "export-format", default_value = "parquet", value_parser = ["parquet", "csv", "json", "jsonl"])]
         export_format: String,
+
+        /// Table: runs, proc_samples, proc_features, proc_inference, outcomes, audit, signature_matches
+        #[arg(long, default_value = "audit")]
+        table: pt_telemetry::TableName,
+
+        /// Export only this event-time range (default: all stored rows)
+        #[arg(long)]
+        range: Option<String>,
+
+        /// Filter rows by exact session ID
+        #[arg(long)]
+        session: Option<String>,
     },
     /// Prune old telemetry data
     Prune {
@@ -10487,11 +10517,7 @@ fn run_query(global: &GlobalOpts, args: &QueryArgs) -> ExitCode {
         Some(QueryCommands::Actions { session, limit }) => {
             run_query_actions(global, session.as_deref(), *limit)
         }
-        Some(QueryCommands::Telemetry { .. }) => output_stub(
-            global,
-            "query telemetry",
-            "Query telemetry mode not yet implemented",
-        ),
+        Some(QueryCommands::Telemetry(args)) => run_query_telemetry(global, args),
         None => {
             if let Some(expr) = &args.query {
                 output_stub(
@@ -10505,6 +10531,84 @@ fn run_query(global: &GlobalOpts, args: &QueryArgs) -> ExitCode {
             }
         }
     }
+}
+
+fn telemetry_query_options(
+    table: pt_telemetry::TableName,
+    range: Option<&str>,
+    session: Option<&str>,
+) -> Result<pt_telemetry::query::QueryOptions, String> {
+    let mut options = pt_telemetry::query::QueryOptions::new(table);
+    options.session_id = session.map(str::to_string);
+    if let Some(range) = range {
+        let duration = parse_duration(range)
+            .filter(|duration| *duration > chrono::Duration::zero())
+            .ok_or_else(|| format!("invalid positive telemetry range: {range}"))?;
+        let now = chrono::Utc::now();
+        options.since = Some(
+            now.checked_sub_signed(duration)
+                .ok_or_else(|| format!("telemetry range is too large: {range}"))?,
+        );
+        options.until = Some(now);
+    }
+    Ok(options)
+}
+
+fn run_query_telemetry(global: &GlobalOpts, args: &TelemetryQueryArgs) -> ExitCode {
+    let options =
+        match telemetry_query_options(args.table, Some(&args.range), args.session.as_deref()) {
+            Ok(options) => options,
+            Err(err) => {
+                eprintln!("query telemetry: {err}");
+                return ExitCode::ArgsError;
+            }
+        };
+    let root = args
+        .telemetry_dir
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(default_telemetry_dir);
+    let result = match pt_telemetry::query::query_rows(&root, &options, args.limit as usize) {
+        Ok(result) => result,
+        Err(err) => {
+            eprintln!("query telemetry: {err}");
+            return ExitCode::IoError;
+        }
+    };
+    let output = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "host_id": pt_core::logging::get_host_id(),
+        "query": "telemetry",
+        "table": args.table.as_str(),
+        "since": options.since,
+        "until": options.until,
+        "session_id": options.session_id,
+        "limit": args.limit,
+        "summary": result.summary,
+        "rows": result.rows,
+        "truncated": result.truncated,
+    });
+    match global.format {
+        OutputFormat::Json | OutputFormat::Toon => {
+            println!("{}", format_structured_output(global, output));
+        }
+        OutputFormat::Jsonl => println!("{}", output),
+        OutputFormat::Exitcode => {}
+        _ => {
+            println!(
+                "Telemetry {}: {} matching rows, {} returned{}",
+                args.table,
+                result.summary.rows_matched,
+                result.rows.len(),
+                if result.truncated { " (limited)" } else { "" },
+            );
+            for row in &result.rows {
+                println!("{row}");
+            }
+        }
+    }
+    ExitCode::Clean
 }
 
 fn run_query_sessions(global: &GlobalOpts, limit: u32) -> ExitCode {
@@ -16653,13 +16757,71 @@ fn run_telemetry(global: &GlobalOpts, _args: &TelemetryArgs) -> ExitCode {
             dry_run,
             keep_everything,
         } => run_telemetry_prune(global, _args, keep, *dry_run, *keep_everything),
-        TelemetryCommands::Export { .. } => {
-            output_stub(global, "telemetry export", "Export not yet implemented")
-        }
+        TelemetryCommands::Export { .. } => run_telemetry_export(global, _args),
         TelemetryCommands::Redact { .. } => {
             output_stub(global, "telemetry redact", "Redaction not yet implemented")
         }
     }
+}
+
+fn run_telemetry_export(global: &GlobalOpts, args: &TelemetryArgs) -> ExitCode {
+    let TelemetryCommands::Export {
+        output,
+        export_format,
+        table,
+        range,
+        session,
+    } = &args.command
+    else {
+        return ExitCode::ArgsError;
+    };
+    let options = match telemetry_query_options(*table, range.as_deref(), session.as_deref()) {
+        Ok(options) => options,
+        Err(err) => {
+            eprintln!("telemetry export: {err}");
+            return ExitCode::ArgsError;
+        }
+    };
+    let format = match export_format.parse::<pt_telemetry::query::ExportFormat>() {
+        Ok(format) => format,
+        Err(err) => {
+            eprintln!("telemetry export: {err}");
+            return ExitCode::ArgsError;
+        }
+    };
+    let summary = match pt_telemetry::query::export_table(
+        &resolve_telemetry_dir(args),
+        &options,
+        Path::new(output),
+        format,
+    ) {
+        Ok(summary) => summary,
+        Err(err) => {
+            eprintln!("telemetry export: {err}");
+            return ExitCode::IoError;
+        }
+    };
+    let response = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "command": "telemetry export",
+        "status": "ok",
+        "table": table.as_str(),
+        "output": output,
+        "export_format": export_format,
+        "summary": summary,
+    });
+    match global.format {
+        OutputFormat::Json | OutputFormat::Toon => {
+            println!("{}", format_structured_output(global, response));
+        }
+        OutputFormat::Jsonl => println!("{response}"),
+        OutputFormat::Exitcode => {}
+        _ => println!(
+            "Exported {} {} rows to {} ({})",
+            summary.rows_matched, table, output, export_format
+        ),
+    }
+    ExitCode::Clean
 }
 
 fn resolve_telemetry_dir(args: &TelemetryArgs) -> PathBuf {
@@ -39796,9 +39958,9 @@ fn parse_duration(s: &str) -> Option<chrono::Duration> {
 
     let num: i64 = num_str.parse().ok()?;
     match unit {
-        'd' => Some(chrono::Duration::days(num)),
-        'h' => Some(chrono::Duration::hours(num)),
-        'm' => Some(chrono::Duration::minutes(num)),
+        'd' => chrono::Duration::try_days(num),
+        'h' => chrono::Duration::try_hours(num),
+        'm' => chrono::Duration::try_minutes(num),
         _ => None,
     }
 }

@@ -24,6 +24,30 @@ pub enum TableName {
 }
 
 impl TableName {
+    /// Tables accepted by the telemetry reader and export commands.
+    pub const ALL: [Self; 7] = [
+        Self::Runs,
+        Self::ProcSamples,
+        Self::ProcFeatures,
+        Self::ProcInference,
+        Self::Outcomes,
+        Self::Audit,
+        Self::SignatureMatches,
+    ];
+
+    /// Event-time column used for range filtering and ordering.
+    pub fn timestamp_column(&self) -> &'static str {
+        match self {
+            Self::Runs => "started_at",
+            Self::ProcSamples => "sample_ts",
+            Self::ProcFeatures => "feature_ts",
+            Self::ProcInference => "inference_ts",
+            Self::Outcomes => "outcome_ts",
+            Self::Audit => "audit_ts",
+            Self::SignatureMatches => "match_ts",
+        }
+    }
+
     /// Get the string name for directory layout.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -61,6 +85,17 @@ impl TableName {
             TableName::Audit => 365,
             TableName::SignatureMatches => 365, // Long retention for calibration analysis
         }
+    }
+}
+
+impl std::str::FromStr for TableName {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|table| table.as_str() == value)
+            .ok_or_else(|| format!("unknown telemetry table: {value}"))
     }
 }
 

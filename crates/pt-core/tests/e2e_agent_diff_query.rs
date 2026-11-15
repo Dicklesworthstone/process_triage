@@ -818,7 +818,7 @@ fn diff_empty_candidates() {
 }
 
 // ============================================================================
-// query tests (sessions and actions implemented; telemetry remains a stub)
+// Query tests (telemetry round trips are covered in e2e_telemetry).
 // ============================================================================
 
 #[test]
@@ -1098,14 +1098,7 @@ fn query_actions_refuses_fifo_journals_without_waiting_for_a_writer() {
 #[test]
 fn every_stub_command_exits_capability_error() {
     let mut stubs: Vec<Vec<&str>> = vec![
-        vec!["query", "telemetry"],
         vec!["query", "last hour kills"],
-        vec![
-            "telemetry",
-            "export",
-            "-o",
-            "/nonexistent/pt-export.parquet",
-        ],
         vec!["telemetry", "redact"],
     ];
     if !cfg!(target_os = "linux") {
@@ -1125,10 +1118,19 @@ fn every_stub_command_exits_capability_error() {
 }
 
 #[test]
-fn query_telemetry_subcommand_reports_missing_capability() {
-    pt_core_fast()
-        .args(["query", "telemetry"])
+fn query_telemetry_empty_lake_is_read_only() {
+    let temp = tempfile::tempdir().unwrap();
+    let missing = temp.path().join("missing-telemetry");
+    let output = pt_core_fast()
+        .args(["--format", "json", "query", "telemetry", "--telemetry-dir"])
+        .arg(&missing)
         .assert()
-        .code(11)
-        .stdout(predicates::str::contains("not yet implemented"));
+        .code(0)
+        .get_output()
+        .stdout
+        .clone();
+    let result: Value = serde_json::from_slice(&output).unwrap();
+    assert!(result["rows"].as_array().unwrap().is_empty());
+    assert_eq!(result["summary"]["rows_scanned"], 0);
+    assert!(!missing.exists(), "queries must not create storage");
 }

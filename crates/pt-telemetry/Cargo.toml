@@ -16,13 +16,16 @@ serde_json.workspace = true
 chrono = { version = "0.4", features = ["serde"] }
 thiserror.workspace = true
 tracing = "0.1"
+tempfile = "3"
 
 dirs = "5"
 
 # Internal crates
 pt-common = { path = "../pt-common" }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
-tempfile = "3"
 filetime = "0.2"
 serde_json.workspace = true  # Re-export for test assertions

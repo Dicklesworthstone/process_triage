@@ -1913,6 +1913,35 @@ These failure-recovery trees describe escalation and diagnosis. Explicit undo re
 
 ---
 
+## Querying and Exporting Stored Telemetry
+
+`query telemetry` reads a Parquet telemetry table, filters by event time and
+optional session ID, and returns the newest matching rows across its partitions.
+The default table is `audit`, the default range is `24h`, and the default limit
+is 100 rows (maximum 10,000). The response reports scanned and matched row counts
+and whether the result was truncated.
+
+```bash
+pt query telemetry --table audit --range 24h --limit 100 --format json
+pt query telemetry --table outcomes --session "$SESSION_ID" --range 7d
+pt telemetry export --table audit --range 7d --export-format json --output audit.json
+pt telemetry export --table proc_samples --export-format parquet --output samples.parquet
+```
+
+Both commands accept `--telemetry-dir`. Available tables are `runs`,
+`proc_samples`, `proc_features`, `proc_inference`, `outcomes`, `audit`, and
+`signature_matches`. Export streams one table to Parquet, CSV, JSON, or JSONL;
+without `--range` it includes all stored rows. Existing output files are
+refused, and destinations must be outside the input telemetry directory.
+A failed read or write does not publish a partial export.
+
+These commands read data already present in the Parquet lake. Normal triage
+sessions still use JSON/JSONL artifacts, and shadow observations use their
+separate storage; this feature does not enable the library-only recorder below.
+Exports preserve the stored values and redaction. They do not apply a new sharing
+profile; use a safe session bundle when sharing session evidence. Arbitrary query
+expressions and in-place `telemetry redact` remain unavailable.
+
 ## Telemetry: Lock-Free Event Recording
 
 > **Status: library-only.** The `pt-telemetry` crate contains the disruptor below; shipped commands record sessions as JSON/JSONL files and shadow observations through shadow storage, not through this ring buffer.

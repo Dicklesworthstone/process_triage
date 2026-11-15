@@ -559,3 +559,202 @@ fn test_telemetry_prune_with_aggressive_config() {
     );
     assert!(!file.exists(), "file should be deleted");
 }
+
+// Query/export tests use actual Parquet produced by the existing recorder.
+fn seed_queryable_telemetry(root: &Path) {
+    let config = pt_telemetry::WriterConfig::new(
+        root.to_path_buf(),
+        "query-session".into(),
+        "query-host".into(),
+    );
+    let recorder = pt_telemetry::recorder::TelemetryRecorder::new(16, config);
+    recorder.record_event(
+        pt_telemetry::EventType::StateChange,
+        4242,
+        "known audit event",
+    );
+    drop(recorder);
+}
+
+#[test]
+fn query_telemetry_reads_actual_rows_and_honors_session_filter() {
+    let temp = tempdir().unwrap();
+    let lake = temp.path().join("lake");
+    seed_queryable_telemetry(&lake);
+
+    let output = pt_core()
+        .args(["--format", "json", "query", "telemetry", "--telemetry-dir"])
+        .arg(&lake)
+        .args(["--table", "audit", "--range", "1d", "--limit", "1"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let result: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(result["query"], "telemetry");
+    assert_eq!(result["table"], "audit");
+    assert_eq!(result["summary"]["rows_matched"], 1);
+    assert_eq!(result["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(result["rows"][0]["target_pid"], 4242);
+    assert_eq!(result["rows"][0]["message"], "known audit event");
+    assert_eq!(result["rows"][0]["session_id"], "query-session");
+    assert_eq!(result["truncated"], false);
+
+    let output = pt_core()
+        .args(["--format", "jsonl", "query", "telemetry", "--telemetry-dir"])
+        .arg(&lake)
+        .args(["--session", "other-session"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(String::from_utf8_lossy(&output).lines().count(), 1);
+    let result: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(result["summary"]["rows_matched"], 0);
+    assert!(result["rows"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn telemetry_export_cli_writes_all_formats_without_overwriting_outputs() {
+    let temp = tempdir().unwrap();
+    let lake = temp.path().join("lake");
+    seed_queryable_telemetry(&lake);
+
+    for format in ["parquet", "csv", "json", "jsonl"] {
+        let output = temp.path().join(format!("export.{format}"));
+        let result = pt_core()
+            .args(["--format", "json", "telemetry", "--telemetry-dir"])
+            .arg(&lake)
+            .args([
+                "export",
+                "--table",
+                "audit",
+                "--session",
+                "query-session",
+                "--range",
+                "1d",
+                "--export-format",
+                format,
+                "--output",
+            ])
+            .arg(&output)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let result: Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(result["status"], "ok");
+        assert_eq!(result["summary"]["rows_matched"], 1);
+        let bytes = fs::read(&output).unwrap();
+        assert!(!bytes.is_empty());
+        match format {
+            "json" => {
+                let rows: Vec<Value> = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0]["message"], "known audit event");
+            }
+            "jsonl" => {
+                let text = String::from_utf8(bytes.clone()).unwrap();
+                assert_eq!(text.lines().count(), 1);
+                let row: Value = serde_json::from_str(text.trim()).unwrap();
+                assert_eq!(row["message"], "known audit event");
+            }
+            "csv" => {
+                let text = String::from_utf8(bytes.clone()).unwrap();
+                assert!(text.starts_with("audit_ts,session_id,"));
+                assert!(text.contains("known audit event"));
+            }
+            "parquet" => {
+                let readback = temp.path().join("readback");
+                fs::create_dir_all(readback.join("audit")).unwrap();
+                fs::copy(&output, readback.join("audit/export.parquet")).unwrap();
+                let result = pt_core()
+                    .args(["--format", "json", "query", "telemetry", "--telemetry-dir"])
+                    .arg(&readback)
+                    .assert()
+                    .success()
+                    .get_output()
+                    .stdout
+                    .clone();
+                let result: Value = serde_json::from_slice(&result).unwrap();
+                assert_eq!(result["rows"][0]["message"], "known audit event");
+            }
+            _ => unreachable!(),
+        }
+
+        pt_core()
+            .args(["telemetry", "--telemetry-dir"])
+            .arg(&lake)
+            .args(["export", "--export-format", format, "--output"])
+            .arg(&output)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("exists"));
+        assert_eq!(fs::read(&output).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn telemetry_query_and_export_reject_invalid_arguments_without_creating_data() {
+    let temp = tempdir().unwrap();
+    let missing = temp.path().join("missing");
+    for range in ["0d", "nonsense", "9223372036854775807d"] {
+        pt_core()
+            .args(["query", "telemetry", "--telemetry-dir"])
+            .arg(&missing)
+            .args(["--range", range])
+            .assert()
+            .code(10)
+            .stderr(predicate::str::contains("range"));
+        let output = temp.path().join(format!("invalid-{range}.json"));
+        pt_core()
+            .args(["telemetry", "--telemetry-dir"])
+            .arg(&missing)
+            .args(["export", "--range", range, "--output"])
+            .arg(&output)
+            .assert()
+            .code(10);
+        assert!(!output.exists());
+    }
+    for args in [
+        ["--limit", "0"],
+        ["--limit", "10001"],
+        ["--table", "../outside"],
+    ] {
+        pt_core()
+            .args(["query", "telemetry", "--telemetry-dir"])
+            .arg(&missing)
+            .args(args)
+            .assert()
+            .code(10);
+    }
+    assert!(!missing.exists());
+}
+
+#[test]
+fn corrupt_telemetry_returns_failure_and_does_not_publish_an_export() {
+    let temp = tempdir().unwrap();
+    let lake = temp.path().join("lake");
+    seed_queryable_telemetry(&lake);
+    create_fake_parquet(&lake.join("audit/zz-corrupt.parquet"), 64, 0).unwrap();
+    pt_core()
+        .args(["query", "telemetry", "--telemetry-dir"])
+        .arg(&lake)
+        .args(["--limit", "1"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Parquet"));
+    let output = temp.path().join("partial.json");
+    pt_core()
+        .args(["telemetry", "--telemetry-dir"])
+        .arg(&lake)
+        .args(["export", "--export-format", "json", "--output"])
+        .arg(&output)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Parquet"));
+    assert!(!output.exists());
+}

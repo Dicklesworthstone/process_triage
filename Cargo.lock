@@ -4143,6 +4143,7 @@ dependencies = [
  "chrono",
  "dirs",
  "filetime",
+ "libc",
  "parquet",
  "pt-common",
  "serde",
