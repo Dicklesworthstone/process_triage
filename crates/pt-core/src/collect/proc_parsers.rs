@@ -232,10 +232,10 @@ pub struct FdInfo {
     /// Device count.
     pub devices: usize,
     /// Open files with details (paths, modes).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub open_files: Vec<OpenFile>,
     /// Critical open write handles (safety-relevant).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub critical_writes: Vec<CriticalFile>,
 }
 

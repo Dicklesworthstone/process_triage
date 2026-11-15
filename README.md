@@ -181,6 +181,8 @@ On Linux, `pt deep` reads 12+ files per process (raw records; the TUI turns netw
 
 Critical file detection recognizes 20+ patterns: git locks (`.git/index.lock`), package manager locks (dpkg, apt, rpm, npm, pnpm, yarn, cargo), SQLite WAL/journal files, database write handles, and generic `.lock`/`.lck` files. At apply time the data-loss gate blocks any target holding a regular file open for writing or a file lock; the categorized critical-file rules are not yet attached to plans.
 
+For standalone Linux deep scans, `pt deep --budget 5` (or `pt-core deep-scan --budget 5`) enforces a five-second collection deadline. The global `--timeout` also bounds this command; when both are supplied, the shorter duration applies. A deadline expiration, including a zero-second budget, returns exit code **22** without publishing a successful partial scan. With neither option, deep scanning uses its existing native collection behavior without an overall deadline.
+
 ### The TUI
 
 The interactive TUI is built on **ftui** (an Elm-style Model-View-Update framework for terminals):

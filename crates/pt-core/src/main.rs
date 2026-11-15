@@ -561,7 +561,7 @@ struct DeepScanArgs {
     #[arg(long, value_delimiter = ',')]
     pids: Vec<u32>,
 
-    /// Maximum time budget for deep scan (seconds)
+    /// Wall-clock deadline for deep collection (seconds); incomplete scans fail with exit 22
     #[arg(long)]
     budget: Option<u64>,
 }
@@ -10394,6 +10394,287 @@ fn resolve_bundle_passphrase(passphrase_arg: &Option<String>) -> Option<String> 
         .or_else(|| std::env::var("PT_BUNDLE_PASSPHRASE").ok())
 }
 
+/// A deadline cannot interrupt a thread blocked inside a procfs or driver read.
+/// Run budgeted collection in an owned child, so the existing bounded tool
+/// runner can stop waiting and cancel it without detaching collector threads
+/// into the long-lived CLI process. Only a complete response is accepted.
+#[cfg(target_os = "linux")]
+fn bounded_deep_scan(
+    pids: &[u32],
+    budget_secs: u64,
+) -> Result<pt_core::collect::DeepScanResult, (ExitCode, String)> {
+    use pt_core::collect::tool_runner::ToolSpec;
+
+    let budget_ms = budget_secs.checked_mul(1000).ok_or_else(|| {
+        (
+            ExitCode::ArgsError,
+            "deep-scan budget exceeds the supported duration".to_string(),
+        )
+    })?;
+    if budget_ms == 0 {
+        return Err((
+            ExitCode::TimeoutError,
+            "deep-scan budget is exhausted before collection".into(),
+        ));
+    }
+    let executable = std::env::current_exe()
+        .map_err(|error| {
+            (
+                ExitCode::IoError,
+                format!("cannot locate deep-scan worker: {error}"),
+            )
+        })?
+        .into_os_string()
+        .into_string()
+        .map_err(|_| {
+            (
+                ExitCode::IoError,
+                "deep-scan executable path is not UTF-8".into(),
+            )
+        })?;
+    // Do not forward --budget/--timeout: the parent owns the deadline and the
+    // worker must perform one direct collection, rather than spawning itself.
+    // Output shaping belongs to the parent, after validating the full result.
+    let mut args = vec![
+        "--format".into(),
+        "json".into(),
+        "--quiet".into(),
+        "deep-scan".into(),
+    ];
+    if !pids.is_empty() {
+        args.push("--pids".into());
+        args.push(
+            pids.iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
+    let mut spec =
+        ToolSpec::new(executable, args).with_timeout(std::time::Duration::from_millis(budget_ms));
+    // GPU collectors may need their normal home/runtime context. Never inherit
+    // output-format overrides, token limits, or arbitrary driver credentials.
+    for key in ["HOME", "XDG_RUNTIME_DIR", "TMPDIR"] {
+        match std::env::var(key) {
+            Ok(value) => {
+                spec.env.insert(key.into(), value);
+            }
+            Err(std::env::VarError::NotPresent) => {}
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err((
+                    ExitCode::ArgsError,
+                    format!("deep-scan environment {key} is not UTF-8"),
+                ));
+            }
+        }
+    }
+    run_deep_scan_worker(&spec, budget_ms)
+}
+
+#[cfg(target_os = "linux")]
+fn run_deep_scan_worker(
+    spec: &pt_core::collect::tool_runner::ToolSpec,
+    budget_ms: u64,
+) -> Result<pt_core::collect::DeepScanResult, (ExitCode, String)> {
+    use pt_core::collect::tool_runner::{ToolConfig, ToolRunner};
+
+    let started = std::time::Instant::now();
+    let deadline = std::time::Duration::from_millis(budget_ms);
+    let runner = ToolRunner::new(ToolConfig {
+        default_timeout: std::time::Duration::from_millis(budget_ms),
+        budget_ms,
+        // Detailed FD/resource evidence can exceed the generic 10 MiB limit.
+        // Keep an explicit cap and refuse truncation rather than claiming that
+        // a partial process census is a successful deep scan.
+        max_output_bytes: 64 * 1024 * 1024,
+        use_nice: false,
+        ..ToolConfig::default()
+    });
+    let output = runner.run(spec).map_err(|error| {
+        (
+            ExitCode::IoError,
+            format!("deep-scan worker failed: {error}"),
+        )
+    })?;
+    let result = parse_deep_scan_worker_output(&output)?;
+    if started.elapsed() >= deadline {
+        return Err((
+            ExitCode::TimeoutError,
+            "deep-scan deadline expired before its complete response could be validated".into(),
+        ));
+    }
+    Ok(result)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_deep_scan_worker_output(
+    output: &pt_core::collect::tool_runner::ToolOutput,
+) -> Result<pt_core::collect::DeepScanResult, (ExitCode, String)> {
+    if output.timed_out {
+        return Err((
+            ExitCode::TimeoutError,
+            "deep-scan exceeded its collection deadline; no complete scan is available".into(),
+        ));
+    }
+    if output.truncated {
+        return Err((
+            ExitCode::IoError,
+            "deep-scan worker output exceeded its byte limit; incomplete evidence was discarded"
+                .into(),
+        ));
+    }
+    if output.exit_code != Some(0) {
+        let diagnostic: String = output.stderr_str().chars().take(1024).collect();
+        return Err((
+            ExitCode::InternalError,
+            format!(
+                "deep-scan worker exited with {:?}: {}",
+                output.exit_code,
+                diagnostic.trim()
+            ),
+        ));
+    }
+    #[derive(serde::Deserialize)]
+    struct WorkerResponse {
+        schema_version: String,
+        deep_scan: pt_core::collect::DeepScanResult,
+    }
+    let response: WorkerResponse = serde_json::from_slice(&output.stdout).map_err(|error| {
+        (
+            ExitCode::IoError,
+            format!("invalid deep-scan worker response: {error}"),
+        )
+    })?;
+    if response.schema_version != SCHEMA_VERSION
+        || response.deep_scan.metadata.process_count != response.deep_scan.processes.len()
+    {
+        return Err((
+            ExitCode::IoError,
+            "deep-scan worker returned an inconsistent schema or process count".into(),
+        ));
+    }
+    Ok(response.deep_scan)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod deep_scan_deadline_tests {
+    use super::*;
+    use pt_core::collect::tool_runner::{ToolOutput, ToolSpec};
+    use std::time::{Duration, Instant};
+
+    fn complete_output() -> ToolOutput {
+        ToolOutput {
+            command: "pt-core".into(),
+            args: vec![],
+            stdout: serde_json::to_vec(&serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "deep_scan": {
+                    "processes": [],
+                    "metadata": {
+                        "started_at": "2026-11-15T00:00:00Z",
+                        "duration_ms": 1,
+                        "process_count": 0,
+                        "skipped_count": 0,
+                    },
+                },
+            }))
+            .unwrap(),
+            stderr: vec![],
+            exit_code: Some(0),
+            truncated: false,
+            timed_out: false,
+            duration: Duration::from_millis(1),
+        }
+    }
+
+    #[test]
+    fn clean_worker_responses_preserve_empty_optional_evidence() {
+        let result = parse_deep_scan_worker_output(&complete_output()).unwrap();
+        assert!(result.metadata.warnings.is_empty());
+        assert!(result.processes.is_empty());
+        let descriptors = pt_core::collect::proc_parsers::FdInfo::default();
+        let saved = serde_json::to_vec(&descriptors).unwrap();
+        let restored: pt_core::collect::proc_parsers::FdInfo =
+            serde_json::from_slice(&saved).unwrap();
+        assert_eq!(restored.count, 0);
+        assert!(restored.open_files.is_empty());
+        assert!(restored.critical_writes.is_empty());
+    }
+
+    #[test]
+    fn incomplete_or_failed_workers_cannot_publish_a_successful_scan() {
+        let mut output = complete_output();
+        output.timed_out = true;
+        assert_eq!(
+            parse_deep_scan_worker_output(&output).unwrap_err().0,
+            ExitCode::TimeoutError
+        );
+        output.timed_out = false;
+        output.truncated = true;
+        assert_eq!(
+            parse_deep_scan_worker_output(&output).unwrap_err().0,
+            ExitCode::IoError
+        );
+        output.truncated = false;
+        output.exit_code = Some(1);
+        assert_eq!(
+            parse_deep_scan_worker_output(&output).unwrap_err().0,
+            ExitCode::InternalError
+        );
+        output.exit_code = Some(0);
+        for contents in [b"not json".as_slice(), b"{}".as_slice()] {
+            output.stdout = contents.to_vec();
+            assert_eq!(
+                parse_deep_scan_worker_output(&output).unwrap_err().0,
+                ExitCode::IoError
+            );
+        }
+        for (field, value) in [
+            ("schema_version", serde_json::json!("unknown")),
+            ("deep_scan", serde_json::json!({"processes": []})),
+        ] {
+            let mut contents: serde_json::Value =
+                serde_json::from_slice(&complete_output().stdout).unwrap();
+            contents[field] = value;
+            output.stdout = serde_json::to_vec(&contents).unwrap();
+            assert_eq!(
+                parse_deep_scan_worker_output(&output).unwrap_err().0,
+                ExitCode::IoError
+            );
+        }
+        let mut contents: serde_json::Value =
+            serde_json::from_slice(&complete_output().stdout).unwrap();
+        contents["deep_scan"]["metadata"]["process_count"] = serde_json::json!(1);
+        output.stdout = serde_json::to_vec(&contents).unwrap();
+        assert_eq!(
+            parse_deep_scan_worker_output(&output).unwrap_err().0,
+            ExitCode::IoError
+        );
+    }
+
+    #[test]
+    fn stalled_worker_returns_at_the_deadline_without_a_partial_result() {
+        let started = Instant::now();
+        let spec = ToolSpec::new("/bin/sh", vec!["-c".into(), "exec sleep 30".into()])
+            .with_timeout(Duration::from_millis(80));
+        let error = run_deep_scan_worker(&spec, 80).unwrap_err();
+        assert_eq!(error.0, ExitCode::TimeoutError);
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn invalid_budgets_fail_before_spawning_a_worker() {
+        assert_eq!(
+            bounded_deep_scan(&[], 0).unwrap_err().0,
+            ExitCode::TimeoutError
+        );
+        assert_eq!(
+            bounded_deep_scan(&[], u64::MAX).unwrap_err().0,
+            ExitCode::ArgsError
+        );
+    }
+}
+
 fn run_deep_scan(global: &GlobalOpts, _args: &DeepScanArgs) -> ExitCode {
     #[cfg(target_os = "linux")]
     {
@@ -10409,15 +10690,18 @@ fn run_deep_scan(global: &GlobalOpts, _args: &DeepScanArgs) -> ExitCode {
             progress,
         };
 
-        match deep_scan(&options) {
-            Ok(mut result) => {
-                if let Some(budget) = args.budget {
-                    result.metadata.warnings.push(format!(
-                        "budget={}s is currently advisory and not enforced by the collector",
-                        budget
-                    ));
-                }
-
+        let budget = match (args.budget, global.timeout) {
+            (Some(scan), Some(global)) => Some(scan.min(global)),
+            (scan, global) => scan.or(global),
+        };
+        let collected = match budget {
+            Some(seconds) => bounded_deep_scan(&args.pids, seconds),
+            None => {
+                deep_scan(&options).map_err(|error| (ExitCode::InternalError, error.to_string()))
+            }
+        };
+        match collected {
+            Ok(result) => {
                 match global.format {
                     OutputFormat::Json | OutputFormat::Toon => {
                         let session_id = SessionId::new();
@@ -10493,9 +10777,9 @@ fn run_deep_scan(global: &GlobalOpts, _args: &DeepScanArgs) -> ExitCode {
 
                 ExitCode::Clean
             }
-            Err(e) => {
-                eprintln!("Deep scan failed: {}", e);
-                ExitCode::InternalError
+            Err((code, message)) => {
+                eprintln!("Deep scan failed: {message}");
+                code
             }
         }
     }

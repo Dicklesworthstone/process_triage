@@ -260,7 +260,7 @@ pub struct DeepScanMetadata {
     pub skipped_count: usize,
 
     /// Any warnings encountered during scan.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
 }
 

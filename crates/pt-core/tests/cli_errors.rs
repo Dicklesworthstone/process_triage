@@ -245,6 +245,56 @@ mod numeric_errors {
             .failure()
             .stderr(predicate::str::contains("error"));
     }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn deep_scan_zero_budget_and_global_timeout_refuse_before_collection() {
+        for args in [
+            vec!["deep-scan", "--budget", "0"],
+            vec!["--timeout", "0", "deep-scan", "--budget", "30"],
+            vec!["--timeout", "0", "deep-scan"],
+        ] {
+            pt_core()
+                .args(args)
+                .assert()
+                .code(22)
+                .stdout(predicate::str::is_empty())
+                .stderr(predicate::str::contains("budget is exhausted"));
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn budgeted_deep_scan_returns_complete_evidence_for_a_live_process() {
+        let pid = std::process::id().to_string();
+        let output = pt_core()
+            .args([
+                "--format",
+                "json",
+                "deep-scan",
+                "--pids",
+                &pid,
+                "--budget",
+                "15",
+            ])
+            .timeout(std::time::Duration::from_secs(20))
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        let result: pt_core::collect::DeepScanResult =
+            serde_json::from_value(value["deep_scan"].clone()).unwrap();
+        assert_eq!(result.metadata.process_count, 1);
+        assert_eq!(result.processes.len(), 1);
+        assert_eq!(result.processes[0].pid.0, std::process::id());
+        assert!(result
+            .metadata
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("advisory")));
+    }
 }
 
 // ============================================================================
