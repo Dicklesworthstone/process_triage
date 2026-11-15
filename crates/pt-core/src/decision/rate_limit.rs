@@ -385,6 +385,37 @@ impl SlidingWindowRateLimiter {
         Self::new(RateLimitConfig::from_guardrails(guardrails), state_path)
     }
 
+    /// Snapshot the current budgets into an independent, non-persistent limiter.
+    /// Previewing a batch may consume this copy, but must never spend the real
+    /// budget or settle a saved pending intent on disk. Corrupt or unreadable
+    /// history is still an error, and unresolved intents still refuse actions.
+    pub fn preview(&self) -> Result<Self, RateLimitError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|error| RateLimitError::LoadState(format!("lock poisoned: {error}")))?;
+        let persistent = if let Some(path) = &self.state_path {
+            let _lock = StateLock::acquire(path, false)?;
+            Self::load_state(path)?
+        } else {
+            state.persistent.clone()
+        };
+        let mut snapshot = RateLimiterState {
+            persistent,
+            kills_this_run: state.kills_this_run,
+            // This copy never owns the original execution's pending intent.
+            owns_kill_intent: false,
+        };
+        if Self::holds_abandoned_intent(&snapshot) {
+            Self::charge_abandoned_intent(&mut snapshot);
+        }
+        Ok(Self {
+            config: self.config.clone(),
+            state: Arc::new(RwLock::new(snapshot)),
+            state_path: None,
+        })
+    }
+
     /// Load state from disk.
     fn load_state(path: &Path) -> Result<PersistentState, RateLimitError> {
         let file = match File::open(path) {
@@ -491,13 +522,17 @@ impl SlidingWindowRateLimiter {
         if !Self::holds_abandoned_intent(state) {
             return Ok(());
         }
+        Self::charge_abandoned_intent(state);
+        Self::save_state(path, &state.persistent)
+    }
+
+    fn charge_abandoned_intent(state: &mut RateLimiterState) {
         let now = current_unix_timestamp();
         state.persistent.kill_timestamps.push_back(now);
         state.persistent.pending_kill_intent = false;
         state.persistent.pending_kill_owner = None;
         state.persistent.last_updated = now;
         state.persistent.prune_old(now);
-        Self::save_state(path, &state.persistent)
     }
 
     /// Refusal while an intent is unresolved, naming the file that holds it.
@@ -998,6 +1033,92 @@ mod tests {
 
     fn saved_json(path: &Path) -> serde_json::Value {
         serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn preview_keeps_history_and_accumulates_without_spending_the_real_budget() {
+        let dir = retained_accounting_dir("preview-history");
+        let state_path = dir.join("rate_limit.json");
+        let original = SlidingWindowRateLimiter::new(test_config(), Some(&state_path)).unwrap();
+        original.record_kill().unwrap();
+        let saved = fs::read(&state_path).unwrap();
+
+        let preview = original.preview().unwrap();
+        assert!(preview.check(false).unwrap().allowed);
+        preview.record_kill().unwrap();
+        let refusal = preview.check(false).unwrap();
+        assert!(!refusal.allowed);
+        assert_eq!(
+            refusal.block_reason.unwrap().window,
+            RateLimitWindow::Minute
+        );
+        assert_eq!(preview.current_run_count().unwrap(), 2);
+        assert_eq!(original.current_run_count().unwrap(), 1);
+        assert_eq!(fs::read(&state_path).unwrap(), saved);
+
+        let repeated = original.preview().unwrap();
+        assert!(repeated.check(false).unwrap().allowed);
+        assert_eq!(repeated.get_counts().unwrap().day, 1);
+        assert_eq!(fs::read(&state_path).unwrap(), saved);
+    }
+
+    #[test]
+    fn preview_does_not_create_a_missing_budget() {
+        let dir = retained_accounting_dir("preview-missing");
+        let state_path = dir.join("rate_limit.json");
+        let original = SlidingWindowRateLimiter::new(test_config(), Some(&state_path)).unwrap();
+        let preview = original.preview().unwrap();
+        preview.record_kill().unwrap();
+        assert_eq!(preview.get_counts().unwrap().day, 1);
+        assert_eq!(original.current_run_count().unwrap(), 0);
+        assert!(!state_path.exists());
+    }
+
+    #[test]
+    fn preview_refuses_unresolved_intents_without_rewriting_them() {
+        let dir = retained_accounting_dir("preview-pending");
+        let state_path = dir.join("rate_limit.json");
+        let owner = SlidingWindowRateLimiter::new(test_config(), Some(&state_path)).unwrap();
+        owner.begin_kill_accounting().unwrap();
+        let saved = fs::read(&state_path).unwrap();
+        let preview = owner.preview().unwrap();
+        assert!(preview.check(false).is_err());
+        assert!(preview.check(true).is_err());
+        assert!(preview.record_kill().is_err());
+        assert!(preview.finish_kill_accounting(false).is_err());
+        assert_eq!(fs::read(&state_path).unwrap(), saved);
+        owner.finish_kill_accounting(false).unwrap();
+    }
+
+    #[test]
+    fn preview_accounts_for_abandoned_intent_only_in_memory() {
+        let dir = retained_accounting_dir("preview-abandoned");
+        let state_path = dir.join("rate_limit.json");
+        let own = IntentOwner::current().expect("own identity");
+        write_pending_intent(
+            &state_path,
+            serde_json::json!({ "pid": own.pid, "birth": own.birth.wrapping_add(1) }),
+        );
+        let saved = fs::read(&state_path).unwrap();
+        let original = SlidingWindowRateLimiter::new(test_config(), Some(&state_path)).unwrap();
+        let preview = original.preview().unwrap();
+        assert_eq!(preview.get_counts().unwrap().day, 1);
+        assert!(preview.check(false).unwrap().allowed);
+        preview.record_kill().unwrap();
+        assert!(!preview.check(false).unwrap().allowed);
+        assert_eq!(fs::read(&state_path).unwrap(), saved);
+        assert_eq!(original.preview().unwrap().get_counts().unwrap().day, 1);
+        assert_eq!(fs::read(&state_path).unwrap(), saved);
+    }
+
+    #[test]
+    fn preview_refuses_corrupt_history_without_replacing_it() {
+        let dir = retained_accounting_dir("preview-corrupt");
+        let state_path = dir.join("rate_limit.json");
+        fs::write(&state_path, b"incomplete history").unwrap();
+        let original = SlidingWindowRateLimiter::new(test_config(), Some(&state_path)).unwrap();
+        assert!(original.preview().is_err());
+        assert_eq!(fs::read(&state_path).unwrap(), b"incomplete history");
     }
 
     /// The writer died during the kill window (Ctrl-C, an agent's timeout): the

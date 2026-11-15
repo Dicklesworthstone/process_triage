@@ -31432,6 +31432,79 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
 
     // Handle dry-run/shadow mode or execute
     if global.dry_run || global.shadow {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let preview_enforcer = {
+            let (lock, enforcer) =
+                match acquire_execution_policy(&config.policy, recorded_policy.as_ref(), &handle) {
+                    Ok(policy) => policy,
+                    Err(error) => {
+                        eprintln!("agent apply: cannot prepare preview: {error}");
+                        return ExitCode::PolicyBlocked;
+                    }
+                };
+            _execution_guard = Some(lock);
+            // A preview describes the same immutable selection as execution.
+            // A concurrent apply or replan must not change its bindings while
+            // we inspect it or append the non-executing outcomes.
+            match fs::read(&plan_path) {
+                Ok(current) if current.as_slice() == plan_content.as_bytes() => {}
+                Ok(_) => {
+                    eprintln!("agent apply: the canonical plan changed before preview; retry against the current saved plan");
+                    return ExitCode::PolicyBlocked;
+                }
+                Err(error) => {
+                    eprintln!("agent apply: cannot revalidate the preview plan: {error}");
+                    return ExitCode::IoError;
+                }
+            }
+            if args.resume {
+                let current = match fs::read(handle.dir.join("action/outcomes.jsonl")) {
+                    Ok(content) => Some(content),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => {
+                        eprintln!(
+                            "agent apply: cannot revalidate preview resume evidence: {error}"
+                        );
+                        return ExitCode::IoError;
+                    }
+                };
+                if current != resume_outcomes_snapshot {
+                    eprintln!("agent apply: execution outcomes changed before preview acquired the lock; retry --resume against the current saved evidence");
+                    return ExitCode::PolicyBlocked;
+                }
+            }
+            // Non-destructive actions never inspect or charge a kill budget.
+            let preview = if actions_to_apply
+                .iter()
+                .any(|action| !action.blocked && action_uses_kill_budget(action))
+            {
+                enforcer.into_preview()
+            } else {
+                Ok(enforcer)
+            };
+            match preview {
+                Ok(enforcer) => enforcer,
+                Err(error) => {
+                    let reason = format!("cannot inspect existing kill budgets: {error}");
+                    eprintln!("agent apply: {reason}");
+                    println!(
+                        "{}",
+                        format_structured_output(
+                            global,
+                            apply_refusal_document(
+                                &sid,
+                                "preview_budget_unavailable",
+                                &reason,
+                                execution_binding.as_ref(),
+                            ),
+                        ),
+                    );
+                    return ExitCode::PolicyBlocked;
+                }
+            }
+        };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let preview_identity = LiveIdentityProvider::new();
         for action in &actions_to_apply {
             action_index = action_index.saturating_add(1);
             emit_action_event(
@@ -31484,6 +31557,99 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 continue;
             }
 
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                let refusal = match preview_identity.revalidate(&action.target) {
+                    Ok(true) => None,
+                    Ok(false) => Some((
+                        "identity_mismatch",
+                        "the recorded target no longer matches the live process".to_string(),
+                    )),
+                    Err(error) => Some(("identity_check_failed", error.to_string())),
+                };
+                if let Some((reason, error)) = refusal {
+                    blocked_by_prechecks += 1;
+                    checkpoint_outcome!(serde_json::json!({
+                        "action_id": action.action_id,
+                        "pid": action.target.pid.0,
+                        "status": "precheck_blocked",
+                        "check": "revalidate_identity",
+                        "reason": reason,
+                        "error": error,
+                    }));
+                    emit_action_event(
+                        pt_core::events::event_names::ACTION_COMPLETE,
+                        action_index,
+                        None,
+                        action,
+                        "precheck_blocked",
+                        &[("check", serde_json::json!("revalidate_identity"))],
+                    );
+                    if args.abort_on_unknown {
+                        break;
+                    }
+                    continue;
+                }
+            }
+            if let Err(reason) =
+                validate_term_grace_policy_cap(action, &config.policy, recorded_policy.as_ref())
+            {
+                blocked_by_prechecks += 1;
+                checkpoint_outcome!(serde_json::json!({
+                    "action_id": action.action_id,
+                    "pid": action.target.pid.0,
+                    "status": "precheck_blocked",
+                    "check": "sigterm_grace_policy_cap",
+                    "reason": reason,
+                }));
+                if args.abort_on_unknown {
+                    break;
+                }
+                continue;
+            }
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            let (policy_check, current_process) =
+                match check_execution_policy(&preview_enforcer, action, true) {
+                    Ok(check) => check,
+                    Err(error) => {
+                        blocked_by_prechecks += 1;
+                        checkpoint_outcome!(serde_json::json!({
+                            "action_id": action.action_id,
+                            "pid": action.target.pid.0,
+                            "status": "blocked_by_policy",
+                            "reason": "policy_evidence_unavailable",
+                            "error": error,
+                        }));
+                        if args.abort_on_unknown {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            if !action
+                .target
+                .matches(&process_identity_from_record(&current_process))
+            {
+                blocked_by_prechecks += 1;
+                checkpoint_outcome!(serde_json::json!({
+                    "action_id": action.action_id,
+                    "pid": action.target.pid.0,
+                    "status": "precheck_blocked",
+                    "check": "revalidate_identity",
+                    "reason": "identity_mismatch",
+                    "error": "target identity changed while collecting policy evidence",
+                }));
+                if args.abort_on_unknown {
+                    break;
+                }
+                continue;
+            }
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            let current_rss_bytes = Some(current_process.rss_bytes);
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            let current_rss_bytes: Option<u64> = None;
+
             let supervised = match supervision_for_robot(action.target.pid.0) {
                 Ok(supervised) => supervised,
                 Err(reason) => {
@@ -31515,7 +31681,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     .posterior
                     .as_ref()
                     .map(|scores| candidate_posterior(scores, action.action)),
-                memory_mb: action.rationale.memory_mb,
+                memory_mb: current_rss_bytes.map(|bytes| bytes as f64 / (1024.0 * 1024.0)),
                 has_known_signature: action.rationale.has_known_signature.unwrap_or(false),
                 category: action.rationale.category.clone(),
                 is_kill_action: action_uses_kill_budget(action),
@@ -31535,6 +31701,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     "pid": action.target.pid.0,
                     "status": "blocked_by_constraints",
                     "violations": check.violations,
+                    "current_rss_bytes": current_rss_bytes,
                 }));
                 emit_action_event(
                     pt_core::events::event_names::ACTION_COMPLETE,
@@ -31591,10 +31758,63 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 continue;
             }
 
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            if !policy_check.allowed {
+                blocked_by_prechecks += 1;
+                let rate_limit = policy_check.violation.as_ref().is_some_and(|violation| {
+                    violation.kind == pt_core::decision::ViolationKind::RateLimitExceeded
+                });
+                checkpoint_outcome!(serde_json::json!({
+                    "action_id": action.action_id,
+                    "pid": action.target.pid.0,
+                    "status": "blocked_by_policy",
+                    "reason": if rate_limit { "rate_limit" } else { "policy" },
+                    "violation": policy_check.violation,
+                }));
+                emit_action_event(
+                    pt_core::events::event_names::ACTION_COMPLETE,
+                    action_index,
+                    None,
+                    action,
+                    "blocked_by_policy",
+                    &[],
+                );
+                if args.abort_on_unknown {
+                    break;
+                }
+                continue;
+            }
+
+            // Forecast the next admission after each permitted destructive
+            // action. The preview limiter has no persistence path, and these
+            // constraint counters belong only to this invocation. No signal,
+            // pending intent, or durable kill charge is produced here.
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            if action_uses_kill_budget(action) {
+                if let Err(error) = preview_enforcer.record_kill() {
+                    blocked_by_prechecks += 1;
+                    checkpoint_outcome!(serde_json::json!({
+                        "action_id": action.action_id,
+                        "pid": action.target.pid.0,
+                        "status": "blocked_by_policy",
+                        "reason": "preview_budget_unavailable",
+                        "error": error.to_string(),
+                    }));
+                    break;
+                }
+                checker.record_action(current_process.rss_bytes, true);
+                if let Some(recorded) = &recorded_checker {
+                    recorded.record_action(current_process.rss_bytes, true);
+                }
+            }
+
             skipped += 1;
-            checkpoint_outcome!(
-                serde_json::json!({"action_id": action.action_id, "pid": action.target.pid.0, "status": if global.dry_run { "dry_run" } else { "shadow" }})
-            );
+            checkpoint_outcome!(serde_json::json!({
+                "action_id": action.action_id,
+                "pid": action.target.pid.0,
+                "status": if global.dry_run { "dry_run" } else { "shadow" },
+                "current_rss_bytes": current_rss_bytes,
+            }));
             emit_action_event(
                 pt_core::events::event_names::ACTION_COMPLETE,
                 action_index,

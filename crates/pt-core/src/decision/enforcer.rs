@@ -505,6 +505,23 @@ impl PolicyEnforcer {
         Ok(enforcer)
     }
 
+    /// Preserve both policy predicates and the existing rate-limit history,
+    /// while isolating all subsequent accounting to this preview's memory.
+    /// Use this before checking a dry-run batch: ordinary limiter reads may
+    /// reconcile an abandoned intent, which a preview must not persist.
+    pub fn into_preview(mut self) -> Result<Self, EnforcerError> {
+        let limiter = Arc::new(
+            self.rate_limiter
+                .preview()
+                .map_err(|error| EnforcerError::PolicyInvalid(error.to_string()))?,
+        );
+        if let Some(recorded) = &mut self.recorded_policy {
+            recorded.rate_limiter = Arc::clone(&limiter);
+        }
+        self.rate_limiter = limiter;
+        Ok(self)
+    }
+
     /// Collect evidence needed by either policy, even if the current policy
     /// removed every protected group or disabled built-in protection.
     pub fn requires_group_evidence(&self) -> bool {
@@ -1712,6 +1729,64 @@ mod tests {
                 .unwrap();
         assert_eq!(fresh.current_run_kill_count(), 0);
         assert!(!fresh.check_action(&candidate, Action::Kill, true).allowed);
+    }
+
+    #[test]
+    fn preview_preserves_recorded_predicates_and_shares_an_isolated_budget() {
+        let data_dir = tempfile::tempdir().unwrap().keep();
+        let state_path = data_dir.join("preview-budget.json");
+        let mut current = test_policy();
+        current.robot_mode.enabled = true;
+        current.robot_mode.max_kills = 10;
+        current.guardrails.max_kills_per_run = 10;
+        current.guardrails.max_kills_per_minute = Some(10);
+        current.guardrails.max_kills_per_hour = None;
+        current.guardrails.max_kills_per_day = None;
+        let mut recorded = current.clone();
+        recorded.guardrails.max_kills_per_minute = Some(2);
+        recorded.guardrails.protected_categories = vec!["protected-preview".to_string()];
+        let enforcer =
+            PolicyEnforcer::new_with_recorded_policy(&current, Some(&recorded), Some(&state_path))
+                .unwrap();
+        enforcer.record_kill().unwrap();
+        let saved = std::fs::read(&state_path).unwrap();
+
+        let preview = enforcer.into_preview().unwrap();
+        let mut candidate = test_candidate();
+        assert!(preview.check_action(&candidate, Action::Kill, true).allowed);
+        candidate.category = Some("protected-preview".to_string());
+        assert_eq!(
+            preview
+                .check_action(&candidate, Action::Kill, true)
+                .violation
+                .unwrap()
+                .kind,
+            ViolationKind::ProtectedCategory
+        );
+        candidate.category = Some("shell".to_string());
+        preview.record_kill().unwrap();
+        assert_eq!(preview.current_run_kill_count(), 2);
+        assert_eq!(
+            preview
+                .check_action(&candidate, Action::Kill, true)
+                .violation
+                .unwrap()
+                .kind,
+            ViolationKind::RateLimitExceeded
+        );
+        assert_eq!(std::fs::read(&state_path).unwrap(), saved);
+        let repeated =
+            PolicyEnforcer::new_with_recorded_policy(&current, Some(&recorded), Some(&state_path))
+                .unwrap()
+                .into_preview()
+                .unwrap();
+        assert_eq!(repeated.current_run_kill_count(), 0);
+        assert!(
+            repeated
+                .check_action(&candidate, Action::Kill, true)
+                .allowed
+        );
+        assert_eq!(std::fs::read(&state_path).unwrap(), saved);
     }
 
     #[test]

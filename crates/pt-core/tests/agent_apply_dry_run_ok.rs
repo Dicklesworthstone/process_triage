@@ -191,6 +191,9 @@ fn agent_apply_dry_run_returns_actions_ok() {
     policy.robot_mode.enabled = true;
     policy.robot_mode.min_posterior = 0.0;
     policy.robot_mode.require_human_for_supervised = false;
+    // The owned fixture must be policy-eligible even when the test runner is
+    // root. Preview now checks protected users just like live apply.
+    policy.guardrails.protected_users.clear();
     // This existing fixture permits fresh children; keep every production
     // policy and the original observation windows unchanged.
     policy.guardrails.min_process_age_seconds = 0;
@@ -456,6 +459,310 @@ fn agent_apply_dry_run_returns_actions_ok() {
     assert_eq!(fs::read(&saved_path).unwrap(), saved_before);
     assert_eq!(optional_file(&budget_path), budget_before);
     target.assert_unchanged();
+}
+
+struct PreviewFixture {
+    data_dir: std::path::PathBuf,
+    config_dir: std::path::PathBuf,
+    session_dir: std::path::PathBuf,
+    session_id: SessionId,
+}
+
+impl PreviewFixture {
+    fn new(identities: Vec<ProcessIdentity>, policy: &Policy) -> Self {
+        let data_dir = TempDir::new().unwrap().keep();
+        let config_dir = TempDir::new().unwrap().keep();
+        fs::write(
+            config_dir.join("policy.json"),
+            serde_json::to_vec_pretty(policy).unwrap(),
+        )
+        .unwrap();
+        let store = SessionStore::at_data_dir(&data_dir);
+        let session_id = SessionId::new();
+        let handle = store
+            .create(&SessionManifest::new(
+                &session_id,
+                None,
+                SessionMode::RobotPlan,
+                None,
+            ))
+            .unwrap();
+        handle
+            .write_context(&SessionContext::new(
+                &session_id,
+                "host-preview".to_string(),
+                "run-preview".to_string(),
+                None,
+            ))
+            .unwrap();
+        let count = identities.len();
+        let plan = Plan {
+            plan_id: "plan-preview".to_string(),
+            session_id: session_id.0.clone(),
+            generated_at: chrono::Utc::now().to_rfc3339(),
+            policy_id: None,
+            policy_version: "1.0.0".to_string(),
+            actions: identities
+                .into_iter()
+                .enumerate()
+                .map(|(index, target)| PlanAction {
+                    action_id: format!("preview-{index}"),
+                    target,
+                    action: Action::Kill,
+                    order: index as u32,
+                    stage: 0,
+                    timeouts: ActionTimeouts::default(),
+                    pre_checks: Vec::new(),
+                    rationale: ActionRationale {
+                        expected_loss: None,
+                        expected_recovery: None,
+                        expected_recovery_stddev: None,
+                        posterior_odds_abandoned_vs_useful: None,
+                        sprt_boundary: None,
+                        posterior: None,
+                        // A stale forecast must not substitute for current RSS.
+                        memory_mb: Some(0.0),
+                        has_known_signature: None,
+                        category: None,
+                    },
+                    on_success: Vec::new(),
+                    on_failure: Vec::new(),
+                    blocked: false,
+                    routing: ActionRouting::Direct,
+                    confidence: ActionConfidence::Normal,
+                    original_zombie_target: None,
+                    d_state_diagnostics: None,
+                    memory_cap: None,
+                    supervisor_restart: None,
+                })
+                .collect(),
+            pre_toggled: Vec::new(),
+            gates_summary: GatesSummary {
+                total_candidates: count,
+                blocked_candidates: 0,
+                pre_toggled_actions: 0,
+            },
+        };
+        fs::create_dir_all(handle.dir.join("decision")).unwrap();
+        fs::write(
+            handle.dir.join("decision/plan.json"),
+            serde_json::to_vec_pretty(&plan).unwrap(),
+        )
+        .unwrap();
+        Self {
+            data_dir,
+            config_dir,
+            session_dir: handle.dir,
+            session_id,
+        }
+    }
+
+    fn run(
+        &self,
+        target: &OwnedSleep,
+        mode: &str,
+        label: &str,
+        flags: &[&str],
+        expected: ExitCode,
+    ) -> Value {
+        let mut args = vec![
+            "--format".to_string(),
+            "json".to_string(),
+            mode.to_string(),
+            "agent".to_string(),
+            "apply".to_string(),
+            "--session".to_string(),
+            self.session_id.0.clone(),
+            "--recommended".to_string(),
+            // Prior preview outcomes must never make an action "completed".
+            "--resume".to_string(),
+        ];
+        args.extend(flags.iter().map(|flag| (*flag).to_string()));
+        let output = apply_logged(
+            &self.data_dir,
+            &self.config_dir,
+            &self.session_id,
+            target,
+            label,
+            &args,
+            expected,
+        );
+        serde_json::from_slice(&output.stdout).expect("preview response")
+    }
+}
+
+fn preview_policy() -> Policy {
+    let mut policy = Policy::default();
+    policy.robot_mode.enabled = true;
+    policy.robot_mode.min_posterior = 0.0;
+    policy.robot_mode.require_human_for_supervised = false;
+    policy.guardrails.min_process_age_seconds = 0;
+    // These tests own their disposable targets, including on root test hosts.
+    // All infrastructure and data-loss checks remain enabled.
+    policy.guardrails.protected_users.clear();
+    // These accounting and identity tests need an actual idle observation,
+    // not the default minute-long window retained by the original success test.
+    policy.data_loss_gates.block_if_recent_io_seconds = Some(1);
+    policy
+}
+
+#[test]
+fn agent_apply_previews_accumulate_kills_and_live_blast_radius_without_spending_budget() {
+    let first = OwnedSleep::spawn();
+    let second = OwnedSleep::spawn();
+    let fixture = PreviewFixture::new(vec![first.identity(), second.identity()], &preview_policy());
+    let first_rss = first.scan().rss_bytes;
+    let second_rss = second.scan().rss_bytes;
+    assert!(first_rss > 0 && second_rss > 0);
+    // Either candidate fits alone, but their combined live RSS does not.
+    let total_limit_mb = (first_rss.max(second_rss) as f64
+        + first_rss.min(second_rss) as f64 / 2.0)
+        / (1024.0 * 1024.0);
+    let total_limit = total_limit_mb.to_string();
+    let budget_path = fixture.data_dir.join("rate_limit.json");
+    let saved_budget = optional_file(&budget_path);
+
+    for (mode, status) in [("--dry-run", "dry_run"), ("--shadow", "shadow")] {
+        for (label, flags, constraint) in [
+            ("kills", vec!["--max-kills", "1"], "max_kills"),
+            (
+                "blast",
+                vec!["--max-total-blast-radius", total_limit.as_str()],
+                "max_total_blast_radius",
+            ),
+        ] {
+            let response = fixture.run(
+                &first,
+                mode,
+                &format!("{status}_{label}"),
+                &flags,
+                ExitCode::PolicyBlocked,
+            );
+            assert_eq!(response["summary"]["attempted"], 2);
+            assert_eq!(response["summary"]["skipped"], 1);
+            assert_eq!(response["summary"]["succeeded"], 0);
+            assert_eq!(response["summary"]["blocked_by_constraints"], 1);
+            let outcomes = response["outcomes"].as_array().unwrap();
+            assert_eq!(outcomes.len(), 2);
+            assert_eq!(outcomes[0]["status"], status);
+            assert_eq!(outcomes[1]["status"], "blocked_by_constraints");
+            assert!(outcomes.iter().all(|outcome| outcome["current_rss_bytes"]
+                .as_u64()
+                .is_some_and(|rss| rss > 0)));
+            assert!(outcomes[1]["violations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|violation| violation["constraint"] == constraint));
+            assert_eq!(optional_file(&budget_path), saved_budget);
+            first.assert_unchanged();
+            second.assert_unchanged();
+        }
+    }
+    let saved = fs::read_to_string(fixture.session_dir.join("action/outcomes.jsonl")).unwrap();
+    assert_eq!(saved.lines().count(), 8);
+    assert!(!fixture
+        .session_dir
+        .join("action/resource_samples.jsonl")
+        .exists());
+}
+
+#[test]
+fn agent_apply_previews_refuse_stale_saved_identity() {
+    let target = OwnedSleep::spawn();
+    let mut stale = target.identity();
+    let (prefix_and_birth, pid) = stale.start_id.0.rsplit_once(':').unwrap();
+    let (prefix, birth) = prefix_and_birth.rsplit_once(':').unwrap();
+    let wrong_birth = birth.parse::<u64>().unwrap().wrapping_add(1);
+    stale.start_id.0 = format!("{prefix}:{wrong_birth}:{pid}");
+    let fixture = PreviewFixture::new(vec![stale], &preview_policy());
+    let budget_path = fixture.data_dir.join("rate_limit.json");
+    let saved_budget = optional_file(&budget_path);
+
+    for mode in ["--dry-run", "--shadow"] {
+        let response = fixture.run(
+            &target,
+            mode,
+            mode.trim_start_matches('-'),
+            &[],
+            ExitCode::PolicyBlocked,
+        );
+        assert_eq!(response["summary"]["failed"], 0);
+        assert_eq!(response["summary"]["blocked_by_prechecks"], 1);
+        assert_eq!(response["summary"]["skipped"], 0);
+        assert_eq!(response["outcomes"][0]["status"], "precheck_blocked");
+        assert_eq!(response["outcomes"][0]["check"], "revalidate_identity");
+        assert_eq!(response["outcomes"][0]["reason"], "identity_mismatch");
+        assert_eq!(optional_file(&budget_path), saved_budget);
+        target.assert_unchanged();
+    }
+}
+
+#[test]
+fn agent_apply_previews_obey_existing_rate_history_without_rewriting_it() {
+    let target = OwnedSleep::spawn();
+    let mut policy = preview_policy();
+    policy.guardrails.max_kills_per_day = Some(1);
+    let fixture = PreviewFixture::new(vec![target.identity()], &policy);
+    let budget_path = fixture.data_dir.join("rate_limit.json");
+    let now = chrono::Utc::now().timestamp() as u64;
+    let saved_budget = serde_json::to_vec_pretty(&serde_json::json!({
+        "kill_timestamps": [now],
+        "last_updated": now,
+        "pending_kill_intent": false,
+    }))
+    .unwrap();
+    fs::write(&budget_path, &saved_budget).unwrap();
+
+    for mode in ["--dry-run", "--shadow"] {
+        let response = fixture.run(
+            &target,
+            mode,
+            mode.trim_start_matches('-'),
+            &[],
+            ExitCode::PolicyBlocked,
+        );
+        assert_eq!(response["summary"]["skipped"], 0);
+        assert_eq!(response["outcomes"][0]["status"], "blocked_by_policy");
+        assert_eq!(response["outcomes"][0]["reason"], "rate_limit");
+        assert_eq!(fs::read(&budget_path).unwrap(), saved_budget);
+        target.assert_unchanged();
+    }
+}
+
+#[test]
+fn agent_apply_previews_preserve_recorded_protected_categories() {
+    let target = OwnedSleep::spawn();
+    let current = preview_policy();
+    let mut recorded = current.clone();
+    recorded
+        .guardrails
+        .protected_categories
+        .push("preview-protected".to_string());
+    let fixture = PreviewFixture::new(vec![target.identity()], &current);
+    let plan_path = fixture.session_dir.join("decision/plan.json");
+    let mut document: Value = serde_json::from_slice(&fs::read(&plan_path).unwrap()).unwrap();
+    document["policy_snapshot"] = serde_json::to_value(recorded).unwrap();
+    document["actions"][0]["rationale"]["category"] = serde_json::json!("preview-protected");
+    fs::write(&plan_path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+    for mode in ["--dry-run", "--shadow"] {
+        let response = fixture.run(
+            &target,
+            mode,
+            mode.trim_start_matches('-'),
+            &[],
+            ExitCode::PolicyBlocked,
+        );
+        assert_eq!(response["summary"]["skipped"], 0);
+        assert_eq!(response["outcomes"][0]["status"], "blocked_by_policy");
+        assert_eq!(
+            response["outcomes"][0]["violation"]["rule"],
+            "guardrails.protected_categories"
+        );
+        assert!(!fixture.data_dir.join("rate_limit.json").exists());
+        target.assert_unchanged();
+    }
 }
 
 fn apply_logged(
