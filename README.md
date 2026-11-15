@@ -1145,6 +1145,10 @@ Without usable CPU PSI, the load fallback uses load and CPU count observed in th
 
 In native `daemon.json` configuration, `triggers.load_per_cpu_threshold` sets the ratio (default `2.0`). An explicitly configured `triggers.load_threshold` keeps its existing **absolute** meaning and takes precedence; omit it or set it to `null` to use the ratio. The older `triggers.sustained_load.threshold_multiplier` setting also uses the observed CPU count on each tick.
 
+Desktop notification clients and `notifications.notify_cmd` hooks have a two-second deadline and a 16 KiB cap on each output stream. All notification commands in a tick share a five-second execution budget, so an unavailable desktop bus or stalled hook cannot suspend monitoring or automatic thaw recovery. Command completion and delivery failures appear in `daemon status`'s recent events; a zero exit status confirms command completion, not display or human receipt. The durable inbox remains available when an external notification fails.
+
+Hook arguments are passed literally, with notification metadata in `PT_NOTIFY_LEVEL`, `PT_NOTIFY_SEVERITY`, `PT_NOTIFY_TITLE`, `PT_NOTIFY_BODY`, `PT_NOTIFY_DEDUPE_KEY`, and, when present, `PT_NOTIFY_SESSION_ID`. Hooks inherit `PATH`, home/user and XDG configuration locations, and desktop bus/display variables; unrelated environment values are not forwarded. A hook requiring additional settings can load them from its own configuration. Notification text stays outside shell or AppleScript source, and hook output is never stored in the status history.
+
 ### Self-Limiting
 
 The daemon enforces overhead budgets on itself:

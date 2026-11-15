@@ -194,6 +194,8 @@ pub enum DaemonEventType {
     FreezeRecoveryCompleted,
     FreezeRecoveryDeferred,
     FreezeRecoveryFailed,
+    NotificationCommandCompleted,
+    NotificationDeliveryFailed,
 }
 
 /// Running state of the daemon core loop.

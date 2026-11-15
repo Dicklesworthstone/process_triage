@@ -18,6 +18,62 @@ use crate::collect::tool_runner::{ToolConfig, ToolOutput, ToolRunner, ToolSpec};
 /// The CLI's explicit `--timeout` can override this default.
 pub const PLAN_TIMEOUT_SECS: u64 = 60;
 
+/// Notification delivery is best effort and must not suspend monitoring or
+/// expired-freeze recovery. Both channels share this budget for the whole tick.
+pub const NOTIFICATION_TIMEOUT_SECS: u64 = 2;
+pub const NOTIFICATION_TICK_BUDGET_MS: u64 = 5_000;
+pub const NOTIFICATION_MAX_OUTPUT_BYTES: usize = 16 * 1024;
+
+/// One runner per daemon tick, reused for desktop and command notifications.
+/// The daemon's priority is already lowered and is inherited by its children.
+pub fn notification_runner() -> ToolRunner {
+    ToolRunner::new(ToolConfig {
+        default_timeout: std::time::Duration::from_secs(NOTIFICATION_TIMEOUT_SECS),
+        max_output_bytes: NOTIFICATION_MAX_OUTPUT_BYTES,
+        budget_ms: NOTIFICATION_TICK_BUDGET_MS,
+        use_nice: false,
+        ..ToolConfig::default()
+    })
+}
+
+/// Run a literal notification command with bounded execution and pipe capture.
+/// Success means only that the command exited successfully, not that a desktop
+/// displayed the message or a person received it. Never persist child output:
+/// hooks can print credentials and arbitrary terminal control sequences.
+pub fn run_notification(runner: &ToolRunner, spec: &ToolSpec) -> Result<(), String> {
+    let mut bounded = spec.clone();
+    bounded.timeout = Some(
+        bounded
+            .timeout
+            .unwrap_or(std::time::Duration::from_secs(NOTIFICATION_TIMEOUT_SECS))
+            .min(std::time::Duration::from_secs(NOTIFICATION_TIMEOUT_SECS)),
+    );
+    bounded.max_output = Some(
+        bounded
+            .max_output
+            .unwrap_or(NOTIFICATION_MAX_OUTPUT_BYTES)
+            .min(NOTIFICATION_MAX_OUTPUT_BYTES),
+    );
+    let output = runner
+        .run(&bounded)
+        .map_err(|error| format!("notification command could not complete: {error}"))?;
+    if output.timed_out {
+        return Err("notification command timed out; delivery is unconfirmed".into());
+    }
+    if output.truncated {
+        return Err(
+            "notification command exceeded its output limit; delivery is unconfirmed".into(),
+        );
+    }
+    if output.exit_code != Some(0) {
+        return Err(format!(
+            "notification command exited with {:?}; delivery is unconfirmed",
+            output.exit_code
+        ));
+    }
+    Ok(())
+}
+
 /// A completed planner response, suitable for publishing a review request.
 #[derive(Debug, PartialEq, Eq)]
 pub struct DaemonEscalationResult {
@@ -458,6 +514,93 @@ mod tests {
             .with_timeout(StdDuration::from_millis(100));
         let started = Instant::now();
         assert!(run_planner(&sleeper, None)
+            .unwrap_err()
+            .contains("timed out"));
+        assert!(started.elapsed() < StdDuration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn notification_commands_require_observed_success_and_bounded_output() {
+        let runner = notification_runner();
+        let shell =
+            |script: &str| ToolSpec::new("/bin/sh", vec!["-c".to_string(), script.to_string()]);
+        assert!(run_notification(&runner, &shell("exit 0")).is_ok());
+        let failure = run_notification(
+            &runner,
+            &shell("printf 'sensitive hook output' >&2; exit 17"),
+        )
+        .unwrap_err();
+        assert!(failure.contains("Some(17)"));
+        assert!(!failure.contains("sensitive hook output"));
+        assert!(run_notification(
+            &runner,
+            &ToolSpec::new("/proc/pt-absent-notification-command", vec![]),
+        )
+        .unwrap_err()
+        .contains("could not complete"));
+
+        // The command can try to request a larger cap; the daemon's finite
+        // output bound still applies, and truncation never becomes success.
+        let noisy = shell("printf '%32768s' x").with_max_output(NOTIFICATION_MAX_OUTPUT_BYTES * 4);
+        assert!(run_notification(&runner, &noisy)
+            .unwrap_err()
+            .contains("output limit"));
+        // An independently successful channel can still run after a failure.
+        assert!(run_notification(&runner, &shell("exit 0")).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn notification_deadlines_cover_stalled_children_and_inherited_output_pipes() {
+        use std::time::{Duration as StdDuration, Instant};
+
+        for script in [
+            // The owned shell becomes the sleeper, so timeout cleanup targets
+            // exactly this disposable process even after its pipes close.
+            "exec 1>&- 2>&-; exec sleep 30",
+            // The short-lived descendant retains both pipes after its parent
+            // exits successfully. The deadline still makes this unconfirmed.
+            "sleep 0.3 & exit 0",
+        ] {
+            let spec = ToolSpec::new("/bin/sh", vec!["-c".into(), script.into()])
+                .with_timeout(StdDuration::from_millis(50));
+            let started = Instant::now();
+            let error = run_notification(&notification_runner(), &spec).unwrap_err();
+            assert!(error.contains("timed out"), "{error}");
+            assert!(started.elapsed() < StdDuration::from_secs(2));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn notification_channels_share_the_tick_budget_and_cannot_extend_the_deadline() {
+        use std::time::{Duration as StdDuration, Instant};
+
+        let runner = ToolRunner::new(ToolConfig {
+            budget_ms: 50,
+            use_nice: false,
+            ..ToolConfig::default()
+        });
+        let sleeper = ToolSpec::new("/bin/sh", vec!["-c".into(), "exec sleep 30".into()])
+            .with_timeout(StdDuration::from_secs(60));
+        let started = Instant::now();
+        assert!(run_notification(&runner, &sleeper)
+            .unwrap_err()
+            .contains("timed out"));
+        assert!(runner.budget_exhausted());
+        assert!(run_notification(
+            &runner,
+            &ToolSpec::new("/bin/sh", vec!["-c".into(), "exit 0".into()]),
+        )
+        .unwrap_err()
+        .contains("budget exhausted"));
+        assert!(started.elapsed() < StdDuration::from_secs(2));
+
+        // With the normal tick budget available, an arbitrary per-command
+        // timeout still cannot exceed the daemon's notification deadline.
+        let started = Instant::now();
+        assert!(run_notification(&notification_runner(), &sleeper)
             .unwrap_err()
             .contains("timed out"));
         assert!(started.elapsed() < StdDuration::from_secs(5));

@@ -16003,10 +16003,18 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
 
         let metrics = collect_daemon_metrics();
         let now_secs = daemon_now_secs();
-
-        if let Some(store) = inbox.as_ref() {
-            daemon_refresh_inbox_notifications(&config, &mut notify_mgr, store, now_secs);
-        }
+        let notification_runner = pt_core::daemon::escalation::notification_runner();
+        let mut notification_outcomes = if let Some(store) = inbox.as_ref() {
+            daemon_refresh_inbox_notifications(
+                &config,
+                &mut notify_mgr,
+                store,
+                now_secs,
+                &notification_runner,
+            )
+        } else {
+            Vec::new()
+        };
 
         let mut budget_exceeded = false;
         let mut cpu_budget_observed = false;
@@ -16141,7 +16149,13 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
                                             );
                                             let notifs = notify_mgr.flush(now_secs);
                                             for n in notifs {
-                                                daemon_deliver_notification(&config, &n);
+                                                notification_outcomes.extend(
+                                                    daemon_deliver_notification(
+                                                        &config,
+                                                        &n,
+                                                        &notification_runner,
+                                                    ),
+                                                );
                                             }
                                         }
                                     }
@@ -16170,6 +16184,9 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
                 .record_event(pt_core::daemon::DaemonEventType::TickCompleted, "tick");
         }
 
+        // Background mode has no stderr. Retain actual command outcomes in the
+        // status event history without treating ladder emission as delivery.
+        daemon_record_notification_outcomes(&mut state_bundle.daemon, notification_outcomes);
         // Persist notification escalation state.
         state_bundle.notifications = notify_mgr.persisted_state();
         if let Err(error) = save_daemon_state(&state_path, &state_bundle) {
@@ -16373,14 +16390,15 @@ fn daemon_refresh_inbox_notifications(
     notify_mgr: &mut pt_core::decision::escalation::EscalationManager,
     store: &pt_core::inbox::InboxStore,
     now_secs: f64,
-) {
+    runner: &pt_core::collect::tool_runner::ToolRunner,
+) -> Vec<DaemonNotificationOutcome> {
     if !config.notifications.enabled {
-        return;
+        return Vec::new();
     }
 
     let items = match store.list() {
         Ok(items) => items,
-        Err(_) => return,
+        Err(_) => return Vec::new(),
     };
 
     // Acknowledged items stop escalation.
@@ -16395,8 +16413,46 @@ fn daemon_refresh_inbox_notifications(
     }
 
     let notifs = notify_mgr.flush(now_secs);
+    let mut outcomes = Vec::new();
     for n in notifs {
-        daemon_deliver_notification(config, &n);
+        outcomes.extend(daemon_deliver_notification(config, &n, runner));
+    }
+    outcomes
+}
+
+#[cfg(feature = "daemon")]
+struct DaemonNotificationOutcome {
+    channel: &'static str,
+    dedupe_key: String,
+    result: Result<(), String>,
+}
+
+#[cfg(feature = "daemon")]
+fn daemon_record_notification_outcomes(
+    state: &mut pt_core::daemon::DaemonState,
+    outcomes: Vec<DaemonNotificationOutcome>,
+) {
+    use pt_core::daemon::DaemonEventType;
+    for outcome in outcomes {
+        // Neither notification content nor hook output belongs in a delivery
+        // receipt. The bounded correlation key is sufficient to find the inbox.
+        let key: String = outcome.dedupe_key.chars().take(256).collect();
+        let (event_type, detail) = match outcome.result {
+            Ok(()) => (
+                DaemonEventType::NotificationCommandCompleted,
+                format!(
+                    "{} command completed for {key}; display or receipt is not verified",
+                    outcome.channel
+                ),
+            ),
+            Err(error) => {
+                let error: String = error.chars().take(1024).collect();
+                let detail = format!("{} notification for {key}: {error}", outcome.channel);
+                eprintln!("daemon: {detail}");
+                (DaemonEventType::NotificationDeliveryFailed, detail)
+            }
+        };
+        state.record_event(event_type, &detail);
     }
 }
 
@@ -16404,11 +16460,13 @@ fn daemon_refresh_inbox_notifications(
 fn daemon_deliver_notification(
     config: &pt_core::daemon::DaemonConfig,
     notif: &pt_core::decision::escalation::Notification,
-) {
+    runner: &pt_core::collect::tool_runner::ToolRunner,
+) -> Vec<DaemonNotificationOutcome> {
     if !config.notifications.enabled {
-        return;
+        return Vec::new();
     }
 
+    let mut outcomes = Vec::new();
     if config.notifications.desktop
         && notif.channels.iter().any(|c| {
             matches!(
@@ -16417,93 +16475,131 @@ fn daemon_deliver_notification(
             )
         })
     {
-        let _ = daemon_notify_desktop(notif);
+        outcomes.push(DaemonNotificationOutcome {
+            channel: "desktop",
+            dedupe_key: notif.dedupe_key.clone(),
+            result: daemon_notify_desktop(runner, notif),
+        });
     }
 
     if let Some(cmd) = config.notifications.notify_cmd.as_deref() {
-        let _ = daemon_notify_cmd(cmd, &config.notifications.notify_arg, notif);
+        outcomes.push(DaemonNotificationOutcome {
+            channel: "notify_cmd",
+            dedupe_key: notif.dedupe_key.clone(),
+            result: daemon_notify_cmd(runner, cmd, &config.notifications.notify_arg, notif),
+        });
     }
+    outcomes
 }
 
 #[cfg(feature = "daemon")]
 fn daemon_notify_cmd(
+    runner: &pt_core::collect::tool_runner::ToolRunner,
     cmd: &str,
     args: &[String],
     notif: &pt_core::decision::escalation::Notification,
-) -> std::io::Result<()> {
-    use std::process::Command;
+) -> Result<(), String> {
+    use pt_core::collect::tool_runner::ToolSpec;
 
-    let mut c = Command::new(cmd);
-    c.args(args);
-    c.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-
-    c.env("PT_NOTIFY_LEVEL", format!("{:?}", notif.level));
-    c.env("PT_NOTIFY_SEVERITY", format!("{:?}", notif.severity));
-    c.env("PT_NOTIFY_TITLE", notif.title.clone());
-    c.env("PT_NOTIFY_BODY", notif.body.clone());
-    c.env("PT_NOTIFY_DEDUPE_KEY", notif.dedupe_key.clone());
+    let mut spec = notification_session_environment(ToolSpec::new(cmd, args.to_vec()))
+        .with_env("PT_NOTIFY_LEVEL", format!("{:?}", notif.level))
+        .with_env("PT_NOTIFY_SEVERITY", format!("{:?}", notif.severity))
+        .with_env("PT_NOTIFY_TITLE", notif.title.clone())
+        .with_env("PT_NOTIFY_BODY", notif.body.clone())
+        .with_env("PT_NOTIFY_DEDUPE_KEY", notif.dedupe_key.clone());
     if let Some(session_id) = &notif.session_id {
-        c.env("PT_NOTIFY_SESSION_ID", session_id.clone());
+        spec = spec.with_env("PT_NOTIFY_SESSION_ID", session_id.clone());
     }
 
-    let _ = c.status();
-    Ok(())
+    pt_core::daemon::escalation::run_notification(runner, &spec)
 }
 
 #[cfg(feature = "daemon")]
 fn daemon_notify_desktop(
+    runner: &pt_core::collect::tool_runner::ToolRunner,
     notif: &pt_core::decision::escalation::Notification,
-) -> std::io::Result<()> {
-    if let Some(mut command) = desktop_notification_command(std::env::consts::OS, notif) {
-        let _ = command.status();
+) -> Result<(), String> {
+    let spec = desktop_notification_command(std::env::consts::OS, notif)
+        .ok_or("desktop notifications are unavailable on this platform")?;
+    pt_core::daemon::escalation::run_notification(runner, &spec)
+}
+
+#[cfg(feature = "daemon")]
+fn notification_session_environment(
+    mut spec: pt_core::collect::tool_runner::ToolSpec,
+) -> pt_core::collect::tool_runner::ToolSpec {
+    // ToolRunner clears inherited environment, preserving PATH and fixed locale.
+    // Desktop clients need the user's bus/display, while hooks may use the usual
+    // home/config locations. Do not forward loader overrides, arbitrary secrets,
+    // or PT_NOTIFY_* values from a previous invocation.
+    for key in [
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "TMPDIR",
+        "XDG_RUNTIME_DIR",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "XAUTHORITY",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            spec = spec.with_env(key, value);
+        }
     }
-    Ok(())
+    spec
 }
 
 #[cfg(feature = "daemon")]
 fn desktop_notification_command(
     target_os: &str,
     notif: &pt_core::decision::escalation::Notification,
-) -> Option<std::process::Command> {
-    use std::process::Command;
+) -> Option<pt_core::collect::tool_runner::ToolSpec> {
+    use pt_core::collect::tool_runner::ToolSpec;
 
-    let mut command = match target_os {
+    let (program, args) = match target_os {
         "linux" => {
             let urgency = match notif.severity {
                 pt_core::decision::escalation::Severity::Critical => "critical",
                 pt_core::decision::escalation::Severity::Warning => "normal",
                 pt_core::decision::escalation::Severity::Info => "low",
             };
-            let mut command = Command::new("notify-send");
-            command.args(["-u", urgency, "-a", "pt", "--"]);
-            command
+            ("notify-send", vec!["-u", urgency, "-a", "pt", "--"])
         }
         "macos" => {
             // Notification text is argv data, never AppleScript source. Escaping
             // only quotes would leave backslash/newline combinations executable.
-            let mut command = Command::new("osascript");
-            command.args([
-                "-e",
-                "on run argv",
-                "-e",
-                "display notification (item 2 of argv) with title (item 1 of argv)",
-                "-e",
-                "end run",
-                "--",
-            ]);
-            command
+            (
+                "osascript",
+                vec![
+                    "-e",
+                    "on run argv",
+                    "-e",
+                    "display notification (item 2 of argv) with title (item 1 of argv)",
+                    "-e",
+                    "end run",
+                    "--",
+                ],
+            )
         }
         _ => return None,
     };
-    command.arg(&notif.title).arg(&notif.body);
-    Some(command)
+    let mut args: Vec<String> = args.into_iter().map(str::to_string).collect();
+    args.push(notif.title.clone());
+    args.push(notif.body.clone());
+    Some(notification_session_environment(ToolSpec::new(program, args)))
 }
 
 #[cfg(all(test, feature = "daemon"))]
 mod desktop_notification_tests {
-    use super::desktop_notification_command;
+    use super::{
+        daemon_deliver_notification, daemon_notify_cmd, daemon_record_notification_outcomes,
+        desktop_notification_command,
+    };
+    use pt_core::daemon::{DaemonConfig, DaemonEventType, DaemonState};
     use pt_core::decision::escalation::{
         EscalationLevel, Notification, NotificationChannel, Severity,
     };
@@ -16537,10 +16633,11 @@ mod desktop_notification_tests {
         ] {
             let notif = notification(title, body, Severity::Warning);
             let command = desktop_notification_command("macos", &notif).unwrap();
-            assert_eq!(command.get_program(), "osascript");
+            assert_eq!(command.command, "osascript");
             let args: Vec<_> = command
-                .get_args()
-                .map(|arg| arg.to_str().unwrap())
+                .args
+                .iter()
+                .map(String::as_str)
                 .collect();
             assert_eq!(
                 args,
@@ -16568,10 +16665,11 @@ mod desktop_notification_tests {
         ] {
             let notif = notification("--help", "-u critical\n\"review\" \\ λ", severity);
             let command = desktop_notification_command("linux", &notif).unwrap();
-            assert_eq!(command.get_program(), "notify-send");
+            assert_eq!(command.command, "notify-send");
             let args: Vec<_> = command
-                .get_args()
-                .map(|arg| arg.to_str().unwrap())
+                .args
+                .iter()
+                .map(String::as_str)
                 .collect();
             assert_eq!(
                 args,
@@ -16584,6 +16682,77 @@ mod desktop_notification_tests {
     fn unsupported_desktop_platform_has_no_command() {
         let notif = notification("Process triage", "Review candidates", Severity::Info);
         assert!(desktop_notification_command("freebsd", &notif).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn notification_hook_receives_literal_arguments_and_current_notification_metadata() {
+        let mut notif = notification(
+            "--title \"quoted\" λ",
+            "literal $HOME $(exit 93) `exit 94`\nsecond line",
+            Severity::Warning,
+        );
+        for session_id in [None, Some("pt-20261115-120000-abcd".to_string())] {
+            notif.session_id = session_id;
+            let args = vec![
+                "-c".to_string(),
+                "test \"$PT_NOTIFY_LEVEL\" = L1 && test \"$PT_NOTIFY_SEVERITY\" = Warning && test \"$PT_NOTIFY_TITLE\" = \"$1\" && test \"$PT_NOTIFY_BODY\" = \"$2\" && test \"$PT_NOTIFY_DEDUPE_KEY\" = \"$3\" && test \"${PT_NOTIFY_SESSION_ID-}\" = \"$4\"".to_string(),
+                "pt-notification-test".to_string(),
+                notif.title.clone(),
+                notif.body.clone(),
+                notif.dedupe_key.clone(),
+                notif.session_id.clone().unwrap_or_default(),
+            ];
+            daemon_notify_cmd(
+                &pt_core::daemon::escalation::notification_runner(),
+                "/bin/sh",
+                &args,
+                &notif,
+            )
+            .expect("literal hook metadata");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn notification_delivery_failures_are_visible_in_persisted_daemon_status() {
+        let mut config = DaemonConfig::default();
+        config.notifications.desktop = false;
+        config.notifications.notify_cmd = Some("/bin/sh".to_string());
+        let mut state = DaemonState::new();
+        let notif = notification("Process Triage", "private notification body", Severity::Info);
+        for (script, expected) in [
+            ("exit 0", DaemonEventType::NotificationCommandCompleted),
+            ("printf 'private hook output' >&2; exit 7", DaemonEventType::NotificationDeliveryFailed),
+        ] {
+            config.notifications.notify_arg = vec!["-c".to_string(), script.to_string()];
+            let outcomes = daemon_deliver_notification(
+                &config,
+                &notif,
+                &pt_core::daemon::escalation::notification_runner(),
+            );
+            assert_eq!(outcomes.len(), 1);
+            daemon_record_notification_outcomes(&mut state, outcomes);
+            let persisted = serde_json::to_string(&state).unwrap();
+            let restored: DaemonState = serde_json::from_str(&persisted).unwrap();
+            let event = restored.recent_events.back().unwrap();
+            assert_eq!(event.event_type, expected);
+            assert!(event.detail.contains("notify_cmd"));
+            assert!(event.detail.contains(&notif.dedupe_key));
+            assert!(!persisted.contains(&notif.body));
+            assert!(!persisted.contains("private hook output"));
+            if expected == DaemonEventType::NotificationDeliveryFailed {
+                assert!(event.detail.contains("Some(7)"));
+                assert!(event.detail.contains("unconfirmed"));
+            }
+        }
+        config.notifications.enabled = false;
+        assert!(daemon_deliver_notification(
+            &config,
+            &notif,
+            &pt_core::daemon::escalation::notification_runner(),
+        )
+        .is_empty());
     }
 }
 
