@@ -205,6 +205,10 @@ pub struct ToolSpec {
     /// Explicit environment additions after clearing inherited variables.
     /// Callers must select only the variables their command requires.
     pub env: BTreeMap<String, String>,
+
+    /// Own a separate process group and cancel its descendants on completion.
+    /// Supported on Linux, where an unreaped leader pins the group identity.
+    pub isolate_process_group: bool,
 }
 
 impl ToolSpec {
@@ -218,6 +222,7 @@ impl ToolSpec {
             timeout: None,
             max_output: None,
             env: BTreeMap::new(),
+            isolate_process_group: false,
         }
     }
 
@@ -250,6 +255,12 @@ impl ToolSpec {
         self.env.insert(key.into(), value.into());
         self
     }
+
+    /// Isolate a trusted worker and its subprocesses for deadline cancellation.
+    pub fn with_process_group(mut self) -> Self {
+        self.isolate_process_group = true;
+        self
+    }
 }
 
 /// Tool runner with shared budget tracking.
@@ -260,14 +271,73 @@ pub struct ToolRunner {
     used_ms: Arc<AtomicU64>,
 }
 
+type StdoutHandler<'a> = &'a mut dyn FnMut(&[u8]) -> std::io::Result<()>;
+
 /// Retain ownership until collection finishes, including every error path.
 /// A timeout must not turn a D-state child into a blocking `wait()` in the caller.
-struct ToolChildGuard(Option<Child>);
+struct ToolChildGuard(Option<Child>, bool);
 
 impl Drop for ToolChildGuard {
     fn drop(&mut self) {
+        #[cfg(not(target_os = "linux"))]
+        let _ = self.1;
         if let Some(child) = self.0.take() {
+            #[cfg(target_os = "linux")]
+            if self.1 {
+                terminate_owned_group(&child);
+            }
             terminate_owned_child(child);
+        }
+    }
+}
+
+/// Observe exit without reaping: the leader's PID must remain pinned until its
+/// process group has been cancelled, even if descendants retain output pipes.
+#[cfg(target_os = "linux")]
+fn peek_child_exit(child: &Child) -> std::io::Result<Option<std::process::ExitStatus>> {
+    use std::os::unix::process::ExitStatusExt;
+
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id(),
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { info.si_pid() } == 0 {
+        return Ok(None);
+    }
+    let status = unsafe { info.si_status() };
+    let raw = match info.si_code {
+        libc::CLD_EXITED => status << 8,
+        libc::CLD_DUMPED => status | 0x80,
+        _ => status,
+    };
+    Ok(Some(std::process::ExitStatus::from_raw(raw)))
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_owned_group(child: &Child) {
+    let pid = child.id();
+    // WNOWAIT establishes parenthood without releasing the numeric identity.
+    // Never signal a group after an ECHILD result or a failed setpgid invariant.
+    if pid <= 1 || peek_child_exit(child).is_err() {
+        warn!(pid, "cannot establish worker group ownership for cleanup");
+        return;
+    }
+    if unsafe { libc::getpgid(pid as libc::pid_t) } != pid as libc::pid_t {
+        warn!(pid, "worker is no longer its owned process group leader");
+        return;
+    }
+    if unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            warn!(pid, %error, "cannot terminate worker process group");
         }
     }
 }
@@ -363,6 +433,7 @@ impl ToolRunner {
             stdin: None,
             working_dir: None,
             env: BTreeMap::new(),
+            isolate_process_group: false,
         };
         self.run(&spec)
     }
@@ -370,6 +441,17 @@ impl ToolRunner {
     /// Run a tool from a specification.
     #[instrument(skip(self), fields(cmd = %spec.command))]
     pub fn run(&self, spec: &ToolSpec) -> Result<ToolOutput, ToolError> {
+        self.run_with_stdout_handler(spec, None)
+    }
+
+    /// Consume stdout while the original deadline and output cap are active.
+    /// A handler error cancels the owned tool just like a pipe error.
+    pub(super) fn run_with_stdout_handler(
+        &self,
+        spec: &ToolSpec,
+        stdout_handler: Option<StdoutHandler<'_>>,
+    ) -> Result<ToolOutput, ToolError> {
+        let start = Instant::now();
         // Validate command
         self.validate_command(&spec.command)?;
 
@@ -418,8 +500,6 @@ impl ToolRunner {
             "running tool"
         );
 
-        let start = Instant::now();
-
         // Build command
         let mut command = match self.build_command(spec) {
             Ok(mut cmd) => {
@@ -440,6 +520,17 @@ impl ToolRunner {
             }
         };
 
+        if start.elapsed() >= timeout {
+            // Preparation consumed the reservation even though no tool started.
+            // Refunding here makes repeated pre-spawn timeouts free forever.
+            let charged_ms = charged_budget_ms(start.elapsed());
+            self.used_ms.fetch_add(
+                charged_ms.saturating_sub(allocated_ms),
+                Ordering::SeqCst,
+            );
+            return Err(ToolError::Timeout(timeout));
+        }
+
         // Spawn process
         let child = match command
             .stdout(Stdio::piped())
@@ -455,7 +546,7 @@ impl ToolRunner {
             }
         };
 
-        let mut child = ToolChildGuard(Some(child));
+        let mut child = ToolChildGuard(Some(child), spec.isolate_process_group);
         // Stdin, both output pipes, and child exit share the original deadline.
         // Never leave a detached writer blocked on a child that stopped reading.
         let result = self.execute_with_timeout(
@@ -464,6 +555,8 @@ impl ToolRunner {
             timeout,
             max_output,
             spec.stdin.as_deref(),
+            spec.isolate_process_group,
+            stdout_handler,
         );
         // Cancel/reap before charging elapsed time, without waiting for a child
         // stuck in kernel I/O. This also runs after setup or pipe-read failures.
@@ -663,6 +756,20 @@ impl ToolRunner {
             }
         }
 
+        if spec.isolate_process_group {
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::unix::process::CommandExt;
+                command.process_group(0);
+            }
+            #[cfg(not(target_os = "linux"))]
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "owned worker process groups require Linux WNOWAIT",
+            )
+            .into());
+        }
+
         Ok(command)
     }
 
@@ -670,7 +777,7 @@ impl ToolRunner {
     /// are separate conditions: descendants can retain output pipes after the
     /// tool exits, and a tool can close its pipes before becoming stuck.
     #[cfg(unix)]
-    #[allow(clippy::type_complexity)]
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn execute_with_timeout(
         &self,
         child: &mut Child,
@@ -678,6 +785,8 @@ impl ToolRunner {
         timeout: Duration,
         max_output: usize,
         input: Option<&[u8]>,
+        isolate_process_group: bool,
+        mut stdout_handler: Option<StdoutHandler<'_>>,
     ) -> Result<(Vec<u8>, Vec<u8>, Option<i32>, bool, bool), ToolError> {
         use std::os::fd::AsRawFd;
 
@@ -728,6 +837,7 @@ impl ToolRunner {
                     Err(error) => return Err(error.into()),
                 }
             }
+            let stdout_start = stdout_buf.len();
             progressed |= read_tool_pipe(
                 &mut stdout,
                 &mut stdout_buf,
@@ -735,6 +845,11 @@ impl ToolRunner {
                 max_output,
                 &mut truncated,
             )?;
+            if stdout_buf.len() > stdout_start {
+                if let Some(handler) = stdout_handler.as_mut() {
+                    handler(&stdout_buf[stdout_start..])?;
+                }
+            }
             progressed |= read_tool_pipe(
                 &mut stderr,
                 &mut stderr_buf,
@@ -743,7 +858,19 @@ impl ToolRunner {
                 &mut truncated,
             )?;
             if status.is_none() {
-                status = child.try_wait()?;
+                #[cfg(target_os = "linux")]
+                {
+                    status = if isolate_process_group {
+                        peek_child_exit(child)?
+                    } else {
+                        child.try_wait()?
+                    };
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = isolate_process_group;
+                    status = child.try_wait()?;
+                }
             }
             if truncated || (status.is_some() && stdout.is_none() && stderr.is_none()) {
                 let exit_code = status.and_then(|status| status.code());
@@ -759,7 +886,7 @@ impl ToolRunner {
     }
 
     #[cfg(not(unix))]
-    #[allow(clippy::type_complexity)]
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn execute_with_timeout(
         &self,
         _child: &mut Child,
@@ -767,6 +894,8 @@ impl ToolRunner {
         _timeout: Duration,
         _max_output: usize,
         _input: Option<&[u8]>,
+        _isolate_process_group: bool,
+        _stdout_handler: Option<StdoutHandler<'_>>,
     ) -> Result<(Vec<u8>, Vec<u8>, Option<i32>, bool, bool), ToolError> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -1077,6 +1206,32 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn pre_spawn_timeout_consumes_budget_without_starting_the_command() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("started");
+        let runner = ToolRunnerBuilder::new().use_nice(false).budget_ms(1).build();
+        let spec = ToolSpec::new(
+            "sh",
+            vec![
+                "-c".into(),
+                "printf started > \"$1\"".into(),
+                "deadline-fixture".into(),
+                marker.to_string_lossy().into_owned(),
+            ],
+        )
+        .with_timeout(Duration::ZERO);
+
+        assert!(matches!(runner.run(&spec), Err(ToolError::Timeout(_))));
+        assert!(!marker.exists(), "an expired deadline must prevent launch");
+        assert!(runner.used_budget_ms() >= 1);
+        assert_eq!(runner.remaining_budget_ms(), 0);
+        assert!(matches!(runner.run(&spec), Err(ToolError::BudgetExhausted { .. })),
+            "repeated preparation timeouts must not bypass cumulative budgeting");
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn deadline_covers_closed_pipes_and_blocked_stdin() {
         let runner = test_runner();
         for spec in [
@@ -1150,7 +1305,7 @@ mod tests {
                 .stderr(Stdio::piped())
                 .spawn()
                 .expect("start owned worker"),
-        ));
+        ), false);
 
         let started = Instant::now();
         let helper_pid: u32 = loop {
@@ -1183,6 +1338,8 @@ mod tests {
                 Instant::now(),
                 Duration::from_millis(100),
                 4096,
+                None,
+                false,
                 None,
             )
             .expect("bounded outer worker");
@@ -1235,7 +1392,7 @@ mod tests {
                 .stderr(Stdio::null())
                 .spawn()
                 .expect("owned output holder"),
-        ));
+        ), false);
         let mut tool = ToolChildGuard(Some(
             Command::new("sh")
                 .args(["-c", "exit 0"])
@@ -1244,7 +1401,7 @@ mod tests {
                 .stderr(Stdio::piped())
                 .spawn()
                 .expect("owned exiting tool"),
-        ));
+        ), false);
         let child = tool.0.as_mut().unwrap();
         child.stdout = Some(std::process::ChildStdout::from(OwnedFd::from(reader)));
         let fixture_start = Instant::now();
@@ -1258,7 +1415,7 @@ mod tests {
         }
         let started = Instant::now();
         let (_, _, code, truncated, timed_out) = test_runner()
-            .execute_with_timeout(child, started, Duration::from_millis(100), 1024, None)
+            .execute_with_timeout(child, started, Duration::from_millis(100), 1024, None, false, None)
             .expect("bounded inherited output");
         assert_eq!(code, Some(0));
         assert!(timed_out);
@@ -1266,6 +1423,63 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
         drop(tool);
         assert!(holder.0.as_mut().unwrap().try_wait().unwrap().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_worker_group_cancels_descendants_after_its_leader_exits() {
+        let mut unrelated = ToolChildGuard(
+            Some(Command::new("sleep").arg("30").spawn().unwrap()),
+            false,
+        );
+        // Both a descendant retaining the pipes and one closing them must die.
+        // A successful leader exit must not release its PID before group cleanup.
+        for (script, expect_timeout) in [
+            ("sleep 30 & printf '%s\\n' \"$!\"; exit 0", true),
+            ("sleep 30 >/dev/null 2>&1 & printf '%s\\n' \"$!\"; exit 0", false),
+        ] {
+            let output = test_runner().run(
+                &ToolSpec::new("sh", vec!["-c".into(), script.into()])
+                    .with_process_group()
+                    .with_timeout(Duration::from_millis(750)),
+            ).unwrap();
+            assert_eq!(output.timed_out, expect_timeout, "{output:?}");
+            assert_eq!(output.exit_code, Some(0), "leader exit was observed without reaping");
+            let descendant: u32 = output.stdout_str().trim().parse().unwrap();
+            let cleanup_start = Instant::now();
+            loop {
+                let state = std::fs::read_to_string(format!("/proc/{descendant}/stat"))
+                    .ok().and_then(|stat| stat.rsplit_once(") ").and_then(|(_, rest)| rest.chars().next()));
+                if matches!(state, None | Some('Z') | Some('X')) {
+                    break;
+                }
+                assert!(cleanup_start.elapsed() < Duration::from_secs(3),
+                    "worker descendant {descendant} survived cancellation in state {state:?}");
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(unrelated.0.as_mut().unwrap().try_wait().unwrap().is_none(),
+                "group cancellation must leave the caller's other children alive");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn streaming_stdout_handler_cancels_a_worker_on_protocol_failure() {
+        let mut observed = Vec::new();
+        let mut handler = |bytes: &[u8]| {
+            observed.extend_from_slice(bytes);
+            Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid worker protocol"))
+        };
+        let started = Instant::now();
+        let error = test_runner().run_with_stdout_handler(
+            &ToolSpec::new("sh", vec!["-c".into(), "printf 'bad-message\\n'; exec sleep 30".into()])
+                .with_process_group()
+                .with_timeout(Duration::from_secs(10)),
+            Some(&mut handler),
+        ).unwrap_err();
+        assert!(matches!(error, ToolError::Io(ref error) if error.kind() == std::io::ErrorKind::InvalidData));
+        assert_eq!(observed, b"bad-message\n");
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[cfg(unix)]

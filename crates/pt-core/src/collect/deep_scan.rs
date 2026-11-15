@@ -29,18 +29,21 @@ use super::proc_parsers::{
     CgroupInfo, FdInfo, IoStats, MemStats, SchedInfo, SchedStats,
 };
 use super::resource_collector::collect_local_resource_evidence;
+use super::tool_runner::{ToolConfig, ToolError, ToolRunner, ToolSpec};
 use crate::events::{event_names, Phase, ProgressEmitter, ProgressEvent};
 use pt_common::RawResourceEvidence;
 use pt_common::{IdentityQuality, ProcessId, ProcessIdentity, StartId};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::warn;
 
@@ -101,6 +104,9 @@ pub enum DeepScanError {
 
     #[error("Process {0} vanished during scan")]
     ProcessVanished(u32),
+
+    #[error("Deep scan worker failed: {0}")]
+    Worker(String),
 }
 
 /// Extended process record from deep scan.
@@ -259,9 +265,498 @@ pub struct DeepScanMetadata {
     /// Number of processes skipped (permission denied, etc.).
     pub skipped_count: usize,
 
+    /// Collection coverage, distinct from inaccessible/vanished process counts.
+    #[serde(default)]
+    pub collection: DeepScanCollection,
+
     /// Any warnings encountered during scan.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+}
+
+/// Last collection phase reached, including unfinished optional enrichment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeepScanStage {
+    #[default]
+    Initializing,
+    Processes,
+    Gpu,
+    GpuEnrichment,
+    Complete,
+}
+
+/// Explicit coverage for completed and deadline-limited scans.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeepScanCollection {
+    pub complete: bool,
+    pub timed_out: bool,
+    pub output_truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_ms: Option<u64>,
+    /// None means the worker did not finish enumerating the process inventory.
+    pub requested_count: Option<usize>,
+    /// Number of PIDs with a reported success, skip, or failure.
+    pub processed_count: usize,
+    /// PIDs with no reported outcome; unknown until the inventory is known.
+    pub incomplete_count: Option<usize>,
+    /// Failed outcomes that were reported as warnings rather than skips.
+    pub failed_count: usize,
+    /// Collected records whose per-process GPU enrichment finished.
+    pub enriched_count: usize,
+    pub stage: DeepScanStage,
+}
+
+const WORKER_REQUEST_LIMIT: usize = 1024 * 1024;
+const WORKER_OUTPUT_LIMIT: usize = 64 * 1024 * 1024;
+const WORKER_MESSAGE_LIMIT: usize = 4 * 1024 * 1024;
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeepScanWorkerRequest {
+    pids: Vec<u32>,
+    skip_inaccessible: bool,
+    include_environ: bool,
+    use_wait_free: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+enum DeepScanWorkerEvent {
+    Inventory { pids: Vec<u32> },
+    Stage { stage: DeepScanStage },
+    Record { record: Box<DeepScanRecord>, enriched: bool },
+    Skipped { pid: u32, failed: bool, warning: Option<String> },
+    Gpu { snapshot: Box<GpuSnapshot> },
+    Complete { metadata: DeepScanMetadata },
+}
+
+type ScanObserver<'a> = dyn Fn(DeepScanWorkerEvent) -> Result<(), DeepScanError> + Sync + 'a;
+
+/// Run only in the dedicated `__deep-scan-worker` subprocess, before application
+/// locks, configuration, logging, or sessions are initialized. The request is a
+/// bounded JSON document on stdin and stdout is exclusively a JSONL event stream.
+pub fn run_deep_scan_worker() -> Result<(), DeepScanError> {
+    let mut request = Vec::new();
+    std::io::stdin()
+        .lock()
+        .take((WORKER_REQUEST_LIMIT + 1) as u64)
+        .read_to_end(&mut request)?;
+    if request.len() > WORKER_REQUEST_LIMIT {
+        return Err(DeepScanError::Worker("request exceeds 1 MiB".into()));
+    }
+    let request: DeepScanWorkerRequest = serde_json::from_slice(&request)
+        .map_err(|error| DeepScanError::Worker(format!("invalid request: {error}")))?;
+    let output = Mutex::new(std::io::BufWriter::new(std::io::stdout()));
+    let observer = |event| {
+        let mut writer = output
+            .lock()
+            .map_err(|_| DeepScanError::Worker("output lock poisoned".into()))?;
+        serde_json::to_writer(&mut *writer, &event)
+            .map_err(|error| DeepScanError::Worker(format!("cannot stream result: {error}")))?;
+        writer.write_all(b"\n")?;
+        writer.flush()?;
+        Ok(())
+    };
+    deep_scan_observed(
+        &DeepScanOptions {
+            pids: request.pids,
+            skip_inaccessible: request.skip_inaccessible,
+            include_environ: request.include_environ,
+            use_wait_free: request.use_wait_free,
+            progress: None,
+        },
+        Some(&observer),
+    )?;
+    Ok(())
+}
+
+/// Isolate `/proc`, filesystem, and GPU reads in an owned subprocess. The parent
+/// stops collecting at its deadline and retains records streamed before
+/// cancellation, including evidence collected before optional GPU enrichment.
+///
+/// The wall budget includes worker startup, stdin, output, and collection. Small
+/// local serialization/cleanup overhead is unavoidable; SIGKILL cannot force a
+/// task out of uninterruptible kernel I/O. A cleanup-only reaper may remain until
+/// the kernel releases that task, but no detached scanning thread runs here.
+///
+/// Progress callbacks are coalesced and invoked only after the worker has exited
+/// or cancellation has been requested. Callback/output delivery is outside the
+/// collection budget; a blocked caller-owned sink cannot delay cancellation.
+pub fn deep_scan_with_budget(
+    options: &DeepScanOptions,
+    budget: Duration,
+    worker_executable: &Path,
+) -> Result<DeepScanResult, DeepScanError> {
+    let started = Instant::now();
+    let budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
+    let mut stream = DeepScanStream::new(options, budget_ms);
+    if budget.as_millis() == 0 {
+        stream.result.metadata.collection.timed_out = true;
+        stream.result.metadata.warnings.push(
+            "Deep scan budget expired before collection started; no probes were run".into(),
+        );
+        return Ok(stream.finish(started, false));
+    }
+    let request = serde_json::to_vec(&DeepScanWorkerRequest {
+        pids: options.pids.clone(),
+        skip_inaccessible: options.skip_inaccessible,
+        include_environ: options.include_environ,
+        use_wait_free: options.use_wait_free,
+    })
+    .map_err(|error| DeepScanError::Worker(format!("cannot encode request: {error}")))?;
+    if request.len() > WORKER_REQUEST_LIMIT {
+        return Err(DeepScanError::Worker("request exceeds 1 MiB".into()));
+    }
+    let remaining = budget.saturating_sub(started.elapsed());
+    // Millisecond budget accounting must never round a tiny budget up and probe.
+    if remaining.as_millis() == 0 {
+        stream.result.metadata.collection.timed_out = true;
+        stream.result.metadata.warnings.push(
+            "Deep scan budget expired before collection started; no probes were run".into(),
+        );
+        return Ok(stream.finish(started, false));
+    }
+    let executable = worker_executable
+        .to_str()
+        .ok_or_else(|| DeepScanError::Worker("worker path is not UTF-8".into()))?;
+    let runner = ToolRunner::new(ToolConfig {
+        default_timeout: remaining,
+        budget_ms: u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX),
+        max_output_bytes: WORKER_OUTPUT_LIMIT,
+        use_nice: false,
+        use_ionice: false,
+        ..ToolConfig::default()
+    });
+    let spec = ToolSpec::new(executable, vec!["__deep-scan-worker".into()])
+        .with_stdin(request)
+        .with_timeout(remaining)
+        .with_process_group();
+    let output = runner.run_with_stdout_handler(&spec, Some(&mut |bytes| stream.consume(bytes)));
+    let successful = match output {
+        Ok(output) => {
+            stream.result.metadata.collection.timed_out = output.timed_out;
+            stream.result.metadata.collection.output_truncated = output.truncated;
+            if output.timed_out {
+                stream.result.metadata.warnings.push(format!(
+                    "Deep scan exceeded its {budget_ms} ms collection budget; completed evidence was retained"
+                ));
+            }
+            if output.truncated {
+                stream.result.metadata.warnings.push(
+                    "Deep scan worker output exceeded its byte limit; collection is incomplete".into(),
+                );
+            }
+            if !output.success() && !output.timed_out && !output.truncated {
+                stream.result.metadata.warnings.push(format!(
+                    "Deep scan worker exited without success (status {:?})",
+                    output.exit_code
+                ));
+            }
+            output.success()
+        }
+        Err(error) => {
+            stream.result.metadata.collection.timed_out = matches!(
+                error,
+                ToolError::Timeout(_) | ToolError::BudgetExhausted { .. }
+            );
+            stream.result.metadata.warnings.push(format!("Deep scan worker: {error}"));
+            false
+        }
+    };
+    Ok(stream.finish(started, successful))
+}
+
+/// Incremental, bounded protocol decoder; no large post-deadline JSON parse.
+struct DeepScanStream<'a> {
+    result: DeepScanResult,
+    pending: Vec<u8>,
+    outcomes: HashSet<u32>,
+    expected_pids: Option<HashSet<u32>>,
+    records: HashMap<u32, usize>,
+    enriched: HashSet<u32>,
+    inventory_received: bool,
+    gpu_received: bool,
+    terminal_received: bool,
+    options: &'a DeepScanOptions,
+    progress_started: Option<ProgressEvent>,
+}
+
+impl<'a> DeepScanStream<'a> {
+    fn new(options: &'a DeepScanOptions, budget_ms: u64) -> Self {
+        let expected_pids = (!options.pids.is_empty())
+            .then(|| options.pids.iter().copied().collect::<HashSet<_>>());
+        let requested_count = expected_pids.as_ref().map(HashSet::len);
+        Self {
+            result: DeepScanResult {
+                processes: Vec::new(),
+                gpu: GpuSnapshot::default(),
+                metadata: DeepScanMetadata {
+                    started_at: chrono::Utc::now().to_rfc3339(),
+                    duration_ms: 0,
+                    process_count: 0,
+                    skipped_count: 0,
+                    warnings: Vec::new(),
+                    collection: DeepScanCollection {
+                        budget_ms: Some(budget_ms),
+                        requested_count,
+                        incomplete_count: requested_count,
+                        ..DeepScanCollection::default()
+                    },
+                },
+            },
+            pending: Vec::new(),
+            outcomes: HashSet::new(),
+            expected_pids,
+            records: HashMap::new(),
+            enriched: HashSet::new(),
+            inventory_received: false,
+            gpu_received: false,
+            terminal_received: false,
+            options,
+            progress_started: None,
+        }
+    }
+
+    fn consume(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        for part in bytes.split_inclusive(|byte| *byte == b'\n') {
+            if self.pending.len().saturating_add(part.len()) > WORKER_MESSAGE_LIMIT {
+                self.result.metadata.collection.output_truncated = true;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "deep scan worker message exceeds 4 MiB",
+                ));
+            }
+            self.pending.extend_from_slice(part);
+            if part.last() == Some(&b'\n') {
+                let event = serde_json::from_slice(&self.pending)
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+                self.pending.clear();
+                self.accept(event)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn accept(&mut self, event: DeepScanWorkerEvent) -> std::io::Result<()> {
+        let invalid = |message| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
+        if self.terminal_received {
+            return Err(invalid("deep scan event after completion"));
+        }
+        match event {
+            DeepScanWorkerEvent::Inventory { pids } => {
+                let count = pids.len();
+                let pids: HashSet<_> = pids.into_iter().collect();
+                if self.inventory_received
+                    || pids.len() != count
+                    || self.expected_pids.as_ref().is_some_and(|expected| expected != &pids)
+                {
+                    return Err(invalid("inconsistent deep scan inventory"));
+                }
+                self.inventory_received = true;
+                self.expected_pids = Some(pids);
+                self.result.metadata.collection.requested_count = Some(count);
+                if self.options.progress.is_some() {
+                    self.progress_started = Some(
+                        ProgressEvent::new(event_names::DEEP_SCAN_STARTED, Phase::DeepScan)
+                            .with_progress(0, Some(count as u64))
+                            .with_detail("include_environ", self.options.include_environ)
+                            .with_detail("skip_inaccessible", self.options.skip_inaccessible)
+                            .with_detail("wait_free", self.options.use_wait_free)
+                            .with_detail("budget_ms", self.result.metadata.collection.budget_ms),
+                    );
+                }
+            }
+            DeepScanWorkerEvent::Stage { stage } => {
+                let previous = self.result.metadata.collection.stage;
+                let valid = self.inventory_received && matches!(
+                    (previous, stage),
+                    (DeepScanStage::Initializing, DeepScanStage::Processes)
+                        | (DeepScanStage::Processes, DeepScanStage::Gpu)
+                        | (DeepScanStage::Gpu, DeepScanStage::GpuEnrichment)
+                );
+                if !valid || (stage == DeepScanStage::GpuEnrichment && !self.gpu_received) {
+                    return Err(invalid("invalid deep scan phase transition"));
+                }
+                self.result.metadata.collection.stage = stage;
+            }
+            DeepScanWorkerEvent::Record { record, enriched } => {
+                let pid = record.pid.0;
+                if !self.expected_pids.as_ref().is_some_and(|pids| pids.contains(&pid)) {
+                    return Err(invalid("deep scan record is outside the requested inventory"));
+                }
+                if enriched {
+                    if self.result.metadata.collection.stage != DeepScanStage::GpuEnrichment {
+                        return Err(invalid("deep scan enrichment outside its collection phase"));
+                    }
+                    let index = *self.records.get(&pid)
+                        .ok_or_else(|| invalid("enrichment without a process record"))?;
+                    if self.result.processes[index].start_id != record.start_id
+                        || record.gpu.is_none()
+                        || !self.enriched.insert(pid)
+                    {
+                        return Err(invalid("inconsistent deep scan enrichment identity"));
+                    }
+                    self.result.processes[index] = *record;
+                } else {
+                    if self.result.metadata.collection.stage != DeepScanStage::Processes
+                        || !self.outcomes.insert(pid)
+                    {
+                        return Err(invalid("duplicate or unannounced deep scan process"));
+                    }
+                    self.records.insert(pid, self.result.processes.len());
+                    self.result.processes.push(*record);
+                }
+            }
+            DeepScanWorkerEvent::Skipped { pid, failed, warning } => {
+                if self.result.metadata.collection.stage != DeepScanStage::Processes
+                    || !self.expected_pids.as_ref().is_some_and(|pids| pids.contains(&pid))
+                    || !self.outcomes.insert(pid)
+                {
+                    return Err(invalid("duplicate or unannounced deep scan skip"));
+                }
+                if failed {
+                    self.result.metadata.collection.failed_count += 1;
+                } else {
+                    self.result.metadata.skipped_count += 1;
+                }
+                if let Some(warning) = warning {
+                    self.result.metadata.warnings.push(warning);
+                }
+            }
+            DeepScanWorkerEvent::Gpu { snapshot } => {
+                if self.result.metadata.collection.stage != DeepScanStage::Gpu || self.gpu_received {
+                    return Err(invalid("unexpected deep scan GPU snapshot"));
+                }
+                self.gpu_received = true;
+                self.result.metadata.warnings.extend(
+                    snapshot.provenance.warnings.iter().map(|warning| format!("GPU: {warning}")),
+                );
+                self.result.gpu = *snapshot;
+            }
+            DeepScanWorkerEvent::Complete { metadata } => {
+                if !self.inventory_received
+                    || self.result.metadata.collection.requested_count != Some(self.outcomes.len())
+                    || metadata.process_count != self.result.processes.len()
+                    || metadata.skipped_count != self.result.metadata.skipped_count
+                    || metadata.collection.failed_count != self.result.metadata.collection.failed_count
+                    || self.enriched.len() != self.result.processes.len()
+                    || !metadata.collection.complete
+                    || metadata.collection.stage != DeepScanStage::Complete
+                    || self.result.metadata.collection.stage != DeepScanStage::GpuEnrichment
+                    || metadata.collection.requested_count != Some(self.outcomes.len())
+                    || metadata.collection.processed_count != self.outcomes.len()
+                    || metadata.collection.enriched_count != self.enriched.len()
+                    || metadata.collection.incomplete_count != Some(0)
+                    || metadata.collection.timed_out
+                    || metadata.collection.output_truncated
+                {
+                    return Err(invalid("deep scan completion does not match observed coverage"));
+                }
+                self.terminal_received = true;
+                self.result.metadata.warnings = metadata.warnings;
+            }
+        }
+        if self.result.metadata.collection.requested_count.is_some_and(|count| self.outcomes.len() > count) {
+            return Err(invalid("deep scan outcomes exceed the inventory"));
+        }
+        Ok(())
+    }
+
+    fn finish(mut self, started: Instant, successful: bool) -> DeepScanResult {
+        let collection = &mut self.result.metadata.collection;
+        collection.complete = successful && self.terminal_received && self.pending.is_empty();
+        collection.processed_count = self.outcomes.len();
+        collection.incomplete_count = collection.requested_count
+            .map(|count| count.saturating_sub(self.outcomes.len()));
+        collection.enriched_count = self.enriched.len();
+        if collection.complete {
+            collection.stage = DeepScanStage::Complete;
+        } else {
+            self.result.metadata.warnings.push(format!(
+                "Incomplete deep scan: {} process outcomes, inventory {:?}, last stage {:?}; missing evidence remains unknown",
+                collection.processed_count, collection.requested_count, collection.stage
+            ));
+        }
+        self.result.metadata.process_count = self.result.processes.len();
+        self.result.metadata.duration_ms =
+            started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+        // ToolRunner has already exited or cancelled its worker before finish.
+        // Never invoke arbitrary callback I/O while probes still own a deadline.
+        if let Some(emitter) = self.options.progress.as_ref() {
+            if let Some(event) = self.progress_started {
+                emitter.emit(event);
+            }
+            if collection.processed_count > 0 {
+                emitter.emit(
+                    ProgressEvent::new(event_names::DEEP_SCAN_PROGRESS, Phase::DeepScan)
+                        .with_progress(
+                            collection.processed_count as u64,
+                            collection.requested_count.map(|count| count as u64),
+                        )
+                        .with_detail("skipped", self.result.metadata.skipped_count)
+                        .with_detail("failed", collection.failed_count),
+                );
+            }
+            emitter.emit(
+                ProgressEvent::new(event_names::DEEP_SCAN_COMPLETE, Phase::DeepScan)
+                    .with_elapsed_ms(self.result.metadata.duration_ms)
+                    .with_detail("complete", collection.complete)
+                    .with_detail("timed_out", collection.timed_out)
+                    .with_detail("process_count", self.result.metadata.process_count)
+                    .with_detail("skipped", self.result.metadata.skipped_count)
+                    .with_detail("warnings", self.result.metadata.warnings.len())
+                    .with_detail("stage", collection.stage),
+            );
+        }
+        self.result
+    }
+}
+
+#[derive(Default)]
+struct ProcessCollection {
+    processes: Vec<DeepScanRecord>,
+    warnings: Vec<String>,
+    skipped: usize,
+    failed: usize,
+}
+
+impl ProcessCollection {
+    fn record(
+        &mut self,
+        pid: u32,
+        result: Result<DeepScanRecord, DeepScanError>,
+        skip_inaccessible: bool,
+        observer: Option<&ScanObserver<'_>>,
+    ) -> Result<(), DeepScanError> {
+        match result {
+            Ok(record) => {
+                if let Some(observer) = observer {
+                    observer(DeepScanWorkerEvent::Record {
+                        record: Box::new(record.clone()),
+                        enriched: false,
+                    })?;
+                }
+                self.processes.push(record);
+            }
+            Err(error) => {
+                let failed = !skip_inaccessible && !matches!(error, DeepScanError::ProcessVanished(_));
+                let warning = failed.then(|| format!("PID {pid}: {error}"));
+                if failed {
+                    self.failed += 1;
+                } else {
+                    self.skipped += 1;
+                }
+                if let Some(observer) = observer {
+                    observer(DeepScanWorkerEvent::Skipped { pid, failed, warning: warning.clone() })?;
+                }
+                if let Some(warning) = warning {
+                    self.warnings.push(warning);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Perform a deep scan of running processes.
@@ -278,8 +773,29 @@ pub struct DeepScanMetadata {
 /// # Errors
 /// * `DeepScanError` if critical failures occur
 pub fn deep_scan(options: &DeepScanOptions) -> Result<DeepScanResult, DeepScanError> {
+    deep_scan_observed(options, None)
+}
+
+fn deep_scan_observed(
+    options: &DeepScanOptions,
+    observer: Option<&ScanObserver<'_>>,
+) -> Result<DeepScanResult, DeepScanError> {
     let start = Instant::now();
     let started_at = chrono::Utc::now().to_rfc3339();
+
+    // Inventory precedes potentially blocked initialization so partial results
+    // can distinguish an unknown census from a known set of unfinished PIDs.
+    let pids = if options.pids.is_empty() {
+        list_all_pids()?
+    } else {
+        // Explicit target order can encode VOI priority; retain first occurrence.
+        let mut seen = HashSet::new();
+        options.pids.iter().copied().filter(|pid| seen.insert(*pid)).collect::<Vec<_>>()
+    };
+    let total_pids = pids.len() as u64;
+    if let Some(observer) = observer {
+        observer(DeepScanWorkerEvent::Inventory { pids: pids.clone() })?;
+    }
 
     // Initialize user cache to avoid reading /etc/passwd for every process
     let user_cache = UserCache::new();
@@ -292,14 +808,6 @@ pub fn deep_scan(options: &DeepScanOptions) -> Result<DeepScanResult, DeepScanEr
         .ok()
         .map(|s| s.trim().to_string());
 
-    // Get list of PIDs to scan
-    let pids = if options.pids.is_empty() {
-        list_all_pids()?
-    } else {
-        options.pids.clone()
-    };
-    let total_pids = pids.len() as u64;
-
     if let Some(emitter) = options.progress.as_ref() {
         emitter.emit(
             ProgressEvent::new(event_names::DEEP_SCAN_STARTED, Phase::DeepScan)
@@ -310,9 +818,10 @@ pub fn deep_scan(options: &DeepScanOptions) -> Result<DeepScanResult, DeepScanEr
         );
     }
 
-    let mut processes = Vec::new();
-    let mut warnings = Vec::new();
-    let mut total_skipped = 0;
+    if let Some(observer) = observer {
+        observer(DeepScanWorkerEvent::Stage { stage: DeepScanStage::Processes })?;
+    }
+    let mut collected = ProcessCollection::default();
 
     // Try to use wait-free prober if requested
     if options.use_wait_free {
@@ -360,33 +869,22 @@ pub fn deep_scan(options: &DeepScanOptions) -> Result<DeepScanResult, DeepScanEr
 
                 for &pid in chunk {
                     let results = pid_results.remove(&pid).unwrap_or_default();
-                    match parse_probed_process(
+                    collected.record(
                         pid,
-                        &results,
-                        &user_cache,
-                        &boot_id,
-                        &network_snapshot,
-                    ) {
-                        Ok(record) => processes.push(record),
-                        Err(DeepScanError::ProcessVanished(_)) => total_skipped += 1,
-                        Err(e) => {
-                            if options.skip_inaccessible {
-                                total_skipped += 1;
-                            } else {
-                                warnings.push(format!("PID {}: {}", pid, e));
-                            }
-                        }
-                    }
+                        parse_probed_process(pid, &results, &user_cache, &boot_id, &network_snapshot),
+                        options.skip_inaccessible,
+                        observer,
+                    )?;
                 }
             }
 
             return finish_scan(
                 start,
                 started_at,
-                processes,
-                warnings,
-                total_skipped,
+                collected,
+                pids.len(),
                 options.progress.as_ref(),
+                observer,
             );
         } else {
             warn!("Failed to initialize io_uring prober, falling back to standard threaded mode");
@@ -405,7 +903,7 @@ pub fn deep_scan(options: &DeepScanOptions) -> Result<DeepScanResult, DeepScanEr
     let chunk_size = pids.len().div_ceil(num_threads.max(1)).max(1);
     let chunks: Vec<_> = pids.chunks(chunk_size).collect();
 
-    let (procs, warns, skipped) = thread::scope(|s| {
+    let collected = thread::scope(|s| -> Result<ProcessCollection, DeepScanError> {
         let mut handles = Vec::new();
 
         for chunk in chunks {
@@ -415,32 +913,19 @@ pub fn deep_scan(options: &DeepScanOptions) -> Result<DeepScanResult, DeepScanEr
             let progress_ref = options.progress.as_ref();
             let counter_ref = &scanned_counter;
 
-            handles.push(s.spawn(move || {
-                let mut local_processes = Vec::new();
-                let mut local_warnings = Vec::new();
-                let mut local_skipped = 0;
+            handles.push(s.spawn(move || -> Result<ProcessCollection, DeepScanError> {
+                let mut local = ProcessCollection::default();
 
                 for &pid in chunk {
-                    match scan_process(
+                    local.record(
                         pid,
-                        options.include_environ,
-                        user_cache_ref,
-                        boot_id_ref,
-                        network_snapshot_ref,
-                    ) {
-                        Ok(record) => local_processes.push(record),
-                        Err(DeepScanError::ProcessVanished(_)) => {
-                            // Always skip vanished processes without warning
-                            local_skipped += 1;
-                        }
-                        Err(e) => {
-                            if options.skip_inaccessible {
-                                local_skipped += 1;
-                            } else {
-                                local_warnings.push(format!("PID {}: {}", pid, e));
-                            }
-                        }
-                    }
+                        scan_process(
+                            pid, options.include_environ, user_cache_ref,
+                            boot_id_ref, network_snapshot_ref,
+                        ),
+                        options.skip_inaccessible,
+                        observer,
+                    )?;
 
                     let current = counter_ref.fetch_add(1, Ordering::Relaxed) + 1;
                     if current.is_multiple_of(PROGRESS_STEP) {
@@ -451,51 +936,58 @@ pub fn deep_scan(options: &DeepScanOptions) -> Result<DeepScanResult, DeepScanEr
                                     Phase::DeepScan,
                                 )
                                 .with_progress(current as u64, Some(total_pids))
-                                .with_detail("skipped", local_skipped),
+                                .with_detail("skipped", local.skipped),
                             );
                         }
                     }
                 }
-                (local_processes, local_warnings, local_skipped)
+                Ok(local)
             }));
         }
 
-        let mut all_processes = Vec::new();
-        let mut all_warnings = Vec::new();
-        let mut total_skipped = 0;
+        let mut all = ProcessCollection::default();
 
         for handle in handles {
-            if let Ok((p, w, s)) = handle.join() {
-                all_processes.extend(p);
-                all_warnings.extend(w);
-                total_skipped += s;
-            }
+            let local = handle.join()
+                .map_err(|_| DeepScanError::Worker("process collector panicked".into()))??;
+            all.processes.extend(local.processes);
+            all.warnings.extend(local.warnings);
+            all.skipped += local.skipped;
+            all.failed += local.failed;
         }
 
-        (all_processes, all_warnings, total_skipped)
-    });
+        Ok(all)
+    })?;
 
     finish_scan(
         start,
         started_at,
-        procs,
-        warns,
-        skipped,
+        collected,
+        pids.len(),
         options.progress.as_ref(),
+        observer,
     )
 }
 
 fn finish_scan(
     start: Instant,
     started_at: String,
-    mut processes: Vec<DeepScanRecord>,
-    mut warnings: Vec<String>,
-    skipped_count: usize,
+    collected: ProcessCollection,
+    requested_count: usize,
     progress: Option<&Arc<dyn ProgressEmitter>>,
+    observer: Option<&ScanObserver<'_>>,
 ) -> Result<DeepScanResult, DeepScanError> {
     use crate::action::{IdentityProvider, LiveIdentityProvider};
 
+    let ProcessCollection { mut processes, mut warnings, skipped: skipped_count, failed } = collected;
+    if let Some(observer) = observer {
+        observer(DeepScanWorkerEvent::Stage { stage: DeepScanStage::Gpu })?;
+    }
     let gpu = collect_gpu_snapshot();
+    if let Some(observer) = observer {
+        observer(DeepScanWorkerEvent::Gpu { snapshot: Box::new(gpu.clone()) })?;
+        observer(DeepScanWorkerEvent::Stage { stage: DeepScanStage::GpuEnrichment })?;
+    }
     let identity_provider = LiveIdentityProvider::new();
     let observed_at = chrono::Utc::now().to_rfc3339();
     for record in &mut processes {
@@ -509,6 +1001,9 @@ fn finish_scan(
             .local_resource_evidence
             .extend(gpu_resource_evidence(record.pid.0, &evidence));
         record.gpu = Some(evidence);
+        if let Some(observer) = observer {
+            observer(DeepScanWorkerEvent::Record { record: Box::new(record.clone()), enriched: true })?;
+        }
     }
     warnings.extend(
         gpu.provenance
@@ -529,16 +1024,30 @@ fn finish_scan(
         );
     }
 
+    let metadata = DeepScanMetadata {
+        started_at,
+        duration_ms: duration.as_millis() as u64,
+        process_count,
+        skipped_count,
+        warnings,
+        collection: DeepScanCollection {
+            complete: true,
+            requested_count: Some(requested_count),
+            processed_count: process_count + skipped_count + failed,
+            incomplete_count: Some(0),
+            failed_count: failed,
+            enriched_count: process_count,
+            stage: DeepScanStage::Complete,
+            ..DeepScanCollection::default()
+        },
+    };
+    if let Some(observer) = observer {
+        observer(DeepScanWorkerEvent::Complete { metadata: metadata.clone() })?;
+    }
     Ok(DeepScanResult {
         processes,
         gpu,
-        metadata: DeepScanMetadata {
-            started_at,
-            duration_ms: duration.as_millis() as u64,
-            process_count,
-            skipped_count,
-            warnings,
-        },
+        metadata,
     })
 }
 
@@ -807,6 +1316,293 @@ fn compute_start_id(boot_id: &Option<String>, starttime: u64, pid: u32) -> Start
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn protocol_record(pid: u32) -> DeepScanRecord {
+        DeepScanRecord {
+            pid: ProcessId(pid),
+            ppid: ProcessId(1),
+            uid: 1000,
+            user: "fixture".into(),
+            pgid: Some(pid),
+            sid: Some(pid),
+            start_id: StartId::from_linux("fixture-boot", 12345, pid),
+            comm: "fixture".into(),
+            cmdline: "fixture --wait".into(),
+            exe: None,
+            state: 'S',
+            io: None,
+            schedstat: None,
+            sched: None,
+            mem: None,
+            fd: None,
+            local_resource_evidence: Vec::new(),
+            gpu: None,
+            cgroup: None,
+            wchan: None,
+            network: None,
+            environ: None,
+            starttime: 12345,
+            source: "protocol-fixture".into(),
+            identity_quality: IdentityQuality::Full,
+        }
+    }
+
+    fn protocol_bytes(events: &[DeepScanWorkerEvent]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for event in events {
+            serde_json::to_writer(&mut bytes, event).unwrap();
+            bytes.push(b'\n');
+        }
+        bytes
+    }
+
+    fn process_events(pids: Vec<u32>, record_pid: u32) -> Vec<DeepScanWorkerEvent> {
+        vec![
+            DeepScanWorkerEvent::Inventory { pids },
+            DeepScanWorkerEvent::Stage { stage: DeepScanStage::Processes },
+            DeepScanWorkerEvent::Record { record: Box::new(protocol_record(record_pid)), enriched: false },
+        ]
+    }
+
+    fn blocked_worker(events: &[DeepScanWorkerEvent]) -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("worker");
+        let fifo = directory.path().join("worker.fifo");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        // Consume the real bounded request, emit complete records, then block
+        // inside a synchronous filesystem open until the owned process is killed.
+        let script = format!(
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' \"$$\" >\"$0.pid\"\ncat <<'PT_DEEP_SCAN_EVENTS'\n{}PT_DEEP_SCAN_EVENTS\nexec 3<\"$0.fifo\"\n",
+            String::from_utf8(protocol_bytes(events)).unwrap(),
+        );
+        fs::write(&executable, script).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        (directory, executable)
+    }
+
+    #[test]
+    fn deadline_zero_never_starts_a_worker_and_keeps_unknown_inventory() {
+        for pids in [vec![], vec![41, 42, 41]] {
+            let options = DeepScanOptions { pids, ..DeepScanOptions::default() };
+            let result = deep_scan_with_budget(&options, Duration::ZERO, Path::new("/does/not/exist"))
+                .expect("zero budget does not validate or launch an executable");
+            assert!(result.metadata.collection.timed_out);
+            assert!(!result.metadata.collection.complete);
+            assert_eq!(result.metadata.collection.processed_count, 0);
+            assert_eq!(result.metadata.skipped_count, 0);
+            assert_eq!(result.metadata.collection.incomplete_count,
+                if options.pids.is_empty() { None } else { Some(2) });
+            assert!(result.processes.is_empty());
+            assert_eq!(result.gpu.has_gpu, None);
+        }
+    }
+
+    #[test]
+    fn deadline_retains_completed_records_when_a_worker_blocks_in_a_fifo_open() {
+        let mut events = process_events(vec![41, 42, 43], 41);
+        events.push(DeepScanWorkerEvent::Skipped { pid: 42, failed: false, warning: None });
+        let (_directory, executable) = blocked_worker(&events);
+        let options = DeepScanOptions { pids: vec![41, 42, 43], ..DeepScanOptions::default() };
+        let started = Instant::now();
+        let result = deep_scan_with_budget(&options, Duration::from_millis(750), &executable).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(result.metadata.collection.timed_out, "{:?}", result.metadata);
+        assert!(!result.metadata.collection.complete);
+        assert_eq!(result.processes.len(), 1);
+        assert_eq!(result.processes[0].pid.0, 41);
+        assert_eq!(result.metadata.collection.processed_count, 2);
+        assert_eq!(result.metadata.collection.incomplete_count, Some(1));
+        assert_eq!(result.metadata.skipped_count, 1);
+        assert_eq!(result.metadata.collection.enriched_count, 0);
+        assert_eq!(result.metadata.collection.stage, DeepScanStage::Processes);
+        assert!(result.processes[0].gpu.is_none());
+    }
+
+    #[test]
+    fn deadline_during_gpu_keeps_process_evidence_without_claiming_completion() {
+        let mut events = process_events(vec![41], 41);
+        events.push(DeepScanWorkerEvent::Stage { stage: DeepScanStage::Gpu });
+        let (_directory, executable) = blocked_worker(&events);
+        let options = DeepScanOptions { pids: vec![41], ..DeepScanOptions::default() };
+        let result = deep_scan_with_budget(&options, Duration::from_millis(750), &executable).unwrap();
+        assert!(result.metadata.collection.timed_out, "{:?}", result.metadata);
+        assert!(!result.metadata.collection.complete);
+        assert_eq!(result.metadata.collection.incomplete_count, Some(0));
+        assert_eq!(result.metadata.collection.stage, DeepScanStage::Gpu);
+        assert_eq!(result.metadata.process_count, 1);
+        assert_eq!(result.gpu.has_gpu, None);
+        assert!(result.processes[0].gpu.is_none());
+    }
+
+    #[test]
+    fn deadline_protocol_rejects_unrequested_duplicate_and_reused_processes() {
+        let options = DeepScanOptions { pids: vec![41], ..DeepScanOptions::default() };
+        let prefix = protocol_bytes(&process_events(vec![41], 41));
+        let mut stream = DeepScanStream::new(&options, 1000);
+        stream.consume(&prefix).unwrap();
+        let duplicate = protocol_bytes(&[DeepScanWorkerEvent::Record { record: Box::new(protocol_record(41)), enriched: false }]);
+        assert!(stream.consume(&duplicate).is_err());
+
+        let mut stream = DeepScanStream::new(&options, 1000);
+        assert!(stream.consume(&protocol_bytes(&process_events(vec![41], 42))).is_err());
+        assert!(stream.result.processes.is_empty());
+
+        let mut stream = DeepScanStream::new(&options, 1000);
+        stream.consume(&prefix).unwrap();
+        stream.consume(&protocol_bytes(&[
+            DeepScanWorkerEvent::Stage { stage: DeepScanStage::Gpu },
+            DeepScanWorkerEvent::Gpu { snapshot: Box::default() },
+            DeepScanWorkerEvent::Stage { stage: DeepScanStage::GpuEnrichment },
+        ])).unwrap();
+        let mut reused = protocol_record(41);
+        reused.start_id = StartId::from_linux("fixture-boot", 99999, 41);
+        reused.gpu = Some(ProcessGpuEvidence::default());
+        assert!(stream.consume(&protocol_bytes(&[DeepScanWorkerEvent::Record { record: Box::new(reused), enriched: true }])).is_err());
+        assert_eq!(stream.result.processes[0].starttime, 12345);
+    }
+
+    #[test]
+    fn deadline_protocol_requires_a_complete_terminal_record_and_bounds_messages() {
+        let options = DeepScanOptions { pids: vec![41], ..DeepScanOptions::default() };
+        let bytes = protocol_bytes(&process_events(vec![41], 41));
+        let mut stream = DeepScanStream::new(&options, 1000);
+        for byte in &bytes {
+            stream.consume(std::slice::from_ref(byte)).unwrap();
+        }
+        stream.consume(b"{\"event\":\"complete\"").unwrap();
+        let partial = stream.finish(Instant::now(), true);
+        assert_eq!(partial.processes.len(), 1);
+        assert!(!partial.metadata.collection.complete);
+
+        let mut stream = DeepScanStream::new(&options, 1000);
+        assert!(stream.consume(&vec![b' '; WORKER_MESSAGE_LIMIT + 1]).is_err());
+        assert!(stream.result.metadata.collection.output_truncated);
+        assert!(stream.pending.len() <= WORKER_MESSAGE_LIMIT);
+    }
+
+    #[test]
+    fn deadline_protocol_verifies_terminal_totals_before_declaring_completion() {
+        let options = DeepScanOptions { pids: vec![41], ..DeepScanOptions::default() };
+        for terminal_count in [2, 1] {
+            let mut events = process_events(vec![41], 41);
+            let mut enriched = protocol_record(41);
+            enriched.gpu = Some(ProcessGpuEvidence::default());
+            events.extend([
+                DeepScanWorkerEvent::Stage { stage: DeepScanStage::Gpu },
+                DeepScanWorkerEvent::Gpu { snapshot: Box::default() },
+                DeepScanWorkerEvent::Stage { stage: DeepScanStage::GpuEnrichment },
+                DeepScanWorkerEvent::Record { record: Box::new(enriched), enriched: true },
+                DeepScanWorkerEvent::Complete { metadata: DeepScanMetadata {
+                    started_at: "2026-01-01T00:00:00Z".into(),
+                    duration_ms: 5,
+                    process_count: terminal_count,
+                    skipped_count: 0,
+                    warnings: vec![],
+                    collection: DeepScanCollection {
+                        complete: true,
+                        requested_count: Some(1),
+                        processed_count: 1,
+                        incomplete_count: Some(0),
+                        enriched_count: 1,
+                        stage: DeepScanStage::Complete,
+                        ..DeepScanCollection::default()
+                    },
+                }},
+            ]);
+            let mut stream = DeepScanStream::new(&options, 1000);
+            let parsed = stream.consume(&protocol_bytes(&events));
+            assert_eq!(parsed.is_ok(), terminal_count == 1);
+            let result = stream.finish(Instant::now(), parsed.is_ok());
+            assert_eq!(result.metadata.collection.complete, terminal_count == 1);
+            assert_eq!(result.metadata.process_count, 1);
+            assert_eq!(result.metadata.collection.enriched_count, 1);
+            assert_eq!(result.metadata.collection.budget_ms, Some(1000));
+        }
+    }
+
+    #[test]
+    fn deadline_explicit_pid_order_preserves_probe_priority() {
+        let options = DeepScanOptions {
+            pids: vec![300, 100, 300, 200],
+            ..DeepScanOptions::default()
+        };
+        let observed = Mutex::new(None);
+        let observer = |event| {
+            if let DeepScanWorkerEvent::Inventory { pids } = event {
+                *observed.lock().unwrap() = Some(pids);
+                Err(DeepScanError::Worker("stop after inventory".into()))
+            } else {
+                panic!("inventory must precede every probe");
+            }
+        };
+        assert!(matches!(
+            deep_scan_observed(&options, Some(&observer)),
+            Err(DeepScanError::Worker(_))
+        ));
+        assert_eq!(observed.into_inner().unwrap().unwrap(), vec![300, 100, 200]);
+    }
+
+    #[test]
+    fn deadline_cancels_worker_before_invoking_progress_callbacks() {
+        struct ConfirmWorkerStopped {
+            marker: PathBuf,
+            events: Mutex<Vec<ProgressEvent>>,
+        }
+        impl ProgressEmitter for ConfirmWorkerStopped {
+            fn emit(&self, event: ProgressEvent) {
+                let pid: u32 = fs::read_to_string(&self.marker)
+                    .expect("worker recorded its identity before streaming")
+                    .trim()
+                    .parse()
+                    .unwrap();
+                let checked = Instant::now();
+                loop {
+                    let state = fs::read_to_string(format!("/proc/{pid}/stat"))
+                        .ok()
+                        .and_then(|contents| parse_proc_stat_content(&contents))
+                        .map(|stat| stat.state);
+                    if matches!(state, None | Some('Z') | Some('X')) {
+                        break;
+                    }
+                    assert!(checked.elapsed() < Duration::from_secs(1),
+                        "a progress callback ran while collection was still active");
+                    thread::sleep(Duration::from_millis(5));
+                }
+                self.events.lock().unwrap().push(event);
+            }
+        }
+
+        let events = process_events(vec![41], 41);
+        let (_directory, executable) = blocked_worker(&events);
+        let emitter = Arc::new(ConfirmWorkerStopped {
+            marker: executable.with_extension("pid"),
+            events: Mutex::new(Vec::new()),
+        });
+        let options = DeepScanOptions {
+            pids: vec![41],
+            use_wait_free: false,
+            progress: Some(emitter.clone()),
+            ..DeepScanOptions::default()
+        };
+        let result = deep_scan_with_budget(
+            &options, Duration::from_millis(750), &executable,
+        ).unwrap();
+        assert!(result.metadata.collection.timed_out);
+        assert_eq!(result.metadata.process_count, 1);
+        let events = emitter.events.lock().unwrap();
+        assert_eq!(events.len(), 3, "progress is coalesced to a bounded event set");
+        assert_eq!(events[0].event, event_names::DEEP_SCAN_STARTED);
+        assert_eq!(events[0].details["wait_free"], serde_json::json!(false));
+        assert_eq!(events[1].event, event_names::DEEP_SCAN_PROGRESS);
+        assert_eq!(serde_json::to_value(&events[1]).unwrap()["progress"]["current"], 1);
+        assert_eq!(events[2].event, event_names::DEEP_SCAN_COMPLETE);
+        assert_eq!(events[2].details["complete"], serde_json::json!(false));
+        assert_eq!(events[2].details["timed_out"], serde_json::json!(true));
+    }
 
     #[test]
     fn test_resolve_username_root() {

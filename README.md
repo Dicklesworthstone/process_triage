@@ -1079,6 +1079,28 @@ Cross-host dependency coordination remains incomplete: the Chandy-Lamport consis
 
 ## GPU and Container Awareness
 
+### Retaining Partial Deep Evidence
+
+On Linux, `pt-core deep-scan --budget 5 --allow-partial --pids 1234,5678`
+retains completed process records if collection reaches its deadline. A timeout
+still returns exit code **22**. Without `--allow-partial`, the existing command
+requires a complete scan and publishes no partial result on timeout.
+
+The partial mode requires `--budget` or the global `--timeout`; the shorter
+supplied duration wins. A zero budget returns an empty, explicitly incomplete
+result without starting probes. JSON, JSONL, and TOON include
+`deep_scan.metadata.collection`, reporting completion, timeout, the last stage,
+requested and processed counts, remaining processes, and GPU enrichment
+coverage. An unknown inventory stays `null`. All basic process records may be
+present while GPU enrichment is still incomplete, so check `complete` as well
+as the counts. Inaccessible or vanished processes are separately counted skips.
+
+The streaming library runs collection in an owned helper process and cancels its
+process group at the deadline, including vendor subprocesses. Linux can defer
+termination of a task in uninterruptible kernel I/O; the caller does not wait
+for that task to be reaped. Process startup and output delivery remain subject
+to operating-system scheduling and caller backpressure.
+
 ### GPU Process Detection
 
 `pt deep` and `pt agent plan --deep` collect GPU observations on Linux. One vendor snapshot serves the entire deep scan, with a 10-second collection deadline and a maximum query timeout of 3 seconds. A driver query that remains stuck after termination cannot block the scan: its result stays unknown, and subsequent scans skip new vendor probes while that worker is pending. The collector tries `nvidia-smi` (CUDA), then `rocm-smi` (AMD ROCm) if the NVIDIA inventory is unavailable. The result describes the selected vendor's visible inventory; it is not a complete census of a mixed-vendor host.

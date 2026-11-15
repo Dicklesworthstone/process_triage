@@ -732,6 +732,140 @@ mod global_options {
 // Command-specific Option Tests
 // ============================================================================
 
+#[cfg(target_os = "linux")]
+mod partial_deep_scan {
+    use super::*;
+    use serde_json::Value;
+    use std::time::Duration;
+
+    #[test]
+    fn zero_budget_and_global_timeout_return_explicit_partial_results() {
+        let pid = std::process::id().to_string();
+        for limits in [
+            vec!["--budget", "0"],
+            vec!["--budget", "0", "--timeout", "60"],
+            vec!["--budget", "60", "--timeout", "0"],
+            vec!["--timeout", "0"],
+        ] {
+            let output = pt_core()
+                .args(["deep-scan", "--allow-partial", "--format", "json", "--pids", &pid])
+                .args(limits)
+                .timeout(Duration::from_secs(10))
+                .assert()
+                .code(22)
+                .get_output()
+                .stdout
+                .clone();
+            let result: Value = serde_json::from_slice(&output).unwrap();
+            let scan = &result["deep_scan"];
+            assert_eq!(scan["processes"].as_array().unwrap().len(), 0);
+            let collection = &scan["metadata"]["collection"];
+            assert_eq!(collection["complete"], false);
+            assert_eq!(collection["timed_out"], true);
+            assert_eq!(collection["budget_ms"], 0);
+            assert_eq!(collection["processed_count"], 0);
+            assert!(
+                scan["metadata"]["warnings"]
+                    .as_array()
+                    .is_some_and(|warnings| !warnings.is_empty())
+            );
+        }
+    }
+
+    #[test]
+    fn budgeted_scan_collects_live_process_without_creating_session_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config");
+        let data = temp.path().join("data");
+        let pid = std::process::id();
+        let output = pt_core()
+            .env("PT_CONFIG_DIR", &config)
+            .env("PROCESS_TRIAGE_DATA", &data)
+            .env("PATH", temp.path().join("no-vendor-tools"))
+            .args([
+                "deep-scan",
+                "--allow-partial",
+                "--format",
+                "json",
+                "--pids",
+                &pid.to_string(),
+                "--budget",
+                "30",
+            ])
+            .timeout(Duration::from_secs(40))
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let result: Value = serde_json::from_slice(&output).unwrap();
+        let scan = &result["deep_scan"];
+        assert_eq!(scan["processes"].as_array().unwrap().len(), 1);
+        assert_eq!(scan["processes"][0]["pid"], pid);
+        let collection = &scan["metadata"]["collection"];
+        assert_eq!(collection["complete"], true);
+        assert_eq!(collection["timed_out"], false);
+        assert_eq!(collection["requested_count"], 1);
+        assert_eq!(collection["processed_count"], 1);
+        assert_eq!(collection["incomplete_count"], 0);
+        assert_eq!(collection["stage"], "complete");
+        assert!(!config.exists());
+        assert!(!data.exists());
+    }
+
+    #[test]
+    fn partial_jsonl_is_one_parseable_record_and_exitcode_is_quiet() {
+        let output = pt_core()
+            .args(["deep-scan", "--allow-partial", "--budget", "0", "--format", "jsonl"])
+            .timeout(Duration::from_secs(10))
+            .assert()
+            .code(22)
+            .get_output()
+            .stdout
+            .clone();
+        let text = String::from_utf8(output).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        let result: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(result["deep_scan"]["metadata"]["collection"]["timed_out"], true);
+        pt_core()
+            .args(["deep-scan", "--allow-partial", "--budget", "0", "--format", "exitcode"])
+            .timeout(Duration::from_secs(10))
+            .assert()
+            .code(22)
+            .stdout("");
+    }
+
+    #[test]
+    fn partial_mode_requires_a_supported_collection_deadline() {
+        for limits in [vec![], vec!["--budget", "18446744073709551615"]] {
+            pt_core()
+                .args(["deep-scan", "--allow-partial"])
+                .args(limits)
+                .timeout(Duration::from_secs(10))
+                .assert()
+                .code(10)
+                .stdout("");
+        }
+    }
+
+    #[test]
+    fn worker_is_hidden_and_rejects_malformed_requests() {
+        pt_core()
+            .arg("--help")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("__deep-scan-worker").not());
+        pt_core()
+            .arg("__deep-scan-worker")
+            .write_stdin("this is not a scan request")
+            .timeout(Duration::from_secs(10))
+            .assert()
+            .code(20)
+            .stdout("")
+            .stderr(predicate::str::contains("Deep scan worker failed"));
+    }
+}
+
 mod command_options {
     use super::*;
 

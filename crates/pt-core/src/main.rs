@@ -351,6 +351,10 @@ enum Commands {
     /// Full deep scan with all available probes
     DeepScan(DeepScanArgs),
 
+    #[cfg(target_os = "linux")]
+    #[command(name = "__deep-scan-worker", hide = true)]
+    DeepScanWorker,
+
     /// Compare two sessions and show differences
     Diff(DiffArgs),
 
@@ -564,6 +568,10 @@ struct DeepScanArgs {
     /// Wall-clock deadline for deep collection (seconds); incomplete scans fail with exit 22
     #[arg(long)]
     budget: Option<u64>,
+
+    /// Retain completed records on timeout; requires --budget or --timeout
+    #[arg(long)]
+    allow_partial: bool,
 }
 
 #[derive(Args, Debug)]
@@ -2146,6 +2154,19 @@ fn main() {
         let _ = error.print();
         std::process::exit(ExitCode::ArgsError.as_i32());
     });
+    // The owned collector has a private stdin/stdout protocol. Start it before
+    // logging, configuration, sessions, or action locks are initialized.
+    #[cfg(target_os = "linux")]
+    if matches!(&cli.command, Some(Commands::DeepScanWorker)) {
+        let code = match pt_core::collect::run_deep_scan_worker() {
+            Ok(()) => ExitCode::Clean,
+            Err(error) => {
+                eprintln!("Deep scan worker failed: {error}");
+                ExitCode::InternalError
+            }
+        };
+        std::process::exit(code.as_i32());
+    }
     let format_source = matches.value_source("format");
     cli.global.format = resolve_output_format(cli.global.format, format_source);
 
@@ -2206,6 +2227,8 @@ fn main() {
         Some(Commands::Scan(args)) => run_scan(&cli.global, &args),
         Some(Commands::Replay(args)) => run_replay(&cli.global, &args),
         Some(Commands::DeepScan(args)) => run_deep_scan(&cli.global, &args),
+        #[cfg(target_os = "linux")]
+        Some(Commands::DeepScanWorker) => unreachable!("worker dispatch precedes initialization"),
         Some(Commands::Diff(args)) => run_diff(&cli.global, &args),
         Some(Commands::Query(args)) => run_query(&cli.global, &args),
         Some(Commands::Bundle(args)) => run_bundle(&cli.global, &args),
@@ -6627,6 +6650,7 @@ fn run_scan(global: &GlobalOpts, args: &ScanArgs) -> ExitCode {
             &DeepScanArgs {
                 pids: vec![],
                 budget: None,
+                allow_partial: false,
             },
         );
     }
@@ -10686,7 +10710,7 @@ mod deep_scan_deadline_tests {
 fn run_deep_scan(global: &GlobalOpts, _args: &DeepScanArgs) -> ExitCode {
     #[cfg(target_os = "linux")]
     {
-        use pt_core::collect::{deep_scan, DeepScanOptions};
+        use pt_core::collect::{deep_scan, deep_scan_with_budget, DeepScanOptions};
         let args = _args;
 
         let progress = progress_emitter(global);
@@ -10702,16 +10726,46 @@ fn run_deep_scan(global: &GlobalOpts, _args: &DeepScanArgs) -> ExitCode {
             (Some(scan), Some(global)) => Some(scan.min(global)),
             (scan, global) => scan.or(global),
         };
-        let collected = match budget {
-            Some(seconds) => bounded_deep_scan(&args.pids, seconds),
-            None => {
-                deep_scan(&options).map_err(|error| (ExitCode::InternalError, error.to_string()))
+        let collected = if args.allow_partial {
+            match budget {
+                None => Err((
+                    ExitCode::ArgsError,
+                    "--allow-partial requires --budget or --timeout".to_string(),
+                )),
+                Some(seconds) if seconds.checked_mul(1000).is_none() => Err((
+                    ExitCode::ArgsError,
+                    "deep-scan budget exceeds the supported duration".to_string(),
+                )),
+                Some(seconds) => std::env::current_exe()
+                    .map_err(|error| (ExitCode::IoError, error.to_string()))
+                    .and_then(|worker| {
+                        deep_scan_with_budget(
+                            &options,
+                            std::time::Duration::from_secs(seconds),
+                            &worker,
+                        )
+                        .map_err(|error| (ExitCode::InternalError, error.to_string()))
+                    }),
+            }
+        } else {
+            match budget {
+                Some(seconds) => bounded_deep_scan(&args.pids, seconds),
+                None => {
+                    deep_scan(&options).map_err(|error| (ExitCode::InternalError, error.to_string()))
+                }
             }
         };
         match collected {
             Ok(result) => {
+                let exit_code = if args.allow_partial && result.metadata.collection.timed_out {
+                    ExitCode::TimeoutError
+                } else if args.allow_partial && !result.metadata.collection.complete {
+                    ExitCode::InternalError
+                } else {
+                    ExitCode::Clean
+                };
                 match global.format {
-                    OutputFormat::Json | OutputFormat::Toon => {
+                    OutputFormat::Json | OutputFormat::Jsonl | OutputFormat::Toon => {
                         let session_id = SessionId::new();
                         let output = serde_json::json!({
                             "schema_version": SCHEMA_VERSION,
@@ -10719,7 +10773,11 @@ fn run_deep_scan(global: &GlobalOpts, _args: &DeepScanArgs) -> ExitCode {
                             "generated_at": chrono::Utc::now().to_rfc3339(),
                             "deep_scan": result
                         });
-                        println!("{}", format_structured_output(global, output));
+                        if matches!(global.format, OutputFormat::Jsonl) {
+                            println!("{output}");
+                        } else {
+                            println!("{}", format_structured_output(global, output));
+                        }
                     }
                     OutputFormat::Summary => {
                         println!(
@@ -10783,7 +10841,7 @@ fn run_deep_scan(global: &GlobalOpts, _args: &DeepScanArgs) -> ExitCode {
                     }
                 }
 
-                ExitCode::Clean
+                exit_code
             }
             Err((code, message)) => {
                 eprintln!("Deep scan failed: {message}");

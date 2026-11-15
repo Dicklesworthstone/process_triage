@@ -70,7 +70,8 @@ mod real_tests;
 
 #[cfg(target_os = "linux")]
 pub use deep_scan::{
-    deep_scan, DeepScanError, DeepScanMetadata, DeepScanOptions, DeepScanRecord, DeepScanResult,
+    deep_scan, deep_scan_with_budget, run_deep_scan_worker, DeepScanCollection, DeepScanError,
+    DeepScanMetadata, DeepScanOptions, DeepScanRecord, DeepScanResult, DeepScanStage,
 };
 #[cfg(target_os = "linux")]
 pub use network::{
