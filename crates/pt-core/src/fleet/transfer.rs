@@ -6,12 +6,14 @@
 //! diff preview before applying changes.
 
 use crate::supervision::pattern_persistence::{
-    ConflictResolution, ImportConflict, PersistedPattern, PersistedSchema,
+    ConflictResolution, ImportConflict, PatternLifecycle, PersistedPattern, PersistedSchema,
 };
+use crate::supervision::signature::SupervisorSignature;
 use pt_config::priors::{BetaParams, ClassParams, Priors};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use thiserror::Error;
 
 // ── Constants ─────────────────────────────────────────────────────────────
@@ -126,26 +128,54 @@ pub struct TransferDiff {
     pub baseline_adjustments: Vec<BaselineAdjustment>,
 }
 
-/// A change to a single class prior.
+/// A source difference or effective change to any prior configuration field.
 #[derive(Debug, Clone, Serialize)]
 pub struct PriorChange {
+    /// Process class, or `configuration` for fields outside `classes`.
     pub class: String,
     pub field: String,
-    pub local_value: f64,
-    pub incoming_value: f64,
-    pub merged_value: Option<f64>,
+    /// JSON Pointer into the complete priors document, including array indices.
+    pub path: String,
+    pub local_value: Value,
+    pub incoming_value: Value,
+    /// The actual strategy result, including JSON null for removed options.
+    /// Absent for a source comparison that does not select a merge strategy.
+    pub merged_value: Option<Value>,
+    /// Whether import changes this field; absent for a source comparison.
+    pub applied: Option<bool>,
 }
 
-/// A change to a signature.
+/// The configuration that determines a signature's matching and lifecycle.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SignatureConfiguration {
+    pub signature: SupervisorSignature,
+    pub lifecycle: PatternLifecycle,
+}
+
+impl From<&PersistedPattern> for SignatureConfiguration {
+    fn from(pattern: &PersistedPattern) -> Self {
+        Self {
+            signature: pattern.signature.clone(),
+            lifecycle: pattern.lifecycle,
+        }
+    }
+}
+
+/// A signature comparison. With a merged library, `change_type` describes the
+/// effective import, not a hypothetical replacement by the incoming bundle.
 #[derive(Debug, Clone, Serialize)]
 pub struct SignatureChange {
     pub name: String,
     pub change_type: SignatureChangeType,
     pub local_confidence: Option<f64>,
     pub incoming_confidence: Option<f64>,
+    pub merged_confidence: Option<f64>,
+    pub local: Option<SignatureConfiguration>,
+    pub incoming: Option<SignatureConfiguration>,
+    pub merged: Option<SignatureConfiguration>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SignatureChangeType {
     Added,
@@ -553,172 +583,180 @@ pub fn compute_diff(
     local_signatures: Option<&PersistedSchema>,
     incoming: &TransferBundle,
     merged_priors: Option<&Priors>,
-) -> TransferDiff {
+    merged_signatures: Option<&PersistedSchema>,
+) -> Result<TransferDiff, TransferError> {
     let mut priors_changes = Vec::new();
     let mut signature_changes = Vec::new();
     let baseline_adjustments = Vec::new();
 
-    // ── Priors diff ───────────────────────────────────────────────────
-    if let (Some(lp), Some(ip)) = (local_priors, &incoming.priors) {
-        diff_class(
-            "useful",
-            &lp.classes.useful,
-            &ip.classes.useful,
-            merged_priors.map(|priors| &priors.classes.useful),
-            &mut priors_changes,
-        );
-        diff_class(
-            "useful_bad",
-            &lp.classes.useful_bad,
-            &ip.classes.useful_bad,
-            merged_priors.map(|priors| &priors.classes.useful_bad),
-            &mut priors_changes,
-        );
-        diff_class(
-            "abandoned",
-            &lp.classes.abandoned,
-            &ip.classes.abandoned,
-            merged_priors.map(|priors| &priors.classes.abandoned),
-            &mut priors_changes,
-        );
-        diff_class(
-            "zombie",
-            &lp.classes.zombie,
-            &ip.classes.zombie,
-            merged_priors.map(|priors| &priors.classes.zombie),
+    // Compare the full typed configuration, not a hand-maintained shortlist
+    // of Beta fields. This also exposes optional removals, Gamma hazards,
+    // category/state arrays, booleans and future serialized parameters.
+    if let Some(incoming_priors) = &incoming.priors {
+        let local = serde_json::to_value(local_priors)?;
+        let incoming = serde_json::to_value(incoming_priors)?;
+        let merged = merged_priors.map(serde_json::to_value).transpose()?;
+        diff_prior_values(
+            &mut Vec::new(),
+            &local,
+            &incoming,
+            merged.as_ref(),
             &mut priors_changes,
         );
     }
 
-    // ── Signature diff ────────────────────────────────────────────────
     if let Some(incoming_sigs) = &incoming.signatures {
         let local_names: BTreeMap<&str, &PersistedPattern> = local_signatures
-            .map(|ls| {
-                ls.patterns
+            .map(|sigs| {
+                sigs.patterns
                     .iter()
-                    .map(|p| (p.signature.name.as_str(), p))
+                    .map(|pattern| (pattern.signature.name.as_str(), pattern))
                     .collect()
             })
             .unwrap_or_default();
-
         let incoming_names: BTreeMap<&str, &PersistedPattern> = incoming_sigs
             .patterns
             .iter()
-            .map(|p| (p.signature.name.as_str(), p))
+            .map(|pattern| (pattern.signature.name.as_str(), pattern))
+            .collect();
+        let merged_names: Option<BTreeMap<&str, &PersistedPattern>> =
+            merged_signatures.map(|sigs| {
+                sigs.patterns
+                    .iter()
+                    .map(|pattern| (pattern.signature.name.as_str(), pattern))
+                    .collect()
+            });
+        let effective_names = merged_names.as_ref().unwrap_or(&incoming_names);
+        let names: BTreeSet<_> = local_names
+            .keys()
+            .chain(incoming_names.keys())
+            .chain(effective_names.keys())
+            .copied()
             .collect();
 
-        // Added or updated in incoming.
-        for (name, incoming_pattern) in &incoming_names {
-            let inc_conf = incoming_pattern.signature.confidence_weight;
-            if let Some(local_pattern) = local_names.get(name) {
-                let loc_conf = local_pattern.signature.confidence_weight;
-                let change_type = if local_pattern.signature == incoming_pattern.signature
-                    && local_pattern.lifecycle == incoming_pattern.lifecycle
-                {
-                    SignatureChangeType::Unchanged
-                } else {
+        for name in names {
+            let local = local_names
+                .get(name)
+                .map(|pattern| SignatureConfiguration::from(*pattern));
+            let incoming = incoming_names
+                .get(name)
+                .map(|pattern| SignatureConfiguration::from(*pattern));
+            let effective = effective_names
+                .get(name)
+                .map(|pattern| SignatureConfiguration::from(*pattern));
+            let change_type = match (&local, &effective) {
+                (None, Some(_)) => SignatureChangeType::Added,
+                (Some(_), None) => SignatureChangeType::Removed,
+                (Some(local), Some(effective)) if local != effective => {
                     SignatureChangeType::Updated
-                };
-                signature_changes.push(SignatureChange {
-                    name: name.to_string(),
-                    change_type,
-                    local_confidence: Some(loc_conf),
-                    incoming_confidence: Some(inc_conf),
-                });
-            } else {
-                signature_changes.push(SignatureChange {
-                    name: name.to_string(),
-                    change_type: SignatureChangeType::Added,
-                    local_confidence: None,
-                    incoming_confidence: Some(inc_conf),
-                });
-            }
-        }
-
-        // Removed (in local but not in incoming).
-        for (name, local_pattern) in &local_names {
-            if !incoming_names.contains_key(name) {
-                signature_changes.push(SignatureChange {
-                    name: name.to_string(),
-                    change_type: SignatureChangeType::Removed,
-                    local_confidence: Some(local_pattern.signature.confidence_weight),
-                    incoming_confidence: None,
-                });
-            }
-        }
-    }
-    signature_changes.sort_by(|left, right| left.name.cmp(&right.name));
-
-    TransferDiff {
-        priors_changes,
-        signature_changes,
-        baseline_adjustments,
-    }
-}
-
-/// Helper: diff a single class's key numeric fields.
-fn diff_class(
-    class: &str,
-    local: &ClassParams,
-    incoming: &ClassParams,
-    merged: Option<&ClassParams>,
-    changes: &mut Vec<PriorChange>,
-) {
-    let merged_values = merged.map(|params| {
-        [
-            params.prior_prob,
-            params.cpu_beta.alpha,
-            params.cpu_beta.beta,
-            params.orphan_beta.alpha,
-            params.orphan_beta.beta,
-            params.tty_beta.alpha,
-            params.tty_beta.beta,
-            params.net_beta.alpha,
-            params.net_beta.beta,
-        ]
-    });
-    let fields: Vec<(&str, f64, f64)> = vec![
-        ("prior_prob", local.prior_prob, incoming.prior_prob),
-        (
-            "cpu_beta.alpha",
-            local.cpu_beta.alpha,
-            incoming.cpu_beta.alpha,
-        ),
-        ("cpu_beta.beta", local.cpu_beta.beta, incoming.cpu_beta.beta),
-        (
-            "orphan_beta.alpha",
-            local.orphan_beta.alpha,
-            incoming.orphan_beta.alpha,
-        ),
-        (
-            "orphan_beta.beta",
-            local.orphan_beta.beta,
-            incoming.orphan_beta.beta,
-        ),
-        (
-            "tty_beta.alpha",
-            local.tty_beta.alpha,
-            incoming.tty_beta.alpha,
-        ),
-        ("tty_beta.beta", local.tty_beta.beta, incoming.tty_beta.beta),
-        (
-            "net_beta.alpha",
-            local.net_beta.alpha,
-            incoming.net_beta.alpha,
-        ),
-        ("net_beta.beta", local.net_beta.beta, incoming.net_beta.beta),
-    ];
-    for (index, (field, lv, iv)) in fields.into_iter().enumerate() {
-        if (lv - iv).abs() > 1e-9 {
-            changes.push(PriorChange {
-                class: class.to_string(),
-                field: field.to_string(),
-                local_value: lv,
-                incoming_value: iv,
-                merged_value: merged_values.map(|values| values[index]),
+                }
+                _ => SignatureChangeType::Unchanged,
+            };
+            let merged = merged_signatures.and(effective);
+            signature_changes.push(SignatureChange {
+                name: name.to_string(),
+                change_type,
+                local_confidence: local
+                    .as_ref()
+                    .map(|value| value.signature.confidence_weight),
+                incoming_confidence: incoming
+                    .as_ref()
+                    .map(|value| value.signature.confidence_weight),
+                merged_confidence: merged
+                    .as_ref()
+                    .map(|value| value.signature.confidence_weight),
+                local,
+                incoming,
+                merged,
             });
         }
     }
+
+    Ok(TransferDiff {
+        priors_changes,
+        signature_changes,
+        baseline_adjustments,
+    })
+}
+
+/// Walk all serialized prior fields in deterministic order. A type/presence
+/// change is shown at its complete subtree so removed options remain visible.
+fn diff_prior_values(
+    path: &mut Vec<String>,
+    local: &Value,
+    incoming: &Value,
+    merged: Option<&Value>,
+    changes: &mut Vec<PriorChange>,
+) {
+    if local == incoming && merged.is_none_or(|value| value == local) {
+        return;
+    }
+
+    if let (Value::Object(local), Value::Object(incoming)) = (local, incoming) {
+        if merged.is_none_or(Value::is_object) {
+            let keys: BTreeSet<_> = local
+                .keys()
+                .chain(incoming.keys())
+                .chain(
+                    merged
+                        .and_then(Value::as_object)
+                        .into_iter()
+                        .flat_map(|map| map.keys()),
+                )
+                .collect();
+            for key in keys {
+                path.push(key.clone());
+                diff_prior_values(
+                    path,
+                    local.get(key).unwrap_or(&Value::Null),
+                    incoming.get(key).unwrap_or(&Value::Null),
+                    merged.map(|value| value.get(key).unwrap_or(&Value::Null)),
+                    changes,
+                );
+                path.pop();
+            }
+            return;
+        }
+    }
+
+    if let (Value::Array(local), Value::Array(incoming)) = (local, incoming) {
+        if merged.is_none_or(Value::is_array) {
+            let len = local
+                .len()
+                .max(incoming.len())
+                .max(merged.and_then(Value::as_array).map_or(0, Vec::len));
+            for index in 0..len {
+                path.push(index.to_string());
+                diff_prior_values(
+                    path,
+                    local.get(index).unwrap_or(&Value::Null),
+                    incoming.get(index).unwrap_or(&Value::Null),
+                    merged.map(|value| value.get(index).unwrap_or(&Value::Null)),
+                    changes,
+                );
+                path.pop();
+            }
+            return;
+        }
+    }
+
+    let (class, field) = if path.len() >= 3 && path[0] == "classes" {
+        (path[1].clone(), path[2..].join("."))
+    } else {
+        ("configuration".to_string(), path.join("."))
+    };
+    changes.push(PriorChange {
+        class,
+        field,
+        path: path
+            .iter()
+            .map(|part| format!("/{}", part.replace('~', "~0").replace('/', "~1")))
+            .collect(),
+        local_value: local.clone(),
+        incoming_value: incoming.clone(),
+        merged_value: merged.cloned(),
+        applied: merged.map(|value| value != local),
+    });
 }
 
 /// Resolve signature conflicts during import, returning summary of changes.
@@ -1263,7 +1301,7 @@ mod tests {
     fn compute_diff_no_changes() {
         let priors = minimal_priors();
         let bundle = export_bundle(Some(&priors), None, None, "h1", None).unwrap();
-        let diff = compute_diff(Some(&priors), None, &bundle, None);
+        let diff = compute_diff(Some(&priors), None, &bundle, None, None).unwrap();
         assert!(diff.priors_changes.is_empty());
     }
 
@@ -1276,7 +1314,7 @@ mod tests {
         incoming.classes.abandoned.prior_prob = 0.004;
         incoming.classes.zombie.prior_prob = 0.001;
         let bundle = export_bundle(Some(&incoming), None, None, "h2", None).unwrap();
-        let diff = compute_diff(Some(&local), None, &bundle, None);
+        let diff = compute_diff(Some(&local), None, &bundle, None, None).unwrap();
         assert!(
             !diff.priors_changes.is_empty(),
             "expected prior changes, got none"
@@ -1301,7 +1339,7 @@ mod tests {
             (MergeStrategy::KeepLocal, 2.0),
         ] {
             let merged = merge_priors(&local, &incoming, strategy).unwrap();
-            let diff = compute_diff(Some(&local), None, &bundle, Some(&merged));
+            let diff = compute_diff(Some(&local), None, &bundle, Some(&merged), None).unwrap();
             let change = diff
                 .priors_changes
                 .iter()
@@ -1309,13 +1347,156 @@ mod tests {
                 .expect("actual changed field reported");
             assert_eq!(change.local_value, 2.0);
             assert_eq!(change.incoming_value, 6.0);
-            assert_eq!(change.merged_value, Some(expected));
+            assert_eq!(change.merged_value, Some(serde_json::json!(expected)));
+            assert_eq!(change.applied, Some(strategy != MergeStrategy::KeepLocal));
         }
-        let comparison = compute_diff(Some(&local), None, &bundle, None);
+        let comparison = compute_diff(Some(&local), None, &bundle, None, None).unwrap();
         assert!(comparison
             .priors_changes
             .iter()
             .all(|change| change.merged_value.is_none()));
+    }
+
+    #[test]
+    fn prior_preview_covers_gamma_optional_hazard_and_global_parameters() {
+        let mut local_value = serde_json::to_value(minimal_priors()).unwrap();
+        local_value["classes"]["useful"]["hazard_gamma"] =
+            serde_json::json!({"shape": 2.0, "rate": 0.02});
+        local_value["classes"]["useful"]["competing_hazards"] =
+            serde_json::json!({"finish": {"shape": 2.0, "rate": 0.04}});
+        local_value["classes"]["useful"]["queue_saturation_beta"] =
+            serde_json::json!({"alpha": 2.0, "beta": 4.0});
+        let local: Priors = serde_json::from_value(local_value).unwrap();
+        let local_value = serde_json::to_value(&local).unwrap();
+
+        // The existing merger keeps Gamma and global parameters local while
+        // averaging Beta fields. Preview must expose that actual disposition.
+        let cases = [
+            (
+                "/classes/useful/runtime_gamma/shape",
+                serde_json::json!(6.0),
+                serde_json::json!(2.0),
+            ),
+            (
+                "/classes/useful/hazard_gamma/rate",
+                serde_json::json!(0.08),
+                serde_json::json!(0.02),
+            ),
+            (
+                "/classes/useful/competing_hazards/finish/rate",
+                serde_json::json!(0.12),
+                serde_json::json!(0.04),
+            ),
+            (
+                "/classes/useful/io_active_beta/alpha",
+                serde_json::json!(10.0),
+                serde_json::json!(8.0),
+            ),
+            (
+                "/classes/useful/queue_saturation_beta/beta",
+                serde_json::json!(8.0),
+                serde_json::json!(6.0),
+            ),
+            (
+                "/command_categories/useful/alpha/0",
+                serde_json::json!(9.0),
+                serde_json::json!(3.0),
+            ),
+            (
+                "/state_flags/useful/alpha/0",
+                serde_json::json!(9.0),
+                serde_json::json!(5.0),
+            ),
+            (
+                "/hierarchical/shrinkage_enabled",
+                serde_json::json!(false),
+                serde_json::json!(true),
+            ),
+            (
+                "/classes/useful/runtime_gamma/rate",
+                serde_json::json!(0.00010000001),
+                serde_json::json!(0.0001),
+            ),
+            (
+                "/classes/useful/io_active_beta",
+                Value::Null,
+                local_value["classes"]["useful"]["io_active_beta"].clone(),
+            ),
+        ];
+        for (path, changed_value, weighted_value) in cases {
+            let mut incoming_value = local_value.clone();
+            *incoming_value
+                .pointer_mut(path)
+                .expect("existing fixture field") = changed_value;
+            let incoming: Priors = serde_json::from_value(incoming_value).unwrap();
+            let incoming_value = serde_json::to_value(&incoming).unwrap();
+            let bundle = export_bundle(Some(&incoming), None, None, "host-owned", None).unwrap();
+            for strategy in [
+                MergeStrategy::Replace,
+                MergeStrategy::KeepLocal,
+                MergeStrategy::Weighted,
+            ] {
+                let merged = merge_priors(&local, &incoming, strategy).unwrap();
+                let diff = compute_diff(Some(&local), None, &bundle, Some(&merged), None).unwrap();
+                let change = diff
+                    .priors_changes
+                    .iter()
+                    .find(|change| change.path == path)
+                    .unwrap_or_else(|| panic!("missing {path} for {strategy:?}: {diff:?}"));
+                let local_field = local_value.pointer(path).unwrap();
+                let incoming_field = incoming_value.pointer(path).unwrap();
+                let expected = match strategy {
+                    MergeStrategy::Replace => incoming_field,
+                    MergeStrategy::KeepLocal => local_field,
+                    MergeStrategy::Weighted => &weighted_value,
+                };
+                assert_eq!(&change.local_value, local_field, "{path}");
+                assert_eq!(&change.incoming_value, incoming_field, "{path}");
+                assert_eq!(
+                    change.merged_value.as_ref(),
+                    Some(expected),
+                    "{path}: {strategy:?}"
+                );
+                assert_eq!(change.applied, Some(expected != local_field), "{path}");
+            }
+        }
+    }
+
+    #[test]
+    fn prior_diff_exposes_optional_additions_and_string_array_edits() {
+        let local = minimal_priors();
+        let mut incoming = serde_json::to_value(&local).unwrap();
+        incoming["semi_markov"] = serde_json::json!({
+            "useful_duration": {"shape": 3.0, "rate": 0.01}
+        });
+        incoming["command_categories"]["category_names"][0] = serde_json::json!("benchmark");
+        let incoming: Priors = serde_json::from_value(incoming).unwrap();
+        let bundle = export_bundle(Some(&incoming), None, None, "host-owned", None).unwrap();
+        let diff = compute_diff(Some(&local), None, &bundle, None, None).unwrap();
+        let addition = diff
+            .priors_changes
+            .iter()
+            .find(|change| change.path == "/semi_markov")
+            .unwrap();
+        assert!(addition.local_value.is_null());
+        assert_eq!(addition.incoming_value["useful_duration"]["shape"], 3.0);
+        assert!(addition.merged_value.is_none());
+        assert!(addition.applied.is_none());
+        let category = diff
+            .priors_changes
+            .iter()
+            .find(|change| change.path == "/command_categories/category_names/0")
+            .unwrap();
+        assert_eq!(category.local_value, "test");
+        assert_eq!(category.incoming_value, "benchmark");
+        let paths: Vec<_> = diff
+            .priors_changes
+            .iter()
+            .map(|change| change.path.as_str())
+            .collect();
+        let mut sorted = paths.clone();
+        sorted.sort();
+        assert_eq!(paths, sorted);
     }
 
     #[test]
@@ -1345,7 +1526,7 @@ mod tests {
         };
         let bundle = export_bundle(None, Some(&incoming_sigs), None, "h3", None).unwrap();
         let local_sigs = PersistedSchema::new();
-        let diff = compute_diff(None, Some(&local_sigs), &bundle, None);
+        let diff = compute_diff(None, Some(&local_sigs), &bundle, None, None).unwrap();
         assert_eq!(diff.signature_changes.len(), 1);
         assert!(matches!(
             diff.signature_changes[0].change_type,
@@ -1392,7 +1573,7 @@ mod tests {
             metadata: None,
         };
         let unchanged = export_bundle(None, Some(&local), None, "host", None).unwrap();
-        let diff = compute_diff(None, Some(&local), &unchanged, None);
+        let diff = compute_diff(None, Some(&local), &unchanged, None, None).unwrap();
         assert!(diff
             .signature_changes
             .iter()
@@ -1401,7 +1582,7 @@ mod tests {
         let mut incoming = local.clone();
         incoming.patterns[0].signature.patterns.process_names = vec!["^new-worker$".to_string()];
         let bundle = export_bundle(None, Some(&incoming), None, "host", None).unwrap();
-        let diff = compute_diff(None, Some(&local), &bundle, None);
+        let diff = compute_diff(None, Some(&local), &bundle, None, None).unwrap();
         assert_eq!(
             diff.signature_changes
                 .iter()
@@ -1465,7 +1646,7 @@ mod tests {
     #[test]
     fn transfer_diff_empty_when_no_data() {
         let bundle = export_bundle(None, None, None, "h1", None).unwrap();
-        let diff = compute_diff(None, None, &bundle, None);
+        let diff = compute_diff(None, None, &bundle, None, None).unwrap();
         assert!(diff.priors_changes.is_empty());
         assert!(diff.signature_changes.is_empty());
         assert!(diff.baseline_adjustments.is_empty());

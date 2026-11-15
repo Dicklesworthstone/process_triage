@@ -348,6 +348,30 @@ fn fleet_transfer_json_export_import_replace_roundtrip() {
     let artifacts = temp.join("artifacts");
     let mut incoming = priors_with_useful_prob(0.62, 0.11, 0.19, 0.08);
     incoming.classes.useful.cpu_beta = BetaParams::new(20.0, 80.0);
+    incoming
+        .classes
+        .useful
+        .runtime_gamma
+        .as_mut()
+        .unwrap()
+        .shape = 6.0;
+    incoming
+        .classes
+        .useful
+        .io_active_beta
+        .as_mut()
+        .unwrap()
+        .alpha = 10.0;
+    incoming.classes.abandoned.runtime_gamma = None;
+    incoming
+        .command_categories
+        .as_mut()
+        .unwrap()
+        .useful
+        .as_mut()
+        .unwrap()
+        .alpha[0] = 9.0;
+    incoming.hierarchical.as_mut().unwrap().shrinkage_enabled = Some(false);
     write_priors(&preview_source, &incoming);
     let mut export = transfer_command(&preview_source);
     export.args(["export", "--out"]).arg(&preview_path);
@@ -436,6 +460,59 @@ fn fleet_transfer_json_export_import_replace_roundtrip() {
                 expected,
             );
         }
+        let local_values = serde_json::to_value(&local).expect("local parameter values");
+        let incoming_values = serde_json::to_value(&incoming).expect("incoming parameter values");
+        let expected_parameters = [
+            (
+                "/classes/useful/runtime_gamma/shape",
+                serde_json::json!(if strategy == "replace" { 6.0 } else { 2.0 }),
+            ),
+            (
+                "/classes/useful/io_active_beta/alpha",
+                serde_json::json!(match strategy {
+                    "replace" => 10.0,
+                    "weighted" => 8.0,
+                    _ => 6.0,
+                }),
+            ),
+            (
+                "/classes/abandoned/runtime_gamma",
+                if strategy == "replace" {
+                    Value::Null
+                } else {
+                    local_values["classes"]["abandoned"]["runtime_gamma"].clone()
+                },
+            ),
+            (
+                "/command_categories/useful/alpha/0",
+                serde_json::json!(if strategy == "replace" { 9.0 } else { 3.0 }),
+            ),
+            (
+                "/hierarchical/shrinkage_enabled",
+                serde_json::json!(strategy != "replace"),
+            ),
+        ];
+        for (path, expected) in &expected_parameters {
+            let matching: Vec<_> = changes
+                .iter()
+                .filter(|change| change["path"] == *path)
+                .collect();
+            assert_eq!(matching.len(), 1, "missing/duplicate parameter {path}");
+            let change = matching[0];
+            let local_value = local_values.pointer(path).expect("local parameter");
+            assert_eq!(&change["local_value"], local_value, "{strategy}: {path}");
+            assert_eq!(
+                &change["incoming_value"],
+                incoming_values.pointer(path).unwrap_or(&Value::Null),
+                "{strategy}: {path}"
+            );
+            assert_eq!(&change["merged_value"], expected, "{strategy}: {path}");
+            assert_eq!(
+                change["applied"],
+                *expected != *local_value,
+                "{strategy}: {path}"
+            );
+        }
         assert_eq!(config_snapshot(&target), before, "dry-run modified config");
 
         let mut import = transfer_command(&target);
@@ -478,6 +555,23 @@ fn fleet_transfer_json_export_import_replace_roundtrip() {
                 change["merged_value"]
                     .as_f64()
                     .expect("previewed saved value"),
+            );
+        }
+        let saved_values = serde_json::to_value(&saved).expect("saved parameter values");
+        for (path, expected) in &expected_parameters {
+            assert_eq!(
+                saved_values.pointer(path).unwrap_or(&Value::Null),
+                expected,
+                "persisted {strategy}: {path}"
+            );
+            let change = changes
+                .iter()
+                .find(|change| change["path"] == *path)
+                .expect("same previewed parameter");
+            assert_eq!(
+                saved_values.pointer(path).unwrap_or(&Value::Null),
+                &change["merged_value"],
+                "preview differs from persistence for {strategy}: {path}"
             );
         }
         assert_eq!(
@@ -1527,11 +1621,204 @@ fn fleet_transfer_diff_compares_against_local_patterns() {
         .expect("run dry-run import");
     assert!(out.status.success(), "dry-run import failed: {out:?}");
     let response: Value = serde_json::from_slice(&out.stdout).expect("import output is JSON");
+    let expected_effective: Vec<(String, String)> = [
+        ("brand_new", "added"),
+        ("local_only", "unchanged"),
+        ("retuned", "updated"),
+        ("shared", "unchanged"),
+    ]
+    .iter()
+    .map(|(name, change)| (name.to_string(), change.to_string()))
+    .collect();
     assert_eq!(
         change_types(&response["diff"]["details"]["signature_changes"]),
-        expected,
+        expected_effective,
         "{response}"
     );
+}
+
+#[test]
+fn fleet_transfer_signature_previews_match_persisted_conflict_resolution() {
+    let temp = retained_dir();
+    let source_dir = temp.join("source");
+    let export_path = temp.join("signatures.json");
+    let artifacts = temp.join("artifacts");
+    let sig = |name: &str, pattern: &str, confidence: f64| {
+        SupervisorSignature::new(name, SupervisorCategory::Other)
+            .with_process_patterns(vec![pattern])
+            .with_confidence(confidence)
+    };
+    write_priors(&source_dir, &Priors::default());
+    let mut source = PatternLibrary::new(&source_dir);
+    for (name, pattern, confidence) in [
+        ("shared", "^shared$", 0.8),
+        ("retuned", "^retuned$", 0.9),
+        ("brand_new", "^brand_new$", 0.7),
+        ("equal_confidence", "^incoming_equal$", 0.8),
+        ("locally_stronger", "^incoming_stronger$", 0.4),
+        ("disabled", "^incoming_disabled$", 0.9),
+    ] {
+        source
+            .add_custom(sig(name, pattern, confidence))
+            .expect("add source signature");
+    }
+    source.save().expect("save source signatures");
+    let mut export = transfer_command(&source_dir);
+    export.args(["export", "--out"]).arg(&export_path);
+    let out = run_retained(export, &artifacts, "signature-export");
+    assert!(out.status.success(), "signature export failed: {out:?}");
+    let incoming_bytes = fs::read(&export_path).expect("signature export bytes");
+
+    for strategy in ["weighted", "replace", "keep-local"] {
+        let target_dir = temp.join(strategy);
+        write_priors(&target_dir, &Priors::default());
+        let mut target = PatternLibrary::new(&target_dir);
+        for (name, pattern, confidence) in [
+            ("shared", "^shared$", 0.8),
+            ("local_only", "^local_only$", 0.6),
+            ("equal_confidence", "^local_equal$", 0.8),
+            ("locally_stronger", "^local_stronger$", 0.9),
+            ("disabled", "^local_disabled$", 0.7),
+        ] {
+            target
+                .add_custom(sig(name, pattern, confidence))
+                .expect("add target signature");
+        }
+        target
+            .add_learned(sig("retuned", "^retuned$", 0.5))
+            .expect("add learned target signature");
+        target
+            .disable_pattern("disabled", Some("local operator choice"))
+            .expect("disable local signature");
+        target.save().expect("save target signatures");
+        let before = config_snapshot(&target_dir);
+
+        let mut preview = pt_core_fast();
+        preview
+            .args(["--format", "jsonl", "--config"])
+            .arg(&target_dir)
+            .args(["agent", "fleet", "transfer", "import", "--from"])
+            .arg(&export_path)
+            .args(["--merge-strategy", strategy, "--dry-run"]);
+        let out = run_retained(
+            preview,
+            &artifacts,
+            &format!("signature-{strategy}-preview"),
+        );
+        assert!(out.status.success(), "signature preview failed: {out:?}");
+        let stdout = String::from_utf8(out.stdout).expect("UTF-8 signature preview");
+        assert_eq!(
+            stdout.lines().count(),
+            1,
+            "JSONL preview must be one record"
+        );
+        let response: Value = serde_json::from_str(&stdout).expect("signature preview JSONL");
+        assert_eq!(response["dry_run"], true);
+        let changes = response["diff"]["details"]["signature_changes"]
+            .as_array()
+            .expect("effective signature changes");
+        let expected = [
+            ("brand_new", "added"),
+            ("disabled", "unchanged"),
+            (
+                "equal_confidence",
+                if strategy == "replace" {
+                    "updated"
+                } else {
+                    "unchanged"
+                },
+            ),
+            ("local_only", "unchanged"),
+            (
+                "locally_stronger",
+                if strategy == "replace" {
+                    "updated"
+                } else {
+                    "unchanged"
+                },
+            ),
+            (
+                "retuned",
+                if strategy == "keep-local" {
+                    "unchanged"
+                } else {
+                    "updated"
+                },
+            ),
+            ("shared", "unchanged"),
+        ];
+        assert_eq!(changes.len(), expected.len());
+        for (change, (name, kind)) in changes.iter().zip(expected) {
+            assert_eq!(change["name"], name, "{strategy}");
+            assert_eq!(change["change_type"], kind, "{strategy}: {name}");
+        }
+        assert_eq!(
+            response["diff"]["signature_changes"],
+            match strategy {
+                "replace" => 4,
+                "weighted" => 2,
+                _ => 1,
+            },
+            "preview count includes only effective changes"
+        );
+        let equal = changes
+            .iter()
+            .find(|change| change["name"] == "equal_confidence")
+            .expect("equal confidence change");
+        assert_ne!(equal["local"]["signature"], equal["incoming"]["signature"]);
+        let selected = if strategy == "replace" {
+            "incoming"
+        } else {
+            "local"
+        };
+        assert_eq!(
+            equal["merged"], equal[selected],
+            "equal-confidence strategy"
+        );
+        assert_eq!(
+            config_snapshot(&target_dir),
+            before,
+            "dry-run modified config"
+        );
+        assert_eq!(fs::read(&export_path).unwrap(), incoming_bytes);
+
+        let mut import = transfer_command(&target_dir);
+        import.args(["import", "--from"]).arg(&export_path).args([
+            "--merge-strategy",
+            strategy,
+            "--no-backup",
+        ]);
+        let out = run_retained(import, &artifacts, &format!("signature-{strategy}-import"));
+        assert!(out.status.success(), "signature import failed: {out:?}");
+        let mut persisted = PatternLibrary::new(&target_dir);
+        persisted.load().expect("load persisted signatures");
+        let active = persisted.all_active_patterns();
+        assert!(active
+            .iter()
+            .any(|pattern| pattern.signature.name == "local_only"));
+        assert!(!active
+            .iter()
+            .any(|pattern| pattern.signature.name == "disabled"));
+        for change in changes {
+            let name = change["name"].as_str().expect("preview signature name");
+            match active.iter().find(|pattern| pattern.signature.name == name) {
+                Some(pattern) => {
+                    assert_eq!(
+                        change["merged"]["signature"],
+                        serde_json::to_value(&pattern.signature).expect("persisted signature"),
+                        "preview differs from persisted {strategy}: {name}"
+                    );
+                    assert_eq!(
+                        change["merged"]["lifecycle"],
+                        serde_json::to_value(pattern.lifecycle).expect("persisted lifecycle"),
+                        "preview lifecycle differs from persisted {strategy}: {name}"
+                    );
+                }
+                None => assert!(change["merged"].is_null(), "{strategy}: {name}"),
+            }
+        }
+        assert_eq!(fs::read(&export_path).unwrap(), incoming_bytes);
+    }
 }
 
 /// An unreadable pattern library fails the export instead of silently producing a

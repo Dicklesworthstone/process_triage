@@ -14128,9 +14128,12 @@ fn run_agent_fleet_transfer_import(
     args: &AgentFleetTransferImportArgs,
 ) -> ExitCode {
     use pt_core::fleet::transfer::{
-        compute_diff, merge_priors, validate_bundle, MergeStrategy, TransferBundle,
+        compute_diff, merge_priors, validate_bundle, MergeStrategy, SignatureChangeType,
+        TransferBundle,
     };
-    use pt_core::supervision::pattern_persistence::{ConflictResolution, PatternLibrary};
+    use pt_core::supervision::pattern_persistence::{
+        ConflictResolution, PatternLibrary, PatternSource,
+    };
 
     let input_path = PathBuf::from(&args.from);
     let is_ptb = input_path.extension().map(|e| e == "ptb").unwrap_or(false);
@@ -14234,23 +14237,77 @@ fn run_agent_fleet_transfer_import(
         None
     };
 
-    let local_signatures = match local_transfer_signatures(global, &bundle) {
-        Ok(local) => local,
-        Err(e) => return output_agent_error(global, "fleet transfer import", &e),
+    // Prepare the actual import once, before preview or persistence. A preview
+    // must use the same conflict resolution and active-pattern filtering as the
+    // library that will be saved, including retained local-only signatures.
+    let signature_sources = [
+        PatternSource::Learned,
+        PatternSource::Custom,
+        PatternSource::Imported,
+    ];
+    let (local_signatures, pending_signatures) = if let Some(incoming_sigs) = &bundle.signatures {
+        let config_dir = resolved_config_dir(global);
+        let mut lib = PatternLibrary::new(&config_dir)
+            .with_legacy_dir(pt_core::signature_cli::legacy_read_dir(&config_dir));
+        if let Err(error) = lib.load() {
+            return output_agent_error(
+                global,
+                "fleet transfer import",
+                &format!("could not load the local pattern library: {error}"),
+            );
+        }
+        let local = lib.export(&signature_sources);
+        let resolution = match strategy {
+            MergeStrategy::Replace => ConflictResolution::ReplaceWithImported,
+            MergeStrategy::KeepLocal => ConflictResolution::KeepExisting,
+            MergeStrategy::Weighted => ConflictResolution::KeepHigherConfidence,
+        };
+        let result = match lib.import(incoming_sigs.clone(), resolution) {
+            Ok(result) => result,
+            Err(error) => {
+                return output_agent_error(
+                    global,
+                    "fleet transfer import",
+                    &format!("signature import failed, nothing was written: {error}"),
+                );
+            }
+        };
+        (Some(local), Some((lib, result)))
+    } else {
+        (None, None)
     };
+    let merged_signatures = pending_signatures
+        .as_ref()
+        .map(|(lib, _)| lib.export(&signature_sources));
     if let Some(priors) = &merged_priors {
         if let Err(error) = pt_config::validate::validate_priors(priors) {
             return output_agent_error(global, "fleet transfer import", &error.to_string());
         }
     }
-    let diff = compute_diff(
+    let diff = match compute_diff(
         Some(&config.priors),
         local_signatures.as_ref(),
         &bundle,
         merged_priors.as_ref(),
-    );
+        merged_signatures.as_ref(),
+    ) {
+        Ok(diff) => diff,
+        Err(error) => {
+            return output_agent_error(global, "fleet transfer import", &error.to_string());
+        }
+    };
 
     if args.dry_run {
+        let applied_priors = diff
+            .priors_changes
+            .iter()
+            .filter(|change| change.applied == Some(true))
+            .count();
+        let applied_signatures = diff
+            .signature_changes
+            .iter()
+            .filter(|change| change.change_type != SignatureChangeType::Unchanged)
+            .count();
         let response = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
             "command": "agent fleet transfer import",
@@ -14260,14 +14317,17 @@ fn run_agent_fleet_transfer_import(
             "source_host_id": bundle.source_host_id,
             "warnings": warnings,
             "diff": {
-                "priors_changes": diff.priors_changes.len(),
-                "signature_changes": diff.signature_changes.len(),
+                "priors_changes": applied_priors,
+                "signature_changes": applied_signatures,
                 "details": diff,
             },
         });
         match global.format {
             OutputFormat::Json | OutputFormat::Toon => {
                 println!("{}", format_structured_output(global, response));
+            }
+            OutputFormat::Jsonl => {
+                println!("{}", serde_json::to_string(&response).unwrap());
             }
             _ => {
                 println!("Dry run — no changes applied.");
@@ -14277,8 +14337,20 @@ fn run_agent_fleet_transfer_import(
                     bundle.source_host_id
                 );
                 println!("Strategy: {:?}", strategy);
-                println!("Prior changes: {}", diff.priors_changes.len());
-                println!("Signature changes: {}", diff.signature_changes.len());
+                println!("Prior changes: {}", applied_priors);
+                for change in &diff.priors_changes {
+                    println!(
+                        "  {}: {} → {} (incoming: {})",
+                        change.path,
+                        change.local_value,
+                        change.merged_value.as_ref().unwrap_or(&change.local_value),
+                        change.incoming_value,
+                    );
+                }
+                println!("Signature changes: {}", applied_signatures);
+                for change in &diff.signature_changes {
+                    println!("  {} [{:?}]", change.name, change.change_type);
+                }
                 if !warnings.is_empty() {
                     println!("Warnings:");
                     for w in &warnings {
@@ -14289,38 +14361,6 @@ fn run_agent_fleet_transfer_import(
         }
         return ExitCode::Clean;
     }
-
-    // Load the local pattern library and merge the bundle's signatures in memory
-    // before writing anything: a failure here must leave both the priors and the
-    // pattern files untouched, not merge the priors and then report success with
-    // the signatures silently skipped. save() rewrites every pattern file,
-    // disabled.json and pattern_stats.json from memory, so it must never follow a
-    // failed load.
-    let pending_signatures = if let Some(ref incoming_sigs) = bundle.signatures {
-        let config_dir = resolved_config_dir(global);
-        let mut lib = PatternLibrary::new(&config_dir)
-            .with_legacy_dir(pt_core::signature_cli::legacy_read_dir(&config_dir));
-        let resolution = match strategy {
-            MergeStrategy::Replace => ConflictResolution::ReplaceWithImported,
-            MergeStrategy::KeepLocal => ConflictResolution::KeepExisting,
-            MergeStrategy::Weighted => ConflictResolution::KeepHigherConfidence,
-        };
-        match lib
-            .load()
-            .and_then(|()| lib.import(incoming_sigs.clone(), resolution))
-        {
-            Ok(result) => Some((lib, result)),
-            Err(e) => {
-                return output_agent_error(
-                    global,
-                    "fleet transfer import",
-                    &format!("signature import failed, nothing was written: {e}"),
-                );
-            }
-        }
-    } else {
-        None
-    };
 
     if let Some(ref final_priors) = merged_priors {
         let priors_path = config
@@ -14537,12 +14577,18 @@ fn run_agent_fleet_transfer_diff(
         Ok(local) => local,
         Err(e) => return output_agent_error(global, "fleet transfer diff", &e),
     };
-    let diff = compute_diff(
+    let diff = match compute_diff(
         Some(&config.priors),
         local_signatures.as_ref(),
         &bundle,
         None,
-    );
+        None,
+    ) {
+        Ok(diff) => diff,
+        Err(error) => {
+            return output_agent_error(global, "fleet transfer diff", &error.to_string());
+        }
+    };
 
     let response = serde_json::json!({
         "schema_version": SCHEMA_VERSION,
@@ -14577,10 +14623,7 @@ fn run_agent_fleet_transfer_diff(
                 if !diff.priors_changes.is_empty() {
                     println!("Prior changes ({}):", diff.priors_changes.len());
                     for c in &diff.priors_changes {
-                        println!(
-                            "  {}.{}: {:.4} → {:.4}",
-                            c.class, c.field, c.local_value, c.incoming_value
-                        );
+                        println!("  {}: {} → {}", c.path, c.local_value, c.incoming_value);
                     }
                 }
                 if !diff.signature_changes.is_empty() {

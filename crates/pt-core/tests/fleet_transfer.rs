@@ -333,7 +333,7 @@ fn normalize_clamps_extreme_ratios() {
 fn diff_identical_priors_no_changes() {
     let priors = default_priors();
     let bundle = export_bundle(Some(&priors), None, None, "h1", None).unwrap();
-    let diff = compute_diff(Some(&priors), None, &bundle, None);
+    let diff = compute_diff(Some(&priors), None, &bundle, None, None).unwrap();
     assert!(diff.priors_changes.is_empty());
 }
 
@@ -347,7 +347,7 @@ fn diff_detects_changed_class_priors() {
     incoming.classes.zombie.prior_prob = 0.001;
 
     let bundle = export_bundle(Some(&incoming), None, None, "h2", None).unwrap();
-    let diff = compute_diff(Some(&local), None, &bundle, None);
+    let diff = compute_diff(Some(&local), None, &bundle, None, None).unwrap();
 
     assert!(!diff.priors_changes.is_empty());
     assert!(diff
@@ -363,7 +363,7 @@ fn diff_detects_added_signature() {
     let incoming_sigs = make_persisted_schema(vec![("existing_sig", 0.8), ("new_sig", 0.6)]);
 
     let bundle = export_bundle(None, Some(&incoming_sigs), None, "h3", None).unwrap();
-    let diff = compute_diff(None, Some(&local_sigs), &bundle, None);
+    let diff = compute_diff(None, Some(&local_sigs), &bundle, None, None).unwrap();
 
     assert!(diff.signature_changes.iter().any(|c| c.name == "new_sig"
         && matches!(
@@ -378,7 +378,7 @@ fn diff_detects_removed_signature() {
     let incoming_sigs = make_persisted_schema(vec![("sig_a", 0.8)]);
 
     let bundle = export_bundle(None, Some(&incoming_sigs), None, "h4", None).unwrap();
-    let diff = compute_diff(None, Some(&local_sigs), &bundle, None);
+    let diff = compute_diff(None, Some(&local_sigs), &bundle, None, None).unwrap();
 
     assert!(diff.signature_changes.iter().any(|c| c.name == "sig_b"
         && matches!(
@@ -393,7 +393,7 @@ fn diff_detects_updated_signature_confidence() {
     let incoming_sigs = make_persisted_schema(vec![("sig_x", 0.9)]);
 
     let bundle = export_bundle(None, Some(&incoming_sigs), None, "h5", None).unwrap();
-    let diff = compute_diff(None, Some(&local_sigs), &bundle, None);
+    let diff = compute_diff(None, Some(&local_sigs), &bundle, None, None).unwrap();
 
     assert!(diff.signature_changes.iter().any(|c| c.name == "sig_x"
         && matches!(
@@ -406,7 +406,7 @@ fn diff_detects_updated_signature_confidence() {
 fn diff_unchanged_signature_marked_as_such() {
     let sigs = make_persisted_schema(vec![("same_sig", 0.8)]);
     let bundle = export_bundle(None, Some(&sigs), None, "h6", None).unwrap();
-    let diff = compute_diff(None, Some(&sigs), &bundle, None);
+    let diff = compute_diff(None, Some(&sigs), &bundle, None, None).unwrap();
 
     assert!(diff.signature_changes.iter().any(|c| c.name == "same_sig"
         && matches!(
@@ -611,7 +611,7 @@ fn dry_run_diff_does_not_mutate_inputs() {
     let bundle = export_bundle(Some(&incoming), None, None, "h1", None).unwrap();
 
     // Compute diff (dry run).
-    let _diff = compute_diff(Some(&local), None, &bundle, None);
+    let _diff = compute_diff(Some(&local), None, &bundle, None, None).unwrap();
 
     // Local priors should be unchanged.
     assert!((local.classes.useful.prior_prob - local_clone.classes.useful.prior_prob).abs() < 1e-9);
