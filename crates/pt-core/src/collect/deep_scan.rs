@@ -408,6 +408,22 @@ pub fn deep_scan_with_budget(
     if request.len() > WORKER_REQUEST_LIMIT {
         return Err(DeepScanError::Worker("request exceeds 1 MiB".into()));
     }
+    // Keep the same minimal GPU runtime context as the complete-response CLI
+    // worker. Never inherit output overrides, arbitrary variables, or credentials.
+    let mut worker_env = std::collections::BTreeMap::new();
+    for key in ["HOME", "XDG_RUNTIME_DIR", "TMPDIR"] {
+        match std::env::var(key) {
+            Ok(value) => {
+                worker_env.insert(key.to_string(), value);
+            }
+            Err(std::env::VarError::NotPresent) => {}
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(DeepScanError::Worker(format!(
+                    "deep-scan environment {key} is not UTF-8"
+                )));
+            }
+        }
+    }
     let remaining = budget.saturating_sub(started.elapsed());
     // Millisecond budget accounting must never round a tiny budget up and probe.
     if remaining.as_millis() == 0 {
@@ -428,10 +444,11 @@ pub fn deep_scan_with_budget(
         use_ionice: false,
         ..ToolConfig::default()
     });
-    let spec = ToolSpec::new(executable, vec!["__deep-scan-worker".into()])
+    let mut spec = ToolSpec::new(executable, vec!["__deep-scan-worker".into()])
         .with_stdin(request)
         .with_timeout(remaining)
         .with_process_group();
+    spec.env = worker_env;
     let output = runner.run_with_stdout_handler(&spec, Some(&mut |bytes| stream.consume(bytes)));
     let successful = match output {
         Ok(output) => {

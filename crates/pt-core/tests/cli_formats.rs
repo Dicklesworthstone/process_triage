@@ -827,6 +827,28 @@ mod partial_deep_scan {
         assert_eq!(text.lines().count(), 1);
         let result: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(result["deep_scan"]["metadata"]["collection"]["timed_out"], true);
+        let estimate = pt_core()
+            .args([
+                "deep-scan",
+                "--allow-partial",
+                "--budget",
+                "0",
+                "--format",
+                "jsonl",
+                "--estimate-tokens",
+            ])
+            .timeout(Duration::from_secs(10))
+            .assert()
+            .code(22)
+            .get_output()
+            .stdout
+            .clone();
+        let estimate_text = String::from_utf8(estimate).unwrap();
+        assert_eq!(estimate_text.lines().count(), 1);
+        let estimate: Value = serde_json::from_str(&estimate_text).unwrap();
+        assert!(estimate["estimated_tokens"].is_number());
+        assert!(estimate.get("deep_scan").is_none());
+
         pt_core()
             .args(["deep-scan", "--allow-partial", "--budget", "0", "--format", "exitcode"])
             .timeout(Duration::from_secs(10))

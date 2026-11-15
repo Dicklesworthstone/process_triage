@@ -417,11 +417,17 @@ enum Commands {
 // Command argument structs
 // ============================================================================
 
+const DEFAULT_PROBE_BUDGET_MS: u64 = 3000;
+
 #[derive(Args, Debug)]
 struct RunArgs {
-    /// Force deep scan with all available probes
+    /// Deep-scan every eligible candidate within the probe budget
     #[arg(long)]
     deep: bool,
+
+    /// Maximum deep collection time per refresh in milliseconds (0 skips probes)
+    #[arg(long, default_value_t = DEFAULT_PROBE_BUDGET_MS)]
+    probe_budget_ms: u64,
 
     /// Activity sampling window in milliseconds (0 uses lifetime CPU averages)
     #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(u64).range(0..=60_000))]
@@ -1268,9 +1274,13 @@ struct AgentPlanArgs {
     #[arg(long)]
     include_kernel_threads: bool,
 
-    /// Force deep scan with all available probes
+    /// Deep-scan every eligible candidate within the probe budget
     #[arg(long)]
     deep: bool,
+
+    /// Maximum deep collection time in milliseconds (0 skips automatic and forced probes)
+    #[arg(long, default_value_t = DEFAULT_PROBE_BUDGET_MS)]
+    probe_budget_ms: u64,
 
     /// Activity sampling window in milliseconds (0 uses lifetime CPU averages)
     #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(u64).range(0..=60_000))]
@@ -2210,6 +2220,7 @@ fn main() {
                 &cli.global,
                 &RunArgs {
                     deep: false,
+                    probe_budget_ms: DEFAULT_PROBE_BUDGET_MS,
                     window_ms: 500,
                     inline: false,
                     signatures: None,
@@ -2622,10 +2633,15 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
 
     app.replace_processes(snapshot);
     app.process_table.select_recommended();
+    let deep_status = system_state
+        .as_ref()
+        .and_then(|state| state["deep_collection"]["status"].as_str())
+        .unwrap_or("not_needed");
     app.set_status(format!(
-        "Session {} • {} candidates",
+        "Session {} • {} candidates • deep {}",
         session_id.0,
-        app.process_table.rows.len()
+        app.process_table.rows.len(),
+        deep_status,
     ));
 
     // ftui runtime path: terminal setup/teardown handled by Program RAII.
@@ -2639,6 +2655,7 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
         let policy_r = policy.clone();
         let timeout_r = global.timeout;
         let deep_r = args.deep;
+        let probe_budget_r = planning_probe_budget(args.probe_budget_ms, global.timeout);
         let window_ms_r = args.window_ms;
         let min_age_r = args.min_age;
         let goal_r = args.goal.clone();
@@ -2676,6 +2693,7 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
                     scan_result.metadata.warnings.is_empty(),
                     min_age_r,
                     deep_r,
+                    probe_budget_r,
                     window_ms_r,
                     scorer,
                     &policy_r,
@@ -3115,6 +3133,7 @@ fn build_tui_data_from_live_scan(
         scan_result.metadata.warnings.is_empty(),
         args.min_age,
         args.deep,
+        planning_probe_budget(args.probe_budget_ms, global.timeout),
         args.window_ms,
         scorer,
         policy,
@@ -3134,6 +3153,7 @@ fn score_tui_rows(
     census_complete: bool,
     min_age: Option<u64>,
     deep: bool,
+    probe_budget: Duration,
     window_ms: u64,
     mut scorer: Scorer,
     policy: &pt_core::config::Policy,
@@ -3149,24 +3169,22 @@ fn score_tui_rows(
     let system_state =
         collect_planning_activity(&mut scorer, population, window_ms, census_complete);
     let pressure = PlanningPressure::from_system_state(&system_state);
-    let probe_advice = compute_probe_advice(processes, &scorer, policy, &pressure);
-    let deep_signals = if deep {
-        collect_deep_signals_for_processes(&eligible, &scorer)
+    let probe_advice = if probe_budget.is_zero() {
+        HashMap::new()
     } else {
-        let targeted = deep_scan_target_pids(processes, &probe_advice);
-        let targeted: Vec<_> = eligible
-            .iter()
-            .copied()
-            .filter(|process| targeted.contains(&process.pid.0))
-            .collect();
-        collect_deep_signals_for_processes(&targeted, &scorer)
+        compute_probe_advice(&eligible, &scorer, policy, &pressure, false)
     };
+    let targeted = select_deep_probe_targets(&eligible, &probe_advice, deep);
+    let selected: HashSet<_> = targeted.iter().map(|process| process.pid.0).collect();
+    let probe_run =
+        collect_deep_observations_for_processes(&targeted, &scorer, probe_budget, deep);
+    let deep_signals = probe_run.observations.as_ref().map(|deep| &deep.signals);
     let mut output = build_tui_rows(
         processes,
         population,
         census_complete,
         Some(min_age),
-        deep_signals.as_ref(),
+        deep_signals,
         Some(&probe_advice),
         &scorer,
         policy,
@@ -3174,6 +3192,24 @@ fn score_tui_rows(
         session_id,
         &pressure,
     )?;
+    for row in &mut output.snapshot.rows {
+        if selected.contains(&row.pid) {
+            let record_observed = deep_signals.is_some_and(|signals| signals.contains_key(&row.pid));
+            let note = format!(
+                "Deep collection {}: {} ({} ms budget); missing measurements remain unknown",
+                probe_run.report.status,
+                if record_observed { "identity-verified record retained" } else { "no usable record" },
+                probe_run.report.budget_ms,
+            );
+            row.top_evidence.insert(0, note.clone());
+            row.why_summary = Some(match row.why_summary.take() {
+                Some(existing) => format!("{existing} {note}"),
+                None => note,
+            });
+        }
+    }
+    let mut system_state = system_state;
+    system_state["deep_collection"] = serde_json::json!(probe_run.report);
     output.system_state = Some(system_state);
     Ok(output)
 }
@@ -5501,38 +5537,73 @@ struct DeepObservations {
     gpu_resources: pt_core::collect::SharedResourceGraph,
 }
 
-#[cfg(feature = "ui")]
 #[derive(Debug, Clone)]
 struct ProbeAdvice {
     should_probe: bool,
     recommended_probe: Option<pt_core::decision::ProbeType>,
     rationale: String,
+    /// Existing loss-model estimate; lower negative values get probe priority.
+    voi: Option<f64>,
 }
 
-#[cfg(feature = "ui")]
+fn probe_action_feasibility(
+    mut feasibility: ActionFeasibility,
+    allow_memory_cap: bool,
+) -> ActionFeasibility {
+    if !allow_memory_cap {
+        // Interactive batches cannot persist the immutable plan binding needed
+        // for a durable memory-cap receipt. Saved agent plans can.
+        feasibility.disabled.push(pt_core::decision::DisabledAction {
+            action: Action::CapMemory,
+            reason: "memory caps require the saved agent plan/apply/undo workflow".to_string(),
+        });
+    }
+    feasibility
+}
+
+fn probe_advice_for_inputs(
+    posterior: &pt_core::inference::ClassScores,
+    policy: &pt_core::config::Policy,
+    feasibility: &ActionFeasibility,
+    cost_model: &pt_core::decision::ProbeCostModel,
+) -> Option<ProbeAdvice> {
+    let available_probes = [pt_core::decision::ProbeType::DeepScan];
+    let (decision, ledger) = pt_core::decision::decide_sequential(
+        posterior,
+        policy,
+        feasibility,
+        cost_model,
+        Some(&available_probes),
+    )
+    .ok()?;
+    Some(ProbeAdvice {
+        should_probe: decision.should_probe,
+        recommended_probe: decision.recommended_probe,
+        rationale: decision.rationale,
+        voi: ledger
+            .iter()
+            .find(|entry| entry.probe == pt_core::decision::ProbeType::DeepScan)
+            .map(|entry| entry.voi)
+            .filter(|voi| voi.is_finite()),
+    })
+}
+
 fn compute_probe_advice(
-    processes: &[ProcessRecord],
+    processes: &[&ProcessRecord],
     scorer: &Scorer,
     policy: &pt_core::config::Policy,
     pressure: &PlanningPressure,
+    allow_memory_cap: bool,
 ) -> HashMap<u32, ProbeAdvice> {
     let mut advice = HashMap::new();
     let cost_model = pt_core::decision::ProbeCostModel::default();
-    let available_probes = [pt_core::decision::ProbeType::DeepScan];
 
-    for proc in processes {
+    for &proc in processes {
         let Some(score) = scorer.score(proc, Evidence::from_snapshot(proc)) else {
             continue;
         };
-        let (mut feasibility, _) = candidate_action_capabilities(proc, &score);
-        // Match the interactive action set: TUI batches cannot persist the
-        // immutable cap plan needed for a durable apply/undo receipt.
-        feasibility
-            .disabled
-            .push(pt_core::decision::DisabledAction {
-                action: Action::CapMemory,
-                reason: "memory caps require the saved agent plan/apply/undo workflow".to_string(),
-            });
+        let (feasibility, _) = candidate_action_capabilities(proc, &score);
+        let feasibility = probe_action_feasibility(feasibility, allow_memory_cap);
         let Ok(inputs) = prepare_pressure_decision(
             &score.posterior.posterior,
             policy,
@@ -5541,171 +5612,314 @@ fn compute_probe_advice(
         ) else {
             continue;
         };
-        let Ok((decision, _)) = pt_core::decision::decide_sequential(
+        if let Some(probe) = probe_advice_for_inputs(
             &score.posterior.posterior,
             &inputs.policy,
             &inputs.feasibility,
             &cost_model,
-            Some(&available_probes),
-        ) else {
-            continue;
-        };
-
-        advice.insert(
-            proc.pid.0,
-            ProbeAdvice {
-                should_probe: decision.should_probe,
-                recommended_probe: decision.recommended_probe,
-                rationale: decision.rationale,
-            },
-        );
+        ) {
+            advice.insert(proc.pid.0, probe);
+        }
     }
-
     advice
 }
 
-#[cfg(feature = "ui")]
-fn deep_scan_target_pids(
-    processes: &[ProcessRecord],
-    probe_advice: &HashMap<u32, ProbeAdvice>,
-) -> Vec<u32> {
-    processes
+/// Select only eligible callers' identities. Force mode broadens the selection
+/// without changing its deadline; automatic mode requires worthwhile real VOI.
+fn select_deep_probe_targets<'a>(
+    processes: &[&'a ProcessRecord],
+    advice: &HashMap<u32, ProbeAdvice>,
+    force: bool,
+) -> Vec<&'a ProcessRecord> {
+    let mut selected: Vec<_> = processes
         .iter()
-        .filter_map(|proc| {
-            let advice = probe_advice.get(&proc.pid.0)?;
-            if advice.should_probe
-                && advice.recommended_probe == Some(pt_core::decision::ProbeType::DeepScan)
-            {
-                Some(proc.pid.0)
-            } else {
-                None
-            }
+        .copied()
+        .filter(|process| {
+            force
+                || advice.get(&process.pid.0).is_some_and(|probe| {
+                    probe.should_probe
+                        && probe.recommended_probe == Some(pt_core::decision::ProbeType::DeepScan)
+                        && probe.voi.is_some_and(|voi| voi.is_finite() && voi < 0.0)
+                })
         })
-        .collect()
+        .collect();
+    let priority = |pid| {
+        advice
+            .get(&pid)
+            .and_then(|probe| probe.voi)
+            .filter(|voi| voi.is_finite())
+            .unwrap_or(f64::INFINITY)
+    };
+    selected.sort_by(|left, right| {
+        priority(left.pid.0)
+            .total_cmp(&priority(right.pid.0))
+            .then_with(|| left.pid.0.cmp(&right.pid.0))
+    });
+    let mut seen = HashSet::new();
+    selected.retain(|process| seen.insert(process.pid.0));
+    selected
 }
 
-#[cfg(feature = "ui")]
-fn collect_deep_signals_for_processes(
-    processes: &[&ProcessRecord],
-    scorer: &Scorer,
-) -> Option<HashMap<u32, DeepSignals>> {
-    collect_deep_observations_for_processes(processes, scorer).map(|result| result.signals)
+fn planning_probe_budget(probe_budget_ms: u64, timeout_seconds: Option<u64>) -> Duration {
+    let requested = Duration::from_millis(probe_budget_ms);
+    timeout_seconds
+        .map(Duration::from_secs)
+        .map_or(requested, |timeout| requested.min(timeout))
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DeepProbeReport {
+    mode: &'static str,
+    status: &'static str,
+    budget_ms: u64,
+    selected_count: usize,
+    observed_count: usize,
+    skipped_count: usize,
+    identity_rejected_count: usize,
+    duration_ms: u64,
+    /// Raw worker coverage keeps basic outcomes separate from GPU enrichment.
+    collection: Option<serde_json::Value>,
+    warnings: Vec<String>,
+}
+
+struct DeepProbeRun {
+    observations: Option<DeepObservations>,
+    report: DeepProbeReport,
+}
+
+impl DeepProbeRun {
+    fn new(selected_count: usize, budget: Duration, force: bool) -> Self {
+        Self {
+            observations: None,
+            report: DeepProbeReport {
+                mode: if force { "forced" } else { "voi" },
+                status: if budget.is_zero() {
+                    "disabled"
+                } else if selected_count == 0 {
+                    "not_needed"
+                } else {
+                    "pending"
+                },
+                budget_ms: budget.as_millis().try_into().unwrap_or(u64::MAX),
+                selected_count,
+                observed_count: 0,
+                skipped_count: 0,
+                identity_rejected_count: 0,
+                duration_ms: 0,
+                collection: None,
+                warnings: Vec::new(),
+            },
+        }
+    }
+}
+
+fn candidate_deep_probe_report(
+    pid: u32,
+    selected: &HashSet<u32>,
+    observations: Option<&DeepObservations>,
+    report: &DeepProbeReport,
+    advice: Option<&ProbeAdvice>,
+) -> serde_json::Value {
+    let signals = observations.and_then(|deep| deep.signals.get(&pid));
+    serde_json::json!({
+        "selected": selected.contains(&pid),
+        "record_observed": signals.is_some(),
+        "collection_status": report.status,
+        "net_active": signals.and_then(|signals| signals.net_active),
+        "io_active": signals.and_then(|signals| signals.io_active),
+        "queue_saturated": signals.and_then(|signals| signals.queue_saturated),
+        "selection_voi": advice.and_then(|advice| advice.voi),
+        "selection_rationale": advice.map(|advice| advice.rationale.as_str()),
+    })
 }
 
 fn collect_deep_observations_for_processes(
     processes: &[&ProcessRecord],
     scorer: &Scorer,
-) -> Option<DeepObservations> {
+    budget: Duration,
+    force: bool,
+) -> DeepProbeRun {
     #[cfg(target_os = "linux")]
     {
         use pt_core::action::{IdentityProvider, LiveIdentityProvider};
-        use pt_core::collect::{deep_scan, DeepScanOptions};
-
-        if processes.is_empty() {
-            return None;
-        }
-
-        let options = DeepScanOptions {
-            pids: processes.iter().map(|process| process.pid.0).collect(),
-            skip_inaccessible: true,
-            include_environ: false,
-            use_wait_free: true,
-            progress: None,
-        };
-        let result = match deep_scan(&options) {
-            Ok(result) => result,
-            Err(error) => {
-                eprintln!("deep scan failed: {}", error);
-                return None;
-            }
-        };
-
-        let by_pid: HashMap<u32, &ProcessRecord> = processes
-            .iter()
-            .map(|process| (process.pid.0, *process))
-            .collect();
-        let identity_provider = LiveIdentityProvider::new();
-        let mut map = HashMap::new();
-        let mut gpu_processes = HashMap::new();
-        let mut gpu_resources = Vec::new();
-        for record in result.processes {
-            let Some(process) = by_pid.get(&record.pid.0) else {
-                continue;
-            };
-            let identity = process_identity_from_record(process);
-            // Deep probes address numeric PIDs and read stat before optional
-            // evidence. Join to the original scan, then revalidate after probes.
-            if !record.can_automate()
-                || !identity.matches(&record.to_identity())
-                || !matches!(identity_provider.revalidate(&identity), Ok(true))
-            {
-                continue;
-            }
-            let io_active = scorer
-                .activity_for(process)
-                .and_then(|activity| activity.io_active);
-            let has_network = record.fd.as_ref().is_some_and(|fd| fd.sockets > 0)
-                || record.network.as_ref().is_some_and(|info| {
-                    let counts = &info.socket_counts;
-                    [
-                        counts.tcp,
-                        counts.tcp6,
-                        counts.udp,
-                        counts.udp6,
-                        counts.unix,
-                        counts.raw,
-                    ]
-                    .iter()
-                    .any(|count| *count > 0)
-                        || !info.listen_ports.is_empty()
-                        || !info.tcp_connections.is_empty()
-                        || !info.udp_sockets.is_empty()
-                        || !info.unix_sockets.is_empty()
-                });
-            // Missing or empty namespace socket tables do not prove absence.
-            let net_active = has_network.then_some(true);
-            let queue_metrics = record.network.as_ref().map(observed_queue_metrics);
-
-            if let Some(gpu) = record.gpu {
-                gpu_processes.insert(record.pid.0, gpu);
-            }
-            gpu_resources.push((
-                record.pid.0,
-                record
-                    .local_resource_evidence
-                    .into_iter()
-                    .filter(|resource| resource.kind == pt_common::ResourceKind::GpuDevice)
-                    .collect(),
-            ));
-
-            map.insert(
-                record.pid.0,
-                DeepSignals {
-                    net_active,
-                    io_active,
-                    queue_saturated: queue_metrics.and_then(|metrics| metrics.saturated),
-                    #[cfg(feature = "ui")]
-                    queue_rx_bytes: queue_metrics.map(|metrics| metrics.rx_bytes),
-                    #[cfg(feature = "ui")]
-                    queue_tx_bytes: queue_metrics.map(|metrics| metrics.tx_bytes),
-                    #[cfg(feature = "ui")]
-                    queue_backlog_sockets: queue_metrics.map(|metrics| metrics.backlog_sockets),
-                },
-            );
-        }
-        Some(DeepObservations {
-            signals: map,
-            gpu_snapshot: result.gpu,
-            gpu_processes,
-            gpu_resources: pt_core::collect::SharedResourceGraph::from_evidence(&gpu_resources),
-        })
+        let identity_provider = std::sync::OnceLock::new();
+        collect_deep_observations_with(
+            processes,
+            scorer,
+            budget,
+            force,
+            |options, budget| {
+                let worker = std::env::current_exe()
+                    .map_err(|error| format!("cannot locate deep-scan worker: {error}"))?;
+                pt_core::collect::deep_scan_with_budget(options, budget, &worker)
+                    .map_err(|error| error.to_string())
+            },
+            |identity| {
+                matches!(
+                    identity_provider
+                        .get_or_init(LiveIdentityProvider::new)
+                        .revalidate(identity),
+                    Ok(true)
+                )
+            },
+        )
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (processes, scorer);
-        eprintln!("deep scan not supported on this platform; using quick-scan evidence only");
-        None
+        let _ = scorer;
+        let mut run = DeepProbeRun::new(processes.len(), budget, force);
+        if run.report.status == "pending" {
+            run.report.status = "unsupported";
+            run.report.warnings.push(
+                "Deep collection is unavailable on this platform; missing evidence remains unknown"
+                    .to_string(),
+            );
+        }
+        run
     }
+}
+
+#[cfg(target_os = "linux")]
+fn collect_deep_observations_with(
+    processes: &[&ProcessRecord],
+    scorer: &Scorer,
+    budget: Duration,
+    force: bool,
+    collect: impl FnOnce(
+        &pt_core::collect::DeepScanOptions,
+        Duration,
+    ) -> Result<pt_core::collect::DeepScanResult, String>,
+    revalidate: impl Fn(&ProcessIdentity) -> bool,
+) -> DeepProbeRun {
+    let mut run = DeepProbeRun::new(processes.len(), budget, force);
+    // The collector treats an empty PID list as "scan all". Never pass an empty
+    // VOI selection through, and never resolve/spawn a worker for a zero budget.
+    if run.report.status != "pending" {
+        return run;
+    }
+    let started = std::time::Instant::now();
+    let options = pt_core::collect::DeepScanOptions {
+        pids: processes.iter().map(|process| process.pid.0).collect(),
+        skip_inaccessible: true,
+        include_environ: false,
+        use_wait_free: true,
+        progress: None,
+    };
+    let result = match collect(&options, budget) {
+        Ok(result) => result,
+        Err(error) => {
+            run.report.status = "failed";
+            run.report.warnings.push(format!("Deep collection failed: {error}"));
+            run.report.duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+            return run;
+        }
+    };
+    run.report.collection = serde_json::to_value(&result.metadata.collection).ok();
+    run.report.skipped_count = result.metadata.skipped_count;
+    run.report.warnings = result.metadata.warnings;
+
+    let by_pid: HashMap<u32, &ProcessRecord> = processes
+        .iter()
+        .map(|process| (process.pid.0, *process))
+        .collect();
+    let mut map = HashMap::new();
+    let mut gpu_processes = HashMap::new();
+    let mut gpu_resources = Vec::new();
+    for record in result.processes {
+        let Some(process) = by_pid.get(&record.pid.0) else {
+            run.report.identity_rejected_count += 1;
+            continue;
+        };
+        let identity = process_identity_from_record(process);
+        // Join the numeric-PID probe to the original incarnation, then verify
+        // that identity again. A timeout never relaxes these checks.
+        if !record.can_automate()
+            || !identity.matches(&record.to_identity())
+            || !revalidate(&identity)
+        {
+            run.report.identity_rejected_count += 1;
+            continue;
+        }
+        let io_active = scorer
+            .activity_for(process)
+            .and_then(|activity| activity.io_active);
+        let has_network = record.fd.as_ref().is_some_and(|fd| fd.sockets > 0)
+            || record.network.as_ref().is_some_and(|info| {
+                let counts = &info.socket_counts;
+                [
+                    counts.tcp,
+                    counts.tcp6,
+                    counts.udp,
+                    counts.udp6,
+                    counts.unix,
+                    counts.raw,
+                ]
+                .iter()
+                .any(|count| *count > 0)
+                    || !info.listen_ports.is_empty()
+                    || !info.tcp_connections.is_empty()
+                    || !info.udp_sockets.is_empty()
+                    || !info.unix_sockets.is_empty()
+            });
+        // Missing or empty socket tables never establish inactivity.
+        let net_active = has_network.then_some(true);
+        let queue_metrics = record.network.as_ref().map(observed_queue_metrics);
+
+        if let Some(gpu) = record.gpu {
+            gpu_processes.insert(record.pid.0, gpu);
+        }
+        gpu_resources.push((
+            record.pid.0,
+            record
+                .local_resource_evidence
+                .into_iter()
+                .filter(|resource| resource.kind == pt_common::ResourceKind::GpuDevice)
+                .collect(),
+        ));
+        map.insert(
+            record.pid.0,
+            DeepSignals {
+                net_active,
+                io_active,
+                queue_saturated: queue_metrics.and_then(|metrics| metrics.saturated),
+                #[cfg(feature = "ui")]
+                queue_rx_bytes: queue_metrics.map(|metrics| metrics.rx_bytes),
+                #[cfg(feature = "ui")]
+                queue_tx_bytes: queue_metrics.map(|metrics| metrics.tx_bytes),
+                #[cfg(feature = "ui")]
+                queue_backlog_sockets: queue_metrics.map(|metrics| metrics.backlog_sockets),
+            },
+        );
+    }
+    run.report.observed_count = map.len();
+    run.report.status = if result.metadata.collection.complete
+        && run.report.identity_rejected_count == 0
+        && run.report.observed_count == run.report.selected_count
+    {
+        "complete"
+    } else {
+        "partial"
+    };
+    if run.report.observed_count < run.report.selected_count {
+        run.report.warnings.push(format!(
+            "Usable deep records for {} of {} selected processes ({} skipped); missing evidence remains unknown",
+            run.report.observed_count, run.report.selected_count, run.report.skipped_count,
+        ));
+    }
+    if run.report.identity_rejected_count > 0 {
+        run.report.warnings.push(format!(
+            "{} deep records failed the identity join or revalidation; their evidence was discarded",
+            run.report.identity_rejected_count,
+        ));
+    }
+    run.observations = Some(DeepObservations {
+        signals: map,
+        gpu_snapshot: result.gpu,
+        gpu_processes,
+        gpu_resources: pt_core::collect::SharedResourceGraph::from_evidence(&gpu_resources),
+    });
+    run.report.duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+    run
 }
 
 #[cfg(target_os = "linux")]
@@ -5750,6 +5964,328 @@ fn candidate_gpu_observations(
         "note": "Observed device co-holders; coverage is partial and sharing alone does not establish dependency or harm",
     });
     (gpu, shared)
+}
+
+#[cfg(test)]
+mod planning_probe_tests {
+    use super::*;
+
+    fn process(pid: u32) -> ProcessRecord {
+        ProcessRecord {
+            pid: pt_common::ProcessId(pid),
+            ppid: pt_common::ProcessId(1),
+            uid: 1000,
+            user: "fixture".into(),
+            pgid: Some(pid),
+            sid: Some(pid),
+            start_id: pt_common::StartId::from_linux("fixture-boot", 12345, pid),
+            comm: "fixture".into(),
+            cmd: "fixture --wait".into(),
+            state: ProcessState::Sleeping,
+            cpu_percent: 0.0,
+            rss_bytes: 1024,
+            vsz_bytes: 2048,
+            tty: None,
+            start_time_unix: 1,
+            elapsed: Duration::from_secs(7200),
+            source: "fixture".into(),
+            container_info: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn scorer() -> Scorer {
+        Scorer::new(
+            Priors::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
+    }
+
+    #[test]
+    fn cli_probe_budgets_default_and_can_disable_even_forced_collection() {
+        for prefix in [vec!["pt-core", "run"], vec!["pt-core", "agent", "plan"]] {
+            for requested in [None, Some("0"), Some("12500")] {
+                let mut argv = prefix.clone();
+                if let Some(value) = requested {
+                    argv.extend(["--deep", "--probe-budget-ms", value]);
+                }
+                let matches = Cli::command().try_get_matches_from(argv).unwrap();
+                let mut leaf = &matches;
+                while let Some((_, child)) = leaf.subcommand() {
+                    leaf = child;
+                }
+                assert_eq!(
+                    leaf.get_one::<u64>("probe_budget_ms").copied(),
+                    Some(requested.map_or(DEFAULT_PROBE_BUDGET_MS, |value| value.parse().unwrap())),
+                );
+            }
+        }
+        assert_eq!(planning_probe_budget(3000, None), Duration::from_secs(3));
+        assert_eq!(planning_probe_budget(3000, Some(1)), Duration::from_secs(1));
+        assert_eq!(planning_probe_budget(3000, Some(30)), Duration::from_secs(3));
+        assert!(planning_probe_budget(0, Some(30)).is_zero());
+        assert!(planning_probe_budget(3000, Some(0)).is_zero());
+    }
+
+    #[test]
+    fn automatic_selection_requires_worthwhile_deep_advice_and_preserves_priority() {
+        use pt_core::decision::ProbeType;
+
+        let processes: Vec<_> = (10..=70).step_by(10).map(process).collect();
+        let candidates = vec![
+            &processes[0], &processes[1], &processes[1], &processes[2],
+            &processes[3], &processes[4], &processes[5], &processes[6],
+        ];
+        let advice: HashMap<_, _> = [
+            (10, true, Some(ProbeType::DeepScan), Some(-1.0)),
+            (20, true, Some(ProbeType::DeepScan), Some(-3.0)),
+            (30, true, Some(ProbeType::DeepScan), Some(1.0)),
+            (40, true, Some(ProbeType::DeepScan), Some(f64::NAN)),
+            (50, true, None, Some(-10.0)),
+            (60, false, Some(ProbeType::DeepScan), Some(-4.0)),
+        ]
+        .into_iter()
+        .map(|(pid, should_probe, recommended_probe, voi)| {
+            (pid, ProbeAdvice {
+                should_probe,
+                recommended_probe,
+                rationale: "fixture".into(),
+                voi,
+            })
+        })
+        .collect();
+        let pids = |selected: Vec<&ProcessRecord>| {
+            selected.iter().map(|process| process.pid.0).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            pids(select_deep_probe_targets(&candidates, &advice, false)),
+            [20, 10],
+        );
+        let forced = pids(select_deep_probe_targets(&candidates, &advice, true));
+        assert_eq!(forced.len(), processes.len());
+        assert_eq!(forced.into_iter().collect::<HashSet<_>>(), (10..=70).step_by(10).collect());
+        assert!(select_deep_probe_targets(&[], &advice, true).is_empty());
+    }
+
+    #[test]
+    fn probe_feasibility_preserves_safety_and_saved_plan_memory_cap_policy() {
+        let mut feasibility = ActionFeasibility::allow_all();
+        feasibility.disabled.push(pt_core::decision::DisabledAction {
+            action: Action::Kill,
+            reason: "fixture protection".into(),
+        });
+        let interactive = probe_action_feasibility(feasibility.clone(), false);
+        assert!(!interactive.is_allowed(Action::Kill));
+        assert!(!interactive.is_allowed(Action::CapMemory));
+        let saved_plan = probe_action_feasibility(feasibility, true);
+        assert!(!saved_plan.is_allowed(Action::Kill));
+        assert!(saved_plan.is_allowed(Action::CapMemory));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn record(process: &ProcessRecord) -> pt_core::collect::DeepScanRecord {
+        pt_core::collect::DeepScanRecord {
+            pid: process.pid,
+            ppid: process.ppid,
+            uid: process.uid,
+            user: process.user.clone(),
+            pgid: process.pgid,
+            sid: process.sid,
+            start_id: process.start_id.clone(),
+            comm: process.comm.clone(),
+            cmdline: process.cmd.clone(),
+            exe: None,
+            state: 'S',
+            io: None,
+            schedstat: None,
+            sched: None,
+            mem: None,
+            fd: None,
+            local_resource_evidence: Vec::new(),
+            gpu: None,
+            cgroup: None,
+            wchan: None,
+            network: None,
+            environ: None,
+            starttime: 12345,
+            source: "protocol-fixture".into(),
+            identity_quality: IdentityQuality::Full,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn result(
+        mut records: Vec<pt_core::collect::DeepScanRecord>,
+        requested: usize,
+        skipped: usize,
+        complete: bool,
+    ) -> pt_core::collect::DeepScanResult {
+        use pt_core::collect::{
+            DeepScanCollection, DeepScanMetadata, DeepScanResult, DeepScanStage,
+            GpuSnapshot, ProcessGpuEvidence,
+        };
+
+        if complete {
+            for record in &mut records {
+                record.gpu = Some(ProcessGpuEvidence::default());
+            }
+        }
+        let processed = records.len() + skipped;
+        DeepScanResult {
+            metadata: DeepScanMetadata {
+                started_at: "2026-01-01T00:00:00Z".into(),
+                duration_ms: 5,
+                process_count: records.len(),
+                skipped_count: skipped,
+                warnings: Vec::new(),
+                collection: DeepScanCollection {
+                    complete,
+                    timed_out: !complete,
+                    budget_ms: Some(3000),
+                    requested_count: Some(requested),
+                    processed_count: processed,
+                    incomplete_count: Some(requested.saturating_sub(processed)),
+                    enriched_count: records.iter().filter(|record| record.gpu.is_some()).count(),
+                    stage: if complete { DeepScanStage::Complete } else { DeepScanStage::Gpu },
+                    ..Default::default()
+                },
+            },
+            processes: records,
+            gpu: GpuSnapshot::default(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn empty_selection_and_zero_budget_never_start_a_collector_or_identity_check() {
+        let process = process(71);
+        let scorer = scorer();
+        for (processes, budget, expected) in [
+            (Vec::new(), Duration::from_secs(3), "not_needed"),
+            (vec![&process], Duration::ZERO, "disabled"),
+        ] {
+            let run = collect_deep_observations_with(
+                &processes,
+                &scorer,
+                budget,
+                true,
+                |_, _| panic!("an empty selection must never become a full census"),
+                |_| panic!("a skipped probe must not inspect live identities"),
+            );
+            assert_eq!(run.report.status, expected);
+            assert!(run.observations.is_none());
+            assert!(run.report.collection.is_none());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn partial_gpu_timeout_retains_joined_basic_records_without_inventing_signals() {
+        let process = process(71);
+        let run = collect_deep_observations_with(
+            &[&process],
+            &scorer(),
+            Duration::from_millis(123),
+            false,
+            |options, budget| {
+                assert_eq!(options.pids, [71]);
+                assert_eq!(budget, Duration::from_millis(123));
+                assert!(!options.include_environ);
+                assert!(options.skip_inaccessible);
+                Ok(result(vec![record(&process)], 1, 0, false))
+            },
+            |_| true,
+        );
+        assert_eq!(run.report.status, "partial");
+        assert_eq!(run.report.observed_count, 1);
+        assert_eq!(run.report.budget_ms, 123);
+        let collection = run.report.collection.as_ref().unwrap();
+        assert_eq!(collection["timed_out"], true);
+        assert_eq!(collection["incomplete_count"], 0);
+        assert_eq!(collection["enriched_count"], 0);
+        let candidate = candidate_deep_probe_report(
+            71, &HashSet::from([71]), run.observations.as_ref(), &run.report, None,
+        );
+        assert_eq!(candidate["record_observed"], true);
+        for field in ["net_active", "io_active", "queue_saturated"] {
+            assert!(candidate[field].is_null(), "{field}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completed_worker_does_not_hide_skipped_or_missing_observations() {
+        let first = process(71);
+        let second = process(72);
+        for skipped in [1, 2] {
+            let records = if skipped == 1 { vec![record(&first)] } else { Vec::new() };
+            let run = collect_deep_observations_with(
+                &[&first, &second],
+                &scorer(),
+                Duration::from_secs(3),
+                false,
+                |_, _| Ok(result(records, 2, skipped, true)),
+                |_| true,
+            );
+            assert_eq!(run.report.status, "partial");
+            assert_eq!(run.report.observed_count, 2 - skipped);
+            assert_eq!(run.report.skipped_count, skipped);
+            assert_eq!(run.report.collection.as_ref().unwrap()["complete"], true);
+            assert!(run.report.warnings.iter().any(|warning| warning.contains("missing evidence")));
+            let missing = candidate_deep_probe_report(
+                72, &HashSet::from([71, 72]), run.observations.as_ref(), &run.report, None,
+            );
+            assert_eq!(missing["selected"], true);
+            assert_eq!(missing["record_observed"], false);
+            assert!(missing["net_active"].is_null());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pid_reuse_and_failed_live_revalidation_cannot_enter_probe_evidence() {
+        let first = process(71);
+        let reused = process(72);
+        let stale = process(73);
+        let mut reused_record = record(&reused);
+        reused_record.start_id = pt_common::StartId::from_linux("fixture-boot", 99999, 72);
+        let run = collect_deep_observations_with(
+            &[&first, &reused, &stale],
+            &scorer(),
+            Duration::from_secs(3),
+            true,
+            |_, _| Ok(result(vec![record(&first), reused_record, record(&stale)], 3, 0, true)),
+            |identity| identity.pid.0 != 73,
+        );
+        assert_eq!(run.report.status, "partial");
+        assert_eq!(run.report.observed_count, 1);
+        assert_eq!(run.report.identity_rejected_count, 2);
+        let observations = run.observations.as_ref().unwrap();
+        assert!(observations.signals.contains_key(&71));
+        assert!(!observations.signals.contains_key(&72));
+        assert!(!observations.signals.contains_key(&73));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_failure_is_reported_without_fabricated_evidence() {
+        let process = process(71);
+        let run = collect_deep_observations_with(
+            &[&process],
+            &scorer(),
+            Duration::from_secs(3),
+            false,
+            |_, _| Err("fixture worker unavailable".into()),
+            |_| panic!("failed collection has no identity to revalidate"),
+        );
+        assert_eq!(run.report.status, "failed");
+        assert_eq!(run.report.observed_count, 0);
+        assert!(run.report.collection.is_none());
+        assert!(run.observations.is_none());
+        assert!(run.report.warnings[0].contains("fixture worker unavailable"));
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -6228,7 +6764,8 @@ fn build_tui_rows(
             ledger.why_summary = format!("{} {}", ledger.why_summary, summary);
         }
         if let Some(probe) = probe {
-            if probe.should_probe
+            if deep.is_none()
+                && probe.should_probe
                 && probe.recommended_probe == Some(pt_core::decision::ProbeType::DeepScan)
             {
                 ledger
@@ -10774,7 +11311,7 @@ fn run_deep_scan(global: &GlobalOpts, _args: &DeepScanArgs) -> ExitCode {
                             "deep_scan": result
                         });
                         if matches!(global.format, OutputFormat::Jsonl) {
-                            println!("{output}");
+                            println!("{}", global.process_output_value(output));
                         } else {
                             println!("{}", format_structured_output(global, output));
                         }
@@ -17338,7 +17875,7 @@ fn run_telemetry_redact(global: &GlobalOpts, args: &TelemetryArgs) -> ExitCode {
         OutputFormat::Json | OutputFormat::Toon => {
             println!("{}", format_structured_output(global, response));
         }
-        OutputFormat::Jsonl => println!("{response}"),
+        OutputFormat::Jsonl => println!("{}", global.process_output_value(response)),
         OutputFormat::Exitcode => {}
         _ => println!(
             "Created {} redacted table files in {}: {} rows, {} values redacted ({})",
@@ -28974,18 +29511,28 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         scan_result.metadata.warnings.is_empty(),
     );
 
-    // --deep: one batched deep scan (sockets, I/O, queue backlog, GPU observations) over the
-    // candidates, overlaid onto the quick-scan evidence below.
-    let deep_scan_start = std::time::Instant::now();
-    let deep_observations = if args.deep {
-        collect_deep_observations_for_processes(&processes_to_infer, &scorer)
+    // Spend one bounded batch on the existing VOI model's worthwhile probes.
+    // --deep broadens the target set; it never bypasses the collection budget.
+    let probe_budget = planning_probe_budget(args.probe_budget_ms, global.timeout);
+    let probe_advice = if probe_budget.is_zero() {
+        HashMap::new()
     } else {
-        None
+        compute_probe_advice(&processes_to_infer, &scorer, &decision_policy, &pressure, true)
     };
+    let deep_targets =
+        select_deep_probe_targets(&processes_to_infer, &probe_advice, args.deep);
+    let deep_target_pids: HashSet<_> = deep_targets.iter().map(|process| process.pid.0).collect();
+    let DeepProbeRun {
+        observations: deep_observations,
+        report: deep_collection,
+    } = collect_deep_observations_for_processes(
+        &deep_targets,
+        &scorer,
+        probe_budget,
+        args.deep,
+    );
     let deep_signals = deep_observations.as_ref().map(|deep| &deep.signals);
-    let deep_scan_ms = args
-        .deep
-        .then(|| deep_scan_start.elapsed().as_millis() as u64);
+    let deep_scan_ms = deep_observations.as_ref().map(|_| deep_collection.duration_ms);
 
     let candidates_evaluated = processes_to_infer.len();
     let total_processes = candidates_evaluated as u64;
@@ -29187,6 +29734,8 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             serde_json::json!({
                 "should_probe": decision.should_probe,
                 "recommended_probe": decision.recommended_probe.map(|probe| probe.name().to_string()),
+                "selected_in_this_plan": deep_target_pids.contains(&proc.pid.0),
+                "collection_status": deep_collection.status,
                 "esn_estimate": decision.esn_estimate,
                 "rationale": decision.rationale,
                 "ledger": ledger.iter().map(|entry| serde_json::json!({
@@ -29407,8 +29956,15 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                     .expect("candidate details were constructed as a JSON object"),
             );
 
+        candidate["deep_probe"] = candidate_deep_probe_report(
+            proc.pid.0,
+            &deep_target_pids,
+            deep_observations.as_ref(),
+            &deep_collection,
+            probe_advice.get(&proc.pid.0),
+        );
         #[cfg(target_os = "linux")]
-        if args.deep {
+        if deep_target_pids.contains(&proc.pid.0) {
             let (gpu, shared_devices) =
                 candidate_gpu_observations(deep_observations.as_ref(), proc.pid.0);
             candidate["gpu"] = gpu;
@@ -29985,10 +30541,11 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         "candidates_evaluated": candidates_evaluated,
         "deep_scan_ms": deep_scan_ms,
         "deep_evidence_pids": deep_signals.as_ref().map(|m| m.len()),
-        // Per-signal coverage: on a starved host a deep scan can return a pid
-        // without its network or I/O data, which silently weakens the evidence.
+        "deep_collection": deep_collection,
+        // Counts refer to selected probes, not every eligible candidate. Missing
+        // signals stay unknown even when the worker attempted every PID.
         "deep_coverage": deep_signals.as_ref().map(|m| serde_json::json!({
-            "requested": candidates_evaluated,
+            "requested": deep_collection.selected_count,
             "net": m.values().filter(|d| d.net_active.is_some()).count(),
             "io": m.values().filter(|d| d.io_active.is_some()).count(),
             "queue": m.values().filter(|d| d.queue_saturated.is_some()).count(),
@@ -30116,6 +30673,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             "sample_size": args.sample_size,
             "include_kernel_threads": args.include_kernel_threads,
             "deep": args.deep,
+            "probe_budget_ms": args.probe_budget_ms,
             "since": args.since,
             "since_time": args.since_time,
             "goal": args.goal,
@@ -30140,7 +30698,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     });
 
     #[cfg(target_os = "linux")]
-    if args.deep {
+    if args.deep || !deep_target_pids.is_empty() {
         plan_output["gpu_snapshot"] = deep_observations.as_ref()
             .map(|deep| serde_json::to_value(&deep.gpu_snapshot).unwrap())
             .unwrap_or_else(|| serde_json::json!({
@@ -30323,6 +30881,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             if args.brief || args.minimal {
                 output_json["agent_activity"] = agent_activity_output(&agent_activity, Some(10));
                 output_json["memory_limits"] = memory_limit_report(&responsible_units);
+                output_json["deep_collection"] = serde_json::json!(deep_collection);
             }
 
             // Apply pretty-printing or compact based on --pretty flag
@@ -30390,6 +30949,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             if args.brief || args.minimal {
                 output_json["agent_activity"] = agent_activity_output(&agent_activity, Some(10));
                 output_json["memory_limits"] = memory_limit_report(&responsible_units);
+                output_json["deep_collection"] = serde_json::json!(deep_collection);
             }
 
             let output_value = if args.pretty {

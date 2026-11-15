@@ -328,6 +328,8 @@ pt agent explain --session <id> --pids 1234 # why one process scored the way it 
 pt agent plan --format json            # Structured JSON plan
 pt agent plan --format toon            # Token-optimized output
 pt agent plan --pids 1234,5678          # Score selected PIDs with full ancestry/protection checks
+pt agent plan --probe-budget-ms 1500   # Spend at most 1.5s collecting worthwhile deep evidence
+pt agent plan --deep --probe-budget-ms 10000 # Deep-probe every eligible candidate within 10s
 pt agent apply --session <id> --yes    # Execute a plan (needs robot_mode.enabled=true in policy)
 pt agent verify --session <id>         # Confirm outcomes
 pt query actions --session <id>        # Read every saved attempt, refusal, and retry
@@ -1103,7 +1105,7 @@ to operating-system scheduling and caller backpressure.
 
 ### GPU Process Detection
 
-`pt deep` and `pt agent plan --deep` collect GPU observations on Linux. One vendor snapshot serves the entire deep scan, with a 10-second collection deadline and a maximum query timeout of 3 seconds. A driver query that remains stuck after termination cannot block the scan: its result stays unknown, and subsequent scans skip new vendor probes while that worker is pending. The collector tries `nvidia-smi` (CUDA), then `rocm-smi` (AMD ROCm) if the NVIDIA inventory is unavailable. The result describes the selected vendor's visible inventory; it is not a complete census of a mixed-vendor host.
+`pt deep` and selected deep probes in agent plans and the TUI collect GPU observations on Linux. One vendor snapshot serves the entire deep scan. The vendor collector has a 10-second deadline and a maximum query timeout of 3 seconds; an outer planning or deep-scan budget can end collection sooner and preserves explicit missing or unfinished GPU evidence. A driver query that remains stuck after termination cannot block the scan: its result stays unknown, and subsequent scans skip new vendor probes while that worker is pending. The collector tries `nvidia-smi` (CUDA), then `rocm-smi` (AMD ROCm) if the NVIDIA inventory is unavailable. The result describes the selected vendor's visible inventory; it is not a complete census of a mixed-vendor host.
 
 | Field Collected | NVIDIA | AMD |
 |----------------|:------:|:---:|
@@ -2097,7 +2099,29 @@ The displayed **score** is `100 × P(abandoned or zombie)`. It measures how susp
 
 ### Value of Information
 
-Before committing to an action, `pt` evaluates whether gathering more evidence would change the decision. Commands currently weigh one probe, a deep scan: the TUI runs it for candidates where it is worth it, and `agent plan` reports it as a hint. The library framework models 9 probe types:
+Before committing to an action, `pt` evaluates whether gathering more evidence
+would improve the decision enough to justify its cost. On Linux, both `agent plan` and the
+interactive TUI now collect worthwhile deep evidence automatically, after
+protection, process-age, and requested-PID filtering. Probe selection uses the
+same process-specific loss model and feasible actions as that workflow.
+
+`--probe-budget-ms` gives the entire selected batch one collection budget
+(default **3000 ms**). `--deep` includes every eligible candidate while retaining
+that budget; `--probe-budget-ms 0` disables deep probing. The global `--timeout`
+can shorten the probe budget. Other planning phases and output are outside this
+limit. Empty selections do not start a worker.
+
+Completed records survive a collection timeout, but they enter scoring only
+after matching the original process identity and passing fresh revalidation.
+Missing network, I/O, queue, and GPU evidence stays unknown. Plans preserve the
+collection report in `summary.deep_collection` and identify each candidate's
+probe coverage in `deep_probe`. This report also accompanies brief/minimal
+structured output. The TUI shows collection caveats for selected rows and saves
+the report in `system_state.deep_collection`. Skipped or identity-rejected
+processes produce partial coverage, including when every collection attempt
+finished; unfinished GPU enrichment is reported separately.
+
+The library framework models 9 probe types:
 
 | Probe | Cost | What It Reveals |
 |-------|------|-----------------|
@@ -2111,7 +2135,10 @@ Before committing to an action, `pt` evaluates whether gathering more evidence w
 | I/O snapshot | ~2 sec | Read/write rates |
 | Cgroup inspect | ~1 sec | Resource limits and usage |
 
-A probe is only worth taking if its expected information gain exceeds its cost: `VoI(m) = E[loss_reduction(m)] - cost(m)`. Probes are ranked by a Whittle-style index `(-VoI) / cost` for budget-constrained scheduling.
+The runtime ledger uses `expected_loss_after_probe - current_expected_loss + probe_cost`,
+so a finite **negative** value favors probing. The command batch prioritizes the
+most negative deep-scan values and uses PID order to break ties. The library
+also exposes cost-aware probe scheduling for its other probe types.
 
 ### FDR Control for Multiple Kill Decisions
 
