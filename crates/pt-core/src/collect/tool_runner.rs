@@ -9,6 +9,7 @@
 //! - Cumulative budget tracking for overhead management
 //! - nice/ionice to limit system impact
 //! - Command path validation to prevent injection
+//! - Linux owned helpers receive a death signal if their spawning thread exits
 //!
 //! # Example
 //!
@@ -627,6 +628,41 @@ impl ToolRunner {
         command.env("LANG", "C");
         command.envs(&spec.env);
 
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::process::CommandExt;
+
+            // A scanner can itself run under a deadline in another process.
+            // Killing that scanner also removes its timeout/reaper threads, so
+            // its owned helpers need kernel-enforced cancellation as well.
+            // This covers this direct child across ordinary execs, including
+            // nice/ionice wrappers. Linux clears the setting in forked children
+            // and on credential-changing execs; it is not a process-tree kill.
+            // SAFETY: getpid only reads the current process identity.
+            let parent_pid = unsafe { libc::getpid() };
+            // SAFETY: after fork, use only allocation-free libc operations and
+            // raw OS errors. Checking getppid after prctl closes the race where
+            // the parent died before the death signal was installed.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::prctl(
+                        libc::PR_SET_PDEATHSIG,
+                        libc::SIGKILL as libc::c_ulong,
+                        0 as libc::c_ulong,
+                        0 as libc::c_ulong,
+                        0 as libc::c_ulong,
+                    ) == -1
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::getppid() != parent_pid {
+                        return Err(std::io::Error::from_raw_os_error(libc::ECHILD));
+                    }
+                    Ok(())
+                });
+            }
+        }
+
         Ok(command)
     }
 
@@ -1057,6 +1093,114 @@ mod tests {
             assert!(output.timed_out, "{output:?}");
             assert!(!output.success(), "incomplete capture is not success");
             assert!(started.elapsed() < Duration::from_secs(2));
+        }
+    }
+
+    /// Subprocess fixture: keep a real nested ToolRunner alive until its owner
+    /// is terminated by the outer runner's deadline.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nested_runner_parent_death_worker() {
+        let Some(marker) = std::env::var_os("PT_TOOL_PARENT_DEATH_MARKER") else {
+            return;
+        };
+        let marker = marker.to_str().expect("fixture marker is UTF-8");
+        let output = test_runner()
+            .run_tool(
+                "sh",
+                &[
+                    "-c",
+                    "printf '%s\\n' \"$$\" > \"$1\"; exec sleep 30",
+                    "pt-tool-parent-death",
+                    marker,
+                ],
+                Some(Duration::from_secs(30)),
+            )
+            .expect("nested owned helper starts");
+        panic!("outer deadline must terminate this worker first: {output:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminating_a_runner_also_terminates_its_owned_helper() {
+        let root = tempfile::tempdir()
+            .expect("parent-death fixture directory")
+            .keep();
+        let marker = root.join("helper.pid");
+        let executable = std::env::current_exe().expect("current test executable");
+        let worker_test = format!(
+            "{}::nested_runner_parent_death_worker",
+            module_path!().split_once("::").unwrap().1
+        );
+        let spec = ToolSpec::new(
+            executable.to_str().expect("test executable is UTF-8"),
+            vec!["--exact".into(), worker_test, "--nocapture".into()],
+        )
+        .with_env(
+            "PT_TOOL_PARENT_DEATH_MARKER",
+            marker.to_str().expect("fixture marker is UTF-8"),
+        );
+        let runner = test_runner();
+        let mut worker = ToolChildGuard(Some(
+            runner
+                .build_command(&spec)
+                .expect("build owned worker")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("start owned worker"),
+        ));
+
+        let started = Instant::now();
+        let helper_pid: u32 = loop {
+            if let Ok(contents) = std::fs::read_to_string(&marker) {
+                if let Ok(pid) = contents.trim().parse() {
+                    break pid;
+                }
+            }
+            assert!(
+                worker.0.as_mut().unwrap().try_wait().unwrap().is_none(),
+                "nested worker must stay alive until the deadline"
+            );
+            assert!(started.elapsed() < Duration::from_secs(10));
+            thread::sleep(Duration::from_millis(5));
+        };
+        let helper_state = || {
+            std::fs::read_to_string(format!("/proc/{helper_pid}/stat"))
+                .ok()
+                .and_then(|contents| super::super::proc_parsers::parse_proc_stat_content(&contents))
+        };
+        let before = helper_state().expect("nested helper is alive");
+        assert_eq!(before.ppid, worker.0.as_ref().unwrap().id());
+        assert_ne!(before.state, 'Z');
+
+        // Start the short outer deadline after readiness; slow test-executable
+        // startup must not turn this into a spurious helper-startup failure.
+        let (_, _, _, _, timed_out) = runner
+            .execute_with_timeout(
+                worker.0.as_mut().unwrap(),
+                Instant::now(),
+                Duration::from_millis(100),
+                4096,
+                None,
+            )
+            .expect("bounded outer worker");
+        assert!(timed_out);
+        drop(worker);
+
+        let stopped = Instant::now();
+        loop {
+            match helper_state() {
+                None => break,
+                Some(after) if after.starttime != before.starttime || after.state == 'Z' => break,
+                Some(_) => {}
+            }
+            assert!(
+                stopped.elapsed() < Duration::from_secs(2),
+                "nested helper must stop when its timeout owner dies"
+            );
+            thread::sleep(Duration::from_millis(5));
         }
     }
 
