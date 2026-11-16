@@ -865,14 +865,25 @@ pub const FUSE_SERVER_NOTES: &str =
 
 /// Whether a process holds the Linux FUSE device open.
 ///
+/// Threads can own separate descriptor tables after unshare(CLONE_FILES), so a
+/// leader-only inspection cannot establish absence. Negative evidence requires
+/// two complete, matching observations of every task identity and descriptor
+/// table. All directory entries share one work/deadline budget across both passes.
+///
 /// Only read procfs descriptor symlinks; following them or stat'ing a mount can
-/// itself hang on an unhealthy FUSE server. An open device is sufficient for a
-/// conservative refusal even when the mount cannot be attributed to this PID.
-/// `None` means inspection was incomplete, or the platform is unsupported.
+/// itself hang on an unhealthy FUSE server. An observed device is sufficient for
+/// a conservative refusal even if other evidence is unavailable or has changed.
+/// None means inspection was incomplete, changing, or unsupported. The checks
+/// detect observed churn; they do not make a later action atomic.
 pub fn holds_fuse_device(pid: u32) -> Option<bool> {
     #[cfg(target_os = "linux")]
     {
-        fuse_device_in_fd_table(std::path::Path::new(&format!("/proc/{pid}/fd")))
+        holds_fuse_device_from(
+            std::path::Path::new(&format!("/proc/{pid}")),
+            pid,
+            &mut FuseInspectionBudget::default(),
+            || {},
+        )
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -882,11 +893,200 @@ pub fn holds_fuse_device(pid: u32) -> Option<bool> {
 }
 
 #[cfg(target_os = "linux")]
-fn fuse_device_in_fd_table(directory: &std::path::Path) -> Option<bool> {
+struct FuseInspectionBudget {
+    deadline: std::time::Instant,
+    remaining_entries: usize,
+    max_tasks: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl Default for FuseInspectionBudget {
+    fn default() -> Self {
+        Self {
+            deadline: std::time::Instant::now() + std::time::Duration::from_millis(500),
+            remaining_entries: 50_000,
+            max_tasks: 1024,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl FuseInspectionBudget {
+    fn available(&self) -> bool {
+        std::time::Instant::now() < self.deadline
+    }
+
+    fn take_entry(&mut self) -> bool {
+        if !self.available() || self.remaining_entries == 0 {
+            return false;
+        }
+        self.remaining_entries -= 1;
+        true
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+struct FuseTaskIdentity {
+    device: u64,
+    inode: u64,
+    birth_ticks: u64,
+    uid: u32,
+}
+
+#[cfg(target_os = "linux")]
+type FuseDescriptorTable = std::collections::BTreeMap<u32, std::path::PathBuf>;
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+enum FuseInspection {
+    Present,
+    Incomplete,
+    Clear(std::collections::BTreeMap<u32, (FuseTaskIdentity, FuseDescriptorTable)>),
+}
+
+#[cfg(target_os = "linux")]
+fn fuse_procfs_id(name: &std::ffi::OsStr, allow_zero: bool) -> Option<u32> {
+    let text = name.to_str()?;
+    let value = text.parse::<u32>().ok()?;
+    (text == value.to_string() && value <= i32::MAX as u32 && (allow_zero || value != 0))
+        .then_some(value)
+}
+
+#[cfg(target_os = "linux")]
+fn fuse_task_ids(
+    process_dir: &std::path::Path,
+    budget: &mut FuseInspectionBudget,
+) -> (std::collections::BTreeSet<u32>, bool) {
+    let mut tids = std::collections::BTreeSet::new();
+    let Ok(entries) = std::fs::read_dir(process_dir.join("task")) else {
+        return (tids, false);
+    };
+    let mut complete = true;
+    for entry in entries {
+        if !budget.take_entry() || tids.len() >= budget.max_tasks {
+            return (tids, false);
+        }
+        let tid = entry
+            .ok()
+            .and_then(|entry| fuse_procfs_id(&entry.file_name(), false));
+        match tid {
+            Some(tid) if tids.insert(tid) => {}
+            _ => complete = false,
+        }
+    }
+    (tids, complete && budget.available())
+}
+
+#[cfg(target_os = "linux")]
+fn fuse_task_identity(task_dir: &std::path::Path, tid: u32) -> Option<FuseTaskIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::metadata(task_dir).ok()?;
+    if !metadata.is_dir() {
+        return None;
+    }
+    let bytes = super::procfs::read_bounded(&task_dir.join("stat"), 16 * 1024).ok()?;
+    let content = std::str::from_utf8(&bytes).ok()?;
+    let stat = super::proc_parsers::parse_required_proc_stat_content(tid, content).ok()?;
+    Some(FuseTaskIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        birth_ticks: stat.starttime,
+        uid: metadata.uid(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn fuse_device_table_snapshot(
+    directory: &std::path::Path,
+    budget: &mut FuseInspectionBudget,
+    descriptors: &mut FuseDescriptorTable,
+) -> Option<bool> {
     let entries = std::fs::read_dir(directory).ok()?;
-    fuse_device_from_link_targets(
-        entries.map(|entry| entry.and_then(|entry| std::fs::read_link(entry.path()))),
-    )
+    let mut exhausted = false;
+    let targets = entries
+        .take_while(|_| {
+            let permitted = budget.take_entry();
+            exhausted = !permitted;
+            permitted
+        })
+        .map(|entry| {
+            let entry = entry?;
+            let fd = fuse_procfs_id(&entry.file_name(), true)
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+            let target = std::fs::read_link(entry.path())?;
+            if descriptors.insert(fd, target.clone()).is_some() {
+                return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+            }
+            Ok(target)
+        });
+    let result = fuse_device_from_link_targets(targets);
+    if result == Some(true) {
+        result
+    } else if exhausted || !budget.available() {
+        None
+    } else {
+        result
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn fuse_device_snapshot(
+    process_dir: &std::path::Path,
+    pid: u32,
+    budget: &mut FuseInspectionBudget,
+) -> FuseInspection {
+    let (tids, mut complete) = fuse_task_ids(process_dir, budget);
+    complete &= tids.contains(&pid);
+    let mut tasks = std::collections::BTreeMap::new();
+    for &tid in &tids {
+        if !budget.available() {
+            return FuseInspection::Incomplete;
+        }
+        let task_dir = process_dir.join("task").join(tid.to_string());
+        let before = fuse_task_identity(&task_dir, tid);
+        let mut descriptors = FuseDescriptorTable::new();
+        match fuse_device_table_snapshot(&task_dir.join("fd"), budget, &mut descriptors) {
+            Some(true) => return FuseInspection::Present,
+            Some(false) => {}
+            None => complete = false,
+        }
+        let after = fuse_task_identity(&task_dir, tid);
+        complete &= before.is_some() && before == after;
+        if let Some(identity) = before {
+            tasks.insert(tid, (identity, descriptors));
+        }
+    }
+    let (after_tids, after_complete) = fuse_task_ids(process_dir, budget);
+    if complete && after_complete && tids == after_tids && budget.available() {
+        FuseInspection::Clear(tasks)
+    } else {
+        FuseInspection::Incomplete
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn holds_fuse_device_from(
+    process_dir: &std::path::Path,
+    pid: u32,
+    budget: &mut FuseInspectionBudget,
+    before_recheck: impl FnOnce(),
+) -> Option<bool> {
+    if pid == 0 || pid > i32::MAX as u32 || !budget.available() {
+        return None;
+    }
+    let before = match fuse_device_snapshot(process_dir, pid, budget) {
+        FuseInspection::Present => return Some(true),
+        FuseInspection::Incomplete => return None,
+        FuseInspection::Clear(tasks) => tasks,
+    };
+    before_recheck();
+    match fuse_device_snapshot(process_dir, pid, budget) {
+        FuseInspection::Present => Some(true),
+        FuseInspection::Clear(after) if before == after => Some(false),
+        _ => None,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1298,6 +1498,15 @@ mod tests {
     use std::time::Duration;
 
     #[cfg(target_os = "linux")]
+    fn fuse_device_in_fd_table(directory: &std::path::Path) -> Option<bool> {
+        fuse_device_table_snapshot(
+            directory,
+            &mut FuseInspectionBudget::default(),
+            &mut FuseDescriptorTable::new(),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn fuse_device_detection_reads_descriptor_links_without_following_them() {
         let table = tempfile::tempdir().unwrap();
@@ -1350,6 +1559,249 @@ mod tests {
                 }
                 assert_eq!(fuse_device_from_link_targets(targets), Some(true));
             }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fuse_fixture_task(
+        process_dir: &std::path::Path,
+        tid: u32,
+        birth: u64,
+    ) -> std::path::PathBuf {
+        let task = process_dir.join("task").join(tid.to_string());
+        std::fs::create_dir_all(task.join("fd")).unwrap();
+        let mut fields = vec!["0".to_string(); 22];
+        fields[0] = "S".to_string();
+        fields[1] = "1".to_string();
+        fields[17] = "2".to_string();
+        fields[19] = birth.to_string();
+        std::fs::write(
+            task.join("stat"),
+            format!("{tid} (worker) {}\n", fields.join(" ")),
+        )
+        .unwrap();
+        task
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fuse_fixture_budget() -> FuseInspectionBudget {
+        FuseInspectionBudget {
+            deadline: std::time::Instant::now() + Duration::from_secs(5),
+            ..FuseInspectionBudget::default()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fuse_inspection_finds_private_worker_devices_despite_incomplete_leader() {
+        for target in ["/dev/fuse", "/dev/fuse (deleted)"] {
+            for leader_available in [true, false] {
+                let process = tempfile::tempdir().unwrap();
+                let leader = fuse_fixture_task(process.path(), 42, 100);
+                let worker = fuse_fixture_task(process.path(), 43, 101);
+                std::os::unix::fs::symlink("/dev/null", leader.join("fd/0")).unwrap();
+                // Distinct task tables model a worker that used unshare(CLONE_FILES).
+                // The leader's harmless table must not hide the worker's device.
+                assert_eq!(fuse_device_in_fd_table(&leader.join("fd")), Some(false));
+                std::os::unix::fs::symlink(target, worker.join("fd/7")).unwrap();
+                if !leader_available {
+                    // An exited leader can retain a stat record while its fd table
+                    // is unavailable. Positive worker evidence must still survive.
+                    std::fs::rename(
+                        leader.join("fd"),
+                        process.path().join("retained-leader-fds"),
+                    )
+                    .unwrap();
+                }
+                assert_eq!(
+                    holds_fuse_device_from(
+                        process.path(),
+                        42,
+                        &mut fuse_fixture_budget(),
+                        || {},
+                    ),
+                    Some(true),
+                    "{target}, leader_available={leader_available}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fuse_inspection_refuses_incomplete_task_or_descriptor_evidence() {
+        for failure in [
+            "missing_leader",
+            "missing_worker_fds",
+            "missing_worker_stat",
+            "wrong_worker_identity",
+            "oversized_worker_stat",
+            "invalid_task_id",
+            "zero_task_id",
+            "invalid_descriptor_id",
+            "unreadable_descriptor",
+        ] {
+            let process = tempfile::tempdir().unwrap();
+            let leader = fuse_fixture_task(process.path(), 42, 100);
+            let worker = fuse_fixture_task(process.path(), 43, 101);
+            std::os::unix::fs::symlink("/dev/null", leader.join("fd/0")).unwrap();
+            std::os::unix::fs::symlink("socket:[123]", worker.join("fd/0")).unwrap();
+            assert_eq!(
+                holds_fuse_device_from(process.path(), 42, &mut fuse_fixture_budget(), || {}),
+                Some(false)
+            );
+            let mut pid = 42;
+            match failure {
+                "missing_leader" => pid = 41,
+                "missing_worker_fds" => {
+                    std::fs::rename(worker.join("fd"), process.path().join("retained-worker-fds"))
+                        .unwrap();
+                }
+                "missing_worker_stat" => {
+                    std::fs::rename(
+                        worker.join("stat"),
+                        process.path().join("retained-worker-stat"),
+                    )
+                    .unwrap();
+                }
+                "wrong_worker_identity" => {
+                    let stat = std::fs::read_to_string(leader.join("stat")).unwrap();
+                    std::fs::write(worker.join("stat"), stat).unwrap();
+                }
+                "oversized_worker_stat" => {
+                    std::fs::write(worker.join("stat"), vec![b'0'; 16 * 1024 + 1]).unwrap();
+                }
+                "invalid_task_id" => {
+                    std::fs::create_dir(process.path().join("task/043")).unwrap();
+                }
+                "zero_task_id" => {
+                    std::fs::create_dir(process.path().join("task/0")).unwrap();
+                }
+                "invalid_descriptor_id" => {
+                    std::os::unix::fs::symlink("/dev/null", worker.join("fd/01")).unwrap();
+                }
+                "unreadable_descriptor" => {
+                    std::fs::write(worker.join("fd/1"), b"not a descriptor symlink").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                holds_fuse_device_from(process.path(), pid, &mut fuse_fixture_budget(), || {}),
+                None,
+                "{failure}"
+            );
+            // Incomplete evidence is never allowed to erase a known device.
+            std::os::unix::fs::symlink("/dev/fuse", leader.join("fd/9")).unwrap();
+            assert_eq!(
+                holds_fuse_device_from(process.path(), pid, &mut fuse_fixture_budget(), || {}),
+                Some(true),
+                "{failure}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fuse_inspection_rechecks_task_identity_and_descriptor_churn() {
+        for change in [
+            "new_task",
+            "exited_task",
+            "reused_tid",
+            "replaced_task_same_birth",
+            "new_descriptor",
+            "retargeted_descriptor",
+            "new_fuse_descriptor",
+        ] {
+            let process = tempfile::tempdir().unwrap();
+            let leader = fuse_fixture_task(process.path(), 42, 100);
+            let worker = fuse_fixture_task(process.path(), 43, 101);
+            std::os::unix::fs::symlink("/dev/null", leader.join("fd/0")).unwrap();
+            std::os::unix::fs::symlink("socket:[123]", worker.join("fd/0")).unwrap();
+            let result =
+                holds_fuse_device_from(process.path(), 42, &mut fuse_fixture_budget(), || {
+                    match change {
+                        "new_task" => {
+                            fuse_fixture_task(process.path(), 44, 102);
+                        }
+                        "exited_task" => {
+                            std::fs::rename(&worker, process.path().join("retained-task")).unwrap();
+                        }
+                        "reused_tid" => {
+                            fuse_fixture_task(process.path(), 43, 200);
+                        }
+                        "replaced_task_same_birth" => {
+                            std::fs::rename(&worker, process.path().join("retained-task")).unwrap();
+                            let replacement = fuse_fixture_task(process.path(), 43, 101);
+                            std::os::unix::fs::symlink("socket:[123]", replacement.join("fd/0"))
+                                .unwrap();
+                        }
+                        "new_descriptor" => {
+                            std::os::unix::fs::symlink("/dev/null", worker.join("fd/9")).unwrap();
+                        }
+                        "retargeted_descriptor" => {
+                            std::fs::rename(
+                                worker.join("fd/0"),
+                                process.path().join("retained-descriptor"),
+                            )
+                            .unwrap();
+                            std::os::unix::fs::symlink("socket:[456]", worker.join("fd/0"))
+                                .unwrap();
+                        }
+                        "new_fuse_descriptor" => {
+                            std::os::unix::fs::symlink("/dev/fuse", worker.join("fd/9")).unwrap();
+                        }
+                        _ => unreachable!(),
+                    }
+                });
+            assert_eq!(
+                result,
+                if change == "new_fuse_descriptor" {
+                    Some(true)
+                } else {
+                    None
+                },
+                "{change}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fuse_inspection_work_budget_spans_tasks_and_both_passes() {
+        let process = tempfile::tempdir().unwrap();
+        for tid in [42, 43] {
+            let task = fuse_fixture_task(process.path(), tid, 100);
+            // Equal descriptor contents do not prove that tables are shared.
+            std::os::unix::fs::symlink("/dev/null", task.join("fd/0")).unwrap();
+        }
+        // Each pass reads two task entries before and after two descriptors.
+        // Both complete passes therefore consume exactly twelve entry credits.
+        for credits in [0, 6, 11, 12] {
+            let mut budget = fuse_fixture_budget();
+            budget.remaining_entries = credits;
+            assert_eq!(
+                holds_fuse_device_from(process.path(), 42, &mut budget, || {}),
+                if credits == 12 { Some(false) } else { None },
+                "credits={credits}"
+            );
+        }
+        let mut limited_tasks = fuse_fixture_budget();
+        limited_tasks.max_tasks = 1;
+        assert_eq!(
+            holds_fuse_device_from(process.path(), 42, &mut limited_tasks, || {}),
+            None
+        );
+        let mut expired = fuse_fixture_budget();
+        expired.deadline = std::time::Instant::now();
+        assert_eq!(
+            holds_fuse_device_from(process.path(), 42, &mut expired, || {}),
+            None
+        );
+        for pid in [0, u32::MAX] {
+            assert_eq!(
+                holds_fuse_device_from(process.path(), pid, &mut fuse_fixture_budget(), || {}),
+                None
+            );
         }
     }
 
