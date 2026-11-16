@@ -891,6 +891,8 @@ pub(super) fn parse_proc_tty(pid: u32, content: &str) -> Result<bool, String> {
 const WRITE_FD_INSPECTION_TIMEOUT: Duration = Duration::from_millis(500);
 #[cfg(target_os = "linux")]
 const MAX_WRITE_FD_INSPECTION: usize = 50_000;
+#[cfg(target_os = "linux")]
+const MAX_WRITE_FD_TASKS: usize = 1024;
 
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -906,6 +908,77 @@ impl WriteFdObservation {
     fn writable(&self) -> bool {
         matches!(self.flags & libc::O_ACCMODE as u32, 1 | 2)
     }
+}
+
+/// Every thread can own a different descriptor table after unshare(CLONE_FILES).
+/// Keep its identity and the complete table, including read-only descriptors,
+/// so a new task or reopened descriptor invalidates a negative observation.
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+struct WriteFdSnapshot {
+    tasks: std::collections::BTreeMap<u32, WriteFdTaskIdentity>,
+    descriptors: std::collections::BTreeMap<String, WriteFdObservation>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+struct WriteFdTaskIdentity {
+    device: u64,
+    inode: u64,
+    birth_ticks: u64,
+    uid: u32,
+}
+
+#[cfg(target_os = "linux")]
+fn write_fd_task_identity(task_dir: &std::path::Path, tid: u32) -> Option<WriteFdTaskIdentity> {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::metadata(task_dir).ok()?;
+    let mut content = String::new();
+    const MAX_STAT_BYTES: u64 = 16 * 1024;
+    std::fs::File::open(task_dir.join("stat"))
+        .ok()?
+        .take(MAX_STAT_BYTES + 1)
+        .read_to_string(&mut content)
+        .ok()?;
+    if content.len() as u64 > MAX_STAT_BYTES {
+        return None;
+    }
+    let stat =
+        crate::collect::proc_parsers::parse_required_proc_stat_content(tid, &content).ok()?;
+    Some(WriteFdTaskIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        birth_ticks: stat.starttime,
+        uid: metadata.uid(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn write_fd_task_ids(
+    process_dir: &std::path::Path,
+    pid: u32,
+    deadline: Instant,
+    max_tasks: usize,
+) -> Option<std::collections::BTreeSet<u32>> {
+    let mut tids = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(process_dir.join("task")).ok()? {
+        if Instant::now() >= deadline || tids.len() >= max_tasks {
+            return None;
+        }
+        let entry = entry.ok()?;
+        let name = entry.file_name();
+        let name = name.to_str()?;
+        if name.is_empty() || !name.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let tid = name.parse::<u32>().ok()?;
+        if tid == 0 || name != tid.to_string() || !tids.insert(tid) {
+            return None;
+        }
+    }
+    (tids.contains(&pid) && Instant::now() < deadline).then_some(tids)
 }
 
 /// Read all required kernel fields, preserving unknown/duplicate/truncated
@@ -953,48 +1026,87 @@ fn write_fd_flags_and_identity(content: &str) -> Option<(u32, u64, u64)> {
 }
 
 #[cfg(target_os = "linux")]
-fn write_fd_snapshot(
+fn write_fd_snapshot(pid: u32, deadline: Instant) -> Option<WriteFdSnapshot> {
+    write_fd_snapshot_from(
+        &std::path::PathBuf::from(format!("/proc/{pid}")),
+        pid,
+        deadline,
+        MAX_WRITE_FD_TASKS,
+        MAX_WRITE_FD_INSPECTION,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn write_fd_snapshot_from(
+    process_dir: &std::path::Path,
     pid: u32,
     deadline: Instant,
-) -> Option<std::collections::BTreeMap<u32, WriteFdObservation>> {
+    max_tasks: usize,
+    max_descriptors: usize,
+) -> Option<WriteFdSnapshot> {
     use std::io::Read;
 
-    let mut observed = std::collections::BTreeMap::new();
-    let entries = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
-    for entry in entries {
-        if Instant::now() >= deadline || observed.len() >= MAX_WRITE_FD_INSPECTION {
+    let tids = write_fd_task_ids(process_dir, pid, deadline, max_tasks)?;
+    let mut observed = WriteFdSnapshot {
+        tasks: std::collections::BTreeMap::new(),
+        descriptors: std::collections::BTreeMap::new(),
+    };
+    for &tid in &tids {
+        let task_dir = process_dir.join("task").join(tid.to_string());
+        let identity = write_fd_task_identity(&task_dir, tid)?;
+        let entries = std::fs::read_dir(task_dir.join("fd")).ok()?;
+        for entry in entries {
+            if Instant::now() >= deadline || observed.descriptors.len() >= max_descriptors {
+                return None;
+            }
+            let entry = entry.ok()?;
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            if name.is_empty() || !name.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            let fd = name.parse::<u32>().ok()?;
+            if name != fd.to_string() {
+                return None;
+            }
+            let target = std::fs::read_link(entry.path()).ok()?;
+            // Large lock/event tables can make fdinfo arbitrarily long. Its
+            // required header must fit within a fixed per-descriptor bound.
+            const MAX_FDINFO_BYTES: u64 = 64 * 1024;
+            let mut content = String::new();
+            std::fs::File::open(task_dir.join("fdinfo").join(name))
+                .ok()?
+                .take(MAX_FDINFO_BYTES + 1)
+                .read_to_string(&mut content)
+                .ok()?;
+            if content.len() as u64 > MAX_FDINFO_BYTES {
+                return None;
+            }
+            let (flags, inode, mount_id) = write_fd_flags_and_identity(&content)?;
+            let path = task_dir.join("fd").join(name).to_str()?.to_string();
+            if observed
+                .descriptors
+                .insert(
+                    path,
+                    WriteFdObservation {
+                        target,
+                        flags,
+                        inode,
+                        mount_id,
+                    },
+                )
+                .is_some()
+            {
+                return None;
+            }
+        }
+        if write_fd_task_identity(&task_dir, tid)? != identity {
             return None;
         }
-        let entry = entry.ok()?;
-        let fd = entry.file_name().to_str()?.parse::<u32>().ok()?;
-        let target = std::fs::read_link(entry.path()).ok()?;
-        // Large lock/event tables can make fdinfo arbitrarily long. Its required
-        // header must be observed completely, within a fixed per-file bound.
-        const MAX_FDINFO_BYTES: u64 = 64 * 1024;
-        let mut content = String::new();
-        std::fs::File::open(format!("/proc/{pid}/fdinfo/{fd}"))
-            .ok()?
-            .take(MAX_FDINFO_BYTES + 1)
-            .read_to_string(&mut content)
-            .ok()?;
-        if content.len() as u64 > MAX_FDINFO_BYTES {
-            return None;
-        }
-        let (flags, inode, mount_id) = write_fd_flags_and_identity(&content)?;
-        if observed
-            .insert(
-                fd,
-                WriteFdObservation {
-                    target,
-                    flags,
-                    inode,
-                    mount_id,
-                },
-            )
-            .is_some()
-        {
-            return None;
-        }
+        observed.tasks.insert(tid, identity);
+    }
+    if write_fd_task_ids(process_dir, pid, deadline, max_tasks)? != tids {
+        return None;
     }
     (Instant::now() < deadline).then_some(observed)
 }
@@ -1083,9 +1195,10 @@ where
     let birth = read_io_birth(pid).ok()?;
     let before = write_fd_snapshot(pid, deadline)?;
     let requested: std::collections::BTreeMap<_, _> = before
+        .descriptors
         .iter()
         .filter(|(_, observation)| observation.writable())
-        .map(|(fd, observation)| (format!("/proc/{pid}/fd/{fd}"), observation))
+        .map(|(path, observation)| (path.clone(), observation))
         .collect();
     let count = if requested.is_empty() {
         0
@@ -1095,8 +1208,8 @@ where
         count_write_fd_metadata(&requested, &probe(&paths, remaining)?)?
     };
     // The command inspected live numeric descriptors. Reject a close/reopen,
-    // changed access mode, mount, pathname, or process incarnation instead of
-    // mixing one file's metadata with another file's access flags.
+    // changed access mode, mount, pathname, task census or process incarnation
+    // instead of mixing one file's metadata with another file's access flags.
     if before != write_fd_snapshot(pid, deadline)? || read_io_birth(pid).ok()? != birth {
         return None;
     }
@@ -1115,9 +1228,11 @@ fn write_fd_probe_runner(remaining: Duration) -> crate::collect::tool_runner::To
     })
 }
 
-/// Number of persistent regular files `pid` holds open for writing: the data-loss
-/// gate's definition, shared by `agent plan` and the apply-time pre-check. `None`
-/// when the process's open files cannot be read.
+/// Conservative count of persistent writable descriptor references across every
+/// thread: the data-loss gate's definition, shared by plan and apply. Shared
+/// tables can contribute repeatedly because equality of descriptor metadata does
+/// not prove shared ownership. `None` means incomplete, changing or over-budget
+/// evidence; only a complete zero proves there are no persistent writers.
 pub fn open_write_fd_count(pid: u32) -> Option<u32> {
     #[cfg(target_os = "linux")]
     {
@@ -2333,7 +2448,7 @@ impl PreCheckProvider for LivePreCheckProvider {
                 return PreCheckResult::Blocked {
                     check: PreCheck::CheckDataLossGate,
                     reason: format!(
-                        "{write_count} open write fds (max: {})",
+                        "{write_count} open write fds across task tables (conservative count; max: {})",
                         self.config.max_open_write_fds
                     ),
                 };
@@ -3357,6 +3472,112 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn write_fd_fixture_task(process_dir: &std::path::Path, tid: u32, birth: u64) {
+        let task = process_dir.join("task").join(tid.to_string());
+        std::fs::create_dir_all(task.join("fd")).unwrap();
+        std::fs::create_dir_all(task.join("fdinfo")).unwrap();
+        let mut stat = vec!["0".to_string(); 22];
+        stat[0] = "S".to_string();
+        stat[1] = "1".to_string();
+        stat[17] = "2".to_string();
+        stat[19] = birth.to_string();
+        std::fs::write(
+            task.join("stat"),
+            format!("{tid} (worker) {}\n", stat.join(" ")),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("/data/pending", task.join("fd/3")).unwrap();
+        std::fs::write(
+            task.join("fdinfo/3"),
+            "pos:\t0\nflags:\t0100001\nmnt_id:\t7\nino:\t42\n",
+        )
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn writable_fd_snapshot_covers_every_task_without_assuming_shared_tables() {
+        let process = tempfile::tempdir().unwrap().keep();
+        write_fd_fixture_task(&process, 42, 100);
+        write_fd_fixture_task(&process, 43, 101);
+        let snapshot =
+            write_fd_snapshot_from(&process, 42, Instant::now() + Duration::from_secs(5), 2, 2)
+                .unwrap();
+        assert_eq!(snapshot.tasks.len(), 2);
+        assert_eq!(snapshot.descriptors.len(), 2);
+        // Matching inode, flags and fd number cannot prove shared tables. Each
+        // task reference survives so a configured positive allowance is safe.
+        for tid in [42, 43] {
+            let path = process.join(format!("task/{tid}/fd/3"));
+            assert!(snapshot.descriptors[path.to_str().unwrap()].writable());
+        }
+        write_fd_fixture_task(&process, 44, 102);
+        let changed =
+            write_fd_snapshot_from(&process, 42, Instant::now() + Duration::from_secs(5), 3, 3)
+                .unwrap();
+        assert_ne!(
+            snapshot, changed,
+            "task creation must invalidate the snapshot"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn writable_fd_snapshot_refuses_partial_tasks_invalid_evidence_and_global_limits() {
+        for failure in [
+            "missing_leader",
+            "unreadable_task",
+            "unreadable_fdinfo",
+            "malformed_fdinfo",
+            "wrong_task_identity",
+            "oversized_stat",
+            "task_limit",
+            "descriptor_limit",
+            "deadline",
+        ] {
+            let process = tempfile::tempdir().unwrap().keep();
+            write_fd_fixture_task(&process, 42, 100);
+            write_fd_fixture_task(&process, 43, 101);
+            let mut pid = 42;
+            let mut max_tasks = 2;
+            let mut max_descriptors = 2;
+            let mut deadline = Instant::now() + Duration::from_secs(5);
+            match failure {
+                "missing_leader" => pid = 41,
+                "unreadable_task" => {
+                    std::fs::create_dir(process.join("task/44")).unwrap();
+                    max_tasks = 3;
+                }
+                "unreadable_fdinfo" => {
+                    std::os::unix::fs::symlink("/data/other", process.join("task/43/fd/4"))
+                        .unwrap();
+                    max_descriptors = 3;
+                }
+                "malformed_fdinfo" => {
+                    std::fs::write(process.join("task/43/fdinfo/3"), "flags:\t1\n").unwrap();
+                }
+                "wrong_task_identity" => {
+                    let leader = std::fs::read(process.join("task/42/stat")).unwrap();
+                    std::fs::write(process.join("task/43/stat"), leader).unwrap();
+                }
+                "oversized_stat" => {
+                    std::fs::write(process.join("task/43/stat"), "x".repeat(16 * 1024 + 1))
+                        .unwrap();
+                }
+                "task_limit" => max_tasks = 1,
+                "descriptor_limit" => max_descriptors = 1,
+                "deadline" => deadline = Instant::now(),
+                _ => unreachable!(),
+            }
+            assert!(
+                write_fd_snapshot_from(&process, pid, deadline, max_tasks, max_descriptors)
+                    .is_none(),
+                "{failure} must not produce complete descriptor evidence"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn writable_fd_metadata_uses_kernel_type_and_links_instead_of_path_prefixes() {
         for target in [
@@ -4296,6 +4517,220 @@ mod tests {
                 .unwrap();
             assert_eq!(ready, "ready\n");
             fixture
+        }
+
+        struct ThreadDescriptorChild {
+            fixture: DescriptorChild,
+            events: std::sync::mpsc::Receiver<std::io::Result<String>>,
+            tid: u32,
+            fd: u32,
+        }
+
+        fn thread_descriptor_child(
+            path: &std::path::Path,
+            mode: &str,
+        ) -> Option<ThreadDescriptorChild> {
+            use std::io::BufRead;
+            use std::process::{Command, Stdio};
+
+            const SCRIPT: &str = r#"
+import ctypes, os, queue, sys, threading
+libc = ctypes.CDLL(None, use_errno=True)
+libc.unshare.argtypes = [ctypes.c_int]
+libc.unshare.restype = ctypes.c_int
+path, mode = sys.argv[1:]
+ready = queue.Queue()
+release = threading.Event()
+shared = os.open(path, os.O_WRONLY) if mode == 'shared' else None
+def worker():
+    if libc.unshare(0x400) != 0:
+        ready.put(('unsupported', ctypes.get_errno()))
+        return
+    flags = os.O_RDONLY if mode == 'read_only' else os.O_RDWR if mode == 'fifo' else os.O_WRONLY
+    fd = shared if shared is not None else os.open(path, flags)
+    ready.put(('ready', threading.get_native_id(), fd))
+    try:
+        release.wait()
+    finally:
+        os.close(fd)
+threads = [threading.Thread(target=worker)]
+threads[0].start()
+event = ready.get(timeout=5)
+print(*event, flush=True)
+if event[0] == 'unsupported':
+    threads[0].join()
+    sys.exit(0)
+try:
+    for command in sys.stdin:
+        if command.strip() == 'new-thread':
+            extra = threading.Thread(target=release.wait)
+            extra.start()
+            threads.append(extra)
+            print('changed', flush=True)
+finally:
+    release.set()
+    for thread in threads:
+        thread.join()
+    if shared is not None:
+        os.close(shared)
+"#;
+            let mut fixture = DescriptorChild {
+                child: Command::new("python3")
+                    .args(["-u", "-c", SCRIPT])
+                    .arg(path)
+                    .arg(mode)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::inherit())
+                    .spawn()
+                    .expect("spawn owned thread descriptor fixture"),
+                reader: None,
+            };
+            let stdout = fixture.child.stdout.take().unwrap();
+            let (sender, events) = std::sync::mpsc::channel();
+            fixture.reader = Some(std::thread::spawn(move || {
+                for line in std::io::BufReader::new(stdout).lines() {
+                    if sender.send(line).is_err() {
+                        break;
+                    }
+                }
+            }));
+            let ready = events
+                .recv_timeout(Duration::from_secs(10))
+                .expect("bounded threaded fixture readiness")
+                .unwrap();
+            if let Some(errno) = ready.strip_prefix("unsupported ") {
+                let errno = errno.parse::<i32>().unwrap();
+                assert!(
+                    matches!(errno, libc::EPERM | libc::EACCES | libc::ENOSYS),
+                    "unexpected unshare(CLONE_FILES) failure: {errno}"
+                );
+                eprintln!(
+                    "SKIP owned thread descriptor case {mode}: unshare(CLONE_FILES) unavailable: {}",
+                    std::io::Error::from_raw_os_error(errno)
+                );
+                return None;
+            }
+            let fields: Vec<_> = ready.split_whitespace().collect();
+            assert_eq!(fields.len(), 3, "unexpected fixture message: {ready}");
+            assert_eq!(fields[0], "ready");
+            let tid = fields[1].parse().unwrap();
+            let fd = fields[2].parse().unwrap();
+            assert_ne!(tid, fixture.child.id());
+            Some(ThreadDescriptorChild {
+                fixture,
+                events,
+                tid,
+                fd,
+            })
+        }
+
+        #[test]
+        fn data_loss_checks_private_thread_writers_and_preserves_harmless_descriptors() {
+            let directory = tempfile::tempdir().unwrap().keep();
+            let provider = LivePreCheckProvider::new(
+                None,
+                LivePreCheckConfig {
+                    block_if_locked_files: false,
+                    block_if_deleted_cwd: false,
+                    block_if_recent_io_seconds: 0,
+                    ..LivePreCheckConfig::default()
+                },
+            )
+            .unwrap();
+            for mode in ["writer", "read_only", "fifo", "device", "shared"] {
+                let path = if mode == "device" {
+                    std::path::PathBuf::from("/dev/null")
+                } else {
+                    directory.join(mode)
+                };
+                if mode == "fifo" {
+                    let c_path =
+                        std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+                    // SAFETY: this is the owned, NUL-terminated fixture pathname.
+                    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+                } else if mode != "device" {
+                    std::fs::write(&path, b"valuable data").unwrap();
+                }
+                let Some(mut child) = thread_descriptor_child(&path, mode) else {
+                    return;
+                };
+                let pid = child.fixture.child.id();
+                assert_eq!(
+                    std::fs::read_link(format!("/proc/{pid}/task/{}/fd/{}", child.tid, child.fd))
+                        .unwrap(),
+                    path
+                );
+                if matches!(mode, "writer" | "read_only" | "fifo") {
+                    assert!(std::fs::read_dir(format!("/proc/{pid}/fd"))
+                        .unwrap()
+                        .all(|entry| std::fs::read_link(entry.unwrap().path()).unwrap() != path));
+                }
+                let expected = match mode {
+                    "writer" => 1,
+                    "shared" => 2,
+                    _ => 0,
+                };
+                assert_eq!(open_write_fd_count(pid), Some(expected), "mode={mode}");
+                let result = provider.check_data_loss(pid);
+                if expected > 0 {
+                    assert!(matches!(result, PreCheckResult::Blocked { check, reason }
+                        if check == PreCheck::CheckDataLossGate && reason.contains("open write fds")));
+                } else {
+                    assert!(result.is_passed(), "mode={mode}: {result:?}");
+                }
+                assert!(child.fixture.child.try_wait().unwrap().is_none());
+            }
+        }
+
+        #[test]
+        fn data_loss_refuses_task_creation_during_descriptor_metadata_probe() {
+            use crate::collect::tool_runner::ToolSpec;
+            use std::io::Write;
+
+            let directory = tempfile::tempdir().unwrap().keep();
+            let path = directory.join("read-only-data");
+            std::fs::write(&path, b"valuable data").unwrap();
+            let Some(mut child) = thread_descriptor_child(&path, "read_only") else {
+                return;
+            };
+            let pid = child.fixture.child.id();
+            assert_eq!(open_write_fd_count(pid), Some(0));
+            let invoked = std::cell::Cell::new(false);
+            let count = open_write_fd_count_with_probe(pid, |paths, remaining| {
+                invoked.set(true);
+                let mut args = vec![
+                    "-L".to_string(),
+                    "-c".to_string(),
+                    "%n %f %h %i".to_string(),
+                    "--".to_string(),
+                ];
+                args.extend_from_slice(paths);
+                let output = write_fd_probe_runner(remaining)
+                    .run(&ToolSpec::new("stat", args))
+                    .unwrap();
+                assert!(output.success(), "{output:?}");
+                writeln!(child.fixture.child.stdin.as_mut().unwrap(), "new-thread").unwrap();
+                assert_eq!(
+                    child
+                        .events
+                        .recv_timeout(Duration::from_secs(10))
+                        .unwrap()
+                        .unwrap(),
+                    "changed"
+                );
+                Some(output)
+            });
+            assert!(invoked.get());
+            assert_eq!(
+                count, None,
+                "a new task invalidates the complete-process observation"
+            );
+            let stable =
+                write_fd_snapshot(pid, Instant::now() + WRITE_FD_INSPECTION_TIMEOUT).unwrap();
+            assert_eq!(stable.tasks.len(), 3);
+            assert_eq!(open_write_fd_count(pid), Some(0));
+            assert!(child.fixture.child.try_wait().unwrap().is_none());
         }
 
         #[test]
