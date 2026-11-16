@@ -323,7 +323,8 @@ pub(crate) fn collect_fd_ipc_resources_with_runner(
                             .push("fd_ipc_descriptor_changed".to_string());
                         continue;
                     }
-                    if let Some(resource) = identity.resource(pid, &target.to_string_lossy(), &now) {
+                    if let Some(resource) = identity.resource(pid, &target.to_string_lossy(), &now)
+                    {
                         result.resources.push(resource);
                     }
                 }
@@ -344,8 +345,12 @@ pub(crate) fn collect_fd_ipc_resources_with_runner(
     }
     result.unavailable.sort();
     result.unavailable.dedup();
-    result.resources.sort_by(|left, right| left.key.cmp(&right.key));
-    result.resources.dedup_by(|left, right| left.key == right.key);
+    result
+        .resources
+        .sort_by(|left, right| left.key.cmp(&right.key));
+    result
+        .resources
+        .dedup_by(|left, right| left.key == right.key);
     result
 }
 
@@ -451,8 +456,10 @@ mod tests {
                     "path equality is not object identity"
                 );
             }
-            assert!(matches!(first.details, ResourceDetails::Generic { description }
-                if description.ends_with(path)));
+            assert!(
+                matches!(first.details, ResourceDetails::Generic { description }
+                if description.ends_with(path))
+            );
         }
     }
 
@@ -861,7 +868,13 @@ mod tests {
             unknown.unavailable
         );
         assert!(holder.0.as_mut().unwrap().try_wait().unwrap().is_none());
-        assert!(alias_holder.0.as_mut().unwrap().try_wait().unwrap().is_none());
+        assert!(alias_holder
+            .0
+            .as_mut()
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .is_none());
     }
 
     #[cfg(target_os = "linux")]

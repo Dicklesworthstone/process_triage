@@ -60,6 +60,12 @@ pub struct Prober {
     /// Test hook: make the next batch's submit fail.
     #[cfg(test)]
     fail_next_submit: bool,
+    /// Test hook: post an old-generation completion after the batch is submitted.
+    #[cfg(test)]
+    inject_stale_completion: bool,
+    /// Test evidence: the injected entry was consumed without a submit error.
+    #[cfg(test)]
+    stale_completion_injected: bool,
 }
 
 struct ProbeState {
@@ -87,6 +93,10 @@ impl Prober {
             poisoned: false,
             #[cfg(test)]
             fail_next_submit: false,
+            #[cfg(test)]
+            inject_stale_completion: false,
+            #[cfg(test)]
+            stale_completion_injected: false,
         })
     }
 
@@ -203,10 +213,10 @@ impl Prober {
                 submitted_count += 1;
             }
 
-            // Completes after `submitted_count` completions (normal case) or when
-            // the probe timeout expires (-ETIME), whichever comes first.
+            // Completion counts are ring-wide, not scoped to this generation.
+            // Late reads or cancellation CQEs must not retire this batch's deadline.
             let timeout_e = opcode::Timeout::new(&ts)
-                .count(submitted_count as u32)
+                .count(0)
                 .build()
                 .user_data(tag(TAG_TIMEOUT));
             // SAFETY: `ts` outlives the submit below.
@@ -236,6 +246,21 @@ impl Prober {
             self.replace_ring();
             submitted_count = 0;
             submitted.iter_mut().for_each(|s| *s = false);
+        }
+
+        #[cfg(test)]
+        if submitted_count > 0 && std::mem::take(&mut self.inject_stale_completion) {
+            let stale_tag = (u64::from(self.generation.wrapping_sub(1)) << 32) | TAG_CANCEL;
+            let stale = opcode::Nop::new().build().user_data(stale_tag);
+            let queued = {
+                let mut sq = self.ring.submission();
+                // SAFETY: Nop references no user memory.
+                unsafe { sq.push(&stale) }.is_ok()
+            };
+            // Do not panic while read buffers may still be kernel-owned. The
+            // test checks this evidence after the normal completion/timeout path.
+            self.stale_completion_injected =
+                queued && self.ring.submit().is_ok() && self.ring.submission().is_empty();
         }
 
         let mut completed_count = 0usize;
@@ -323,9 +348,26 @@ impl Prober {
                 }
             }
         }
+
+        // Successful reads no longer retire the count-free deadline. Request
+        // removal so fast successive batches do not retain long-lived timers.
+        if completed_count == submitted_count && !timeout_reaped {
+            let remove = opcode::TimeoutRemove::new(tag(TAG_TIMEOUT))
+                .build()
+                .user_data(tag(TAG_CANCEL));
+            let queued = {
+                let mut sq = self.ring.submission();
+                // SAFETY: TimeoutRemove references only a numeric user_data tag.
+                unsafe { sq.push(&remove) }.is_ok()
+            };
+            if queued {
+                // Best effort: no wait, and failure leaves the original deadline
+                // to expire naturally. Late removal CQEs are generation-filtered.
+                let _ = self.ring.submit();
+            }
+        }
         // An unreaped timeout entry is harmless: it references `ts` only at submit
         // time and its late CQE is filtered by generation.
-        let _ = timeout_reaped;
 
         // Finalize results
         for (idx, state) in states.into_iter().enumerate() {
@@ -451,6 +493,113 @@ mod tests {
             assert!(res.error.is_none());
             assert!(!res.data.is_empty());
         }
+    }
+
+    /// A ring-wide completion count can be satisfied by a stale generation while
+    /// the current read still waits. The fallback writer bounds the regression:
+    /// a lost deadline returns its data and fails instead of hanging the test.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn stale_completion_cannot_retire_current_batch_deadline() {
+        use std::io::Write;
+        use std::os::fd::{FromRawFd, OwnedFd};
+
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: fds is a valid 2-element array receiving fresh descriptors.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: each successful pipe descriptor is transferred to one owner.
+        let (read_end, write_end) =
+            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        let stalled = PathBuf::from(format!("/proc/self/fd/{}", read_end.as_raw_fd()));
+        let mut prober = Prober::new(ProberConfig {
+            ring_entries: 8,
+            probe_timeout: Duration::from_millis(100),
+            ..ProberConfig::default()
+        })
+        .unwrap();
+        prober.inject_stale_completion = true;
+        let fallback_writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(1));
+            let mut writer = File::from(write_end);
+            writer.write_all(b"fallback-after-deadline").unwrap();
+        });
+
+        let results = prober.probe_batch(&[stalled]);
+        fallback_writer.join().unwrap();
+        assert!(
+            prober.stale_completion_injected,
+            "failed to inject a stale completion after the initial submit"
+        );
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].timed_out,
+            "a stale completion retired the current deadline: {:?}",
+            results[0]
+        );
+        assert!(results[0].error.is_none());
+        assert!(results[0].data.is_empty());
+
+        prober.config.probe_timeout = Duration::from_secs(5);
+        let later = prober.probe_batch(&[PathBuf::from("/proc/self/stat")]);
+        assert_eq!(later.len(), 1);
+        assert!(!later[0].timed_out && later[0].error.is_none());
+        assert!(!later[0].data.is_empty());
+    }
+
+    /// A completed fast batch should not keep a long-lived count-free timeout.
+    /// Observe the real removal and cancellation CQEs without a blocking wait.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn fast_batch_removes_its_pending_deadline_when_supported() {
+        let mut prober = Prober::new(ProberConfig {
+            probe_timeout: Duration::from_secs(60),
+            ..ProberConfig::default()
+        })
+        .unwrap();
+        let mut capabilities = io_uring::Probe::new();
+        if let Err(error) = prober.ring.submitter().register_probe(&mut capabilities) {
+            if error.raw_os_error() == Some(libc::EINVAL) {
+                eprintln!("kernel lacks io_uring opcode probing; optional cleanup test skipped");
+                return;
+            }
+            panic!("cannot probe timeout-removal support: {error}");
+        }
+        if !capabilities.is_supported(opcode::TimeoutRemove::CODE) {
+            eprintln!("kernel lacks TimeoutRemove; optional cleanup test skipped");
+            return;
+        }
+
+        let results = prober.probe_batch(&[PathBuf::from("/proc/self/stat")]);
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].timed_out && results[0].error.is_none());
+        assert!(!results[0].data.is_empty());
+
+        let generation_bits = u64::from(prober.generation) << 32;
+        let timeout_tag = generation_bits | TAG_TIMEOUT;
+        let removal_tag = generation_bits | TAG_CANCEL;
+        let started = std::time::Instant::now();
+        let mut removed = false;
+        let mut cancelled = false;
+        while !(removed && cancelled) && started.elapsed() < Duration::from_secs(2) {
+            prober.ring.submit().unwrap();
+            for cqe in prober.ring.completion() {
+                if cqe.user_data() == removal_tag {
+                    assert_eq!(cqe.result(), 0, "deadline removal failed");
+                    removed = true;
+                } else if cqe.user_data() == timeout_tag {
+                    assert_eq!(cqe.result(), -libc::ECANCELED);
+                    cancelled = true;
+                }
+            }
+            if !(removed && cancelled) {
+                std::thread::yield_now();
+            }
+        }
+        assert!(
+            removed,
+            "completed batch did not remove its pending deadline"
+        );
+        assert!(cancelled, "removed deadline did not report cancellation");
     }
 
     /// After a failed submit no entry of that batch may stay queued (it would reach

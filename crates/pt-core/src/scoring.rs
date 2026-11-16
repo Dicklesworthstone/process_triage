@@ -3967,10 +3967,7 @@ mod provenance_tests {
     #[test]
     fn failed_resource_probes_do_not_establish_low_blast_radius() {
         let mut bundle = ProvenanceInferenceBundle {
-            lineages: HashMap::from([
-                (200, lineage(200, 2, None)),
-                (300, lineage(300, 2, None)),
-            ]),
+            lineages: HashMap::from([(200, lineage(200, 2, None)), (300, lineage(300, 2, None))]),
             ..Default::default()
         };
         let complete = derive_provenance_adjustment(200, &bundle);
@@ -3979,7 +3976,10 @@ mod provenance_tests {
         bundle.resource_unavailable.insert(300, Vec::new());
         let empty_peer = derive_provenance_adjustment(200, &bundle);
         assert!(feature_names(&empty_peer).contains(&"provenance_blast_radius_low"));
-        assert_eq!(empty_peer.evidence_completeness, complete.evidence_completeness);
+        assert_eq!(
+            empty_peer.evidence_completeness,
+            complete.evidence_completeness
+        );
         assert_eq!(
             empty_peer.confidence_penalty_steps,
             complete.confidence_penalty_steps

@@ -1280,12 +1280,8 @@ mod tests {
         }
 
         assert_eq!(
-            ensure_cgroup_target_with(
-                || Ok(()),
-                || Ok("/owned/leaf".to_string()),
-                |_| Ok(()),
-            )
-            .unwrap(),
+            ensure_cgroup_target_with(|| Ok(()), || Ok("/owned/leaf".to_string()), |_| Ok(()),)
+                .unwrap(),
             "/owned/leaf"
         );
     }
@@ -1304,10 +1300,7 @@ mod tests {
                 Ok(())
             },
         );
-        assert!(matches!(
-            refused_before,
-            Err(ActionError::PermissionDenied)
-        ));
+        assert!(matches!(refused_before, Err(ActionError::PermissionDenied)));
         assert!(!inspected.get());
 
         let refused_after = ensure_cgroup_target_with(
@@ -1324,10 +1317,7 @@ mod tests {
                 Ok(())
             },
         );
-        assert!(matches!(
-            refused_after,
-            Err(ActionError::PermissionDenied)
-        ));
+        assert!(matches!(refused_after, Err(ActionError::PermissionDenied)));
         assert!(inspected.get());
     }
 
