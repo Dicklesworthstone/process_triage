@@ -313,9 +313,25 @@
         "risky_max": { "type": "number", "minimum": 0 }
       }
     },
+    "pressure_loss": {
+      "type": "object",
+      "description": "Additive pressure cost and explicit heuristic relief fractions",
+      "additionalProperties": false,
+      "properties": {
+        "kappa": { "type": "number", "minimum": 0, "default": 1 },
+        "renice_cpu_relief": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.5 },
+        "pause_cpu_relief": { "type": "number", "minimum": 0, "maximum": 1, "default": 1 },
+        "pause_io_relief": {
+          "type": "number", "minimum": 0, "maximum": 1, "default": 0,
+          "description": "Opt-in reduction in new I/O submissions while paused or frozen; pending I/O and writeback may continue"
+        },
+        "throttle_cpu_relief": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.5 },
+        "cap_memory_relief": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.1 }
+      }
+    },
     "load_aware": {
       "type": "object",
-      "description": "Load-aware decision tuning for adaptive thresholds",
+      "description": "Additive pressure costs; legacy threshold fields remain parseable",
       "additionalProperties": false,
       "required": ["enabled"],
       "properties": {
@@ -325,7 +341,8 @@
         "memory_used_fraction_high": { "type": "number", "minimum": 0, "maximum": 1 },
         "psi_avg10_high": { "type": "number", "minimum": 0 },
         "weights": { "$ref": "#/$defs/load_weights" },
-        "multipliers": { "$ref": "#/$defs/load_multipliers" }
+        "multipliers": { "$ref": "#/$defs/load_multipliers" },
+        "pressure": { "$ref": "#/$defs/pressure_loss" }
       }
     }
   }

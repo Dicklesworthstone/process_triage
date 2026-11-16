@@ -12,8 +12,10 @@ use serde::{Deserialize, Serialize};
 /// Shares attributed to the exact process incarnation being considered.
 ///
 /// CPU is windowed CPU cores consumed / observed online CPUs. Memory is RSS /
-/// system RAM (not unique reclaimable memory). I/O requires a comparable,
-/// same-window denominator. Missing evidence remains `None`, never observed zero.
+/// system RAM (not unique reclaimable memory). I/O is the process's measured
+/// storage-byte rate divided by the complete sampled process cohort's rate;
+/// it is not a fraction of device utilization or a causal share of I/O stalls.
+/// Missing evidence remains `None`, never observed zero.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct ResourceShares {
     pub cpu: Option<f64>,
@@ -235,6 +237,8 @@ pub fn prepare_pressure_decision(
             "Relief fractions are policy heuristics, not measured recovery guarantees.",
             "CPU credit covers only the observed process, never its parent, agent, or cgroup peers.",
             "RSS can contain shared pages; it is not a unique reclaimable-memory estimate.",
+            "I/O shares cover the complete observed process cohort, not kernel I/O, transient tasks, device utilization, or a causal share of host stalls.",
+            "Pause/freeze I/O relief is opt-in and models fewer new submissions only; pending I/O and writeback can continue.",
             "Only an observed owned-leaf memory.high cap receives reversible memory-pressure credit; this is a reclaim heuristic, not promised freed bytes. Pending I/O can outlive a stop.",
         ],
     };
@@ -270,6 +274,10 @@ fn pressure_cost(
         _ => 0.0,
     };
     let other_relief = if action == Action::Kill { 1.0 } else { 0.0 };
+    let io_relief = match action {
+        Action::Pause | Action::Freeze => model.pause_io_relief,
+        _ => other_relief,
+    };
     let memory_relief = if action == Action::CapMemory {
         model.cap_memory_relief
     } else {
@@ -286,7 +294,7 @@ fn pressure_cost(
             * model.kappa,
         io: context.severity.io
             * context.shares.io.unwrap_or(0.0)
-            * (1.0 - other_relief)
+            * (1.0 - io_relief)
             * model.kappa,
     }
 }
@@ -629,6 +637,83 @@ mod tests {
             .unavailable
             .iter()
             .any(|r| r.contains("cpu severity unavailable")));
+    }
+
+    #[test]
+    fn io_relief_requires_explicit_pause_credit_and_never_enables_termination() {
+        let posterior = ClassScores {
+            useful: 0.0,
+            useful_bad: 1.0,
+            abandoned: 0.0,
+            zombie: 0.0,
+        };
+        let context = PressureContext {
+            severity: ResourceSeverity {
+                io: 1.0,
+                ..Default::default()
+            },
+            shares: ResourceShares {
+                io: Some(0.8),
+                ..Default::default()
+            },
+            unavailable: Vec::new(),
+        };
+        let mut policy = pressure_policy();
+        let feasibility = ActionFeasibility::allow_all();
+        let conservative =
+            prepare_pressure_decision(&posterior, &policy, &feasibility, &context).unwrap();
+        assert_eq!(conservative.decision.optimal_action, Action::Keep);
+        assert_eq!(conservative.report.modeled_pressure_relief, 0.0);
+
+        policy.load_aware.pressure.pause_io_relief = 0.5;
+        let configured =
+            prepare_pressure_decision(&posterior, &policy, &feasibility, &context).unwrap();
+        assert_eq!(configured.report.evidence_only_action, Action::Keep);
+        assert!(matches!(
+            configured.decision.optimal_action,
+            Action::Pause | Action::Freeze
+        ));
+        assert!((configured.report.modeled_pressure_relief - 0.4).abs() < 1e-12);
+        assert!(!configured.feasibility.is_allowed(Action::Kill));
+        assert!(!configured.feasibility.is_allowed(Action::Restart));
+        for row in &configured.report.actions {
+            if matches!(row.action, Action::Pause | Action::Freeze) {
+                assert!((row.pressure_by_resource.io - 0.4).abs() < 1e-12);
+            } else if row.action.is_reversible() {
+                assert!((row.pressure_by_resource.io - 0.8).abs() < 1e-12);
+            }
+        }
+
+        let refused = ActionFeasibility {
+            disabled: vec![
+                DisabledAction {
+                    action: Action::Pause,
+                    reason: "pause is unsafe".into(),
+                },
+                DisabledAction {
+                    action: Action::Freeze,
+                    reason: "freeze is unsafe".into(),
+                },
+            ],
+        };
+        let blocked = prepare_pressure_decision(&posterior, &policy, &refused, &context).unwrap();
+        assert_eq!(blocked.decision.optimal_action, Action::Keep);
+        assert_eq!(blocked.report.modeled_pressure_relief, 0.0);
+
+        for share in [None, Some(0.0), Some(f64::NAN)] {
+            let mut unknown = context.clone();
+            unknown.shares.io = share;
+            let result =
+                prepare_pressure_decision(&posterior, &policy, &feasibility, &unknown).unwrap();
+            assert_eq!(result.decision.optimal_action, Action::Keep);
+            assert!(!result.report.applied);
+        }
+        let mut healthy = context;
+        healthy.severity.io = 0.0;
+        let result =
+            prepare_pressure_decision(&posterior, &policy, &feasibility, &healthy).unwrap();
+        assert_eq!(result.decision.optimal_action, Action::Keep);
+        assert!(!result.report.applied);
     }
 
     #[test]

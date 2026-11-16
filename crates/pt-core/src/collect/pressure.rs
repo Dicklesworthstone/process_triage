@@ -20,9 +20,12 @@
 //! averages, VM counters, RAM/swap sizes and the kernel's qualitative memory
 //! pressure level. Linux-only PSI and MemAvailable remain unavailable there.
 
+use super::types::{ProcessActivity, ProcessRecord};
+use pt_common::StartId;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 /// Aggregate CPU accounting from `/proc/stat`, with the observed online CPU IDs.
@@ -196,6 +199,361 @@ pub fn host_cpu_window(
         logical_cpus,
         window_seconds: elapsed.as_secs_f64(),
     })
+}
+
+const PROCESS_IO_SOURCE: &str = "procfs_window";
+const PROCESS_IO_SCOPE: &str = "observed_census_process_io";
+const PROCESS_IO_LIMITATIONS: [&str; 4] = [
+    "Shares compare accounted I/O rates within the observed process cohort, not host device capacity or responsibility for PSI stalls.",
+    "Each process uses its own measured interval; enumeration staggers interval endpoints and transient processes outside the census are not represented.",
+    "Kernel I/O outside process accounting is excluded, and process accounting can include waited-for children.",
+    "Write bytes are accounted when pages are dirtied; pending or cancelled writes need not become completed device writes.",
+];
+
+/// I/O accounting for every process in one complete observed census.
+///
+/// The denominator is the sum of each process's `read_bytes` and `write_bytes`
+/// deltas divided by that process's actual monotonic sampling duration. It is
+/// deliberately **not** disk throughput, device utilization, or a causal share
+/// of host I/O stalls. In particular, unequal per-process durations must not be
+/// turned into a share by dividing raw byte sums.
+///
+/// Every census member, including protected and unselected processes, must have
+/// a complete identity-bound sample. A failed read or incomplete census makes
+/// the entire denominator unavailable. New and short-lived processes outside
+/// the census remain a limitation even when every observed member is readable.
+///
+/// Fields are immutable outside this module so validation can be cached once,
+/// including after deserialization, without rescanning the census for every
+/// candidate. Serialized summaries retain the member measurements for audit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessIoWindow {
+    source: String,
+    scope: String,
+    census_complete: bool,
+    requested_window_ms: u64,
+    sampled_processes: usize,
+    read_bytes: u64,
+    write_bytes: u64,
+    read_bytes_per_second: f64,
+    write_bytes_per_second: f64,
+    min_window_seconds: f64,
+    max_window_seconds: f64,
+    limitations: Vec<String>,
+    members: BTreeMap<u32, ProcessIoMember>,
+    #[serde(skip)]
+    validation: OnceLock<Result<(), String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct ProcessIoMember {
+    start_id: StartId,
+    uid: u32,
+    read_bytes: u64,
+    write_bytes: u64,
+    window_seconds: f64,
+}
+
+#[derive(Debug)]
+struct ProcessIoTotals {
+    read_bytes: u64,
+    write_bytes: u64,
+    read_bytes_per_second: f64,
+    write_bytes_per_second: f64,
+    min_window_seconds: f64,
+    max_window_seconds: f64,
+}
+
+fn process_io_boot_id(pid: u32, start_id: &StartId) -> Result<&str, String> {
+    let mut parts = start_id.0.split(':');
+    let boot_id = parts.next().unwrap_or_default();
+    let start_ticks = parts.next().unwrap_or_default();
+    let identity_pid = parts.next().unwrap_or_default();
+    if pid == 0
+        || boot_id.is_empty()
+        || matches!(boot_id, "unknown" | "synthetic")
+        || start_ticks.is_empty()
+        || !start_ticks.bytes().all(|byte| byte.is_ascii_digit())
+        || start_ticks.parse::<u64>().is_err()
+        || identity_pid.parse::<u32>().ok() != Some(pid)
+        || parts.next().is_some()
+    {
+        return Err(format!(
+            "PID {pid}: complete Linux process identity is unavailable"
+        ));
+    }
+    // A process born in the first boot tick may legitimately have start tick 0.
+    Ok(boot_id)
+}
+
+fn same_io_rate(observed: f64, expected: f64) -> bool {
+    observed.is_finite()
+        && observed >= 0.0
+        && expected.is_finite()
+        && expected >= 0.0
+        && (observed == expected
+            || (observed - expected).abs() <= expected.abs() * (16.0 * f64::EPSILON))
+}
+
+impl ProcessIoMember {
+    fn from_activity(activity: &ProcessActivity, requested_window_ms: u64) -> Result<Self, String> {
+        let pid = activity.pid;
+        if activity.source != PROCESS_IO_SOURCE {
+            return Err(format!(
+                "PID {pid}: I/O source is not a measured procfs window"
+            ));
+        }
+        if let Some(error) = &activity.io_error {
+            return Err(format!("PID {pid}: I/O sample unavailable: {error}"));
+        }
+        if requested_window_ms == 0 || activity.requested_window_ms != requested_window_ms {
+            return Err(format!(
+                "PID {pid}: I/O samples have different or zero requested intervals"
+            ));
+        }
+        let member = Self {
+            start_id: activity.start_id.clone(),
+            uid: activity.uid,
+            read_bytes: activity
+                .io_read_bytes
+                .ok_or_else(|| format!("PID {pid}: measured I/O read byte delta is unavailable"))?,
+            write_bytes: activity.io_write_bytes.ok_or_else(|| {
+                format!("PID {pid}: measured I/O write byte delta is unavailable")
+            })?,
+            window_seconds: activity
+                .io_window_seconds
+                .ok_or_else(|| format!("PID {pid}: measured I/O interval is unavailable"))?,
+        };
+        member.validate(pid, requested_window_ms)?;
+        let read_rate = activity
+            .read_bytes_per_second
+            .ok_or_else(|| format!("PID {pid}: measured I/O read rate is unavailable"))?;
+        let write_rate = activity
+            .write_bytes_per_second
+            .ok_or_else(|| format!("PID {pid}: measured I/O write rate is unavailable"))?;
+        if !same_io_rate(read_rate, member.read_rate())
+            || !same_io_rate(write_rate, member.write_rate())
+            || activity.io_active != Some(member.read_bytes > 0 || member.write_bytes > 0)
+        {
+            return Err(format!(
+                "PID {pid}: I/O rates or activity do not match the measured byte deltas"
+            ));
+        }
+        Ok(member)
+    }
+
+    fn validate(&self, pid: u32, requested_window_ms: u64) -> Result<(), String> {
+        process_io_boot_id(pid, &self.start_id)?;
+        if requested_window_ms == 0
+            || !self.window_seconds.is_finite()
+            || self.window_seconds <= 0.0
+            || self.window_seconds < Duration::from_millis(requested_window_ms).as_secs_f64()
+        {
+            return Err(format!(
+                "PID {pid}: I/O interval is invalid or shorter than requested"
+            ));
+        }
+        if !self.read_rate().is_finite() || !self.write_rate().is_finite() {
+            return Err(format!("PID {pid}: measured I/O rate is not finite"));
+        }
+        Ok(())
+    }
+
+    fn read_rate(&self) -> f64 {
+        self.read_bytes as f64 / self.window_seconds
+    }
+
+    fn write_rate(&self) -> f64 {
+        self.write_bytes as f64 / self.window_seconds
+    }
+}
+
+fn process_io_totals(
+    members: &BTreeMap<u32, ProcessIoMember>,
+    requested_window_ms: u64,
+) -> Result<ProcessIoTotals, String> {
+    if members.is_empty() {
+        return Err("observed process I/O census is empty".to_string());
+    }
+    let mut totals = ProcessIoTotals {
+        read_bytes: 0,
+        write_bytes: 0,
+        read_bytes_per_second: 0.0,
+        write_bytes_per_second: 0.0,
+        min_window_seconds: f64::INFINITY,
+        max_window_seconds: 0.0,
+    };
+    let mut boot_id = None;
+    for (&pid, member) in members {
+        member.validate(pid, requested_window_ms)?;
+        let member_boot = process_io_boot_id(pid, &member.start_id)?;
+        if boot_id.is_some_and(|boot| boot != member_boot) {
+            return Err("observed process I/O samples have different boot identities".to_string());
+        }
+        boot_id = Some(member_boot);
+        totals.read_bytes = totals
+            .read_bytes
+            .checked_add(member.read_bytes)
+            .ok_or_else(|| "observed process I/O read byte sum exceeds u64".to_string())?;
+        totals.write_bytes = totals
+            .write_bytes
+            .checked_add(member.write_bytes)
+            .ok_or_else(|| "observed process I/O write byte sum exceeds u64".to_string())?;
+        totals.read_bytes_per_second += member.read_rate();
+        totals.write_bytes_per_second += member.write_rate();
+        totals.min_window_seconds = totals.min_window_seconds.min(member.window_seconds);
+        totals.max_window_seconds = totals.max_window_seconds.max(member.window_seconds);
+    }
+    if !(totals.read_bytes_per_second + totals.write_bytes_per_second).is_finite() {
+        return Err("observed process I/O rate sum is not finite".to_string());
+    }
+    Ok(totals)
+}
+
+impl ProcessIoWindow {
+    /// Source of every sample in this window.
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    /// Scope of the denominator; this is a process cohort, not host throughput.
+    pub fn scope(&self) -> &str {
+        &self.scope
+    }
+
+    /// Validate the full serialized accounting once before it can be used.
+    pub fn validate(&self) -> Result<(), String> {
+        self.validation
+            .get_or_init(|| self.validate_uncached())
+            .clone()
+    }
+
+    fn validate_uncached(&self) -> Result<(), String> {
+        if self.source != PROCESS_IO_SOURCE
+            || self.scope != PROCESS_IO_SCOPE
+            || !self.census_complete
+            || self.sampled_processes != self.members.len()
+            || self
+                .limitations
+                .iter()
+                .map(String::as_str)
+                .ne(PROCESS_IO_LIMITATIONS)
+        {
+            return Err(
+                "observed process I/O source, scope, or census coverage is invalid".to_string(),
+            );
+        }
+        let totals = process_io_totals(&self.members, self.requested_window_ms)?;
+        if self.read_bytes != totals.read_bytes
+            || self.write_bytes != totals.write_bytes
+            || !same_io_rate(self.read_bytes_per_second, totals.read_bytes_per_second)
+            || !same_io_rate(self.write_bytes_per_second, totals.write_bytes_per_second)
+            || self.min_window_seconds != totals.min_window_seconds
+            || self.max_window_seconds != totals.max_window_seconds
+        {
+            return Err(
+                "observed process I/O summary does not match its member measurements".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Share of measured accounted byte rates within the observed cohort.
+    ///
+    /// The sample must match the exact process incarnation, byte deltas and
+    /// measured interval used in the denominator. All-zero cohort activity is
+    /// unknown, not a denominator from which a zero contribution can be inferred.
+    pub fn share(&self, activity: &ProcessActivity) -> Option<f64> {
+        self.validate().ok()?;
+        let member = self.members.get(&activity.pid)?;
+        if *member != ProcessIoMember::from_activity(activity, self.requested_window_ms).ok()? {
+            return None;
+        }
+        let total_rate = self.read_bytes_per_second + self.write_bytes_per_second;
+        if total_rate <= 0.0 {
+            return None;
+        }
+        let share = (member.read_rate() + member.write_rate()) / total_rate;
+        (share.is_finite() && (0.0..=1.0).contains(&share)).then_some(share)
+    }
+}
+
+/// Aggregate a complete census's already collected, bounded process I/O samples.
+///
+/// This performs no additional reads or waits. Call it before candidate filters,
+/// supplying every census process and exactly one sample for each incarnation.
+/// Missing, failed, extra or duplicate samples make the denominator unavailable.
+pub fn process_io_window(
+    population: &[ProcessRecord],
+    samples: impl IntoIterator<Item = ProcessActivity>,
+    census_complete: bool,
+) -> Result<ProcessIoWindow, String> {
+    if !census_complete {
+        return Err(
+            "observed process I/O denominator requires a complete process census".to_string(),
+        );
+    }
+    if population.is_empty() {
+        return Err("observed process I/O census is empty".to_string());
+    }
+    let mut expected = BTreeMap::new();
+    for process in population {
+        if expected.insert(process.pid.0, process).is_some() {
+            return Err(format!(
+                "PID {}: duplicate process in I/O census",
+                process.pid.0
+            ));
+        }
+    }
+    let mut members = BTreeMap::new();
+    let mut requested_window_ms = None;
+    for activity in samples {
+        let pid = activity.pid;
+        let process = expected
+            .get(&pid)
+            .ok_or_else(|| format!("PID {pid}: I/O sample is outside the process census"))?;
+        if !activity.matches_record(process) {
+            return Err(format!(
+                "PID {pid}: I/O sample does not match the census process incarnation"
+            ));
+        }
+        let requested = *requested_window_ms.get_or_insert(activity.requested_window_ms);
+        let member = ProcessIoMember::from_activity(&activity, requested)?;
+        if members.insert(pid, member).is_some() {
+            return Err(format!("PID {pid}: duplicate I/O sample"));
+        }
+    }
+    if members.len() != expected.len() {
+        return Err(format!(
+            "observed process I/O samples are incomplete: {} of {} census processes",
+            members.len(),
+            expected.len()
+        ));
+    }
+    let requested_window_ms = requested_window_ms
+        .ok_or_else(|| "observed process I/O samples are unavailable".to_string())?;
+    let totals = process_io_totals(&members, requested_window_ms)?;
+    let window = ProcessIoWindow {
+        source: PROCESS_IO_SOURCE.to_string(),
+        scope: PROCESS_IO_SCOPE.to_string(),
+        census_complete,
+        requested_window_ms,
+        sampled_processes: members.len(),
+        read_bytes: totals.read_bytes,
+        write_bytes: totals.write_bytes,
+        read_bytes_per_second: totals.read_bytes_per_second,
+        write_bytes_per_second: totals.write_bytes_per_second,
+        min_window_seconds: totals.min_window_seconds,
+        max_window_seconds: totals.max_window_seconds,
+        limitations: PROCESS_IO_LIMITATIONS
+            .iter()
+            .map(|text| (*text).to_string())
+            .collect(),
+        members,
+        validation: OnceLock::new(),
+    };
+    window.validate()?;
+    Ok(window)
 }
 
 /// One PSI line (`some` or `full`): running averages in percent and the cumulative
@@ -911,6 +1269,285 @@ pub fn pressure_window_with_elapsed(
             .zip(after.vmstat.and_then(|v| v.oom_kill))
             .and_then(|(b, a)| a.checked_sub(b)),
     })
+}
+
+#[cfg(test)]
+mod process_io_tests {
+    use super::*;
+    use crate::collect::ProcessState;
+    use pt_common::ProcessId;
+
+    fn process(pid: u32) -> ProcessRecord {
+        ProcessRecord {
+            pid: ProcessId(pid),
+            ppid: ProcessId(1),
+            uid: 1000,
+            user: "fixture".to_string(),
+            pgid: Some(pid),
+            sid: Some(pid),
+            start_id: StartId::from_linux("test-boot", u64::from(pid), pid),
+            comm: "worker".to_string(),
+            cmd: "worker".to_string(),
+            state: ProcessState::Sleeping,
+            cpu_percent: 0.0,
+            rss_bytes: 0,
+            vsz_bytes: 0,
+            tty: None,
+            start_time_unix: 0,
+            elapsed: Duration::from_secs(3600),
+            source: "test".to_string(),
+            container_info: None,
+        }
+    }
+
+    fn activity(process: &ProcessRecord, read: u64, written: u64, seconds: f64) -> ProcessActivity {
+        let mut activity =
+            ProcessActivity::unavailable(process, Duration::from_millis(500), "CPU unavailable");
+        activity.source = PROCESS_IO_SOURCE.to_string();
+        activity.io_error = None;
+        activity.io_read_bytes = Some(read);
+        activity.io_write_bytes = Some(written);
+        activity.io_window_seconds = Some(seconds);
+        activity.read_bytes_per_second = Some(read as f64 / seconds);
+        activity.write_bytes_per_second = Some(written as f64 / seconds);
+        activity.io_active = Some(read > 0 || written > 0);
+        activity
+    }
+
+    #[test]
+    fn observed_io_shares_normalize_each_actual_interval_before_summing() {
+        let population = [process(10), process(20)];
+        let a = activity(&population[0], 100, 100, 0.5);
+        let b = activity(&population[1], 400, 400, 2.0);
+        let window = process_io_window(&population, [a.clone(), b.clone()], true).unwrap();
+        assert_eq!(window.read_bytes, 500);
+        assert_eq!(window.write_bytes, 500);
+        assert_eq!(window.read_bytes_per_second, 400.0);
+        assert_eq!(window.write_bytes_per_second, 400.0);
+        assert_eq!(window.min_window_seconds, 0.5);
+        assert_eq!(window.max_window_seconds, 2.0);
+        assert_eq!(window.share(&a), Some(0.5));
+        assert_eq!(window.share(&b), Some(0.5));
+        assert_eq!(window.source(), "procfs_window");
+        assert_eq!(window.scope(), "observed_census_process_io");
+        let reordered = process_io_window(&population, [b.clone(), a.clone()], true).unwrap();
+        assert_eq!(window.share(&a), reordered.share(&a));
+        assert_eq!(window.share(&b), reordered.share(&b));
+        assert!(window
+            .limitations
+            .iter()
+            .any(|text| text.contains("waited-for children")));
+        assert!(window
+            .limitations
+            .iter()
+            .any(|text| text.contains("not host device capacity")));
+    }
+
+    #[test]
+    fn observed_io_denominator_retains_young_and_protected_processes() {
+        let candidate = process(10);
+        let mut protected = process(1);
+        protected.uid = 0;
+        protected.elapsed = Duration::from_secs(1);
+        let a = activity(&candidate, 100, 0, 0.5);
+        let b = activity(&protected, 900, 0, 0.5);
+        let window = process_io_window(&[candidate, protected], [a.clone(), b], true).unwrap();
+        assert_eq!(window.sampled_processes, 2);
+        assert_eq!(window.share(&a), Some(0.1));
+    }
+
+    #[test]
+    fn observed_io_refuses_partial_missing_extra_and_duplicate_censuses() {
+        let population = [process(10), process(20)];
+        let a = activity(&population[0], 100, 0, 0.5);
+        let b = activity(&population[1], 900, 0, 0.5);
+        assert!(process_io_window(&population, [a.clone(), b.clone()], false).is_err());
+        assert!(process_io_window(&[], [], true).is_err());
+        assert!(process_io_window(&population, [], true).is_err());
+        assert!(process_io_window(&population, [a.clone()], true).is_err());
+        assert!(process_io_window(&population[..1], [a.clone(), b.clone()], true).is_err());
+        assert!(process_io_window(&population, [a.clone(), a.clone()], true).is_err());
+        assert!(process_io_window(
+            &[population[0].clone(), population[0].clone()],
+            [a.clone(), a.clone()],
+            true
+        )
+        .is_err());
+        let mut different_request = b;
+        different_request.requested_window_ms = 250;
+        assert!(process_io_window(&population, [a, different_request], true).is_err());
+    }
+
+    #[test]
+    fn observed_io_refuses_incomplete_invalid_and_inconsistent_measurements() {
+        let process = process(10);
+        let valid = activity(&process, 100, 50, 0.5);
+        let invalidators: &[fn(&mut ProcessActivity)] = &[
+            |a| a.pid += 1,
+            |a| a.uid += 1,
+            |a| a.start_id = StartId::from_linux("test-boot", 99, a.pid),
+            |a| a.source = "ps_lifetime_fallback".to_string(),
+            |a| a.io_error = Some("permission denied".to_string()),
+            |a| a.requested_window_ms = 0,
+            |a| a.io_window_seconds = None,
+            |a| a.io_read_bytes = None,
+            |a| a.io_write_bytes = None,
+            |a| a.read_bytes_per_second = None,
+            |a| a.write_bytes_per_second = None,
+            |a| a.read_bytes_per_second = Some(0.0),
+            |a| a.write_bytes_per_second = Some(1.0),
+            |a| a.io_active = None,
+            |a| a.io_active = Some(false),
+        ];
+        for invalidate in invalidators {
+            let mut invalid = valid.clone();
+            invalidate(&mut invalid);
+            assert!(
+                process_io_window(std::slice::from_ref(&process), [invalid.clone()], true).is_err(),
+                "{invalid:?}"
+            );
+        }
+        for value in [0.0, 0.499, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut invalid = valid.clone();
+            invalid.io_window_seconds = Some(value);
+            assert!(process_io_window(std::slice::from_ref(&process), [invalid], true).is_err());
+        }
+        for value in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for read in [true, false] {
+                let mut invalid = valid.clone();
+                if read {
+                    invalid.read_bytes_per_second = Some(value);
+                } else {
+                    invalid.write_bytes_per_second = Some(value);
+                }
+                assert!(
+                    process_io_window(std::slice::from_ref(&process), [invalid], true).is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn observed_io_requires_full_identity_and_one_boot() {
+        for start_id in [
+            "unknown:10:10",
+            "synthetic:10:10",
+            ":10:10",
+            "test-boot:x:10",
+            "test-boot:10:11",
+            "test-boot:10:10:extra",
+        ] {
+            let mut process = process(10);
+            process.start_id = StartId(start_id.to_string());
+            let sample = activity(&process, 1, 0, 0.5);
+            assert!(
+                process_io_window(&[process], [sample], true).is_err(),
+                "{start_id}"
+            );
+        }
+        let a = process(10);
+        let mut b = process(20);
+        b.start_id = StartId::from_linux("different-boot", 20, 20);
+        let samples = [activity(&a, 1, 0, 0.5), activity(&b, 1, 0, 0.5)];
+        assert!(process_io_window(&[a, b], samples, true).is_err());
+        let mut boot_process = process(1);
+        boot_process.start_id = StartId::from_linux("test-boot", 0, 1);
+        let sample = activity(&boot_process, 1, 0, 0.5);
+        assert!(process_io_window(&[boot_process], [sample], true).is_ok());
+    }
+
+    #[test]
+    fn observed_io_share_requires_the_exact_denominator_sample() {
+        let process = process(10);
+        let sample = activity(&process, 100, 50, 0.5);
+        let window = process_io_window(&[process], [sample.clone()], true).unwrap();
+        assert_eq!(window.share(&sample), Some(1.0));
+        let invalidators: &[fn(&mut ProcessActivity)] = &[
+            |a| a.pid += 1,
+            |a| a.uid += 1,
+            |a| a.start_id = StartId::from_linux("test-boot", 999, a.pid),
+            |a| a.io_read_bytes = Some(99),
+            |a| a.io_write_bytes = Some(51),
+            |a| a.io_window_seconds = Some(1.0),
+            |a| a.requested_window_ms = 250,
+            |a| a.source = "ps_lifetime_fallback".to_string(),
+            |a| a.io_error = Some("process exited".to_string()),
+        ];
+        for invalidate in invalidators {
+            let mut other_sample = sample.clone();
+            invalidate(&mut other_sample);
+            assert_eq!(window.share(&other_sample), None, "{other_sample:?}");
+        }
+        // A different interval with identical rates is still a different sample.
+        let mut different_interval = sample;
+        different_interval.io_window_seconds = Some(1.0);
+        different_interval.io_read_bytes = Some(200);
+        different_interval.io_write_bytes = Some(100);
+        assert_eq!(window.share(&different_interval), None);
+    }
+
+    #[test]
+    fn observed_io_idle_cohort_has_no_share_but_idle_member_can_have_zero() {
+        let population = [process(10), process(20)];
+        let a = activity(&population[0], 0, 0, 0.5);
+        let b = activity(&population[1], 0, 0, 1.0);
+        let idle = process_io_window(&population, [a.clone(), b], true).unwrap();
+        assert!(idle.validate().is_ok());
+        assert_eq!(idle.share(&a), None);
+        let busy = activity(&population[1], 100, 0, 1.0);
+        let mixed = process_io_window(&population, [a.clone(), busy.clone()], true).unwrap();
+        assert_eq!(mixed.share(&a), Some(0.0));
+        assert_eq!(mixed.share(&busy), Some(1.0));
+    }
+
+    #[test]
+    fn observed_io_refuses_overflow_in_either_raw_counter_sum() {
+        let population = [process(10), process(20)];
+        for read in [true, false] {
+            let a = activity(
+                &population[0],
+                if read { u64::MAX } else { 0 },
+                if read { 0 } else { u64::MAX },
+                0.5,
+            );
+            let b = activity(&population[1], u64::from(read), u64::from(!read), 0.5);
+            assert!(process_io_window(&population, [a, b], true).is_err());
+        }
+    }
+
+    #[test]
+    fn observed_io_roundtrip_and_invalid_saved_summaries_fail_closed() {
+        let population = [process(10), process(20)];
+        let a = activity(&population[0], 4096, 2048, 0.512345678);
+        let b = activity(&population[1], 8192, 0, 0.612345678);
+        let window = process_io_window(&population, [a.clone(), b], true).unwrap();
+        let encoded = serde_json::to_value(&window).unwrap();
+        assert!(encoded.get("validation").is_none());
+        let roundtrip: ProcessIoWindow = serde_json::from_value(encoded.clone()).unwrap();
+        assert!(roundtrip.validate().is_ok());
+        assert_eq!(window.share(&a), roundtrip.share(&a));
+        for (field, value) in [
+            ("source", serde_json::json!("diskstats")),
+            ("scope", serde_json::json!("host_io")),
+            ("census_complete", serde_json::json!(false)),
+            ("sampled_processes", serde_json::json!(1)),
+            ("requested_window_ms", serde_json::json!(1000)),
+            ("read_bytes", serde_json::json!(0)),
+            ("write_bytes", serde_json::json!(0)),
+            ("read_bytes_per_second", serde_json::json!(1.0)),
+            ("write_bytes_per_second", serde_json::json!(-1.0)),
+            ("min_window_seconds", serde_json::json!(0.1)),
+            ("max_window_seconds", serde_json::json!(2.0)),
+            ("limitations", serde_json::json!([])),
+            ("members", serde_json::json!({})),
+        ] {
+            let mut invalid = encoded.clone();
+            invalid[field] = value;
+            let invalid: ProcessIoWindow = serde_json::from_value(invalid).unwrap();
+            assert!(invalid.validate().is_err(), "{field}");
+            assert_eq!(invalid.share(&a), None, "{field}");
+        }
+    }
 }
 
 #[cfg(test)]

@@ -719,6 +719,7 @@ Add this section to a complete policy to use the default heuristic model:
       "kappa": 1.0,
       "renice_cpu_relief": 0.5,
       "pause_cpu_relief": 1.0,
+      "pause_io_relief": 0.0,
       "throttle_cpu_relief": 0.5,
       "cap_memory_relief": 0.1
     }
@@ -731,7 +732,7 @@ count. Credit is limited to that process, even if it belongs to a larger agent,
 build, or cgroup. RSS/system RAM provides a memory share, not an estimate of
 unique reclaimable pages. A feasible, identity-bound `cap_memory` action can
 receive the configured memory relief fraction; other reversible actions receive
-no memory relief credit. I/O attribution remains unavailable without a comparable denominator.
+no memory relief credit.
 Per-process CPU occupancy also respects the tightest visible cgroup-v1 or
 cgroup-v2 ancestor quota, comparing quota/period ratios and reporting the
 controller path that supplies the limit. This is a shared ceiling, not a
@@ -747,6 +748,16 @@ observed at both ends of a completed sampling window. Unreadable, changing or
 over-budget capacity leaves CPU evidence unavailable while preserving the raw
 CPU and I/O measurements. Saved observations retain the denominator, so replay
 never borrows capacity from the machine running it.
+I/O attribution uses each process's measured storage-byte rate divided by the
+sum of rates from the complete observed process census, including protected and
+unselected processes. Every member must have matching identity-bound byte
+deltas over a completed window; unreadable, missing or changed samples leave
+the denominator unavailable. An entirely idle census supplies no I/O share.
+This accounting share excludes kernel I/O and processes outside the census and
+can include waited-for children. It does not measure device utilization or
+prove responsibility for PSI stalls. Full reports retain the member
+measurements in `system_state.io_accounting`; minimal snapshots point to the
+saved `scan/system_state.json` instead of repeating the member list.
 Missing observations are reported as unavailable, and disabled, zero-pressure,
 or wholly unattributable cases preserve the evidence-only decision. Reports
 separate base loss, modeled pressure cost, excluded actions, and unavailable
@@ -1394,6 +1405,22 @@ These goals require `load_aware.enabled: true` in the policy (already enabled by
 The selector chooses one tier per plan: **renice/throttle/memory cap**, then **pause/freeze**, then **termination already justified by evidence-only inference**. Within a tier it ranks modeled relief relative to expected loss. Later tiers remain visible as alternatives and require a fresh plan. The saved plan retains the exact original action IDs, full process identities, staged prerequisites, and child-before-parent execution order. A memory cap must also retain the exact proposed limit and original cgroup binding. Tree safety is checked again after narrowing the selection. Missing observations, final policy refusals, unavailable routes, or absent resource-specific relief produce no executable fallback actions.
 
 `goal_summary` identifies the selected tier and PIDs, modeled relief in `heuristic_loss_units`, exclusions, and alternatives. It is included in brief and minimal JSON/TOON output; text and TUI output also show the relief summary. `achievable` and `goal_achievable` are `null`: this model does not establish a physical PSI or resource-recovery target. Memory caps receive only memory relief credit, and unknown I/O attribution cannot support an I/O remedy. No cap is credited toward numeric RAM-recovery goals. Measure the result with the normal verification workflow, then generate a new plan before proceeding to another tier. Pressure goals cannot be combined with numeric resource goals in one expression.
+
+### Reversible I/O pressure relief
+
+Pause and Freeze can receive I/O relief credit when
+`load_aware.pressure.pause_io_relief` is explicitly set above its default of
+`0.0`. For example, `0.5` models a 50% reduction in the process's new I/O
+submissions while stopped. It does not promise a 50% reduction in device load:
+already submitted I/O and dirty-page writeback can continue. The value must be
+finite and between zero and one.
+
+With a complete, active I/O sample, this setting lets `io-pressure` and `relieve`
+goals select an otherwise feasible pause or freeze. The existing writable-file,
+protection, identity and action gates still apply. A missing denominator, zero
+I/O pressure or an infeasible stop receives no credit; pressure cannot make
+Kill or Restart eligible. Keep the default zero if this workload's stop behavior
+is not established, and verify actual pressure changes after any action.
 
 ### Reversible memory pressure relief
 

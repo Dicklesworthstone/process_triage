@@ -26394,9 +26394,12 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
     };
 
     let mut system_state = match &scan_result {
-        Some(scan) if args.minimal => {
-            collect_observational_activity(&mut scorer, &scan.processes, args.window_ms)
-        }
+        Some(scan) if args.minimal => collect_observational_activity(
+            &mut scorer,
+            &scan.processes,
+            args.window_ms,
+            scan.metadata.warnings.is_empty(),
+        ),
         Some(scan) => collect_planning_activity(
             &mut scorer,
             &scan.processes,
@@ -26442,6 +26445,17 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                     .collect::<Vec<_>>(),
             })
         });
+        let mut reported_system_state = system_state.clone();
+        if let Some(accounting) = reported_system_state
+            .get_mut("io_accounting")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            accounting.remove("members");
+            accounting.insert(
+                "member_measurements_artifact".into(),
+                serde_json::json!("scan/system_state.json"),
+            );
+        }
         let output = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
             "command": "agent snapshot",
@@ -26456,7 +26470,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
             "minimal": true,
             "read_only": true,
             "activity_window_ms": args.window_ms,
-            "system_state": system_state,
+            "system_state": reported_system_state,
             "responsible_units": units,
             "memory_limits": responsible_units.as_ref().map(memory_limit_report),
             "agent_activity": agent_activity.as_ref().map(|report| agent_activity_output(report, Some(10))),
@@ -27079,6 +27093,7 @@ fn process_cpu_percent(
 struct PlanningPressure {
     snapshot: Option<pt_core::collect::pressure::PressureSnapshot>,
     cpu_usage: Option<pt_core::collect::pressure::HostCpuWindow>,
+    io_accounting: Option<pt_core::collect::pressure::ProcessIoWindow>,
     severity: pt_core::decision::pressure_regime::ResourceSeverity,
     unavailable: Vec<String>,
 }
@@ -27132,9 +27147,30 @@ impl PlanningPressure {
                     }
                 }
             });
+        let io_accounting = system
+            .get("io_accounting")
+            .filter(|value| !value.is_null())
+            .and_then(|value| {
+                match serde_json::from_value::<pt_core::collect::pressure::ProcessIoWindow>(
+                    value.clone(),
+                ) {
+                    Ok(window) => match window.validate() {
+                        Ok(()) => Some(window),
+                        Err(error) => {
+                            unavailable.push(format!("process I/O accounting invalid: {error}"));
+                            None
+                        }
+                    },
+                    Err(error) => {
+                        unavailable.push(format!("process I/O accounting unavailable: {error}"));
+                        None
+                    }
+                }
+            });
         Self {
             snapshot,
             cpu_usage,
+            io_accounting,
             severity,
             unavailable,
         }
@@ -27217,16 +27253,19 @@ impl PlanningPressure {
         if memory.is_none() {
             unavailable.push("memory share requires observed host total memory".to_string());
         }
-        unavailable.push(
-            "I/O share unavailable: no comparable host-wide I/O rate was measured".to_string(),
-        );
+        let io = self
+            .io_accounting
+            .as_ref()
+            .zip(activity)
+            .and_then(|(window, sample)| window.share(sample));
+        if io.is_none() {
+            unavailable.push(
+                "I/O share requires matching storage-byte measurements from a complete, active process sampling cohort".to_string(),
+            );
+        }
         PressureContext {
             severity: self.severity,
-            shares: ResourceShares {
-                cpu,
-                memory,
-                io: None,
-            },
+            shares: ResourceShares { cpu, memory, io },
             unavailable,
         }
     }
@@ -27317,6 +27356,7 @@ mod planning_pressure_tests {
                 fd: 0.0,
             },
             cpu_usage: None,
+            io_accounting: None,
             unavailable: Vec::new(),
         }
     }
@@ -27352,6 +27392,104 @@ mod planning_pressure_tests {
                 ..ProcessPressureActivity::default()
             }),
         }
+    }
+
+    #[test]
+    fn io_pressure_uses_complete_identity_bound_cohort_accounting() {
+        use pt_core::collect::pressure::process_io_window;
+
+        let process = process();
+        let mut peer = process.clone();
+        peer.pid = ProcessId(124);
+        peer.start_id = StartId::from_linux("pressure-test", 101, 124);
+        let sample = activity(&process);
+        let mut peer_sample = activity(&peer);
+        peer_sample.io_read_bytes = Some(1500);
+        peer_sample.read_bytes_per_second = Some(3000.0);
+        let population = [process.clone(), peer];
+        let samples = [sample.clone(), peer_sample];
+        assert!(process_io_window(&population, samples.clone(), false).is_err());
+        assert!(process_io_window(&population, [sample.clone()], true).is_err());
+
+        let window = process_io_window(&population, samples, true).unwrap();
+        assert_eq!(window.scope(), "observed_census_process_io");
+        let mut pressure = host();
+        pressure.io_accounting = Some(window);
+        let context = pressure.for_process(&process, Some(&sample));
+        assert_eq!(context.shares.io, Some(0.25));
+        assert_eq!(pressure.for_process(&process, None).shares.io, None);
+        for case in 0..5 {
+            let mut changed = sample.clone();
+            match case {
+                0 => changed.uid += 1,
+                1 => changed.start_id = StartId::from_linux("pressure-test", 102, 123),
+                2 => changed.io_read_bytes = Some(501),
+                3 => changed.io_window_seconds = Some(0.75),
+                4 => changed.io_error = Some("unreadable descriptor".into()),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                pressure.for_process(&process, Some(&changed)).shares.io,
+                None,
+                "case {case}"
+            );
+        }
+
+        let mut system = system_state_from_pressure(pressure.snapshot.clone().unwrap(), None, None);
+        system["io_accounting"] = serde_json::json!(pressure.io_accounting);
+        let restored = PlanningPressure::from_system_state(&system);
+        assert_eq!(
+            restored.for_process(&process, Some(&sample)).shares.io,
+            Some(0.25)
+        );
+        system["io_accounting"]["read_bytes"] = serde_json::json!(1);
+        let invalid = PlanningPressure::from_system_state(&system);
+        assert_eq!(invalid.for_process(&process, Some(&sample)).shares.io, None);
+        assert!(invalid
+            .unavailable
+            .iter()
+            .any(|reason| reason.contains("I/O accounting invalid")));
+    }
+
+    #[test]
+    fn measured_io_share_drives_only_explicit_reversible_pressure_credit() {
+        use pt_core::collect::pressure::process_io_window;
+
+        let process = process();
+        let sample = activity(&process);
+        let mut pressure = host();
+        pressure.severity = pt_core::decision::pressure_regime::ResourceSeverity {
+            io: 1.0,
+            ..Default::default()
+        };
+        pressure.io_accounting = Some(
+            process_io_window(std::slice::from_ref(&process), [sample.clone()], true).unwrap(),
+        );
+        let context = pressure.for_process(&process, Some(&sample));
+        assert_eq!(context.shares.io, Some(1.0));
+        let posterior = pt_core::inference::ClassScores {
+            useful: 0.0,
+            useful_bad: 1.0,
+            abandoned: 0.0,
+            zombie: 0.0,
+        };
+        let mut policy = pt_core::config::Policy::default();
+        policy.load_aware.enabled = true;
+        let feasibility = ActionFeasibility::allow_all();
+        let defaults =
+            prepare_pressure_decision(&posterior, &policy, &feasibility, &context).unwrap();
+        assert_eq!(defaults.decision.optimal_action, Action::Keep);
+        policy.load_aware.pressure.pause_io_relief = 0.5;
+        let result =
+            prepare_pressure_decision(&posterior, &policy, &feasibility, &context).unwrap();
+        assert!(matches!(
+            result.decision.optimal_action,
+            Action::Pause | Action::Freeze
+        ));
+        assert_eq!(result.report.evidence_only_action, Action::Keep);
+        assert!(!result.feasibility.is_allowed(Action::Kill));
+        assert!(!result.feasibility.is_allowed(Action::Restart));
+        assert!(result.report.modeled_pressure_relief > 0.0);
     }
 
     #[test]
@@ -27931,7 +28069,7 @@ fn collect_planning_activity(
     window_ms: u64,
     census_complete: bool,
 ) -> serde_json::Value {
-    let mut system = collect_observational_activity(scorer, population, window_ms);
+    let mut system = collect_observational_activity(scorer, population, window_ms, census_complete);
     system["respawn_history"] = collect_planning_respawn_history(scorer, population);
     system["workloads"] = collect_planning_workloads(scorer, population, census_complete);
     system
@@ -27943,9 +28081,10 @@ fn collect_observational_activity(
     scorer: &mut Scorer,
     population: &[ProcessRecord],
     window_ms: u64,
+    census_complete: bool,
 ) -> serde_json::Value {
     use pt_core::collect::pressure::{
-        host_cpu_window, read_host_cpu_counters, read_pressure_snapshot,
+        host_cpu_window, process_io_window, read_host_cpu_counters, read_pressure_snapshot,
     };
 
     // Linux process sampling already waits once for the whole population. Read
@@ -27979,6 +28118,16 @@ fn collect_observational_activity(
             "host CPU utilization requires a nonzero process sampling window on Linux".to_string(),
         ),
     };
+    // Use exactly the same unfiltered cohort and identity-bound counters as
+    // process scoring. Summed device rows would double-count stacked devices
+    // and do not share /proc/PID/io accounting semantics.
+    let io_accounting = process_io_window(
+        population,
+        population
+            .iter()
+            .filter_map(|process| scorer.activity_for(process)),
+        census_complete,
+    );
     let mut snapshot = read_pressure_snapshot();
     if let Err(reason) = &cpu_usage {
         snapshot
@@ -27988,12 +28137,21 @@ fn collect_observational_activity(
                 reason: reason.clone(),
             });
     }
+    if let Err(reason) = &io_accounting {
+        snapshot
+            .unavailable
+            .push(pt_core::collect::pressure::Unavailable {
+                source: "io_accounting".to_string(),
+                reason: reason.clone(),
+            });
+    }
     let baseline = baseline
         .as_ref()
         .map(|(before, started, _, _)| (before, started.elapsed()));
     let window = planning_pressure_window(&mut snapshot, baseline, requested);
     let mut system = system_state_from_pressure(snapshot, window, Some(population));
     system["cpu_usage"] = serde_json::json!(cpu_usage.ok());
+    system["io_accounting"] = serde_json::json!(io_accounting.ok());
     system
 }
 

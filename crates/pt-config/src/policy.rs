@@ -553,6 +553,9 @@ pub struct PressureLossConfig {
     pub renice_cpu_relief: f64,
     /// Pause and Freeze share a loss column and the same CPU relief estimate.
     pub pause_cpu_relief: f64,
+    /// Opt-in reduction in new process I/O submissions while paused or frozen.
+    /// Zero by default: pending kernel I/O and writeback may continue.
+    pub pause_io_relief: f64,
     /// Throttle and Quarantine share a loss column and this heuristic estimate.
     pub throttle_cpu_relief: f64,
     /// Heuristic memory-pressure relief for a verified `memory.high` cap.
@@ -565,6 +568,7 @@ impl Default for PressureLossConfig {
             kappa: 1.0,
             renice_cpu_relief: 0.5,
             pause_cpu_relief: 1.0,
+            pause_io_relief: 0.0,
             throttle_cpu_relief: 0.5,
             cap_memory_relief: 0.1,
         }
@@ -580,6 +584,7 @@ impl PressureLossConfig {
         for (name, value) in [
             ("renice_cpu_relief", self.renice_cpu_relief),
             ("pause_cpu_relief", self.pause_cpu_relief),
+            ("pause_io_relief", self.pause_io_relief),
             ("throttle_cpu_relief", self.throttle_cpu_relief),
             ("cap_memory_relief", self.cap_memory_relief),
         ] {
@@ -1448,6 +1453,25 @@ mod tests {
         assert_eq!(enabled.pressure.kappa, 0.25);
         assert_eq!(enabled.pressure.renice_cpu_relief, 0.5);
         assert_eq!(enabled.pressure.pause_cpu_relief, 1.0);
+        assert_eq!(enabled.pressure.pause_io_relief, 0.0);
         assert_eq!(enabled.pressure.throttle_cpu_relief, 0.5);
+    }
+
+    #[test]
+    fn pause_io_relief_requires_a_finite_probability() {
+        let configured: PressureLossConfig =
+            serde_json::from_str(r#"{"pause_io_relief":0.5}"#).unwrap();
+        assert_eq!(configured.pause_io_relief, 0.5);
+        assert_eq!(configured.validation_error(), None);
+        for value in [-0.1, 1.1, f64::NAN, f64::INFINITY] {
+            let invalid = PressureLossConfig {
+                pause_io_relief: value,
+                ..PressureLossConfig::default()
+            };
+            assert_eq!(
+                invalid.validation_error(),
+                Some(("pause_io_relief", "must be finite and in [0, 1]"))
+            );
+        }
     }
 }
