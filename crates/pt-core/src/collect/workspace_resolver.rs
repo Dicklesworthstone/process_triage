@@ -147,8 +147,37 @@ pub fn find_repo_root(start: &Path) -> (Option<RawPathEvidence>, Option<RawPathE
     (None, None)
 }
 
-/// Maximum size of a gitdir pointer, including its prefix and newline.
-const MAX_GITDIR_FILE_BYTES: u64 = 4096;
+/// Maximum size of the small Git text metadata files consulted here.
+const MAX_GIT_METADATA_FILE_BYTES: u64 = 4096;
+
+/// Read a small regular metadata file without waiting for a FIFO writer.
+/// Filesystem access itself can still stall; planning runs this in its bounded
+/// collector worker. The byte limit also bounds allocation for hostile files.
+fn read_git_metadata_file(path: &Path) -> std::io::Result<String> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    // A marker may change between inspection and open. Do not hang on a FIFO
+    // substituted at that point; only regular files are accepted below.
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK);
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Git metadata is not a regular file",
+        ));
+    }
+    let mut content = String::new();
+    file.take(MAX_GIT_METADATA_FILE_BYTES + 1)
+        .read_to_string(&mut content)?;
+    if content.len() as u64 > MAX_GIT_METADATA_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Git metadata exceeds the 4 KiB limit",
+        ));
+    }
+    Ok(content)
+}
 
 /// Parse a `.git` file that points to a checkout's own Git directory.
 ///
@@ -156,23 +185,7 @@ const MAX_GITDIR_FILE_BYTES: u64 = 4096;
 /// are resolved against the pointer file, as Git does for submodules as well.
 /// Never follow `commondir`: each checkout has its own HEAD and index.
 pub(super) fn parse_gitdir_file(git_file: &Path) -> Option<PathBuf> {
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    // A marker may change between inspection and open. Do not hang on a FIFO
-    // substituted at that point; only regular files are accepted below.
-    #[cfg(unix)]
-    options.custom_flags(libc::O_NONBLOCK);
-    let file = options.open(git_file).ok()?;
-    if !file.metadata().ok()?.is_file() {
-        return None;
-    }
-    let mut content = String::new();
-    file.take(MAX_GITDIR_FILE_BYTES + 1)
-        .read_to_string(&mut content)
-        .ok()?;
-    if content.len() as u64 > MAX_GITDIR_FILE_BYTES {
-        return None;
-    }
+    let content = read_git_metadata_file(git_file).ok()?;
     let line = content.lines().next()?;
     let gitdir = line.strip_prefix("gitdir: ")?;
     let gitdir_path = gitdir.trim();
@@ -195,7 +208,7 @@ fn resolve_worktree_repo_root(gitdir: &Path) -> Option<PathBuf> {
     // Typical worktree gitdir: /path/to/repo/.git/worktrees/<name>
     // We need to go up from .git/worktrees/<name> to get the repo root.
     let common_dir_file = gitdir.join("commondir");
-    if let Ok(content) = fs::read_to_string(&common_dir_file) {
+    if let Ok(content) = read_git_metadata_file(&common_dir_file) {
         let common_dir = content.lines().next()?.trim();
         let common_path = if Path::new(common_dir).is_absolute() {
             PathBuf::from(common_dir)
@@ -240,7 +253,7 @@ pub fn read_head_state(repo_root: &Path) -> Option<HeadState> {
         }
     };
 
-    match fs::read_to_string(&head_path) {
+    match read_git_metadata_file(&head_path) {
         Ok(content) => {
             let trimmed = content.trim();
             if let Some(branch) = trimmed.strip_prefix("ref: refs/heads/") {
@@ -620,6 +633,36 @@ mod tests {
                 reason: "malformed .git file".to_string()
             })
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_head_state_rejects_oversized_and_fifo_metadata() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = retained_test_dir("invalid-head-files");
+        let oversized = dir.join("oversized");
+        fs::create_dir_all(oversized.join(".git")).unwrap();
+        fs::write(
+            oversized.join(".git/HEAD"),
+            format!("ref: refs/heads/{}", "x".repeat(4096)),
+        )
+        .unwrap();
+        assert!(matches!(
+            read_head_state(&oversized),
+            Some(HeadState::Unreadable { reason }) if reason.contains("4 KiB")
+        ));
+
+        let fifo = dir.join("fifo");
+        fs::create_dir_all(fifo.join(".git")).unwrap();
+        let head = fifo.join(".git/HEAD");
+        let path = std::ffi::CString::new(head.as_os_str().as_bytes()).unwrap();
+        // SAFETY: path names a new FIFO inside this test's retained fixture.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        assert!(matches!(
+            read_head_state(&fifo),
+            Some(HeadState::Unreadable { reason }) if reason.contains("regular file")
+        ));
     }
 
     #[test]

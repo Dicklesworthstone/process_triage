@@ -388,6 +388,9 @@ pub fn collect_user_intent(pid: u32, config: &UserIntentConfig) -> Option<UserIn
     // Read process stat
     // parse_proc_stat returns Option, so we don't need .ok()
     let proc_stat = read_proc_stat(pid)?;
+    if proc_stat.pid != pid || proc_stat.starttime == 0 {
+        return None;
+    }
     data_sources.push("proc_stat".to_string());
 
     let mut signals_checked = 0u32;
@@ -471,6 +474,13 @@ pub fn collect_user_intent(pid: u32, config: &UserIntentConfig) -> Option<UserIn
         privacy_mode
             .skipped_signals
             .push("editor_focus".to_string());
+    }
+
+    // The context probes read several procfs and filesystem objects. Discard
+    // their combined evidence if the PID exited or changed incarnation.
+    let current_stat = read_proc_stat(pid)?;
+    if current_stat.pid != proc_stat.pid || current_stat.starttime != proc_stat.starttime {
+        return None;
     }
 
     // Compute final score
@@ -736,19 +746,48 @@ fn detect_repo_activity_signals(
     pid: u32,
     config: &UserIntentConfig,
 ) -> Option<Vec<IntentEvidence>> {
-    // Get process CWD
     let cwd_path = format!("/proc/{}/cwd", pid);
     let cwd = fs::read_link(&cwd_path).ok()?;
+    let evidence = detect_repo_activity_at(&cwd, config, SystemTime::now())?;
+    // A stable PID can still chdir. Do not report another checkout's activity
+    // if it changed while the metadata was being read.
+    if fs::read_link(&cwd_path).ok()? != cwd {
+        return None;
+    }
+    Some(evidence)
+}
 
-    // Look for .git directory in CWD or parents
-    let mut search_path = cwd.as_path();
+/// Inspect only the nearest checkout's own Git metadata. A linked worktree's
+/// HEAD and index live in its gitdir, while a submodule has the same pointer
+/// format. Neither should inherit activity from the enclosing/main checkout.
+#[cfg(target_os = "linux")]
+fn detect_repo_activity_at(
+    cwd: &std::path::Path,
+    config: &UserIntentConfig,
+    now: SystemTime,
+) -> Option<Vec<IntentEvidence>> {
+    let mut search_path = cwd;
     let mut git_dir: Option<std::path::PathBuf> = None;
 
     for _ in 0..10 {
-        let potential_git = search_path.join(".git");
-        if potential_git.exists() {
-            git_dir = Some(potential_git);
-            break;
+        let marker = search_path.join(".git");
+        match fs::symlink_metadata(&marker) {
+            Ok(_) => {
+                // Even a malformed or dangling nearest marker is a boundary.
+                // Falling through would attribute an outer repo's activity to
+                // this checkout. metadata follows a legitimate marker symlink.
+                let metadata = fs::metadata(&marker).ok()?;
+                git_dir = if metadata.is_dir() {
+                    Some(marker)
+                } else if metadata.is_file() {
+                    super::workspace_resolver::parse_gitdir_file(&marker)
+                } else {
+                    None
+                };
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
         }
         match search_path.parent() {
             Some(parent) => search_path = parent,
@@ -758,7 +797,7 @@ fn detect_repo_activity_signals(
 
     let git_dir = git_dir?;
 
-    // Check git index or HEAD for recent modification
+    // Check the checkout-local index or HEAD for recent modification.
     let index_path = git_dir.join("index");
     let head_path = git_dir.join("HEAD");
 
@@ -767,7 +806,7 @@ fn detect_repo_activity_signals(
     for path in [&index_path, &head_path] {
         if let Ok(metadata) = fs::metadata(path) {
             if let Ok(modified) = metadata.modified() {
-                if let Ok(age) = SystemTime::now().duration_since(modified) {
+                if let Ok(age) = now.duration_since(modified) {
                     let age_secs = age.as_secs();
                     if age_secs < config.recent_repo_secs {
                         most_recent_secs = Some(
@@ -1096,6 +1135,175 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, pid);
         assert!(results[0].1.is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    mod repo_activity {
+        use super::*;
+        use std::path::{Path, PathBuf};
+        use std::time::Duration;
+
+        struct RepoFixture {
+            root: PathBuf,
+            now: SystemTime,
+        }
+
+        impl RepoFixture {
+            fn new(label: &str) -> Self {
+                let root = std::env::temp_dir().join(format!(
+                    "pt-intent-repo-{label}-{}-{}",
+                    std::process::id(),
+                    uuid::Uuid::new_v4()
+                ));
+                fs::create_dir(&root).unwrap();
+                // Retain each owned fixture; no cleanup can touch another run.
+                Self {
+                    root,
+                    now: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+                }
+            }
+
+            fn metadata(&self, gitdir: &Path, head_age: u64, index_age: u64) {
+                fs::create_dir_all(gitdir).unwrap();
+                fs::write(gitdir.join("HEAD"), "ref: refs/heads/fixture\n").unwrap();
+                fs::write(gitdir.join("index"), b"owned timestamp fixture").unwrap();
+                self.set_age(&gitdir.join("HEAD"), head_age);
+                self.set_age(&gitdir.join("index"), index_age);
+            }
+
+            fn set_age(&self, path: &Path, seconds: u64) {
+                fs::File::open(path)
+                    .unwrap()
+                    .set_times(
+                        fs::FileTimes::new()
+                            .set_modified(self.now - Duration::from_secs(seconds)),
+                    )
+                    .unwrap();
+            }
+
+            fn activity(&self, cwd: &Path) -> Option<Vec<IntentEvidence>> {
+                detect_repo_activity_at(cwd, &UserIntentConfig::default(), self.now)
+            }
+
+            fn assert_age(&self, cwd: &Path, expected: u64) {
+                let evidence = self.activity(cwd).expect("checkout has recent activity");
+                assert_eq!(evidence.len(), 1);
+                assert_eq!(evidence[0].signal_type, IntentSignalType::ActiveRepoContext);
+                match evidence[0].metadata.as_ref() {
+                    Some(IntentMetadata::Repo {
+                        last_modified_secs_ago,
+                        has_uncommitted_changes,
+                    }) => {
+                        assert_eq!(*last_modified_secs_ago, expected);
+                        assert_eq!(*has_uncommitted_changes, None);
+                    }
+                    other => panic!("expected repository metadata, got {other:?}"),
+                }
+            }
+        }
+
+        #[test]
+        fn ordinary_repo_uses_recent_index_or_head() {
+            for (label, head_age, index_age, expected) in
+                [("index", 7200, 30, 30), ("head", 40, 7200, 40)]
+            {
+                let fixture = RepoFixture::new(label);
+                let checkout = fixture.root.join("repo");
+                let cwd = checkout.join("nested/working");
+                fs::create_dir_all(&cwd).unwrap();
+                fixture.metadata(&checkout.join(".git"), head_age, index_age);
+                fixture.assert_age(&cwd, expected);
+            }
+        }
+
+        #[test]
+        fn linked_worktrees_use_their_own_metadata_for_both_pointer_forms() {
+            for relative in [false, true] {
+                let fixture = RepoFixture::new("worktree");
+                let main_gitdir = fixture.root.join("main/.git");
+                let checkout = fixture.root.join("linked");
+                let gitdir = main_gitdir.join("worktrees/linked");
+                let cwd = checkout.join("src/nested");
+                fs::create_dir_all(&cwd).unwrap();
+                fixture.metadata(&main_gitdir, 2, 2);
+                fixture.metadata(&gitdir, 30, 7200);
+                fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+                let pointer = if relative {
+                    "gitdir: ../main/.git/worktrees/linked\n".to_string()
+                } else {
+                    format!("gitdir: {}\n", gitdir.display())
+                };
+                fs::write(checkout.join(".git"), pointer).unwrap();
+                fixture.assert_age(&cwd, 30);
+
+                // The other checkout's fresh metadata must not keep this
+                // inactive worktree looking active.
+                fixture.set_age(&gitdir.join("HEAD"), 7200);
+                assert!(fixture.activity(&cwd).is_none());
+                fixture.set_age(&gitdir.join("index"), 45);
+                fixture.assert_age(&cwd, 45);
+            }
+        }
+
+        #[test]
+        fn submodule_pointer_uses_its_index_instead_of_outer_repo_activity() {
+            let fixture = RepoFixture::new("submodule");
+            let outer = fixture.root.join("super");
+            let checkout = outer.join("vendor/component");
+            let gitdir = outer.join(".git/modules/component");
+            let cwd = checkout.join("src");
+            fs::create_dir_all(&cwd).unwrap();
+            fixture.metadata(&outer.join(".git"), 1, 1);
+            fixture.metadata(&gitdir, 7200, 55);
+            fs::write(
+                checkout.join(".git"),
+                "gitdir: ../../.git/modules/component\n",
+            )
+            .unwrap();
+            fixture.assert_age(&cwd, 55);
+
+            fixture.set_age(&gitdir.join("index"), 7200);
+            assert!(fixture.activity(&cwd).is_none());
+        }
+
+        #[test]
+        fn invalid_nearest_marker_never_falls_back_to_active_outer_repo() {
+            let fixture = RepoFixture::new("invalid-marker");
+            fixture.metadata(&fixture.root.join(".git"), 1, 1);
+            let contents = [
+                "not a gitdir pointer\n".to_string(),
+                "gitdir: \n".to_string(),
+                "gitdir: missing\n".to_string(),
+                format!("gitdir: ../.git\n{}", "x".repeat(4096)),
+            ];
+            for (index, content) in contents.iter().enumerate() {
+                let checkout = fixture.root.join(format!("child-{index}"));
+                let cwd = checkout.join("src");
+                fs::create_dir_all(&cwd).unwrap();
+                fs::write(checkout.join(".git"), content).unwrap();
+                assert!(fixture.activity(&cwd).is_none(), "marker {index}");
+            }
+
+            let checkout = fixture.root.join("dangling");
+            fs::create_dir(&checkout).unwrap();
+            std::os::unix::fs::symlink("missing", checkout.join(".git")).unwrap();
+            assert!(fixture.activity(&checkout).is_none());
+        }
+
+        #[test]
+        fn repository_search_retains_its_ancestor_limit() {
+            let fixture = RepoFixture::new("depth");
+            fixture.metadata(&fixture.root.join(".git"), 1, 1);
+            let mut cwd = fixture.root.clone();
+            for _ in 0..9 {
+                cwd = cwd.join("nested");
+            }
+            fs::create_dir_all(&cwd).unwrap();
+            fixture.assert_age(&cwd, 1);
+            cwd = cwd.join("one-too-deep");
+            fs::create_dir(&cwd).unwrap();
+            assert!(fixture.activity(&cwd).is_none());
+        }
     }
 
     // === Deterministic fixture tests for session attribution ===
