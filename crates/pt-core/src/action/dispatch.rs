@@ -452,8 +452,38 @@ pub(super) fn read_cgroup_identity(pid: u32) -> Option<pt_common::ProcessIdentit
 pub(super) fn ensure_cgroup_target(
     target: &pt_common::ProcessIdentity,
 ) -> Result<String, ActionError> {
-    ensure_cgroup_identity(target)?;
-    ensure_exclusive_cgroup(target.pid.0)
+    ensure_cgroup_target_with(
+        || ensure_cgroup_identity(target).map(|_| ()),
+        || read_unified_cgroup_membership(target.pid.0),
+        |path| {
+            ensure_exclusive_cgroup_path(
+                target.pid.0,
+                std::path::Path::new(&format!("/sys/fs/cgroup{path}")),
+            )
+        },
+    )
+}
+
+/// Isolation reads can race with process exit, PID reuse, exec or ownership
+/// changes. The final writer must not reuse an identity/protection check from
+/// before those reads. This brackets the observation; it is not a kernel lock
+/// preventing a subsequent process migration or fork.
+#[cfg(target_os = "linux")]
+fn ensure_cgroup_target_with(
+    mut validate_target: impl FnMut() -> Result<(), ActionError>,
+    mut read_membership: impl FnMut() -> Result<String, ActionError>,
+    inspect_isolation: impl FnOnce(&str) -> Result<(), ActionError>,
+) -> Result<String, ActionError> {
+    validate_target()?;
+    let path = read_membership()?;
+    inspect_isolation(&path)?;
+    validate_target()?;
+    if read_membership()? != path {
+        return Err(ActionError::Failed(
+            "target cgroup membership changed during isolation inspection".to_string(),
+        ));
+    }
+    Ok(path)
 }
 
 /// Common identity/ownership/infrastructure checks; return the observed command
@@ -501,11 +531,47 @@ pub(super) fn ensure_exclusive_cgroup(pid: u32) -> Result<String, ActionError> {
             "refusing cgroup mutation for protected PID {pid}"
         )));
     }
-    let path = crate::collect::collect_cgroup_details(pid)
-        .and_then(|d| d.unified_path)
-        .ok_or_else(|| ActionError::Failed(format!("cannot resolve cgroup of pid {pid}")))?;
-    ensure_exclusive_cgroup_path(pid, std::path::Path::new(&format!("/sys/fs/cgroup{path}")))?;
-    Ok(path)
+    ensure_cgroup_target_with(
+        || Ok(()),
+        || read_unified_cgroup_membership(pid),
+        |path| {
+            ensure_exclusive_cgroup_path(
+                pid,
+                std::path::Path::new(&format!("/sys/fs/cgroup{path}")),
+            )
+        },
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn read_unified_cgroup_membership(pid: u32) -> Result<String, ActionError> {
+    let source = format!("/proc/{pid}/cgroup");
+    let content = std::fs::read_to_string(&source)
+        .map_err(|error| ActionError::Failed(format!("cannot read {source}: {error}")))?;
+    unified_cgroup_membership(&content)
+}
+
+/// Read only membership here: resource-limit collection adds unrelated I/O to
+/// every final action recheck. Namespace-relative paths escaping the visible
+/// root cannot be resolved by appending them to /sys/fs/cgroup.
+#[cfg(target_os = "linux")]
+fn unified_cgroup_membership(content: &str) -> Result<String, ActionError> {
+    let mut paths = content.lines().filter_map(|line| line.strip_prefix("0::"));
+    let path = paths.next().ok_or_else(|| {
+        ActionError::Failed("cannot establish unified cgroup membership".to_string())
+    })?;
+    if paths.next().is_some()
+        || !path.starts_with('/')
+        || path.contains('\0')
+        || path
+            .split('/')
+            .any(|component| matches!(component, "." | ".."))
+    {
+        return Err(ActionError::Failed(
+            "unified cgroup membership is ambiguous or outside the visible root".to_string(),
+        ));
+    }
+    Ok(path.to_string())
 }
 
 /// Check the actual controller directory, including a hybrid v1 fallback.
@@ -514,22 +580,53 @@ pub(super) fn ensure_exclusive_cgroup_path(
     pid: u32,
     directory: &std::path::Path,
 ) -> Result<(), ActionError> {
+    let procs_file = directory.join("cgroup.procs");
+    ensure_exclusive_leaf_with(
+        pid,
+        directory,
+        || {
+            std::fs::read_to_string(&procs_file).map_err(|error| {
+                ActionError::Failed(format!("cannot read {}: {error}", procs_file.display()))
+            })
+        },
+        || ensure_cgroup_has_no_descendants(directory),
+    )
+}
+
+/// A target-only process list observed before a directory walk does not prove
+/// the group stayed exclusive during that walk. Re-read it after checking the
+/// descendants, including on pinned controller directories used by undo.
+#[cfg(target_os = "linux")]
+fn ensure_exclusive_leaf_with(
+    pid: u32,
+    directory: &std::path::Path,
+    mut read_members: impl FnMut() -> Result<String, ActionError>,
+    inspect_descendants: impl FnOnce() -> Result<(), ActionError>,
+) -> Result<(), ActionError> {
     if pid <= 1 {
         return Err(ActionError::Failed(format!(
             "refusing cgroup mutation for protected PID {pid}"
         )));
     }
     let path = directory.display();
-    let procs_file = directory.join("cgroup.procs");
-    let content = std::fs::read_to_string(&procs_file)
-        .map_err(|e| ActionError::Failed(format!("cannot read {}: {e}", procs_file.display())))?;
-    let others = shared_cgroup_members(&content, pid)?;
-    if others > 0 {
-        return Err(ActionError::Failed(format!(
-            "refusing: cgroup {path} is shared with {others} other process(es) and would \
-             affect them all (leaf-cgroup isolation not implemented)"
-        )));
-    }
+    let check_members = |content: &str| {
+        let others = shared_cgroup_members(content, pid)?;
+        if others > 0 {
+            return Err(ActionError::Failed(format!(
+                "refusing: cgroup {path} is shared with {others} other process(es) and would \
+                 affect them all (leaf-cgroup isolation not implemented)"
+            )));
+        }
+        Ok(())
+    };
+    check_members(&read_members()?)?;
+    inspect_descendants()?;
+    check_members(&read_members()?)
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_cgroup_has_no_descendants(directory: &std::path::Path) -> Result<(), ActionError> {
+    let path = directory.display();
     // Resource limits and freeze state affect descendants too. Require a leaf
     // rather than inferring isolation from only this directory's process list.
     for entry in std::fs::read_dir(directory)
@@ -1149,6 +1246,233 @@ mod tests {
                 .contains("effective-controller-access-refused"));
         } else {
             assert!(check_controller_access(&path).is_err());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_isolation_rechecks_target_after_reading_the_census() {
+        use std::cell::RefCell;
+
+        for change in 0..3 {
+            let planned = make_action().target;
+            let observed = RefCell::new(planned.clone());
+            let result = ensure_cgroup_target_with(
+                || {
+                    if planned.matches(&observed.borrow()) {
+                        Ok(())
+                    } else {
+                        Err(ActionError::IdentityMismatch)
+                    }
+                },
+                || Ok("/owned/leaf".to_string()),
+                |_| {
+                    let mut current = observed.borrow_mut();
+                    match change {
+                        0 => current.start_id = StartId("boot:2:123".to_string()),
+                        1 => current.uid += 1,
+                        _ => current.pid = ProcessId(456),
+                    }
+                    Ok(())
+                },
+            );
+            assert!(matches!(result, Err(ActionError::IdentityMismatch)));
+        }
+
+        assert_eq!(
+            ensure_cgroup_target_with(
+                || Ok(()),
+                || Ok("/owned/leaf".to_string()),
+                |_| Ok(()),
+            )
+            .unwrap(),
+            "/owned/leaf"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_isolation_preserves_target_refusals_before_and_after_the_census() {
+        use std::cell::Cell;
+
+        let inspected = Cell::new(false);
+        let refused_before = ensure_cgroup_target_with(
+            || Err(ActionError::PermissionDenied),
+            || Ok("/owned/leaf".to_string()),
+            |_| {
+                inspected.set(true);
+                Ok(())
+            },
+        );
+        assert!(matches!(
+            refused_before,
+            Err(ActionError::PermissionDenied)
+        ));
+        assert!(!inspected.get());
+
+        let refused_after = ensure_cgroup_target_with(
+            || {
+                if inspected.get() {
+                    Err(ActionError::PermissionDenied)
+                } else {
+                    Ok(())
+                }
+            },
+            || Ok("/owned/leaf".to_string()),
+            |_| {
+                inspected.set(true);
+                Ok(())
+            },
+        );
+        assert!(matches!(
+            refused_after,
+            Err(ActionError::PermissionDenied)
+        ));
+        assert!(inspected.get());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_isolation_rejects_migration_or_lost_membership_after_leaf_inspection() {
+        use std::cell::Cell;
+
+        for after in [Some("/different/leaf"), None] {
+            let inspected = Cell::new(false);
+            let result = ensure_cgroup_target_with(
+                || Ok(()),
+                || {
+                    let membership = if inspected.get() {
+                        after
+                    } else {
+                        Some("/owned/leaf")
+                    };
+                    membership
+                        .map(str::to_string)
+                        .ok_or(ActionError::PermissionDenied)
+                },
+                |path| {
+                    assert_eq!(path, "/owned/leaf");
+                    inspected.set(true);
+                    Ok(())
+                },
+            );
+            assert!(result.is_err());
+            assert!(inspected.get());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_isolation_rechecks_membership_after_final_target_validation() {
+        use std::cell::Cell;
+
+        let validations = Cell::new(0);
+        let membership_reads = Cell::new(0);
+        let result = ensure_cgroup_target_with(
+            || {
+                validations.set(validations.get() + 1);
+                Ok(())
+            },
+            || {
+                membership_reads.set(membership_reads.get() + 1);
+                let path = if validations.get() < 2 {
+                    "/owned/leaf"
+                } else {
+                    "/moved/leaf"
+                };
+                Ok(path.to_string())
+            },
+            |_| {
+                assert_eq!(validations.get(), 1);
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(validations.get(), 2);
+        assert_eq!(membership_reads.get(), 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exclusive_leaf_rechecks_members_after_descendant_inspection() {
+        for members in ["123\n456\n", "456\n", "", "123\ninvalid\n", "123\n0\n"] {
+            let directory = capability_leaf(&[]);
+            let procs_file = directory.join("cgroup.procs");
+            let result = ensure_exclusive_leaf_with(
+                123,
+                &directory,
+                || {
+                    std::fs::read_to_string(&procs_file)
+                        .map_err(|error| ActionError::Failed(error.to_string()))
+                },
+                || {
+                    ensure_cgroup_has_no_descendants(&directory)?;
+                    std::fs::write(&procs_file, members).unwrap();
+                    Ok(())
+                },
+            );
+            assert!(result.is_err(), "{members:?}");
+            assert_eq!(
+                std::fs::read_to_string(directory.join("cpu.max")).unwrap(),
+                "max 100000\n"
+            );
+        }
+
+        let directory = capability_leaf(&[]);
+        ensure_exclusive_cgroup_path(123, &directory).unwrap();
+        for (name, content) in CAPABILITY_FILES {
+            assert_eq!(
+                std::fs::read_to_string(directory.join(name)).unwrap(),
+                content
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exclusive_leaf_refuses_an_unreadable_second_census() {
+        use std::cell::Cell;
+
+        let inspected = Cell::new(false);
+        let result = ensure_exclusive_leaf_with(
+            123,
+            std::path::Path::new("/test/exclusive-leaf"),
+            || {
+                if inspected.get() {
+                    Err(ActionError::PermissionDenied)
+                } else {
+                    Ok("123\n".to_string())
+                }
+            },
+            || {
+                inspected.set(true);
+                Ok(())
+            },
+        );
+        assert!(matches!(result, Err(ActionError::PermissionDenied)));
+        assert!(inspected.get());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unified_membership_requires_one_path_inside_the_visible_root() {
+        for path in ["/", "/owned/leaf", "/user.slice/job:worker.scope"] {
+            let content = format!("2:cpu:/legacy\n0::{path}\n");
+            assert_eq!(unified_cgroup_membership(&content).unwrap(), path);
+        }
+        for invalid in [
+            "",
+            "2:cpu:/legacy\n",
+            "0::\n",
+            "0::relative\n",
+            "0::/../other\n",
+            "0::/owned/../other\n",
+            "0::/owned/./leaf\n",
+            "0::/owned\0/leaf\n",
+            "0::/owned/leaf\n0::/different/leaf\n",
+            "0::/owned/leaf\n0::/owned/leaf\n",
+        ] {
+            assert!(unified_cgroup_membership(invalid).is_err(), "{invalid:?}");
         }
     }
 
