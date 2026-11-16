@@ -402,6 +402,8 @@ pub(crate) fn resolve_cgroup_mount(
         "cgroup.controllers",
         "memory.pressure",
         "io.pressure",
+        "cgroup.events",
+        "cgroup.type",
     ];
     if mount_points.iter().any(|path| {
         path.file_name()
@@ -427,7 +429,7 @@ fn collect_cpu_limits(details: &mut CgroupDetails, _pid: u32) {
     }
 }
 
-fn collect_cpu_limits_from_mounts(details: &mut CgroupDetails, mountinfo: &str) {
+pub(super) fn collect_cpu_limits_from_mounts(details: &mut CgroupDetails, mountinfo: &str) {
     let mut limits = None;
     if let Some(path) = &details.unified_path {
         match resolve_cgroup_mount(path, mountinfo, "cgroup2", None) {
@@ -446,13 +448,48 @@ fn collect_cpu_limits_from_mounts(details: &mut CgroupDetails, mountinfo: &str) 
                 Ok(mount) => {
                     limits = Some(read_cpu_hierarchy(&mount, false, &mut details.provenance));
                 }
-                Err(error) => details.provenance.warnings.push(error),
+                Err(error) => {
+                    // A readable v2 root says nothing about an independently
+                    // reported v1 CPU hierarchy that we cannot inspect.
+                    if let Some(limits) = &mut limits {
+                        limits.quota_hierarchy_complete = false;
+                    }
+                    details.provenance.warnings.push(error);
+                }
             }
         }
     }
     details.cpu_limits = limits.filter(|limits| {
-        limits.source != CpuLimitSource::None || limits.shares.is_some() || limits.weight.is_some()
+        limits.quota_hierarchy_complete
+            || limits.source != CpuLimitSource::None
+            || limits.shares.is_some()
+            || limits.weight.is_some()
     });
+}
+
+/// The global v2 root has mandatory core files but no cgroup.events or
+/// cgroup.type. A namespace root still has those non-root core files even when
+/// its CPU controller is disabled and cpu.max is absent. See the kernel's
+/// cgroup-v2 "Core Interface Files" documentation; absence of cpu.max alone
+/// cannot establish that no ancestor quota exists.
+fn has_v2_root_core_files(directory: &Path) -> bool {
+    use std::io::Read;
+
+    if !["cgroup.events", "cgroup.type"].iter().all(|name| {
+        fs::symlink_metadata(directory.join(name))
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    }) {
+        return false;
+    }
+    let Ok(file) = fs::File::open(directory.join("cgroup.controllers")) else {
+        return false;
+    };
+    let mut controllers = String::new();
+    const MAX_CONTROLLERS_BYTES: u64 = 16 * 1024;
+    file.take(MAX_CONTROLLERS_BYTES + 1)
+        .read_to_string(&mut controllers)
+        .is_ok()
+        && controllers.len() as u64 <= MAX_CONTROLLERS_BYTES
 }
 
 fn read_cpu_hierarchy(
@@ -515,7 +552,8 @@ fn read_cpu_hierarchy(
                 && directory == mount.mount_point
                 && mount.mount_root == Path::new("/")
                 && fs::symlink_metadata(&quota_file)
-                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                && has_v2_root_core_files(directory);
             if !normal_root_absence {
                 limits.quota_hierarchy_complete = false;
                 provenance.warnings.push(format!(
@@ -1549,6 +1587,8 @@ mod tests {
             "22 21 0:21 /source /sys/fs/cgroup/job/memory.max rw - ext4 /dev/sda rw\n",
             "22 21 0:21 /source /sys/fs/cgroup/job/child/memory.swap.max rw - ext4 /dev/sda rw\n",
             "22 21 0:21 /source /sys/fs/cgroup/cgroup.controllers rw - ext4 /dev/sda rw\n",
+            "22 21 0:21 /source /sys/fs/cgroup/cgroup.events rw - ext4 /dev/sda rw\n",
+            "22 21 0:21 /source /sys/fs/cgroup/cgroup.type rw - ext4 /dev/sda rw\n",
         ] {
             let hidden = format!("{mount}{replacement}");
             assert!(resolve_cgroup_mount("/job/child", &hidden, "cgroup2", None).is_err());
@@ -1569,6 +1609,7 @@ mod tests {
             .replace('\\', "\\134")
             .replace(' ', "\\040");
         let (filesystem, options) = if v2 {
+            fs::write(root.join("cgroup.controllers"), "cpu\n").unwrap();
             ("cgroup2", "rw")
         } else {
             ("cgroup", "rw,cpu,cpuacct")
@@ -1580,6 +1621,92 @@ mod tests {
                 .is_ok()
         );
         mountinfo
+    }
+
+    #[test]
+    fn cpu_hierarchy_preserves_observed_unlimited_true_v2_root() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let mountinfo = cpu_fixture_mount(&root, "/", "/", true);
+        let mut details = collect_cgroup_from_content("0::/\n", "fixture", None).unwrap();
+        collect_cpu_limits_from_mounts(&mut details, &mountinfo);
+        let limits = details.cpu_limits.as_ref().unwrap();
+        assert!(limits.quota_hierarchy_complete);
+        assert_eq!(limits.source, CpuLimitSource::None);
+        assert_eq!(limits.effective_cores, None);
+        assert_eq!(limits.quota_us, None);
+        assert_eq!(limits.period_us, None);
+        assert_eq!(limits.weight, None);
+        assert!(details.provenance.warnings.is_empty());
+    }
+
+    #[test]
+    fn cpu_hierarchy_root_absence_requires_readable_core_evidence() {
+        for failure in ["missing", "unreadable", "oversized", "non_utf8"] {
+            let root = tempfile::tempdir().unwrap().keep();
+            let mountinfo = format!("21 1 0:20 / {} rw - cgroup2 cgroup rw\n", root.display());
+            let controllers = root.join("cgroup.controllers");
+            match failure {
+                "missing" => {}
+                "unreadable" => fs::create_dir(&controllers).unwrap(),
+                "oversized" => fs::write(&controllers, "x".repeat(16 * 1024 + 1)).unwrap(),
+                "non_utf8" => fs::write(&controllers, [0xff]).unwrap(),
+                _ => unreachable!(),
+            }
+            let mut details = collect_cgroup_from_content("0::/\n", "fixture", None).unwrap();
+            collect_cpu_limits_from_mounts(&mut details, &mountinfo);
+            assert!(details.cpu_limits.is_none(), "{failure}");
+        }
+    }
+
+    #[test]
+    fn cpu_hierarchy_rejects_namespace_root_without_local_cpu_controller() {
+        for marker in ["cgroup.events", "cgroup.type"] {
+            let root = tempfile::tempdir().unwrap().keep();
+            fs::create_dir(root.join("job")).unwrap();
+            fs::write(root.join("job/cpu.max"), "10000 100000\n").unwrap();
+            fs::write(root.join(marker), "non-root\n").unwrap();
+            let mountinfo = cpu_fixture_mount(&root, "/", "/", true);
+            // A missing cpu.max at a namespace root can mean CPU is disabled
+            // here while a hidden ancestor still limits the entire subtree.
+            for membership in ["/", "/job"] {
+                let mut details =
+                    collect_cgroup_from_content(&format!("0::{membership}\n"), "fixture", None)
+                        .unwrap();
+                collect_cpu_limits_from_mounts(&mut details, &mountinfo);
+                assert!(
+                    details
+                        .cpu_limits
+                        .as_ref()
+                        .is_none_or(|limits| !limits.quota_hierarchy_complete),
+                    "{marker}: {membership} must retain unknown ancestor limits"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cpu_hierarchy_unlimited_v2_root_cannot_hide_unresolved_v1_cpu_limits() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let mut mountinfo = cpu_fixture_mount(&root, "/", "/", true);
+        fs::write(root.join("cgroup.controllers"), "memory\n").unwrap();
+        let membership = "0::/\n5:cpu,cpuacct:/job\n";
+        let mut details = collect_cgroup_from_content(membership, "fixture", None).unwrap();
+        collect_cpu_limits_from_mounts(&mut details, &mountinfo);
+        assert!(details.cpu_limits.is_none());
+
+        let legacy = tempfile::tempdir().unwrap().keep();
+        fs::create_dir(legacy.join("job")).unwrap();
+        for (path, quota) in [("", "-1"), ("job", "10000")] {
+            fs::write(legacy.join(path).join("cpu.cfs_quota_us"), quota).unwrap();
+            fs::write(legacy.join(path).join("cpu.cfs_period_us"), "100000").unwrap();
+        }
+        mountinfo.push_str(&cpu_fixture_mount(&legacy, "/job", "/", false));
+        let mut details = collect_cgroup_from_content(membership, "fixture", None).unwrap();
+        collect_cpu_limits_from_mounts(&mut details, &mountinfo);
+        let limits = details.cpu_limits.as_ref().unwrap();
+        assert!(limits.quota_hierarchy_complete);
+        assert_eq!(limits.source, CpuLimitSource::CgroupV1Cfs);
+        assert_eq!(limits.effective_cores, Some(0.1));
     }
 
     #[test]

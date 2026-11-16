@@ -737,6 +737,16 @@ cgroup-v2 ancestor quota, comparing quota/period ratios and reporting the
 controller path that supplies the limit. This is a shared ceiling, not a
 guarantee of CPU time for each member. Hidden or unreadable hierarchy levels
 retain explicit warnings; host-wide percentages still use host capacity.
+For inference, a sampled process's CPU occupancy is its measured cores consumed
+divided by the smaller of its observed thread count and effective CPU capacity.
+The capacity accounts for online CPUs, the effective affinity of every thread,
+and the complete visible quota hierarchy. A process using 10% of one core under
+a 0.1-core quota is fully occupied; its displayed `cpu_percent` still reads 10%.
+The same thread identities, affinity, cgroup membership and capacity must be
+observed at both ends of a completed sampling window. Unreadable, changing or
+over-budget capacity leaves CPU evidence unavailable while preserving the raw
+CPU and I/O measurements. Saved observations retain the denominator, so replay
+never borrows capacity from the machine running it.
 Missing observations are reported as unavailable, and disabled, zero-pressure,
 or wholly unattributable cases preserve the evidence-only decision. Reports
 separate base loss, modeled pressure cost, excluded actions, and unavailable

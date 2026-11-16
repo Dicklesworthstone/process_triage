@@ -14,11 +14,15 @@
 //! - System CLK_TCK via sysconf(_SC_CLK_TCK)
 
 use super::cgroup::collect_cgroup_details;
-use super::cpu_capacity::{compute_cpu_capacity, CpuCapacity};
+use super::cpu_capacity::{
+    compute_cpu_capacity, CpuCapacity, CpuCapacitySample, CpuCapacitySampler,
+};
 use super::proc_parsers::{
     parse_io_content, parse_process_memory_status, parse_schedstat_content, IoStats, SchedStats,
 };
-use super::{ProcessActivity, ProcessMemoryUsage, ProcessPressureActivity, ProcessRecord};
+use super::{
+    CpuOccupancy, ProcessActivity, ProcessMemoryUsage, ProcessPressureActivity, ProcessRecord,
+};
 use pt_common::{IdentityQuality, ProcessIdentity, StartId};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -519,6 +523,7 @@ struct ActivitySnapshot {
     scheduler_observed_at: Instant,
     memory: Result<ProcessMemoryUsage, String>,
     delay_accounting: Result<(), String>,
+    cpu_capacity: Result<CpuCapacitySample, String>,
 }
 
 /// Read accounting switches once per batch endpoint, never modify them. Kernel
@@ -572,6 +577,7 @@ fn ticks_match_process(ticks: &TickSnapshot, process: &ProcessRecord) -> bool {
 fn collect_activity_snapshot(
     process: &ProcessRecord,
     accounting: &ActivityAccounting,
+    capacities: &mut CpuCapacitySampler,
 ) -> Result<ActivitySnapshot, String> {
     let pid = process.pid.0;
     let before = collect_tick_snapshot(pid)
@@ -597,6 +603,7 @@ fn collect_activity_snapshot(
     let memory = fs::read_to_string(format!("/proc/{pid}/status"))
         .map_err(|error| format!("cannot read /proc/{pid}/status: {error}"))
         .and_then(|content| parse_process_memory_status(&content));
+    let cpu_capacity = capacities.observe(pid, before.num_threads);
 
     // All these files are addressed by numeric PID. Bracket them with identity
     // reads so a replacement cannot donate counters or memory to the old record.
@@ -606,6 +613,11 @@ fn collect_activity_snapshot(
     if !ticks_match_process(&after, process) || !before.identity.matches(&after.identity) {
         return Err("process identity changed while collecting activity".to_string());
     }
+    let cpu_capacity = if before.num_threads == after.num_threads {
+        cpu_capacity
+    } else {
+        Err("thread count changed while sampling CPU capacity".to_string())
+    };
     Ok(ActivitySnapshot {
         ticks: after,
         io,
@@ -615,7 +627,47 @@ fn collect_activity_snapshot(
         scheduler_observed_at,
         memory,
         delay_accounting: accounting.delay.clone(),
+        cpu_capacity,
     })
+}
+
+fn normalized_cpu_occupancy(
+    cpu_percent: Option<f64>,
+    before: &Result<CpuCapacitySample, String>,
+    after: &Result<CpuCapacitySample, String>,
+) -> CpuOccupancy {
+    let normalize = || -> Result<CpuOccupancy, String> {
+        let first = before
+            .as_ref()
+            .map_err(|reason| format!("first capacity sample: {reason}"))?;
+        let second = after
+            .as_ref()
+            .map_err(|reason| format!("second capacity sample: {reason}"))?;
+        if first != second {
+            return Err(
+                "CPU capacity, affinity, thread identity or cgroup changed across the window"
+                    .into(),
+            );
+        }
+        let cpu_percent = cpu_percent
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .ok_or("CPU activity is unavailable")?;
+        let effective_cores = second.effective_cores();
+        let effective_parallelism = effective_cores.min(f64::from(second.threads));
+        if !effective_parallelism.is_finite() || effective_parallelism <= 0.0 {
+            return Err("observed CPU capacity is not positive and finite".into());
+        }
+        Ok(CpuOccupancy::Observed {
+            occupancy: (cpu_percent / 100.0 / effective_parallelism).clamp(0.0, 1.0),
+            effective_cores,
+            effective_parallelism,
+            online_cores: second.online_cores,
+            affinity_cores: second.affinity_cores,
+            quota_cores: second.quota_cores,
+            threads: second.threads,
+        })
+    };
+    normalize().unwrap_or_else(|reason| CpuOccupancy::Unavailable { reason })
 }
 
 fn pressure_from_snapshots(
@@ -740,8 +792,13 @@ fn activity_from_snapshots(
         Ok(_) => activity.cpu_error = Some("clock ticks per second is zero".to_string()),
         Err(error) => activity.cpu_error = Some(error.to_string()),
     }
+    activity.cpu_occupancy = Some(normalized_cpu_occupancy(
+        activity.cpu_percent,
+        &before.cpu_capacity,
+        &after.cpu_capacity,
+    ));
 
-    let io_rates = || -> Result<(f64, f64, f64, bool), String> {
+    let io_rates = || -> Result<(f64, f64, f64, u64, u64), String> {
         let first = before
             .io
             .as_ref()
@@ -759,14 +816,16 @@ fn activity_from_snapshots(
             .map_err(|error| format!("read_bytes: {error}"))?;
         let (written, write_rate) = counter_rate(first.write_bytes, second.write_bytes, seconds)
             .map_err(|error| format!("write_bytes: {error}"))?;
-        Ok((seconds, read_rate, write_rate, read > 0 || written > 0))
+        Ok((seconds, read_rate, write_rate, read, written))
     };
     match io_rates() {
-        Ok((seconds, read_rate, write_rate, active)) => {
+        Ok((seconds, read_rate, write_rate, read, written)) => {
             activity.io_window_seconds = Some(seconds);
+            activity.io_read_bytes = Some(read);
+            activity.io_write_bytes = Some(written);
             activity.read_bytes_per_second = Some(read_rate);
             activity.write_bytes_per_second = Some(write_rate);
-            activity.io_active = Some(active);
+            activity.io_active = Some(read > 0 || written > 0);
             activity.io_error = None;
         }
         Err(error) => activity.io_error = Some(error),
@@ -793,13 +852,14 @@ pub fn sample_process_activity(
         return BTreeMap::new();
     }
     let accounting_before = ActivityAccounting::read();
+    let mut capacities_before = CpuCapacitySampler::new();
     let first: Vec<_> = processes
         .iter()
         .copied()
         .map(|process| {
             (
                 process,
-                collect_activity_snapshot(process, &accounting_before),
+                collect_activity_snapshot(process, &accounting_before, &mut capacities_before),
             )
         })
         .collect();
@@ -808,6 +868,7 @@ pub fn sample_process_activity(
     }
     let tck = clk_tck();
     let accounting_after = ActivityAccounting::read();
+    let mut capacities_after = CpuCapacitySampler::new();
     first
         .into_iter()
         .map(|(process, before)| {
@@ -815,7 +876,11 @@ pub fn sample_process_activity(
                 Err(error) => {
                     ProcessActivity::unavailable(process, window, format!("first sample: {error}"))
                 }
-                Ok(before) => match collect_activity_snapshot(process, &accounting_after) {
+                Ok(before) => match collect_activity_snapshot(
+                    process,
+                    &accounting_after,
+                    &mut capacities_after,
+                ) {
                     Ok(after) => activity_from_snapshots(process, &before, &after, window, tck),
                     Err(error) => ProcessActivity::unavailable(
                         process,
@@ -900,6 +965,7 @@ mod tests {
                 threads: 1,
             }),
             delay_accounting: Ok(()),
+            cpu_capacity: Err("fixture capacity unavailable".to_string()),
         };
         let mut second = first.clone();
         second.ticks.timestamp += Duration::from_millis(500);
@@ -907,6 +973,100 @@ mod tests {
         second.io_observed_at += Duration::from_millis(500);
         second.scheduler_observed_at += Duration::from_millis(500);
         (process, first, second)
+    }
+
+    fn capacity_fixture(threads: u32, affinity: u32, quota: Option<f64>) -> CpuCapacitySample {
+        CpuCapacitySample {
+            online_cores: 8,
+            online: vec![(0, 7)],
+            affinity_cores: affinity,
+            quota_cores: quota,
+            threads,
+            affinity: vec![(0, affinity - 1)],
+            membership: "0::/workload\n".into(),
+            tasks: (0..threads).map(|index| (1234 + index, 12345)).collect(),
+        }
+    }
+
+    #[test]
+    fn activity_cpu_occupancy_uses_quota_affinity_and_threads_without_changing_raw_rate() {
+        // Five ticks in half a second is 10% of one CPU but all of a 0.1-core
+        // quota. One busy thread on eight available CPUs also occupies its
+        // entire execution capacity, not one eighth of it.
+        for (ticks, threads, affinity, quota, expected_percent, expected_occupancy) in [
+            (5, 1, 8, Some(0.1), 10.0, 1.0),
+            (50, 1, 8, None, 100.0, 1.0),
+            (50, 4, 2, None, 100.0, 0.5),
+            (100, 4, 8, None, 200.0, 0.5),
+            (0, 4, 2, Some(0.5), 0.0, 0.0),
+        ] {
+            let (process, mut first, mut second) = activity_fixture();
+            first.ticks.num_threads = threads;
+            second.ticks.num_threads = threads;
+            first.cpu_capacity = Ok(capacity_fixture(threads, affinity, quota));
+            second.cpu_capacity = first.cpu_capacity.clone();
+            second.ticks.utime += ticks;
+            second.ticks.total_ticks += ticks;
+            let activity =
+                activity_from_snapshots(&process, &first, &second, Duration::from_millis(500), 100);
+            assert_eq!(activity.cpu_percent, Some(expected_percent));
+            assert_eq!(
+                activity.normalized_cpu_occupancy(),
+                Some(expected_occupancy)
+            );
+            assert_eq!(activity.io_read_bytes, Some(0));
+            assert_eq!(activity.io_write_bytes, Some(0));
+        }
+    }
+
+    #[test]
+    fn changed_or_unavailable_capacity_preserves_rates_but_withholds_cpu_inference() {
+        for change in [
+            "quota",
+            "online",
+            "online_ids",
+            "affinity",
+            "membership",
+            "thread_identity",
+            "threads",
+            "unreadable",
+        ] {
+            let (process, mut first, mut second) = activity_fixture();
+            first.cpu_capacity = Ok(capacity_fixture(1, 2, Some(0.1)));
+            let mut capacity = first.cpu_capacity.clone().unwrap();
+            match change {
+                "quota" => capacity.quota_cores = Some(0.2),
+                "online" => capacity.online_cores = 4,
+                "online_ids" => capacity.online = vec![(1, 8)],
+                "affinity" => capacity.affinity = vec![(2, 3)],
+                "membership" => capacity.membership = "0::/other\n".into(),
+                "thread_identity" => capacity.tasks[0].1 += 1,
+                "threads" => capacity.threads = 2,
+                "unreadable" => (),
+                _ => unreachable!(),
+            }
+            second.cpu_capacity = if change == "unreadable" {
+                Err("permission denied".into())
+            } else {
+                Ok(capacity)
+            };
+            second.ticks.utime += 5;
+            second.ticks.total_ticks += 5;
+            second.io.as_mut().unwrap().write_bytes += 10;
+            let activity =
+                activity_from_snapshots(&process, &first, &second, Duration::from_millis(500), 100);
+            assert_eq!(activity.cpu_percent, Some(10.0), "{change}");
+            assert_eq!(activity.normalized_cpu_occupancy(), None, "{change}");
+            assert!(
+                matches!(
+                    activity.cpu_occupancy,
+                    Some(CpuOccupancy::Unavailable { .. })
+                ),
+                "{change}"
+            );
+            assert_eq!(activity.io_write_bytes, Some(10), "{change}");
+            assert_eq!(activity.write_bytes_per_second, Some(20.0), "{change}");
+        }
     }
 
     #[test]

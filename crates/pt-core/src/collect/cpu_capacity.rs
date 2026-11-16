@@ -16,7 +16,321 @@
 
 use super::cgroup::CgroupDetails;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
+use std::io::Read;
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+const CAPACITY_MAX_THREADS: usize = 256;
+const CAPACITY_MAX_FILE_BYTES: usize = 64 * 1024;
+const CAPACITY_MAX_MOUNT_BYTES: usize = 2 * 1024 * 1024;
+const CAPACITY_PROCESS_BUDGET: Duration = Duration::from_millis(50);
+const CAPACITY_SCAN_BUDGET: Duration = Duration::from_millis(500);
+
+/// Complete endpoint observations for inference, unlike the best-effort
+/// capacity hints returned by `compute_cpu_capacity` to diagnostic callers.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct CpuCapacitySample {
+    pub online_cores: u32,
+    pub online: Vec<(u32, u32)>,
+    pub affinity_cores: u32,
+    pub quota_cores: Option<f64>,
+    pub threads: u32,
+    pub affinity: Vec<(u32, u32)>,
+    pub membership: String,
+    pub tasks: Vec<(u32, u64)>,
+}
+
+impl CpuCapacitySample {
+    pub fn effective_cores(&self) -> f64 {
+        // Cpus_allowed_list is already the effective affinity/cpuset mask.
+        // Do not read a guessed /sys/fs/cgroup cpuset path in another namespace.
+        compute_n_eff(
+            Some(self.affinity_cores),
+            None,
+            self.quota_cores,
+            self.online_cores,
+        )
+    }
+}
+
+/// One shared capacity view per activity-window endpoint. CPU quota hierarchies
+/// are read once per observed membership, not once per process or thread.
+pub(super) struct CpuCapacitySampler {
+    started: Instant,
+    online: Result<Vec<(u32, u32)>, String>,
+    mountinfo: Result<String, String>,
+    quotas: HashMap<String, Result<Option<f64>, String>>,
+}
+
+impl CpuCapacitySampler {
+    pub fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            online: read_capacity_text(
+                Path::new("/sys/devices/system/cpu/online"),
+                CAPACITY_MAX_FILE_BYTES,
+            )
+            .and_then(|list| parse_observed_affinity(&format!("Cpus_allowed_list:{list}"))),
+            mountinfo: read_capacity_text(
+                Path::new("/proc/self/mountinfo"),
+                CAPACITY_MAX_MOUNT_BYTES,
+            ),
+            quotas: HashMap::new(),
+        }
+    }
+
+    pub fn observe(&mut self, pid: u32, threads: u32) -> Result<CpuCapacitySample, String> {
+        let started = Instant::now();
+        capacity_budget(started, self.started)?;
+        let online = self.online.as_ref().map_err(Clone::clone)?;
+        let online_cores = affinity_count(online)?;
+        let root = std::path::PathBuf::from(format!("/proc/{pid}"));
+        let membership = read_capacity_membership(&root.join("cgroup"))?;
+        let quota_cores = if let Some(cached) = self.quotas.get(&membership) {
+            cached.clone()
+        } else {
+            let observed = self
+                .mountinfo
+                .as_ref()
+                .map_err(Clone::clone)
+                .and_then(|mountinfo| observed_quota(&membership, mountinfo));
+            self.quotas.insert(membership.clone(), observed.clone());
+            observed
+        }?;
+        capacity_budget(started, self.started)?;
+        let tasks = read_capacity_tasks(&root.join("task"), threads)?;
+        let mut observed_tasks = Vec::with_capacity(tasks.len());
+        let mut affinity = None;
+        for tid in &tasks {
+            capacity_budget(started, self.started)?;
+            let task = root.join("task").join(tid.to_string());
+            let starttime = read_capacity_starttime(&task.join("stat"), *tid)?;
+            let status = read_capacity_text(&task.join("status"), CAPACITY_MAX_FILE_BYTES)?;
+            let mask = parse_observed_affinity(&status)?;
+            if affinity.as_ref().is_some_and(|expected| *expected != mask) {
+                return Err(
+                    "threads have different CPU affinities; capacity is not established".into(),
+                );
+            }
+            affinity = Some(mask);
+            if read_capacity_membership(&task.join("cgroup"))? != membership {
+                return Err("threads have different CPU cgroup memberships".into());
+            }
+            observed_tasks.push((*tid, starttime));
+        }
+        // A thread that exits or changes affinity/membership during inspection
+        // must not lend a capacity denominator to the original process.
+        for (tid, starttime) in &observed_tasks {
+            capacity_budget(started, self.started)?;
+            let task = root.join("task").join(tid.to_string());
+            let status = read_capacity_text(&task.join("status"), CAPACITY_MAX_FILE_BYTES)?;
+            if read_capacity_starttime(&task.join("stat"), *tid)? != *starttime
+                || Some(parse_observed_affinity(&status)?) != affinity
+                || read_capacity_membership(&task.join("cgroup"))? != membership
+            {
+                return Err(
+                    "thread identity, affinity or cgroup changed during capacity sampling".into(),
+                );
+            }
+        }
+        capacity_budget(started, self.started)?;
+        if read_capacity_tasks(&root.join("task"), threads)? != tasks
+            || read_capacity_membership(&root.join("cgroup"))? != membership
+        {
+            return Err("thread inventory or cgroup changed during capacity sampling".into());
+        }
+        capacity_budget(started, self.started)?;
+        let affinity = affinity.ok_or("no complete thread affinity observation")?;
+        // Affinity can retain offline CPU IDs. Intersect the actual masks;
+        // min(mask sizes) can overstate the CPUs this process can execute on.
+        let affinity_cores = online_affinity_count(&affinity, online)?;
+        Ok(CpuCapacitySample {
+            online_cores,
+            online: online.clone(),
+            affinity_cores,
+            quota_cores,
+            threads,
+            affinity,
+            membership,
+            tasks: observed_tasks,
+        })
+    }
+}
+
+fn capacity_budget(started: Instant, scan_started: Instant) -> Result<(), String> {
+    if scan_started.elapsed() > CAPACITY_SCAN_BUDGET {
+        Err("shared CPU capacity scan budget exhausted".into())
+    } else if started.elapsed() > CAPACITY_PROCESS_BUDGET {
+        Err("CPU capacity inspection budget exhausted".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn read_capacity_text(path: &Path, limit: usize) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .and_then(|file| file.take(limit as u64 + 1).read_to_end(&mut bytes))
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    if bytes.len() > limit {
+        return Err(format!(
+            "CPU capacity evidence exceeds byte limit: {}",
+            path.display()
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| format!("non-UTF-8 CPU capacity evidence: {}", path.display()))
+}
+
+fn read_capacity_membership(path: &Path) -> Result<String, String> {
+    let content = read_capacity_text(path, CAPACITY_MAX_FILE_BYTES)?;
+    if content.is_empty()
+        || content.lines().any(|line| {
+            let fields: Vec<_> = line.splitn(3, ':').collect();
+            fields.len() != 3 || fields[0].parse::<u32>().is_err() || !fields[2].starts_with('/')
+        })
+    {
+        return Err("CPU cgroup membership is invalid or incomplete".into());
+    }
+    Ok(content)
+}
+
+fn observed_quota(membership: &str, mountinfo: &str) -> Result<Option<f64>, String> {
+    let mut details =
+        super::cgroup::collect_cgroup_from_content(membership, "activity_window", None)
+            .ok_or("cannot parse CPU cgroup membership")?;
+    super::cgroup::collect_cpu_limits_from_mounts(&mut details, mountinfo);
+    let limits = details
+        .cpu_limits
+        .filter(|limits| limits.quota_hierarchy_complete)
+        .ok_or("complete CPU quota hierarchy is unavailable (including hidden ancestors)")?;
+    if limits
+        .effective_cores
+        .is_some_and(|cores| !cores.is_finite() || cores <= 0.0)
+    {
+        return Err("observed CPU quota is not positive and finite".into());
+    }
+    Ok(limits.effective_cores)
+}
+
+fn read_capacity_tasks(root: &Path, threads: u32) -> Result<Vec<u32>, String> {
+    if threads == 0 || threads as usize > CAPACITY_MAX_THREADS {
+        return Err("thread count is zero or exceeds CPU capacity inspection limit".into());
+    }
+    let entries =
+        fs::read_dir(root).map_err(|error| format!("cannot inspect thread inventory: {error}"))?;
+    let mut tasks = Vec::new();
+    for entry in entries {
+        if tasks.len() >= CAPACITY_MAX_THREADS {
+            return Err("thread inventory exceeds CPU capacity inspection limit".into());
+        }
+        let entry = entry.map_err(|error| format!("incomplete thread inventory: {error}"))?;
+        let tid = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+            .filter(|tid| *tid > 0)
+            .ok_or("invalid thread inventory entry")?;
+        tasks.push(tid);
+    }
+    tasks.sort_unstable();
+    if tasks.len() != threads as usize {
+        return Err("thread inventory differs from sampled thread count".into());
+    }
+    Ok(tasks)
+}
+
+fn read_capacity_starttime(path: &Path, tid: u32) -> Result<u64, String> {
+    let content = read_capacity_text(path, CAPACITY_MAX_FILE_BYTES)?;
+    let parse = || -> Option<u64> {
+        let start = content.find('(')?;
+        if content[..start].trim().parse::<u32>().ok()? != tid {
+            return None;
+        }
+        let fields = content.get(content.rfind(')')? + 1..)?;
+        fields.split_whitespace().nth(19)?.parse().ok()
+    };
+    parse().ok_or_else(|| "invalid thread identity during CPU capacity inspection".into())
+}
+
+/// Strict complete affinity parsing for inference; malformed fragments must not
+/// silently reduce the capacity as the legacy best-effort count helper can.
+fn parse_observed_affinity(status: &str) -> Result<Vec<(u32, u32)>, String> {
+    let mut fields = status
+        .lines()
+        .filter_map(|line| line.strip_prefix("Cpus_allowed_list:"));
+    let list = fields.next().ok_or("CPU affinity is unavailable")?.trim();
+    if fields.next().is_some() || list.is_empty() {
+        return Err("CPU affinity is empty or duplicated".into());
+    }
+    let mut intervals = Vec::new();
+    for entry in list.split(',') {
+        let (first, last) = entry
+            .trim()
+            .split_once('-')
+            .unwrap_or((entry.trim(), entry.trim()));
+        let first = first
+            .parse::<u32>()
+            .map_err(|_| "invalid CPU affinity range")?;
+        let last = last
+            .parse::<u32>()
+            .map_err(|_| "invalid CPU affinity range")?;
+        if last < first {
+            return Err("reversed CPU affinity range".into());
+        }
+        intervals.push((first, last));
+    }
+    intervals.sort_unstable();
+    let mut canonical: Vec<(u32, u32)> = Vec::new();
+    for (first, last) in intervals {
+        if let Some(previous) = canonical.last_mut() {
+            if first <= previous.1 {
+                return Err("overlapping CPU affinity ranges".into());
+            }
+            if previous.1.checked_add(1) == Some(first) {
+                previous.1 = last;
+                continue;
+            }
+        }
+        canonical.push((first, last));
+    }
+    affinity_count(&canonical)?;
+    Ok(canonical)
+}
+
+fn affinity_count(intervals: &[(u32, u32)]) -> Result<u32, String> {
+    intervals.iter().try_fold(0u32, |total, (first, last)| {
+        last.checked_sub(*first)
+            .and_then(|size| size.checked_add(1))
+            .and_then(|size| total.checked_add(size))
+            .filter(|total| *total > 0)
+            .ok_or_else(|| "CPU affinity size is invalid or overflows".into())
+    })
+}
+
+fn online_affinity_count(affinity: &[(u32, u32)], online: &[(u32, u32)]) -> Result<u32, String> {
+    let mut intersection = Vec::new();
+    let (mut left, mut right) = (0, 0);
+    while left < affinity.len() && right < online.len() {
+        let first = affinity[left].0.max(online[right].0);
+        let last = affinity[left].1.min(online[right].1);
+        if first <= last {
+            intersection.push((first, last));
+        }
+        if affinity[left].1 <= online[right].1 {
+            left += 1;
+        } else {
+            right += 1;
+        }
+    }
+    affinity_count(&intersection).and_then(|count| {
+        (count > 0)
+            .then_some(count)
+            .ok_or_else(|| "CPU affinity has no observed online CPUs".into())
+    })
+}
 
 /// Effective CPU capacity for a process.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -398,6 +712,96 @@ pub fn compute_n_eff(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observed_affinity_requires_complete_nonoverlapping_nonempty_ranges() {
+        let compact =
+            parse_observed_affinity("Name:\tworker\nCpus_allowed_list:\t0-3,5\n").unwrap();
+        let expanded = parse_observed_affinity("Cpus_allowed_list:\t0,1,2,3,5\n").unwrap();
+        assert_eq!(compact, expanded);
+        assert_eq!(affinity_count(&compact).unwrap(), 5);
+        for list in [
+            "",
+            "0,",
+            "bad",
+            "0-3,bad",
+            "5-2",
+            "0-3,2-4",
+            "0,0",
+            "0-4294967295",
+        ] {
+            assert!(
+                parse_observed_affinity(&format!("Cpus_allowed_list:\t{list}\n")).is_err(),
+                "{list:?} must not become a smaller fabricated capacity"
+            );
+        }
+        assert!(parse_observed_affinity("Name:\tworker\n").is_err());
+        assert!(parse_observed_affinity("Cpus_allowed_list:\t0\nCpus_allowed_list:\t1\n").is_err());
+    }
+
+    #[test]
+    fn online_affinity_uses_cpu_ids_instead_of_minimum_mask_sizes() {
+        assert_eq!(online_affinity_count(&[(0, 3)], &[(2, 5)]).unwrap(), 2);
+        assert_eq!(
+            online_affinity_count(&[(0, 3), (8, 11)], &[(1, 2), (4, 9)]).unwrap(),
+            4
+        );
+        assert!(online_affinity_count(&[(0, 3)], &[(4, 7)]).is_err());
+        assert!(online_affinity_count(&[], &[(0, 3)]).is_err());
+    }
+
+    #[test]
+    fn capacity_quota_rejects_hidden_or_unreadable_hierarchies() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("cgroup.controllers"), "cpu\n").unwrap();
+        fs::create_dir(directory.path().join("job")).unwrap();
+        fs::write(directory.path().join("job/cpu.max"), "10000 100000\n").unwrap();
+        fs::write(directory.path().join("job/cpu.weight"), "100\n").unwrap();
+        let mountinfo = format!(
+            "42 31 0:35 / {} rw - cgroup2 cgroup rw\n",
+            directory.path().display()
+        );
+        assert_eq!(observed_quota("0::/job\n", &mountinfo).unwrap(), Some(0.1));
+
+        // A quota at the purported root proves ancestors are hidden even when
+        // mountinfo reports a slash root. Do not infer that this is the limit.
+        fs::write(directory.path().join("cpu.max"), "max 100000\n").unwrap();
+        assert!(observed_quota("0::/job\n", &mountinfo).is_err());
+        let hidden = mountinfo.replacen(" / ", " /hidden ", 1);
+        assert!(observed_quota("0::/hidden/job\n", &hidden).is_err());
+        assert!(observed_quota("0::/job\n", "").is_err());
+    }
+
+    #[test]
+    fn capacity_thread_inventory_is_bounded_and_complete() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("12")).unwrap();
+        fs::create_dir(directory.path().join("13")).unwrap();
+        assert_eq!(
+            read_capacity_tasks(directory.path(), 2).unwrap(),
+            vec![12, 13]
+        );
+        assert!(read_capacity_tasks(directory.path(), 1).is_err());
+        assert!(read_capacity_tasks(directory.path(), 0).is_err());
+        assert!(read_capacity_tasks(directory.path(), CAPACITY_MAX_THREADS as u32 + 1).is_err());
+        fs::create_dir(directory.path().join("bad")).unwrap();
+        assert!(read_capacity_tasks(directory.path(), 3).is_err());
+    }
+
+    #[test]
+    fn exhausted_capacity_scan_does_not_probe_later_processes() {
+        let mut sampler = CpuCapacitySampler {
+            started: Instant::now() - CAPACITY_SCAN_BUDGET - Duration::from_millis(1),
+            online: Ok(vec![(0, 7)]),
+            mountinfo: Err("must not be consulted".into()),
+            quotas: HashMap::new(),
+        };
+        for pid in [std::process::id(), u32::MAX] {
+            let error = sampler.observe(pid, 1).unwrap_err();
+            assert_eq!(error, "shared CPU capacity scan budget exhausted");
+            assert!(sampler.quotas.is_empty());
+        }
+    }
 
     #[test]
     fn test_count_cpus_single() {

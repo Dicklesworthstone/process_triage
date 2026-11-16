@@ -4581,7 +4581,7 @@ finally:
                     .arg(mode)
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
-                    .stderr(Stdio::inherit())
+                    .stderr(Stdio::null())
                     .spawn()
                     .expect("spawn owned thread descriptor fixture"),
                 reader: None,

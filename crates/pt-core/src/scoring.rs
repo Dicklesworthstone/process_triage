@@ -1169,9 +1169,9 @@ impl Scorer {
         let respawn_history = observations.respawn_history;
         let work = observations.work;
         if let Some(activity) = &activity {
-            evidence.cpu = activity.cpu_percent.map(|percent| CpuEvidence::Fraction {
-                occupancy: (percent / 100.0).clamp(0.0, 1.0),
-            });
+            evidence.cpu = activity
+                .cpu_occupancy_fraction()
+                .map(|occupancy| CpuEvidence::Fraction { occupancy });
             evidence.io_active = activity.io_active;
         }
         if desktop_app.is_some() {
@@ -1374,6 +1374,24 @@ impl Scorer {
                 "Activity ({}; requested {}ms): {cpu}; {io}",
                 activity.source, activity.requested_window_ms
             ));
+            if activity.source == "procfs_window" {
+                let capacity = match (
+                    activity.normalized_cpu_occupancy(),
+                    activity.cpu_occupancy.as_ref(),
+                ) {
+                    (Some(occupancy), Some(crate::collect::CpuOccupancy::Observed {
+                        effective_cores, effective_parallelism, threads, ..
+                    })) => format!(
+                        "CPU occupancy {:.2}% of {:.3} effective cores (min of {} threads and {:.3} observed core capacity); uniform thread affinities and quota scope were stable at both window endpoints",
+                        occupancy * 100.0, effective_parallelism, threads, effective_cores
+                    ),
+                    (_, Some(crate::collect::CpuOccupancy::Unavailable { reason })) => {
+                        format!("CPU occupancy unavailable: {reason}; raw CPU rate is display-only")
+                    }
+                    _ => "CPU occupancy unavailable: missing or invalid recorded capacity; raw CPU rate is display-only".to_string(),
+                };
+                ledger.top_evidence.push(capacity);
+            }
         }
 
         if let Some(history) = &respawn_history {
@@ -2023,7 +2041,10 @@ mod tests {
             cpu_percent: Some(cpu),
             cpu_ticks: Some(if cpu > 0.0 { 1 } else { 0 }),
             cpu_window_seconds: Some(0.5),
+            cpu_occupancy: None,
             io_window_seconds: Some(0.5),
+            io_read_bytes: None,
+            io_write_bytes: None,
             read_bytes_per_second: Some(read),
             write_bytes_per_second: Some(0.0),
             io_active: Some(read > 0.0),
@@ -2680,7 +2701,18 @@ mod tests {
         activity.cpu_percent = Some(0.0);
         activity.cpu_ticks = Some(0);
         activity.cpu_window_seconds = Some(0.5);
+        activity.cpu_occupancy = Some(crate::collect::CpuOccupancy::Observed {
+            occupancy: 0.0,
+            effective_cores: 1.0,
+            effective_parallelism: 1.0,
+            online_cores: 1,
+            affinity_cores: 1,
+            quota_cores: None,
+            threads: 1,
+        });
         activity.io_window_seconds = Some(0.5);
+        activity.io_read_bytes = Some(0);
+        activity.io_write_bytes = Some(0);
         activity.read_bytes_per_second = Some(0.0);
         activity.write_bytes_per_second = Some(0.0);
         activity.io_active = Some(false);
@@ -2727,6 +2759,15 @@ mod tests {
                 activity.cpu_percent = Some(80.0);
                 activity.cpu_ticks = Some(40);
                 activity.cpu_window_seconds = Some(0.5);
+                activity.cpu_occupancy = Some(crate::collect::CpuOccupancy::Observed {
+                    occupancy: 0.8,
+                    effective_cores: 1.0,
+                    effective_parallelism: 1.0,
+                    online_cores: 1,
+                    affinity_cores: 1,
+                    quota_cores: None,
+                    threads: 1,
+                });
                 activity.cpu_error = None;
             } else {
                 activity.io_active = Some(true);
@@ -2993,6 +3034,168 @@ mod tests {
             .top_evidence
             .iter()
             .any(|line| line.contains("procfs_window") && line.contains("over 0.500s")));
+    }
+
+    #[test]
+    fn replayed_quota_busy_cpu_uses_recorded_capacity_and_preserves_display_percent() {
+        let process = record(1234, "worker", "worker", FOUR_DAYS);
+        let measured = scorer(SignatureDatabase::new());
+        let mut observations = measured.recorded_observations(&process, None);
+        let mut activity = sampled_idle(&process);
+        activity.cpu_percent = Some(10.0);
+        activity.cpu_ticks = Some(5);
+        activity.cpu_occupancy = Some(crate::collect::CpuOccupancy::Observed {
+            occupancy: 1.0,
+            effective_cores: 0.1,
+            effective_parallelism: 0.1,
+            online_cores: 32,
+            affinity_cores: 8,
+            quota_cores: Some(0.1),
+            threads: 4,
+        });
+        observations.activity = Some(activity);
+        // The serialized observation, not this test machine's CPU limits,
+        // determines the replay posterior and its explanation.
+        let observations: ScoringObservations =
+            serde_json::from_slice(&serde_json::to_vec(&observations).unwrap()).unwrap();
+        let incoming = Evidence {
+            cpu: Some(CpuEvidence::Fraction { occupancy: 0.1 }),
+            ..Evidence::default()
+        };
+        let actual = measured
+            .score_recorded(&process, incoming, observations)
+            .unwrap();
+        let expected = measured
+            .score_with_desktop(
+                &process,
+                Evidence {
+                    cpu: Some(CpuEvidence::Fraction { occupancy: 1.0 }),
+                    io_active: Some(false),
+                    ..Evidence::default()
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(actual.posterior.posterior, expected.posterior.posterior);
+        assert_eq!(actual.activity.as_ref().unwrap().cpu_percent, Some(10.0));
+        assert_eq!(
+            actual.activity.as_ref().unwrap().cpu_occupancy_fraction(),
+            Some(1.0)
+        );
+        assert!(
+            actual
+                .ledger
+                .top_evidence
+                .iter()
+                .any(|line| line.contains("CPU occupancy 100.00%") && line.contains("0.100"))
+        );
+    }
+
+    #[test]
+    fn missing_or_invalid_recorded_capacity_never_becomes_idle_or_one_core_evidence() {
+        let process = record(1234, "worker", "worker", FOUR_DAYS);
+        let measured = scorer(SignatureDatabase::new());
+        for invalid in [
+            "missing",
+            "unavailable",
+            "zero_capacity",
+            "zero_threads",
+            "nonfinite",
+            "wrong_fraction",
+            "wrong_parallelism",
+            "short_window",
+        ] {
+            let mut activity = sampled_idle(&process);
+            activity.cpu_percent = Some(10.0);
+            activity.cpu_occupancy = Some(crate::collect::CpuOccupancy::Observed {
+                occupancy: 1.0,
+                effective_cores: 0.1,
+                effective_parallelism: 0.1,
+                online_cores: 8,
+                affinity_cores: 2,
+                quota_cores: Some(0.1),
+                threads: 1,
+            });
+            match invalid {
+                "missing" => activity.cpu_occupancy = None,
+                "unavailable" => {
+                    activity.cpu_occupancy = Some(crate::collect::CpuOccupancy::Unavailable {
+                        reason: "quota hierarchy unreadable".into(),
+                    })
+                }
+                "short_window" => activity.cpu_window_seconds = Some(0.1),
+                _ => {
+                    if let Some(crate::collect::CpuOccupancy::Observed {
+                        affinity_cores,
+                        threads,
+                        occupancy,
+                        effective_parallelism,
+                        ..
+                    }) = activity.cpu_occupancy.as_mut()
+                    {
+                        match invalid {
+                            "zero_capacity" => *affinity_cores = 0,
+                            "zero_threads" => *threads = 0,
+                            "nonfinite" => *occupancy = f64::NAN,
+                            "wrong_fraction" => *occupancy = 0.1,
+                            "wrong_parallelism" => *effective_parallelism = 1.0,
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+            }
+            let mut observations = measured.recorded_observations(&process, None);
+            observations.activity = Some(activity);
+            let actual = measured
+                .score_recorded(
+                    &process,
+                    Evidence {
+                        cpu: Some(CpuEvidence::Fraction { occupancy: 0.1 }),
+                        ..Evidence::default()
+                    },
+                    observations,
+                )
+                .unwrap();
+            assert!(
+                actual
+                    .posterior
+                    .evidence_terms
+                    .iter()
+                    .all(|term| term.feature != "cpu"),
+                "{invalid}"
+            );
+            assert_eq!(
+                actual.activity.as_ref().unwrap().cpu_percent,
+                Some(10.0),
+                "{invalid}"
+            );
+            assert_eq!(
+                actual.activity.as_ref().unwrap().cpu_occupancy_fraction(),
+                None,
+                "{invalid}"
+            );
+            assert!(
+                actual
+                    .ledger
+                    .top_evidence
+                    .iter()
+                    .any(|line| line.contains("CPU occupancy unavailable")),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_native_cpu_fallback_retains_its_label_and_fraction() {
+        let process = record(1234, "worker", "worker", FOUR_DAYS);
+        let mut activity = sampled_idle(&process);
+        activity.source = "ps_lifetime_fallback".into();
+        activity.cpu_percent = Some(40.0);
+        activity.cpu_occupancy = None;
+        activity.cpu_window_seconds = None;
+        assert_eq!(activity.cpu_occupancy_fraction(), Some(0.4));
+        activity.source = "unknown".into();
+        assert_eq!(activity.cpu_occupancy_fraction(), None);
     }
 
     #[test]

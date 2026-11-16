@@ -10085,7 +10085,10 @@ mod executable_goal_tests {
             cpu_percent: Some(400.0),
             cpu_ticks: Some(250),
             cpu_window_seconds: Some(0.5),
+            cpu_occupancy: None,
             io_window_seconds: None,
+            io_read_bytes: None,
+            io_write_bytes: None,
             read_bytes_per_second: None,
             write_bytes_per_second: None,
             io_active: None,
@@ -27328,7 +27331,10 @@ mod planning_pressure_tests {
             cpu_percent: Some(400.0),
             cpu_ticks: Some(200),
             cpu_window_seconds: Some(0.5),
+            cpu_occupancy: None,
             io_window_seconds: Some(0.5),
+            io_read_bytes: Some(500),
+            io_write_bytes: Some(0),
             read_bytes_per_second: Some(1000.0),
             write_bytes_per_second: Some(0.0),
             io_active: Some(true),
@@ -31524,6 +31530,10 @@ fn build_process_explanation(
     let learned_prior = &score.learned_prior;
     let activity = score.activity.as_ref();
     let cpu_percent = process_cpu_percent(proc, activity);
+    let cpu_occupancy = activity.map_or_else(
+        || cpu_percent.map(|percent| (percent / 100.0).clamp(0.0, 1.0)),
+        pt_core::collect::ProcessActivity::cpu_occupancy_fraction,
+    );
     let io_active = activity.and_then(|sample| sample.io_active);
 
     // Build base explanation
@@ -31599,7 +31609,7 @@ fn build_process_explanation(
     // Add input evidence if requested
     if args.include.contains(&"evidence".to_string()) {
         explanation["evidence"] = serde_json::json!({
-            "cpu_occupancy": cpu_percent.map(|percent| (percent / 100.0).clamp(0.0, 1.0)),
+            "cpu_occupancy": cpu_occupancy,
             "io_active": io_active,
             "runtime_seconds": proc.elapsed.as_secs_f64(),
             "is_orphan": proc.is_orphan(),

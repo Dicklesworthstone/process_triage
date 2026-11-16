@@ -249,6 +249,28 @@ impl ProcessPressureActivity {
     }
 }
 
+/// CPU occupancy relative to the capacity observed for this thread group.
+///
+/// Raw CPU percentages retain the one-core = 100% convention. Inference uses
+/// this separately recorded observation so a busy quota-limited process is not
+/// mistaken for an idle one. Missing or changing capacity is not zero activity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum CpuOccupancy {
+    Observed {
+        occupancy: f64,
+        effective_cores: f64,
+        effective_parallelism: f64,
+        online_cores: u32,
+        affinity_cores: u32,
+        quota_cores: Option<f64>,
+        threads: u32,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
 /// Recent CPU, storage-I/O and pressure activity for one process incarnation.
 ///
 /// Missing measurements remain null, with a reason; they never mean that the
@@ -265,7 +287,13 @@ pub struct ProcessActivity {
     pub cpu_percent: Option<f64>,
     pub cpu_ticks: Option<u64>,
     pub cpu_window_seconds: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_occupancy: Option<CpuOccupancy>,
     pub io_window_seconds: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub io_read_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub io_write_bytes: Option<u64>,
     pub read_bytes_per_second: Option<f64>,
     pub write_bytes_per_second: Option<f64>,
     /// Whether storage bytes moved during this window, not during the lifetime.
@@ -278,6 +306,67 @@ pub struct ProcessActivity {
 }
 
 impl ProcessActivity {
+    /// CPU input used by scoring and explain/replay surfaces. A requested Linux
+    /// window requires recorded capacity; only the explicit native-ps fallback
+    /// retains the legacy one-core fraction on unsupported platforms.
+    pub fn cpu_occupancy_fraction(&self) -> Option<f64> {
+        match self.source.as_str() {
+            "procfs_window" => self.normalized_cpu_occupancy(),
+            "ps_lifetime_fallback" => self
+                .cpu_percent
+                .filter(|percent| percent.is_finite() && *percent >= 0.0)
+                .map(|percent| (percent / 100.0).clamp(0.0, 1.0)),
+            _ => None,
+        }
+    }
+
+    /// Validate the recorded denominator before admitting it to inference.
+    /// Replay never fills missing capacity from the machine running the replay.
+    pub(crate) fn normalized_cpu_occupancy(&self) -> Option<f64> {
+        if self.source != "procfs_window"
+            || self.requested_window_ms == 0
+            || self.cpu_error.is_some()
+            || !self.cpu_window_seconds.is_some_and(|seconds| {
+                seconds.is_finite()
+                    && seconds > 0.0
+                    && seconds >= self.requested_window_ms as f64 / 1000.0
+            })
+        {
+            return None;
+        }
+        let CpuOccupancy::Observed {
+            occupancy,
+            effective_cores,
+            effective_parallelism,
+            online_cores,
+            affinity_cores,
+            quota_cores,
+            threads,
+        } = self.cpu_occupancy.as_ref()?
+        else {
+            return None;
+        };
+        if *online_cores == 0
+            || *affinity_cores == 0
+            || *threads == 0
+            || quota_cores.is_some_and(|cores| !cores.is_finite() || cores <= 0.0)
+        {
+            return None;
+        }
+        let capacity = f64::from((*online_cores).min(*affinity_cores))
+            .min(quota_cores.unwrap_or(f64::INFINITY));
+        let parallelism = capacity.min(f64::from(*threads));
+        let percent = self
+            .cpu_percent
+            .filter(|percent| percent.is_finite() && *percent >= 0.0)?;
+        let normalized = (percent / 100.0 / parallelism).clamp(0.0, 1.0);
+        (*effective_cores == capacity
+            && *effective_parallelism == parallelism
+            && occupancy.is_finite()
+            && (*occupancy - normalized).abs() <= 1e-12)
+            .then_some(normalized)
+    }
+
     pub(crate) fn unavailable(
         process: &ProcessRecord,
         window: Duration,
@@ -298,7 +387,10 @@ impl ProcessActivity {
             cpu_percent: None,
             cpu_ticks: None,
             cpu_window_seconds: None,
+            cpu_occupancy: None,
             io_window_seconds: None,
+            io_read_bytes: None,
+            io_write_bytes: None,
             read_bytes_per_second: None,
             write_bytes_per_second: None,
             io_active: None,
