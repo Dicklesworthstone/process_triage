@@ -8,6 +8,9 @@
 //! `pt_common::workspace_evidence`.
 
 use std::fs;
+use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use pt_common::{HeadState, PathResolutionError, RawPathEvidence};
@@ -27,9 +30,12 @@ pub fn resolve_workspace_for_pid(pid: u32) -> RawWorkspaceEvidence {
         Some(cwd_ev) => {
             let effective = cwd_ev.effective_path();
             let (root, wt) = find_repo_root(Path::new(effective));
-            let head = root
+            // HEAD belongs to the checkout, not the shared repository. A linked
+            // worktree can be on another branch or have a detached HEAD.
+            let head = wt
                 .as_ref()
-                .map(|r| read_head_state(Path::new(r.effective_path())))
+                .or(root.as_ref())
+                .map(|checkout| read_head_state(Path::new(checkout.effective_path())))
                 .unwrap_or(Some(HeadState::NotARepo));
             (root, wt, head)
         }
@@ -141,11 +147,32 @@ pub fn find_repo_root(start: &Path) -> (Option<RawPathEvidence>, Option<RawPathE
     (None, None)
 }
 
-/// Parse a `.git` file that points to a gitdir (git worktree format).
+/// Maximum size of a gitdir pointer, including its prefix and newline.
+const MAX_GITDIR_FILE_BYTES: u64 = 4096;
+
+/// Parse a `.git` file that points to a checkout's own Git directory.
 ///
-/// Expected format: `gitdir: /path/to/.git/worktrees/<name>`
-fn parse_gitdir_file(git_file: &Path) -> Option<PathBuf> {
-    let content = fs::read_to_string(git_file).ok()?;
+/// Expected format: `gitdir: /path/to/.git/worktrees/<name>`. Relative paths
+/// are resolved against the pointer file, as Git does for submodules as well.
+/// Never follow `commondir`: each checkout has its own HEAD and index.
+pub(super) fn parse_gitdir_file(git_file: &Path) -> Option<PathBuf> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    // A marker may change between inspection and open. Do not hang on a FIFO
+    // substituted at that point; only regular files are accepted below.
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK);
+    let file = options.open(git_file).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut content = String::new();
+    file.take(MAX_GITDIR_FILE_BYTES + 1)
+        .read_to_string(&mut content)
+        .ok()?;
+    if content.len() as u64 > MAX_GITDIR_FILE_BYTES {
+        return None;
+    }
     let line = content.lines().next()?;
     let gitdir = line.strip_prefix("gitdir: ")?;
     let gitdir_path = gitdir.trim();
@@ -591,6 +618,112 @@ mod tests {
             read_head_state(&dir),
             Some(HeadState::Unreadable {
                 reason: "malformed .git file".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn parse_gitdir_file_preserves_checkout_local_absolute_and_relative_paths() {
+        let dir = retained_test_dir("gitdir-paths");
+        let checkout = dir.join("checkout");
+        let gitdir = dir.join("main/.git/worktrees/checkout");
+        fs::create_dir_all(&checkout).unwrap();
+        fs::create_dir_all(&gitdir).unwrap();
+        fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+        let marker = checkout.join(".git");
+
+        fs::write(&marker, format!("gitdir: {}\n", gitdir.display())).unwrap();
+        assert_eq!(parse_gitdir_file(&marker), Some(gitdir));
+
+        fs::write(&marker, "gitdir: ../main/.git/worktrees/checkout\n").unwrap();
+        assert_eq!(
+            parse_gitdir_file(&marker),
+            Some(checkout.join("../main/.git/worktrees/checkout"))
+        );
+    }
+
+    #[test]
+    fn parse_gitdir_file_rejects_oversized_and_nonregular_markers() {
+        let dir = retained_test_dir("invalid-gitdir");
+        let marker = dir.join(".git");
+        // Even a valid first line must not hide an oversized marker.
+        fs::write(
+            &marker,
+            format!("gitdir: ../repo/.git\n{}", "x".repeat(4096)),
+        )
+        .unwrap();
+        assert_eq!(parse_gitdir_file(&marker), None);
+        assert_eq!(parse_gitdir_file(&dir), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_gitdir_file_rejects_fifo_without_waiting_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = retained_test_dir("fifo-gitdir");
+        let marker = dir.join(".git");
+        let path = std::ffi::CString::new(marker.as_os_str().as_bytes()).unwrap();
+        // SAFETY: path is a NUL-terminated name in this test's owned directory.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        assert_eq!(parse_gitdir_file(&marker), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_workspace_for_linked_worktree_uses_its_own_head() {
+        let fixture = GitFixture::new("linked-head");
+        let worktree = fixture.root.parent().unwrap().join("linked");
+        let worktree_arg = worktree.to_str().unwrap();
+        fixture.git(&[
+            "worktree",
+            "add",
+            "-b",
+            "agent-work",
+            "--",
+            worktree_arg,
+            "HEAD",
+        ]);
+        let cwd = worktree.join("nested/working");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut child = OwnedCwdChild::spawn(&cwd);
+        assert!(child.child.try_wait().unwrap().is_none());
+
+        let evidence = resolve_workspace_for_pid(child.child.id());
+        assert_eq!(
+            evidence.repo_root.as_ref().unwrap().effective_path(),
+            fs::canonicalize(&fixture.root).unwrap().to_str().unwrap()
+        );
+        assert_eq!(
+            evidence.worktree.as_ref().unwrap().effective_path(),
+            fs::canonicalize(&worktree).unwrap().to_str().unwrap()
+        );
+        assert_eq!(
+            evidence.head_state,
+            Some(HeadState::Branch {
+                name: "agent-work".to_string()
+            })
+        );
+        assert_eq!(
+            read_head_state(&fixture.root),
+            Some(HeadState::Branch {
+                name: "main".to_string()
+            })
+        );
+
+        fixture.git(&["-C", worktree_arg, "checkout", "--detach", &fixture.commit]);
+        assert!(child.child.try_wait().unwrap().is_none());
+        let detached = resolve_workspace_for_pid(child.child.id());
+        assert_eq!(
+            detached.head_state,
+            Some(HeadState::Detached {
+                commit_prefix: fixture.commit[..7].to_string()
+            })
+        );
+        assert_eq!(
+            read_head_state(&fixture.root),
+            Some(HeadState::Branch {
+                name: "main".to_string()
             })
         );
     }
