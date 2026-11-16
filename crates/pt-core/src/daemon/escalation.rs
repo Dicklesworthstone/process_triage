@@ -12,67 +12,15 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::triggers::FiredTrigger;
+#[cfg(all(test, unix))]
+use crate::collect::tool_runner::{
+    notification_runner, run_notification, NOTIFICATION_MAX_OUTPUT_BYTES,
+};
 use crate::collect::tool_runner::{ToolConfig, ToolOutput, ToolRunner, ToolSpec};
 
 /// Each quick/deep planner invocation is bounded, including its output pipes.
 /// The CLI's explicit `--timeout` can override this default.
 pub const PLAN_TIMEOUT_SECS: u64 = 60;
-
-/// Notification delivery is best effort and must not suspend monitoring or
-/// expired-freeze recovery. Both channels share this budget for the whole tick.
-pub const NOTIFICATION_TIMEOUT_SECS: u64 = 2;
-pub const NOTIFICATION_TICK_BUDGET_MS: u64 = 5_000;
-pub const NOTIFICATION_MAX_OUTPUT_BYTES: usize = 16 * 1024;
-
-/// One runner per daemon tick, reused for desktop and command notifications.
-/// The daemon's priority is already lowered and is inherited by its children.
-pub fn notification_runner() -> ToolRunner {
-    ToolRunner::new(ToolConfig {
-        default_timeout: std::time::Duration::from_secs(NOTIFICATION_TIMEOUT_SECS),
-        max_output_bytes: NOTIFICATION_MAX_OUTPUT_BYTES,
-        budget_ms: NOTIFICATION_TICK_BUDGET_MS,
-        use_nice: false,
-        ..ToolConfig::default()
-    })
-}
-
-/// Run a literal notification command with bounded execution and pipe capture.
-/// Success means only that the command exited successfully, not that a desktop
-/// displayed the message or a person received it. Never persist child output:
-/// hooks can print credentials and arbitrary terminal control sequences.
-pub fn run_notification(runner: &ToolRunner, spec: &ToolSpec) -> Result<(), String> {
-    let mut bounded = spec.clone();
-    bounded.timeout = Some(
-        bounded
-            .timeout
-            .unwrap_or(std::time::Duration::from_secs(NOTIFICATION_TIMEOUT_SECS))
-            .min(std::time::Duration::from_secs(NOTIFICATION_TIMEOUT_SECS)),
-    );
-    bounded.max_output = Some(
-        bounded
-            .max_output
-            .unwrap_or(NOTIFICATION_MAX_OUTPUT_BYTES)
-            .min(NOTIFICATION_MAX_OUTPUT_BYTES),
-    );
-    let output = runner
-        .run(&bounded)
-        .map_err(|error| format!("notification command could not complete: {error}"))?;
-    if output.timed_out {
-        return Err("notification command timed out; delivery is unconfirmed".into());
-    }
-    if output.truncated {
-        return Err(
-            "notification command exceeded its output limit; delivery is unconfirmed".into(),
-        );
-    }
-    if output.exit_code != Some(0) {
-        return Err(format!(
-            "notification command exited with {:?}; delivery is unconfirmed",
-            output.exit_code
-        ));
-    }
-    Ok(())
-}
 
 /// A completed planner response, suitable for publishing a review request.
 #[derive(Debug, PartialEq, Eq)]

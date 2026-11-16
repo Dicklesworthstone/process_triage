@@ -16893,7 +16893,7 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
 
         let metrics = collect_daemon_metrics();
         let now_secs = daemon_now_secs();
-        let notification_runner = pt_core::daemon::escalation::notification_runner();
+        let notification_runner = pt_core::collect::tool_runner::notification_runner();
         let mut notification_outcomes = if let Some(store) = inbox.as_ref() {
             daemon_refresh_inbox_notifications(
                 &config,
@@ -17401,7 +17401,7 @@ fn daemon_notify_cmd(
         spec = spec.with_env("PT_NOTIFY_SESSION_ID", session_id.clone());
     }
 
-    pt_core::daemon::escalation::run_notification(runner, &spec)
+    pt_core::collect::tool_runner::run_notification(runner, &spec)
 }
 
 #[cfg(feature = "daemon")]
@@ -17411,10 +17411,9 @@ fn daemon_notify_desktop(
 ) -> Result<(), String> {
     let spec = desktop_notification_command(std::env::consts::OS, notif)
         .ok_or("desktop notifications are unavailable on this platform")?;
-    pt_core::daemon::escalation::run_notification(runner, &spec)
+    pt_core::collect::tool_runner::run_notification(runner, &spec)
 }
 
-#[cfg(feature = "daemon")]
 fn notification_session_environment(
     mut spec: pt_core::collect::tool_runner::ToolSpec,
 ) -> pt_core::collect::tool_runner::ToolSpec {
@@ -17594,7 +17593,7 @@ mod desktop_notification_tests {
                 notif.session_id.clone().unwrap_or_default(),
             ];
             daemon_notify_cmd(
-                &pt_core::daemon::escalation::notification_runner(),
+                &pt_core::collect::tool_runner::notification_runner(),
                 "/bin/sh",
                 &args,
                 &notif,
@@ -17619,7 +17618,7 @@ mod desktop_notification_tests {
             let outcomes = daemon_deliver_notification(
                 &config,
                 &notif,
-                &pt_core::daemon::escalation::notification_runner(),
+                &pt_core::collect::tool_runner::notification_runner(),
             );
             assert_eq!(outcomes.len(), 1);
             daemon_record_notification_outcomes(&mut state, outcomes);
@@ -17640,7 +17639,7 @@ mod desktop_notification_tests {
         assert!(daemon_deliver_notification(
             &config,
             &notif,
-            &pt_core::daemon::escalation::notification_runner(),
+            &pt_core::collect::tool_runner::notification_runner(),
         )
         .is_empty());
     }
@@ -38378,19 +38377,22 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
         // a zombie leak or D-state storm.
         let census = watch_process_census(&scan_result.processes, &scan_result.metadata.warnings);
         let timestamp = chrono::Utc::now().to_rfc3339();
+        // Every event in this iteration shares the hook budget. A stalled
+        // receiver cannot turn many candidates into many full timeout waits.
+        let notification_runner = pt_core::collect::tool_runner::notification_runner();
         let agent_activity = scorer.agent_activity_report(
             &scan_result.processes,
             scan_result.metadata.warnings.is_empty(),
         );
         if let Some(event) = agent_activity_watch.update(&agent_activity, &timestamp) {
-            emit_watch_event(&event, notify_exec, notify_cmd, notify_args);
+            emit_watch_event(&event, &notification_runner, notify_exec, notify_cmd, notify_args);
         }
         let memory_limits = memory_limit_report(&responsible_units);
         if let Some(event) = memory_limit_watch.update(&memory_limits, &timestamp) {
-            emit_watch_event(&event, notify_exec, notify_cmd, notify_args);
+            emit_watch_event(&event, &notification_runner, notify_exec, notify_cmd, notify_args);
         }
         if let Some(event) = workload_watch.update(&system_state, &timestamp) {
-            emit_watch_event(&event, notify_exec, notify_cmd, notify_args);
+            emit_watch_event(&event, &notification_runner, notify_exec, notify_cmd, notify_args);
         }
         for mut event in pressure_watch.update(
             pressure.snapshot.as_ref(),
@@ -38407,16 +38409,16 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
             });
             event["memory_limits"] = memory_limits.clone();
             event["agent_activity"] = agent_activity_output(&agent_activity, Some(10));
-            emit_watch_event(&event, notify_exec, notify_cmd, notify_args);
+            emit_watch_event(&event, &notification_runner, notify_exec, notify_cmd, notify_args);
         }
         if baseline.is_none() {
             baseline = Some(WatchBaseline::from_state(&system_state));
         }
         if let Some(event) = check_goal_violation(&system_state, args) {
-            emit_watch_event(&event, notify_exec, notify_cmd, notify_args);
+            emit_watch_event(&event, &notification_runner, notify_exec, notify_cmd, notify_args);
         }
         if let Some(event) = check_baseline_anomaly(&system_state, baseline.as_ref()) {
-            emit_watch_event(&event, notify_exec, notify_cmd, notify_args);
+            emit_watch_event(&event, &notification_runner, notify_exec, notify_cmd, notify_args);
         }
 
         let mut evaluated = Vec::new();
@@ -38484,7 +38486,7 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
             .collect();
         let timestamp = chrono::Utc::now().to_rfc3339();
         for event in watch_candidate_events(&previous, &current, &observed, &timestamp) {
-            emit_watch_event(&event, notify_exec, notify_cmd, notify_args);
+            emit_watch_event(&event, &notification_runner, notify_exec, notify_cmd, notify_args);
         }
 
         previous = current;
@@ -39564,6 +39566,7 @@ fn check_baseline_anomaly(
 
 fn emit_watch_event(
     event: &serde_json::Value,
+    runner: &pt_core::collect::tool_runner::ToolRunner,
     notify_exec: Option<&str>,
     notify_cmd: Option<&str>,
     notify_args: &[String],
@@ -39572,39 +39575,61 @@ fn emit_watch_event(
         "{}",
         serde_json::to_string(event).unwrap_or_else(|_| "{}".to_string())
     );
-    let event_type = event
-        .get("event")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    let json = event.to_string();
-    if let Some(cmd) = notify_cmd {
-        let mut child = std::process::Command::new(cmd);
-        for arg in notify_args {
-            child.arg(arg);
-        }
-        child.env("PT_WATCH_EVENT", event_type);
-        child.env("PT_WATCH_EVENT_JSON", &json);
-        if let Some(pid) = event.get("pid").and_then(|v| v.as_u64()) {
-            child.env("PT_WATCH_PID", pid.to_string());
-        }
-        if let Err(err) = child.status() {
-            eprintln!("agent watch: notify-cmd failed: {}", err);
-        }
-        return;
+    if let Some(failure) =
+        deliver_watch_notification(event, runner, notify_exec, notify_cmd, notify_args)
+    {
+        // The failure is retained in the JSONL stream, but is not delivered
+        // recursively to the same failed hook. Child output is never forwarded.
+        println!("{failure}");
     }
+}
 
-    if let Some(cmd) = notify_exec {
-        let mut child = std::process::Command::new("sh");
-        child.arg("-c").arg(cmd);
-        child.env("PT_WATCH_EVENT", event_type);
-        child.env("PT_WATCH_EVENT_JSON", &json);
-        if let Some(pid) = event.get("pid").and_then(|v| v.as_u64()) {
-            child.env("PT_WATCH_PID", pid.to_string());
-        }
-        if let Err(err) = child.status() {
-            eprintln!("agent watch: notify-exec failed: {}", err);
-        }
+fn watch_notification_command(
+    event: &serde_json::Value,
+    notify_exec: Option<&str>,
+    notify_cmd: Option<&str>,
+    notify_args: &[String],
+) -> Option<pt_core::collect::tool_runner::ToolSpec> {
+    use pt_core::collect::tool_runner::ToolSpec;
+    let spec = if let Some(command) = notify_cmd {
+        ToolSpec::new(command, notify_args.to_vec())
+    } else {
+        ToolSpec::new("sh", vec!["-c".into(), notify_exec?.to_string()])
+    };
+    let mut spec = notification_session_environment(spec)
+        .with_env(
+            "PT_WATCH_EVENT",
+            event["event"].as_str().unwrap_or("unknown"),
+        )
+        .with_env("PT_WATCH_EVENT_JSON", event.to_string());
+    if let Some(pid) = event["pid"].as_u64() {
+        spec = spec.with_env("PT_WATCH_PID", pid.to_string());
     }
+    Some(spec)
+}
+
+/// A successful local command is not proof of downstream delivery. Failures
+/// carry only the current event identity and a bounded runner diagnostic.
+fn deliver_watch_notification(
+    event: &serde_json::Value,
+    runner: &pt_core::collect::tool_runner::ToolRunner,
+    notify_exec: Option<&str>,
+    notify_cmd: Option<&str>,
+    notify_args: &[String],
+) -> Option<serde_json::Value> {
+    let spec = watch_notification_command(event, notify_exec, notify_cmd, notify_args)?;
+    let error = pt_core::collect::tool_runner::run_notification(runner, &spec).err()?;
+    Some(serde_json::json!({
+        "event": "notification_delivery_failed",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "source_event": event["event"],
+        "source_timestamp": event["timestamp"],
+        "source_pid": event["pid"],
+        "channel": if notify_cmd.is_some() { "notify_cmd" } else { "notify_exec" },
+        "reason": error,
+        "iteration_budget_exhausted": runner.budget_exhausted(),
+        "delivery_confirmed": false,
+    }))
 }
 
 #[cfg(test)]
@@ -39612,6 +39637,128 @@ mod watch_tests {
     use super::*;
     use pt_common::StartId;
     use pt_core::collect::pressure::{FileHandles, LoadAvg, MemInfo, PsiLine, PsiResource, VmStat};
+
+    #[cfg(unix)]
+    #[test]
+    fn watch_notifications_preserve_literal_metadata_and_command_precedence() {
+        use pt_core::collect::tool_runner::{notification_runner, run_notification};
+        let event = serde_json::json!({
+            "event": "candidate_detected",
+            "pid": 41,
+            "timestamp": "2026-11-16T00:00:00Z",
+            "command": "literal $HOME $(exit 93) `exit 94`\nquoted \"λ\"",
+        });
+        let args = vec![
+            "-c".into(),
+            "test \"$PT_WATCH_EVENT\" = candidate_detected && test \"$PT_WATCH_PID\" = 41 && test \"$PT_WATCH_EVENT_JSON\" = \"$1\"".into(),
+            "pt-watch-test".into(),
+            event.to_string(),
+        ];
+        let spec =
+            watch_notification_command(&event, Some("exit 99"), Some("/bin/sh"), &args).unwrap();
+        assert_eq!(spec.command, "/bin/sh");
+        assert_eq!(spec.args, args);
+        run_notification(&notification_runner(), &spec).unwrap();
+
+        let system = serde_json::json!({"event": "memory_limit_forecast"});
+        let system_spec = watch_notification_command(
+            &system,
+            Some(
+                "test -z \"${PT_WATCH_PID+x}\" && test \"$PT_WATCH_EVENT\" = memory_limit_forecast",
+            ),
+            None,
+            &[],
+        )
+        .unwrap();
+        assert!(!system_spec.env.contains_key("PT_WATCH_PID"));
+        run_notification(&notification_runner(), &system_spec).unwrap();
+        assert!(watch_notification_command(&event, None, None, &[]).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watch_notifications_report_failures_without_polluting_events_with_child_output() {
+        use pt_core::collect::tool_runner::notification_runner;
+        let event = serde_json::json!({
+            "event": "memory_limit_forecast", "timestamp": "sample", "private": "private evidence"
+        });
+        let failure = deliver_watch_notification(
+            &event,
+            &notification_runner(),
+            Some("printf 'sensitive stdout'; printf 'sensitive stderr' >&2; exit 17"),
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(failure["event"], "notification_delivery_failed");
+        assert_eq!(failure["source_event"], event["event"]);
+        assert_eq!(failure["source_timestamp"], "sample");
+        assert_eq!(failure["channel"], "notify_exec");
+        assert_eq!(failure["delivery_confirmed"], false);
+        assert!(failure["reason"].as_str().unwrap().contains("Some(17)"));
+        let serialized = failure.to_string();
+        for private in ["sensitive stdout", "sensitive stderr", "private evidence"] {
+            assert!(!serialized.contains(private));
+        }
+        assert!(deliver_watch_notification(
+            &event,
+            &notification_runner(),
+            Some("printf 'not a JSON event'"),
+            None,
+            &[],
+        )
+        .is_none());
+        let excessive = deliver_watch_notification(
+            &event,
+            &notification_runner(),
+            Some("printf '%32768s' x"),
+            None,
+            &[],
+        )
+        .unwrap();
+        assert!(excessive["reason"]
+            .as_str()
+            .unwrap()
+            .contains("output limit"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watch_notifications_share_a_scan_budget_and_recover_on_the_next_scan() {
+        use pt_core::collect::tool_runner::{notification_runner, ToolConfig, ToolRunner};
+        let event = serde_json::json!({"event": "candidate_detected", "pid": 41});
+        let runner = ToolRunner::new(ToolConfig {
+            budget_ms: 50,
+            use_nice: false,
+            ..ToolConfig::default()
+        });
+        let started = std::time::Instant::now();
+        let timed_out = deliver_watch_notification(
+            &event,
+            &runner,
+            Some("exec 1>&- 2>&-; exec sleep 30"),
+            None,
+            &[],
+        )
+        .unwrap();
+        assert!(timed_out["reason"].as_str().unwrap().contains("timed out"));
+        assert_eq!(timed_out["iteration_budget_exhausted"], true);
+        let refused =
+            deliver_watch_notification(&event, &runner, Some("exit 99"), None, &[]).unwrap();
+        assert!(refused["reason"]
+            .as_str()
+            .unwrap()
+            .contains("budget exhausted"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(deliver_watch_notification(
+            &event,
+            &notification_runner(),
+            Some("exit 0"),
+            None,
+            &[],
+        )
+        .is_none());
+    }
 
     fn pressure_sample(
         previous: Option<&PressureSnapshot>,

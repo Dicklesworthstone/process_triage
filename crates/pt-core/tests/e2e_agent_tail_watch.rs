@@ -445,6 +445,71 @@ fn watch_reports_policy_review_instead_of_raw_kill_decision() {
 
 #[cfg(unix)]
 #[test]
+fn watch_hook_failure_is_jsonl_and_does_not_leak_child_output() {
+    let child = OwnedWatchChild(
+        std::process::Command::new("sleep")
+            .arg("300")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn owned process"),
+    );
+    let config = TempDir::new().expect("config directory");
+    let data = TempDir::new().expect("data directory");
+    write_watch_review_config(&config);
+    let output = pt_core_fast()
+        .env("PROCESS_TRIAGE_DATA", data.path())
+        .env("PROCESS_TRIAGE_RETENTION", "off")
+        .arg("--config")
+        .arg(config.path())
+        .args([
+            "--format",
+            "jsonl",
+            "agent",
+            "watch",
+            "--once",
+            "--threshold",
+            "low",
+            "--notify-cmd",
+            "/bin/sh",
+            "--notify-arg=-c",
+            "--notify-arg=printf 'private-hook-stdout'; printf 'private-hook-stderr' >&2; exit 17",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 watch output");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stdout.contains("private-hook-stdout"));
+    assert!(!stdout.contains("private-hook-stderr"));
+    assert!(!stderr.contains("private-hook-stdout"));
+    assert!(!stderr.contains("private-hook-stderr"));
+    let events: Vec<Value> = stdout
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).expect("every output line is a watch event"))
+        .collect();
+    let pid = u64::from(child.0.id());
+    assert!(events.iter().any(|event| {
+        event["event"] == "candidate_detected" && event["pid"].as_u64() == Some(pid)
+    }));
+    let failure = events
+        .iter()
+        .find(|event| {
+            event["event"] == "notification_delivery_failed"
+                && event["source_event"] == "candidate_detected"
+                && event["source_pid"].as_u64() == Some(pid)
+        })
+        .expect("the failed owned-process hook is reported in the event stream");
+    assert_eq!(failure["channel"], "notify_cmd");
+    assert_eq!(failure["delivery_confirmed"], false);
+    assert!(failure["reason"].as_str().unwrap().contains("Some(17)"));
+}
+
+#[cfg(unix)]
+#[test]
 fn watch_clears_owned_process_after_exit_with_the_original_identity() {
     use std::io::{BufRead, BufReader};
     use std::process::Stdio;

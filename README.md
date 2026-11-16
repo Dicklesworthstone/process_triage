@@ -337,6 +337,17 @@ pt agent label --pid 1234 --kill       # Teach pt your verdict for this command 
 pt agent watch --format jsonl          # Stream events
 ```
 
+Watch hooks use `--notify-cmd PROGRAM` with repeated `--notify-arg` values, or
+`--notify-exec` for an explicitly requested shell command. Each hook has a
+two-second deadline and a 16 KiB output cap; all hooks in one scan share a
+five-second budget. Hook output is captured so stdout remains valid JSONL.
+Timeouts, nonzero exits, excessive output, and exhausted budgets produce
+`notification_delivery_failed` events and monitoring continues. A failure event
+is not sent back to the same hook. Hooks receive the current `PT_WATCH_EVENT`,
+`PT_WATCH_EVENT_JSON`, and, for process events, `PT_WATCH_PID`; standard user
+home/config/display variables are retained, while other inherited variables are
+cleared. Programs needing credentials should load them from their own config.
+
 ### 4. Shadow Mode (calibration)
 
 ```bash

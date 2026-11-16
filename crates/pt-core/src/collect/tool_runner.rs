@@ -46,6 +46,66 @@ pub const DEFAULT_MAX_PARALLEL: usize = 4;
 /// Default budget in milliseconds (5 seconds).
 pub const DEFAULT_BUDGET_MS: u64 = 5000;
 
+/// Hook delivery must not suspend monitoring. All notifications in one scan or
+/// daemon tick share a budget, while each command also has its own deadline.
+pub const NOTIFICATION_TIMEOUT_SECS: u64 = 2;
+pub const NOTIFICATION_TICK_BUDGET_MS: u64 = 5_000;
+pub const NOTIFICATION_MAX_OUTPUT_BYTES: usize = 16 * 1024;
+
+/// Reuse this runner for every notification in a single monitoring iteration.
+pub fn notification_runner() -> ToolRunner {
+    ToolRunner::new(ToolConfig {
+        default_timeout: Duration::from_secs(NOTIFICATION_TIMEOUT_SECS),
+        max_output_bytes: NOTIFICATION_MAX_OUTPUT_BYTES,
+        budget_ms: NOTIFICATION_TICK_BUDGET_MS,
+        use_nice: false,
+        ..ToolConfig::default()
+    })
+}
+
+/// Run a literal notification command with bounded execution and pipe capture.
+/// Successful exit is a command receipt, not proof of delivery to a person.
+/// Never return child output: hooks may print credentials or terminal escapes.
+pub fn run_notification(runner: &ToolRunner, spec: &ToolSpec) -> Result<(), String> {
+    let mut bounded = spec.clone();
+    // Linux keeps the owned group leader unreaped until collection completes,
+    // so deadline cleanup can also cancel hook children without a PID-reuse race.
+    #[cfg(target_os = "linux")]
+    {
+        bounded.isolate_process_group = true;
+    }
+    bounded.timeout = Some(
+        bounded
+            .timeout
+            .unwrap_or(Duration::from_secs(NOTIFICATION_TIMEOUT_SECS))
+            .min(Duration::from_secs(NOTIFICATION_TIMEOUT_SECS)),
+    );
+    bounded.max_output = Some(
+        bounded
+            .max_output
+            .unwrap_or(NOTIFICATION_MAX_OUTPUT_BYTES)
+            .min(NOTIFICATION_MAX_OUTPUT_BYTES),
+    );
+    let output = runner
+        .run(&bounded)
+        .map_err(|error| format!("notification command could not complete: {error}"))?;
+    if output.timed_out {
+        return Err("notification command timed out; delivery is unconfirmed".into());
+    }
+    if output.truncated {
+        return Err(
+            "notification command exceeded its output limit; delivery is unconfirmed".into(),
+        );
+    }
+    if output.exit_code != Some(0) {
+        return Err(format!(
+            "notification command exited with {:?}; delivery is unconfirmed",
+            output.exit_code
+        ));
+    }
+    Ok(())
+}
+
 /// Errors that can occur during tool execution.
 #[derive(Debug, Error)]
 pub enum ToolError {
@@ -439,7 +499,7 @@ impl ToolRunner {
     }
 
     /// Run a tool from a specification.
-    #[instrument(skip(self), fields(cmd = %spec.command))]
+    #[instrument(skip(self, spec), fields(cmd = %spec.command))]
     pub fn run(&self, spec: &ToolSpec) -> Result<ToolOutput, ToolError> {
         self.run_with_stdout_handler(spec, None)
     }
