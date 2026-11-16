@@ -1366,6 +1366,8 @@ mod tests {
             fd: None,
             local_resource_evidence: Vec::new(),
             gpu: None,
+            user_intent: None,
+            workspace: None,
             cgroup: None,
             wchan: None,
             network: Some(crate::collect::NetworkInfo {

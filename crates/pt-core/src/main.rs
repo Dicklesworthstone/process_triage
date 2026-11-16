@@ -5517,12 +5517,115 @@ struct DeepSignals {
     net_active: Option<bool>,
     io_active: Option<bool>,
     queue_saturated: Option<bool>,
+    workspace_context: Option<DeepWorkspaceContext>,
     #[cfg(feature = "ui")]
     queue_rx_bytes: Option<u64>,
     #[cfg(feature = "ui")]
     queue_tx_bytes: Option<u64>,
     #[cfg(feature = "ui")]
     queue_backlog_sockets: Option<usize>,
+}
+
+/// Privacy-preserving context from an identity-verified bounded deep probe.
+/// Raw paths, branch names, and collector descriptions never enter plan output.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+struct DeepWorkspaceContext {
+    recent_repo_activity_seconds_ago: Option<u64>,
+    cwd_resolved: Option<bool>,
+    repo_root_resolved: Option<bool>,
+    worktree_resolved: Option<bool>,
+    head_kind: Option<&'static str>,
+}
+
+#[cfg(target_os = "linux")]
+fn deep_workspace_context(
+    record: &pt_core::collect::DeepScanRecord,
+) -> Option<DeepWorkspaceContext> {
+    use pt_core::collect::user_intent::{IntentMetadata, IntentSignalType, UserIntentConfig};
+
+    let intent = record
+        .user_intent
+        .as_ref()
+        .filter(|intent| intent.pid == record.pid.0);
+    let workspace = record
+        .workspace
+        .as_ref()
+        .filter(|workspace| workspace.pid == record.pid.0);
+    if intent.is_none() && workspace.is_none() {
+        return None;
+    }
+    // Require the observed repository signal and its metadata, not the
+    // uncalibrated aggregate score or another kind of user-intent evidence.
+    let recent_window = UserIntentConfig::default().recent_repo_secs;
+    let recent_repo_activity_seconds_ago = intent
+        .filter(|intent| {
+            intent.privacy_mode.repo_activity_enabled && intent.privacy_mode.repo_activity_collected
+        })
+        .into_iter()
+        .flat_map(|intent| &intent.evidence)
+        .filter(|evidence| evidence.signal_type == IntentSignalType::ActiveRepoContext)
+        .filter_map(|evidence| match evidence.metadata.as_ref() {
+            Some(IntentMetadata::Repo {
+                last_modified_secs_ago,
+                ..
+            }) if *last_modified_secs_ago < recent_window => Some(*last_modified_secs_ago),
+            _ => None,
+        })
+        .min();
+    let resolved = |path: &pt_common::RawPathEvidence| {
+        path.canonical.is_some() && path.resolution_error.is_none()
+    };
+    Some(DeepWorkspaceContext {
+        recent_repo_activity_seconds_ago,
+        cwd_resolved: workspace.and_then(|workspace| workspace.cwd.as_ref()).map(resolved),
+        repo_root_resolved: workspace
+            .and_then(|workspace| workspace.repo_root.as_ref())
+            .map(resolved),
+        worktree_resolved: workspace
+            .and_then(|workspace| workspace.worktree.as_ref())
+            .map(resolved),
+        head_kind: workspace
+            .and_then(|workspace| workspace.head_state.as_ref())
+            .map(|head| match head {
+                pt_common::HeadState::Branch { .. } => "branch",
+                pt_common::HeadState::Detached { .. } => "detached",
+                pt_common::HeadState::Unreadable { .. } => "unreadable",
+                pt_common::HeadState::NotARepo => "not_a_repo",
+            }),
+    })
+}
+
+/// Recent checkout activity can request review, never establish usefulness or
+/// authorize an action. Routed zombie remedies must use the parent's own probe.
+fn apply_workspace_review(
+    recommendation: &mut CandidateRecommendation,
+    process: &ProcessRecord,
+    deep_signals: Option<&HashMap<u32, DeepSignals>>,
+    builtin_protection: bool,
+) -> Option<String> {
+    if !builtin_protection
+        || !matches!(
+            recommendation.action,
+            "kill" | "restart" | "pause" | "freeze" | "renice" | "throttle"
+                | "cap_memory" | "quarantine"
+        )
+    {
+        return None;
+    }
+    let subject_pid = if process.state.is_zombie() {
+        process.ppid.0
+    } else {
+        process.pid.0
+    };
+    let context = deep_signals?.get(&subject_pid)?.workspace_context?;
+    let age = context.recent_repo_activity_seconds_ago?;
+    let reason = format!(
+        "Review PID {subject_pid}: repository activity was observed {age}s ago; \
+         shared checkout activity does not establish whether this process is still needed"
+    );
+    recommendation.action = "review";
+    recommendation.rationale = format!("{reason}; {}", recommendation.rationale);
+    Some(reason)
 }
 
 /// Scoring signals and uncalibrated GPU observations are kept separate. The
@@ -5728,6 +5831,7 @@ fn candidate_deep_probe_report(
         "net_active": signals.and_then(|signals| signals.net_active),
         "io_active": signals.and_then(|signals| signals.io_active),
         "queue_saturated": signals.and_then(|signals| signals.queue_saturated),
+        "workspace_context": signals.and_then(|signals| signals.workspace_context),
         "selection_voi": advice.and_then(|advice| advice.voi),
         "selection_rationale": advice.map(|advice| advice.rationale.as_str()),
     })
@@ -5864,6 +5968,7 @@ fn collect_deep_observations_with(
         // Missing or empty socket tables never establish inactivity.
         let net_active = has_network.then_some(true);
         let queue_metrics = record.network.as_ref().map(observed_queue_metrics);
+        let workspace_context = deep_workspace_context(&record);
 
         if let Some(gpu) = record.gpu {
             gpu_processes.insert(record.pid.0, gpu);
@@ -5882,6 +5987,7 @@ fn collect_deep_observations_with(
                 net_active,
                 io_active,
                 queue_saturated: queue_metrics.and_then(|metrics| metrics.saturated),
+                workspace_context,
                 #[cfg(feature = "ui")]
                 queue_rx_bytes: queue_metrics.map(|metrics| metrics.rx_bytes),
                 #[cfg(feature = "ui")]
@@ -6112,6 +6218,8 @@ mod planning_probe_tests {
             starttime: 12345,
             source: "protocol-fixture".into(),
             identity_quality: IdentityQuality::Full,
+            user_intent: None,
+            workspace: None,
         }
     }
 
@@ -6266,6 +6374,346 @@ mod planning_probe_tests {
         assert!(observations.signals.contains_key(&71));
         assert!(!observations.signals.contains_key(&72));
         assert!(!observations.signals.contains_key(&73));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn workspace_record(
+        process: &ProcessRecord,
+        age: u64,
+    ) -> pt_core::collect::DeepScanRecord {
+        use pt_core::collect::user_intent::{
+            IntentEvidence, IntentMetadata, IntentSignalType, PrivacyMode, UserIntentFeatures,
+        };
+
+        let mut record = record(process);
+        let mut intent = UserIntentFeatures::none(process.pid.0, PrivacyMode::default());
+        intent.privacy_mode.repo_activity_collected = true;
+        // Neither this uncalibrated score nor the private collector text may
+        // enter class probabilities or the persisted candidate explanation.
+        intent.user_intent_score = 0.99;
+        intent.evidence.push(IntentEvidence {
+            signal_type: IntentSignalType::ActiveRepoContext,
+            weight: 0.75,
+            description: "private-fixture-collector-description".into(),
+            metadata: Some(IntentMetadata::Repo {
+                last_modified_secs_ago: age,
+                has_uncommitted_changes: None,
+            }),
+        });
+        record.user_intent = Some(intent);
+        record.workspace = Some(pt_common::RawWorkspaceEvidence {
+            pid: process.pid.0,
+            cwd: Some(pt_common::RawPathEvidence::resolved(
+                "/private-fixture/cwd",
+                "/private-fixture/cwd",
+            )),
+            repo_root: Some(pt_common::RawPathEvidence::resolved(
+                "/private-fixture/repo",
+                "/private-fixture/repo",
+            )),
+            worktree: None,
+            head_state: Some(pt_common::HeadState::Branch {
+                name: "private-fixture-branch".into(),
+            }),
+            collection_method: pt_common::WorkspaceCollectionMethod::Synthetic,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+        });
+        record
+    }
+
+    #[cfg(target_os = "linux")]
+    fn recommendation(action: &'static str) -> CandidateRecommendation {
+        CandidateRecommendation {
+            action,
+            rationale: "existing decision rationale".into(),
+            policy: pt_core::decision::PolicyCheckResult {
+                allowed: true,
+                violation: None,
+                warnings: Vec::new(),
+            },
+            agent_liveness: None,
+            fuse_server: None,
+            fuse_mounts: Vec::new(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn workspace_context_requires_recent_observed_repository_evidence() {
+        use pt_core::collect::user_intent::{IntentSignalType, UserIntentConfig};
+
+        let process = process(71);
+        assert!(deep_workspace_context(&record(&process)).is_none());
+        for case in [
+            "active",
+            "at_boundary",
+            "old",
+            "wrong_pid",
+            "privacy_disabled",
+            "not_collected",
+            "different_signal",
+            "missing_metadata",
+            "score_only",
+        ] {
+            let mut observed = workspace_record(&process, 30);
+            let intent = observed.user_intent.as_mut().unwrap();
+            match case {
+                "active" => {}
+                "at_boundary" | "old" => {
+                    if let Some(pt_core::collect::user_intent::IntentMetadata::Repo {
+                        last_modified_secs_ago,
+                        ..
+                    }) = intent.evidence[0].metadata.as_mut()
+                    {
+                        *last_modified_secs_ago =
+                            UserIntentConfig::default().recent_repo_secs + u64::from(case == "old");
+                    }
+                }
+                "wrong_pid" => intent.pid = 72,
+                "privacy_disabled" => intent.privacy_mode.repo_activity_enabled = false,
+                "not_collected" => intent.privacy_mode.repo_activity_collected = false,
+                "different_signal" => intent.evidence[0].signal_type = IntentSignalType::ActiveTty,
+                "missing_metadata" => intent.evidence[0].metadata = None,
+                "score_only" => intent.evidence.clear(),
+                _ => unreachable!(),
+            }
+            let context = deep_workspace_context(&observed).unwrap();
+            assert_eq!(
+                context.recent_repo_activity_seconds_ago,
+                (case == "active").then_some(30),
+                "{case}"
+            );
+        }
+        let mut mismatched = workspace_record(&process, 30);
+        mismatched.user_intent.as_mut().unwrap().pid = 72;
+        mismatched.workspace.as_mut().unwrap().pid = 72;
+        assert!(deep_workspace_context(&mismatched).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn partial_workspace_context_is_identity_bound_and_keeps_paths_private() {
+        let first = process(71);
+        let reused = process(72);
+        let stale = process(73);
+        let mut replacement = workspace_record(&reused, 30);
+        replacement.start_id = pt_common::StartId::from_linux("fixture-boot", 99999, 72);
+        let run = collect_deep_observations_with(
+            &[&first, &reused, &stale],
+            &scorer(),
+            Duration::from_secs(3),
+            true,
+            |_, _| {
+                Ok(result(
+                    vec![
+                        workspace_record(&first, 30),
+                        replacement,
+                        workspace_record(&stale, 30),
+                    ],
+                    3,
+                    0,
+                    false,
+                ))
+            },
+            |identity| identity.pid.0 != 73,
+        );
+        assert_eq!(run.report.status, "partial");
+        assert_eq!(run.report.identity_rejected_count, 2);
+        let selected = HashSet::from([71, 72, 73]);
+        let candidate = candidate_deep_probe_report(
+            71, &selected, run.observations.as_ref(), &run.report, None,
+        );
+        let context = &candidate["workspace_context"];
+        assert_eq!(context["recent_repo_activity_seconds_ago"], 30);
+        assert_eq!(context["cwd_resolved"], true);
+        assert_eq!(context["repo_root_resolved"], true);
+        assert!(context["worktree_resolved"].is_null());
+        assert_eq!(context["head_kind"], "branch");
+        let rendered = serde_json::to_string(&candidate).unwrap();
+        assert!(!rendered.contains("private-fixture"));
+        assert!(!rendered.contains("user_intent_score"));
+        for pid in [72, 73, 74] {
+            let missing = candidate_deep_probe_report(
+                pid, &selected, run.observations.as_ref(), &run.report, None,
+            );
+            assert!(missing["workspace_context"].is_null());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn workspace_activity_only_requests_review_and_preserves_other_decisions() {
+        let process = process(71);
+        let run = collect_deep_observations_with(
+            &[&process],
+            &scorer(),
+            Duration::from_secs(3),
+            true,
+            |_, _| Ok(result(vec![workspace_record(&process, 30)], 1, 0, true)),
+            |_| true,
+        );
+        let signals = &run.observations.as_ref().unwrap().signals;
+        for action in [
+            "kill", "restart", "pause", "freeze", "renice", "throttle", "cap_memory", "quarantine",
+        ] {
+            let mut advice = recommendation(action);
+            let reason =
+                apply_workspace_review(&mut advice, &process, Some(signals), true).unwrap();
+            assert_eq!(advice.action, "review", "{action}");
+            assert!(reason.contains("PID 71") && reason.contains("30s ago"));
+            assert!(advice.rationale.contains("existing decision rationale"));
+            // This context only withholds automatic eligibility; it does not
+            // rewrite the policy verdict or create a learned human label.
+            assert!(advice.policy.allowed);
+            let mut disabled = recommendation(action);
+            assert!(
+                apply_workspace_review(&mut disabled, &process, Some(signals), false).is_none()
+            );
+            assert_eq!(disabled.action, action);
+        }
+        for action in ["keep", "review", "resume", "unfreeze", "unquarantine"] {
+            let mut advice = recommendation(action);
+            assert!(apply_workspace_review(&mut advice, &process, Some(signals), true).is_none());
+            assert_eq!(advice.action, action);
+            assert_eq!(advice.rationale, "existing decision rationale");
+        }
+        let mut absent = recommendation("kill");
+        assert!(apply_workspace_review(&mut absent, &process, None, true).is_none());
+        assert_eq!(absent.action, "kill");
+
+        let inactive = collect_deep_observations_with(
+            &[&process],
+            &scorer(),
+            Duration::from_secs(3),
+            true,
+            |_, _| Ok(result(vec![workspace_record(&process, 3600)], 1, 0, true)),
+            |_| true,
+        );
+        let mut advice = recommendation("pause");
+        assert!(apply_workspace_review(
+            &mut advice,
+            &process,
+            Some(&inactive.observations.as_ref().unwrap().signals),
+            true,
+        )
+        .is_none());
+        assert_eq!(advice.action, "pause");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn workspace_review_cannot_enter_an_executable_plan() {
+        let process = process(71);
+        let policy = pt_core::config::Policy::default();
+        let posterior = pt_core::inference::ClassScores {
+            useful: 0.001,
+            useful_bad: 0.0,
+            abandoned: 0.999,
+            zombie: 0.0,
+        };
+        let decision = pt_core::decision::decide_action(
+            &posterior,
+            &policy,
+            &ActionFeasibility::allow_all(),
+        )
+        .unwrap();
+        assert_eq!(decision.optimal_action, Action::Kill);
+        let mut inputs = HashMap::from([(
+            71,
+            DecisionCandidate {
+                identity: process_identity_from_record(&process),
+                ppid: Some(process.ppid.0),
+                decision,
+                blocked_reasons: Vec::new(),
+                stage_pause_before_kill: false,
+                process_state: Some(process.state),
+                parent_identity: None,
+                d_state_diagnostics: None,
+                supervisor_restart: None,
+                memory_cap: None,
+            },
+        )]);
+        let session_id = SessionId::new();
+        let generated_at = "2026-01-01T00:00:00Z".to_string();
+        let before = build_agent_action_plan(
+            &session_id,
+            &policy,
+            &[serde_json::json!({"pid": 71, "recommended_action": "kill"})],
+            &inputs,
+            generated_at.clone(),
+        );
+        assert!(before
+            .actions
+            .iter()
+            .any(|action| action.action == Action::Kill && !action.blocked));
+        let run = collect_deep_observations_with(
+            &[&process],
+            &scorer(),
+            Duration::from_secs(3),
+            true,
+            |_, _| Ok(result(vec![workspace_record(&process, 30)], 1, 0, true)),
+            |_| true,
+        );
+        let mut advice = recommendation("kill");
+        let reason = apply_workspace_review(
+            &mut advice,
+            &process,
+            Some(&run.observations.as_ref().unwrap().signals),
+            true,
+        )
+        .unwrap();
+        inputs.get_mut(&71).unwrap().blocked_reasons.push(reason);
+        // Both the final review recommendation and the explicit action block
+        // independently prevent a later selector from reviving this remedy.
+        for final_action in [advice.action, "kill"] {
+            let plan = build_agent_action_plan(
+                &session_id,
+                &policy,
+                &[serde_json::json!({"pid": 71, "recommended_action": final_action})],
+                &inputs,
+                generated_at.clone(),
+            );
+            assert_eq!(plan.gates_summary.blocked_candidates, 1);
+            assert!(plan.pre_toggled.is_empty());
+            assert!(plan
+                .actions
+                .iter()
+                .all(|action| action.blocked || action.action == Action::Keep));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn zombie_workspace_review_uses_only_the_actual_parent_context() {
+        let parent = process(71);
+        let mut zombie = process(72);
+        zombie.ppid = parent.pid;
+        zombie.state = ProcessState::Zombie;
+        for observed_pid in [71, 72] {
+            let observed = if observed_pid == 71 { &parent } else { &zombie };
+            let run = collect_deep_observations_with(
+                &[&parent, &zombie],
+                &scorer(),
+                Duration::from_secs(3),
+                true,
+                |_, _| Ok(result(vec![workspace_record(observed, 30)], 2, 1, true)),
+                |_| true,
+            );
+            let mut advice = recommendation("restart");
+            let reason = apply_workspace_review(
+                &mut advice,
+                &zombie,
+                Some(&run.observations.as_ref().unwrap().signals),
+                true,
+            );
+            if observed_pid == 71 {
+                assert_eq!(advice.action, "review");
+                assert!(reason.unwrap().contains("PID 71"));
+            } else {
+                assert_eq!(advice.action, "restart");
+                assert!(reason.is_none());
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -6743,7 +7191,7 @@ fn build_tui_rows(
             .signature
             .as_ref()
             .map(|matched| format!("{:?}", matched.signature.category));
-        let advice = candidate_recommendation(
+        let mut advice = candidate_recommendation(
             proc,
             population.iter().find(|parent| parent.pid == proc.ppid),
             &score,
@@ -6752,7 +7200,17 @@ fn build_tui_rows(
             &enforcer,
             false,
         );
+        let workspace_review = apply_workspace_review(
+            &mut advice,
+            proc,
+            deep_signals,
+            policy.guardrails.builtin_protection,
+        );
         let mut ledger = score.ledger.clone();
+        if let Some(reason) = &workspace_review {
+            ledger.top_evidence.insert(0, reason.clone());
+            ledger.why_summary = format!("{} {reason}", ledger.why_summary);
+        }
         if pressure_decision.changed {
             let summary = format!(
                 "Pressure model prefers {:?} instead of {:?} before safety checks; modeled relief {:.3} loss units (heuristic)",
@@ -6922,6 +7380,7 @@ fn build_tui_rows(
                 "state": proc.state.to_string(),
                 "recommended_action": recommendation,
                 "action_rationale": rationale,
+                "workspace_context": deep.and_then(|deep| deep.workspace_context),
                 "work": scorer.workload_diagnosis_for(proc),
                 "supervisor_restart": scorer.supervisor_restart_for(proc),
                 "supervisor_restart_unavailable": scorer.supervisor_restart_unavailable_for(proc),
@@ -29847,7 +30306,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             continue;
         }
 
-        let advice = candidate_recommendation(
+        let mut advice = candidate_recommendation(
             proc,
             scan_result
                 .processes
@@ -29858,6 +30317,12 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             &decision_policy,
             &enforcer,
             global.robot,
+        );
+        let workspace_review = apply_workspace_review(
+            &mut advice,
+            proc,
+            deep_signals,
+            decision_policy.guardrails.builtin_protection,
         );
         let recommended_action = advice.action;
         let policy_result = advice.policy;
@@ -30259,6 +30724,9 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             .into_iter()
             .collect();
         if let Some(reason) = supervision_refusal {
+            blocked_reasons.push(reason);
+        }
+        if let Some(reason) = workspace_review {
             blocked_reasons.push(reason);
         }
         if let Some(reason) = &parent_refusal {

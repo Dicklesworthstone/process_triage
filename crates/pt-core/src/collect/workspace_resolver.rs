@@ -112,30 +112,37 @@ pub fn find_repo_root(start: &Path) -> (Option<RawPathEvidence>, Option<RawPathE
 
     loop {
         let git_path = current.join(".git");
-
-        if git_path.is_dir() {
-            // Standard git repo: .git is a directory
-            let root_ev = canonicalize_path(&current);
-            return (Some(root_ev), None);
-        }
-
-        if git_path.is_file() {
-            // Git worktree: .git is a file containing `gitdir: <path>`
-            match parse_gitdir_file(&git_path) {
-                Some(actual_git_dir) => {
-                    // The actual repo root is the parent of the actual .git dir
+        let marker = git_marker_metadata(&git_path);
+        if let Ok(Some(metadata)) = &marker {
+            if metadata.is_dir() {
+                // Standard git repo: .git is a directory.
+                return (Some(canonicalize_path(&current)), None);
+            }
+            if metadata.is_file() {
+                if let Some(actual_git_dir) = parse_gitdir_file(&git_path) {
                     let actual_repo_root = resolve_worktree_repo_root(&actual_git_dir);
                     let repo_ev = actual_repo_root
                         .map(|r| canonicalize_path(&r))
                         .unwrap_or_else(|| canonicalize_path(&current));
-                    let worktree_ev = canonicalize_path(&current);
-                    return (Some(repo_ev), Some(worktree_ev));
+                    return (Some(repo_ev), Some(canonicalize_path(&current)));
                 }
-                None => {
-                    // Malformed .git file — treat this dir as the root with degraded confidence
-                    let root_ev = canonicalize_path(&current);
-                    return (Some(root_ev), None);
-                }
+            }
+        }
+        match marker {
+            Ok(None) => {} // Only an absent marker permits checking the parent.
+            present => {
+                let error = match present {
+                    Err(error) => io_error_to_resolution(error),
+                    _ => PathResolutionError::IoError {
+                        message: "malformed or nonregular .git marker".to_string(),
+                    },
+                };
+                // A broken nearest checkout is still a boundary. Returning
+                // unresolved evidence avoids attributing an enclosing repo.
+                return (
+                    Some(RawPathEvidence::unresolved(current.to_string_lossy(), error)),
+                    None,
+                );
             }
         }
 
@@ -145,6 +152,16 @@ pub fn find_repo_root(start: &Path) -> (Option<RawPathEvidence>, Option<RawPathE
     }
 
     (None, None)
+}
+
+/// Distinguish an absent marker from a broken symlink or unreadable marker.
+fn git_marker_metadata(path: &Path) -> std::io::Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => fs::metadata(path).map(Some),
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// Maximum size of the small Git text metadata files consulted here.
@@ -233,24 +250,31 @@ fn resolve_worktree_repo_root(gitdir: &Path) -> Option<PathBuf> {
 
 /// Read HEAD state from a git repo root.
 pub fn read_head_state(repo_root: &Path) -> Option<HeadState> {
-    let head_path = repo_root.join(".git").join("HEAD");
-    // Also handle worktrees where .git is a file
-    let head_path = if head_path.exists() {
-        head_path
-    } else {
-        // Try reading the .git file for a worktree reference
-        let git_path = repo_root.join(".git");
-        if git_path.is_file() {
-            if let Some(gitdir) = parse_gitdir_file(&git_path) {
-                gitdir.join("HEAD")
-            } else {
+    let git_path = repo_root.join(".git");
+    let metadata = match git_marker_metadata(&git_path) {
+        Ok(Some(metadata)) => metadata,
+        Ok(None) => return Some(HeadState::NotARepo),
+        Err(error) => {
+            return Some(HeadState::Unreadable {
+                reason: error.to_string(),
+            });
+        }
+    };
+    let head_path = if metadata.is_dir() {
+        git_path.join("HEAD")
+    } else if metadata.is_file() {
+        match parse_gitdir_file(&git_path) {
+            Some(gitdir) => gitdir.join("HEAD"),
+            None => {
                 return Some(HeadState::Unreadable {
                     reason: "malformed .git file".to_string(),
                 });
             }
-        } else {
-            return Some(HeadState::NotARepo);
         }
+    } else {
+        return Some(HeadState::Unreadable {
+            reason: "nonregular .git marker".to_string(),
+        });
     };
 
     match read_git_metadata_file(&head_path) {
@@ -530,6 +554,52 @@ mod tests {
             "owned directory without .git must not be a repo"
         );
         assert!(worktree.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nearest_invalid_marker_never_inherits_outer_workspace() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+
+        let fixture = GitFixture::new("marker-boundary");
+        let check_boundary = |checkout: &Path| {
+            let (root, worktree) = find_repo_root(&checkout.join("src"));
+            let root = root.expect("nearest marker remains a checkout boundary");
+            assert_eq!(root.original, checkout.to_string_lossy());
+            assert!(root.canonical.is_none());
+            assert!(root.resolution_error.is_some());
+            assert!(worktree.is_none());
+            assert!(matches!(
+                read_head_state(checkout),
+                Some(HeadState::Unreadable { .. })
+            ));
+        };
+
+        let malformed = fixture.root.join("malformed");
+        fs::create_dir_all(malformed.join("src")).unwrap();
+        fs::write(malformed.join(".git"), b"not a gitdir pointer\n").unwrap();
+        check_boundary(&malformed);
+
+        let dangling = fixture.root.join("dangling");
+        fs::create_dir_all(dangling.join("src")).unwrap();
+        symlink(dangling.join("missing-gitdir"), dangling.join(".git")).unwrap();
+        check_boundary(&dangling);
+
+        let fifo = fixture.root.join("fifo");
+        fs::create_dir_all(fifo.join("src")).unwrap();
+        let marker = fifo.join(".git");
+        let path = std::ffi::CString::new(marker.as_os_str().as_bytes()).unwrap();
+        // SAFETY: path names a marker in this test's owned fixture.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        check_boundary(&fifo);
+
+        assert_eq!(
+            read_head_state(&fixture.root),
+            Some(HeadState::Branch {
+                name: "main".to_string()
+            })
+        );
     }
 
     #[test]

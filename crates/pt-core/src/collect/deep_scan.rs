@@ -30,8 +30,10 @@ use super::proc_parsers::{
 };
 use super::resource_collector::collect_local_resource_evidence;
 use super::tool_runner::{ToolConfig, ToolError, ToolRunner, ToolSpec};
+use super::user_intent::{collect_user_intent, UserIntentConfig, UserIntentFeatures};
+use super::workspace_resolver::resolve_workspace_for_pid;
 use crate::events::{event_names, Phase, ProgressEmitter, ProgressEvent};
-use pt_common::RawResourceEvidence;
+use pt_common::{RawResourceEvidence, RawWorkspaceEvidence};
 use pt_common::{IdentityQuality, ProcessId, ProcessIdentity, StartId};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -183,6 +185,17 @@ pub struct DeepScanRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu: Option<ProcessGpuEvidence>,
 
+    /// Identity-bound recent repository activity from the bounded worker.
+    /// Other intent probes are disabled here. Direct synchronous deep_scan
+    /// leaves this absent; absence never establishes inactivity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_intent: Option<UserIntentFeatures>,
+
+    /// Repository/worktree provenance for the same observed process and CWD,
+    /// collected only in the bounded worker path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<RawWorkspaceEvidence>,
+
     /// Cgroup information.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cgroup: Option<CgroupInfo>,
@@ -302,7 +315,7 @@ pub struct DeepScanCollection {
     pub incomplete_count: Option<usize>,
     /// Failed outcomes that were reported as warnings rather than skips.
     pub failed_count: usize,
-    /// Collected records whose per-process GPU enrichment finished.
+    /// Collected records whose optional workflow/GPU enrichment finished.
     pub enriched_count: usize,
     pub stage: DeepScanStage,
 }
@@ -986,6 +999,47 @@ fn deep_scan_observed(
     )
 }
 
+/// Collect optional filesystem context only after the base record is retained.
+/// Only the observed worker path calls this: direct synchronous deep_scan
+/// callers must not inherit arbitrary checkout-filesystem I/O.
+fn collect_workflow_context(
+    record: &DeepScanRecord,
+) -> (Option<UserIntentFeatures>, Option<RawWorkspaceEvidence>) {
+    use crate::action::{IdentityProvider, LiveIdentityProvider};
+
+    let provider = LiveIdentityProvider::new();
+    let identity = record.to_identity();
+    if !record.can_automate() || !matches!(provider.revalidate(&identity), Ok(true)) {
+        return (None, None);
+    }
+    let cwd_path = format!("/proc/{}/cwd", record.pid.0);
+    let Ok(cwd) = fs::read_link(&cwd_path) else {
+        return (None, None);
+    };
+    let config = UserIntentConfig {
+        enable_tty: false,
+        enable_session_mux: false,
+        enable_ssh: false,
+        enable_shell_activity: false,
+        enable_repo_activity: true,
+        enable_editor_focus: false,
+        ..UserIntentConfig::default()
+    };
+    let user_intent = collect_user_intent(record.pid.0, &config);
+    let workspace = resolve_workspace_for_pid(record.pid.0);
+    if !matches!(fs::read_link(&cwd_path), Ok(current) if current == cwd)
+        || !matches!(provider.revalidate(&identity), Ok(true))
+    {
+        return (None, None);
+    }
+    let workspace = workspace
+        .cwd
+        .as_ref()
+        .is_some_and(|observed| Path::new(&observed.original) == cwd.as_path())
+        .then_some(workspace);
+    (user_intent, workspace)
+}
+
 fn finish_scan(
     start: Instant,
     started_at: String,
@@ -1008,6 +1062,14 @@ fn finish_scan(
     let identity_provider = LiveIdentityProvider::new();
     let observed_at = chrono::Utc::now().to_rfc3339();
     for record in &mut processes {
+        // Only the dedicated worker's observed path may inspect arbitrary
+        // checkout files. Its base records were streamed first, so a deadline
+        // here preserves their counters with context explicitly unknown.
+        if observer.is_some() {
+            let (user_intent, workspace) = collect_workflow_context(record);
+            record.user_intent = user_intent;
+            record.workspace = workspace;
+        }
         let handles = collect_gpu_handles(record.pid.0, record.fd.as_ref());
         let identity = record.to_identity();
         let identity_verified =
@@ -1183,6 +1245,8 @@ fn parse_probed_process(
         fd,
         local_resource_evidence,
         gpu: None,
+        user_intent: None,
+        workspace: None,
         cgroup,
         wchan,
         network,
@@ -1314,6 +1378,8 @@ fn scan_process(
         fd,
         local_resource_evidence,
         gpu: None,
+        user_intent: None,
+        workspace: None,
         cgroup,
         wchan,
         network,
@@ -1354,6 +1420,8 @@ mod tests {
             fd: None,
             local_resource_evidence: Vec::new(),
             gpu: None,
+            user_intent: None,
+            workspace: None,
             cgroup: None,
             wchan: None,
             network: None,
@@ -1743,6 +1811,106 @@ mod tests {
             comm = record.comm.as_str(),
             state = format!("{}", record.state).as_str()
         );
+    }
+
+    #[test]
+    fn worker_collects_checkout_context_on_both_collection_paths() {
+        use std::process::{Command, Stdio};
+
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                // Only an unreaped owned child is signalled; an exited child
+                // reaped by try_wait is never addressed again by numeric PID.
+                if matches!(self.0.try_wait(), Ok(None)) {
+                    let _ = self.0.kill();
+                }
+                let _ = self.0.wait();
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "pt-deep-workflow-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let main_gitdir = root.join("main/.git");
+        let worktree = root.join("linked");
+        let gitdir = main_gitdir.join("worktrees/linked");
+        let cwd = worktree.join("src");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&gitdir).unwrap();
+        fs::write(main_gitdir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(gitdir.join("HEAD"), "ref: refs/heads/agent-work\n").unwrap();
+        fs::write(gitdir.join("index"), b"owned workflow fixture").unwrap();
+        fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+        fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .unwrap();
+        let mut child = OwnedChild(
+            Command::new("sleep")
+                .arg("60")
+                .current_dir(&cwd)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .ok()
+            .map(|boot| boot.trim().to_string());
+
+        for use_wait_free in [false, true] {
+            assert!(child.0.try_wait().unwrap().is_none());
+            let options = DeepScanOptions {
+                pids: vec![child.0.id()],
+                skip_inaccessible: false,
+                include_environ: false,
+                use_wait_free,
+                progress: None,
+            };
+            let direct = deep_scan(&options).unwrap();
+            assert!(direct.processes.iter().all(|record| {
+                record.user_intent.is_none() && record.workspace.is_none()
+            }));
+            let observer = |_event: DeepScanWorkerEvent| Ok(());
+            let scan = deep_scan_observed(&options, Some(&observer)).unwrap();
+            let record = scan.processes.first().expect("owned process was scanned");
+            let intent = record.user_intent.as_ref().expect("identity-bound context");
+            assert_eq!(intent.pid, child.0.id());
+            assert!(intent.privacy_mode.repo_activity_collected);
+            assert!(!intent.privacy_mode.session_mux_enabled);
+            assert!(!intent.privacy_mode.ssh_enabled);
+            assert!(intent.evidence.iter().any(|evidence| {
+                evidence.signal_type == super::super::user_intent::IntentSignalType::ActiveRepoContext
+            }));
+            let workspace = record.workspace.as_ref().expect("checkout provenance");
+            assert_eq!(workspace.pid, child.0.id());
+            assert_eq!(
+                workspace.worktree.as_ref().unwrap().effective_path(),
+                fs::canonicalize(&worktree).unwrap().to_str().unwrap()
+            );
+            assert_eq!(
+                workspace.head_state,
+                Some(pt_common::HeadState::Branch {
+                    name: "agent-work".to_string()
+                })
+            );
+
+            // The optional fields survive the same serialization used by the
+            // worker stream; stale numeric-PID joins never acquire context.
+            let serialized = serde_json::to_value(record).unwrap();
+            assert!(serialized["user_intent"].is_object());
+            assert!(serialized["workspace"].is_object());
+            let mut stale = record.clone();
+            stale.start_id = compute_start_id(&boot_id, record.starttime + 1, record.pid.0);
+            let (intent, workspace) = collect_workflow_context(&stale);
+            assert!(intent.is_none());
+            assert!(workspace.is_none());
+        }
     }
 
     #[test]
