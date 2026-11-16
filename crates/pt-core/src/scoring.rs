@@ -1692,10 +1692,11 @@ mod provenance {
         };
         let mut confidence_notes = Vec::new();
         let mut confidence_penalty_steps = 0usize;
+        // Any participant with missing IPC observations can hide a shared edge.
         let resource_collection_complete = bundle
             .resource_unavailable
-            .get(&pid)
-            .is_none_or(|notes| notes.is_empty());
+            .values()
+            .all(|notes| notes.is_empty());
 
         if let Some(unavailable) = bundle
             .resource_unavailable
@@ -1708,6 +1709,17 @@ mod provenance {
                     .iter()
                     .map(|reason| format!("resource collection incomplete: {reason}")),
             );
+            confidence_penalty_steps += 1;
+        } else if !resource_collection_complete {
+            resource_score = resource_score.min(0.5);
+            let unavailable_peers = bundle
+                .resource_unavailable
+                .values()
+                .filter(|notes| !notes.is_empty())
+                .count();
+            confidence_notes.push(format!(
+                "resource collection incomplete: {unavailable_peers} other process observation(s) unavailable"
+            ));
             confidence_penalty_steps += 1;
         }
         // Missing peers can hide shared resources even when this target was
@@ -3955,26 +3967,50 @@ mod provenance_tests {
     #[test]
     fn failed_resource_probes_do_not_establish_low_blast_radius() {
         let mut bundle = ProvenanceInferenceBundle {
-            lineages: HashMap::from([(200, lineage(200, 2, None))]),
+            lineages: HashMap::from([
+                (200, lineage(200, 2, None)),
+                (300, lineage(300, 2, None)),
+            ]),
             ..Default::default()
         };
         let complete = derive_provenance_adjustment(200, &bundle);
         assert!(feature_names(&complete).contains(&"provenance_blast_radius_low"));
 
-        bundle.resource_unavailable.insert(
-            200,
-            vec!["fd_ipc_metadata_unavailable: budget exhausted".into()],
+        bundle.resource_unavailable.insert(300, Vec::new());
+        let empty_peer = derive_provenance_adjustment(200, &bundle);
+        assert!(feature_names(&empty_peer).contains(&"provenance_blast_radius_low"));
+        assert_eq!(empty_peer.evidence_completeness, complete.evidence_completeness);
+        assert_eq!(
+            empty_peer.confidence_penalty_steps,
+            complete.confidence_penalty_steps
         );
-        let incomplete = derive_provenance_adjustment(200, &bundle);
-        assert!(!feature_names(&incomplete).contains(&"provenance_blast_radius_low"));
-        assert!(incomplete.evidence_completeness < complete.evidence_completeness);
-        assert!(incomplete.confidence_penalty_steps > complete.confidence_penalty_steps);
-        assert!(incomplete
-            .confidence_notes
-            .iter()
-            .any(|note| note.contains("budget exhausted")));
+        assert_eq!(empty_peer.confidence_notes, complete.confidence_notes);
 
-        // A failed optional probe does not erase positively observed resources.
+        for unreadable_pid in [200, 300] {
+            bundle.resource_unavailable = HashMap::from([(
+                unreadable_pid,
+                vec!["fd_ipc_metadata_unavailable: budget exhausted".into()],
+            )]);
+            let incomplete = derive_provenance_adjustment(200, &bundle);
+            assert!(!feature_names(&incomplete).contains(&"provenance_blast_radius_low"));
+            assert!(incomplete.evidence_completeness < complete.evidence_completeness);
+            assert!(incomplete.confidence_penalty_steps > complete.confidence_penalty_steps);
+            assert!(incomplete
+                .confidence_notes
+                .iter()
+                .any(|note| note.contains("resource collection incomplete")));
+            let expected_caveat = if unreadable_pid == 200 {
+                "budget exhausted"
+            } else {
+                "1 other process observation(s) unavailable"
+            };
+            assert!(incomplete
+                .confidence_notes
+                .iter()
+                .any(|note| note.contains(expected_caveat)));
+        }
+
+        // An unavailable peer does not erase the target's positive observations.
         bundle.resource_graph =
             SharedResourceGraph::from_evidence(&[(200, vec![listener_ev(200, 8080)])]);
         let with_listener = derive_provenance_adjustment(200, &bundle);

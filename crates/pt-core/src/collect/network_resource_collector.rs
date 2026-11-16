@@ -270,28 +270,13 @@ pub(crate) fn collect_fd_ipc_resources_with_runner(
 
         let target = link.to_string_lossy();
 
-        // Detect shared memory segments
-        if let Some(shm_name) = target.strip_prefix("/dev/shm/") {
-            if !shm_name.is_empty() {
-                result.resources.push(RawResourceEvidence {
-                    kind: ResourceKind::SharedMemory,
-                    key: format!("shm:{shm_name}"),
-                    owner_pid: pid,
-                    collection_method: ResourceCollectionMethod::ProcFd,
-                    state: ResourceState::Active,
-                    details: ResourceDetails::Generic {
-                        description: format!("shm:/dev/shm/{shm_name}"),
-                    },
-                    observed_at: now.clone(),
-                });
-            }
-            continue;
-        }
-
         // Do not stat the displayed target path in this thread. It can cross
         // namespaces, reopen a different inode, or block on an unhealthy mount.
-        // Kernel-labelled sockets/anonymous pipes/devices need no FIFO probe.
-        if target.starts_with('/') && !target.starts_with("/dev/") {
+        // Shared memory needs descriptor identity too: the same /dev/shm name
+        // in two mount namespaces is not necessarily the same resource.
+        if target.starts_with("/dev/shm/")
+            || (target.starts_with('/') && !target.starts_with("/dev/"))
+        {
             metadata_candidates.insert(format!("/proc/{pid}/fd/{fd}"), link);
         }
     }
@@ -299,7 +284,7 @@ pub(crate) fn collect_fd_ipc_resources_with_runner(
     if !metadata_candidates.is_empty() {
         let mut args = vec![
             "-L".to_string(),
-            "--format=%n %f".to_string(),
+            "--format=%n %f %d %i".to_string(),
             "--".to_string(),
         ];
         args.extend(metadata_candidates.keys().cloned());
@@ -308,7 +293,7 @@ pub(crate) fn collect_fd_ipc_resources_with_runner(
             Ok(output) if output.success() && output.stderr.is_empty() => {
                 let mut observed = std::collections::HashSet::new();
                 for line in output.stdout_str().lines() {
-                    let Some((descriptor, mode)) = line.split_once(' ') else {
+                    let Some((descriptor, metadata)) = line.split_once(' ') else {
                         result
                             .unavailable
                             .push("fd_ipc_invalid_metadata".to_string());
@@ -320,8 +305,10 @@ pub(crate) fn collect_fd_ipc_resources_with_runner(
                             .push("fd_ipc_unrequested_metadata".to_string());
                         continue;
                     };
-                    let Ok(mode) = u32::from_str_radix(mode, 16) else {
-                        result.unavailable.push("fd_ipc_invalid_mode".to_string());
+                    let Some(identity) = FdIpcIdentity::parse(metadata) else {
+                        result
+                            .unavailable
+                            .push("fd_ipc_invalid_metadata".to_string());
                         continue;
                     };
                     if !observed.insert(descriptor.to_string()) {
@@ -336,19 +323,8 @@ pub(crate) fn collect_fd_ipc_resources_with_runner(
                             .push("fd_ipc_descriptor_changed".to_string());
                         continue;
                     }
-                    if mode & libc::S_IFMT == libc::S_IFIFO {
-                        let path = target.to_string_lossy().into_owned();
-                        result.resources.push(RawResourceEvidence {
-                            kind: ResourceKind::NamedPipe,
-                            key: path.clone(),
-                            owner_pid: pid,
-                            collection_method: ResourceCollectionMethod::ProcFd,
-                            state: ResourceState::Active,
-                            details: ResourceDetails::Generic {
-                                description: format!("fifo:{path}"),
-                            },
-                            observed_at: now.clone(),
-                        });
+                    if let Some(resource) = identity.resource(pid, &target.to_string_lossy(), &now) {
+                        result.resources.push(resource);
                     }
                 }
                 if observed.len() != metadata_candidates.len() {
@@ -368,12 +344,156 @@ pub(crate) fn collect_fd_ipc_resources_with_runner(
     }
     result.unavailable.sort();
     result.unavailable.dedup();
+    result.resources.sort_by(|left, right| left.key.cmp(&right.key));
+    result.resources.dedup_by(|left, right| left.key == right.key);
     result
+}
+
+/// Identity of an observed descriptor target, scoped to the live host census.
+/// Paths are display evidence only: bind mounts, hard links and inherited FDs
+/// can expose one object through different names, and containers can reuse names
+/// for unrelated objects. Device plus inode identifies the held object instead.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy)]
+struct FdIpcIdentity {
+    mode: u32,
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl FdIpcIdentity {
+    fn parse(metadata: &str) -> Option<Self> {
+        let mut fields = metadata.split_whitespace();
+        let mode = u32::from_str_radix(fields.next()?, 16).ok()?;
+        let device: u64 = fields.next()?.parse().ok()?;
+        let inode: u64 = fields.next()?.parse().ok()?;
+        if fields.next().is_some() || inode == 0 {
+            return None;
+        }
+        Some(Self {
+            mode,
+            device,
+            inode,
+        })
+    }
+
+    fn resource(self, pid: u32, path: &str, observed_at: &str) -> Option<RawResourceEvidence> {
+        let (kind, prefix) = match self.mode & libc::S_IFMT {
+            libc::S_IFIFO => (ResourceKind::NamedPipe, "fifo"),
+            libc::S_IFREG
+                if path
+                    .strip_prefix("/dev/shm/")
+                    .is_some_and(|name| !name.is_empty()) =>
+            {
+                (ResourceKind::SharedMemory, "shm")
+            }
+            _ => return None,
+        };
+        Some(RawResourceEvidence {
+            kind,
+            key: format!("{prefix}:dev:{}:ino:{}", self.device, self.inode),
+            owner_pid: pid,
+            collection_method: ResourceCollectionMethod::ProcFd,
+            state: ResourceState::Active,
+            details: ResourceDetails::Generic {
+                description: format!("{prefix}:{path}"),
+            },
+            observed_at: observed_at.to_string(),
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ipc_identity_separates_same_named_objects_and_joins_aliases() {
+        for (mode, path, alias, kind) in [
+            (
+                libc::S_IFIFO,
+                "/run/worker.pipe",
+                "/mnt/worker.pipe",
+                ResourceKind::NamedPipe,
+            ),
+            (
+                libc::S_IFREG,
+                "/dev/shm/worker",
+                "/dev/shm/worker-alias",
+                ResourceKind::SharedMemory,
+            ),
+        ] {
+            let identity = FdIpcIdentity {
+                mode,
+                device: 10,
+                inode: 42,
+            };
+            let first = identity.resource(100, path, "observed").unwrap();
+            let inherited = identity.resource(200, alias, "observed").unwrap();
+            assert_eq!(first.kind, kind);
+            assert_eq!(first.key, inherited.key, "aliases must retain sharing");
+            assert_ne!(first.owner_pid, inherited.owner_pid);
+            for other in [
+                FdIpcIdentity {
+                    device: 11,
+                    ..identity
+                },
+                FdIpcIdentity {
+                    inode: 43,
+                    ..identity
+                },
+            ] {
+                let unrelated = other.resource(300, path, "observed").unwrap();
+                assert_ne!(
+                    first.key, unrelated.key,
+                    "path equality is not object identity"
+                );
+            }
+            assert!(matches!(first.details, ResourceDetails::Generic { description }
+                if description.ends_with(path)));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ipc_metadata_requires_complete_identity_and_observed_file_type() {
+        for invalid in [
+            "",
+            "81a4",
+            "81a4 10",
+            "81a4 10 0",
+            "81a4 x 42",
+            "x 10 42",
+            "81a4 10 42 extra",
+        ] {
+            assert!(FdIpcIdentity::parse(invalid).is_none(), "{invalid}");
+        }
+        let shared = FdIpcIdentity::parse("81a4 10 42").unwrap();
+        assert!(shared.resource(1, "/run/ordinary-file", "now").is_none());
+        assert!(shared.resource(1, "/dev/shm/", "now").is_none());
+        assert_eq!(
+            shared
+                .resource(1, "/dev/shm/held (deleted)", "now")
+                .unwrap()
+                .kind,
+            ResourceKind::SharedMemory
+        );
+        let directory = FdIpcIdentity {
+            mode: libc::S_IFDIR,
+            ..shared
+        };
+        assert!(directory.resource(1, "/dev/shm/directory", "now").is_none());
+        let fifo = FdIpcIdentity {
+            mode: libc::S_IFIFO,
+            ..shared
+        };
+        assert_eq!(
+            fifo.resource(1, "/dev/shm/pipe", "now").unwrap().kind,
+            ResourceKind::NamedPipe
+        );
+    }
 
     #[test]
     fn partial_network_observation_keeps_known_resources_and_caveats_together() {
@@ -636,7 +756,7 @@ mod tests {
     fn live_named_fifo_is_detected_without_opening_its_path() {
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
         use std::process::{Command, Stdio};
         use std::time::{Duration, Instant};
 
@@ -652,6 +772,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("work.pipe");
         let moved = dir.path().join("held.pipe");
+        let alias = dir.path().join("alias.pipe");
         let path_c = CString::new(path.as_os_str().as_bytes()).unwrap();
         // SAFETY: the fixture owns this new path and supplies a valid C string.
         assert_eq!(unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) }, 0);
@@ -673,6 +794,22 @@ mod tests {
         let pid = holder.0.as_ref().unwrap().id();
         std::fs::rename(&path, &moved).unwrap();
         std::fs::write(&path, "replacement regular file").unwrap();
+        std::fs::hard_link(&moved, &alias).unwrap();
+        let alias_fd = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&alias)
+            .unwrap();
+        let mut alias_holder = OwnedChild(Some(
+            Command::new("sleep")
+                .arg("30")
+                .stdin(Stdio::from(alias_fd))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        ));
 
         let started = Instant::now();
         let result = collect_fd_ipc_resources_with_diagnostics(pid);
@@ -683,9 +820,30 @@ mod tests {
             .iter()
             .find(|item| item.kind == ResourceKind::NamedPipe)
             .expect("held FIFO is positively identified");
-        assert_eq!(fifo.key, moved.to_string_lossy());
+        let metadata = std::fs::metadata(&moved).unwrap();
+        assert_eq!(
+            fifo.key,
+            format!("fifo:dev:{}:ino:{}", metadata.dev(), metadata.ino())
+        );
         assert_eq!(fifo.state, ResourceState::Active);
         assert_eq!(fifo.owner_pid, pid);
+        let alias_result =
+            collect_fd_ipc_resources_with_diagnostics(alias_holder.0.as_ref().unwrap().id());
+        assert!(
+            alias_result.unavailable.is_empty(),
+            "{:?}",
+            alias_result.unavailable
+        );
+        let alias_resource = alias_result
+            .resources
+            .iter()
+            .find(|item| item.kind == ResourceKind::NamedPipe)
+            .expect("hard-linked FIFO is positively identified");
+        assert_eq!(fifo.key, alias_resource.key);
+        assert!(
+            matches!(&alias_resource.details, ResourceDetails::Generic { description }
+                if description.ends_with(alias.to_string_lossy().as_ref()))
+        );
 
         let exhausted =
             super::super::tool_runner::ToolRunner::new(super::super::tool_runner::ToolConfig {
@@ -703,6 +861,7 @@ mod tests {
             unknown.unavailable
         );
         assert!(holder.0.as_mut().unwrap().try_wait().unwrap().is_none());
+        assert!(alias_holder.0.as_mut().unwrap().try_wait().unwrap().is_none());
     }
 
     #[cfg(target_os = "linux")]

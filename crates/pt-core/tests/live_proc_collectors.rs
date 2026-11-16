@@ -144,7 +144,8 @@ fn live_collect_local_resource_evidence_for_self() {
 #[test]
 fn live_fifo_pidfile_probe_is_bounded_without_losing_ipc_evidence() {
     use std::ffi::CString;
-    use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
 
@@ -171,6 +172,8 @@ fn live_fifo_pidfile_probe_is_bounded_without_losing_ipc_evidence() {
         .custom_flags(libc::O_NONBLOCK)
         .open(&path)
         .expect("open owned FIFO without waiting for a peer");
+    let metadata = fifo.metadata().expect("held FIFO identity");
+    let fifo_key = format!("fifo:dev:{}:ino:{}", metadata.dev(), metadata.ino());
     let mut holder = OwnedChild(
         Command::new("sleep")
             .arg("30")
@@ -206,7 +209,7 @@ fn live_fifo_pidfile_probe_is_bounded_without_losing_ipc_evidence() {
         entry.kind == ResourceKind::NamedPipe
             && entry.state == pt_common::ResourceState::Active
             && entry.owner_pid == pid
-            && entry.key == path.to_string_lossy()
+            && entry.key == fifo_key
     }));
     assert!(holder.0.try_wait().unwrap().is_none());
 }
