@@ -1309,10 +1309,31 @@ pub fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<(), Ses
         path: path.to_path_buf(),
         source: e,
     })?;
+    publish_json_bytes(path, &content)
+}
+
+/// Publish an already serialized JSON artifact without changing any bytes.
+///
+/// This is intended for exact configuration backups: whitespace and fields not
+/// known to the current typed model are preserved. Invalid JSON is rejected
+/// before creating directories or temporary files. Publication uses the same
+/// private inode, synchronization and path checks as [`write_json_pretty`],
+/// including its post-publication directory-sync error semantics.
+pub fn write_serialized_json(path: &Path, content: &[u8]) -> Result<(), SessionError> {
+    serde_json::from_slice::<serde::de::IgnoredAny>(content).map_err(|source| {
+        SessionError::Json {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    publish_json_bytes(path, content)
+}
+
+fn publish_json_bytes(path: &Path, content: &[u8]) -> Result<(), SessionError> {
     // Randomness prevents same-process writers from sharing a temporary path;
     // exclusive creation, rather than randomness, enforces collision safety.
     let temporary = format!(".pt-json-{}.tmp", uuid::Uuid::new_v4());
-    write_json_bytes(path, &content, temporary.as_ref(), std::fs::File::sync_all)
+    write_json_bytes(path, content, temporary.as_ref(), std::fs::File::sync_all)
 }
 
 fn session_io(path: &Path, source: std::io::Error) -> SessionError {
@@ -2498,6 +2519,27 @@ mod tests {
     }
 
     // ── write_json_pretty ────────────────
+
+    #[test]
+    fn write_serialized_json_preserves_bytes_and_rejects_invalid_input_before_mutation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("backup.json");
+        let original = b" \n{\"unrecognized_field\": [1,  2], \"model\":{}}\n \n";
+        write_serialized_json(&path, original).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+
+        for invalid in [b"{} {}".as_slice(), b"{\"partial\":", b"not json"] {
+            assert!(matches!(
+                write_serialized_json(&path, invalid),
+                Err(SessionError::Json { .. })
+            ));
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            let missing_parent = tmp.path().join("not-created");
+            assert!(write_serialized_json(&missing_parent.join("backup.json"), invalid).is_err());
+            assert!(!missing_parent.exists());
+        }
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
 
     #[test]
     fn write_json_pretty_creates_file() {

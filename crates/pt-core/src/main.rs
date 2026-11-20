@@ -38342,49 +38342,23 @@ fn run_agent_export_priors(global: &GlobalOpts, args: &AgentExportPriorsArgs) ->
         }
     };
 
+    let host_profile = args
+        .host_profile
+        .as_deref()
+        .or(config.priors.host_profile.as_deref());
     let export = serde_json::json!({
         "schema_version": SCHEMA_VERSION,
         "exported_at": chrono::Utc::now().to_rfc3339(),
         "host_id": host_id,
-        "host_profile": args.host_profile,
+        "host_profile": host_profile,
         "priors": config.priors,
         "snapshot": config.snapshot(),
     });
 
     let out_path = PathBuf::from(&args.out);
-    if let Some(parent) = out_path.parent() {
-        if let Err(err) = std::fs::create_dir_all(parent) {
-            eprintln!(
-                "agent export-priors: failed to create {}: {}",
-                parent.display(),
-                err
-            );
-            return ExitCode::IoError;
-        }
-    }
-
-    let tmp_path = out_path.with_extension("tmp");
-    let payload = match serde_json::to_vec_pretty(&export) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            eprintln!("agent export-priors: failed to serialize: {}", err);
-            return ExitCode::IoError;
-        }
-    };
-
-    if let Err(err) = std::fs::write(&tmp_path, payload) {
+    if let Err(err) = pt_core::session::write_json_pretty(&out_path, &export) {
         eprintln!(
-            "agent export-priors: failed to write {}: {}",
-            tmp_path.display(),
-            err
-        );
-        return ExitCode::IoError;
-    }
-
-    if let Err(err) = std::fs::rename(&tmp_path, &out_path) {
-        eprintln!(
-            "agent export-priors: failed to rename {} to {}: {}",
-            tmp_path.display(),
+            "agent export-priors: failed to publish {}: {}",
             out_path.display(),
             err
         );
@@ -38395,15 +38369,16 @@ fn run_agent_export_priors(global: &GlobalOpts, args: &AgentExportPriorsArgs) ->
         "exported": true,
         "path": out_path.display().to_string(),
         "host_id": host_id,
-        "host_profile": args.host_profile,
+        "host_profile": host_profile,
     });
     match global.format {
         OutputFormat::Json | OutputFormat::Toon => {
             println!("{}", format_structured_output(global, response));
         }
         OutputFormat::Jsonl => {
-            println!("{}", serde_json::to_string_pretty(&response).unwrap());
+            println!("{}", global.process_output_value(response));
         }
+        OutputFormat::Exitcode => {}
         _ => {
             println!("Exported priors to: {}", out_path.display());
         }
@@ -38414,9 +38389,14 @@ fn run_agent_export_priors(global: &GlobalOpts, args: &AgentExportPriorsArgs) ->
 
 fn run_agent_import_priors(global: &GlobalOpts, args: &AgentImportPriorsArgs) -> ExitCode {
     use pt_core::config::priors::Priors;
+    use pt_core::fleet::transfer::{merge_priors, MergeStrategy};
 
     // Default to merge if neither --merge nor --replace specified
-    let mode = if args.replace { "replace" } else { "merge" };
+    let (mode, strategy) = if args.replace {
+        ("replace", MergeStrategy::Replace)
+    } else {
+        ("merge", MergeStrategy::Weighted)
+    };
 
     // Read the input file
     let input_path = PathBuf::from(&args.from);
@@ -38471,6 +38451,28 @@ fn run_agent_import_priors(global: &GlobalOpts, args: &AgentImportPriorsArgs) ->
         }
     };
 
+    // Serde establishes the shape, not whether these parameters form a usable
+    // model. Refuse invalid input even if merging would hide the bad values.
+    if let Err(err) = pt_config::validate::validate_priors(&imported_priors) {
+        eprintln!("agent import-priors: invalid imported priors: {err}");
+        return ExitCode::ArgsError;
+    }
+
+    if let Some(expected) = args.host_profile.as_deref() {
+        // Export metadata may deliberately tag a copy for another profile.
+        // Raw Priors documents carry the same field inside the configuration.
+        let imported_profile = match import_doc.get("host_profile") {
+            Some(value) if !value.is_null() => value.as_str(),
+            _ => imported_priors.host_profile.as_deref(),
+        };
+        if expected.is_empty() || imported_profile != Some(expected) {
+            eprintln!(
+                "agent import-priors: imported host_profile must match --host-profile; no priors were changed"
+            );
+            return ExitCode::ArgsError;
+        }
+    }
+
     // Load current config
     let options = ConfigOptions {
         config_dir: global.config.as_ref().map(PathBuf::from),
@@ -38491,52 +38493,26 @@ fn run_agent_import_priors(global: &GlobalOpts, args: &AgentImportPriorsArgs) ->
         .priors_path
         .unwrap_or_else(|| resolved_config_dir(global).join("priors.json"));
 
-    // Check host profile compatibility
-    if let Some(ref filter_profile) = args.host_profile {
-        if let Some(imported_profile) = import_doc.get("host_profile").and_then(|v| v.as_str()) {
-            if imported_profile != filter_profile {
-                eprintln!(
-                    "agent import-priors: warning: imported host_profile '{}' differs from target '{}'",
-                    imported_profile, filter_profile
-                );
-            }
+    // Share fleet's actual merge semantics: equal-weight class probabilities
+    // and Beta parameters, retaining local non-Beta settings in merge mode.
+    let final_priors = match merge_priors(&config.priors, &imported_priors, strategy) {
+        Ok(priors) => priors,
+        Err(err) => {
+            eprintln!("agent import-priors: cannot merge priors: {err}");
+            return ExitCode::ArgsError;
         }
+    };
+    if let Err(err) = pt_config::validate::validate_priors(&final_priors) {
+        eprintln!("agent import-priors: invalid resulting priors: {err}");
+        return ExitCode::ArgsError;
     }
 
-    // Compute the final priors
-    let final_priors = if mode == "replace" {
-        imported_priors
-    } else {
-        // Merge mode: weighted combination
-        // For now, we do a simple replacement of class priors that exist in the import
-        // A more sophisticated merge could weight by observation counts
-        let mut merged = config.priors;
-
-        // Merge class priors
-        merged.classes.useful = imported_priors.classes.useful.clone();
-        merged.classes.useful_bad = imported_priors.classes.useful_bad.clone();
-        merged.classes.abandoned = imported_priors.classes.abandoned.clone();
-        merged.classes.zombie = imported_priors.classes.zombie.clone();
-
-        // Merge optional sections if present in import
-        if imported_priors.causal_interventions.is_some() {
-            merged.causal_interventions = imported_priors.causal_interventions.clone();
-        }
-        if imported_priors.hierarchical.is_some() {
-            merged.hierarchical = imported_priors.hierarchical.clone();
-        }
-        if imported_priors.robust_bayes.is_some() {
-            merged.robust_bayes = imported_priors.robust_bayes;
-        }
-
-        merged
-    };
-
     // Dry run: just show what would happen
-    if args.dry_run {
+    if args.dry_run || global.dry_run || global.shadow {
         let response = serde_json::json!({
             "dry_run": true,
             "mode": mode,
+            "merge_strategy": strategy,
             "source": input_path.display().to_string(),
             "target": priors_path.display().to_string(),
             "changes": {
@@ -38546,59 +38522,42 @@ fn run_agent_import_priors(global: &GlobalOpts, args: &AgentImportPriorsArgs) ->
                     "abandoned": final_priors.classes.abandoned.prior_prob,
                     "zombie": final_priors.classes.zombie.prior_prob,
                 }
-            }
+            },
+            "resulting_priors": final_priors,
         });
-        println!("{}", serde_json::to_string_pretty(&response).unwrap());
+        match global.format {
+            OutputFormat::Json | OutputFormat::Toon => {
+                println!("{}", format_structured_output(global, response));
+            }
+            OutputFormat::Jsonl => println!("{}", global.process_output_value(response)),
+            OutputFormat::Exitcode => {}
+            _ => println!("{}", serde_json::to_string_pretty(&response).unwrap()),
+        }
         return ExitCode::Clean;
     }
 
     // Create backup unless --no-backup
     if !args.no_backup && priors_path.exists() {
         let backup_path = priors_path.with_extension("json.bak");
-        if let Err(err) = std::fs::copy(&priors_path, &backup_path) {
+        let backup = std::fs::read(&priors_path)
+            .map_err(|source| pt_core::session::SessionError::Io {
+                path: priors_path.clone(),
+                source,
+            })
+            .and_then(|original| pt_core::session::write_serialized_json(&backup_path, &original));
+        if let Err(err) = backup {
             eprintln!(
-                "agent import-priors: warning: failed to create backup at {}: {}",
+                "agent import-priors: failed to create backup at {}: {}; priors unchanged",
                 backup_path.display(),
                 err
             );
-        }
-    }
-
-    // Ensure parent directory exists
-    if let Some(parent) = priors_path.parent() {
-        if let Err(err) = std::fs::create_dir_all(parent) {
-            eprintln!(
-                "agent import-priors: failed to create directory {}: {}",
-                parent.display(),
-                err
-            );
             return ExitCode::IoError;
         }
     }
 
-    // Write the priors atomically
-    let tmp_path = priors_path.with_extension("json.tmp");
-    let payload = match serde_json::to_vec_pretty(&final_priors) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            eprintln!("agent import-priors: failed to serialize: {}", err);
-            return ExitCode::IoError;
-        }
-    };
-
-    if let Err(err) = std::fs::write(&tmp_path, payload) {
+    if let Err(err) = pt_core::session::write_json_pretty(&priors_path, &final_priors) {
         eprintln!(
-            "agent import-priors: failed to write {}: {}",
-            tmp_path.display(),
-            err
-        );
-        return ExitCode::IoError;
-    }
-
-    if let Err(err) = std::fs::rename(&tmp_path, &priors_path) {
-        eprintln!(
-            "agent import-priors: failed to rename {} to {}: {}",
-            tmp_path.display(),
+            "agent import-priors: failed to publish {}: {}",
             priors_path.display(),
             err
         );
@@ -38609,6 +38568,7 @@ fn run_agent_import_priors(global: &GlobalOpts, args: &AgentImportPriorsArgs) ->
     let response = serde_json::json!({
         "imported": true,
         "mode": mode,
+        "merge_strategy": strategy,
         "source": input_path.display().to_string(),
         "target": priors_path.display().to_string(),
         "class_priors": {
@@ -38623,8 +38583,9 @@ fn run_agent_import_priors(global: &GlobalOpts, args: &AgentImportPriorsArgs) ->
             println!("{}", format_structured_output(global, response));
         }
         OutputFormat::Jsonl => {
-            println!("{}", serde_json::to_string_pretty(&response).unwrap());
+            println!("{}", global.process_output_value(response));
         }
+        OutputFormat::Exitcode => {}
         _ => {
             println!(
                 "Imported priors from {} to {} (mode: {})",

@@ -112,6 +112,10 @@ fn validate_class_params(name: &str, params: &crate::priors::ClassParams) -> Val
         validate_beta_params(&format!("classes.{}.io_active_beta", name), beta)?;
     }
 
+    if let Some(ref beta) = params.queue_saturation_beta {
+        validate_beta_params(&format!("classes.{}.queue_saturation_beta", name), beta)?;
+    }
+
     // Validate Gamma parameters
     if let Some(ref gamma) = params.runtime_gamma {
         validate_gamma_params(&format!("classes.{}.runtime_gamma", name), gamma)?;
@@ -674,6 +678,25 @@ mod tests {
         assert!(
             matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("net_beta"))
         );
+    }
+
+    #[test]
+    fn priors_require_finite_positive_queue_saturation_parameters() {
+        use crate::priors::{BetaParams, Priors};
+
+        let mut priors = Priors::default();
+        priors.classes.abandoned.queue_saturation_beta = Some(BetaParams::new(2.0, 4.0));
+        assert!(validate_priors(&priors).is_ok());
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for (alpha, beta, parameter) in [(invalid, 4.0, "alpha"), (2.0, invalid, "beta")] {
+                priors.classes.abandoned.queue_saturation_beta = Some(BetaParams::new(alpha, beta));
+                assert!(matches!(
+                    validate_priors(&priors),
+                    Err(ValidationError::InvalidValue { field, .. })
+                        if field == format!("classes.abandoned.queue_saturation_beta.{parameter}")
+                ));
+            }
+        }
     }
 
     #[test]
