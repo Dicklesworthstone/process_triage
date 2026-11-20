@@ -267,7 +267,7 @@ pub struct ToolSpec {
     pub env: BTreeMap<String, String>,
 
     /// Own a separate process group and cancel its descendants on completion.
-    /// Supported on Linux, where an unreaped leader pins the group identity.
+    /// Supported on Linux and macOS, where WNOWAIT pins the leader's identity.
     pub isolate_process_group: bool,
 }
 
@@ -339,10 +339,10 @@ struct ToolChildGuard(Option<Child>, bool);
 
 impl Drop for ToolChildGuard {
     fn drop(&mut self) {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let _ = self.1;
         if let Some(child) = self.0.take() {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             if self.1 {
                 terminate_owned_group(&child);
             }
@@ -353,7 +353,7 @@ impl Drop for ToolChildGuard {
 
 /// Observe exit without reaping: the leader's PID must remain pinned until its
 /// process group has been cancelled, even if descendants retain output pipes.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn peek_child_exit(child: &Child) -> std::io::Result<Option<std::process::ExitStatus>> {
     use std::os::unix::process::ExitStatusExt;
 
@@ -381,7 +381,7 @@ fn peek_child_exit(child: &Child) -> std::io::Result<Option<std::process::ExitSt
     Ok(Some(std::process::ExitStatus::from_raw(raw)))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn terminate_owned_group(child: &Child) {
     let pid = child.id();
     // WNOWAIT establishes parenthood without releasing the numeric identity.
@@ -390,9 +390,24 @@ fn terminate_owned_group(child: &Child) {
         warn!(pid, "cannot establish worker group ownership for cleanup");
         return;
     }
-    if unsafe { libc::getpgid(pid as libc::pid_t) } != pid as libc::pid_t {
-        warn!(pid, "worker is no longer its owned process group leader");
-        return;
+    let observed_group = unsafe { libc::getpgid(pid as libc::pid_t) };
+    if observed_group != pid as libc::pid_t {
+        // Darwin getpgid uses proc_find, which excludes exited processes, while
+        // waitid(WNOWAIT) retains the owned zombie until we reap it. Recheck
+        // that ownership after ESRCH: its reserved PID still prevents an
+        // unrelated process from creating a replacement group with this ID.
+        // https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_exit.c
+        // https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_prot.c
+        #[cfg(target_os = "macos")]
+        let owned_exited_leader = observed_group == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            && matches!(peek_child_exit(child), Ok(Some(_)));
+        #[cfg(not(target_os = "macos"))]
+        let owned_exited_leader = false;
+        if !owned_exited_leader {
+            warn!(pid, "worker is no longer its owned process group leader");
+            return;
+        }
     }
     if unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) } != 0 {
         let error = std::io::Error::last_os_error();
@@ -817,15 +832,15 @@ impl ToolRunner {
         }
 
         if spec.isolate_process_group {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             {
                 use std::os::unix::process::CommandExt;
                 command.process_group(0);
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
-                "owned worker process groups require Linux WNOWAIT",
+                "owned worker process groups require Linux or macOS WNOWAIT",
             )
             .into());
         }
@@ -918,7 +933,7 @@ impl ToolRunner {
                 &mut truncated,
             )?;
             if status.is_none() {
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
                 {
                     status = if isolate_process_group {
                         peek_child_exit(child)?
@@ -926,7 +941,7 @@ impl ToolRunner {
                         child.try_wait()?
                     };
                 }
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                 {
                     let _ = isolate_process_group;
                     status = child.try_wait()?;
@@ -1485,7 +1500,7 @@ mod tests {
         assert!(holder.0.as_mut().unwrap().try_wait().unwrap().is_none());
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn owned_worker_group_cancels_descendants_after_its_leader_exits() {
         let mut unrelated = ToolChildGuard(
@@ -1508,8 +1523,12 @@ mod tests {
             let descendant: u32 = output.stdout_str().trim().parse().unwrap();
             let cleanup_start = Instant::now();
             loop {
+                #[cfg(target_os = "linux")]
                 let state = std::fs::read_to_string(format!("/proc/{descendant}/stat"))
                     .ok().and_then(|stat| stat.rsplit_once(") ").and_then(|(_, rest)| rest.chars().next()));
+                #[cfg(target_os = "macos")]
+                let state =
+                    crate::collect::macos::read_session_stat(descendant).map(|stat| stat.state);
                 if matches!(state, None | Some('Z') | Some('X')) {
                     break;
                 }
@@ -1522,7 +1541,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn streaming_stdout_handler_cancels_a_worker_on_protocol_failure() {
         let mut observed = Vec::new();

@@ -677,7 +677,7 @@ fn parse_ps_line_with_timing(
     synthetic_now_unix: Option<i64>,
     clock: Option<&LinuxClock>,
 ) -> Result<ProcessRecord, String> {
-    let parsed = parse_ps_fields(line)?;
+    let parsed = parse_ps_fields(line, platform)?;
 
     // On Linux, prefer the kernel's exact start time over `ps etimes`.
     let exact = match (synthetic_now_unix, clock) {
@@ -694,6 +694,19 @@ fn parse_ps_line_with_timing(
     };
     #[cfg(not(target_os = "macos"))]
     let mac_start_us: Option<u64> = None;
+
+    #[cfg(target_os = "macos")]
+    let sid = if platform == "macos" && synthetic_now_unix.is_none() {
+        mac_start_us.and_then(|start_us| {
+            crate::collect::macos::read_session_stat(parsed.pid)
+                .filter(|native| native.starttime == start_us)
+                .and_then(|native| u32::try_from(native.session).ok())
+        })
+    } else {
+        parsed.sid
+    };
+    #[cfg(not(target_os = "macos"))]
+    let sid = parsed.sid;
 
     let (start_time_unix, elapsed, start_id) = if let Some(exact) = exact {
         let boot = boot_id.as_deref().unwrap_or("unknown");
@@ -744,7 +757,7 @@ fn parse_ps_line_with_timing(
         uid: parsed.uid,
         user: parsed.user.to_string(),
         pgid: Some(parsed.pgid),
-        sid: Some(parsed.sid),
+        sid,
         start_id,
         comm: parsed.comm.to_string(),
         cmd: parsed.cmd,
@@ -766,7 +779,7 @@ struct ParsedPsFields<'a> {
     uid: u32,
     user: &'a str,
     pgid: u32,
-    sid: u32,
+    sid: Option<u32>,
     state_char: char,
     cpu_percent: f64,
     rss_bytes: u64,
@@ -777,7 +790,7 @@ struct ParsedPsFields<'a> {
     cmd: String,
 }
 
-fn parse_ps_fields(line: &str) -> Result<ParsedPsFields<'_>, String> {
+fn parse_ps_fields<'a>(line: &'a str, platform: &str) -> Result<ParsedPsFields<'a>, String> {
     let mut fields = line.split_whitespace();
     let mut seen = 0usize;
 
@@ -794,9 +807,15 @@ fn parse_ps_fields(line: &str) -> Result<ParsedPsFields<'_>, String> {
     let pgid: u32 = next_ps_field(&mut fields, &mut seen)?
         .parse()
         .map_err(|_| "Invalid PGID")?;
-    let sid: u32 = next_ps_field(&mut fields, &mut seen)?
-        .parse()
-        .map_err(|_| "Invalid SID")?;
+    let session_field = next_ps_field(&mut fields, &mut seen)?;
+    // Darwin's `sess` is a hexadecimal kernel pointer, not a session ID:
+    // https://github.com/apple-oss-distributions/adv_cmds/blob/main/ps/keyword.c
+    // Only a native getsid observation can populate a macOS numeric session.
+    let sid = if platform == "macos" {
+        None
+    } else {
+        Some(session_field.parse().map_err(|_| "Invalid SID")?)
+    };
     let state_char = next_ps_field(&mut fields, &mut seen)?
         .chars()
         .next()
@@ -1945,6 +1964,22 @@ mod tests {
         assert_eq!(record.uid, 501);
         assert_eq!(record.user, "alice");
         assert_eq!(record.comm, "sleep");
+    }
+
+    #[test]
+    fn macos_session_pointer_is_never_a_numeric_session_id() {
+        for pointer in ["0", "501", "fffffe001234abcd"] {
+            let line = format!("501 1 501 alice 501 {pointer} S 0.0 8192 40960 ?? Mon Feb 24 09:00:00 2026 1:23:45 sleep sleep");
+            let record = parse_ps_line_synthetic(&line, "macos", &None, 1_800_000_000)
+                .expect("Darwin kernel session pointer must not discard a process");
+            assert_eq!(record.pid, ProcessId(501));
+            assert_eq!(record.sid, None);
+            let linux = parse_ps_line_synthetic(&line, "linux", &None, 1_800_000_000);
+            match pointer.parse::<u32>() {
+                Ok(sid) => assert_eq!(linux.unwrap().sid, Some(sid)),
+                Err(_) => assert!(linux.is_err(), "Linux still requires a numeric SID"),
+            }
+        }
     }
 
     #[test]

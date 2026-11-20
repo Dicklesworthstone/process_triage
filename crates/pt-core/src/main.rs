@@ -351,7 +351,7 @@ enum Commands {
     /// Full deep scan with all available probes
     DeepScan(DeepScanArgs),
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[command(name = "__deep-scan-worker", hide = true)]
     DeepScanWorker,
 
@@ -2177,7 +2177,7 @@ fn main() {
     });
     // The owned collector has a private stdin/stdout protocol. Start it before
     // logging, configuration, sessions, or action locks are initialized.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     if matches!(&cli.command, Some(Commands::DeepScanWorker)) {
         let code = match pt_core::collect::run_deep_scan_worker() {
             Ok(()) => ExitCode::Clean,
@@ -2250,7 +2250,7 @@ fn main() {
         Some(Commands::Scan(args)) => run_scan(&cli.global, &args),
         Some(Commands::Replay(args)) => run_replay(&cli.global, &args),
         Some(Commands::DeepScan(args)) => run_deep_scan(&cli.global, &args),
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         Some(Commands::DeepScanWorker) => unreachable!("worker dispatch precedes initialization"),
         Some(Commands::Diff(args)) => run_diff(&cli.global, &args),
         Some(Commands::Query(args)) => run_query(&cli.global, &args),
@@ -11755,7 +11755,122 @@ mod deep_scan_deadline_tests {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn run_macos_deep_scan(global: &GlobalOpts, args: &DeepScanArgs) -> ExitCode {
+    use pt_core::collect::{macos_scan, macos_scan_with_budget, MacOsScanOptions};
+
+    let budget = match (args.budget, global.timeout) {
+        (Some(scan), Some(global)) => Some(scan.min(global)),
+        (scan, global) => scan.or(global),
+    };
+    if args.allow_partial && budget.is_none() {
+        eprintln!("--allow-partial requires --budget or --timeout");
+        return ExitCode::ArgsError;
+    }
+    if budget.is_some_and(|seconds| seconds.checked_mul(1000).is_none())
+        || args
+            .pids
+            .iter()
+            .any(|pid| *pid == 0 || *pid > i32::MAX as u32)
+    {
+        eprintln!("Invalid deep-scan budget or process ID");
+        return ExitCode::ArgsError;
+    }
+    let options = MacOsScanOptions {
+        pids: args.pids.clone(),
+        skip_inaccessible: true,
+        include_environ: false,
+        tool_timeout: None,
+        progress: progress_emitter(global),
+    };
+    let collected = match budget {
+        Some(seconds) => std::env::current_exe()
+            .map_err(pt_core::collect::MacOsScanError::from)
+            .and_then(|worker| {
+                macos_scan_with_budget(&options, std::time::Duration::from_secs(seconds), &worker)
+            }),
+        None => macos_scan(&options),
+    };
+    let result = match collected {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("Deep scan failed: {error}");
+            return ExitCode::InternalError;
+        }
+    };
+    let exit_code = if result.metadata.collection.timed_out {
+        ExitCode::TimeoutError
+    } else if !result.metadata.collection.complete {
+        ExitCode::InternalError
+    } else {
+        ExitCode::Clean
+    };
+    if !result.metadata.collection.complete && !args.allow_partial {
+        eprintln!(
+            "Deep scan did not complete; no result published. Use --allow-partial with a budget to retain completed evidence."
+        );
+        return exit_code;
+    }
+    match global.format {
+        OutputFormat::Json | OutputFormat::Jsonl | OutputFormat::Toon => {
+            let output = serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "session_id": SessionId::new().0,
+                "generated_at": chrono::Utc::now().to_rfc3339(),
+                "deep_scan": result,
+            });
+            if matches!(global.format, OutputFormat::Jsonl) {
+                println!("{}", global.process_output_value(output));
+            } else {
+                println!("{}", format_structured_output(global, output));
+            }
+        }
+        OutputFormat::Exitcode => {}
+        _ => {
+            println!(
+                "Deep-scanned {} processes in {}ms (complete: {}, skipped: {})",
+                result.metadata.process_count,
+                result.metadata.duration_ms,
+                result.metadata.collection.complete,
+                result.metadata.skipped_count,
+            );
+            for warning in &result.metadata.warnings {
+                println!("Warning: {warning}");
+            }
+            if !matches!(global.format, OutputFormat::Summary) {
+                println!(
+                    "{:<8} {:<8} {:<10} {:<6} {:<10} COMMAND",
+                    "PID", "PPID", "USER", "STATE", "LSOF"
+                );
+                for process in result.processes.iter().take(20) {
+                    println!(
+                        "{:<8} {:<8} {:<10} {:<6} {:<10} {}",
+                        process.pid.0,
+                        process.ppid.0,
+                        process.user.chars().take(10).collect::<String>(),
+                        process.state,
+                        if process.lsof_complete {
+                            "observed"
+                        } else {
+                            "unknown"
+                        },
+                        process.comm,
+                    );
+                }
+                if result.processes.len() > 20 {
+                    println!("... and {} more", result.processes.len() - 20);
+                }
+            }
+        }
+    }
+    exit_code
+}
+
 fn run_deep_scan(global: &GlobalOpts, _args: &DeepScanArgs) -> ExitCode {
+    #[cfg(target_os = "macos")]
+    {
+        run_macos_deep_scan(global, _args)
+    }
     #[cfg(target_os = "linux")]
     {
         use pt_core::collect::{deep_scan, deep_scan_with_budget, DeepScanOptions};
@@ -11898,13 +12013,13 @@ fn run_deep_scan(global: &GlobalOpts, _args: &DeepScanArgs) -> ExitCode {
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         // Not a success: agents must not read a stub as a completed deep scan.
         output_stub(
             global,
             "deep-scan",
-            "Deep scan is currently supported on Linux only",
+            "Deep scan is supported on Linux and macOS",
         )
     }
 }
@@ -34896,7 +35011,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                         execution_evidence["signal_delivery_unknown"] = serde_json::json!(true);
                     }
                     pending.push_back(PendingKillExecution {
-                        action: action.clone(),
+                        action: (*action).clone(),
                         ancestors,
                         worker,
                         evidence: execution_evidence,

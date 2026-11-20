@@ -1454,7 +1454,6 @@ impl Scorer {
 
 #[cfg(target_os = "linux")]
 mod provenance {
-    use serde::Deserialize;
     use std::collections::HashMap;
 
     use pt_common::{

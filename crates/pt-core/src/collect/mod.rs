@@ -62,7 +62,7 @@ mod types;
 pub mod user_intent;
 pub mod workspace_resolver;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
 pub mod macos;
 
 #[cfg(test)]
@@ -198,7 +198,8 @@ pub use incremental::{
 #[cfg(target_os = "macos")]
 pub use macos::{
     collect_environ, collect_lsof_info, detect_launchd_service, detect_sip_status, macos_scan,
-    read_bsd_info, read_process_snapshot, LaunchdService, MacBsdInfo, MacOsCapabilities,
+    macos_scan_with_budget, read_bsd_info, read_process_snapshot,
+    run_macos_scan_worker as run_deep_scan_worker, LaunchdService, MacBsdInfo, MacOsCapabilities,
     MacOsNetworkConnection, MacOsPsSnapshot, MacOsScanError, MacOsScanMetadata, MacOsScanOptions,
     MacOsScanRecord, MacOsScanResult, OpenFile, SipStatus,
 };

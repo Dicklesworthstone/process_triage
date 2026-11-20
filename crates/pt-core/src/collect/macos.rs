@@ -18,14 +18,17 @@
 //! - Tool capabilities are auto-detected at startup
 //!
 //! # Platform Support
-//! This module only compiles on macOS (target_os = "macos").
+//! Native collection compiles on macOS. Pure parsers and the worker protocol
+//! also compile in Linux unit tests so bounded/partial behavior is exercised.
 
-use super::tool_runner::run_tool;
+use super::tool_runner::{run_tool, ToolConfig, ToolError, ToolOutput, ToolRunner, ToolSpec};
 use crate::events::{event_names, Phase, ProgressEmitter, ProgressEvent};
 use pt_common::{IdentityQuality, ProcessId, StartId};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::{HashMap, HashSet};
+#[cfg(target_os = "macos")]
+use std::io::{Read, Write};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -196,7 +199,8 @@ pub struct MacOsScanOptions {
     /// Only scan specific PIDs (empty = all processes).
     pub pids: Vec<u32>,
 
-    /// Skip processes we can't fully inspect.
+    /// Skip processes whose native identity cannot be verified; otherwise fail.
+    /// Optional probe failures remain explicit unavailable evidence in records.
     pub skip_inaccessible: bool,
 
     /// Include environment variables (may be sensitive).
@@ -238,6 +242,9 @@ pub enum MacOsScanError {
 
     #[error("Tool not available: {0}")]
     ToolNotAvailable(String),
+
+    #[error("macOS deep scan worker failed: {0}")]
+    Worker(String),
 }
 
 /// Open file information from lsof.
@@ -346,12 +353,27 @@ pub struct MacOsScanRecord {
 
     // === macOS-specific details ===
     /// Open files from lsof.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub open_files: Vec<OpenFile>,
 
     /// Network connections.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub network_connections: Vec<MacOsNetworkConnection>,
+
+    /// True only after a complete, successful lsof response for this identity.
+    /// Empty file/socket lists with false here mean unknown, not no open files.
+    #[serde(default)]
+    pub lsof_complete: bool,
+
+    /// launchctl list observes only the collector's bootstrap domain. A missing
+    /// service is never proof that another user or domain does not supervise it.
+    #[serde(default)]
+    pub launchd_domain_observed: bool,
+
+    /// Failed optional probes. The base process remains visible, but callers
+    /// must not interpret the missing evidence as inactivity or no supervision.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unavailable: Vec<String>,
 
     /// launchd service info (if managed by launchd).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -404,124 +426,489 @@ pub struct MacOsScanMetadata {
     /// Detected capabilities.
     pub capabilities: MacOsCapabilities,
 
+    /// Coverage of the inventory and worker stream, separate from optional
+    /// probe availability on each process (for example SIP-restricted lsof).
+    #[serde(default)]
+    pub collection: MacOsScanCollection,
+
     /// Warnings encountered.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+}
+
+/// Completed process outcomes, even when a deadline cancels later probes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MacOsScanCollection {
+    pub complete: bool,
+    pub timed_out: bool,
+    pub output_truncated: bool,
+    pub budget_ms: Option<u64>,
+    /// Unknown until the native process inventory has been received.
+    pub requested_count: Option<usize>,
+    pub processed_count: usize,
+    pub incomplete_count: Option<usize>,
+    pub failed_count: usize,
+}
+
+const MACOS_REQUEST_LIMIT: usize = 1024 * 1024;
+const MACOS_OUTPUT_LIMIT: usize = 64 * 1024 * 1024;
+const MACOS_MESSAGE_LIMIT: usize = 4 * 1024 * 1024;
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MacOsScanRequest {
+    pids: Vec<u32>,
+    skip_inaccessible: bool,
+    include_environ: bool,
+    tool_timeout_ms: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+enum MacOsScanEvent {
+    Inventory { pids: Vec<u32> },
+    Capabilities { capabilities: MacOsCapabilities },
+    Record { record: Box<MacOsScanRecord> },
+    Skipped { pid: u32, warning: String },
+    Complete { metadata: Box<MacOsScanMetadata> },
+}
+
+/// Private worker protocol: the parent owns its deadline and only accepts
+/// complete JSONL records. No logging or session setup runs in this subprocess.
+#[cfg(target_os = "macos")]
+pub fn run_macos_scan_worker() -> Result<(), MacOsScanError> {
+    let mut request = Vec::new();
+    std::io::stdin()
+        .lock()
+        .take((MACOS_REQUEST_LIMIT + 1) as u64)
+        .read_to_end(&mut request)?;
+    if request.len() > MACOS_REQUEST_LIMIT {
+        return Err(MacOsScanError::Worker("request exceeds 1 MiB".into()));
+    }
+    let request: MacOsScanRequest = serde_json::from_slice(&request)
+        .map_err(|error| MacOsScanError::Worker(format!("invalid request: {error}")))?;
+    let options = MacOsScanOptions {
+        pids: request.pids,
+        skip_inaccessible: request.skip_inaccessible,
+        include_environ: request.include_environ,
+        tool_timeout: request.tool_timeout_ms.map(Duration::from_millis),
+        progress: None,
+    };
+    let mut writer = std::io::BufWriter::new(std::io::stdout().lock());
+    let mut observer = |event| {
+        serde_json::to_writer(&mut writer, &event)
+            .map_err(|error| MacOsScanError::Worker(format!("cannot stream result: {error}")))?;
+        writer.write_all(b"\n")?;
+        writer.flush()?;
+        Ok(())
+    };
+    macos_scan_observed(&options, Some(&mut observer))?;
+    Ok(())
+}
+
+/// Bound the whole native scan, including startup, capability probes, lsof,
+/// launchctl and output parsing. Completed records survive cancellation only as
+/// explicitly incomplete evidence. Callback delivery follows cancellation so
+/// a slow caller-owned progress sink cannot prolong a running collector.
+pub fn macos_scan_with_budget(
+    options: &MacOsScanOptions,
+    budget: Duration,
+    worker_executable: &Path,
+) -> Result<MacOsScanResult, MacOsScanError> {
+    let started = Instant::now();
+    let budget_ms = u64::try_from(budget.as_millis())
+        .map_err(|_| MacOsScanError::Worker("collection budget exceeds u64 milliseconds".into()))?;
+    let mut stream = MacOsScanStream::new(options, budget_ms);
+    if budget_ms == 0 {
+        stream.result.metadata.collection.timed_out = true;
+        return Ok(stream.finish(started, false));
+    }
+    let request = serde_json::to_vec(&MacOsScanRequest {
+        pids: options.pids.clone(),
+        skip_inaccessible: options.skip_inaccessible,
+        include_environ: options.include_environ,
+        tool_timeout_ms: options
+            .tool_timeout
+            .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
+    })
+    .map_err(|error| MacOsScanError::Worker(format!("cannot encode request: {error}")))?;
+    if request.len() > MACOS_REQUEST_LIMIT {
+        return Err(MacOsScanError::Worker("request exceeds 1 MiB".into()));
+    }
+    let remaining = budget.saturating_sub(started.elapsed());
+    if remaining.as_millis() == 0 {
+        stream.result.metadata.collection.timed_out = true;
+        return Ok(stream.finish(started, false));
+    }
+    let executable = worker_executable
+        .to_str()
+        .ok_or_else(|| MacOsScanError::Worker("worker path is not UTF-8".into()))?;
+    let runner = ToolRunner::new(ToolConfig {
+        default_timeout: remaining,
+        budget_ms: u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX),
+        max_output_bytes: MACOS_OUTPUT_LIMIT,
+        use_nice: false,
+        #[cfg(target_os = "linux")]
+        use_ionice: false,
+        ..ToolConfig::default()
+    });
+    let spec = ToolSpec::new(executable, vec!["__deep-scan-worker".into()])
+        .with_stdin(request)
+        .with_timeout(remaining)
+        .with_process_group();
+    let output = runner.run_with_stdout_handler(&spec, Some(&mut |bytes| stream.consume(bytes)));
+    let successful = match output {
+        Ok(output) => {
+            stream.result.metadata.collection.timed_out = output.timed_out;
+            stream.result.metadata.collection.output_truncated |= output.truncated;
+            if !output.success() {
+                stream.result.metadata.warnings.push(format!(
+                    "macOS deep scan worker incomplete: status {:?}, timed_out={}, truncated={}; {}",
+                    output.exit_code, output.timed_out, output.truncated,
+                    output.stderr_str().chars().take(4096).collect::<String>(),
+                ));
+            }
+            output.success()
+        }
+        Err(error) => {
+            stream.result.metadata.collection.timed_out = matches!(
+                error,
+                ToolError::Timeout(_) | ToolError::BudgetExhausted { .. }
+            );
+            stream
+                .result
+                .metadata
+                .warnings
+                .push(format!("macOS deep scan worker: {error}"));
+            false
+        }
+    };
+    // ToolRunner's deadline begins after request/configuration setup. Keep the
+    // caller's original deadline authoritative even for a late successful exit.
+    if started.elapsed() >= budget {
+        stream.result.metadata.collection.timed_out = true;
+    }
+    Ok(stream.finish(started, successful))
+}
+
+struct MacOsScanStream<'a> {
+    result: MacOsScanResult,
+    pending: Vec<u8>,
+    expected_pids: Option<HashSet<u32>>,
+    outcomes: HashSet<u32>,
+    inventory_received: bool,
+    capabilities_received: bool,
+    complete_received: bool,
+    options: &'a MacOsScanOptions,
+}
+
+impl<'a> MacOsScanStream<'a> {
+    fn new(options: &'a MacOsScanOptions, budget_ms: u64) -> Self {
+        let expected_pids = (!options.pids.is_empty())
+            .then(|| options.pids.iter().copied().collect::<HashSet<_>>());
+        let requested_count = expected_pids.as_ref().map(HashSet::len);
+        Self {
+            result: MacOsScanResult {
+                processes: Vec::new(),
+                metadata: MacOsScanMetadata {
+                    started_at: chrono::Utc::now().to_rfc3339(),
+                    duration_ms: 0,
+                    process_count: 0,
+                    skipped_count: 0,
+                    capabilities: MacOsCapabilities::default(),
+                    warnings: Vec::new(),
+                    collection: MacOsScanCollection {
+                        budget_ms: Some(budget_ms),
+                        requested_count,
+                        incomplete_count: requested_count,
+                        ..MacOsScanCollection::default()
+                    },
+                },
+            },
+            pending: Vec::new(),
+            expected_pids,
+            outcomes: HashSet::new(),
+            inventory_received: false,
+            capabilities_received: false,
+            complete_received: false,
+            options,
+        }
+    }
+
+    fn consume(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        for part in bytes.split_inclusive(|byte| *byte == b'\n') {
+            if self.pending.len().saturating_add(part.len()) > MACOS_MESSAGE_LIMIT {
+                self.result.metadata.collection.output_truncated = true;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "macOS deep scan message exceeds 4 MiB",
+                ));
+            }
+            self.pending.extend_from_slice(part);
+            if part.last() == Some(&b'\n') {
+                let event = serde_json::from_slice(&self.pending)
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+                self.pending.clear();
+                self.accept(event)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn accept(&mut self, event: MacOsScanEvent) -> std::io::Result<()> {
+        let invalid = |message| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
+        if self.complete_received {
+            return Err(invalid("macOS deep scan event follows completion"));
+        }
+        match event {
+            MacOsScanEvent::Inventory { pids } => {
+                let count = pids.len();
+                let pids: HashSet<_> = pids.into_iter().collect();
+                if self.inventory_received
+                    || pids.len() != count
+                    || pids.iter().any(|pid| *pid == 0 || *pid > i32::MAX as u32)
+                    || self
+                        .expected_pids
+                        .as_ref()
+                        .is_some_and(|expected| expected != &pids)
+                {
+                    return Err(invalid("inconsistent macOS deep scan inventory"));
+                }
+                self.inventory_received = true;
+                self.expected_pids = Some(pids);
+                self.result.metadata.collection.requested_count = Some(count);
+            }
+            MacOsScanEvent::Capabilities { capabilities } => {
+                if !self.inventory_received
+                    || self.capabilities_received
+                    || !self.outcomes.is_empty()
+                {
+                    return Err(invalid("unexpected macOS capability snapshot"));
+                }
+                self.capabilities_received = true;
+                self.result.metadata.capabilities = capabilities;
+            }
+            MacOsScanEvent::Record { record } => {
+                let pid = record.pid.0;
+                if !self.capabilities_received
+                    || !self
+                        .expected_pids
+                        .as_ref()
+                        .is_some_and(|pids| pids.contains(&pid))
+                    || !record.cpu_percent.is_finite()
+                    || record.cpu_percent < 0.0
+                    || record.identity_quality == IdentityQuality::PidOnly
+                    || record.start_id.0.is_empty()
+                    || !self.outcomes.insert(pid)
+                {
+                    return Err(invalid(
+                        "duplicate, unannounced or invalid macOS process record",
+                    ));
+                }
+                self.result.processes.push(*record);
+            }
+            MacOsScanEvent::Skipped { pid, warning } => {
+                if !self.capabilities_received
+                    || !self
+                        .expected_pids
+                        .as_ref()
+                        .is_some_and(|pids| pids.contains(&pid))
+                    || !self.outcomes.insert(pid)
+                {
+                    return Err(invalid("duplicate or unannounced macOS process skip"));
+                }
+                self.result.metadata.skipped_count += 1;
+                self.result.metadata.collection.failed_count += 1;
+                self.result.metadata.warnings.push(warning);
+            }
+            MacOsScanEvent::Complete { metadata } => {
+                let collection = &metadata.collection;
+                if !self.capabilities_received
+                    || self.result.metadata.collection.requested_count != Some(self.outcomes.len())
+                    || metadata.process_count != self.result.processes.len()
+                    || metadata.skipped_count != self.result.metadata.skipped_count
+                    || collection.failed_count != self.result.metadata.collection.failed_count
+                    || !collection.complete
+                    || collection.timed_out
+                    || collection.output_truncated
+                    || collection.requested_count != Some(self.outcomes.len())
+                    || collection.processed_count != self.outcomes.len()
+                    || collection.incomplete_count != Some(0)
+                {
+                    return Err(invalid(
+                        "macOS completion disagrees with observed process coverage",
+                    ));
+                }
+                self.result.metadata.warnings = metadata.warnings;
+                self.complete_received = true;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(mut self, started: Instant, successful: bool) -> MacOsScanResult {
+        let collection = &mut self.result.metadata.collection;
+        collection.complete = successful
+            && self.complete_received
+            && self.pending.is_empty()
+            && !collection.timed_out
+            && !collection.output_truncated;
+        collection.processed_count = self.outcomes.len();
+        collection.incomplete_count = collection
+            .requested_count
+            .map(|count| count.saturating_sub(self.outcomes.len()));
+        self.result.metadata.process_count = self.result.processes.len();
+        self.result.metadata.duration_ms =
+            started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+        if !collection.complete {
+            self.result.metadata.warnings.push(format!(
+                "Incomplete macOS deep scan: {} outcomes from inventory {:?}; missing evidence remains unknown",
+                collection.processed_count, collection.requested_count
+            ));
+        }
+        if let Some(emitter) = self.options.progress.as_ref() {
+            emitter.emit(
+                ProgressEvent::new(event_names::DEEP_SCAN_COMPLETE, Phase::DeepScan)
+                    .with_progress(
+                        collection.processed_count as u64,
+                        collection.requested_count.map(|count| count as u64),
+                    )
+                    .with_elapsed_ms(self.result.metadata.duration_ms)
+                    .with_detail("complete", collection.complete)
+                    .with_detail("timed_out", collection.timed_out),
+            );
+        }
+        self.result
+    }
 }
 
 // ============================================================================
 // lsof Parsing
 // ============================================================================
 
-/// Parse lsof output for a specific PID.
-///
-/// Uses `-p <pid> -F` format for machine-parseable output.
-fn parse_lsof_output(output: &str) -> (Vec<OpenFile>, Vec<MacOsNetworkConnection>) {
+/// Parse NUL-delimited lsof fields, retaining newlines inside filenames. Every
+/// response must name the requested PID and every file must provide its type.
+fn parse_lsof_output(
+    output: &str,
+    expected_pid: u32,
+) -> Result<(Vec<OpenFile>, Vec<MacOsNetworkConnection>), String> {
     let mut files = Vec::new();
     let mut connections = Vec::new();
-
-    let mut current_fd: Option<i32> = None;
-    let mut current_type: Option<String> = None;
-    let mut current_name: Option<String> = None;
-    let mut current_mode: Option<String> = None;
-
-    for line in output.lines() {
-        if line.is_empty() {
+    let mut process_seen = false;
+    let mut entry: Option<LsofEntry> = None;
+    if !output.contains('\0') || !output.trim_end_matches('\n').ends_with('\0') {
+        return Err("lsof response is not a complete NUL-delimited field stream".into());
+    }
+    for field in output.split('\0') {
+        // lsof separates process/file sets with a newline after the NUL.
+        let field = field.trim_start_matches('\n');
+        if field.is_empty() {
             continue;
         }
-
-        let (key, value) = (line.chars().next(), &line[1..]);
-
+        if !field.as_bytes()[0].is_ascii() {
+            return Err("invalid lsof field identifier".into());
+        }
+        let (key, value) = field.split_at(1);
         match key {
-            Some('f') => {
-                // Flush previous entry
-                flush_lsof_entry(
-                    &mut files,
-                    &mut connections,
-                    current_fd,
-                    current_type.take(),
-                    current_name.take(),
-                    current_mode.take(),
-                );
-
-                // Parse FD
-                current_fd = value.parse().ok();
+            "p" => {
+                if process_seen || value.parse::<u32>() != Ok(expected_pid) {
+                    return Err("lsof response names an unexpected or repeated process".into());
+                }
+                process_seen = true;
             }
-            Some('t') => {
-                current_type = Some(value.to_string());
+            "f" => {
+                if !process_seen || value.is_empty() {
+                    return Err("lsof file appears without its process or descriptor".into());
+                }
+                if let Some(previous) = entry.take() {
+                    flush_lsof_entry(&mut files, &mut connections, previous)?;
+                }
+                entry = Some(LsofEntry {
+                    fd: value.parse().ok(),
+                    ..LsofEntry::default()
+                });
             }
-            Some('n') => {
-                current_name = Some(value.to_string());
+            "t" | "n" | "a" | "P" | "T" => {
+                let current = entry.as_mut().ok_or("lsof field appears before a file")?;
+                let destination = match key {
+                    "t" => &mut current.file_type,
+                    "n" => &mut current.name,
+                    "a" => &mut current.mode,
+                    "P" => &mut current.protocol,
+                    "T" if value.starts_with("ST=") => &mut current.state,
+                    _ => continue,
+                };
+                let value = if key == "T" { &value[3..] } else { value };
+                if destination.replace(value.to_string()).is_some() {
+                    return Err(format!("duplicate lsof {key} field"));
+                }
             }
-            Some('a') => {
-                current_mode = Some(value.to_string());
-            }
-            _ => {}
+            _ => return Err(format!("unexpected lsof field {key}")),
         }
     }
+    if !process_seen {
+        return Err("lsof response has no process identity".into());
+    }
+    if let Some(previous) = entry {
+        flush_lsof_entry(&mut files, &mut connections, previous)?;
+    }
+    Ok((files, connections))
+}
 
-    // Flush final entry
-    flush_lsof_entry(
-        &mut files,
-        &mut connections,
-        current_fd,
-        current_type,
-        current_name,
-        current_mode,
-    );
-
-    (files, connections)
+#[derive(Default)]
+struct LsofEntry {
+    fd: Option<i32>,
+    file_type: Option<String>,
+    name: Option<String>,
+    mode: Option<String>,
+    protocol: Option<String>,
+    state: Option<String>,
 }
 
 fn flush_lsof_entry(
     files: &mut Vec<OpenFile>,
     connections: &mut Vec<MacOsNetworkConnection>,
-    fd: Option<i32>,
-    file_type: Option<String>,
-    name: Option<String>,
-    mode: Option<String>,
-) {
-    let Some(file_type) = file_type else { return };
-    let name = name.unwrap_or_default();
-
-    // Check if this is a network connection
+    entry: LsofEntry,
+) -> Result<(), String> {
+    let file_type = entry.file_type.ok_or("lsof file type is unavailable")?;
+    let name = entry.name.ok_or("lsof file name is unavailable")?;
+    if file_type.is_empty()
+        || file_type.eq_ignore_ascii_case("unknown")
+        || file_type.starts_with("UNKN")
+        || file_type == "UNSP"
+        || file_type.contains('?')
+        || name.is_empty()
+    {
+        return Err("lsof file metadata is unavailable".into());
+    }
     if file_type == "IPv4" || file_type == "IPv6" {
-        // Parse network connection from name
-        // Format: "localhost:8080->remote:443 (ESTABLISHED)"
-        let (addresses, state) = if let Some(paren_pos) = name.rfind('(') {
-            let state = name[paren_pos + 1..].trim_end_matches(')').to_string();
-            (name[..paren_pos].trim(), Some(state))
-        } else {
-            (name.as_str(), None)
-        };
-
-        let (local, remote) = if let Some(arrow_pos) = addresses.find("->") {
-            (
-                addresses[..arrow_pos].to_string(),
-                Some(addresses[arrow_pos + 2..].to_string()),
-            )
-        } else {
-            (addresses.to_string(), None)
-        };
-
+        let (local, remote) = name
+            .split_once("->")
+            .map_or((name.as_str(), None), |(local, remote)| {
+                (local, Some(remote))
+            });
+        let protocol = entry
+            .protocol
+            .ok_or("lsof socket protocol is unavailable")?;
         connections.push(MacOsNetworkConnection {
             protocol: if file_type == "IPv6" {
-                "TCP6".to_string()
+                format!("{protocol}6")
             } else {
-                "TCP".to_string()
+                protocol
             },
-            local_address: local,
-            remote_address: remote,
-            state,
+            local_address: local.to_string(),
+            remote_address: remote.map(str::to_string),
+            state: entry.state,
         });
     } else {
         files.push(OpenFile {
-            fd,
+            fd: entry.fd,
             file_type,
             name,
-            mode,
+            mode: entry.mode,
         });
     }
+    Ok(())
 }
 
 /// `lsof` lives in /usr/sbin on macOS, which is often missing from PATH (launchd
@@ -542,7 +929,7 @@ pub fn collect_lsof_info(
 ) -> Result<(Vec<OpenFile>, Vec<MacOsNetworkConnection>), MacOsScanError> {
     let output = match run_tool(
         lsof_path(),
-        &["-p", &pid.to_string(), "-F", "ftna"],
+        &["-nP", "-p", &pid.to_string(), "-F0pftnaPT"],
         Some(timeout),
         None,
     ) {
@@ -555,17 +942,38 @@ pub fn collect_lsof_info(
         }
     };
 
-    if !output.success() {
+    parse_lsof_tool_output(&output, pid)
+}
+
+fn parse_lsof_tool_output(
+    output: &ToolOutput,
+    pid: u32,
+) -> Result<(Vec<OpenFile>, Vec<MacOsNetworkConnection>), MacOsScanError> {
+    // lsof can exit zero after returning only some requested information. Its
+    // warnings (for example an unreadable filesystem) make coverage unknown.
+    if !output.success() || !output.stderr.is_empty() {
         // lsof returns non-zero for various reasons (process exited, permission denied)
         let stderr = output.stderr_str();
         if stderr.contains("Permission denied") {
             return Err(MacOsScanError::PermissionDenied(pid));
         }
-        // Process may have exited - return empty
-        return Ok((Vec::new(), Vec::new()));
+        return Err(MacOsScanError::ToolFailed {
+            tool: "lsof".into(),
+            message: format!(
+                "incomplete response: status {:?}, timed_out={}, truncated={}; {}",
+                output.exit_code,
+                output.timed_out,
+                output.truncated,
+                stderr.chars().take(4096).collect::<String>(),
+            ),
+        });
     }
-
-    Ok(parse_lsof_output(&output.stdout_str()))
+    let stdout =
+        std::str::from_utf8(&output.stdout).map_err(|error| MacOsScanError::ParseError {
+            pid,
+            message: format!("lsof output is not UTF-8: {error}"),
+        })?;
+    parse_lsof_output(stdout, pid).map_err(|message| MacOsScanError::ParseError { pid, message })
 }
 
 // ============================================================================
@@ -574,41 +982,63 @@ pub fn collect_lsof_info(
 
 /// Check if a PID is managed by launchd and get service info.
 pub fn detect_launchd_service(pid: u32) -> Option<LaunchdService> {
-    // Run `launchctl list` and find the service with matching PID
-    let output = crate::collect::tool_runner::run_tool(
-        "launchctl",
-        &["list"],
-        Some(std::time::Duration::from_secs(5)),
-        None,
-    )
-    .ok()?;
+    collect_launchd_services(Duration::from_secs(5))
+        .ok()?
+        .remove(&pid)
+}
 
-    if !output.success() {
-        return None;
+fn collect_launchd_services(timeout: Duration) -> Result<HashMap<u32, LaunchdService>, String> {
+    let output = crate::collect::tool_runner::run_tool("launchctl", &["list"], Some(timeout), None)
+        .map_err(|error| error.to_string())?;
+    if !output.success() || !output.stderr.is_empty() {
+        return Err(format!(
+            "incomplete domain listing: status {:?}, timed_out={}, truncated={}; {}",
+            output.exit_code,
+            output.timed_out,
+            output.truncated,
+            output.stderr_str().chars().take(4096).collect::<String>(),
+        ));
     }
+    let stdout = std::str::from_utf8(&output.stdout).map_err(|error| error.to_string())?;
+    parse_launchd_services(stdout)
+}
 
-    let stdout = output.stdout_str();
-
-    for line in stdout.lines().skip(1) {
-        // Skip header
+fn parse_launchd_services(output: &str) -> Result<HashMap<u32, LaunchdService>, String> {
+    let mut lines = output.lines().filter(|line| !line.trim().is_empty());
+    if lines
+        .next()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>())
+        != Some(vec!["PID", "Status", "Label"])
+    {
+        return Err("invalid launchctl list header".into());
+    }
+    let mut services = HashMap::new();
+    for line in lines {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 3 {
-            // Format: PID Status Label
-            if let Ok(service_pid) = parts[0].parse::<u32>() {
-                if service_pid == pid {
-                    let status = parts[1].parse().ok();
-                    let label = parts[2..].join(" ");
-                    return Some(LaunchdService {
-                        label,
-                        pid: Some(pid),
-                        last_exit_status: status,
-                    });
-                }
-            }
+        if parts.len() != 3 {
+            return Err("malformed launchctl service row".into());
+        }
+        let status = parts[1]
+            .parse::<i32>()
+            .map_err(|_| "invalid launchctl service status")?;
+        if parts[0] == "-" {
+            continue;
+        }
+        let pid = parts[0]
+            .parse::<u32>()
+            .ok()
+            .filter(|pid| *pid > 0)
+            .ok_or("invalid launchctl service PID")?;
+        let service = LaunchdService {
+            label: parts[2].to_string(),
+            pid: Some(pid),
+            last_exit_status: Some(status),
+        };
+        if services.insert(pid, service).is_some() {
+            return Err("ambiguous launchctl service ownership".into());
         }
     }
-
-    None
+    Ok(services)
 }
 
 // ============================================================================
@@ -685,6 +1115,7 @@ pub struct MacBsdInfo {
 }
 
 /// Raw `proc_bsdinfo` for `pid`; `None` if it is gone or not readable.
+#[cfg(target_os = "macos")]
 fn raw_bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
     let pid = i32::try_from(pid).ok()?;
     // SAFETY: proc_bsdinfo is plain old data; proc_pidinfo writes at most `size` bytes.
@@ -708,6 +1139,7 @@ fn raw_bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
 /// identity across repeated macOS observations. Uncollected CPU and memory
 /// fields remain zero. `tty_nr` is 0 when there is no controlling terminal, as
 /// on Linux.
+#[cfg(target_os = "macos")]
 pub fn read_session_stat(pid: u32) -> Option<crate::collect::proc_parsers::ProcessStat> {
     let info = raw_bsd_info(pid)?;
     // SAFETY: getsid only reads kernel state for the pid.
@@ -753,6 +1185,7 @@ pub fn read_session_stat(pid: u32) -> Option<crate::collect::proc_parsers::Proce
 }
 
 /// Read [`MacBsdInfo`] for `pid`; `None` if it is gone or not readable.
+#[cfg(target_os = "macos")]
 pub fn read_bsd_info(pid: u32) -> Option<MacBsdInfo> {
     let info = raw_bsd_info(pid)?;
     Some(MacBsdInfo {
@@ -825,33 +1258,95 @@ fn parse_process_snapshot_line(line: &str, now_unix: i64) -> Option<MacOsPsSnaps
 // Main Scan Function
 // ============================================================================
 
+fn validate_inventory_warnings(warnings: &[String]) -> Result<(), MacOsScanError> {
+    if !warnings.is_empty() {
+        // quick_scan deliberately permits malformed rows in a full-host scan.
+        // Those missing rows prevent us from announcing a complete census.
+        return Err(MacOsScanError::ToolFailed {
+            tool: "ps".into(),
+            message: format!(
+                "process inventory is unknown: {} unreadable rows; {}",
+                warnings.len(),
+                warnings[0]
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Perform a macOS-specific deep scan.
 ///
 /// Collects detailed process information using macOS tools (lsof, launchctl, etc.)
 /// since /proc filesystem is not available.
+#[cfg(target_os = "macos")]
 pub fn macos_scan(options: &MacOsScanOptions) -> Result<MacOsScanResult, MacOsScanError> {
+    macos_scan_observed(options, None)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_scan_observed(
+    options: &MacOsScanOptions,
+    mut observer: Option<&mut dyn FnMut(MacOsScanEvent) -> Result<(), MacOsScanError>>,
+) -> Result<MacOsScanResult, MacOsScanError> {
+    use crate::action::IdentityProvider;
+
     let start = Instant::now();
     let started_at = chrono::Utc::now().to_rfc3339();
-
-    // Detect capabilities
-    let capabilities = MacOsCapabilities::detect();
-    debug!(
-        sip = ?capabilities.sip_status,
-        lsof = capabilities.lsof_available,
-        launchctl = capabilities.launchctl_available,
-        "macOS scan capabilities detected"
-    );
-
     let tool_timeout = options.tool_timeout.unwrap_or(Duration::from_secs(5));
-
-    // Get list of PIDs from ps output
-    let pids = if options.pids.is_empty() {
-        list_all_pids_macos()?
+    // Reuse the shipped scanner's target-only selection and exact native birth
+    // identity. The old private ps parser mixed -e with -p and reconstructed
+    // birth from elapsed seconds, which could join evidence across PID reuse.
+    let scan = super::quick_scan(&super::QuickScanOptions {
+        pids: options.pids.clone(),
+        timeout: Some(tool_timeout),
+        ..super::QuickScanOptions::default()
+    })
+    .map_err(|error| MacOsScanError::ToolFailed {
+        tool: "ps".into(),
+        message: error.to_string(),
+    })?;
+    validate_inventory_warnings(&scan.metadata.warnings)?;
+    let mut pids = if options.pids.is_empty() {
+        scan.processes
+            .iter()
+            .map(|process| process.pid.0)
+            .collect::<Vec<_>>()
     } else {
         options.pids.clone()
     };
+    pids.sort_unstable();
+    pids.dedup();
+    if let Some(observer) = observer.as_deref_mut() {
+        observer(MacOsScanEvent::Inventory { pids: pids.clone() })?;
+    }
+    let base_info: HashMap<_, _> = scan
+        .processes
+        .into_iter()
+        .map(|process| (process.pid.0, process))
+        .collect();
+    let identity_quality = if scan
+        .metadata
+        .boot_id
+        .as_deref()
+        .is_some_and(|boot| !boot.is_empty() && boot != "unknown")
+    {
+        IdentityQuality::Full
+    } else {
+        IdentityQuality::NoBootId
+    };
+    let capabilities = MacOsCapabilities::detect();
+    if let Some(observer) = observer.as_deref_mut() {
+        observer(MacOsScanEvent::Capabilities {
+            capabilities: capabilities.clone(),
+        })?;
+    }
+    // One launchctl snapshot per scan, not one full domain listing per PID.
+    let launchd = if capabilities.launchctl_available {
+        collect_launchd_services(tool_timeout)
+    } else {
+        Err("launchctl is unavailable".to_string())
+    };
     let total_pids = pids.len() as u64;
-
     if let Some(emitter) = options.progress.as_ref() {
         emitter.emit(
             ProgressEvent::new(event_names::DEEP_SCAN_STARTED, Phase::DeepScan)
@@ -860,85 +1355,143 @@ pub fn macos_scan(options: &MacOsScanOptions) -> Result<MacOsScanResult, MacOsSc
         );
     }
 
-    // Get base process info from ps first
-    let base_info = collect_base_process_info(&pids)?;
-
     let mut processes = Vec::new();
-    let mut warnings = Vec::new();
+    let mut warnings = scan.metadata.warnings;
+    warnings.push("launchd observations cover only the collector's bootstrap domain; no matching service does not establish absence of supervision".into());
     let mut skipped_count = 0usize;
-    let scanned = AtomicUsize::new(0);
-    const PROGRESS_STEP: usize = 50;
+    let identity_provider = crate::action::signal::LiveIdentityProvider::new();
 
     for pid in &pids {
         let Some(base) = base_info.get(pid) else {
-            // Process may have exited
+            if !options.skip_inaccessible {
+                return Err(MacOsScanError::ParseError {
+                    pid: *pid,
+                    message: "base process identity is unavailable".into(),
+                });
+            }
             skipped_count += 1;
+            let warning = format!("PID {pid}: base process identity is unavailable");
+            warnings.push(warning.clone());
+            if let Some(observer) = observer.as_deref_mut() {
+                observer(MacOsScanEvent::Skipped { pid: *pid, warning })?;
+            }
             continue;
         };
-
-        // Collect detailed info
-        let (open_files, network_connections) = if capabilities.lsof_available {
+        // BSD ps's sess value is not a native numeric session ID. Read both
+        // group and session from the same birth used by the action subsystem.
+        let identity = read_session_stat(*pid)
+            .filter(|native| {
+                native.starttime == read_bsd_info(*pid).map_or(0, |info| info.start_us)
+            })
+            .map(|native| {
+                pt_common::ProcessIdentity::full(
+                    *pid,
+                    base.start_id.clone(),
+                    base.uid,
+                    u32::try_from(native.pgrp).ok(),
+                    u32::try_from(native.session).ok(),
+                    identity_quality,
+                )
+            });
+        let Some(identity) =
+            identity.filter(|identity| identity_provider.revalidate(identity).unwrap_or(false))
+        else {
+            if !options.skip_inaccessible {
+                return Err(MacOsScanError::ParseError {
+                    pid: *pid,
+                    message: "native identity changed or could not be verified before collection"
+                        .into(),
+                });
+            }
+            skipped_count += 1;
+            let warning = format!(
+                "PID {pid}: native identity changed or could not be verified before collection"
+            );
+            warnings.push(warning.clone());
+            if let Some(observer) = observer.as_deref_mut() {
+                observer(MacOsScanEvent::Skipped { pid: *pid, warning })?;
+            }
+            continue;
+        };
+        let mut unavailable = Vec::new();
+        let (open_files, network_connections, lsof_complete) = if capabilities.lsof_available {
             match collect_lsof_info(*pid, tool_timeout) {
-                Ok(info) => info,
-                Err(MacOsScanError::PermissionDenied(_)) => {
-                    if options.skip_inaccessible {
-                        skipped_count += 1;
-                        continue;
-                    }
-                    (Vec::new(), Vec::new())
-                }
+                Ok((files, sockets)) => (files, sockets, true),
                 Err(e) => {
-                    warnings.push(format!("lsof failed for PID {}: {}", pid, e));
-                    (Vec::new(), Vec::new())
+                    unavailable.push(format!("lsof: {e}"));
+                    (Vec::new(), Vec::new(), false)
                 }
             }
         } else {
-            (Vec::new(), Vec::new())
+            unavailable.push("lsof is unavailable".into());
+            (Vec::new(), Vec::new(), false)
         };
-
-        // Check launchd
-        let launchd_service = if capabilities.launchctl_available {
-            detect_launchd_service(*pid)
-        } else {
-            None
+        let launchd_service = match &launchd {
+            Ok(services) => services.get(pid).cloned(),
+            Err(error) => {
+                unavailable.push(format!("launchctl: {error}"));
+                None
+            }
         };
-
-        // Collect environment if requested
         let environ = if options.include_environ {
-            collect_environ(*pid)
+            let values = collect_environ(*pid);
+            if values.is_none() {
+                unavailable.push("process environment is unavailable".into());
+            }
+            values
         } else {
             None
         };
-
+        if !identity_provider.revalidate(&identity).unwrap_or(false) {
+            if !options.skip_inaccessible {
+                return Err(MacOsScanError::ParseError {
+                    pid: *pid,
+                    message: "native identity changed or became unavailable during collection; evidence discarded".into(),
+                });
+            }
+            skipped_count += 1;
+            let warning = format!("PID {pid}: native identity changed or became unavailable during collection; evidence discarded");
+            warnings.push(warning.clone());
+            if let Some(observer) = observer.as_deref_mut() {
+                observer(MacOsScanEvent::Skipped { pid: *pid, warning })?;
+            }
+            continue;
+        }
         let record = MacOsScanRecord {
             pid: ProcessId(*pid),
             ppid: base.ppid,
             uid: base.uid,
             user: base.user.clone(),
-            pgid: base.pgid,
-            sid: base.sid,
+            pgid: identity.pgid,
+            sid: identity.sid,
             start_id: base.start_id.clone(),
             comm: base.comm.clone(),
-            cmdline: base.cmdline.clone(),
-            exe: base.exe.clone(),
-            state: base.state,
+            cmdline: base.cmd.clone(),
+            exe: None,
+            state: base.state.to_string().chars().next().unwrap_or('?'),
             cpu_percent: base.cpu_percent,
             rss_bytes: base.rss_bytes,
             vsz_bytes: base.vsz_bytes,
             open_files,
             network_connections,
+            lsof_complete,
+            launchd_domain_observed: launchd.is_ok(),
+            unavailable,
             launchd_service,
             environ,
             start_time_unix: base.start_time_unix,
             elapsed: base.elapsed,
             source: "macos_scan".to_string(),
-            identity_quality: IdentityQuality::NoBootId, // macOS lacks /proc/boot_id TOCTOU protection
+            identity_quality,
         };
-
+        if let Some(observer) = observer.as_deref_mut() {
+            observer(MacOsScanEvent::Record {
+                record: Box::new(record.clone()),
+            })?;
+        }
         processes.push(record);
-
-        let current = scanned.fetch_add(1, Ordering::Relaxed) + 1;
-        if current.is_multiple_of(PROGRESS_STEP) {
+        let current = processes.len() + skipped_count;
+        if current.is_multiple_of(50) {
             if let Some(emitter) = options.progress.as_ref() {
                 emitter.emit(
                     ProgressEvent::new(event_names::DEEP_SCAN_PROGRESS, Phase::DeepScan)
@@ -960,191 +1513,36 @@ pub fn macos_scan(options: &MacOsScanOptions) -> Result<MacOsScanResult, MacOsSc
         );
     }
 
+    let metadata = MacOsScanMetadata {
+        started_at,
+        duration_ms: duration.as_millis().try_into().unwrap_or(u64::MAX),
+        process_count,
+        skipped_count,
+        capabilities,
+        warnings,
+        collection: MacOsScanCollection {
+            complete: true,
+            requested_count: Some(pids.len()),
+            processed_count: pids.len(),
+            incomplete_count: Some(0),
+            failed_count: skipped_count,
+            ..MacOsScanCollection::default()
+        },
+    };
+    if let Some(observer) = observer {
+        observer(MacOsScanEvent::Complete {
+            metadata: Box::new(metadata.clone()),
+        })?;
+    }
     Ok(MacOsScanResult {
         processes,
-        metadata: MacOsScanMetadata {
-            started_at,
-            duration_ms: duration.as_millis() as u64,
-            process_count,
-            skipped_count,
-            capabilities,
-            warnings,
-        },
+        metadata,
     })
 }
 
 // ============================================================================
 // Helper Types and Functions
 // ============================================================================
-
-/// Base process info collected from ps.
-#[derive(Debug, Clone)]
-struct BaseProcessInfo {
-    ppid: ProcessId,
-    uid: u32,
-    user: String,
-    pgid: Option<u32>,
-    sid: Option<u32>,
-    start_id: StartId,
-    comm: String,
-    cmdline: String,
-    exe: Option<String>,
-    state: char,
-    cpu_percent: f64,
-    rss_bytes: u64,
-    vsz_bytes: u64,
-    start_time_unix: i64,
-    elapsed: Duration,
-}
-
-/// List all PIDs on macOS using ps.
-fn list_all_pids_macos() -> Result<Vec<u32>, MacOsScanError> {
-    let output = crate::collect::tool_runner::run_tool(
-        "ps",
-        &["-eo", "pid"],
-        Some(std::time::Duration::from_secs(10)),
-        None,
-    )
-    .map_err(|e| MacOsScanError::ToolFailed {
-        tool: "ps".to_string(),
-        message: e.to_string(),
-    })?;
-
-    if !output.success() {
-        return Err(MacOsScanError::ToolFailed {
-            tool: "ps".to_string(),
-            message: "Failed to list processes".to_string(),
-        });
-    }
-
-    let stdout = output.stdout_str();
-    let mut pids = Vec::new();
-
-    for line in stdout.lines().skip(1) {
-        // Skip header
-        if let Ok(pid) = line.trim().parse::<u32>() {
-            pids.push(pid);
-        }
-    }
-
-    Ok(pids)
-}
-
-/// Collect base process info for a list of PIDs using a single ps command.
-fn collect_base_process_info(
-    pids: &[u32],
-) -> Result<HashMap<u32, BaseProcessInfo>, MacOsScanError> {
-    // Use ps with BSD format to get all needed fields
-    let mut args = vec![
-        "-eo".to_string(),
-        "pid,ppid,uid,user,pgid,sess,state,%cpu,rss,vsz,lstart,etime,comm,args".to_string(),
-    ];
-
-    if !pids.is_empty() {
-        let pid_list = pids
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        args.push("-p".to_string());
-        args.push(pid_list);
-    }
-
-    let output = crate::collect::tool_runner::run_tool(
-        "ps",
-        &args.iter().map(|s| s.as_str()).collect::<Vec<&str>>(),
-        Some(std::time::Duration::from_secs(10)),
-        None,
-    )
-    .map_err(|e| MacOsScanError::ToolFailed {
-        tool: "ps".to_string(),
-        message: e.to_string(),
-    })?;
-
-    if !output.success() {
-        return Err(MacOsScanError::ToolFailed {
-            tool: "ps".to_string(),
-            message: "Failed to get process info".to_string(),
-        });
-    }
-
-    let stdout = output.stdout_str();
-    let mut info = HashMap::new();
-
-    for line in stdout.lines().skip(1) {
-        // Skip header
-        if let Some(parsed) = parse_ps_line_macos(line) {
-            info.insert(parsed.0, parsed.1);
-        }
-    }
-
-    Ok(info)
-}
-
-/// Parse a single ps output line for macOS.
-fn parse_ps_line_macos(line: &str) -> Option<(u32, BaseProcessInfo)> {
-    let fields: Vec<&str> = line.split_whitespace().collect();
-
-    // Need at least: pid ppid uid user pgid sess state %cpu rss vsz + lstart(5 fields) + etime + comm
-    // Total minimum: 17 fields
-    if fields.len() < 17 {
-        return None;
-    }
-
-    let pid: u32 = fields[0].parse().ok()?;
-    let ppid: u32 = fields[1].parse().ok()?;
-    let uid: u32 = fields[2].parse().ok()?;
-    let user = fields[3].to_string();
-    let pgid: u32 = fields[4].parse().ok()?;
-    let sid: u32 = fields[5].parse().ok()?;
-    let state = fields[6].chars().next().unwrap_or('?');
-    let cpu_percent: f64 = fields[7].parse().unwrap_or(0.0);
-    let rss_kb: u64 = fields[8].parse().unwrap_or(0);
-    let vsz_kb: u64 = fields[9].parse().unwrap_or(0);
-
-    // lstart is fields 10-14 (day mon date time year)
-    // etime is field 15
-    // comm is field 16
-    // args is 17+
-
-    let etime_idx = 15;
-    let comm_idx = 16;
-
-    let elapsed_secs = parse_etime_macos(fields.get(etime_idx)?).unwrap_or(0);
-    let now = chrono::Utc::now().timestamp();
-    let start_time_unix = now - elapsed_secs as i64;
-
-    let comm = fields.get(comm_idx)?.to_string();
-    let cmdline = if fields.len() > comm_idx + 1 {
-        fields[comm_idx + 1..].join(" ")
-    } else {
-        comm.clone()
-    };
-
-    // Create start_id for macOS (less precise than Linux)
-    let start_id = StartId::from_macos("unknown", start_time_unix as u64, pid);
-
-    Some((
-        pid,
-        BaseProcessInfo {
-            ppid: ProcessId(ppid),
-            uid,
-            user,
-            pgid: Some(pgid),
-            sid: Some(sid),
-            start_id,
-            comm,
-            cmdline,
-            exe: None, // Would need additional lookup
-            state,
-            cpu_percent,
-            rss_bytes: rss_kb * 1024,
-            vsz_bytes: vsz_kb * 1024,
-            start_time_unix,
-            elapsed: Duration::from_secs(elapsed_secs),
-        },
-    ))
-}
 
 /// Parse macOS etime format.
 fn parse_etime_macos(s: &str) -> Option<u64> {
@@ -1193,6 +1591,7 @@ fn parse_etime_macos(s: &str) -> Option<u64> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_session_stat_preserves_native_process_birth() {
         let pid = std::process::id();
@@ -1289,8 +1688,8 @@ mod tests {
 
     #[test]
     fn test_parse_lsof_output_files() {
-        let output = "f3\ntREG\nnpath/to/file.txt\nar\n";
-        let (files, connections) = parse_lsof_output(output);
+        let output = "p42\0\nf3\0tREG\0npath/to/file.txt\0ar\0\n";
+        let (files, connections) = parse_lsof_output(output, 42).unwrap();
 
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].fd, Some(3));
@@ -1302,21 +1701,318 @@ mod tests {
 
     #[test]
     fn test_parse_lsof_output_network() {
-        let output = "f5\ntIPv4\nnlocalhost:8080->remote:443 (ESTABLISHED)\n";
-        let (files, connections) = parse_lsof_output(output);
+        let output = "p42\0\nf5\0tIPv4\0PTCP\0n127.0.0.1:8080->127.0.0.2:443\0TST=ESTABLISHED\0\n";
+        let (files, connections) = parse_lsof_output(output, 42).unwrap();
 
         assert!(files.is_empty());
         assert_eq!(connections.len(), 1);
-        assert_eq!(connections[0].local_address, "localhost:8080");
+        assert_eq!(connections[0].protocol, "TCP");
+        assert_eq!(connections[0].local_address, "127.0.0.1:8080");
         assert_eq!(
             connections[0].remote_address,
-            Some("remote:443".to_string())
+            Some("127.0.0.2:443".to_string())
         );
         assert_eq!(connections[0].state, Some("ESTABLISHED".to_string()));
     }
 
-    // Mock-based tests for full scan would go here
-    // These tests can run on any platform since they use mocked data
+    #[test]
+    fn lsof_preserves_filename_boundaries_and_udp_protocol() {
+        let output =
+            "p42\0\nf3\0tREG\0n/tmp/日本語\np999\nf7\0aw\0\nf9\0tIPv6\0PUDP\0n[::1]:5353\0\n";
+        let (files, sockets) = parse_lsof_output(output, 42).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name, "/tmp/日本語\np999\nf7");
+        assert_eq!(sockets.len(), 1);
+        assert_eq!(sockets[0].protocol, "UDP6");
+        assert_eq!(sockets[0].local_address, "[::1]:5353");
+        assert_eq!(sockets[0].state, None);
+        assert_eq!(sockets[0].remote_address, None);
+    }
+
+    #[test]
+    fn lsof_missing_identity_truncated_and_malformed_evidence_is_unknown() {
+        for invalid in [
+            "",
+            "p42\nf3\ntREG\nn/tmp/file\n",
+            "p42\0\nf3\0tREG\0n/tmp/file",
+            "p43\0\nf3\0tREG\0n/tmp/file\0",
+            "p42\0p42\0",
+            "f3\0tREG\0n/tmp/file\0",
+            "p42\0f3\0n/tmp/file\0",
+            "p42\0f3\0tREG\0",
+            "p42\0f3\0tREG\0tREG\0n/file\0",
+            "p42\0f3\0tIPv4\0n*:1234\0",
+            "p42\0f3\0tUNKNfd\0nstat(/secret): Permission denied\0",
+            "p42\0f3\0tUNSP\0n/unsupported\0",
+            "p42\0f3\0t\0n/unknown\0",
+            "p42\0ébad\0",
+        ] {
+            assert!(
+                parse_lsof_output(invalid, 42).is_err(),
+                "accepted {invalid:?}"
+            );
+        }
+        let (files, sockets) = parse_lsof_output("p42\0\n", 42).unwrap();
+        assert!(files.is_empty() && sockets.is_empty());
+    }
+
+    #[test]
+    fn successful_lsof_with_diagnostics_is_unavailable_evidence() {
+        let mut output = ToolOutput {
+            command: "lsof".into(),
+            args: vec![],
+            stdout: b"p42\0\nf3\0tREG\0n/tmp/file\0ar\0\n".to_vec(),
+            stderr: vec![],
+            exit_code: Some(0),
+            truncated: false,
+            duration: Duration::from_millis(1),
+            timed_out: false,
+        };
+        assert_eq!(parse_lsof_tool_output(&output, 42).unwrap().0.len(), 1);
+        output.stderr = b"lsof: WARNING: cannot stat filesystem; output may be incomplete".to_vec();
+        assert!(parse_lsof_tool_output(&output, 42).is_err());
+        output.stderr.clear();
+        output.truncated = true;
+        assert!(parse_lsof_tool_output(&output, 42).is_err());
+        output.truncated = false;
+        output.timed_out = true;
+        assert!(parse_lsof_tool_output(&output, 42).is_err());
+        output.timed_out = false;
+        output.exit_code = Some(1);
+        assert!(parse_lsof_tool_output(&output, 42).is_err());
+    }
+
+    #[test]
+    fn launchd_snapshot_preserves_domain_matches_and_rejects_ambiguous_evidence() {
+        let snapshot = parse_launchd_services(
+            "PID\tStatus\tLabel\n-\t0\tdisabled.job\n42\t-9\tcom.example.worker\n",
+        )
+        .unwrap();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[&42].label, "com.example.worker");
+        assert_eq!(snapshot[&42].last_exit_status, Some(-9));
+        for invalid in [
+            "",
+            "42 0 job",
+            "PID Status Label\n42 x job",
+            "PID Status Label\n0 0 job",
+            "PID Status Label\n42 0 one\n42 0 two",
+        ] {
+            assert!(
+                parse_launchd_services(invalid).is_err(),
+                "accepted {invalid:?}"
+            );
+        }
+        assert!(parse_launchd_services("PID Status Label\n")
+            .unwrap()
+            .is_empty());
+    }
+
+    fn stream_record(pid: u32) -> MacOsScanRecord {
+        MacOsScanRecord {
+            pid: ProcessId(pid),
+            ppid: ProcessId(1),
+            uid: 501,
+            user: "fixture".into(),
+            pgid: Some(pid),
+            sid: None,
+            start_id: StartId::from_macos("boot", 1_000_000, pid),
+            comm: "sleep".into(),
+            cmdline: "sleep 30".into(),
+            exe: None,
+            state: 'S',
+            cpu_percent: 0.0,
+            rss_bytes: 4096,
+            vsz_bytes: 8192,
+            open_files: vec![],
+            network_connections: vec![],
+            lsof_complete: false,
+            launchd_domain_observed: false,
+            unavailable: vec!["lsof: permission denied".into()],
+            launchd_service: None,
+            environ: None,
+            start_time_unix: 1,
+            elapsed: Duration::from_secs(3),
+            source: "macos_scan".into(),
+            identity_quality: IdentityQuality::Full,
+        }
+    }
+
+    fn stream_prefix() -> Vec<MacOsScanEvent> {
+        vec![
+            MacOsScanEvent::Inventory { pids: vec![41, 42] },
+            MacOsScanEvent::Capabilities {
+                capabilities: MacOsCapabilities::default(),
+            },
+            MacOsScanEvent::Record {
+                record: Box::new(stream_record(41)),
+            },
+        ]
+    }
+
+    fn stream_bytes(events: &[MacOsScanEvent]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for event in events {
+            bytes.extend(serde_json::to_vec(event).unwrap());
+            bytes.push(b'\n');
+        }
+        bytes
+    }
+
+    #[test]
+    fn streamed_records_preserve_unknown_evidence_and_exact_coverage() {
+        let options = MacOsScanOptions {
+            pids: vec![41, 42],
+            ..MacOsScanOptions::default()
+        };
+        let mut stream = MacOsScanStream::new(&options, 500);
+        for byte in stream_bytes(&stream_prefix()) {
+            stream.consume(&[byte]).unwrap();
+        }
+        let partial = stream.finish(Instant::now(), false);
+        assert_eq!(partial.metadata.process_count, 1);
+        assert!(!partial.metadata.collection.complete);
+        assert_eq!(partial.metadata.collection.processed_count, 1);
+        assert_eq!(partial.metadata.collection.incomplete_count, Some(1));
+        assert!(!partial.processes[0].lsof_complete);
+        assert!(!partial.processes[0].unavailable.is_empty());
+
+        let mut stream = MacOsScanStream::new(&options, 500);
+        stream.consume(&stream_bytes(&stream_prefix())).unwrap();
+        stream
+            .accept(MacOsScanEvent::Skipped {
+                pid: 42,
+                warning: "process exited".into(),
+            })
+            .unwrap();
+        let mut metadata = partial.metadata;
+        metadata.skipped_count = 1;
+        metadata.collection = MacOsScanCollection {
+            complete: true,
+            requested_count: Some(2),
+            processed_count: 2,
+            incomplete_count: Some(0),
+            failed_count: 1,
+            ..MacOsScanCollection::default()
+        };
+        stream
+            .accept(MacOsScanEvent::Complete {
+                metadata: Box::new(metadata),
+            })
+            .unwrap();
+        let complete = stream.finish(Instant::now(), true);
+        assert!(complete.metadata.collection.complete);
+        assert_eq!(complete.metadata.collection.failed_count, 1);
+        assert_eq!(complete.metadata.collection.incomplete_count, Some(0));
+    }
+
+    #[test]
+    fn malformed_worker_cannot_claim_duplicate_or_missing_processes() {
+        let options = MacOsScanOptions {
+            pids: vec![41, 42],
+            ..MacOsScanOptions::default()
+        };
+        for pid in [41, 43] {
+            let mut stream = MacOsScanStream::new(&options, 500);
+            stream.consume(&stream_bytes(&stream_prefix())).unwrap();
+            assert!(stream
+                .accept(MacOsScanEvent::Record {
+                    record: Box::new(stream_record(pid))
+                })
+                .is_err());
+        }
+        let mut stream = MacOsScanStream::new(&options, 500);
+        assert!(stream
+            .accept(MacOsScanEvent::Inventory { pids: vec![41] })
+            .is_err());
+        let mut stream = MacOsScanStream::new(&options, 500);
+        assert!(stream
+            .accept(MacOsScanEvent::Record {
+                record: Box::new(stream_record(41))
+            })
+            .is_err());
+        let mut stream = MacOsScanStream::new(&options, 500);
+        stream.consume(&stream_bytes(&stream_prefix())).unwrap();
+        let mut metadata = stream.result.metadata.clone();
+        metadata.process_count = 1;
+        metadata.collection.complete = true;
+        metadata.collection.processed_count = 2;
+        metadata.collection.incomplete_count = Some(0);
+        assert!(stream
+            .accept(MacOsScanEvent::Complete {
+                metadata: Box::new(metadata)
+            })
+            .is_err());
+        assert!(
+            !stream
+                .finish(Instant::now(), true)
+                .metadata
+                .collection
+                .complete
+        );
+    }
+
+    #[test]
+    fn zero_budget_does_not_start_worker_or_invent_a_census() {
+        for pids in [vec![], vec![41, 41, 42]] {
+            let options = MacOsScanOptions {
+                pids,
+                ..MacOsScanOptions::default()
+            };
+            let result =
+                macos_scan_with_budget(&options, Duration::ZERO, Path::new("/does/not/exist"))
+                    .unwrap();
+            assert!(result.metadata.collection.timed_out);
+            assert!(!result.metadata.collection.complete);
+            assert!(result.processes.is_empty());
+            assert_eq!(
+                result.metadata.collection.requested_count,
+                (!options.pids.is_empty()).then_some(2)
+            );
+        }
+    }
+
+    #[test]
+    fn unreadable_snapshot_rows_prevent_a_complete_inventory() {
+        assert!(validate_inventory_warnings(&[]).is_ok());
+        let warning = "Line 2: malformed process row".to_string();
+        let error = validate_inventory_warnings(&[warning]).unwrap_err();
+        assert!(error.to_string().contains("process inventory is unknown"));
+        let options = MacOsScanOptions::default();
+        // The native collector validates before publishing its Inventory event.
+        let result = MacOsScanStream::new(&options, 500).finish(Instant::now(), false);
+        assert!(!result.metadata.collection.complete);
+        assert_eq!(result.metadata.collection.requested_count, None);
+        assert_eq!(result.metadata.collection.incomplete_count, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_worker_deadline_retains_only_completed_records() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("macos-scan-fixture");
+        let events = String::from_utf8(stream_bytes(&stream_prefix())).unwrap();
+        let script = format!(
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{}'\nexec sleep 30\n",
+            events.replace('\'', "'\"'\"'")
+        );
+        std::fs::write(&executable, script).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let options = MacOsScanOptions {
+            pids: vec![41, 42],
+            ..MacOsScanOptions::default()
+        };
+        let started = Instant::now();
+        let result =
+            macos_scan_with_budget(&options, Duration::from_millis(750), &executable).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(result.metadata.collection.timed_out);
+        assert!(!result.metadata.collection.complete);
+        assert_eq!(result.processes.len(), 1);
+        assert_eq!(result.processes[0].pid, ProcessId(41));
+        assert_eq!(result.metadata.collection.incomplete_count, Some(1));
+    }
 
     #[test]
     fn test_macos_capabilities_default() {

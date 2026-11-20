@@ -181,7 +181,7 @@ On Linux, `pt deep` reads 12+ files per process (raw records; the TUI turns netw
 
 Critical file detection recognizes 20+ patterns: git locks (`.git/index.lock`), package manager locks (dpkg, apt, rpm, npm, pnpm, yarn, cargo), SQLite WAL/journal files, database write handles, and generic `.lock`/`.lck` files. At apply time the data-loss gate blocks any target holding a regular file open for writing or a file lock; the categorized critical-file rules are not yet attached to plans.
 
-For standalone Linux deep scans, `pt deep --budget 5` (or `pt-core deep-scan --budget 5`) enforces a five-second collection deadline. The global `--timeout` also bounds this command; when both are supplied, the shorter duration applies. A deadline expiration, including a zero-second budget, returns exit code **22** without publishing a successful partial scan. With neither option, deep scanning uses its existing native collection behavior without an overall deadline.
+For standalone Linux and macOS deep scans, `pt deep --budget 5` (or `pt-core deep-scan --budget 5`) enforces a five-second collection deadline. The global `--timeout` also bounds this command; when both are supplied, the shorter duration applies. A deadline expiration, including a zero-second budget, returns exit code **22** without publishing a partial scan unless `--allow-partial` is explicitly supplied. With neither option, deep scanning uses native collection without an overall deadline.
 
 ### The TUI
 
@@ -239,6 +239,8 @@ For a resource goal, pass the same `goal` text the CLI accepts, such as `free 4G
 ```
 
 `pids` is an optional nonempty array of unique process IDs that limits candidate inference; protection and resource ownership still use the complete process census. `max_candidates`, `min_score`, `min_age`, `deep` and `window_ms` control the same planner options as the CLI. To compare with a saved plan, use `since` with its session ID, or `since_time` with a duration such as `2h` or a past RFC3339 timestamp. These comparisons retain a complete fresh plan and preserve the baseline session. `prediction_fields` requires `include_predictions: true`; forecasts still require recorded observations. Invalid types, empty PID selections, conflicting comparison options and unknown arguments are errors rather than silently broadening the scan. Starting the server with `pt-core --robot mcp` preserves robot policy in its planner children. The tool returns the actual saved plan and never applies its actions.
+
+`pt_plan` has a total deadline of 120 seconds, adjustable with `timeout_secs` from 1 to 600. This deadline covers the planner, its probes and output collection. A timeout, truncated output, failed exit or incomplete plan returns a tool error; it never returns partial evidence as a completed plan. The child keeps the server's explicit configuration and data directory and acquires the normal planning lock. On Linux and macOS, deadline cleanup also cancels the planner's owned process group.
 
 For feedback, call `pt_label` with exactly one of `pid` or `cmd`, a `verdict` of `"kill"` or `"spare"`, and `confirmed_by_user: true` only after the user explicitly chose that verdict. For example:
 
@@ -1115,7 +1117,7 @@ Cross-host dependency coordination remains incomplete: the Chandy-Lamport consis
 
 ### Retaining Partial Deep Evidence
 
-On Linux, `pt-core deep-scan --budget 5 --allow-partial --pids 1234,5678`
+On Linux and macOS, `pt-core deep-scan --budget 5 --allow-partial --pids 1234,5678`
 retains completed process records if collection reaches its deadline. A timeout
 still returns exit code **22**. Without `--allow-partial`, the existing command
 requires a complete scan and publishes no partial result on timeout.
@@ -1123,17 +1125,30 @@ requires a complete scan and publishes no partial result on timeout.
 The partial mode requires `--budget` or the global `--timeout`; the shorter
 supplied duration wins. A zero budget returns an empty, explicitly incomplete
 result without starting probes. JSON, JSONL, and TOON include
-`deep_scan.metadata.collection`, reporting completion, timeout, the last stage,
-requested and processed counts, remaining processes, and GPU enrichment
-coverage. An unknown inventory stays `null`. All basic process records may be
-present while GPU enrichment is still incomplete, so check `complete` as well
-as the counts. Inaccessible or vanished processes are separately counted skips.
+`deep_scan.metadata.collection`, reporting completion, timeout, requested and
+processed counts, and remaining processes. An unknown inventory stays `null`.
+Linux additionally reports the last stage and GPU enrichment coverage: all
+basic process records may be present while GPU enrichment is still incomplete,
+so check `complete` as well as the counts. Inaccessible or vanished processes
+are separately counted skips.
 
 The streaming library runs collection in an owned helper process and cancels its
 process group at the deadline, including vendor subprocesses. Linux can defer
 termination of a task in uninterruptible kernel I/O; the caller does not wait
 for that task to be reaped. Process startup and output delivery remain subject
 to operating-system scheduling and caller backpressure.
+
+On macOS, the command collects native process identities, open files and TCP/UDP
+sockets from `lsof`, and a shared `launchctl` service snapshot. Native birth and
+owner checks bracket each process's probes; evidence is discarded if its
+identity changes. `lsof_complete: false` and the record's `unavailable` reasons
+mean file and socket evidence is unknown, even when the lists are empty.
+`launchd_domain_observed` covers only the collector's bootstrap domain; no
+matching service does not establish absence of supervision in another domain.
+Collection completion means every inventoried process has an outcome, including
+reported skips; it does not make unavailable optional probes complete. A
+malformed process inventory fails before claiming census coverage. The CLI
+does not collect process environment variables.
 
 ### GPU Process Detection
 
@@ -2287,7 +2302,7 @@ cargo run -p pt-core -- run
 
 ## Limitations
 
-- **Linux-first**: Deep scan features (`/proc` parsing, cgroup limits, io_uring probes) require Linux. macOS has basic collection via `ps`/`lsof`/`proc_pidinfo`. Actions on macOS: kill, pause/resume and renice run (identity is revalidated to the microsecond immediately before each signal; there is no pidfd, so a tiny PID-reuse window remains), while freeze/throttle/quarantine need cgroups and are Linux-only. Session safety (same session, session leader, parent shell, SSH chain), the macOS protection model and the data-loss gate (via `lsof`, failing closed) all apply on macOS.
+- **Linux-first**: `/proc` parsing, cgroup limits, io_uring probes and GPU deep evidence require Linux. macOS deep scans collect native identities, open files, TCP/UDP sockets and launchd domain observations, with bounded collection and explicit partial results as described above. Actions on macOS: kill, pause/resume and renice run (identity is revalidated to the microsecond immediately before each signal; there is no pidfd, so a tiny PID-reuse window remains), while freeze/throttle/quarantine need cgroups and are Linux-only. Session safety (same session, session leader, parent shell, SSH chain), the macOS protection model and the data-loss gate (via `lsof`, failing closed) all apply on macOS.
 - **No Windows native**: Windows support is via WSL2 only.
 - **Uncalibrated posterior**: the posterior is deliberately conservative and not yet calibrated against labeled outcomes, so `kill` recommendations are rare; most candidates come back as `pause` or `review`. Robot mode gates on the posterior only (no conformal gate is applied yet).
 - **Cross-host dependencies**: Fleet planning and confirmed apply preserve host-local safety and the exact pooled selection. They do not yet coordinate service dependencies or establish that stopping processes on different hosts is jointly safe.

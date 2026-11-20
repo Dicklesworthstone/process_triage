@@ -1127,7 +1127,7 @@ fn plan_worker_spec(
     ];
     command_args.extend(args);
     let mut spec = ToolSpec::new(executable, command_args).with_timeout(timeout);
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         // The runner retains the leader's identity until all owned descendants
         // and inherited output pipes have been cancelled on completion/timeout.
@@ -1479,7 +1479,7 @@ mod tests {
         assert!(!spec.env.contains_key("PT_SKIP_GLOBAL_LOCK"));
         assert!(!spec.env.contains_key("PT_FORMAT"));
         assert!(!spec.env.contains_key("LD_PRELOAD"));
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         assert!(spec.isolate_process_group);
     }
 
@@ -1567,7 +1567,7 @@ mod tests {
         assert!(run_plan_worker(&sleeper).unwrap_err().contains("timed out"));
         assert!(started.elapsed() < Duration::from_secs(5));
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             // A successful leader can leave a child holding the output pipes.
             // The original deadline must still apply to the complete response.
