@@ -2808,17 +2808,22 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
                             plan,
                             &policy_e,
                             &term_grace_config_dir_e,
-                            candidates.values().map(|candidate| (
-                                candidate.identity.clone(),
-                                candidate.comm.as_str(),
-                                candidate.cmd.as_str(),
-                            )),
+                            candidates.values().map(|candidate| {
+                                (
+                                    candidate.identity.clone(),
+                                    candidate.comm.as_str(),
+                                    candidate.cmd.as_str(),
+                                )
+                            }),
                         );
                         if policy_e.signal.adaptive_term_grace.enabled {
                             pt_core::session::write_json_pretty(
                                 &handle_e.dir.join("decision/adaptive_term_grace.json"),
                                 &report,
-                            ).map_err(|error| format!("persist adaptive cleanup plan evidence: {error}"))?;
+                            )
+                            .map_err(|error| {
+                                format!("persist adaptive cleanup plan evidence: {error}")
+                            })?;
                         }
                     }
                     let commands: HashMap<u32, TuiReviewedProcess> = selected
@@ -2907,15 +2912,18 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
                         return Err(error.clone());
                     }
                     let learning_warning = execution_evidence.values().find_map(|evidence| {
-                        (evidence["adaptive_term_grace_learning"]["status"].as_str() == Some("unavailable"))
-                            .then(|| evidence["adaptive_term_grace_learning"]["error"].as_str())
-                            .flatten()
+                        (evidence["adaptive_term_grace_learning"]["status"].as_str()
+                            == Some("unavailable"))
+                        .then(|| evidence["adaptive_term_grace_learning"]["error"].as_str())
+                        .flatten()
                     });
                     Ok(ExecutionOutcome {
-                        mode: learning_warning.map(|error| format!(
+                        mode: learning_warning.map(|error| {
+                            format!(
                             "{} succeeded, {} failed; cleanup timing learning unavailable: {error}",
                             result.summary.actions_succeeded, result.summary.actions_failed,
-                        )),
+                        )
+                        }),
                         attempted: result.summary.actions_attempted,
                         succeeded: result.summary.actions_succeeded,
                         failed: result.summary.actions_failed,
@@ -3188,8 +3196,8 @@ fn build_tui_data_from_live_scan(
     )
 }
 
-/// Score a filtered scan for the TUI: provenance for the processes old enough to be
-/// candidates (as `agent plan` collects it), VOI probe advice, deep signals (all
+/// Score a filtered scan for the TUI: target provenance against the full process
+/// census (as `agent plan` collects it), VOI probe advice, deep signals (all
 /// processes with `--deep`, else where the advice asks for them), then rows.
 #[cfg(feature = "ui")]
 #[allow(clippy::too_many_arguments)]
@@ -3212,7 +3220,7 @@ fn score_tui_rows(
         .iter()
         .filter(|proc| proc.elapsed.as_secs() >= min_age)
         .collect();
-    scorer.collect_provenance(&eligible);
+    scorer.collect_provenance(&eligible, population, census_complete);
     let system_state =
         collect_planning_activity(&mut scorer, population, window_ms, census_complete);
     let pressure = PlanningPressure::from_system_state(&system_state);
@@ -3223,8 +3231,7 @@ fn score_tui_rows(
     };
     let targeted = select_deep_probe_targets(&eligible, &probe_advice, deep);
     let selected: HashSet<_> = targeted.iter().map(|process| process.pid.0).collect();
-    let probe_run =
-        collect_deep_observations_for_processes(&targeted, &scorer, probe_budget, deep);
+    let probe_run = collect_deep_observations_for_processes(&targeted, &scorer, probe_budget, deep);
     let deep_signals = probe_run.observations.as_ref().map(|deep| &deep.signals);
     let mut output = build_tui_rows(
         processes,
@@ -3242,11 +3249,16 @@ fn score_tui_rows(
     )?;
     for row in &mut output.snapshot.rows {
         if selected.contains(&row.pid) {
-            let record_observed = deep_signals.is_some_and(|signals| signals.contains_key(&row.pid));
+            let record_observed =
+                deep_signals.is_some_and(|signals| signals.contains_key(&row.pid));
             let note = format!(
                 "Deep collection {}: {} ({} ms budget); missing measurements remain unknown",
                 probe_run.report.status,
-                if record_observed { "identity-verified record retained" } else { "no usable record" },
+                if record_observed {
+                    "identity-verified record retained"
+                } else {
+                    "no usable record"
+                },
                 probe_run.report.budget_ms,
             );
             row.top_evidence.insert(0, note.clone());
@@ -4686,9 +4698,9 @@ fn recover_expired_freezes_for_execution(
 
     let Some(data_dir) = sessions_root.parent() else {
         let mut report = pt_core::action::reversal::FreezeRecoveryReport::default();
-        report.errors.push(
-            "cannot resolve the data directory for freeze-recovery continuation".to_string(),
-        );
+        report
+            .errors
+            .push("cannot resolve the data directory for freeze-recovery continuation".to_string());
         return report;
     };
     let cursor_path = data_dir.join("freeze_recovery_cursor.json");
@@ -4855,12 +4867,16 @@ fn execute_tui_plan_selection(
     let execution = (|| {
         // Persist every earlier binding, but execute only this new selection.
         write_plan_to_session(handle, selection)?;
-        let ((result, mut evidence), lock) = execute_plan_actions(handle, policy, selection, state)?;
+        let ((result, mut evidence), lock) =
+            execute_plan_actions(handle, policy, selection, state)?;
         execution_lock = Some(lock);
         #[cfg(unix)]
         for outcome in &result.outcomes {
             if let (Some(action), Some(captured)) = (
-                selection.actions.iter().find(|action| action.action_id == outcome.action_id),
+                selection
+                    .actions
+                    .iter()
+                    .find(|action| action.action_id == outcome.action_id),
                 evidence.get_mut(&outcome.action_id),
             ) {
                 record_verified_term_grace(
@@ -5041,7 +5057,10 @@ fn execute_plan_actions(
         let execution = executor
             .begin_execution()
             .map_err(|error| format!("cannot lock interactive actions: {error}"))?;
-        let parallel_limit = policy.signal.parallel_kill_limit(None).map_err(String::from)?;
+        let parallel_limit = policy
+            .signal
+            .parallel_kill_limit(None)
+            .map_err(String::from)?;
         let mut outcomes = Vec::new();
         let mut execution_evidence = HashMap::new();
         // Declared after both locks: dropping the queue joins every worker
@@ -5049,12 +5068,7 @@ fn execute_plan_actions(
         let mut pending = std::collections::VecDeque::<PendingKillExecution>::new();
         macro_rules! finish_pending {
             ($count:expr) => {
-                finish_tui_kills(
-                    &mut pending,
-                    $count,
-                    &mut outcomes,
-                    &mut execution_evidence,
-                )
+                finish_tui_kills(&mut pending, $count, &mut outcomes, &mut execution_evidence)
             };
         }
         for action in &plan.actions {
@@ -5625,7 +5639,9 @@ fn deep_workspace_context(
     };
     Some(DeepWorkspaceContext {
         recent_repo_activity_seconds_ago,
-        cwd_resolved: workspace.and_then(|workspace| workspace.cwd.as_ref()).map(resolved),
+        cwd_resolved: workspace
+            .and_then(|workspace| workspace.cwd.as_ref())
+            .map(resolved),
         repo_root_resolved: workspace
             .and_then(|workspace| workspace.repo_root.as_ref())
             .map(resolved),
@@ -5654,8 +5670,14 @@ fn apply_workspace_review(
     if !builtin_protection
         || !matches!(
             recommendation.action,
-            "kill" | "restart" | "pause" | "freeze" | "renice" | "throttle"
-                | "cap_memory" | "quarantine"
+            "kill"
+                | "restart"
+                | "pause"
+                | "freeze"
+                | "renice"
+                | "throttle"
+                | "cap_memory"
+                | "quarantine"
         )
     {
         return None;
@@ -5704,10 +5726,12 @@ fn probe_action_feasibility(
     if !allow_memory_cap {
         // Interactive batches cannot persist the immutable plan binding needed
         // for a durable memory-cap receipt. Saved agent plans can.
-        feasibility.disabled.push(pt_core::decision::DisabledAction {
-            action: Action::CapMemory,
-            reason: "memory caps require the saved agent plan/apply/undo workflow".to_string(),
-        });
+        feasibility
+            .disabled
+            .push(pt_core::decision::DisabledAction {
+                action: Action::CapMemory,
+                reason: "memory caps require the saved agent plan/apply/undo workflow".to_string(),
+            });
     }
     feasibility
 }
@@ -5961,7 +5985,9 @@ fn collect_deep_observations_with(
         Ok(result) => result,
         Err(error) => {
             run.report.status = "failed";
-            run.report.warnings.push(format!("Deep collection failed: {error}"));
+            run.report
+                .warnings
+                .push(format!("Deep collection failed: {error}"));
             run.report.duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
             return run;
         }
@@ -6178,7 +6204,10 @@ mod planning_probe_tests {
         }
         assert_eq!(planning_probe_budget(3000, None), Duration::from_secs(3));
         assert_eq!(planning_probe_budget(3000, Some(1)), Duration::from_secs(1));
-        assert_eq!(planning_probe_budget(3000, Some(30)), Duration::from_secs(3));
+        assert_eq!(
+            planning_probe_budget(3000, Some(30)),
+            Duration::from_secs(3)
+        );
         assert!(planning_probe_budget(0, Some(30)).is_zero());
         assert!(planning_probe_budget(3000, Some(0)).is_zero());
     }
@@ -6189,8 +6218,14 @@ mod planning_probe_tests {
 
         let processes: Vec<_> = (10..=70).step_by(10).map(process).collect();
         let candidates = vec![
-            &processes[0], &processes[1], &processes[1], &processes[2],
-            &processes[3], &processes[4], &processes[5], &processes[6],
+            &processes[0],
+            &processes[1],
+            &processes[1],
+            &processes[2],
+            &processes[3],
+            &processes[4],
+            &processes[5],
+            &processes[6],
         ];
         let advice: HashMap<_, _> = [
             (10, true, Some(ProbeType::DeepScan), Some(-1.0)),
@@ -6202,16 +6237,22 @@ mod planning_probe_tests {
         ]
         .into_iter()
         .map(|(pid, should_probe, recommended_probe, voi)| {
-            (pid, ProbeAdvice {
-                should_probe,
-                recommended_probe,
-                rationale: "fixture".into(),
-                voi,
-            })
+            (
+                pid,
+                ProbeAdvice {
+                    should_probe,
+                    recommended_probe,
+                    rationale: "fixture".into(),
+                    voi,
+                },
+            )
         })
         .collect();
         let pids = |selected: Vec<&ProcessRecord>| {
-            selected.iter().map(|process| process.pid.0).collect::<Vec<_>>()
+            selected
+                .iter()
+                .map(|process| process.pid.0)
+                .collect::<Vec<_>>()
         };
         assert_eq!(
             pids(select_deep_probe_targets(&candidates, &advice, false)),
@@ -6219,17 +6260,22 @@ mod planning_probe_tests {
         );
         let forced = pids(select_deep_probe_targets(&candidates, &advice, true));
         assert_eq!(forced.len(), processes.len());
-        assert_eq!(forced.into_iter().collect::<HashSet<_>>(), (10..=70).step_by(10).collect());
+        assert_eq!(
+            forced.into_iter().collect::<HashSet<_>>(),
+            (10..=70).step_by(10).collect()
+        );
         assert!(select_deep_probe_targets(&[], &advice, true).is_empty());
     }
 
     #[test]
     fn probe_feasibility_preserves_safety_and_saved_plan_memory_cap_policy() {
         let mut feasibility = ActionFeasibility::allow_all();
-        feasibility.disabled.push(pt_core::decision::DisabledAction {
-            action: Action::Kill,
-            reason: "fixture protection".into(),
-        });
+        feasibility
+            .disabled
+            .push(pt_core::decision::DisabledAction {
+                action: Action::Kill,
+                reason: "fixture protection".into(),
+            });
         let interactive = probe_action_feasibility(feasibility.clone(), false);
         assert!(!interactive.is_allowed(Action::Kill));
         assert!(!interactive.is_allowed(Action::CapMemory));
@@ -6279,8 +6325,8 @@ mod planning_probe_tests {
         complete: bool,
     ) -> pt_core::collect::DeepScanResult {
         use pt_core::collect::{
-            DeepScanCollection, DeepScanMetadata, DeepScanResult, DeepScanStage,
-            GpuSnapshot, ProcessGpuEvidence,
+            DeepScanCollection, DeepScanMetadata, DeepScanResult, DeepScanStage, GpuSnapshot,
+            ProcessGpuEvidence,
         };
 
         if complete {
@@ -6304,7 +6350,11 @@ mod planning_probe_tests {
                     processed_count: processed,
                     incomplete_count: Some(requested.saturating_sub(processed)),
                     enriched_count: records.iter().filter(|record| record.gpu.is_some()).count(),
-                    stage: if complete { DeepScanStage::Complete } else { DeepScanStage::Gpu },
+                    stage: if complete {
+                        DeepScanStage::Complete
+                    } else {
+                        DeepScanStage::Gpu
+                    },
                     ..Default::default()
                 },
             },
@@ -6362,7 +6412,11 @@ mod planning_probe_tests {
         assert_eq!(collection["incomplete_count"], 0);
         assert_eq!(collection["enriched_count"], 0);
         let candidate = candidate_deep_probe_report(
-            71, &HashSet::from([71]), run.observations.as_ref(), &run.report, None,
+            71,
+            &HashSet::from([71]),
+            run.observations.as_ref(),
+            &run.report,
+            None,
         );
         assert_eq!(candidate["record_observed"], true);
         for field in ["net_active", "io_active", "queue_saturated"] {
@@ -6376,7 +6430,11 @@ mod planning_probe_tests {
         let first = process(71);
         let second = process(72);
         for skipped in [1, 2] {
-            let records = if skipped == 1 { vec![record(&first)] } else { Vec::new() };
+            let records = if skipped == 1 {
+                vec![record(&first)]
+            } else {
+                Vec::new()
+            };
             let run = collect_deep_observations_with(
                 &[&first, &second],
                 &scorer(),
@@ -6389,9 +6447,17 @@ mod planning_probe_tests {
             assert_eq!(run.report.observed_count, 2 - skipped);
             assert_eq!(run.report.skipped_count, skipped);
             assert_eq!(run.report.collection.as_ref().unwrap()["complete"], true);
-            assert!(run.report.warnings.iter().any(|warning| warning.contains("missing evidence")));
+            assert!(run
+                .report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("missing evidence")));
             let missing = candidate_deep_probe_report(
-                72, &HashSet::from([71, 72]), run.observations.as_ref(), &run.report, None,
+                72,
+                &HashSet::from([71, 72]),
+                run.observations.as_ref(),
+                &run.report,
+                None,
             );
             assert_eq!(missing["selected"], true);
             assert_eq!(missing["record_observed"], false);
@@ -6412,7 +6478,14 @@ mod planning_probe_tests {
             &scorer(),
             Duration::from_secs(3),
             true,
-            |_, _| Ok(result(vec![record(&first), reused_record, record(&stale)], 3, 0, true)),
+            |_, _| {
+                Ok(result(
+                    vec![record(&first), reused_record, record(&stale)],
+                    3,
+                    0,
+                    true,
+                ))
+            },
             |identity| identity.pid.0 != 73,
         );
         assert_eq!(run.report.status, "partial");
@@ -6425,10 +6498,7 @@ mod planning_probe_tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn workspace_record(
-        process: &ProcessRecord,
-        age: u64,
-    ) -> pt_core::collect::DeepScanRecord {
+    fn workspace_record(process: &ProcessRecord, age: u64) -> pt_core::collect::DeepScanRecord {
         use pt_core::collect::user_intent::{
             IntentEvidence, IntentMetadata, IntentSignalType, PrivacyMode, UserIntentFeatures,
         };
@@ -6569,7 +6639,11 @@ mod planning_probe_tests {
         assert_eq!(run.report.identity_rejected_count, 2);
         let selected = HashSet::from([71, 72, 73]);
         let candidate = candidate_deep_probe_report(
-            71, &selected, run.observations.as_ref(), &run.report, None,
+            71,
+            &selected,
+            run.observations.as_ref(),
+            &run.report,
+            None,
         );
         let context = &candidate["workspace_context"];
         assert_eq!(context["recent_repo_activity_seconds_ago"], 30);
@@ -6582,7 +6656,11 @@ mod planning_probe_tests {
         assert!(!rendered.contains("user_intent_score"));
         for pid in [72, 73, 74] {
             let missing = candidate_deep_probe_report(
-                pid, &selected, run.observations.as_ref(), &run.report, None,
+                pid,
+                &selected,
+                run.observations.as_ref(),
+                &run.report,
+                None,
             );
             assert!(missing["workspace_context"].is_null());
         }
@@ -6602,7 +6680,14 @@ mod planning_probe_tests {
         );
         let signals = &run.observations.as_ref().unwrap().signals;
         for action in [
-            "kill", "restart", "pause", "freeze", "renice", "throttle", "cap_memory", "quarantine",
+            "kill",
+            "restart",
+            "pause",
+            "freeze",
+            "renice",
+            "throttle",
+            "cap_memory",
+            "quarantine",
         ] {
             let mut advice = recommendation(action);
             let reason =
@@ -6659,12 +6744,9 @@ mod planning_probe_tests {
             abandoned: 0.999,
             zombie: 0.0,
         };
-        let decision = pt_core::decision::decide_action(
-            &posterior,
-            &policy,
-            &ActionFeasibility::allow_all(),
-        )
-        .unwrap();
+        let decision =
+            pt_core::decision::decide_action(&posterior, &policy, &ActionFeasibility::allow_all())
+                .unwrap();
         assert_eq!(decision.optimal_action, Action::Kill);
         let mut inputs = HashMap::from([(
             71,
@@ -11913,9 +11995,8 @@ fn run_deep_scan(global: &GlobalOpts, _args: &DeepScanArgs) -> ExitCode {
         } else {
             match budget {
                 Some(seconds) => bounded_deep_scan(&args.pids, seconds),
-                None => {
-                    deep_scan(&options).map_err(|error| (ExitCode::InternalError, error.to_string()))
-                }
+                None => deep_scan(&options)
+                    .map_err(|error| (ExitCode::InternalError, error.to_string())),
             }
         };
         match collected {
@@ -18102,7 +18183,9 @@ fn desktop_notification_command(
     let mut args: Vec<String> = args.into_iter().map(str::to_string).collect();
     args.push(notif.title.clone());
     args.push(notif.body.clone());
-    Some(notification_session_environment(ToolSpec::new(program, args)))
+    Some(notification_session_environment(ToolSpec::new(
+        program, args,
+    )))
 }
 
 #[cfg(all(test, feature = "daemon"))]
@@ -18146,11 +18229,7 @@ mod desktop_notification_tests {
             let notif = notification(title, body, Severity::Warning);
             let command = desktop_notification_command("macos", &notif).unwrap();
             assert_eq!(command.command, "osascript");
-            let args: Vec<_> = command
-                .args
-                .iter()
-                .map(String::as_str)
-                .collect();
+            let args: Vec<_> = command.args.iter().map(String::as_str).collect();
             assert_eq!(
                 args,
                 [
@@ -18178,11 +18257,7 @@ mod desktop_notification_tests {
             let notif = notification("--help", "-u critical\n\"review\" \\ λ", severity);
             let command = desktop_notification_command("linux", &notif).unwrap();
             assert_eq!(command.command, "notify-send");
-            let args: Vec<_> = command
-                .args
-                .iter()
-                .map(String::as_str)
-                .collect();
+            let args: Vec<_> = command.args.iter().map(String::as_str).collect();
             assert_eq!(
                 args,
                 ["-u", urgency, "-a", "pt", "--", &notif.title, &notif.body]
@@ -18232,10 +18307,17 @@ mod desktop_notification_tests {
         config.notifications.desktop = false;
         config.notifications.notify_cmd = Some("/bin/sh".to_string());
         let mut state = DaemonState::new();
-        let notif = notification("Process Triage", "private notification body", Severity::Info);
+        let notif = notification(
+            "Process Triage",
+            "private notification body",
+            Severity::Info,
+        );
         for (script, expected) in [
             ("exit 0", DaemonEventType::NotificationCommandCompleted),
-            ("printf 'private hook output' >&2; exit 7", DaemonEventType::NotificationDeliveryFailed),
+            (
+                "printf 'private hook output' >&2; exit 7",
+                DaemonEventType::NotificationDeliveryFailed,
+            ),
         ] {
             config.notifications.notify_arg = vec!["-c".to_string(), script.to_string()];
             let outcomes = daemon_deliver_notification(
@@ -22261,20 +22343,18 @@ mod process_tree_safety_tests {
         let directory = tempfile::tempdir().unwrap();
         let sessions_root = directory.path().join("sessions");
         std::fs::create_dir_all(&sessions_root).unwrap();
-        let _lock = super::GlobalLock::try_acquire(
-            &directory.path().join(".execution-policy-lock"),
-        )
-        .unwrap()
-        .expect("own the same execution-policy lock as real callers");
+        let _lock =
+            super::GlobalLock::try_acquire(&directory.path().join(".execution-policy-lock"))
+                .unwrap()
+                .expect("own the same execution-policy lock as real callers");
         for (expected, next) in [
             (None, Some("session-064")),
             (Some("session-064"), Some("session-128")),
             (Some("session-128"), None),
             (None, None),
         ] {
-            let report = super::recover_expired_freezes_for_execution(
-                &sessions_root,
-                |root, cursor| {
+            let report =
+                super::recover_expired_freezes_for_execution(&sessions_root, |root, cursor| {
                     assert_eq!(root, sessions_root.as_path());
                     assert_eq!(cursor, expected);
                     FreezeRecoveryReport {
@@ -22282,8 +22362,7 @@ mod process_tree_safety_tests {
                         budget_exhausted: next.is_some(),
                         ..FreezeRecoveryReport::default()
                     }
-                },
-            );
+                });
             assert!(report.errors.is_empty(), "{:?}", report.errors);
             assert_eq!(report.next_session.as_deref(), next);
             assert_eq!(report.budget_exhausted, next.is_some());
@@ -22310,23 +22389,23 @@ mod process_tree_safety_tests {
             } else {
                 std::fs::write(&cursor_path, b"{ malformed advisory cursor").unwrap();
             }
-            let _lock = super::GlobalLock::try_acquire(
-                &directory.path().join(".execution-policy-lock"),
-            )
-            .unwrap()
-            .expect("hold the execution-policy lock");
-            let report = super::recover_expired_freezes_for_execution(
-                &sessions_root,
-                |_, cursor| {
-                    assert_eq!(cursor, None, "unusable advisory state starts a bounded pass");
+            let _lock =
+                super::GlobalLock::try_acquire(&directory.path().join(".execution-policy-lock"))
+                    .unwrap()
+                    .expect("hold the execution-policy lock");
+            let report =
+                super::recover_expired_freezes_for_execution(&sessions_root, |_, cursor| {
+                    assert_eq!(
+                        cursor, None,
+                        "unusable advisory state starts a bounded pass"
+                    );
                     FreezeRecoveryReport {
                         next_session: Some("session-064".to_string()),
                         budget_exhausted: true,
                         errors: vec!["retained recovery observation".to_string()],
                         ..FreezeRecoveryReport::default()
                     }
-                },
-            );
+                });
             assert_eq!(report.next_session.as_deref(), Some("session-064"));
             assert!(report.budget_exhausted);
             assert_eq!(report.errors[0], "retained recovery observation");
@@ -22359,12 +22438,7 @@ mod process_tree_safety_tests {
         let before = make_action(200);
         let mut after = make_action(300);
         let barrier = |after: &PlanAction, before_ancestors, after_ancestors| {
-            super::direct_kills_require_barrier(
-                &before,
-                before_ancestors,
-                after,
-                after_ancestors,
-            )
+            super::direct_kills_require_barrier(&before, before_ancestors, after, after_ancestors)
         };
         assert!(!barrier(&after, Some(&[10, 1]), Some(&[20, 1])));
         assert!(barrier(&after, Some(&[300, 1]), Some(&[1])));
@@ -22391,7 +22465,10 @@ mod process_tree_safety_tests {
             rec(200, 100, "worker", ProcessState::Sleeping),
             rec(100, 1, "parent", ProcessState::Sleeping),
         ];
-        assert_eq!(super::execution_ancestors(200, &processes), Some(vec![100, 1]));
+        assert_eq!(
+            super::execution_ancestors(200, &processes),
+            Some(vec![100, 1])
+        );
         assert_eq!(super::execution_ancestors(300, &processes), None);
         assert_eq!(super::execution_ancestors(200, &processes[..1]), None);
         processes[1].ppid = ProcessId(200);
@@ -22596,12 +22673,10 @@ mod process_tree_safety_tests {
                     )
                     .unwrap()
                 };
-                assert!(
-                    rows_for(DEFAULT_CANDIDATE_MIN_POSTERIOR)
-                        .snapshot
-                        .rows
-                        .is_empty()
-                );
+                assert!(rows_for(DEFAULT_CANDIDATE_MIN_POSTERIOR)
+                    .snapshot
+                    .rows
+                    .is_empty());
                 assert!(rows_for(0.61).snapshot.rows.is_empty());
                 for threshold in [0.0, 0.59] {
                     let output = rows_for(threshold);
@@ -22610,17 +22685,15 @@ mod process_tree_safety_tests {
                     assert_eq!(row.pid, population[0].pid.0);
                     assert_eq!(row.classification, "REVIEW");
                     assert!(!row.selected);
-                    assert!(
-                        build_plan_from_selection(
-                            &session,
-                            &policy,
-                            &[row.pid],
-                            &output.plan_candidates,
-                        )
-                        .unwrap()
-                        .actions
-                        .is_empty()
-                    );
+                    assert!(build_plan_from_selection(
+                        &session,
+                        &policy,
+                        &[row.pid],
+                        &output.plan_candidates,
+                    )
+                    .unwrap()
+                    .actions
+                    .is_empty());
                 }
             }
         }
@@ -25414,9 +25487,8 @@ mod process_tree_safety_tests {
         };
         let mut state = super::TuiExecutionState::default();
         let (result, evidence) = std::thread::scope(|scope| {
-            let execution = scope.spawn(|| {
-                super::execute_tui_plan_selection(&handle, &policy, &batch, &mut state)
-            });
+            let execution = scope
+                .spawn(|| super::execute_tui_plan_selection(&handle, &policy, &batch, &mut state));
             wait_for_handler(0);
             wait_for_handler(1);
             // Both handlers are held open by owned input pipes. Their TERM
@@ -25499,7 +25571,9 @@ mod process_tree_safety_tests {
     fn tui_batch_charges_inflight_delivery_before_admitting_the_next_kill() {
         use pt_core::action::ActionStatus;
         use std::io::Write;
-        use tui_live_fixtures::{case, policy, record, selection, selection_for_pid, DetachedTarget};
+        use tui_live_fixtures::{
+            case, policy, record, selection, selection_for_pid, DetachedTarget,
+        };
 
         let (handle, log_dir) = case("tui-parallel-budget");
         let mut policy = policy(1);
@@ -25518,9 +25592,8 @@ mod process_tree_safety_tests {
         batch.gates_summary.pre_toggled_actions = 2;
         let mut state = super::TuiExecutionState::default();
         let (result, evidence) = std::thread::scope(|scope| {
-            let execution = scope.spawn(|| {
-                super::execute_tui_plan_selection(&handle, &policy, &batch, &mut state)
-            });
+            let execution = scope
+                .spawn(|| super::execute_tui_plan_selection(&handle, &policy, &batch, &mut state));
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
             while !marker.exists() {
                 assert!(
@@ -25547,14 +25620,14 @@ mod process_tree_safety_tests {
         assert!(!evidence.contains_key(&spared.actions[0].action_id));
         assert_eq!(state.enforcer.as_ref().unwrap().current_run_kill_count(), 1);
         let identity = pt_core::action::LiveIdentityProvider::new();
-        assert!(
-            pt_core::action::IdentityProvider::revalidate(&identity, &spared.actions[0].target)
-                .unwrap()
-        );
-        let budget: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(log_dir.join("data/rate_limit.json")).unwrap(),
+        assert!(pt_core::action::IdentityProvider::revalidate(
+            &identity,
+            &spared.actions[0].target
         )
-        .unwrap();
+        .unwrap());
+        let budget: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(log_dir.join("data/rate_limit.json")).unwrap())
+                .unwrap();
         assert_eq!(budget["kill_timestamps"].as_array().unwrap().len(), 1);
         assert!(first.leader.wait().unwrap().success());
         record(
@@ -27566,7 +27639,11 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
             .iter()
             .filter(|proc| proc.pid.0 > 1 && proc.elapsed.as_secs() >= min_age)
             .collect();
-        scorer.collect_provenance(&plan_eligible);
+        scorer.collect_provenance(
+            &plan_eligible,
+            &scan_result.processes,
+            scan_result.metadata.warnings.is_empty(),
+        );
         let decision_policy = policy.clone();
 
         // Inventory remains useful for diffs even when a process is too young
@@ -30653,7 +30730,11 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     let _current_cpu_pct: f64 = processes_to_infer.iter().map(|p| p.cpu_percent).sum();
     let probe_cost_model = pt_core::decision::ProbeCostModel::default();
     let deep_scan_probe = [pt_core::decision::ProbeType::DeepScan];
-    scorer.collect_provenance(&processes_to_infer);
+    scorer.collect_provenance(
+        &processes_to_infer,
+        &scan_result.processes,
+        scan_result.metadata.warnings.is_empty(),
+    );
     let system_state = collect_planning_activity(
         &mut scorer,
         &scan_result.processes,
@@ -30694,22 +30775,24 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     let probe_advice = if probe_budget.is_zero() {
         HashMap::new()
     } else {
-        compute_probe_advice(&processes_to_infer, &scorer, &decision_policy, &pressure, true)
+        compute_probe_advice(
+            &processes_to_infer,
+            &scorer,
+            &decision_policy,
+            &pressure,
+            true,
+        )
     };
-    let deep_targets =
-        select_deep_probe_targets(&processes_to_infer, &probe_advice, args.deep);
+    let deep_targets = select_deep_probe_targets(&processes_to_infer, &probe_advice, args.deep);
     let deep_target_pids: HashSet<_> = deep_targets.iter().map(|process| process.pid.0).collect();
     let DeepProbeRun {
         observations: deep_observations,
         report: deep_collection,
-    } = collect_deep_observations_for_processes(
-        &deep_targets,
-        &scorer,
-        probe_budget,
-        args.deep,
-    );
+    } = collect_deep_observations_for_processes(&deep_targets, &scorer, probe_budget, args.deep);
     let deep_signals = deep_observations.as_ref().map(|deep| &deep.signals);
-    let deep_scan_ms = deep_observations.as_ref().map(|_| deep_collection.duration_ms);
+    let deep_scan_ms = deep_observations
+        .as_ref()
+        .map(|_| deep_collection.duration_ms);
 
     let candidates_evaluated = processes_to_infer.len();
     let total_processes = candidates_evaluated as u64;
@@ -31537,11 +31620,13 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         &mut action_plan,
         &decision_policy,
         &config.config_dir,
-        scan_result.processes.iter().map(|process| (
-            process_identity_from_record(process),
-            process.comm.as_str(),
-            process.cmd.as_str(),
-        )),
+        scan_result.processes.iter().map(|process| {
+            (
+                process_identity_from_record(process),
+                process.comm.as_str(),
+                process.cmd.as_str(),
+            )
+        }),
     );
     remap_adaptive_term_action_ids(&mut candidates, &adaptive_term_grace);
     if let Some(summary) = goal_summary.as_mut() {
@@ -32600,9 +32685,8 @@ struct ExplainContext {
     min_age_seconds: u64,
 }
 
-/// Collect provenance the way `agent plan` does: over the processes plan would
-/// evaluate (unprotected and old enough) plus the ones being explained, so the
-/// explanation carries the same lineage, listener and blast-radius terms.
+/// Collect target lineage and full-census dependency evidence as `agent plan`
+/// does. Protected/young peers remain visible in the explanation's blast radius.
 fn collect_explain_provenance(
     global: &GlobalOpts,
     scorer: &mut Scorer,
@@ -32623,7 +32707,7 @@ fn collect_explain_provenance(
             scorer.collect_respawn_history(None, &[], chrono::Utc::now());
             collect_planning_workloads(scorer, &[], false);
             scorer.collect_supervisor_restarts(&[]);
-            scorer.collect_provenance(&targets.iter().collect::<Vec<_>>());
+            scorer.collect_provenance(&targets.iter().collect::<Vec<_>>(), targets, false);
             return;
         }
     };
@@ -32650,7 +32734,7 @@ fn collect_explain_provenance(
             } else {
                 &[]
             });
-            population.processes
+            population.processes.clone()
         }
     };
     let mut set: Vec<&ProcessRecord> = passed
@@ -32662,7 +32746,11 @@ fn collect_explain_provenance(
             set.push(target);
         }
     }
-    scorer.collect_provenance(&set);
+    scorer.collect_provenance(
+        &set,
+        &population.processes,
+        population.metadata.warnings.is_empty(),
+    );
 }
 
 /// Why a process would be skipped by `agent plan` (not evaluated), if it would be.
@@ -34941,14 +35029,12 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     // may have appeared. Refuse the parent while any live child
                     // remains, even if that child was in the original kill set.
                     let mut tree_scan = quick_scan(&goal_progress_scan_options);
-                    let current_ancestors = tree_scan.as_ref().ok().and_then(|scan| {
-                        execution_ancestors(action.target.pid.0, &scan.processes)
-                    });
-                    if pending_kills_require_barrier(
-                        &pending,
-                        action,
-                        current_ancestors.as_deref(),
-                    ) {
+                    let current_ancestors = tree_scan
+                        .as_ref()
+                        .ok()
+                        .and_then(|scan| execution_ancestors(action.target.pid.0, &scan.processes));
+                    if pending_kills_require_barrier(&pending, action, current_ancestors.as_deref())
+                    {
                         if finish_pending!(usize::MAX) {
                             break;
                         }
@@ -35017,11 +35103,9 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 if !parallel && finish_pending!(usize::MAX) {
                     break;
                 }
-                if let Err(reason) = validate_term_grace_policy_cap(
-                    action,
-                    &config.policy,
-                    recorded_policy.as_ref(),
-                ) {
+                if let Err(reason) =
+                    validate_term_grace_policy_cap(action, &config.policy, recorded_policy.as_ref())
+                {
                     blocked_by_prechecks += 1;
                     checkpoint_outcome!(serde_json::json!({
                         "action_id": action.action_id,
@@ -39386,7 +39470,11 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
             .iter()
             .filter(|proc| proc.pid.0 > 1 && proc.elapsed.as_secs() >= min_age)
             .collect();
-        scorer.collect_provenance(&eligible);
+        scorer.collect_provenance(
+            &eligible,
+            &scan_result.processes,
+            scan_result.metadata.warnings.is_empty(),
+        );
         let system_state = collect_planning_activity(
             &mut scorer,
             &scan_result.processes,
@@ -39408,14 +39496,32 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
             scan_result.metadata.warnings.is_empty(),
         );
         if let Some(event) = agent_activity_watch.update(&agent_activity, &timestamp) {
-            emit_watch_event(&event, &notification_runner, notify_exec, notify_cmd, notify_args);
+            emit_watch_event(
+                &event,
+                &notification_runner,
+                notify_exec,
+                notify_cmd,
+                notify_args,
+            );
         }
         let memory_limits = memory_limit_report(&responsible_units);
         if let Some(event) = memory_limit_watch.update(&memory_limits, &timestamp) {
-            emit_watch_event(&event, &notification_runner, notify_exec, notify_cmd, notify_args);
+            emit_watch_event(
+                &event,
+                &notification_runner,
+                notify_exec,
+                notify_cmd,
+                notify_args,
+            );
         }
         if let Some(event) = workload_watch.update(&system_state, &timestamp) {
-            emit_watch_event(&event, &notification_runner, notify_exec, notify_cmd, notify_args);
+            emit_watch_event(
+                &event,
+                &notification_runner,
+                notify_exec,
+                notify_cmd,
+                notify_args,
+            );
         }
         for mut event in pressure_watch.update(
             pressure.snapshot.as_ref(),
@@ -39432,16 +39538,34 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
             });
             event["memory_limits"] = memory_limits.clone();
             event["agent_activity"] = agent_activity_output(&agent_activity, Some(10));
-            emit_watch_event(&event, &notification_runner, notify_exec, notify_cmd, notify_args);
+            emit_watch_event(
+                &event,
+                &notification_runner,
+                notify_exec,
+                notify_cmd,
+                notify_args,
+            );
         }
         if baseline.is_none() {
             baseline = Some(WatchBaseline::from_state(&system_state));
         }
         if let Some(event) = check_goal_violation(&system_state, args) {
-            emit_watch_event(&event, &notification_runner, notify_exec, notify_cmd, notify_args);
+            emit_watch_event(
+                &event,
+                &notification_runner,
+                notify_exec,
+                notify_cmd,
+                notify_args,
+            );
         }
         if let Some(event) = check_baseline_anomaly(&system_state, baseline.as_ref()) {
-            emit_watch_event(&event, &notification_runner, notify_exec, notify_cmd, notify_args);
+            emit_watch_event(
+                &event,
+                &notification_runner,
+                notify_exec,
+                notify_cmd,
+                notify_args,
+            );
         }
 
         let mut evaluated = Vec::new();
@@ -39509,7 +39633,13 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
             .collect();
         let timestamp = chrono::Utc::now().to_rfc3339();
         for event in watch_candidate_events(&previous, &current, &observed, &timestamp) {
-            emit_watch_event(&event, &notification_runner, notify_exec, notify_cmd, notify_args);
+            emit_watch_event(
+                &event,
+                &notification_runner,
+                notify_exec,
+                notify_cmd,
+                notify_args,
+            );
         }
 
         previous = current;

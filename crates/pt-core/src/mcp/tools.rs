@@ -126,7 +126,8 @@ impl Evaluator {
                 set.push(process);
             }
         }
-        self.scorer.collect_provenance(&set);
+        self.scorer
+            .collect_provenance(&set, &scan.processes, scan.metadata.warnings.is_empty());
     }
 
     fn eligible_processes<'a>(&self, scan: &'a ScanResult) -> Vec<&'a ProcessRecord> {

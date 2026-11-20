@@ -639,17 +639,28 @@ impl Scorer {
         )
     }
 
-    /// Collect provenance (lineage, resources, blast radius) for the processes about
-    /// to be scored. Linux only; a no-op elsewhere. Without it, scores carry no
-    /// provenance terms.
-    pub fn collect_provenance(&mut self, processes: &[&ProcessRecord]) {
+    /// Collect target lineage against the complete observed process population.
+    /// Age, protection and sampling filters select only `targets`; they must not
+    /// remove resource holders or children from dependency reasoning. An incomplete
+    /// census can establish observed dependencies, never that a target is isolated.
+    /// Linux only; a no-op elsewhere.
+    pub fn collect_provenance(
+        &mut self,
+        targets: &[&ProcessRecord],
+        population: &[ProcessRecord],
+        census_complete: bool,
+    ) {
         #[cfg(target_os = "linux")]
         {
-            self.provenance = Some(build_provenance_bundle(processes));
+            self.provenance = Some(build_provenance_bundle(
+                targets,
+                population,
+                census_complete,
+            ));
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = processes;
+            let _ = (targets, population, census_complete);
         }
     }
 
@@ -1140,8 +1151,16 @@ impl Scorer {
                 .provenance
                 .as_ref()
                 .filter(|bundle| {
-                    bundle.lineages.contains_key(&process.pid.0)
-                        || bundle.lineage_unavailable.contains_key(&process.pid.0)
+                    bundle
+                        .target_identities
+                        .get(&process.pid.0)
+                        .is_some_and(|identity| {
+                            identity.start_id == process.start_id
+                                && identity.uid == process.uid
+                                && identity.pgid == process.pgid
+                                && identity.sid == process.sid
+                        })
+                        && bundle.target_ppids.get(&process.pid.0) == Some(&process.ppid.0)
                 })
                 .map(|bundle| derive_provenance_adjustment(process.pid.0, bundle)),
         }
@@ -1454,11 +1473,12 @@ impl Scorer {
 
 #[cfg(target_os = "linux")]
 mod provenance {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap, HashSet};
 
     use pt_common::{
-        normalize_lineage, CandidateProvenanceOutput, OwnershipState, ProvenanceConfidence,
-        ProvenanceFeatureInput, ProvenanceRedactionState, RawLineageEvidence,
+        normalize_lineage, CandidateProvenanceOutput, IdentityQuality, OwnershipState,
+        ProcessIdentity, ProvenanceConfidence, ProvenanceFeatureInput, ProvenanceRedactionState,
+        RawLineageEvidence, RawResourceEvidence,
     };
 
     use crate::action::{IdentityProvider, LiveIdentityProvider};
@@ -1486,6 +1506,16 @@ mod provenance {
         /// Lineage could not be bound to the scanned process incarnation.
         pub lineage_unavailable: HashMap<u32, String>,
         pub children: HashMap<u32, Vec<u32>>,
+        /// Only requested scoring targets receive provenance adjustments. Peers
+        /// observed for dependency analysis never become candidates implicitly.
+        pub target_identities: HashMap<u32, ProcessIdentity>,
+        /// Parent identity from the same census; reparenting invalidates cached
+        /// ancestry even when process birth and job-control identity are unchanged.
+        pub target_ppids: HashMap<u32, u32>,
+        /// Number of distinct PIDs in the unfiltered observed population.
+        pub population_count: usize,
+        /// False for a partial, ambiguous or unavailable census. Default is unknown.
+        pub census_complete: bool,
         /// Failed network observations are not empty resource inventories.
         pub network_errors: HashMap<u32, String>,
         /// Missing/failed probes are confidence caveats, never absent resources.
@@ -1539,6 +1569,22 @@ mod provenance {
         }
     }
 
+    fn process_identity(process: &ProcessRecord) -> ProcessIdentity {
+        let quality = match super::agent_start_parts(process) {
+            Some(("unknown" | "synthetic", _)) => IdentityQuality::NoBootId,
+            Some(_) => IdentityQuality::Full,
+            None => IdentityQuality::PidOnly,
+        };
+        ProcessIdentity::full(
+            process.pid.0,
+            process.start_id.clone(),
+            process.uid,
+            process.pgid,
+            process.sid,
+            quality,
+        )
+    }
+
     /// Read ancestry only while the original process identity remains valid.
     /// Resource collectors have separate validation and availability reporting.
     pub(super) fn collect_bound_lineage(
@@ -1580,64 +1626,277 @@ mod provenance {
         Ok(lineage)
     }
 
-    /// Collect lineage and shared-resource evidence for `processes`.
-    pub fn build_provenance_bundle(processes: &[&ProcessRecord]) -> ProvenanceInferenceBundle {
-        let mut lineages = HashMap::new();
-        let mut lineage_unavailable = HashMap::new();
-        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
-        let mut network_errors = HashMap::new();
-        let mut per_process_resources: Vec<(u32, Vec<pt_common::RawResourceEvidence>)> = Vec::new();
-        let mut all_resources = Vec::new();
+    /// One identity-bound observation. Keep failures alongside positive evidence;
+    /// an unreadable peer cannot establish that a target has no dependents.
+    pub(super) struct ProcessProvenance {
+        pub identity: ProcessIdentity,
+        pub lineage: Option<RawLineageEvidence>,
+        pub lineage_error: Option<String>,
+        pub resources: Vec<RawResourceEvidence>,
+        pub network_error: Option<String>,
+        pub unavailable: Vec<String>,
+    }
+
+    /// Collect lineage for targets and shared resources for every census member.
+    /// Socket tables and the finite optional-filesystem budget are shared by the
+    /// entire scan, including protected, young, other-user and unselected peers.
+    pub fn build_provenance_bundle(
+        targets: &[&ProcessRecord],
+        population: &[ProcessRecord],
+        census_complete: bool,
+    ) -> ProvenanceInferenceBundle {
         let resource_runner = resource_probe_runner();
         let identity_provider = LiveIdentityProvider::new();
-        let mut resource_unavailable = HashMap::new();
-        // One socket-table snapshot for the whole scan (was re-parsed per process).
-        let network_snapshot = if processes.is_empty() {
+        let network_snapshot = if targets.is_empty() {
             NetworkSnapshot::default()
         } else {
             NetworkSnapshot::collect()
         };
 
-        for proc in processes {
-            let pid = proc.pid.0;
-            children.entry(proc.ppid.0).or_default().push(pid);
-            match collect_bound_lineage(proc, &identity_provider, collect_lineage_for_pid) {
-                Ok(lineage) => {
-                    lineages.insert(pid, lineage);
+        build_provenance_bundle_with(
+            targets,
+            population,
+            census_complete,
+            |process, is_target| {
+                let pid = process.pid.0;
+                let identity = process_identity(process);
+                if !identity.can_safely_revalidate() {
+                    return Err(
+                        "process birth identity is unavailable for provenance collection"
+                            .to_string(),
+                    );
+                }
+                let validate = || match identity_provider.revalidate(&identity) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => Err(
+                        "process identity is missing or changed during provenance collection"
+                            .to_string(),
+                    ),
+                    Err(error) => Err(format!(
+                        "process identity unavailable during provenance collection: {error}"
+                    )),
+                };
+                validate()?;
+                let (lineage, lineage_error) = if is_target {
+                    match collect_bound_lineage(
+                        process,
+                        &identity_provider,
+                        collect_lineage_for_pid,
+                    ) {
+                        Ok(lineage) => (Some(lineage), None),
+                        Err(reason) => (None, Some(reason.to_string())),
+                    }
+                } else {
+                    (None, None)
+                };
+                let fd_info = parse_fd(pid);
+                let mut resources = collect_local_resource_evidence_with_runner(
+                    pid,
+                    fd_info.as_ref(),
+                    &resource_runner,
+                );
+                let network_error =
+                    match collect_listener_resources_with_diagnostics(pid, &network_snapshot) {
+                        Ok(observed) => {
+                            resources.extend(observed.resources);
+                            (!observed.unavailable.is_empty())
+                                .then(|| observed.unavailable.join("; "))
+                        }
+                        Err(error) => Some(error.to_string()),
+                    };
+                let mut ipc = collect_fd_ipc_resources_with_runner(pid, &resource_runner);
+                if fd_info.as_ref().is_none_or(|info| {
+                    info.truncated || info.by_type.values().sum::<usize>() != info.count
+                }) {
+                    ipc.unavailable
+                        .push("file_descriptor_evidence_incomplete".to_string());
+                }
+                resources.extend(ipc.resources);
+                // Never retain resources from a replacement process, even when the
+                // first identity check or the scan's own observation was valid.
+                validate()?;
+                Ok(ProcessProvenance {
+                    identity,
+                    lineage,
+                    lineage_error,
+                    resources,
+                    network_error,
+                    unavailable: ipc.unavailable,
+                })
+            },
+        )
+    }
+
+    /// Assemble the same census graph for live collection and deterministic
+    /// fixtures. The callback observes one PID once; it cannot expand candidacy.
+    pub(super) fn build_provenance_bundle_with<F>(
+        targets: &[&ProcessRecord],
+        population: &[ProcessRecord],
+        census_complete: bool,
+        mut observe: F,
+    ) -> ProvenanceInferenceBundle
+    where
+        F: FnMut(&ProcessRecord, bool) -> Result<ProcessProvenance, String>,
+    {
+        let mut bundle = ProvenanceInferenceBundle {
+            census_complete,
+            ..Default::default()
+        };
+        if targets.is_empty() {
+            return bundle;
+        }
+        let mut population_by_pid = BTreeMap::new();
+        for process in population {
+            population_by_pid
+                .entry(process.pid.0)
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(process));
+        }
+        bundle.population_count = population_by_pid.len();
+
+        let mut ambiguous_targets = HashSet::new();
+        for target in targets {
+            let pid = target.pid.0;
+            let identity = process_identity(target);
+            if bundle
+                .target_identities
+                .get(&pid)
+                .is_some_and(|previous| previous != &identity)
+                || bundle
+                    .target_ppids
+                    .get(&pid)
+                    .is_some_and(|previous| *previous != target.ppid.0)
+            {
+                ambiguous_targets.insert(pid);
+            }
+            if population_by_pid
+                .get(&pid)
+                .copied()
+                .flatten()
+                .is_some_and(|process| {
+                    process_identity(process) == identity && process.ppid == target.ppid
+                })
+            {
+                bundle.target_identities.insert(pid, identity);
+                bundle.target_ppids.insert(pid, target.ppid.0);
+            } else {
+                bundle.census_complete = false;
+                ambiguous_targets.insert(pid);
+            }
+        }
+        for pid in ambiguous_targets {
+            bundle.target_identities.remove(&pid);
+            bundle.target_ppids.remove(&pid);
+            bundle.resource_unavailable.insert(
+                pid,
+                vec![
+                    "requested target identity is absent or ambiguous in the process census"
+                        .to_string(),
+                ],
+            );
+        }
+
+        let mut per_process_resources = Vec::new();
+        let mut all_resources = Vec::new();
+        // Targets consume optional probe budgets first. All peers still receive
+        // their own observation and any exhausted budget is retained as unknown.
+        let ordered = population_by_pid
+            .iter()
+            .filter(|(pid, _)| bundle.target_identities.contains_key(*pid))
+            .chain(
+                population_by_pid
+                    .iter()
+                    .filter(|(pid, _)| !bundle.target_identities.contains_key(*pid)),
+            )
+            .map(|(&pid, &process)| (pid, process))
+            .collect::<Vec<_>>();
+        for (pid, process) in ordered {
+            let Some(process) = process else {
+                bundle.census_complete = false;
+                bundle.resource_unavailable.insert(
+                    pid,
+                    vec![
+                        "duplicate PID in the process census; dependency identity is ambiguous"
+                            .to_string(),
+                    ],
+                );
+                continue;
+            };
+            if process.pid != process.ppid {
+                bundle.children.entry(process.ppid.0).or_default().push(pid);
+            } else {
+                bundle.census_complete = false;
+            }
+            let is_target = bundle.target_identities.contains_key(&pid);
+            let observed = observe(process, is_target).and_then(|mut observed| {
+                if observed.identity != process_identity(process)
+                    || observed
+                        .resources
+                        .iter()
+                        .any(|resource| resource.owner_pid != pid)
+                {
+                    Err(
+                        "provenance observation belongs to a different process identity"
+                            .to_string(),
+                    )
+                } else {
+                    if observed.lineage.as_ref().is_some_and(|lineage| {
+                        lineage.pid != pid
+                            || lineage.ppid != process.ppid.0
+                            || lineage.uid != process.uid
+                            || process.pgid.is_some_and(|pgid| pgid != lineage.pgid)
+                            || process.sid.is_some_and(|sid| sid != lineage.sid)
+                    }) {
+                        observed.lineage = None;
+                        observed.lineage_error = Some(
+                            "lineage PID, parent, owner, or session differs from scan".to_string(),
+                        );
+                    }
+                    Ok(observed)
+                }
+            });
+            match observed {
+                Ok(observed) => {
+                    if is_target {
+                        match (observed.lineage, observed.lineage_error) {
+                            (_, Some(reason)) => {
+                                bundle.lineage_unavailable.insert(pid, reason);
+                            }
+                            (Some(lineage), None) => {
+                                bundle.lineages.insert(pid, lineage);
+                            }
+                            (None, None) => {
+                                bundle
+                                    .lineage_unavailable
+                                    .insert(pid, "lineage observation unavailable".to_string());
+                            }
+                        }
+                    }
+                    if let Some(reason) = observed.network_error {
+                        bundle.network_errors.insert(pid, reason);
+                    }
+                    if !observed.unavailable.is_empty() {
+                        bundle
+                            .resource_unavailable
+                            .entry(pid)
+                            .or_default()
+                            .extend(observed.unavailable);
+                    }
+                    all_resources.extend(observed.resources.iter().cloned());
+                    per_process_resources.push((pid, observed.resources));
                 }
                 Err(reason) => {
-                    lineage_unavailable.insert(pid, reason.to_string());
-                }
-            }
-
-            let fd_info = parse_fd(pid);
-            let mut resources = collect_local_resource_evidence_with_runner(
-                pid,
-                fd_info.as_ref(),
-                &resource_runner,
-            );
-            match collect_listener_resources_with_diagnostics(pid, &network_snapshot) {
-                Ok(observed) => {
-                    resources.extend(observed.resources);
-                    if !observed.unavailable.is_empty() {
-                        network_errors.insert(pid, observed.unavailable.join("; "));
+                    if is_target {
+                        bundle.lineage_unavailable.insert(pid, reason.clone());
                     }
+                    bundle.network_errors.insert(pid, reason.clone());
+                    bundle
+                        .resource_unavailable
+                        .entry(pid)
+                        .or_default()
+                        .push(reason);
                 }
-                Err(error) => {
-                    network_errors.insert(pid, error.to_string());
-                }
             }
-            let mut ipc = collect_fd_ipc_resources_with_runner(pid, &resource_runner);
-            if fd_info.as_ref().is_none_or(|info| info.truncated) {
-                ipc.unavailable
-                    .push("file_descriptor_evidence_incomplete".to_string());
-            }
-            if !ipc.unavailable.is_empty() {
-                resource_unavailable.insert(pid, ipc.unavailable);
-            }
-            resources.extend(ipc.resources);
-            all_resources.extend(resources.iter().cloned());
-            per_process_resources.push((pid, resources));
         }
 
         let index_of_pid: HashMap<u32, usize> = per_process_resources
@@ -1662,16 +1921,8 @@ mod provenance {
             }
         }
 
-        let resource_graph = SharedResourceGraph::from_evidence(&per_process_resources);
-
-        ProvenanceInferenceBundle {
-            resource_graph,
-            lineages,
-            lineage_unavailable,
-            children,
-            network_errors,
-            resource_unavailable,
-        }
+        bundle.resource_graph = SharedResourceGraph::from_evidence(&per_process_resources);
+        bundle
     }
 
     fn provenance_confidence_score(confidence: ProvenanceConfidence) -> f64 {
@@ -1778,6 +2029,14 @@ mod provenance {
         };
         let mut confidence_notes = Vec::new();
         let mut confidence_penalty_steps = 0usize;
+        if !bundle.census_complete {
+            resource_score = 0.0;
+            confidence_notes.push(
+                "process census is incomplete or ambiguous; unobserved dependents may exist"
+                    .to_string(),
+            );
+            confidence_penalty_steps += 1;
+        }
         // Any participant with missing IPC observations can hide a shared edge.
         let resource_collection_complete = bundle
             .resource_unavailable
@@ -1810,16 +2069,14 @@ mod provenance {
         }
         // Missing peers can hide shared resources even when this target was
         // observed completely. Retain the actual scan coverage in confidence.
+        let observed_population = bundle.population_count.max(bundle.lineages.len());
         let network_coverage = if bundle.network_errors.is_empty() {
             1.0
-        } else if bundle.lineages.is_empty() {
+        } else if observed_population == 0 {
             0.0
         } else {
-            bundle
-                .lineages
-                .len()
-                .saturating_sub(bundle.network_errors.len()) as f64
-                / bundle.lineages.len() as f64
+            observed_population.saturating_sub(bundle.network_errors.len()) as f64
+                / observed_population as f64
         };
         let resource_score = resource_score * network_coverage;
         let mut evidence_completeness = ((lineage_score + resource_score) / 2.0).clamp(0.0, 1.0);
@@ -1940,6 +2197,8 @@ mod provenance {
             }
             RiskLevel::Low
                 if blast_radius.total_affected == 0
+                    && child_pids.is_empty()
+                    && bundle.census_complete
                     && bundle.network_errors.is_empty()
                     && resource_collection_complete
                     && unresolved_resources == 0 =>
@@ -3746,14 +4005,42 @@ mod tests {
 
 #[cfg(all(test, target_os = "linux"))]
 mod provenance_tests {
+    use super::provenance::{build_provenance_bundle_with, ProcessProvenance};
     use super::*;
     use crate::collect::SharedResourceGraph;
+    use crate::mock_process::MockProcessBuilder;
     use pt_common::{
         AncestorEntry, LineageCollectionMethod, LockMechanism, ProvenanceConfidence,
         RawLineageEvidence, RawResourceEvidence, ResourceCollectionMethod, ResourceDetails,
         ResourceKind, ResourceState, SupervisorEvidence, SupervisorKind,
     };
     use std::collections::HashMap;
+
+    fn provenance_identity(process: &ProcessRecord) -> pt_common::ProcessIdentity {
+        pt_common::ProcessIdentity::full(
+            process.pid.0,
+            process.start_id.clone(),
+            process.uid,
+            process.pgid,
+            process.sid,
+            pt_common::IdentityQuality::Full,
+        )
+    }
+
+    fn observed_process(process: &ProcessRecord, target: bool) -> ProcessProvenance {
+        let mut observed_lineage = lineage(process.pid.0, process.ppid.0, None);
+        observed_lineage.uid = process.uid;
+        observed_lineage.pgid = process.pgid.unwrap_or(0);
+        observed_lineage.sid = process.sid.unwrap_or(0);
+        ProcessProvenance {
+            identity: provenance_identity(process),
+            lineage: target.then_some(observed_lineage),
+            lineage_error: None,
+            resources: Vec::new(),
+            network_error: None,
+            unavailable: Vec::new(),
+        }
+    }
 
     fn lock_ev(pid: u32, path: &str, state: ResourceState) -> RawResourceEvidence {
         RawResourceEvidence {
@@ -3819,6 +4106,359 @@ mod provenance_tests {
     }
 
     #[test]
+    fn filtered_and_sampled_targets_keep_full_population_dependencies() {
+        let population = vec![
+            MockProcessBuilder::new()
+                .pid(100)
+                .ppid(10)
+                .comm("target")
+                .elapsed_secs(7200)
+                .build(),
+            MockProcessBuilder::new()
+                .pid(200)
+                .ppid(10)
+                .comm("protected-peer")
+                .elapsed_secs(7200)
+                .build(),
+            MockProcessBuilder::new()
+                .pid(300)
+                .ppid(100)
+                .comm("young-child")
+                .elapsed_secs(1)
+                .build(),
+            MockProcessBuilder::new()
+                .pid(400)
+                .ppid(10)
+                .uid(2000)
+                .comm("other-user")
+                .elapsed_secs(7200)
+                .build(),
+        ];
+        let filter = crate::collect::ProtectedFilter::new(&[], &[], &[200], &[]).unwrap();
+        let filtered = filter.filter_with_observations(
+            &population,
+            &Default::default(),
+            |_| crate::collect::CgroupRole::Unknown,
+            |_| None,
+        );
+        assert_eq!(filtered.filtered.len(), 1);
+        let eligible: Vec<_> = filtered
+            .passed
+            .iter()
+            .filter(|process| process.elapsed.as_secs() >= 3600)
+            .collect();
+        assert_eq!(eligible.len(), 2);
+        let observe = |process: &ProcessRecord, target| {
+            let mut observed = observed_process(process, target);
+            let paths: &[&str] = match process.pid.0 {
+                100 => &["/a.lock", "/c.lock"],
+                200 => &["/a.lock", "/b.lock"],
+                300 => &["/b.lock"],
+                400 => &["/c.lock"],
+                _ => unreachable!(),
+            };
+            observed.resources = paths
+                .iter()
+                .map(|path| lock_ev(process.pid.0, path, ResourceState::Active))
+                .collect();
+            Ok(observed)
+        };
+        let all = build_provenance_bundle_with(&eligible, &population, true, observe);
+        let sampled = build_provenance_bundle_with(&eligible[..1], &population, true, observe);
+        assert_eq!(all.population_count, 4);
+        assert_eq!(sampled.target_identities.len(), 1);
+        assert_eq!(
+            sampled.lineages.len(),
+            1,
+            "peers are not additional scoring targets"
+        );
+        assert_eq!(sampled.children[&100], vec![300]);
+        assert_eq!(
+            sampled.resource_graph.co_holders(100),
+            std::collections::HashSet::from([200, 400])
+        );
+        let mut all_estimate = derive_provenance_adjustment(100, &all);
+        let mut sample_estimate = derive_provenance_adjustment(100, &sampled);
+        assert_eq!(sample_estimate.blast_radius.total_affected, 3);
+        assert_eq!(
+            sample_estimate.blast_radius.direct.components.child_count,
+            1
+        );
+        // Direct co-holders come from a set; compare their identities independently
+        // of that set's iteration order when checking the two scoring populations.
+        all_estimate
+            .blast_radius
+            .direct
+            .blast_radius
+            .affected_pids
+            .sort_unstable();
+        sample_estimate
+            .blast_radius
+            .direct
+            .blast_radius
+            .affected_pids
+            .sort_unstable();
+        assert_eq!(
+            serde_json::to_value(&all_estimate).unwrap(),
+            serde_json::to_value(&sample_estimate).unwrap(),
+            "sampling changes scoring targets, not the observed dependency graph"
+        );
+        assert!(!feature_names(&sample_estimate).contains(&"provenance_blast_radius_low"));
+    }
+
+    #[test]
+    fn partial_census_or_unreadable_unselected_peer_never_establishes_isolation() {
+        let population = vec![
+            MockProcessBuilder::new().pid(100).ppid(10).build(),
+            MockProcessBuilder::new().pid(200).ppid(10).build(),
+        ];
+        let targets = [&population[0]];
+        let complete =
+            build_provenance_bundle_with(&targets, &population, true, |process, target| {
+                Ok(observed_process(process, target))
+            });
+        assert!(feature_names(&derive_provenance_adjustment(100, &complete))
+            .contains(&"provenance_blast_radius_low"));
+
+        let partial =
+            build_provenance_bundle_with(&targets, &population, false, |process, target| {
+                Ok(observed_process(process, target))
+            });
+        let incomplete = derive_provenance_adjustment(100, &partial);
+        assert!(!feature_names(&incomplete).contains(&"provenance_blast_radius_low"));
+        assert!(incomplete
+            .confidence_notes
+            .iter()
+            .any(|note| note.contains("process census is incomplete")));
+
+        let unreadable =
+            build_provenance_bundle_with(&targets, &population, true, |process, target| {
+                if process.pid.0 == 200 {
+                    Err("peer descriptors are not readable".to_string())
+                } else {
+                    Ok(observed_process(process, target))
+                }
+            });
+        assert!(unreadable.network_errors.contains_key(&200));
+        let unknown = derive_provenance_adjustment(100, &unreadable);
+        assert!(!feature_names(&unknown).contains(&"provenance_blast_radius_low"));
+        assert!(
+            unknown.evidence_completeness
+                < derive_provenance_adjustment(100, &complete).evidence_completeness
+        );
+    }
+
+    #[test]
+    fn provenance_rejects_replaced_peers_and_never_transfers_scoring_identity() {
+        let population = vec![
+            MockProcessBuilder::new().pid(100).ppid(10).build(),
+            MockProcessBuilder::new().pid(200).ppid(10).build(),
+        ];
+        for mismatch in ["birth", "uid", "pgid", "sid"] {
+            let bundle = build_provenance_bundle_with(
+                &[&population[0]],
+                &population,
+                true,
+                |process, target| {
+                    let mut observed = observed_process(process, target);
+                    observed.resources.push(lock_ev(
+                        process.pid.0,
+                        "/shared.lock",
+                        ResourceState::Active,
+                    ));
+                    if process.pid.0 == 200 {
+                        match mismatch {
+                            "birth" => {
+                                observed.identity.start_id =
+                                    pt_common::StartId::from_linux("new-boot", 123, 200)
+                            }
+                            "uid" => observed.identity.uid += 1,
+                            "pgid" => observed.identity.pgid = Some(999),
+                            "sid" => observed.identity.sid = Some(999),
+                            _ => unreachable!(),
+                        }
+                    }
+                    Ok(observed)
+                },
+            );
+            assert!(
+                bundle.resource_graph.co_holders(100).is_empty(),
+                "{mismatch}"
+            );
+            assert!(bundle.resource_unavailable.contains_key(&200), "{mismatch}");
+            assert!(!feature_names(&derive_provenance_adjustment(100, &bundle))
+                .contains(&"provenance_blast_radius_low"));
+        }
+
+        let mut scorer = Scorer::new(
+            Priors::default(),
+            DecisionStore::default(),
+            SignatureDatabase::new(),
+            FastPathConfig::disabled(),
+        );
+        scorer.provenance = Some(build_provenance_bundle_with(
+            &[&population[0]],
+            &population,
+            true,
+            |process, target| Ok(observed_process(process, target)),
+        ));
+        assert!(scorer
+            .recorded_observations(&population[0], None)
+            .provenance
+            .is_some());
+        assert!(scorer
+            .recorded_observations(&population[1], None)
+            .provenance
+            .is_none());
+        for mismatch in ["birth", "uid", "pgid", "sid", "ppid"] {
+            let mut replaced = population[0].clone();
+            match mismatch {
+                "birth" => replaced.start_id = pt_common::StartId::from_linux("new-boot", 123, 100),
+                "uid" => replaced.uid += 1,
+                "pgid" => replaced.pgid = Some(999),
+                "sid" => replaced.sid = Some(999),
+                "ppid" => replaced.ppid = pt_common::ProcessId(999),
+                _ => unreachable!(),
+            }
+            assert!(
+                scorer
+                    .recorded_observations(&replaced, None)
+                    .provenance
+                    .is_none(),
+                "{mismatch}"
+            );
+        }
+    }
+
+    #[test]
+    fn lineage_failures_keep_bound_resources_and_report_missing_ancestry() {
+        let population = vec![
+            MockProcessBuilder::new().pid(100).ppid(10).build(),
+            MockProcessBuilder::new().pid(200).ppid(10).build(),
+        ];
+        for failure in ["unavailable", "parent_changed"] {
+            let bundle = build_provenance_bundle_with(
+                &[&population[0]],
+                &population,
+                true,
+                |process, target| {
+                    let mut observed = observed_process(process, target);
+                    observed.resources.push(lock_ev(
+                        process.pid.0,
+                        "/shared.lock",
+                        ResourceState::Active,
+                    ));
+                    if target {
+                        if failure == "unavailable" {
+                            observed.lineage = None;
+                            observed.lineage_error = Some("ancestry unavailable".to_string());
+                        } else {
+                            observed.lineage.as_mut().unwrap().ppid = 999;
+                        }
+                    }
+                    Ok(observed)
+                },
+            );
+            assert!(!bundle.lineages.contains_key(&100));
+            assert!(bundle.lineage_unavailable.contains_key(&100));
+            assert_eq!(
+                bundle.resource_graph.co_holders(100),
+                std::collections::HashSet::from([200])
+            );
+            let adjustment = derive_provenance_adjustment(100, &bundle);
+            assert_eq!(adjustment.orphaned, None);
+            assert_eq!(adjustment.blast_radius.total_affected, 1);
+            assert!(!feature_names(&adjustment)
+                .iter()
+                .any(|feature| feature.starts_with("provenance_ownership_")));
+            assert!(adjustment
+                .confidence_notes
+                .iter()
+                .any(|note| note.contains("lineage unavailable")));
+        }
+    }
+
+    #[test]
+    fn ambiguous_census_and_empty_targets_do_not_invent_complete_evidence() {
+        let process = MockProcessBuilder::new().pid(100).ppid(10).build();
+        let bundle = build_provenance_bundle_with(
+            &[&process],
+            &[process.clone(), process.clone()],
+            true,
+            |_, _| panic!("ambiguous identities must not be probed"),
+        );
+        assert!(!bundle.census_complete);
+        assert!(bundle.target_identities.is_empty());
+        assert!(bundle.resource_unavailable.contains_key(&100));
+        let empty =
+            build_provenance_bundle_with(&[], std::slice::from_ref(&process), true, |_, _| {
+                panic!("no targets means no provenance work")
+            });
+        assert!(empty.resource_graph.resources.is_empty());
+        assert!(empty.lineages.is_empty());
+    }
+
+    #[test]
+    fn live_provenance_keeps_protected_holder_of_an_owned_childs_lock() {
+        use std::process::{Child, Command, Stdio};
+        struct OwnedChild(Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let held_path = temporary.path().join("provenance-held.lock");
+        let held = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&held_path)
+            .unwrap();
+        let child = OwnedChild(
+            Command::new("sleep")
+                .arg("30")
+                .stdin(Stdio::from(held.try_clone().unwrap()))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let scan =
+            crate::collect::quick_scan(&crate::collect::QuickScanOptions::default()).unwrap();
+        let target = scan
+            .processes
+            .iter()
+            .find(|process| process.pid.0 == child.0.id())
+            .expect("owned child is present in the census");
+        let parent = scan
+            .processes
+            .iter()
+            .find(|process| process.pid.0 == std::process::id())
+            .expect("protected test parent is present in the census");
+        let filter = crate::collect::ProtectedFilter::new(&[], &[], &[parent.pid.0], &[]).unwrap();
+        assert!(filter.is_protected(parent).is_some());
+        let bundle = build_provenance_bundle(
+            &[target],
+            &scan.processes,
+            scan.metadata.warnings.is_empty(),
+        );
+        assert!(
+            bundle
+                .resource_graph
+                .co_holders(target.pid.0)
+                .contains(&parent.pid.0),
+            "the inherited held file must link to its protected holder: {:?}",
+            bundle.resource_unavailable
+        );
+        assert!(!bundle.target_identities.contains_key(&parent.pid.0));
+        let adjustment = derive_provenance_adjustment(target.pid.0, &bundle);
+        assert!(adjustment.blast_radius.total_affected >= 1);
+        assert!(!feature_names(&adjustment).contains(&"provenance_blast_radius_low"));
+    }
+
+    #[test]
     fn orphaned_low_blast_radius_elevates_abandonment_features() {
         // Reparented to init, still in its spawner's session: an orphan even without
         // a readable ancestor chain.
@@ -3828,6 +4468,7 @@ mod provenance_tests {
             resource_graph: SharedResourceGraph::from_evidence(&[]),
             lineages: HashMap::from([(100, orphan)]),
             children: HashMap::new(),
+            census_complete: true,
             ..Default::default()
         };
 
@@ -3844,7 +4485,7 @@ mod provenance_tests {
             .pid(u32::MAX)
             .comm("missing-worker")
             .build();
-        let bundle = build_provenance_bundle(&[&missing]);
+        let bundle = build_provenance_bundle(&[&missing], std::slice::from_ref(&missing), true);
         assert!(bundle.network_errors.contains_key(&missing.pid.0));
         let adjustment = derive_provenance_adjustment(missing.pid.0, &bundle);
         assert!(!feature_names(&adjustment).contains(&"provenance_blast_radius_low"));
@@ -3864,6 +4505,7 @@ mod provenance_tests {
             lineages: HashMap::from([(100, orphan), (200, lineage(200, 2, None))]),
             children: HashMap::new(),
             network_errors: HashMap::new(),
+            census_complete: true,
             ..Default::default()
         };
         let complete = derive_provenance_adjustment(100, &bundle);
@@ -3913,6 +4555,9 @@ mod provenance_tests {
             lineages: HashMap::from([(100, lineage(100, 90, None))]),
             children: HashMap::new(),
             network_errors: HashMap::from([(100, "unclassified socket inode".to_string())]),
+            target_identities: HashMap::from([(100, provenance_identity(&process))]),
+            target_ppids: HashMap::from([(100, process.ppid.0)]),
+            census_complete: true,
             ..Default::default()
         });
         let observations = scorer.recorded_observations(&process, None);
@@ -4044,7 +4689,7 @@ mod provenance_tests {
         (process, observed)
     }
 
-    fn scorer_with_lineage(observed: RawLineageEvidence) -> Scorer {
+    fn scorer_with_lineage(process: &ProcessRecord, observed: RawLineageEvidence) -> Scorer {
         let mut scorer = Scorer::new(
             Priors::default(),
             DecisionStore::default(),
@@ -4053,6 +4698,10 @@ mod provenance_tests {
         );
         scorer.provenance = Some(ProvenanceInferenceBundle {
             lineages: HashMap::from([(observed.pid, observed)]),
+            target_identities: HashMap::from([(process.pid.0, provenance_identity(process))]),
+            target_ppids: HashMap::from([(process.pid.0, process.ppid.0)]),
+            population_count: 1,
+            census_complete: true,
             ..Default::default()
         });
         scorer
@@ -4066,7 +4715,7 @@ mod provenance_tests {
             let (process, observed) = adopted_job(ppid);
             let evidence = Evidence::from_snapshot(&process);
             assert_eq!(evidence.orphan, Some(ppid == 1));
-            let mut scorer = scorer_with_lineage(observed);
+            let mut scorer = scorer_with_lineage(&process, observed);
             scorer.provenance.as_mut().unwrap().resource_graph =
                 SharedResourceGraph::from_evidence(&[
                     (500, vec![listener_ev(500, 8080)]),
@@ -4136,7 +4785,7 @@ mod provenance_tests {
                 auto_restart: Some(true),
                 confidence: ProvenanceConfidence::High,
             });
-            let scorer = scorer_with_lineage(observed);
+            let scorer = scorer_with_lineage(&process, observed);
             let score = scorer
                 .score_with_desktop(&process, Evidence::from_snapshot(&process), None)
                 .unwrap();
@@ -4158,7 +4807,7 @@ mod provenance_tests {
     fn unknown_and_desktop_lineage_do_not_invent_orphanhood() {
         let (process, mut observed) = adopted_job(2000);
         observed.ancestors.clear();
-        let scorer = scorer_with_lineage(observed);
+        let scorer = scorer_with_lineage(&process, observed);
         let score = scorer
             .score_with_desktop(
                 &process,
@@ -4182,7 +4831,7 @@ mod provenance_tests {
         assert_eq!(attached.orphaned, Some(false));
 
         let (process, observed) = adopted_job(2000);
-        let scorer = scorer_with_lineage(observed);
+        let scorer = scorer_with_lineage(&process, observed);
         let score = scorer
             .score_with_desktop(
                 &process,
@@ -4202,7 +4851,7 @@ mod provenance_tests {
     #[test]
     fn recorded_orphan_verdict_replays_and_rejects_reused_identity() {
         let (process, observed) = adopted_job(2000);
-        let mut scorer = scorer_with_lineage(observed);
+        let mut scorer = scorer_with_lineage(&process, observed);
         let observations = scorer.recorded_observations(&process, None);
         assert_eq!(
             observations.provenance.as_ref().unwrap().orphaned,
@@ -4315,7 +4964,7 @@ mod provenance_tests {
     #[test]
     fn unavailable_lineage_is_recorded_without_erasing_resource_observations() {
         let (process, observed) = adopted_job(2000);
-        let mut scorer = scorer_with_lineage(observed);
+        let mut scorer = scorer_with_lineage(&process, observed);
         let bundle = scorer.provenance.as_mut().unwrap();
         bundle.lineages.clear();
         bundle.lineage_unavailable.insert(
@@ -4345,6 +4994,7 @@ mod provenance_tests {
     #[test]
     fn supervised_listener_suppresses_false_positive_path() {
         let bundle = ProvenanceInferenceBundle {
+            census_complete: true,
             resource_graph: SharedResourceGraph::from_evidence(&[(
                 200,
                 vec![listener_ev(200, 8080)],
@@ -4378,6 +5028,7 @@ mod provenance_tests {
     fn failed_resource_probes_do_not_establish_low_blast_radius() {
         let mut bundle = ProvenanceInferenceBundle {
             lineages: HashMap::from([(200, lineage(200, 2, None)), (300, lineage(300, 2, None))]),
+            census_complete: true,
             ..Default::default()
         };
         let complete = derive_provenance_adjustment(200, &bundle);
@@ -4458,6 +5109,9 @@ mod provenance_tests {
             FastPathConfig::disabled(),
         );
         measured.provenance = Some(ProvenanceInferenceBundle {
+            target_identities: HashMap::from([(process.pid.0, provenance_identity(&process))]),
+            target_ppids: HashMap::from([(process.pid.0, process.ppid.0)]),
+            census_complete: true,
             resource_graph: SharedResourceGraph::from_evidence(&[(
                 process.pid.0,
                 vec![listener_ev(process.pid.0, 8080)],

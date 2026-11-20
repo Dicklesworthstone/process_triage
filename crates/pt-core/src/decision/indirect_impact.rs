@@ -51,6 +51,10 @@ pub struct IndirectImpactResult {
     pub direct_affected: usize,
     /// Transitive co-holders (all hops up to max_hops).
     pub transitive_affected: usize,
+    /// Observed co-holder PIDs, sorted and deduplicated, excluding the target.
+    /// Older recorded estimates may retain counts without this identity list.
+    #[serde(default)]
+    pub affected_pids: Vec<u32>,
     /// Per-hop breakdown: hop distance → (count, confidence).
     pub per_hop: Vec<HopBreakdown>,
     /// Raw transitive impact score before uncertainty penalty.
@@ -151,7 +155,9 @@ pub fn compute_indirect_impact(
     }
 
     let direct_affected = hop0_count;
-    let transitive_affected = visited.len() - 1; // Exclude the target itself.
+    let mut affected_pids: Vec<u32> = visited.into_iter().filter(|peer| *peer != pid).collect();
+    affected_pids.sort_unstable();
+    let transitive_affected = affected_pids.len();
 
     // Raw score: sum of contributions (count * confidence per hop).
     let raw_score: f64 = per_hop.iter().map(|h| h.contribution).sum();
@@ -168,6 +174,7 @@ pub fn compute_indirect_impact(
         pid,
         direct_affected,
         transitive_affected,
+        affected_pids,
         per_hop,
         raw_score,
         evidence_completeness: completeness,

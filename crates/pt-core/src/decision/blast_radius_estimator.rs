@@ -20,7 +20,7 @@ use crate::decision::indirect_impact::{
 };
 use pt_common::RawLineageEvidence;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Configuration for the unified blast-radius estimator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,7 +113,19 @@ pub fn estimate_blast_radius(
     evidence_completeness: f64,
     config: &BlastRadiusEstimatorConfig,
 ) -> BlastRadiusEstimate {
-    let direct = compute_direct_impact(pid, graph, lineage, child_pids, &config.direct_config);
+    let children: HashSet<u32> = child_pids
+        .iter()
+        .copied()
+        .filter(|child| *child != pid && *child != 0)
+        .collect();
+    let observed_children: Vec<u32> = children.iter().copied().collect();
+    let direct = compute_direct_impact(
+        pid,
+        graph,
+        lineage,
+        &observed_children,
+        &config.direct_config,
+    );
 
     let indirect =
         compute_indirect_impact(pid, graph, evidence_completeness, &config.indirect_config);
@@ -125,13 +137,37 @@ pub fn estimate_blast_radius(
 
     let risk_level = classify_risk(risk_score, &config.risk_thresholds);
 
-    // Total affected = transitive_affected (already includes direct).
-    let total_affected = indirect.transitive_affected;
+    // Children are dependents even if they do not share a collected resource.
+    // A child that also holds a socket/lock must count only once, and malformed
+    // self edges must never make a process its own collateral impact.
+    let total_affected = indirect
+        .affected_pids
+        .iter()
+        .copied()
+        .chain(children.iter().copied())
+        .collect::<HashSet<_>>()
+        .len();
+    let direct_affected = direct
+        .blast_radius
+        .affected_pids
+        .iter()
+        .copied()
+        .chain(children)
+        .collect::<HashSet<_>>()
+        .len();
 
     // Confidence: higher when evidence is complete and we have many data points.
     let confidence = evidence_completeness.clamp(0.0, 1.0);
 
-    let summary = build_summary(pid, risk_score, risk_level, &direct, &indirect, confidence);
+    let summary = build_summary(
+        pid,
+        risk_score,
+        risk_level,
+        &direct,
+        direct_affected,
+        total_affected,
+        confidence,
+    );
 
     BlastRadiusEstimate {
         pid,
@@ -185,7 +221,8 @@ fn build_summary(
     score: f64,
     level: RiskLevel,
     direct: &DirectImpactResult,
-    indirect: &IndirectImpactResult,
+    direct_affected: usize,
+    total_affected: usize,
     confidence: f64,
 ) -> String {
     let level_str = match level {
@@ -203,15 +240,15 @@ fn build_summary(
         "low confidence (incomplete evidence)"
     };
 
-    let affected = if indirect.transitive_affected == 0 {
-        "no other processes affected".to_string()
-    } else if indirect.transitive_affected == indirect.direct_affected {
-        format!("{} directly affected", indirect.direct_affected)
+    let affected = if total_affected == 0 {
+        "no other dependents observed".to_string()
+    } else if total_affected == direct_affected {
+        format!("{direct_affected} observed directly affected")
     } else {
         format!(
-            "{} directly + {} transitively affected",
-            indirect.direct_affected,
-            indirect.transitive_affected - indirect.direct_affected
+            "{} observed directly + {} transitively affected",
+            direct_affected,
+            total_affected - direct_affected
         )
     };
 
@@ -305,6 +342,44 @@ mod tests {
         let est_app = estimate_blast_radius(200, &graph, None, &[], 1.0, &Default::default());
         let est_orphan = estimate_blast_radius(500, &graph, None, &[], 1.0, &Default::default());
         assert!(est_app.risk_score > est_orphan.risk_score);
+    }
+
+    #[test]
+    fn children_without_shared_resources_remain_in_affected_count() {
+        let estimate = estimate_blast_radius(
+            100,
+            &SharedResourceGraph::default(),
+            None,
+            &[200, 201],
+            1.0,
+            &Default::default(),
+        );
+        assert_eq!(estimate.direct.components.child_count, 2);
+        assert_eq!(estimate.indirect.transitive_affected, 0);
+        assert_eq!(estimate.total_affected, 2);
+        assert!(estimate.summary.contains("2 observed directly affected"));
+        assert!(!estimate.summary.contains("no other"));
+    }
+
+    #[test]
+    fn children_and_resource_dependents_are_a_union_not_a_sum() {
+        let graph = SharedResourceGraph::from_evidence(&[
+            (100, vec![lock_ev(100, "/a.lock")]),
+            (200, vec![lock_ev(200, "/a.lock"), lock_ev(200, "/b.lock")]),
+            (300, vec![lock_ev(300, "/b.lock")]),
+        ]);
+        let estimate = estimate_blast_radius(
+            100,
+            &graph,
+            None,
+            &[0, 100, 200, 200, 300, 400],
+            1.0,
+            &Default::default(),
+        );
+        assert_eq!(estimate.indirect.affected_pids, vec![200, 300]);
+        assert_eq!(estimate.direct.components.child_count, 3);
+        assert_eq!(estimate.total_affected, 3);
+        assert!(estimate.summary.contains("3 observed directly affected"));
     }
 
     #[test]

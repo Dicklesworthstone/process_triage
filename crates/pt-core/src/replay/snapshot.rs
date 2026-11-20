@@ -390,7 +390,11 @@ pub fn capture_snapshot(
             workloads.mark_census_incomplete();
         }
         scorer.set_workload_snapshot(workloads);
-        scorer.collect_provenance(&eligible);
+        scorer.collect_provenance(
+            &eligible,
+            &scan.processes,
+            scan.metadata.warnings.is_empty(),
+        );
         let eligible_pids: HashSet<u32> = eligible.iter().map(|process| process.pid.0).collect();
         for process in &scan.processes {
             let input = inputs
