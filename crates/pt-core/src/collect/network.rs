@@ -116,9 +116,9 @@ pub const NETWORK_MAX_TASKS: usize = 1024;
 pub const NETWORK_MAX_DESCRIPTORS: usize = 50_000;
 
 #[derive(Debug, PartialEq, Eq)]
-struct TaskNetworkInventory {
+pub(crate) struct TaskNetworkInventory {
     identities: Vec<(u32, (u64, u64, u64, u32))>,
-    socket_inodes: HashSet<u64>,
+    pub(crate) socket_inodes: HashSet<u64>,
 }
 
 #[derive(Debug)]
@@ -296,7 +296,7 @@ fn invalid_network(reason: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, reason)
 }
 
-fn read_network_process_identity(
+pub(crate) fn read_network_process_identity(
     process_dir: &Path,
     pid: u32,
 ) -> std::io::Result<(u64, u64, u64, u32)> {
@@ -322,7 +322,7 @@ fn check_network_namespace(process_dir: &Path, expected: NetworkNamespace) -> st
     Ok(())
 }
 
-fn revalidate_network_observation(
+pub(crate) fn revalidate_network_observation(
     process_dir: &Path,
     pid: u32,
     namespace: NetworkNamespace,
@@ -370,7 +370,7 @@ fn read_task_ids(process_dir: &Path, max_tasks: usize) -> std::io::Result<Vec<u3
     Ok(tids)
 }
 
-fn read_task_network_inventory(
+pub(crate) fn read_task_network_inventory(
     process_dir: &Path,
     namespace: NetworkNamespace,
     max_tasks: usize,

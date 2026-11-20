@@ -4,16 +4,22 @@
 
 use super::types::{EvidenceType, SupervisionEvidence, SupervisorCategory};
 #[cfg(target_os = "linux")]
-use crate::collect::network::{has_inet_socket_inode, parse_proc_net_unix};
+use crate::collect::network::{
+    has_inet_socket_inode, parse_proc_net_unix, read_network_process_identity,
+    read_task_network_inventory, revalidate_network_observation,
+    NetworkNamespace as ObservedNetworkNamespace, NETWORK_MAX_DESCRIPTORS, NETWORK_MAX_TASKS,
+};
 #[cfg(target_os = "linux")]
 use crate::collect::proc_parsers::read_required_proc_stat;
 use crate::collect::proc_parsers::StatReadError;
 #[cfg(target_os = "linux")]
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(target_os = "linux")]
 use std::fs;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt;
+#[cfg(target_os = "linux")]
+use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::sync::{Arc, Mutex};
 #[cfg(target_os = "linux")]
@@ -300,125 +306,115 @@ fn read_socket_paths_with_refresh(
     scan: Option<&ScanUnixSocketPaths>,
 ) -> Result<Vec<String>, IpcError> {
     let before = read_required_proc_stat(pid)?;
-    let scan_namespace = match scan {
-        Some(snapshot) => {
-            let (namespace, handle) = open_network_namespace(pid)?;
-            Some((snapshot, namespace, handle))
-        }
-        None => None,
-    };
-    let expected_namespace = scan_namespace.as_ref().map(|(_, namespace, _)| *namespace);
-    let fd_dir = format!("/proc/{}/fd", pid);
-    let entries = fs::read_dir(&fd_dir).map_err(|source| IpcError::IoError {
-        pid,
-        path: fd_dir.clone(),
-        source,
-    })?;
-
-    let mut sockets = Vec::new();
-    let mut socket_inodes = Vec::new();
-
-    for entry in entries {
-        let entry = entry.map_err(|source| IpcError::IoError {
-            pid,
-            path: fd_dir.clone(),
-            source,
-        })?;
-        // Read the symlink target
-        let target = fs::read_link(entry.path()).map_err(|source| IpcError::IoError {
-            pid,
-            path: entry.path().display().to_string(),
-            source,
-        })?;
-        let target_str = target.to_str().ok_or_else(|| IpcError::Parse {
-            pid,
-            path: entry.path().display().to_string(),
-            reason: "invalid descriptor-link UTF-8".to_string(),
-        })?;
-
-        // A socket descriptor: its bound path (if any) is in /proc/net/unix.
-        if let Some(value) = target_str.strip_prefix("socket:[") {
-            let inode = value
-                .strip_suffix(']')
-                .and_then(|value| value.parse::<u64>().ok())
-                .ok_or_else(|| IpcError::Parse {
-                    pid,
-                    path: entry.path().display().to_string(),
-                    reason: "invalid socket inode link".to_string(),
-                })?;
-            socket_inodes.push(inode);
-            continue;
-        }
-
-        // Check for Unix socket paths
-        if target_str.starts_with('/') || target_str.starts_with('@') {
-            sockets.push(target_str.to_string());
-        }
-    }
-
-    if !socket_inodes.is_empty() {
-        let mut table = match scan_namespace {
-            Some((snapshot, namespace, handle)) => snapshot.table_for(pid, namespace, handle)?,
-            None => unix_socket_paths_by_inode(pid, refresh)?,
-        };
-        if scan.is_none()
-            && !refresh
-            && socket_inodes
-                .iter()
-                .any(|inode| table.get(inode).is_none_or(|path| path.is_none()))
-        {
-            table = unix_socket_paths_by_inode(pid, true)?;
-        }
-        // An unnamed Unix socket can acquire a supervisor path without changing
-        // its inode. Refresh those uncertain entries before admitting a negative,
-        // but retain the original scan view for every other inode. In particular,
-        // a missing inode must not become trusted merely because an unrelated
-        // unnamed descriptor triggered this read.
-        let unnamed = if let Some(snapshot) = scan.filter(|_| {
-            socket_inodes
-                .iter()
-                .any(|inode| matches!(table.get(inode), Some(None)))
-        }) {
-            #[cfg(test)]
-            snapshot
-                .table_reads
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            #[cfg(not(test))]
-            let _ = snapshot;
-            Some(unix_socket_paths_by_inode(pid, true)?)
-        } else {
-            None
-        };
-        for inode in socket_inodes {
-            let observed = match table.get(&inode) {
-                Some(None) if unnamed.is_some() => {
-                    unnamed.as_ref().and_then(|view| view.get(&inode))
+    let process_dir = PathBuf::from(format!("/proc/{pid}"));
+    let sockets =
+        inspect_socket_inventory(pid, &process_dir, |socket_inodes, namespace, handle| {
+            let mut sockets = Vec::new();
+            if !socket_inodes.is_empty() {
+                let mut table = match scan {
+                    Some(snapshot) => snapshot.table_for(pid, namespace, handle)?,
+                    None => unix_socket_paths_by_inode(pid, refresh)?,
+                };
+                if scan.is_none()
+                    && !refresh
+                    && socket_inodes
+                        .iter()
+                        .any(|inode| table.get(inode).is_none_or(|path| path.is_none()))
+                {
+                    table = unix_socket_paths_by_inode(pid, true)?;
                 }
-                observed => observed,
-            };
-            if let Some(path) = observed {
-                if let Some(path) = path {
-                    sockets.push(path.clone());
+                // An unnamed Unix socket can acquire a supervisor path without changing
+                // its inode. Refresh those uncertain entries before admitting a negative,
+                // but retain the original scan view for every other inode. In particular,
+                // a missing inode must not become trusted merely because an unrelated
+                // unnamed descriptor triggered this read.
+                let unnamed = if let Some(snapshot) = scan.filter(|_| {
+                    socket_inodes
+                        .iter()
+                        .any(|inode| matches!(table.get(inode), Some(None)))
+                }) {
+                    #[cfg(test)]
+                    snapshot
+                        .table_reads
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    #[cfg(not(test))]
+                    let _ = snapshot;
+                    Some(unix_socket_paths_by_inode(pid, true)?)
+                } else {
+                    None
+                };
+                for &inode in socket_inodes {
+                    let observed = match table.get(&inode) {
+                        Some(None) if unnamed.is_some() => {
+                            unnamed.as_ref().and_then(|view| view.get(&inode))
+                        }
+                        observed => observed,
+                    };
+                    if let Some(path) = observed {
+                        if let Some(path) = path {
+                            sockets.push(path.clone());
+                        }
+                    } else if !has_inet_socket_inode(pid, inode).map_err(|source| {
+                        IpcError::IoError {
+                            pid,
+                            path: format!("/proc/{pid}/net TCP/UDP tables"),
+                            source,
+                        }
+                    })? {
+                        return Err(IpcError::UnclassifiedSocket { pid, inode });
+                    }
                 }
-            } else if !has_inet_socket_inode(pid, inode).map_err(|source| IpcError::IoError {
-                pid,
-                path: format!("/proc/{pid}/net TCP/UDP tables"),
-                source,
-            })? {
-                return Err(IpcError::UnclassifiedSocket { pid, inode });
             }
-        }
-    }
-
-    if let Some(namespace) = expected_namespace {
-        check_network_namespace(pid, namespace)?;
-    }
+            sockets.sort_unstable();
+            sockets.dedup();
+            Ok(sockets)
+        })?;
     let after = read_required_proc_stat(pid)?;
     if after.starttime != before.starttime {
         return Err(IpcError::ProcessChanged(pid));
     }
 
     Ok(sockets)
+}
+
+/// Resolve sockets only while the complete thread group has two matching
+/// inventories. A worker may unshare its file table without changing the leader,
+/// so neither an empty leader table nor an unchanged leader birth proves absence.
+/// The namespace stays held open across resolution and revalidation. This walks
+/// only procfs descriptor links; it never opens or stats their target paths.
+#[cfg(target_os = "linux")]
+fn inspect_socket_inventory(
+    pid: u32,
+    process_dir: &Path,
+    inspect: impl FnOnce(&HashSet<u64>, NetworkNamespace, &fs::File) -> Result<Vec<String>, IpcError>,
+) -> Result<Vec<String>, IpcError> {
+    let failure = |source| IpcError::IoError {
+        pid,
+        path: process_dir.display().to_string(),
+        source,
+    };
+    let identity = read_network_process_identity(process_dir, pid).map_err(failure)?;
+    let handle = fs::File::open(process_dir.join("ns/net")).map_err(failure)?;
+    let metadata = handle.metadata().map_err(failure)?;
+    let namespace = ObservedNetworkNamespace {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    };
+    let inventory = read_task_network_inventory(
+        process_dir,
+        namespace,
+        NETWORK_MAX_TASKS,
+        NETWORK_MAX_DESCRIPTORS,
+    )
+    .map_err(failure)?;
+    let paths = inspect(
+        &inventory.socket_inodes,
+        (namespace.device, namespace.inode),
+        &handle,
+    )?;
+    revalidate_network_observation(process_dir, pid, namespace, identity, &inventory)
+        .map_err(failure)?;
+    Ok(paths)
 }
 
 /// How long one parse of /proc/net/unix is reused.
@@ -453,7 +449,7 @@ impl ScanUnixSocketPaths {
         &self,
         pid: u32,
         namespace: NetworkNamespace,
-        handle: fs::File,
+        handle: &fs::File,
     ) -> Result<Arc<UnixSocketPaths>, IpcError> {
         check_network_namespace(pid, namespace)?;
         let mut tables = self
@@ -468,10 +464,15 @@ impl ScanUnixSocketPaths {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let table = read_unix_socket_paths(pid)?;
         check_network_namespace(pid, namespace)?;
+        let namespace_handle = handle.try_clone().map_err(|source| IpcError::IoError {
+            pid,
+            path: format!("/proc/{pid}/ns/net"),
+            source,
+        })?;
         tables.insert(
             namespace,
             ScanUnixSocketTable {
-                _namespace: handle,
+                _namespace: namespace_handle,
                 table: Arc::clone(&table),
             },
         );
@@ -479,7 +480,7 @@ impl ScanUnixSocketPaths {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", test))]
 fn open_network_namespace(pid: u32) -> Result<(NetworkNamespace, fs::File), IpcError> {
     let path = format!("/proc/{pid}/ns/net");
     let failure = |source| IpcError::IoError {
@@ -678,6 +679,161 @@ mod tests {
     use super::*;
 
     #[cfg(target_os = "linux")]
+    mod inventory_tests {
+        use super::*;
+
+        fn write_stat(path: &Path, pid: u32, birth: u64) {
+            fs::write(
+                path,
+                format!(
+                    "{pid} (ipc-fixture) S 1 100 100 0 0 0 0 0 0 0 0 0 0 0 20 0 1 0 {birth} 4096 1\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        fn add_task(process: &Path, tid: u32, sockets: &[u64]) -> PathBuf {
+            let task = process.join("task").join(tid.to_string());
+            fs::create_dir_all(task.join("fd")).unwrap();
+            fs::create_dir_all(task.join("ns")).unwrap();
+            fs::hard_link(process.join("ns/net"), task.join("ns/net")).unwrap();
+            write_stat(&task.join("stat"), tid, 12345);
+            for (index, inode) in sockets.iter().enumerate() {
+                std::os::unix::fs::symlink(
+                    format!("socket:[{inode}]"),
+                    task.join("fd").join(index.to_string()),
+                )
+                .unwrap();
+            }
+            task
+        }
+
+        fn fixture_process(root: &Path) -> PathBuf {
+            let process = root.join("100");
+            fs::create_dir_all(process.join("ns")).unwrap();
+            fs::write(process.join("ns/net"), "held namespace").unwrap();
+            write_stat(&process.join("stat"), 100, 12345);
+            add_task(&process, 100, &[]);
+            std::os::unix::fs::symlink("task/100/fd", process.join("fd")).unwrap();
+            process
+        }
+
+        #[test]
+        fn complete_inventory_includes_private_worker_sockets_once() {
+            let root = tempfile::tempdir().unwrap();
+            let process = fixture_process(root.path());
+            let worker = add_task(&process, 101, &[41, 42]);
+            add_task(&process, 102, &[42]);
+            std::os::unix::fs::symlink("/tmp/vscode-ordinary-file", worker.join("fd/2")).unwrap();
+            assert_eq!(fs::read_dir(process.join("fd")).unwrap().count(), 0);
+
+            let paths = inspect_socket_inventory(100, &process, |inodes, namespace, handle| {
+                assert_eq!(inodes, &HashSet::from([41, 42]));
+                let metadata = handle.metadata().unwrap();
+                assert_eq!(namespace, (metadata.dev(), metadata.ino()));
+                Ok(vec!["/tmp/vscode-private-worker.sock".to_string()])
+            })
+            .unwrap();
+            let result = IpcAnalyzer::new().analyze_sockets(&paths);
+            assert!(result.human_supervised);
+            assert_eq!(result.supervisor_name.as_deref(), Some("vscode"));
+        }
+
+        #[test]
+        fn incomplete_worker_evidence_never_reaches_negative_resolution() {
+            for problem in [
+                "fd",
+                "stat",
+                "namespace",
+                "different_namespace",
+                "malformed_fd",
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let process = fixture_process(root.path());
+                let worker = add_task(&process, 101, &[42]);
+                match problem {
+                    "fd" => {
+                        fs::rename(worker.join("fd"), root.path().join("saved-fd")).unwrap();
+                        fs::write(worker.join("fd"), "not a directory").unwrap();
+                    }
+                    "stat" => {
+                        fs::write(worker.join("stat"), "unreadable identity").unwrap();
+                    }
+                    "namespace" => {
+                        fs::rename(worker.join("ns/net"), root.path().join("saved-net")).unwrap();
+                    }
+                    "different_namespace" => {
+                        fs::rename(worker.join("ns/net"), root.path().join("saved-net")).unwrap();
+                        fs::write(worker.join("ns/net"), "different namespace").unwrap();
+                    }
+                    "malformed_fd" => {
+                        std::os::unix::fs::symlink("socket:[invalid]", worker.join("fd/1"))
+                            .unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                let error = inspect_socket_inventory(100, &process, |_, _, _| {
+                    panic!("{problem}: incomplete worker must not resolve as unsupervised")
+                })
+                .unwrap_err();
+                assert!(matches!(error, IpcError::IoError { pid: 100, .. }));
+            }
+        }
+
+        #[test]
+        fn task_socket_and_namespace_changes_refuse_negative_results() {
+            for change in [
+                "socket",
+                "worker_birth",
+                "worker_replaced",
+                "worker_missing",
+                "worker_joined",
+                "leader_birth",
+                "leader_namespace",
+                "worker_namespace",
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let process = fixture_process(root.path());
+                let worker = add_task(&process, 101, &[42]);
+                let result = inspect_socket_inventory(100, &process, |inodes, _, _| {
+                    assert_eq!(inodes, &HashSet::from([42]));
+                    match change {
+                        "socket" => {
+                            fs::rename(worker.join("fd/0"), root.path().join("saved-fd")).unwrap();
+                            std::os::unix::fs::symlink("socket:[43]", worker.join("fd/0")).unwrap();
+                        }
+                        "worker_birth" => write_stat(&worker.join("stat"), 101, 99999),
+                        "worker_replaced" => {
+                            fs::rename(&worker, root.path().join("saved-worker")).unwrap();
+                            add_task(&process, 101, &[42]);
+                        }
+                        "worker_missing" => {
+                            fs::rename(&worker, root.path().join("saved-worker")).unwrap();
+                        }
+                        "worker_joined" => {
+                            add_task(&process, 102, &[43]);
+                        }
+                        "leader_birth" => write_stat(&process.join("stat"), 100, 99999),
+                        "leader_namespace" | "worker_namespace" => {
+                            let subject = if change == "leader_namespace" {
+                                &process
+                            } else {
+                                &worker
+                            };
+                            fs::rename(subject.join("ns/net"), root.path().join("saved-net"))
+                                .unwrap();
+                            fs::write(subject.join("ns/net"), "different namespace").unwrap();
+                        }
+                        _ => unreachable!(),
+                    }
+                    Ok(Vec::new())
+                });
+                assert!(result.is_err(), "{change} admitted a negative IPC result");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     mod scan_tests {
         use super::*;
         use std::os::fd::{AsRawFd, OwnedFd};
@@ -687,10 +843,10 @@ mod tests {
         use std::process::{Child, Command, Stdio};
         use std::sync::atomic::Ordering;
 
-        struct SocketChild(Child);
+        pub(super) struct SocketChild(Child);
 
         impl SocketChild {
-            fn new(path: &Path) -> Self {
+            pub(super) fn new(path: &Path) -> Self {
                 let socket: OwnedFd = UnixListener::bind(path).unwrap().into();
                 Self::with_socket(socket, Stdio::null())
             }
@@ -707,9 +863,122 @@ mod tests {
                 )
             }
 
-            fn pid(&self) -> u32 {
+            pub(super) fn pid(&self) -> u32 {
                 self.0.id()
             }
+        }
+
+        #[test]
+        fn ordinary_files_with_supervisor_names_are_not_socket_evidence() {
+            let directory = tempfile::Builder::new()
+                .prefix("vscode-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let file = fs::File::create(directory.path().join("ordinary-file")).unwrap();
+            let child = SocketChild::with_socket(file.into(), Stdio::null());
+            for analyzer in [IpcAnalyzer::new(), IpcAnalyzer::for_scan()] {
+                let result = analyzer.analyze(child.pid()).unwrap();
+                assert!(!result.is_supervised);
+                assert!(result.matched_sockets.is_empty());
+            }
+        }
+
+        #[test]
+        fn private_worker_socket_child() {
+            use std::io::{BufRead, Write};
+
+            let Some(path) = std::env::var_os("PT_IPC_PRIVATE_WORKER_SOCKET") else {
+                return;
+            };
+            let (ready_send, ready_receive) = std::sync::mpsc::channel();
+            let (release_send, release_receive) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                // SAFETY: only this owned fixture thread receives a separate
+                // descriptor table; no existing descriptor is closed or changed.
+                assert_eq!(
+                    unsafe { libc::unshare(libc::CLONE_FILES) },
+                    0,
+                    "cannot unshare fixture descriptor table: {}",
+                    std::io::Error::last_os_error()
+                );
+                let socket = UnixListener::bind(path).unwrap();
+                // SAFETY: gettid only reads this live thread's kernel identity.
+                let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
+                ready_send.send((tid, socket.as_raw_fd())).unwrap();
+                release_receive
+                    .recv_timeout(Duration::from_secs(30))
+                    .unwrap();
+                drop(socket);
+            });
+            let (tid, fd) = ready_receive.recv_timeout(Duration::from_secs(10)).unwrap();
+            println!("\nPT_IPC_WORKER_READY {tid} {fd}");
+            std::io::stdout().flush().unwrap();
+            let mut command = String::new();
+            std::io::stdin().lock().read_line(&mut command).unwrap();
+            release_send.send(()).unwrap();
+            worker.join().unwrap();
+        }
+
+        #[test]
+        fn live_and_scan_detection_find_a_private_worker_supervisor_socket() {
+            use std::io::{BufRead, BufReader, Write};
+
+            let directory = tempfile::Builder::new()
+                .prefix("vscode-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let path = directory.path().join("worker.sock");
+            let mut child = SocketChild(
+                Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "supervision::ipc::tests::scan_tests::private_worker_socket_child",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env("PT_IPC_PRIVATE_WORKER_SOCKET", &path)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::inherit())
+                    .spawn()
+                    .unwrap(),
+            );
+            let stdout = child.0.stdout.take().unwrap();
+            let (ready_send, ready_receive) = std::sync::mpsc::channel();
+            let output = std::thread::spawn(move || {
+                for line in BufReader::new(stdout).lines() {
+                    let line = line.unwrap();
+                    if let Some(ready) = line.strip_prefix("PT_IPC_WORKER_READY ") {
+                        let (tid, fd) = ready.split_once(' ').unwrap();
+                        ready_send
+                            .send((tid.parse::<u32>().unwrap(), fd.parse::<u32>().unwrap()))
+                            .unwrap();
+                    }
+                }
+            });
+            let (tid, fd) = ready_receive.recv_timeout(Duration::from_secs(10)).unwrap();
+            let pid = child.pid();
+            assert_ne!(tid, pid);
+            let worker_socket = fs::read_link(format!("/proc/{pid}/task/{tid}/fd/{fd}")).unwrap();
+            assert!(worker_socket.to_string_lossy().starts_with("socket:["));
+            assert_ne!(
+                fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok(),
+                Some(worker_socket),
+                "the fixture must keep its supervisor socket out of the leader table"
+            );
+            for analyzer in [IpcAnalyzer::new(), IpcAnalyzer::for_scan()] {
+                let observed = analyzer.analyze(pid).unwrap();
+                assert!(observed.is_supervised);
+                assert!(observed.human_supervised);
+                assert_eq!(observed.supervisor_name.as_deref(), Some("vscode"));
+                assert_eq!(
+                    observed.matched_sockets,
+                    vec![path.to_str().unwrap().to_string()]
+                );
+            }
+            child.0.stdin.take().unwrap().write_all(b"done\n").unwrap();
+            assert!(child.0.wait().unwrap().success());
+            output.join().unwrap();
         }
 
         #[test]
@@ -876,7 +1145,7 @@ mod tests {
             let (namespace, handle) = open_network_namespace(pid).unwrap();
             let other_namespace = (namespace.0, namespace.1 ^ 1);
             assert!(matches!(
-                snapshot.table_for(pid, other_namespace, handle),
+                snapshot.table_for(pid, other_namespace, &handle),
                 Err(IpcError::ProcessChanged(changed)) if changed == pid
             ));
             assert_eq!(snapshot.table_reads.load(Ordering::Relaxed), 1);
@@ -896,29 +1165,29 @@ mod tests {
         }
     }
 
-    /// A unix socket this process binds is found through the shared inode table, and
+    /// A unix socket an owned child holds is found through the shared inode table, and
     /// repeated lookups within the TTL reuse one parse.
     #[cfg(target_os = "linux")]
     #[test]
     fn bound_socket_path_found_through_shared_table() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pt-ipc-test.sock");
-        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let child = scan_tests::SocketChild::new(&path);
         // The cache may hold a table from before the bind; let it expire.
         std::thread::sleep(UNIX_TABLE_TTL + Duration::from_millis(50));
 
-        let sockets = read_socket_paths(std::process::id()).unwrap();
+        let sockets = read_socket_paths(child.pid()).unwrap();
         let wanted = path.to_string_lossy().to_string();
         assert!(sockets.contains(&wanted), "{wanted} not in {sockets:?}");
 
-        let first = unix_socket_paths_by_inode(std::process::id(), false).unwrap();
-        let second = unix_socket_paths_by_inode(std::process::id(), false).unwrap();
+        let first = unix_socket_paths_by_inode(child.pid(), false).unwrap();
+        let second = unix_socket_paths_by_inode(child.pid(), false).unwrap();
         assert!(Arc::ptr_eq(&first, &second), "parsed twice within the TTL");
 
         // A bind after the warm table must not disappear into cached absence.
         let later = dir.path().join("pt-later.sock");
-        let _later_listener = std::os::unix::net::UnixListener::bind(&later).unwrap();
-        assert!(read_socket_paths(std::process::id())
+        let later_child = scan_tests::SocketChild::new(&later);
+        assert!(read_socket_paths(later_child.pid())
             .unwrap()
             .contains(&later.to_string_lossy().to_string()));
         let error = unix_socket_paths_by_inode(u32::MAX, true).unwrap_err();
