@@ -6,7 +6,7 @@
 //!
 //! # Algorithms
 //!
-//! - **Greedy**: Sort by efficiency (contribution/loss), select greedily.
+//! - **Greedy**: Select by remaining, target-normalized progress per unit of loss.
 //! - **DP-exact**: Dynamic programming for small candidate sets (N ≤ 30).
 //! - **Local search**: Swap-based improvement on greedy solutions.
 //!
@@ -14,7 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{BinaryHeap, HashSet};
 
 /// A resource goal the user wants to achieve.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,7 +222,11 @@ impl PreferenceModel {
     }
 }
 
-/// Greedy optimization: sort by efficiency, select until goals met.
+/// Greedy optimization: rank marginal progress per loss until goals are met.
+///
+/// Each resource is normalized by its target, and excess beyond its remaining
+/// deficit earns no selection credit. Thus units (bytes versus MiB, for example)
+/// do not change the objective and a satisfied goal cannot keep driving kills.
 pub fn optimize_greedy(candidates: &[OptCandidate], goals: &[ResourceGoal]) -> OptimizationResult {
     optimize_greedy_internal(candidates, goals, None, "greedy", true)
 }
@@ -236,6 +240,126 @@ pub fn optimize_greedy_with_preferences(
     optimize_greedy_internal(candidates, goals, Some(prefs), "greedy_pref", true)
 }
 
+/// A stale entry is an upper bound: deficits only decrease, so marginal gain
+/// cannot increase. Re-evaluate only entries that reach the top of the heap.
+#[derive(Clone, Copy, Debug)]
+struct GreedyRank {
+    weighted: bool,
+    costless: bool,
+    log_efficiency: f64,
+    index: usize,
+    generation: usize,
+}
+
+impl PartialEq for GreedyRank {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for GreedyRank {}
+
+impl PartialOrd for GreedyRank {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for GreedyRank {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.weighted
+            .cmp(&other.weighted)
+            .then_with(|| self.costless.cmp(&other.costless))
+            .then_with(|| self.log_efficiency.total_cmp(&other.log_efficiency))
+            // Preserve the input order for equal priorities, as stable sorting
+            // did before. The generation is freshness metadata, not priority.
+            .then_with(|| other.index.cmp(&self.index))
+    }
+}
+
+fn log_add_positive(a: f64, b: f64) -> f64 {
+    if a == f64::NEG_INFINITY {
+        b
+    } else {
+        a.max(b) + (a.min(b) - a.max(b)).exp().ln_1p()
+    }
+}
+
+fn marginal_rank(
+    candidate: &OptCandidate,
+    adjusted_loss: f64,
+    goals: &[ResourceGoal],
+    remaining: impl Iterator<Item = f64>,
+    index: usize,
+    generation: usize,
+) -> Option<GreedyRank> {
+    let mut weighted_gain = f64::NEG_INFINITY;
+    let mut unweighted_gain = f64::NEG_INFINITY;
+    for ((contribution, goal), deficit) in candidate.contributions.iter().zip(goals).zip(remaining)
+    {
+        if *contribution <= 0.0 || deficit <= 0.0 {
+            continue;
+        }
+        // Log space avoids overflow/underflow when loss, target, or weight
+        // spans many orders of magnitude. No measurement is rounded to zero.
+        let log_fraction = contribution.min(deficit).ln() - goal.target.ln();
+        unweighted_gain = log_add_positive(unweighted_gain, log_fraction);
+        if goal.weight > 0.0 {
+            weighted_gain = log_add_positive(weighted_gain, log_fraction + goal.weight.ln());
+        }
+    }
+    let weighted = weighted_gain.is_finite();
+    let gain = if weighted {
+        weighted_gain
+    } else {
+        // Zero-weight goals are still constraints. Work on them after all
+        // attainable positive-weight progress, instead of abandoning them.
+        unweighted_gain
+    };
+    gain.is_finite().then(|| GreedyRank {
+        weighted,
+        costless: adjusted_loss == 0.0,
+        log_efficiency: if adjusted_loss == 0.0 {
+            gain
+        } else {
+            gain - adjusted_loss.ln()
+        },
+        index,
+        generation,
+    })
+}
+
+fn valid_goal_inputs(goals: &[ResourceGoal]) -> bool {
+    goals.iter().all(|goal| {
+        goal.target.is_finite()
+            && goal.target >= 0.0
+            && goal.weight.is_finite()
+            && goal.weight >= 0.0
+    })
+}
+
+fn valid_candidate_inputs(candidate: &OptCandidate, goal_count: usize) -> bool {
+    candidate.expected_loss.is_finite()
+        && candidate.expected_loss >= 0.0
+        && candidate.contributions.len() == goal_count
+        && candidate
+            .contributions
+            .iter()
+            .all(|value| value.is_finite() && *value >= 0.0)
+}
+
+fn record_invalid_candidates(
+    events: &mut Vec<OptimizationLogEvent>,
+    algorithm: &str,
+    count: usize,
+) {
+    if count > 0 {
+        let mut event = OptimizationLogEvent::new("invalid_input", algorithm);
+        event.note = Some(format!("excluded_invalid_candidates={count}: loss and contributions must be finite and non-negative, with one contribution per goal"));
+        events.push(event);
+    }
+}
+
 fn optimize_greedy_internal(
     candidates: &[OptCandidate],
     goals: &[ResourceGoal],
@@ -246,7 +370,7 @@ fn optimize_greedy_internal(
     let mut log_events = Vec::new();
     let mut start_event = OptimizationLogEvent::new("optimizer_start", algorithm_label);
     start_event.note = Some(format!(
-        "candidates={} goals={}",
+        "candidates={} goals={} score=log(target_normalized_remaining_gain/adjusted_loss)",
         candidates.len(),
         goals.len()
     ));
@@ -254,43 +378,45 @@ fn optimize_greedy_internal(
 
     let adjust_loss = |loss: f64| prefs.map_or(loss, |p| p.adjust_loss(loss));
 
-    if candidates.is_empty() {
-        let goal_achievement: Vec<GoalAchievement> = goals
-            .iter()
-            .map(|g| GoalAchievement {
-                resource: g.resource.clone(),
-                target: g.target,
-                achieved: 0.0,
-                shortfall: g.target,
-                met: g.target <= 0.0,
-            })
-            .collect();
+    if !valid_goal_inputs(goals) || prefs.is_some_and(|prefs| !prefs.risk_tolerance.is_finite()) {
+        let mut invalid = OptimizationLogEvent::new("invalid_input", algorithm_label);
+        invalid.note = Some("targets, weights and risk preference must be finite; targets and weights must be non-negative".into());
+        log_events.push(invalid);
         return OptimizationResult {
             selected: Vec::new(),
             total_loss: 0.0,
             total_contributions: vec![0.0; goals.len()],
-            goal_achievement,
-            feasible: goals.iter().all(|g| g.target <= 0.0),
+            // There is no meaningful numerical achievement for a malformed
+            // goal. Do not publish fabricated zero targets or NaN measurements.
+            goal_achievement: Vec::new(),
+            feasible: false,
             algorithm: algorithm_label.to_string(),
             alternatives: Vec::new(),
             log_events,
         };
     }
 
-    assert_eq!(
-        goals.len(),
-        candidates[0].contributions.len(),
-        "Contribution vector length must match number of goals"
+    let valid_candidate = |candidate: &OptCandidate| {
+        valid_candidate_inputs(candidate, goals.len())
+            && adjust_loss(candidate.expected_loss).is_finite()
+    };
+    record_invalid_candidates(
+        &mut log_events,
+        algorithm_label,
+        candidates
+            .iter()
+            .filter(|candidate| !valid_candidate(candidate))
+            .count(),
     );
 
     // A missing resource observation contributes zero. Do not turn a shortfall
     // into gratuitous actions, including in the alternative plans below.
-    let mut eligible: Vec<(usize, &OptCandidate)> = candidates
+    let eligible: Vec<(usize, &OptCandidate)> = candidates
         .iter()
         .enumerate()
         .filter(|(_, c)| {
             !c.blocked
-                && c.expected_loss >= 0.0
+                && valid_candidate(c)
                 && c.contributions
                     .iter()
                     .zip(goals)
@@ -304,43 +430,58 @@ fn optimize_greedy_internal(
         log_events.push(event);
     }
 
-    // Compute scalarized efficiency: weighted_contribution / adjusted_loss.
-    let scalarize = |c: &OptCandidate| -> f64 {
-        let weighted_contrib: f64 = c
-            .contributions
-            .iter()
-            .zip(goals.iter())
-            .map(|(contrib, goal)| contrib * goal.weight)
-            .sum();
-        let loss = adjust_loss(c.expected_loss);
-        if loss > 1e-15 {
-            weighted_contrib / loss
-        } else {
-            weighted_contrib * 1e10 // Free lunch: near-zero loss
-        }
-    };
-
-    eligible.sort_by(|a, b| {
-        scalarize(b.1)
-            .partial_cmp(&scalarize(a.1))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
     let mut selected = Vec::new();
     let mut remaining_targets: Vec<f64> = goals.iter().map(|g| g.target).collect();
+    let mut total_contributions = vec![0.0; goals.len()];
     let mut total_loss = 0.0;
+    let mut heap: BinaryHeap<_> = eligible
+        .iter()
+        .filter_map(|(index, candidate)| {
+            marginal_rank(
+                candidate,
+                adjust_loss(candidate.expected_loss),
+                goals,
+                remaining_targets.iter().copied(),
+                *index,
+                0,
+            )
+        })
+        .collect();
 
-    for (_, cand) in &eligible {
+    while let Some(rank) = heap.pop() {
         // Check if all goals are already met.
         if remaining_targets.iter().all(|t| *t <= 0.0) {
             break;
         }
-        if !cand
-            .contributions
-            .iter()
-            .zip(&remaining_targets)
-            .any(|(contribution, remaining)| *contribution > 0.0 && *remaining > 0.0)
+        let cand = &candidates[rank.index];
+        if rank.generation != selected.len() {
+            if let Some(updated) = marginal_rank(
+                cand,
+                adjust_loss(cand.expected_loss),
+                goals,
+                remaining_targets.iter().copied(),
+                rank.index,
+                selected.len(),
+            ) {
+                heap.push(updated);
+            }
+            continue;
+        }
+        // Keep the result finite and reviewable even for library callers with
+        // extreme inputs. Never count an action whose aggregate cannot be represented.
+        if !(total_loss + cand.expected_loss).is_finite()
+            || total_contributions
+                .iter()
+                .zip(&cand.contributions)
+                .any(|(total, value)| !(*total + value).is_finite())
         {
+            if include_alternatives || log_events.len() < ILP_SEARCH_LOG_LIMIT {
+                let mut event = OptimizationLogEvent::new("constraint_violation", algorithm_label);
+                event.candidate_id = Some(cand.id.clone());
+                event.note =
+                    Some("aggregate loss or contribution exceeds finite numeric capacity".into());
+                log_events.push(event);
+            }
             continue;
         }
 
@@ -348,7 +489,7 @@ fn optimize_greedy_internal(
             let mut eval = OptimizationLogEvent::new("objective_eval", algorithm_label);
             eval.candidate_id = Some(cand.id.clone());
             eval.loss = Some(cand.expected_loss);
-            eval.score = Some(scalarize(cand));
+            eval.score = Some(rank.log_efficiency);
             eval.total_contributions = cand.contributions.clone();
             log_events.push(eval);
         }
@@ -361,13 +502,10 @@ fn optimize_greedy_internal(
 
         total_loss += cand.expected_loss;
         for (i, contrib) in cand.contributions.iter().enumerate() {
-            remaining_targets[i] -= contrib;
+            total_contributions[i] += contrib;
+            remaining_targets[i] = (goals[i].target - total_contributions[i]).max(0.0);
         }
     }
-
-    let total_contributions: Vec<f64> = (0..goals.len())
-        .map(|i| goals[i].target - remaining_targets[i])
-        .collect();
 
     let goal_achievement: Vec<GoalAchievement> = goals
         .iter()
@@ -603,15 +741,24 @@ pub fn optimize_ilp(candidates: &[OptCandidate], goals: &[ResourceGoal]) -> Opti
     ));
     log_events.push(start_event);
 
-    if goals.len() != 1 || candidates.is_empty() {
+    if goals.len() != 1 || candidates.is_empty() || !valid_goal_inputs(goals) {
         return ilp_greedy_fallback(candidates, goals, "unsupported", log_events);
     }
+
+    record_invalid_candidates(
+        &mut log_events,
+        "ilp_branch_bound",
+        candidates
+            .iter()
+            .filter(|candidate| !valid_candidate_inputs(candidate, goals.len()))
+            .count(),
+    );
 
     let eligible: Vec<&OptCandidate> = candidates
         .iter()
         .filter(|c| {
             !c.blocked
-                && c.expected_loss >= 0.0
+                && valid_candidate_inputs(c, goals.len())
                 && c.contributions
                     .first()
                     .is_some_and(|contribution| *contribution > 0.0)
@@ -631,11 +778,7 @@ pub fn optimize_ilp(candidates: &[OptCandidate], goals: &[ResourceGoal]) -> Opti
 
     let target = goals[0].target;
     let mut ordered = eligible;
-    ordered.sort_by(|a, b| {
-        pareto_efficiency(b, goals)
-            .partial_cmp(&pareto_efficiency(a, goals))
-            .unwrap_or(Ordering::Equal)
-    });
+    ordered.sort_by_cached_key(|candidate| std::cmp::Reverse(pareto_efficiency(candidate, goals)));
 
     let n = ordered.len();
     let mut suffix_max = vec![0.0; n + 1];
@@ -1003,6 +1146,14 @@ fn generate_alternatives(
     let mut seen = HashSet::new();
 
     let mut push_unique = |alt: AlternativePlan| {
+        if !alt.total_loss.is_finite()
+            || alt
+                .goal_achievement
+                .iter()
+                .any(|goal| !goal.achieved.is_finite())
+        {
+            return;
+        }
         let key = alternative_key(&alt);
         if seen.insert(key) {
             alts.push(alt);
@@ -1118,11 +1269,8 @@ fn compute_pareto_frontier(
             PARETO_CANDIDATE_LIMIT
         ));
         log_events.push(event);
-        candidates.sort_by(|a, b| {
-            pareto_efficiency(b, goals)
-                .partial_cmp(&pareto_efficiency(a, goals))
-                .unwrap_or(Ordering::Equal)
-        });
+        candidates
+            .sort_by_cached_key(|candidate| std::cmp::Reverse(pareto_efficiency(candidate, goals)));
         candidates.truncate(PARETO_CANDIDATE_LIMIT);
     }
 
@@ -1150,6 +1298,9 @@ fn compute_pareto_frontier(
             }
         }
 
+        if !total_loss.is_finite() || totals.iter().any(|value| !value.is_finite()) {
+            continue;
+        }
         sets.push(ParetoSet {
             actions,
             total_loss,
@@ -1236,18 +1387,18 @@ struct ParetoSet {
     total_contributions: Vec<f64>,
 }
 
-fn pareto_efficiency(candidate: &OptCandidate, goals: &[ResourceGoal]) -> f64 {
-    let weighted: f64 = candidate
-        .contributions
-        .iter()
-        .zip(goals.iter())
-        .map(|(c, g)| c * g.weight)
-        .sum();
-    if candidate.expected_loss > 1e-12 {
-        weighted / candidate.expected_loss
-    } else {
-        weighted * 1e8
-    }
+fn pareto_efficiency(candidate: &OptCandidate, goals: &[ResourceGoal]) -> Option<GreedyRank> {
+    // Initial branch ordering and the bounded alternative shortlist use the
+    // same normalized, capped objective. Exact search still minimizes actual
+    // expected loss; this only determines which incumbent it discovers first.
+    marginal_rank(
+        candidate,
+        candidate.expected_loss,
+        goals,
+        goals.iter().map(|goal| goal.target),
+        0,
+        0,
+    )
 }
 
 fn pareto_dominates(a: &ParetoSet, b: &ParetoSet) -> bool {
@@ -1379,6 +1530,348 @@ mod tests {
             result.total_loss,
             candidates[0].expected_loss + candidates[2].expected_loss
         );
+    }
+
+    fn goal_candidate(id: &str, loss: f64, contributions: &[f64]) -> OptCandidate {
+        OptCandidate {
+            id: id.into(),
+            expected_loss: loss,
+            contributions: contributions.to_vec(),
+            blocked: false,
+            block_reason: None,
+        }
+    }
+
+    fn selected_ids(result: &OptimizationResult) -> Vec<&str> {
+        result
+            .selected
+            .iter()
+            .map(|action| action.id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn greedy_caps_overshoot_and_is_invariant_to_resource_units() {
+        // Raw contribution/loss chooses the enormous process at loss 10.
+        // Its excess RAM does not advance either requested goal beyond 100%.
+        for memory_unit in [1.0, 1024.0 * 1024.0, 1.0 / 1024.0] {
+            let goals = [
+                ResourceGoal {
+                    resource: "memory".into(),
+                    target: 1024.0 * memory_unit,
+                    weight: 1.0,
+                },
+                ResourceGoal {
+                    resource: "port_3000".into(),
+                    target: 1.0,
+                    weight: 1.0,
+                },
+            ];
+            let candidates = [
+                goal_candidate("memory", 1.0, &[1024.0 * memory_unit, 0.0]),
+                goal_candidate("listener", 2.0, &[0.0, 1.0]),
+                goal_candidate("enormous", 10.0, &[1e9 * memory_unit, 1.0]),
+            ];
+            let result = optimize_greedy(&candidates, &goals);
+            assert!(result.feasible);
+            assert_eq!(selected_ids(&result), ["memory", "listener"]);
+            assert_eq!(result.total_loss, 3.0);
+            assert_eq!(result.total_contributions, [1024.0 * memory_unit, 1.0]);
+        }
+    }
+
+    #[test]
+    fn greedy_recomputes_marginal_gain_after_each_selection() {
+        let goals = [
+            ResourceGoal {
+                resource: "memory_mb".into(),
+                target: 100.0,
+                weight: 1.0,
+            },
+            ResourceGoal {
+                resource: "fd_count".into(),
+                target: 100.0,
+                weight: 1.0,
+            },
+        ];
+        let candidates = [
+            goal_candidate("memory", 1.0, &[100.0, 10.0]),
+            goal_candidate("mixed", 2.0, &[90.0, 100.0]),
+            goal_candidate("descriptors", 1.1, &[0.0, 90.0]),
+        ];
+        // Initial normalized efficiencies: 1.1, 0.95, 0.9/1.1. After the
+        // memory action the mixed action drops to 0.45 and must be re-ranked.
+        let result = optimize_greedy(&candidates, &goals);
+        assert!(result.feasible);
+        assert_eq!(selected_ids(&result), ["memory", "descriptors"]);
+        assert_eq!(result.total_loss, 2.1);
+        assert_eq!(result.total_contributions, [100.0, 100.0]);
+    }
+
+    #[test]
+    fn greedy_preserves_weights_and_still_meets_zero_weight_constraints() {
+        let candidates = [
+            goal_candidate("first", 1.0, &[1.0, 0.0]),
+            goal_candidate("second", 1.0, &[0.0, 1.0]),
+        ];
+        for (weights, expected) in [
+            ([1.0, 4.0], ["second", "first"]),
+            ([0.0, 1.0], ["second", "first"]),
+            ([0.0, 0.0], ["first", "second"]),
+        ] {
+            let goals = [
+                ResourceGoal {
+                    resource: "first".into(),
+                    target: 1.0,
+                    weight: weights[0],
+                },
+                ResourceGoal {
+                    resource: "second".into(),
+                    target: 1.0,
+                    weight: weights[1],
+                },
+            ];
+            let result = optimize_greedy(&candidates, &goals);
+            assert!(result.feasible);
+            assert_eq!(selected_ids(&result), expected);
+        }
+    }
+
+    #[test]
+    fn greedy_ties_are_stable_and_true_zero_loss_is_preferred() {
+        let goals = [ResourceGoal {
+            resource: "fd_count".into(),
+            target: 1.0,
+            weight: 1.0,
+        }];
+        let mut candidates = vec![
+            goal_candidate("first", 1.0, &[1.0]),
+            goal_candidate("second", 1.0, &[1.0]),
+        ];
+        assert_eq!(
+            selected_ids(&optimize_greedy(&candidates, &goals)),
+            ["first"]
+        );
+        candidates.push(goal_candidate("free", 0.0, &[1.0]));
+        assert_eq!(
+            selected_ids(&optimize_greedy(&candidates, &goals)),
+            ["free"]
+        );
+        candidates[2].blocked = true;
+        assert_eq!(
+            selected_ids(&optimize_greedy(&candidates, &goals)),
+            ["first"]
+        );
+
+        let empty = optimize_greedy(&candidates, &[]);
+        assert!(empty.feasible);
+        assert!(empty.selected.is_empty());
+        assert!(empty.total_contributions.is_empty());
+        let zero = optimize_greedy(
+            &candidates,
+            &[ResourceGoal {
+                target: 0.0,
+                ..goals[0].clone()
+            }],
+        );
+        assert!(zero.feasible);
+        assert!(zero.selected.is_empty());
+        assert!(zero.alternatives.is_empty());
+    }
+
+    #[test]
+    fn greedy_rejects_malformed_candidates_and_goals_without_panicking() {
+        let goals = [ResourceGoal {
+            resource: "fd_count".into(),
+            target: 1.0,
+            weight: 1.0,
+        }];
+        let candidates = [
+            goal_candidate("nan_loss", f64::NAN, &[1.0]),
+            goal_candidate("infinite_loss", f64::INFINITY, &[1.0]),
+            goal_candidate("negative_loss", -1.0, &[1.0]),
+            goal_candidate("nan_contribution", 0.0, &[f64::NAN]),
+            goal_candidate("infinite_contribution", 0.0, &[f64::INFINITY]),
+            goal_candidate("negative_contribution", 0.0, &[-1.0]),
+            goal_candidate("short_vector", 0.0, &[]),
+            goal_candidate("long_vector", 0.0, &[1.0, 1.0]),
+            goal_candidate("valid", 1.0, &[1.0]),
+        ];
+        let result = optimize_greedy(&candidates, &goals);
+        assert!(result.feasible);
+        assert_eq!(selected_ids(&result), ["valid"]);
+        assert_eq!(result.total_loss, 1.0);
+        for result in [result, optimize_ilp(&candidates, &goals)] {
+            assert!(result.log_events.iter().any(|event| {
+                event.event == "invalid_input"
+                    && event
+                        .note
+                        .as_deref()
+                        .is_some_and(|note| note.starts_with("excluded_invalid_candidates=8:"))
+            }));
+            assert_eq!(selected_ids(&result), ["valid"]);
+        }
+
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+            for goal in [
+                ResourceGoal {
+                    target: bad,
+                    ..goals[0].clone()
+                },
+                ResourceGoal {
+                    weight: bad,
+                    ..goals[0].clone()
+                },
+            ] {
+                let result = optimize_greedy(&candidates, &[goal]);
+                assert!(!result.feasible);
+                assert!(result.selected.is_empty());
+                assert!(result.goal_achievement.is_empty());
+                assert!(result
+                    .log_events
+                    .iter()
+                    .any(|event| event.event == "invalid_input"));
+            }
+        }
+        let result = optimize_greedy_with_preferences(
+            &candidates,
+            &goals,
+            &PreferenceModel {
+                risk_tolerance: f64::NAN,
+                ..PreferenceModel::default()
+            },
+        );
+        assert!(!result.feasible);
+        assert!(result.selected.is_empty());
+    }
+
+    #[test]
+    fn greedy_log_ranking_retains_tiny_progress_and_finite_totals() {
+        let goals = [ResourceGoal {
+            resource: "memory".into(),
+            target: 1e300,
+            weight: 1e300,
+        }];
+        let candidates = [goal_candidate("tiny", 1e-300, &[1e-300])];
+        let result = optimize_greedy(&candidates, &goals);
+        assert!(!result.feasible);
+        assert_eq!(selected_ids(&result), ["tiny"]);
+        assert_eq!(result.total_contributions, [1e-300]);
+        assert!(result
+            .log_events
+            .iter()
+            .filter_map(|event| event.score)
+            .all(f64::is_finite));
+
+        let goals = [
+            ResourceGoal {
+                resource: "memory".into(),
+                target: f64::MAX,
+                weight: 1.0,
+            },
+            ResourceGoal {
+                resource: "fds".into(),
+                target: 2.0,
+                weight: 1.0,
+            },
+        ];
+        let candidates = [
+            goal_candidate("first", f64::MAX, &[f64::MAX, 1.0]),
+            goal_candidate("second", f64::MAX, &[f64::MAX, 1.0]),
+        ];
+        let result = optimize_greedy(&candidates, &goals);
+        assert!(!result.feasible);
+        assert_eq!(selected_ids(&result), ["first"]);
+        assert!(result.total_loss.is_finite());
+        assert!(result
+            .total_contributions
+            .iter()
+            .all(|value| value.is_finite()));
+        let json = serde_json::to_value(&result).unwrap();
+        assert!(json["total_loss"].is_number());
+        assert!(result
+            .alternatives
+            .iter()
+            .all(|alternative| alternative.total_loss.is_finite()));
+    }
+
+    #[test]
+    fn lazy_greedy_matches_eager_deficit_recalculation() {
+        // An independent, small O(N^2) reference evaluates ordinary arithmetic
+        // afresh after every action. Production uses logarithms and stale heap
+        // bounds; agreement checks that lazy invalidation never skips a winner.
+        let goals = [
+            ResourceGoal {
+                resource: "memory".into(),
+                target: 4000.0,
+                weight: 1.0,
+            },
+            ResourceGoal {
+                resource: "ports".into(),
+                target: 17.0,
+                weight: 2.0,
+            },
+            ResourceGoal {
+                resource: "fds".into(),
+                target: 300.0,
+                weight: 4.0,
+            },
+        ];
+        for seed in 0..12 {
+            let candidates: Vec<_> = (0..24)
+                .map(|i| {
+                    let mut candidate = goal_candidate(
+                        &format!("{i}"),
+                        ((i * 31 + seed * 7) % 97 + 1) as f64,
+                        &[
+                            ((i * 79 + seed * 17) % 700 + 1) as f64,
+                            ((i * 3 + seed * 5) % 8) as f64,
+                            ((i * 29 + seed * 13) % 100) as f64,
+                        ],
+                    );
+                    candidate.blocked = i % 13 == 0;
+                    candidate
+                })
+                .collect();
+            let mut remaining: Vec<_> = goals.iter().map(|goal| goal.target).collect();
+            let mut used = HashSet::new();
+            let mut expected = Vec::new();
+            while remaining.iter().any(|value| *value > 0.0) {
+                let mut best = None;
+                let mut best_score = 0.0;
+                for (index, candidate) in candidates.iter().enumerate() {
+                    if candidate.blocked || used.contains(&index) {
+                        continue;
+                    }
+                    let score = candidate
+                        .contributions
+                        .iter()
+                        .zip(&goals)
+                        .zip(&remaining)
+                        .map(|((value, goal), deficit)| {
+                            value.min(*deficit) / goal.target * goal.weight
+                        })
+                        .sum::<f64>()
+                        / candidate.expected_loss;
+                    if score > best_score {
+                        best = Some(index);
+                        best_score = score;
+                    }
+                }
+                let Some(index) = best else {
+                    break;
+                };
+                used.insert(index);
+                expected.push(candidates[index].id.as_str());
+                for (deficit, contribution) in
+                    remaining.iter_mut().zip(&candidates[index].contributions)
+                {
+                    *deficit = (*deficit - contribution).max(0.0);
+                }
+            }
+            let actual = optimize_greedy(&candidates, &goals);
+            assert_eq!(selected_ids(&actual), expected, "seed={seed}");
+        }
     }
 
     #[test]
@@ -2439,7 +2932,34 @@ mod tests {
             weight: 1.0,
         }];
         let eff = pareto_efficiency(&cand, &goals);
-        // Near-zero loss => efficiency = weighted * 1e8
-        assert!(eff > 1e6);
+        assert!(eff.is_some_and(|rank| rank.costless));
+        let costly = OptCandidate {
+            expected_loss: f64::MIN_POSITIVE,
+            ..cand
+        };
+        assert!(eff > pareto_efficiency(&costly, &goals));
+    }
+
+    #[test]
+    fn auxiliary_ranking_caps_progress_and_is_invariant_to_units() {
+        for unit in [1.0, 1024.0 * 1024.0, 1.0 / 1024.0] {
+            let goals = [
+                ResourceGoal {
+                    resource: "memory".into(),
+                    target: 1024.0 * unit,
+                    weight: 1.0,
+                },
+                ResourceGoal {
+                    resource: "port".into(),
+                    target: 1.0,
+                    weight: 1.0,
+                },
+            ];
+            let memory = goal_candidate("memory", 1.0, &[1024.0 * unit, 0.0]);
+            let listener = goal_candidate("listener", 2.0, &[0.0, 1.0]);
+            let enormous = goal_candidate("enormous", 10.0, &[1e9 * unit, 1.0]);
+            assert!(pareto_efficiency(&memory, &goals) > pareto_efficiency(&listener, &goals));
+            assert!(pareto_efficiency(&listener, &goals) > pareto_efficiency(&enormous, &goals));
+        }
     }
 }
