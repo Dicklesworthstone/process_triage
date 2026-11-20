@@ -17,8 +17,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
 };
-#[cfg(all(unix, not(target_os = "linux")))]
-use tracing::warn;
+#[cfg(target_os = "linux")]
 use tracing::{debug, info};
 
 /// Default nice value to apply (positive = lower priority).
@@ -64,7 +63,7 @@ pub struct ReniceReversalMetadata {
     /// Timestamp when renice was applied.
     pub applied_at: String,
 
-    /// Process incarnation captured with the thread priorities on Linux.
+    /// Original process incarnation, required for restoration on every platform.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<pt_common::ProcessIdentity>,
 
@@ -215,6 +214,9 @@ impl ReniceActionRunner {
     /// Current nice value via getpriority(2).
     #[cfg(target_os = "macos")]
     fn get_nice_value(&self, pid: u32) -> Option<i32> {
+        if pid <= 1 || pid > i32::MAX as u32 {
+            return None;
+        }
         // getpriority can legitimately return -1, so errors are told apart by errno.
         // SAFETY: plain libc calls on a pid; errno is thread-local.
         unsafe {
@@ -243,22 +245,13 @@ impl ReniceActionRunner {
     /// Capture the process-level priority on platforms with process-level nice semantics.
     #[cfg(all(unix, not(target_os = "linux")))]
     pub fn capture_reversal_metadata(&self, pid: u32) -> Option<ReniceReversalMetadata> {
-        let previous_nice = self.get_nice_value(pid)?;
-        let applied_nice = self.effective_nice_value();
-
-        debug!(
-            pid,
-            previous_nice, applied_nice, "capturing renice reversal metadata"
-        );
-
-        Some(ReniceReversalMetadata {
-            pid,
-            previous_nice,
-            applied_nice,
-            applied_at: chrono::Utc::now().to_rfc3339(),
-            identity: None,
-            threads: Vec::new(),
-        })
+        let target = process_priority::capture_identity(pid).ok()?;
+        process_priority::capture(
+            &process_priority::LiveProcess(self),
+            &target,
+            self.effective_nice_value(),
+        )
+        .ok()
     }
 
     #[cfg(not(unix))]
@@ -301,36 +294,7 @@ impl ReniceActionRunner {
         &self,
         metadata: &ReniceReversalMetadata,
     ) -> Result<(), ActionError> {
-        info!(
-            pid = metadata.pid,
-            previous_nice = metadata.previous_nice,
-            "restoring nice value from reversal metadata"
-        );
-
-        self.set_priority(metadata.pid, metadata.previous_nice)?;
-
-        // Verify restoration
-        if let Some(current) = self.get_nice_value(metadata.pid) {
-            if current != metadata.previous_nice {
-                warn!(
-                    pid = metadata.pid,
-                    expected = metadata.previous_nice,
-                    actual = current,
-                    "nice value restoration mismatch"
-                );
-                return Err(ActionError::Failed(format!(
-                    "nice value restoration mismatch: expected {}, got {}",
-                    metadata.previous_nice, current
-                )));
-            }
-        }
-
-        info!(
-            pid = metadata.pid,
-            nice = metadata.previous_nice,
-            "successfully restored nice value"
-        );
-        Ok(())
+        process_priority::restore(&process_priority::LiveProcess(self), metadata)
     }
 
     #[cfg(not(unix))]
@@ -378,38 +342,11 @@ impl ReniceActionRunner {
     /// Execute a process-level priority change on other Unix platforms.
     #[cfg(all(unix, not(target_os = "linux")))]
     fn execute_renice(&self, action: &PlanAction) -> Result<(), ActionError> {
-        let pid = action.target.pid.0;
-        let nice_value = self.effective_nice_value();
-
-        debug!(pid, nice_value, "executing renice action");
-
-        let previous = self.get_nice_value(pid);
-        // Capture previous nice value for logging (reversal metadata can be captured separately)
-        if self.config.capture_reversal {
-            if let Some(previous) = previous {
-                debug!(
-                    pid,
-                    previous_nice = previous,
-                    new_nice = nice_value,
-                    "renice: capturing prior state"
-                );
-            }
-        }
-
-        // Renice only ever LOWERS priority. A process already at or below the target
-        // priority (nice >= target) is left alone: setting the target would raise its
-        // priority, which is not what this action means and fails with EACCES for
-        // unprivileged users (observed on a host whose sessions run at nice -4 while
-        // pt ran under `nice`).
-        if previous.is_some_and(|p| p >= nice_value) {
-            info!(pid, previous_nice = ?previous, nice_value, "renice: already at or below target priority");
-            return Ok(());
-        }
-
-        self.set_priority(pid, nice_value)?;
-
-        info!(pid, nice_value, "renice action applied successfully");
-        Ok(())
+        process_priority::apply(
+            &process_priority::LiveProcess(self),
+            &action.target,
+            self.effective_nice_value(),
+        )
     }
 
     #[cfg(target_os = "linux")]
@@ -447,13 +384,11 @@ impl ReniceActionRunner {
     /// Verify a process-level priority change on other Unix platforms.
     #[cfg(all(unix, not(target_os = "linux")))]
     fn verify_renice(&self, action: &PlanAction) -> Result<(), ActionError> {
-        let pid = action.target.pid.0;
-        let expected = self.effective_nice_value();
-
-        // Give it a moment for the change to take effect
-        std::thread::sleep(std::time::Duration::from_millis(10));
-
-        Self::verify_observed_priority(self.get_nice_value(pid), expected)
+        process_priority::verify(
+            &process_priority::LiveProcess(self),
+            &action.target,
+            self.effective_nice_value(),
+        )
     }
 
     #[cfg(all(unix, any(not(target_os = "linux"), test)))]
@@ -476,6 +411,511 @@ pub(crate) fn validate_reversal_metadata(
     metadata: &ReniceReversalMetadata,
 ) -> Result<(), ActionError> {
     linux_threads::validate_saved(metadata)
+}
+
+/// Process-level nice semantics on macOS. Identity observations bracket each
+/// priority read and are repeated at the write boundary. Unlike Linux signals,
+/// setpriority has no pidfd form: these guards detect reuse and changes but do
+/// not make the identity/priority observations and the numeric-PID syscall
+/// atomic against process exit or another actor's concurrent adjustment.
+#[cfg(all(unix, any(not(target_os = "linux"), test)))]
+mod process_priority {
+    use super::*;
+    use pt_common::ProcessIdentity;
+
+    pub(super) trait ProcessOps {
+        fn revalidate(&self, target: &ProcessIdentity) -> Result<(), ActionError>;
+        fn read(&self, pid: u32) -> Result<i32, ActionError>;
+        fn set(&self, pid: u32, nice: i32) -> Result<(), ActionError>;
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(super) struct LiveProcess<'a>(pub &'a ReniceActionRunner);
+
+    #[cfg(not(target_os = "linux"))]
+    impl ProcessOps for LiveProcess<'_> {
+        fn revalidate(&self, target: &ProcessIdentity) -> Result<(), ActionError> {
+            #[cfg(target_os = "macos")]
+            {
+                use crate::action::executor::IdentityProvider;
+                if super::super::signal::LiveIdentityProvider::new().revalidate(target)? {
+                    Ok(())
+                } else {
+                    Err(ActionError::IdentityMismatch)
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = target;
+                Err(ActionError::Failed(
+                    "identity-bound renice is unsupported on this platform".into(),
+                ))
+            }
+        }
+
+        fn read(&self, pid: u32) -> Result<i32, ActionError> {
+            self.0.get_nice_value(pid).ok_or_else(|| {
+                ActionError::Failed("unable to observe original process priority".into())
+            })
+        }
+
+        fn set(&self, pid: u32, nice: i32) -> Result<(), ActionError> {
+            self.0.set_priority(pid, nice)
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn capture_identity(pid: u32) -> Result<ProcessIdentity, ActionError> {
+        if pid <= 1 || pid > i32::MAX as u32 {
+            return Err(ActionError::IdentityMismatch);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let before = crate::collect::macos::read_bsd_info(pid).ok_or_else(|| {
+                ActionError::Failed("cannot capture native process identity".into())
+            })?;
+            let stat = crate::collect::macos::read_session_stat(pid).ok_or_else(|| {
+                ActionError::Failed("cannot capture native process context".into())
+            })?;
+            let target = ProcessIdentity::full(
+                pid,
+                pt_common::StartId::from_macos("unknown", before.start_us, pid),
+                before.uid,
+                Some(u32::try_from(stat.pgrp).map_err(|_| ActionError::IdentityMismatch)?),
+                Some(u32::try_from(stat.session).map_err(|_| ActionError::IdentityMismatch)?),
+                pt_common::IdentityQuality::NoBootId,
+            );
+            if stat.starttime != before.start_us {
+                return Err(ActionError::IdentityMismatch);
+            }
+            validate_target(&target)?;
+            use crate::action::executor::IdentityProvider;
+            if !super::super::signal::LiveIdentityProvider::new().revalidate(&target)? {
+                return Err(ActionError::IdentityMismatch);
+            }
+            Ok(target)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(ActionError::Failed(
+                "native process identity capture is unsupported on this platform".into(),
+            ))
+        }
+    }
+
+    fn validate_target(target: &ProcessIdentity) -> Result<(), ActionError> {
+        let mut birth = target.start_id.0.split(':');
+        if target.pid.0 <= 1
+            || target.pid.0 > i32::MAX as u32
+            || !target.can_safely_revalidate()
+            || !birth.next().is_some_and(|boot| !boot.is_empty())
+            || !birth
+                .next()
+                .is_some_and(|start| start.parse::<u64>().is_ok_and(|start| start > 0))
+            || !birth
+                .next()
+                .is_some_and(|pid| pid.parse::<u32>() == Ok(target.pid.0))
+            || birth.next().is_some()
+            || target
+                .pgid
+                .is_some_and(|pgid| pgid == 0 || pgid > i32::MAX as u32)
+            || target
+                .sid
+                .is_some_and(|sid| sid == 0 || sid > i32::MAX as u32)
+        {
+            return Err(ActionError::IdentityMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_nice(nice: i32) -> Result<(), ActionError> {
+        if !(-20..=MAX_NICE_VALUE).contains(&nice) {
+            return Err(ActionError::Failed("invalid priority value".into()));
+        }
+        Ok(())
+    }
+
+    fn observe(ops: &impl ProcessOps, target: &ProcessIdentity) -> Result<i32, ActionError> {
+        validate_target(target)?;
+        ops.revalidate(target)?;
+        let nice = ops.read(target.pid.0)?;
+        validate_nice(nice)?;
+        ops.revalidate(target)?;
+        Ok(nice)
+    }
+
+    pub(super) fn capture(
+        ops: &impl ProcessOps,
+        target: &ProcessIdentity,
+        requested: i32,
+    ) -> Result<ReniceReversalMetadata, ActionError> {
+        validate_nice(requested)?;
+        let before = observe(ops, target)?;
+        if observe(ops, target)? != before {
+            return Err(ActionError::Failed(
+                "process priority changed during renice reversal capture".into(),
+            ));
+        }
+        Ok(ReniceReversalMetadata {
+            pid: target.pid.0,
+            previous_nice: before,
+            applied_nice: before.max(requested),
+            applied_at: chrono::Utc::now().to_rfc3339(),
+            identity: Some(target.clone()),
+            threads: Vec::new(),
+        })
+    }
+
+    pub(super) fn apply(
+        ops: &impl ProcessOps,
+        target: &ProcessIdentity,
+        requested: i32,
+    ) -> Result<(), ActionError> {
+        validate_nice(requested)?;
+        let previous = observe(ops, target)?;
+        // Lower priority only; an already lower priority is never raised.
+        if previous >= requested {
+            return Ok(());
+        }
+        ops.revalidate(target)?;
+        ops.set(target.pid.0, requested)?;
+        if observe(ops, target)? != requested {
+            return Err(ActionError::Failed(
+                "original process priority differs from the applied renice value".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn verify(
+        ops: &impl ProcessOps,
+        target: &ProcessIdentity,
+        requested: i32,
+    ) -> Result<(), ActionError> {
+        validate_nice(requested)?;
+        ReniceActionRunner::verify_observed_priority(Some(observe(ops, target)?), requested)
+    }
+
+    pub(super) fn restore(
+        ops: &impl ProcessOps,
+        metadata: &ReniceReversalMetadata,
+    ) -> Result<(), ActionError> {
+        let target = metadata.identity.as_ref().ok_or_else(|| {
+            ActionError::Failed("renice restoration requires the original process identity".into())
+        })?;
+        validate_target(target)?;
+        validate_nice(metadata.previous_nice)?;
+        validate_nice(metadata.applied_nice)?;
+        if target.pid.0 != metadata.pid
+            || !metadata.threads.is_empty()
+            || metadata.applied_nice < metadata.previous_nice
+        {
+            return Err(ActionError::Failed(
+                "invalid process-level renice metadata".into(),
+            ));
+        }
+        let current = observe(ops, target)?;
+        if current == metadata.previous_nice {
+            return Ok(());
+        }
+        if current != metadata.applied_nice {
+            return Err(ActionError::Failed(
+                "process priority changed after renice; refusing to overwrite another adjustment"
+                    .into(),
+            ));
+        }
+        ops.revalidate(target)?;
+        ops.set(target.pid.0, metadata.previous_nice)?;
+        if observe(ops, target)? != metadata.previous_nice {
+            return Err(ActionError::Failed(
+                "nice value restoration mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::cell::{Cell, RefCell};
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Fault {
+            None,
+            BirthOnRead,
+            OwnerOnRead,
+            GroupOnRead,
+            SessionOnRead,
+            BirthBeforeWrite,
+            BirthAfterWrite,
+            Unreadable,
+            UnreadableAfterWrite,
+            DeniedWrite,
+            IgnoredWrite,
+            PriorityOnSecondRead,
+        }
+
+        struct FakeProcess {
+            target: RefCell<ProcessIdentity>,
+            nice: Cell<i32>,
+            writes: RefCell<Vec<(u32, i32)>>,
+            checks: Cell<usize>,
+            reads: Cell<usize>,
+            fault: Fault,
+        }
+
+        impl FakeProcess {
+            fn target() -> ProcessIdentity {
+                ProcessIdentity::full(
+                    42,
+                    pt_common::StartId::from_macos("unknown", 1_800_000_000_000_000, 42),
+                    501,
+                    Some(40),
+                    Some(39),
+                    pt_common::IdentityQuality::NoBootId,
+                )
+            }
+
+            fn new(nice: i32, fault: Fault) -> Self {
+                Self {
+                    target: RefCell::new(Self::target()),
+                    nice: Cell::new(nice),
+                    writes: RefCell::new(Vec::new()),
+                    checks: Cell::new(0),
+                    reads: Cell::new(0),
+                    fault,
+                }
+            }
+
+            fn replace(&self) {
+                self.target.borrow_mut().start_id =
+                    pt_common::StartId::from_macos("unknown", 1_800_000_001_000_000, 42);
+            }
+        }
+
+        impl ProcessOps for FakeProcess {
+            fn revalidate(&self, target: &ProcessIdentity) -> Result<(), ActionError> {
+                self.checks.set(self.checks.get() + 1);
+                if self.fault == Fault::BirthBeforeWrite && self.checks.get() == 3 {
+                    self.replace();
+                }
+                if *self.target.borrow() == *target {
+                    Ok(())
+                } else {
+                    Err(ActionError::IdentityMismatch)
+                }
+            }
+
+            fn read(&self, pid: u32) -> Result<i32, ActionError> {
+                assert_eq!(pid, 42);
+                self.reads.set(self.reads.get() + 1);
+                match self.fault {
+                    Fault::BirthOnRead => self.replace(),
+                    Fault::OwnerOnRead => self.target.borrow_mut().uid += 1,
+                    Fault::GroupOnRead => self.target.borrow_mut().pgid = Some(99),
+                    Fault::SessionOnRead => self.target.borrow_mut().sid = Some(99),
+                    Fault::Unreadable => {
+                        return Err(ActionError::Failed("priority unavailable".into()));
+                    }
+                    Fault::UnreadableAfterWrite if !self.writes.borrow().is_empty() => {
+                        return Err(ActionError::Failed(
+                            "priority unavailable after write".into(),
+                        ));
+                    }
+                    Fault::PriorityOnSecondRead if self.reads.get() == 2 => {
+                        self.nice.set(self.nice.get() + 1);
+                    }
+                    _ => {}
+                }
+                Ok(self.nice.get())
+            }
+
+            fn set(&self, pid: u32, nice: i32) -> Result<(), ActionError> {
+                self.writes.borrow_mut().push((pid, nice));
+                if self.fault == Fault::DeniedWrite {
+                    return Err(ActionError::PermissionDenied);
+                }
+                if self.fault != Fault::IgnoredWrite {
+                    self.nice.set(nice);
+                }
+                if self.fault == Fault::BirthAfterWrite {
+                    self.replace();
+                }
+                Ok(())
+            }
+        }
+
+        #[test]
+        fn process_renice_applies_only_lower_priorities_and_captures_actual_values() {
+            for (previous, requested, applied, writes) in
+                [(0, 10, 10, 1), (15, 10, 15, 0), (-10, -5, -5, 1)]
+            {
+                let ops = FakeProcess::new(previous, Fault::None);
+                let target = FakeProcess::target();
+                let saved = capture(&ops, &target, requested).unwrap();
+                assert_eq!(saved.previous_nice, previous);
+                assert_eq!(saved.applied_nice, applied);
+                assert_eq!(saved.identity.as_ref(), Some(&target));
+                apply(&ops, &target, requested).unwrap();
+                verify(&ops, &target, requested).unwrap();
+                assert_eq!(ops.nice.get(), applied);
+                assert_eq!(ops.writes.borrow().len(), writes);
+            }
+        }
+
+        #[test]
+        fn process_renice_refuses_changed_or_missing_evidence_before_writing() {
+            for fault in [
+                Fault::BirthOnRead,
+                Fault::OwnerOnRead,
+                Fault::GroupOnRead,
+                Fault::SessionOnRead,
+                Fault::BirthBeforeWrite,
+                Fault::Unreadable,
+            ] {
+                let ops = FakeProcess::new(0, fault);
+                assert!(apply(&ops, &FakeProcess::target(), 10).is_err());
+                assert!(ops.writes.borrow().is_empty());
+                assert_eq!(ops.nice.get(), 0);
+            }
+            let ops = FakeProcess::new(0, Fault::PriorityOnSecondRead);
+            assert!(capture(&ops, &FakeProcess::target(), 10).is_err());
+            assert!(ops.writes.borrow().is_empty());
+        }
+
+        #[test]
+        fn process_renice_never_reports_success_without_original_effect_evidence() {
+            for fault in [
+                Fault::BirthAfterWrite,
+                Fault::UnreadableAfterWrite,
+                Fault::DeniedWrite,
+                Fault::IgnoredWrite,
+            ] {
+                let ops = FakeProcess::new(0, fault);
+                assert!(apply(&ops, &FakeProcess::target(), 10).is_err());
+                assert_eq!(ops.writes.borrow().as_slice(), &[(42, 10)]);
+            }
+            let ops = FakeProcess::new(15, Fault::BirthOnRead);
+            assert!(verify(&ops, &FakeProcess::target(), 10).is_err());
+            assert!(ops.writes.borrow().is_empty());
+            let ops = FakeProcess::new(15, Fault::Unreadable);
+            assert!(verify(&ops, &FakeProcess::target(), 10).is_err());
+        }
+
+        #[test]
+        fn process_renice_restoration_requires_identity_and_unchanged_owned_priority() {
+            let target = FakeProcess::target();
+            let saved = capture(&FakeProcess::new(0, Fault::None), &target, 10).unwrap();
+            let ops = FakeProcess::new(10, Fault::None);
+            restore(&ops, &saved).unwrap();
+            restore(&ops, &saved).unwrap();
+            assert_eq!(ops.nice.get(), 0);
+            assert_eq!(ops.writes.borrow().as_slice(), &[(42, 0)]);
+
+            let ops = FakeProcess::new(15, Fault::None);
+            assert!(restore(&ops, &saved).is_err());
+            assert!(ops.writes.borrow().is_empty());
+            for change in ["identity", "pid", "birth", "owner", "quality", "priority"] {
+                let ops = FakeProcess::new(10, Fault::None);
+                let mut changed = saved.clone();
+                match change {
+                    "identity" => changed.identity = None,
+                    "pid" => changed.pid = 43,
+                    "birth" => {
+                        changed.identity.as_mut().unwrap().start_id.0 = "unknown:2:42".into()
+                    }
+                    "owner" => changed.identity.as_mut().unwrap().uid += 1,
+                    "quality" => {
+                        changed.identity.as_mut().unwrap().quality =
+                            pt_common::IdentityQuality::PidOnly;
+                    }
+                    _ => changed.applied_nice = -1,
+                }
+                assert!(restore(&ops, &changed).is_err(), "{change}");
+                assert!(ops.writes.borrow().is_empty(), "{change}");
+            }
+            for fault in [Fault::Unreadable, Fault::BirthBeforeWrite] {
+                let ops = FakeProcess::new(10, fault);
+                assert!(restore(&ops, &saved).is_err());
+                assert!(ops.writes.borrow().is_empty());
+            }
+            for fault in [
+                Fault::UnreadableAfterWrite,
+                Fault::BirthAfterWrite,
+                Fault::IgnoredWrite,
+            ] {
+                let ops = FakeProcess::new(10, fault);
+                assert!(restore(&ops, &saved).is_err());
+                assert_eq!(ops.writes.borrow().as_slice(), &[(42, 0)]);
+            }
+        }
+
+        #[test]
+        fn process_renice_rejects_invalid_requests_before_observation_or_mutation() {
+            for pid in [0, 1, u32::MAX] {
+                let ops = FakeProcess::new(0, Fault::None);
+                let mut target = FakeProcess::target();
+                target.pid.0 = pid;
+                assert!(apply(&ops, &target, 10).is_err());
+                assert_eq!(ops.reads.get(), 0);
+                assert!(ops.writes.borrow().is_empty());
+            }
+            for nice in [i32::MIN, -21, 20, i32::MAX] {
+                let ops = FakeProcess::new(0, Fault::None);
+                assert!(apply(&ops, &FakeProcess::target(), nice).is_err());
+                assert_eq!(ops.reads.get(), 0);
+                assert!(ops.writes.borrow().is_empty());
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn macos_renice_preserves_native_identity_on_a_real_child() {
+            struct Child(std::process::Child);
+            impl Drop for Child {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+            let child = Child(
+                std::process::Command::new("sleep")
+                    .arg("60")
+                    .spawn()
+                    .unwrap(),
+            );
+            let runner = ReniceActionRunner::with_defaults();
+            let saved = runner.capture_reversal_metadata(child.0.id()).unwrap();
+            let target = saved.identity.as_ref().unwrap();
+            assert_eq!(target.pid.0, child.0.id());
+            assert!(target.pgid.is_some());
+            assert!(target.sid.is_some());
+            assert!(saved.threads.is_empty());
+            let ops = LiveProcess(&runner);
+
+            let mut stale = target.clone();
+            stale.uid ^= 1;
+            assert!(apply(&ops, &stale, DEFAULT_NICE_VALUE).is_err());
+            assert_eq!(observe(&ops, target).unwrap(), saved.previous_nice);
+            apply(&ops, target, DEFAULT_NICE_VALUE).unwrap();
+            verify(&ops, target, DEFAULT_NICE_VALUE).unwrap();
+            assert_eq!(observe(&ops, target).unwrap(), saved.applied_nice);
+
+            let mut wrong_receipt = saved.clone();
+            wrong_receipt.identity = Some(stale);
+            assert!(runner.restore_from_metadata(&wrong_receipt).is_err());
+            assert_eq!(observe(&ops, target).unwrap(), saved.applied_nice);
+            // A real priority increase can require privileges. Refusal is an
+            // honest result; it must not be silently reported as restored.
+            match runner.restore_from_metadata(&saved) {
+                Ok(()) => assert_eq!(observe(&ops, target).unwrap(), saved.previous_nice),
+                Err(ActionError::PermissionDenied) => {
+                    assert_eq!(observe(&ops, target).unwrap(), saved.applied_nice);
+                }
+                Err(error) => panic!("unexpected native restoration error: {error}"),
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
