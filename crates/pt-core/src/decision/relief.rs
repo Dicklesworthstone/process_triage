@@ -447,11 +447,25 @@ fn pressure_credit(
         if reduction < 0.0 {
             return Err("pressure_action_increases_resource_burden");
         }
+        let pause_io_credit = matches!(action, Action::Pause | Action::Freeze) && resource == "io";
         let supported_credit = action == Action::Kill
             || (action == Action::CapMemory && resource == "memory")
-            || (action != Action::CapMemory && resource == "cpu");
+            || (action != Action::CapMemory && resource == "cpu")
+            || pause_io_credit;
         if !supported_credit && reduction > 0.0 {
             return Err("unsupported_reversible_resource_credit");
+        }
+        if pause_io_credit && reduction > 0.0 {
+            // The pressure model permits a stop to reduce new I/O submissions
+            // only when the policy explicitly opts in. Retain that exact
+            // modeled fraction when selecting a remedy; a stop cannot inherit
+            // kill's full I/O credit or turn missing policy into permission.
+            let fraction = nonnegative(&report["model"]["pause_io_relief"])
+                .filter(|fraction| *fraction > 0.0 && *fraction <= 1.0)
+                .ok_or("missing_or_invalid_pause_io_relief")?;
+            if !approximately_equal(reduction, keep_cost * fraction) {
+                return Err("inconsistent_pause_io_relief");
+            }
         }
         if reduction > 0.0 {
             let observed = |value: &Value| {
@@ -495,6 +509,13 @@ fn pressure_credit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collect::ProcessState;
+    use crate::config::Policy;
+    use crate::decision::load_aware::{prepare_pressure_decision, PressureContext, ResourceShares};
+    use crate::decision::pressure_regime::ResourceSeverity;
+    use crate::decision::{ActionFeasibility, DisabledAction};
+    use crate::inference::ClassScores;
+    use crate::plan::{generate_plan, DecisionBundle, DecisionCandidate};
     use crate::plan::{ActionRationale, ActionTimeouts, GatesSummary};
     use serde_json::json;
 
@@ -637,6 +658,195 @@ mod tests {
         proposed["pressure_decision"]["evidence_only_action"] = json!("keep");
         action.memory_cap = Some(binding);
         (proposed, action)
+    }
+
+    /// Exercise the producer contract instead of synthesizing pressure costs.
+    fn io_pressure_remedy(
+        pid: u32,
+        stop: Action,
+        fraction: f64,
+        io_share: Option<f64>,
+        severity: f64,
+    ) -> (Value, Plan) {
+        let mut policy = Policy::default();
+        policy.load_aware.enabled = true;
+        policy.load_aware.pressure.pause_io_relief = fraction;
+        let feasibility = ActionFeasibility {
+            disabled: Action::ALL
+                .into_iter()
+                .filter(|action| *action != Action::Keep && *action != stop)
+                .map(|action| DisabledAction {
+                    action,
+                    reason: "only the observed stop capability is available".into(),
+                })
+                .collect(),
+        };
+        let prepared = prepare_pressure_decision(
+            &ClassScores {
+                useful: 0.0,
+                useful_bad: 1.0,
+                abandoned: 0.0,
+                zombie: 0.0,
+            },
+            &policy,
+            &feasibility,
+            &PressureContext {
+                severity: ResourceSeverity {
+                    io: severity,
+                    ..Default::default()
+                },
+                shares: ResourceShares {
+                    io: io_share,
+                    ..Default::default()
+                },
+                unavailable: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(prepared.report.evidence_only_action, Action::Keep);
+        assert!(!prepared.feasibility.is_allowed(Action::Kill));
+        assert!(!prepared.feasibility.is_allowed(Action::Restart));
+        let mut proposed = candidate(pid, prepared.decision.optimal_action, [0.0; 3], 0.0);
+        proposed["pressure_decision"] = serde_json::to_value(prepared.report).unwrap();
+        let executable = generate_plan(&DecisionBundle {
+            session_id: pt_common::SessionId("pt-20261120-120000-ioab".into()),
+            policy,
+            candidates: vec![DecisionCandidate {
+                identity: identity(pid),
+                ppid: Some(50),
+                decision: prepared.decision,
+                blocked_reasons: Vec::new(),
+                stage_pause_before_kill: false,
+                process_state: Some(ProcessState::Sleeping),
+                parent_identity: None,
+                d_state_diagnostics: None,
+                supervisor_restart: None,
+                memory_cap: None,
+            }],
+            generated_at: Some("2026-11-20T12:00:00Z".into()),
+        });
+        (proposed, executable)
+    }
+
+    #[test]
+    fn model_produced_io_stops_reach_relief_selection_before_termination() {
+        for stop in [Action::Pause, Action::Freeze] {
+            let (proposed, mut executable) = io_pressure_remedy(100, stop, 0.5, Some(0.8), 1.0);
+            assert_eq!(proposed["recommended_action"], json!(stop));
+            assert_eq!(executable.actions.len(), 1);
+            let original_id = executable.actions[0].action_id.clone();
+            let stop_only = select_relief_plan(
+                ReliefGoal::Io,
+                std::slice::from_ref(&proposed),
+                &executable,
+                None,
+            );
+            assert_eq!(stop_only.status, ReliefStatus::RemediesAvailable);
+            assert_eq!(stop_only.selected_pids, [100]);
+            assert!((stop_only.total_modeled_relief - 0.4).abs() < 1e-12);
+
+            // A stronger termination alternative must not displace the valid
+            // reversible tier merely because the requested resource is I/O.
+            executable.actions.push(plan_action(200, Action::Kill, 0));
+            let candidates = vec![proposed, candidate(200, Action::Kill, [0.0, 0.0, 2.0], 0.1)];
+            for goal in [ReliefGoal::Io, ReliefGoal::All] {
+                let result = select_relief_plan(goal, &candidates, &executable, None);
+                assert_eq!(result.status, ReliefStatus::RemediesAvailable);
+                assert_eq!(result.selected_tier, Some(ReliefTier::Pause));
+                assert_eq!(result.selected_pids, [100]);
+                assert_eq!(result.selected_action_ids, [original_id.clone()]);
+                assert_eq!(result.remediation_ladder[0].action, stop);
+                assert_eq!(result.remediation_ladder[0].target, identity(100));
+                assert!((result.total_modeled_relief - 0.4).abs() < 1e-12);
+                assert_eq!(result.alternatives.len(), 1);
+                assert_eq!(result.alternatives[0].tier, ReliefTier::Terminate);
+                assert!(result.alternatives[0].requires_new_plan);
+                assert_eq!(result.goal_achievable, None);
+            }
+            for goal in [ReliefGoal::Cpu, ReliefGoal::Memory] {
+                assert!(select_relief_plan(goal, &candidates, &executable, None)
+                    .selected_action_ids
+                    .is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn io_stop_credit_requires_the_recorded_opt_in_and_exact_modeled_fraction() {
+        for stop in [Action::Pause, Action::Freeze] {
+            let (valid, executable) = io_pressure_remedy(100, stop, 0.5, Some(0.8), 1.0);
+            for fraction in [
+                Value::Null,
+                json!(0.0),
+                json!(-0.1),
+                json!(1.1),
+                json!("0.5"),
+            ] {
+                let mut malformed = valid.clone();
+                malformed["pressure_decision"]["model"]["pause_io_relief"] = fraction;
+                let result = select_relief_plan(ReliefGoal::Io, &[malformed], &executable, None);
+                assert!(result.selected_action_ids.is_empty());
+                assert_eq!(
+                    result.excluded[0].reason,
+                    "missing_or_invalid_pause_io_relief"
+                );
+            }
+            let mut missing = valid.clone();
+            missing["pressure_decision"]["model"] = Value::Null;
+            let result = select_relief_plan(ReliefGoal::Io, &[missing], &executable, None);
+            assert!(result.selected_action_ids.is_empty());
+            assert_eq!(
+                result.excluded[0].reason,
+                "missing_or_invalid_pause_io_relief"
+            );
+
+            let mut mismatched = valid.clone();
+            mismatched["pressure_decision"]["model"]["pause_io_relief"] = json!(0.25);
+            let result = select_relief_plan(ReliefGoal::Io, &[mismatched], &executable, None);
+            assert!(result.selected_action_ids.is_empty());
+            assert_eq!(result.excluded[0].reason, "inconsistent_pause_io_relief");
+
+            for (path, replacement) in [
+                ("/pressure_decision/shares/io", Value::Null),
+                ("/pressure_decision/severity/io", json!(0.0)),
+                ("/policy/allowed", json!(false)),
+                ("/action_target/uid", json!(1001)),
+            ] {
+                let mut refused = valid.clone();
+                *refused.pointer_mut(path).unwrap() = replacement;
+                assert!(
+                    select_relief_plan(ReliefGoal::Io, &[refused], &executable, None)
+                        .selected_action_ids
+                        .is_empty(),
+                    "accepted {path}"
+                );
+            }
+            let mut blocked = executable;
+            blocked.actions[0].blocked = true;
+            assert!(select_relief_plan(ReliefGoal::Io, &[valid], &blocked, None)
+                .selected_action_ids
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn disabled_or_unobserved_io_relief_produces_no_executable_stop() {
+        for stop in [Action::Pause, Action::Freeze] {
+            for (fraction, share, severity) in [
+                (0.0, Some(0.8), 1.0),
+                (0.5, None, 1.0),
+                (0.5, Some(0.0), 1.0),
+                (0.5, Some(0.8), 0.0),
+            ] {
+                let (proposed, executable) =
+                    io_pressure_remedy(100, stop, fraction, share, severity);
+                assert_eq!(proposed["recommended_action"], "keep");
+                assert!(executable.actions.is_empty());
+                let result = select_relief_plan(ReliefGoal::Io, &[proposed], &executable, None);
+                assert_eq!(result.status, ReliefStatus::NoEligibleRemedies);
+                assert!(result.selected_action_ids.is_empty());
+            }
+        }
     }
 
     #[test]
