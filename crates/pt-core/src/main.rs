@@ -174,6 +174,9 @@ struct GlobalOpts {
     no_color: bool,
 
     /// Abort if operation exceeds time limit (seconds)
+    ///
+    /// Agent apply stops admitting new actions; already-started cleanup keeps
+    /// its approved grace and completes its execution receipts.
     #[arg(long, global = true)]
     timeout: Option<u64>,
 
@@ -3563,18 +3566,43 @@ fn action_uses_kill_budget(action: &PlanAction) -> bool {
             && action.routing == pt_core::plan::ActionRouting::Supervisor)
 }
 
+/// Share an absolute budget across successive scans without starting a new
+/// collector after expiry. Existing per-scan limits still apply when shorter.
+fn quick_scan_with_deadline(
+    options: &QuickScanOptions,
+    deadline: Option<std::time::Instant>,
+) -> Result<ScanResult, pt_core::collect::QuickScanError> {
+    let mut options = options.clone();
+    if let Some(deadline) = deadline {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(pt_core::collect::QuickScanError::Timeout(Duration::ZERO));
+        }
+        options.timeout = Some(
+            options
+                .timeout
+                .map_or(remaining, |limit| limit.min(remaining)),
+        );
+    }
+    quick_scan(&options)
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn check_execution_policy(
     enforcer: &pt_core::decision::PolicyEnforcer,
     action: &pt_core::plan::PlanAction,
     robot: bool,
+    deadline: Option<std::time::Instant>,
 ) -> Result<(pt_core::decision::PolicyCheckResult, ProcessRecord), String> {
-    let scan = quick_scan(&QuickScanOptions {
-        pids: vec![action.target.pid.0],
-        include_kernel_threads: false,
-        timeout: None,
-        progress: None,
-    })
+    let scan = quick_scan_with_deadline(
+        &QuickScanOptions {
+            pids: vec![action.target.pid.0],
+            include_kernel_threads: false,
+            timeout: None,
+            progress: None,
+        },
+        deadline,
+    )
     .map_err(|error| format!("cannot collect current policy evidence: {error}"))?;
     let proc = scan
         .processes
@@ -4461,6 +4489,7 @@ mod adaptive_term_grace_tests {
 fn capture_action_execution_evidence(
     action: &pt_core::plan::PlanAction,
     process: &ProcessRecord,
+    deadline: Option<std::time::Instant>,
 ) -> Result<serde_json::Value, String> {
     if process.pid != action.target.pid
         || process.uid != action.target.uid
@@ -4474,12 +4503,15 @@ fn capture_action_execution_evidence(
         return Err("kill command or parent evidence is unavailable".to_string());
     }
     let parent_identity = if action.action == pt_core::decision::Action::Kill {
-        let parents = quick_scan(&QuickScanOptions {
-            pids: vec![process.ppid.0],
-            include_kernel_threads: false,
-            timeout: Some(Duration::from_secs(5)),
-            progress: None,
-        })
+        let parents = quick_scan_with_deadline(
+            &QuickScanOptions {
+                pids: vec![process.ppid.0],
+                include_kernel_threads: false,
+                timeout: Some(Duration::from_secs(5)),
+                progress: None,
+            },
+            deadline,
+        )
         .map_err(|error| format!("cannot collect execution parent identity: {error}"))?;
         parents
             .processes
@@ -4513,20 +4545,24 @@ fn capture_action_execution_evidence(
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn capture_current_action_execution_evidence(
     action: &pt_core::plan::PlanAction,
+    deadline: Option<std::time::Instant>,
 ) -> Result<serde_json::Value, String> {
-    let scan = quick_scan(&QuickScanOptions {
-        pids: vec![action.target.pid.0],
-        include_kernel_threads: false,
-        timeout: Some(Duration::from_secs(5)),
-        progress: None,
-    })
+    let scan = quick_scan_with_deadline(
+        &QuickScanOptions {
+            pids: vec![action.target.pid.0],
+            include_kernel_threads: false,
+            timeout: Some(Duration::from_secs(5)),
+            progress: None,
+        },
+        deadline,
+    )
     .map_err(|error| format!("cannot refresh execution identity: {error}"))?;
     let process = scan
         .processes
         .iter()
         .find(|process| process.pid == action.target.pid)
         .ok_or("target disappeared before execution")?;
-    capture_action_execution_evidence(action, process)
+    capture_action_execution_evidence(action, process, deadline)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -4782,7 +4818,7 @@ struct RecordedActionRunner {
 #[cfg(all(feature = "ui", any(target_os = "linux", target_os = "macos")))]
 impl pt_core::action::ActionRunner for RecordedActionRunner {
     fn execute(&self, action: &PlanAction) -> Result<(), pt_core::action::ActionError> {
-        let evidence = capture_current_action_execution_evidence(action)
+        let evidence = capture_current_action_execution_evidence(action, None)
             .map_err(pt_core::action::ActionError::Failed)?;
         *self.evidence.borrow_mut() = Some(evidence);
         self.runner.execute(action)
@@ -5139,7 +5175,7 @@ fn execute_plan_actions(
             // Policy evidence (including current groups and process state)
             // must be collected after every possibly long cleanup barrier.
             if !action.blocked && action.action != Action::Keep {
-                let (check, _) = match check_execution_policy(enforcer, action, false) {
+                let (check, _) = match check_execution_policy(enforcer, action, false, None) {
                     Ok(check) => check,
                     Err(error) => {
                         finish_pending!(usize::MAX);
@@ -5177,7 +5213,7 @@ fn execute_plan_actions(
                     outcomes.push(refusal);
                     continue;
                 }
-                match capture_current_action_execution_evidence(action) {
+                match capture_current_action_execution_evidence(action, None) {
                     Ok(evidence) => Some(evidence),
                     Err(reason) => {
                         finish_pending!(usize::MAX);
@@ -33737,10 +33773,22 @@ fn goal_report_brief_json(report: &GoalProgressReport, planning_only: bool) -> s
 
 fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     let apply_started = std::time::Instant::now();
+    let apply_deadline = match global.timeout {
+        Some(seconds) => match apply_started.checked_add(Duration::from_secs(seconds)) {
+            Some(deadline) => Some(deadline),
+            None => {
+                eprintln!("agent apply: --timeout exceeds the supported clock range");
+                return ExitCode::ArgsError;
+            }
+        },
+        None => None,
+    };
+    let deadline_expired =
+        || apply_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline);
     let remaining_observation_budget = || {
-        global.timeout.map(|seconds| {
-            Duration::from_secs(seconds)
-                .saturating_sub(apply_started.elapsed())
+        apply_deadline.map(|deadline| {
+            deadline
+                .saturating_duration_since(std::time::Instant::now())
                 .as_millis()
                 .min(u128::from(u64::MAX)) as u64
         })
@@ -34017,14 +34065,20 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             .as_ref()
             .is_some_and(|policy| policy.guardrails.builtin_protection);
     if min_age > 0 && !target_pids.is_empty() {
+        if deadline_expired() {
+            return output_apply_timeout(global, &sid, execution_binding.as_ref());
+        }
         let scan_options = QuickScanOptions {
             pids: target_pids.clone(),
             include_kernel_threads: false,
-            timeout: global.timeout.map(std::time::Duration::from_secs),
+            timeout: None,
             progress: None,
         };
-        let scan_result = match quick_scan(&scan_options) {
+        let scan_result = match quick_scan_with_deadline(&scan_options, apply_deadline) {
             Ok(r) => r,
+            Err(pt_core::collect::QuickScanError::Timeout(_)) if deadline_expired() => {
+                return output_apply_timeout(global, &sid, execution_binding.as_ref());
+            }
             Err(e) => {
                 eprintln!("agent apply: min-age scan failed: {}", e);
                 return ExitCode::InternalError;
@@ -34069,12 +34123,15 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             .pointer("/args/include_kernel_threads")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
-        timeout: global.timeout.map(std::time::Duration::from_secs),
+        timeout: None,
         progress: None,
     };
 
-    let before_scan = match quick_scan(&goal_progress_scan_options) {
+    let before_scan = match quick_scan_with_deadline(&goal_progress_scan_options, apply_deadline) {
         Ok(scan) => scan,
+        Err(pt_core::collect::QuickScanError::Timeout(_)) if deadline_expired() => {
+            return output_apply_timeout(global, &sid, execution_binding.as_ref());
+        }
         Err(error) => {
             eprintln!("agent apply: cannot revalidate selected process tree: {error}");
             return ExitCode::InternalError;
@@ -34257,6 +34314,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     Some(&policy.guardrails),
                     LivePreCheckConfig::from(&policy.data_loss_gates),
                 )
+                .map(|provider| provider.with_deadline(apply_deadline))
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| eprintln!("agent apply: cannot configure safety checks: {error}"))
@@ -34350,6 +34408,11 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     let mut blocked_by_constraints = 0usize;
     let mut blocked_by_prechecks = 0usize;
     let mut resumed_skipped = 0usize;
+    let mut operation_timed_out = false;
+
+    if deadline_expired() {
+        return output_apply_timeout(global, &sid, execution_binding.as_ref());
+    }
 
     // Handle dry-run/shadow mode or execute
     if global.dry_run || global.shadow {
@@ -34478,6 +34541,13 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 continue;
             }
 
+            if deadline_expired() {
+                operation_timed_out = true;
+                failed += 1;
+                checkpoint_outcome!(apply_timeout_outcome(action, apply_started.elapsed()));
+                break;
+            }
+
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             {
                 let refusal = match preview_identity.revalidate(&action.target) {
@@ -34530,7 +34600,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             }
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             let (policy_check, current_process) =
-                match check_execution_policy(&preview_enforcer, action, true) {
+                match check_execution_policy(&preview_enforcer, action, true, apply_deadline) {
                     Ok(check) => check,
                     Err(error) => {
                         blocked_by_prechecks += 1;
@@ -34706,6 +34776,13 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 continue;
             }
 
+            if deadline_expired() {
+                operation_timed_out = true;
+                failed += 1;
+                checkpoint_outcome!(apply_timeout_outcome(action, apply_started.elapsed()));
+                break;
+            }
+
             // Forecast the next admission after each permitted destructive
             // action. The preview limiter has no persistence path, and these
             // constraint counters belong only to this invocation. No signal,
@@ -34734,6 +34811,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 "action_id": action.action_id,
                 "pid": action.target.pid.0,
                 "status": if global.dry_run { "dry_run" } else { "shadow" },
+                "requested_action": action.action,
                 "current_rss_bytes": current_rss_bytes,
             }));
             emit_action_event(
@@ -34807,6 +34885,9 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             }
             // Preview modes never enter an execution phase. Real execution
             // publishes this state under the lock held through final persistence.
+            if deadline_expired() {
+                return output_apply_timeout(global, &sid, execution_binding.as_ref());
+            }
             if let Err(error) = handle.update_state(SessionState::Executing) {
                 eprintln!("agent apply: cannot persist execution state before actuation: {error}");
                 return ExitCode::IoError;
@@ -35022,13 +35103,20 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 }
 
                 let start = std::time::Instant::now();
+                if deadline_expired() {
+                    operation_timed_out = true;
+                    failed += 1;
+                    checkpoint_outcome!(apply_timeout_outcome(action, start.elapsed()));
+                    break;
+                }
                 let mut ancestors = None;
                 let mut tree_reason = tree_refusals.get(&action.target.pid.0).cloned();
                 if action_uses_kill_budget(action) && tree_reason.is_none() {
                     // A selected child's action may have failed, or a new child
                     // may have appeared. Refuse the parent while any live child
                     // remains, even if that child was in the original kill set.
-                    let mut tree_scan = quick_scan(&goal_progress_scan_options);
+                    let mut tree_scan =
+                        quick_scan_with_deadline(&goal_progress_scan_options, apply_deadline);
                     let current_ancestors = tree_scan
                         .as_ref()
                         .ok()
@@ -35040,7 +35128,8 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                         }
                         // A parent must observe whether the child's cleanup
                         // actually completed before its own safety decision.
-                        tree_scan = quick_scan(&goal_progress_scan_options);
+                        tree_scan =
+                            quick_scan_with_deadline(&goal_progress_scan_options, apply_deadline);
                     }
                     let current_tree = match tree_scan {
                         Ok(scan) if scan.metadata.warnings.is_empty() => scan.processes,
@@ -35053,6 +35142,12 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                                 "error": "incomplete process-tree snapshot",
                                 "warnings": scan.metadata.warnings,
                             }));
+                            break;
+                        }
+                        Err(pt_core::collect::QuickScanError::Timeout(_)) if deadline_expired() => {
+                            operation_timed_out = true;
+                            failed += 1;
+                            checkpoint_outcome!(apply_timeout_outcome(action, start.elapsed()));
                             break;
                         }
                         Err(error) => {
@@ -35101,6 +35196,12 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     && pt_core::action::signal::PendingSignalKill::supports(action)
                     && ancestors.is_some();
                 if !parallel && finish_pending!(usize::MAX) {
+                    break;
+                }
+                if deadline_expired() {
+                    operation_timed_out = true;
+                    failed += 1;
+                    checkpoint_outcome!(apply_timeout_outcome(action, start.elapsed()));
                     break;
                 }
                 if let Err(reason) =
@@ -35191,7 +35292,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     continue;
                 }
                 let (policy_check, current_process) =
-                    match check_execution_policy(&enforcer, action, true) {
+                    match check_execution_policy(&enforcer, action, true, apply_deadline) {
                         Ok(check) => check,
                         Err(error) => {
                             blocked_by_prechecks += 1;
@@ -35306,6 +35407,13 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     continue;
                 }
 
+                if deadline_expired() {
+                    operation_timed_out = true;
+                    failed += 1;
+                    checkpoint_outcome!(apply_timeout_outcome(action, start.elapsed()));
+                    break;
+                }
+
                 if action_uses_kill_budget(action) {
                     if let Err(error) = enforcer.begin_kill_accounting() {
                         accounting_error = Some(error.to_string());
@@ -35320,32 +35428,48 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                         break;
                     }
                 }
-                let mut execution_evidence = match capture_current_action_execution_evidence(action)
-                {
-                    Ok(evidence) => evidence,
-                    Err(error) => {
-                        if action_uses_kill_budget(action) {
-                            if let Err(error) = enforcer.finish_kill_accounting(false) {
-                                accounting_error = Some(error.to_string());
+                let mut execution_evidence =
+                    match capture_current_action_execution_evidence(action, apply_deadline) {
+                        Ok(evidence) => evidence,
+                        Err(error) => {
+                            if action_uses_kill_budget(action) {
+                                if let Err(error) = enforcer.finish_kill_accounting(false) {
+                                    accounting_error = Some(error.to_string());
+                                }
                             }
+                            blocked_by_prechecks += 1;
+                            checkpoint_outcome!(serde_json::json!({
+                                "action_id": action.action_id,
+                                "pid": action.target.pid.0,
+                                "status": "precheck_blocked",
+                                "check": "verify_identity",
+                                "reason": error,
+                                "accounting_error": accounting_error,
+                            }));
+                            if args.abort_on_unknown || accounting_error.is_some() {
+                                break;
+                            }
+                            continue;
                         }
-                        blocked_by_prechecks += 1;
-                        checkpoint_outcome!(serde_json::json!({
-                            "action_id": action.action_id,
-                            "pid": action.target.pid.0,
-                            "status": "precheck_blocked",
-                            "check": "verify_identity",
-                            "reason": error,
-                            "accounting_error": accounting_error,
-                        }));
-                        if args.abort_on_unknown || accounting_error.is_some() {
-                            break;
-                        }
-                        continue;
-                    }
-                };
+                    };
                 execution_evidence["resource_run_id"] =
                     serde_json::json!(resource_run.as_ref().map(|run| &run.run_id));
+                if deadline_expired() {
+                    // No worker or synchronous runner has started. Clear only
+                    // this unconsumed intent; earlier delivery receipts and
+                    // charges stay intact while checkpointing joins workers.
+                    if action_uses_kill_budget(action) {
+                        if let Err(error) = enforcer.finish_kill_accounting(false) {
+                            accounting_error = Some(error.to_string());
+                        }
+                    }
+                    operation_timed_out = true;
+                    failed += 1;
+                    let mut outcome = apply_timeout_outcome(action, start.elapsed());
+                    outcome["accounting_error"] = serde_json::json!(accounting_error);
+                    checkpoint_outcome!(outcome);
+                    break;
+                }
                 if parallel {
                     let preflight_ms = start.elapsed().as_millis();
                     let worker = match pt_core::action::signal::PendingSignalKill::start(action) {
@@ -35590,7 +35714,8 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 });
         }
     }
-    let after_scan = quick_scan(&goal_progress_scan_options);
+    let after_scan = quick_scan_with_deadline(&goal_progress_scan_options, apply_deadline);
+    operation_timed_out |= deadline_expired();
     let after_scan_error = match &after_scan {
         Ok(scan) if scan.metadata.warnings.is_empty() => None,
         Ok(scan) => Some(format!(
@@ -35894,6 +36019,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         eprintln!("agent apply: cannot save goal observations: {error}; measurements remain in this response");
     }
     let final_state = if failed > 0
+        || operation_timed_out
         || accounting_error.is_some()
         || goal_evidence_error.is_some()
         || persistence_error.is_some()
@@ -35925,6 +36051,8 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         },
         "outcomes": outcomes,
         "max_parallel_kills": max_parallel_kills,
+        "operation_timed_out": operation_timed_out,
+        "timeout_seconds": global.timeout,
         "accounting_error": accounting_error,
         "persistence_error": persistence_error,
         "session_state_error": session_state_error,
@@ -35954,6 +36082,8 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         OutputFormat::Json | OutputFormat::Toon => {
             println!("{}", format_structured_output(global, result));
         }
+        OutputFormat::Jsonl => println!("{}", global.process_output_value(result)),
+        OutputFormat::Exitcode => {}
         OutputFormat::Summary => {
             if resumed_skipped > 0 {
                 println!(
@@ -35978,6 +36108,9 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     blocked_by_prechecks,
                     memory_summary_suffix
                 );
+            }
+            if operation_timed_out {
+                println!("Operation timeout reached; no later actions were admitted. Started actions retained their approved completion windows.");
             }
         }
         _ => {
@@ -36008,6 +36141,8 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         || !respawn_history_update.errors.is_empty()
     {
         ExitCode::IoError
+    } else if operation_timed_out {
+        ExitCode::TimeoutError
     } else if (blocked_by_constraints + blocked_by_prechecks) > 0 && succeeded == 0 && failed == 0 {
         ExitCode::PolicyBlocked
     } else if failed > 0 || accounting_error.is_some() || goal_evidence_error.is_some() {
@@ -36015,6 +36150,49 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     } else {
         ExitCode::ActionsOk
     }
+}
+
+fn apply_timeout_outcome(action: &PlanAction, elapsed: Duration) -> serde_json::Value {
+    // Requested work must not masquerade as execution evidence. In particular,
+    // do not attach `action` or `executed_at` until a runner has been admitted.
+    serde_json::json!({
+        "action_id": action.action_id,
+        "pid": action.target.pid.0,
+        "requested_action": action.action,
+        "status": "timeout",
+        "reason": "operation_timeout",
+        "error": "operation deadline expired before action admission",
+        "kill_signal_delivered": false,
+        "time_ms": elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
+    })
+}
+
+fn output_apply_timeout(
+    global: &GlobalOpts,
+    sid: &SessionId,
+    binding: Option<&ApplyBindingReceipt>,
+) -> ExitCode {
+    let mut result = apply_refusal_document(
+        sid,
+        "operation_timeout",
+        "operation deadline expired before action admission",
+        binding,
+    );
+    result["mode"] = serde_json::json!("robot_apply");
+    result["status"] = serde_json::json!("timeout");
+    result["operation_timed_out"] = serde_json::json!(true);
+    result["timeout_seconds"] = serde_json::json!(global.timeout);
+    result["summary"] = serde_json::json!({"attempted": 0});
+    result["outcomes"] = serde_json::json!([]);
+    match global.format {
+        OutputFormat::Json | OutputFormat::Toon => {
+            println!("{}", format_structured_output(global, result));
+        }
+        OutputFormat::Jsonl => println!("{}", global.process_output_value(result)),
+        OutputFormat::Exitcode => {}
+        _ => println!("[{}] apply: operation timeout before action admission", sid),
+    }
+    ExitCode::TimeoutError
 }
 
 fn apply_refusal_document(

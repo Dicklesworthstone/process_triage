@@ -4882,6 +4882,292 @@ fn agent_apply_zombie_route_reaps_via_sigchld() {
     assert!(parent.alive(), "the parent must not be harmed");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn agent_apply_zero_timeout_refuses_before_mutation_or_budget_charge() {
+    let data_dir = TempDir::new().unwrap();
+    let config_dir = TempDir::new().unwrap();
+    write_test_policy(config_dir.path());
+    let victim = ForeignTarget::spawn("sleep 381");
+    let identity = live_identity(victim.pid);
+    let original_nice = nice_of(victim.pid).unwrap();
+    let target = format!("{}:{}", victim.pid, identity.start_id.0);
+    let session = session_with_plan(data_dir.path(), plan_action(Action::Renice, &identity));
+
+    for (format, preview) in [("json", false), ("json", true), ("jsonl", false)] {
+        let mut args = vec![
+            "--format",
+            format,
+            "--timeout",
+            "0",
+            "agent",
+            "apply",
+            "--session",
+            &session,
+            "--targets",
+            &target,
+            "--yes",
+            "--settle",
+            "0",
+        ];
+        if preview {
+            args.push("--dry-run");
+        }
+        let (code, result) = recorded_action_command(
+            data_dir.path(),
+            config_dir.path(),
+            &session,
+            if preview {
+                "timeout-zero-preview"
+            } else if format == "jsonl" {
+                "timeout-zero-jsonl"
+            } else {
+                "timeout-zero"
+            },
+            &args,
+        );
+        assert_eq!(code, Some(22), "{result}");
+        assert_eq!(result["status"], "timeout", "{result}");
+        assert_eq!(result["operation_timed_out"], true);
+        assert_eq!(result["summary"]["attempted"], 0);
+        assert!(result["outcomes"].as_array().unwrap().is_empty());
+        assert_eq!(nice_of(victim.pid), Some(original_nice));
+        assert_eq!(live_identity(victim.pid), identity);
+        assert!(!data_dir.path().join("rate_limit.json").exists());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn agent_apply_deadline_preserves_an_observed_missing_target_failure() {
+    let data_dir = TempDir::new().unwrap();
+    let config_dir = TempDir::new().unwrap();
+    write_test_policy(config_dir.path());
+    let victim = ForeignTarget::spawn("sleep 384");
+    let identity = live_identity(victim.pid);
+    let target = format!("{}:{}", victim.pid, identity.start_id.0);
+    let session = session_with_plan(data_dir.path(), plan_action(Action::Renice, &identity));
+    drop(victim);
+    let (code, result) = recorded_action_command(
+        data_dir.path(),
+        config_dir.path(),
+        &session,
+        "timeout-missing-target",
+        &[
+            "--format",
+            "json",
+            "--timeout",
+            "10",
+            "agent",
+            "apply",
+            "--session",
+            &session,
+            "--targets",
+            &target,
+            "--yes",
+            "--settle",
+            "0",
+        ],
+    );
+    assert_eq!(code, Some(3), "{result}");
+    assert_eq!(result["operation_timed_out"], false);
+    assert!(
+        matches!(
+            result["outcomes"][0]["status"].as_str(),
+            Some("identity_mismatch" | "identity_check_failed")
+        ),
+        "{result}"
+    );
+    assert!(!data_dir.path().join("rate_limit.json").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn agent_apply_timeout_cannot_shorten_required_recent_io_observation() {
+    let data_dir = TempDir::new().unwrap();
+    let config_dir = TempDir::new().unwrap();
+    write_test_policy(config_dir.path());
+    let victim = ForeignTarget::spawn("sleep 382");
+    let identity = live_identity(victim.pid);
+    let target = format!("{}:{}", victim.pid, identity.start_id.0);
+    let session = session_with_plan(data_dir.path(), plan_action(Action::Kill, &identity));
+    let started = std::time::Instant::now();
+    let (code, result) = recorded_action_command(
+        data_dir.path(),
+        config_dir.path(),
+        &session,
+        "timeout-full-io-window",
+        &[
+            "--format",
+            "json",
+            "--timeout",
+            "10",
+            "agent",
+            "apply",
+            "--session",
+            &session,
+            "--targets",
+            &target,
+            "--yes",
+            "--settle",
+            "0",
+        ],
+    );
+    assert!(started.elapsed() < Duration::from_secs(10));
+    // The budget has not expired: this is missing full safety evidence, not a
+    // fabricated observation of inactivity and not an elapsed-time failure.
+    assert_eq!(code, Some(4), "{result}");
+    assert_eq!(result["operation_timed_out"], false);
+    assert_eq!(result["outcomes"][0]["status"], "precheck_blocked");
+    assert!(
+        result["outcomes"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("complete 60s"),
+        "{result}"
+    );
+    assert!(victim.alive());
+    assert_eq!(live_identity(victim.pid), identity);
+    assert!(!data_dir.path().join("rate_limit.json").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn agent_apply_deadline_preserves_started_grace_and_blocks_later_admission() {
+    let data_dir = TempDir::new().unwrap();
+    let config_dir = TempDir::new().unwrap();
+    write_test_policy(config_dir.path());
+    let policy_path = config_dir.path().join("policy.json");
+    let mut policy: Policy = serde_json::from_slice(&fs::read(&policy_path).unwrap()).unwrap();
+    policy.data_loss_gates.block_if_recent_io_seconds = Some(1);
+    policy.signal.term_grace_ms = 10_000;
+    policy.signal.max_parallel_kills = 2;
+    fs::write(&policy_path, serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+
+    // A caught TERM, unlike SIG_IGN, must receive its entire approved cleanup
+    // interval. The handler creates no child and performs no further I/O.
+    let script = data_dir.path().join("owned-timeout-cleanup.py");
+    fs::write(
+        &script,
+        "import signal, sys, time\nfrom pathlib import Path\nsignal.signal(signal.SIGTERM, lambda *_: None)\nPath(sys.argv[1]).write_text('READY')\nwhile True:\n time.sleep(1)\n",
+    )
+    .unwrap();
+    let shell_quote = |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
+    let mut targets = Vec::new();
+    let mut actions = Vec::new();
+    let mut owned = Vec::new();
+    for i in 0..2 {
+        let ready = data_dir.path().join(format!("cleanup-{i}.ready"));
+        let child = ForeignTarget::spawn(&format!(
+            "python3 {} {}",
+            shell_quote(&script),
+            shell_quote(&ready),
+        ));
+        let waiting = std::time::Instant::now();
+        while !ready.exists() {
+            assert!(
+                child.alive(),
+                "owned cleanup target exited before readiness"
+            );
+            assert!(waiting.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let identity = live_identity(child.pid);
+        targets.push(format!("{}:{}", child.pid, identity.start_id.0));
+        let mut action = plan_action(Action::Kill, &identity);
+        action.action_id = format!("deadline-started-{i}");
+        action.order = i;
+        action.timeouts.term_grace_ms = Some(10_000);
+        action.timeouts.execute_ms = 15_000;
+        actions.push(action);
+        owned.push(child);
+    }
+    let later = ForeignTarget::spawn("sleep 383");
+    let later_identity = live_identity(later.pid);
+    targets.push(format!("{}:{}", later.pid, later_identity.start_id.0));
+    let mut later_action = plan_action(Action::Kill, &later_identity);
+    later_action.action_id = "deadline-not-admitted".to_string();
+    later_action.order = 2;
+    actions.push(later_action);
+    let session = session_with_actions(data_dir.path(), actions);
+    let targets = targets.join(",");
+    let started = std::time::Instant::now();
+    let (code, result) = recorded_action_command(
+        data_dir.path(),
+        config_dir.path(),
+        &session,
+        "timeout-started-cleanup",
+        &[
+            "--format",
+            "json",
+            "--timeout",
+            "8",
+            "agent",
+            "apply",
+            "--session",
+            &session,
+            "--targets",
+            &targets,
+            "--yes",
+            "--settle",
+            "0",
+        ],
+    );
+    assert_eq!(code, Some(22), "{result}");
+    assert!(started.elapsed() >= Duration::from_secs(10));
+    assert_eq!(result["operation_timed_out"], true);
+    assert_eq!(result["summary"]["succeeded"], 2, "{result}");
+    let outcomes = result["outcomes"].as_array().unwrap();
+    assert_eq!(outcomes.len(), 3, "{result}");
+    for (i, child) in owned.iter().enumerate() {
+        let outcome = &outcomes[i];
+        assert_eq!(outcome["pid"], child.pid);
+        assert_eq!(outcome["status"], "success", "{outcome}");
+        assert_eq!(outcome["kill_signal_delivered"], true);
+        assert_eq!(outcome["signal_outcome"]["configured_grace_ms"], 10_000);
+        assert!(
+            outcome["signal_outcome"]["observed_grace_ms"]
+                .as_u64()
+                .unwrap()
+                >= 10_000
+        );
+        assert!(!child.alive(), "already-started cleanup must finish");
+    }
+    assert_eq!(outcomes[2]["status"], "timeout");
+    assert_eq!(outcomes[2]["requested_action"], "kill");
+    assert_eq!(outcomes[2]["kill_signal_delivered"], false);
+    assert!(outcomes[2].get("executed_at").is_none());
+    assert!(outcomes[2].get("action").is_none());
+    assert!(
+        later.alive(),
+        "expired operation must not signal another target"
+    );
+    assert_eq!(live_identity(later.pid), later_identity);
+
+    let budget: Value =
+        serde_json::from_slice(&fs::read(data_dir.path().join("rate_limit.json")).unwrap())
+            .unwrap();
+    assert_eq!(budget["kill_timestamps"].as_array().unwrap().len(), 2);
+    assert_eq!(budget["pending_kill_intent"], false);
+    let handle = SessionStore::at_data_dir(data_dir.path())
+        .open(&SessionId::parse(&session).unwrap())
+        .unwrap();
+    let persisted: Vec<Value> = fs::read_to_string(handle.dir.join("action/outcomes.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(persisted.len(), 3);
+    for (saved, actual) in persisted.iter().zip(outcomes) {
+        assert_eq!(saved["action_id"], actual["action_id"]);
+        assert_eq!(saved["status"], actual["status"]);
+        assert_eq!(
+            saved["kill_signal_delivered"],
+            actual["kill_signal_delivered"]
+        );
+    }
+}
+
 /// The recent-I/O data-loss probe runs once for all targets (it slept the full
 /// 60 s window per target), and still blocks a process that writes periodically.
 #[cfg(target_os = "linux")]

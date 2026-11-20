@@ -25,9 +25,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashSet;
 use std::fmt;
-use std::time::Duration;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, trace};
 
@@ -425,6 +423,12 @@ impl fmt::Display for SupervisorInfo {
 /// All checks read current process state from /proc for TOCTOU safety.
 /// This ensures we validate the process as it exists now, not when the decision was made.
 pub trait PreCheckProvider {
+    /// Optional operation deadline for live safety observations. An expired
+    /// budget refuses the action; it never shortens a required evidence window.
+    fn operation_deadline(&self) -> Option<Instant> {
+        None
+    }
+
     /// Check if a process is protected (should never be killed).
     ///
     /// Reads comm, cmd, user from /proc to validate current state.
@@ -498,7 +502,11 @@ pub trait PreCheckProvider {
         // A stale or edited plan can list data-loss probes ahead of protection.
         // Do not touch their filesystem targets until infrastructure is checked.
         if checks.contains(&PreCheck::CheckNotProtected) {
-            let result = self.check_not_protected_for_action(pid, action);
+            let result = precheck_with_deadline(
+                self.operation_deadline(),
+                PreCheck::CheckNotProtected,
+                || self.check_not_protected_for_action(pid, action),
+            );
             let blocked = !result.is_passed();
             results.push(result);
             if blocked {
@@ -506,15 +514,22 @@ pub trait PreCheckProvider {
             }
         }
         for check in checks {
-            let result = match check {
-                // Identity is handled by IdentityProvider; protection ran above.
-                PreCheck::VerifyIdentity | PreCheck::CheckNotProtected => continue,
-                PreCheck::CheckDataLossGate => self.check_data_loss(pid),
-                PreCheck::CheckSupervisor => self.check_supervisor(pid),
-                PreCheck::CheckAgentSupervision => self.check_agent_supervision(pid),
-                PreCheck::CheckSessionSafety => self.check_session_safety(pid, sid),
-                PreCheck::VerifyProcessState => self.check_process_state(pid),
-            };
+            // Identity is handled by IdentityProvider; protection ran above.
+            if matches!(
+                check,
+                PreCheck::VerifyIdentity | PreCheck::CheckNotProtected
+            ) {
+                continue;
+            }
+            let result =
+                precheck_with_deadline(self.operation_deadline(), check.clone(), || match check {
+                    PreCheck::CheckDataLossGate => self.check_data_loss(pid),
+                    PreCheck::CheckSupervisor => self.check_supervisor(pid),
+                    PreCheck::CheckAgentSupervision => self.check_agent_supervision(pid),
+                    PreCheck::CheckSessionSafety => self.check_session_safety(pid, sid),
+                    PreCheck::VerifyProcessState => self.check_process_state(pid),
+                    PreCheck::VerifyIdentity | PreCheck::CheckNotProtected => unreachable!(),
+                });
             let blocked = !result.is_passed();
             results.push(result);
             if blocked {
@@ -542,6 +557,30 @@ pub trait PreCheckProvider {
             action.target.sid,
             action.action,
         )
+    }
+}
+
+/// Preserve a real refusal observed by a probe, even when it finished late.
+/// Only a passing result can be replaced by an exhausted operation budget.
+fn precheck_with_deadline(
+    deadline: Option<Instant>,
+    check: PreCheck,
+    observe: impl FnOnce() -> PreCheckResult,
+) -> PreCheckResult {
+    let expired = || deadline.is_some_and(|deadline| Instant::now() >= deadline);
+    let refusal = || PreCheckResult::Blocked {
+        check: check.clone(),
+        reason: "operation deadline expired during safety prechecks; no action admitted"
+            .to_string(),
+    };
+    if expired() {
+        return refusal();
+    }
+    let result = observe();
+    if result.is_passed() && expired() {
+        refusal()
+    } else {
+        result
     }
 }
 
@@ -1639,6 +1678,14 @@ struct RecentIoObservation {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl RecentIoObservation {
+    fn unavailable(window: Duration, reason: String) -> Self {
+        Self {
+            before: Err(reason.clone()),
+            after: Err(reason),
+            window,
+        }
+    }
+
     fn evidence(&self) -> RecentIoEvidence {
         let (before, after) = match (&self.before, &self.after) {
             (Ok(before), Ok(after)) => (before, after),
@@ -1819,6 +1866,8 @@ fn read_io_sample(pid: u32) -> Result<IoSample, String> {
 pub struct LivePreCheckProvider {
     protected_filter: Option<ProtectedFilter>,
     config: LivePreCheckConfig,
+    /// Shared absolute operation budget; absent for callers without a timeout.
+    deadline: Option<Instant>,
     /// Known supervisor comm names.
     known_supervisors: HashSet<String>,
     /// Recent-I/O results sampled up front for many pids (see `prime_recent_io`).
@@ -1827,6 +1876,28 @@ pub struct LivePreCheckProvider {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl LivePreCheckProvider {
+    /// Limit new observations without reducing any policy safety requirement.
+    /// Existing callers, including interactive execution, have no deadline
+    /// unless they explicitly attach one.
+    pub fn with_deadline(mut self, deadline: Option<Instant>) -> Self {
+        self.deadline = deadline;
+        self
+    }
+
+    fn io_deadline_refusal(&self, required_window: Duration) -> Option<String> {
+        let remaining = self.deadline?.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            Some("operation deadline expired before recent-I/O observation".to_string())
+        } else if remaining <= required_window {
+            Some(format!(
+                "operation deadline cannot cover the complete {}s recent-I/O window; the required window is not shortened",
+                required_window.as_secs_f64(),
+            ))
+        } else {
+            None
+        }
+    }
+
     /// Reuse plan-time counters only when a fresh read already covers the full
     /// configured window for the same process, boot and namespaces. Missing,
     /// ambiguous, young or invalid baselines use the unchanged shared live probe.
@@ -1848,6 +1919,13 @@ impl LivePreCheckProvider {
             if !seen.insert(target.pid.0) {
                 continue;
             }
+            if let Some(reason) = self.io_deadline_refusal(Duration::ZERO) {
+                observations.push((
+                    target.pid.0,
+                    RecentIoObservation::unavailable(window, reason),
+                ));
+                continue;
+            }
             let mut matching = baselines
                 .iter()
                 .filter(|baseline| baseline.target.pid == target.pid);
@@ -1856,6 +1934,9 @@ impl LivePreCheckProvider {
                 .filter(|baseline| baseline.target.matches(target))
                 .and_then(|baseline| {
                     let (current, sample) = RecentIoBaseline::capture_with_sample(target).ok()?;
+                    if let Some(reason) = self.io_deadline_refusal(Duration::ZERO) {
+                        return Some(RecentIoObservation::unavailable(window, reason));
+                    }
                     baseline.observation(&current, sample, window)
                 });
             match observation {
@@ -1881,17 +1962,49 @@ impl LivePreCheckProvider {
     /// individually as before.
     pub fn prime_recent_io(&self, pids: &[u32]) {
         if self.config.block_if_recent_io_seconds > 0 && !pids.is_empty() {
-            let before: Vec<_> = pids.iter().map(|&pid| (pid, read_io_sample(pid))).collect();
             let window = Duration::from_secs(self.config.block_if_recent_io_seconds);
-            std::thread::sleep(recent_io_probe_window(window));
+            // Refuse before native counter reads when a full window cannot fit.
+            // Cache unknown evidence so later checks cannot retry the full wait.
+            if let Some(reason) = self.io_deadline_refusal(recent_io_probe_window(window)) {
+                let mut cache = self.recent_io.lock().unwrap_or_else(|e| e.into_inner());
+                for &pid in pids {
+                    cache.insert(
+                        pid,
+                        RecentIoObservation::unavailable(window, reason.clone()),
+                    );
+                }
+                return;
+            }
+            let before: Vec<_> = pids
+                .iter()
+                .map(|&pid| {
+                    (
+                        pid,
+                        self.io_deadline_refusal(Duration::ZERO)
+                            .map_or_else(|| read_io_sample(pid), Err),
+                    )
+                })
+                .collect();
+            let refusal = self.io_deadline_refusal(recent_io_probe_window(window));
+            if refusal.is_none() {
+                std::thread::sleep(recent_io_probe_window(window));
+            }
             let observations: Vec<_> = before
                 .into_iter()
                 .map(|(pid, before)| {
+                    let after = refusal
+                        .clone()
+                        .or_else(|| self.io_deadline_refusal(Duration::ZERO))
+                        .map_or_else(|| read_io_sample(pid), Err);
+                    let after = match (after, self.io_deadline_refusal(Duration::ZERO)) {
+                        (Ok(_), Some(reason)) => Err(reason),
+                        (sample, _) => sample,
+                    };
                     (
                         pid,
                         RecentIoObservation {
                             before,
-                            after: read_io_sample(pid),
+                            after,
                             window,
                         },
                     )
@@ -1932,6 +2045,7 @@ impl LivePreCheckProvider {
         Ok(Self {
             protected_filter,
             config,
+            deadline: None,
             known_supervisors,
             recent_io: Default::default(),
         })
@@ -2049,6 +2163,7 @@ impl LivePreCheckProvider {
         Self {
             protected_filter,
             config: LivePreCheckConfig::default(),
+            deadline: None,
             known_supervisors,
             recent_io: Default::default(),
         }
@@ -2062,6 +2177,9 @@ impl LivePreCheckProvider {
 
     /// Observe a full I/O window, retaining unreadable and invalid evidence.
     fn has_recent_io(&self, pid: u32, window: Duration) -> RecentIoEvidence {
+        if let Some(reason) = self.io_deadline_refusal(Duration::ZERO) {
+            return RecentIoEvidence::Unknown(reason);
+        }
         let cached = self
             .recent_io
             .lock()
@@ -2074,16 +2192,38 @@ impl LivePreCheckProvider {
                     "cached I/O window differs from the required window".to_string(),
                 );
             }
-            return cached.revalidate(read_io_sample(pid));
+            let evidence = cached.evidence();
+            if matches!(evidence, RecentIoEvidence::Unknown(_)) {
+                return evidence;
+            }
+            let evidence = cached.revalidate(read_io_sample(pid));
+            return match (evidence, self.io_deadline_refusal(Duration::ZERO)) {
+                (RecentIoEvidence::Idle, Some(reason)) => RecentIoEvidence::Unknown(reason),
+                (evidence, _) => evidence,
+            };
+        }
+        if let Some(reason) = self.io_deadline_refusal(recent_io_probe_window(window)) {
+            return RecentIoEvidence::Unknown(reason);
         }
         let before = read_io_sample(pid);
+        if let Some(reason) = self.io_deadline_refusal(recent_io_probe_window(window)) {
+            return RecentIoEvidence::Unknown(reason);
+        }
         std::thread::sleep(recent_io_probe_window(window));
         let observation = RecentIoObservation {
             before,
-            after: read_io_sample(pid),
+            after: self
+                .io_deadline_refusal(Duration::ZERO)
+                .map_or_else(|| read_io_sample(pid), Err),
             window,
         };
-        let evidence = observation.evidence();
+        let evidence = match (
+            observation.evidence(),
+            self.io_deadline_refusal(Duration::ZERO),
+        ) {
+            (RecentIoEvidence::Idle, Some(reason)) => RecentIoEvidence::Unknown(reason),
+            (evidence, _) => evidence,
+        };
         self.recent_io
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -2457,9 +2597,11 @@ impl LivePreCheckProvider {
         let started = Instant::now();
         let budget = Duration::from_millis(action.timeouts.preflight_ms.min(30_000));
         let remaining = || {
-            budget
-                .checked_sub(started.elapsed())
-                .filter(|left| !left.is_zero())
+            let mut left = budget.saturating_sub(started.elapsed());
+            if let Some(deadline) = self.deadline {
+                left = left.min(deadline.saturating_duration_since(Instant::now()));
+            }
+            (!left.is_zero()).then_some(left)
         };
         if remaining().is_none() {
             return vec![blocked(
@@ -2551,6 +2693,10 @@ fn detached_service_session_is_safe(result: &crate::supervision::session::Sessio
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl PreCheckProvider for LivePreCheckProvider {
+    fn operation_deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
     fn check_not_protected(&self, pid: u32) -> PreCheckResult {
         self.check_not_protected_for_action(pid, Action::Kill)
     }
@@ -3090,6 +3236,112 @@ mod tests {
             idle.revalidate(Ok(sample(start + window * 2, 101, 4096, 8192))),
             RecentIoEvidence::Unknown(reason) if reason.contains("birth changed")
         ));
+    }
+
+    #[test]
+    fn expired_prechecks_do_not_probe_and_unbudgeted_checks_still_run() {
+        let observed = std::cell::Cell::new(false);
+        let result =
+            precheck_with_deadline(Some(Instant::now()), PreCheck::CheckDataLossGate, || {
+                observed.set(true);
+                PreCheckResult::Passed
+            });
+        assert!(!observed.get(), "expired admission must not start a probe");
+        assert!(matches!(
+            result,
+            PreCheckResult::Blocked { check: PreCheck::CheckDataLossGate, reason }
+                if reason.contains("operation deadline")
+        ));
+        assert!(
+            precheck_with_deadline(None, PreCheck::CheckDataLossGate, || {
+                observed.set(true);
+                PreCheckResult::Passed
+            })
+            .is_passed()
+        );
+        assert!(
+            observed.get(),
+            "unbudgeted callers keep normal observations"
+        );
+    }
+
+    #[test]
+    fn late_prechecks_preserve_observed_refusals_but_cannot_authorize_action() {
+        for passed in [false, true] {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let result =
+                precheck_with_deadline(Some(deadline), PreCheck::VerifyProcessState, || {
+                    std::thread::sleep(
+                        deadline.saturating_duration_since(Instant::now())
+                            + Duration::from_millis(1),
+                    );
+                    if passed {
+                        PreCheckResult::Passed
+                    } else {
+                        PreCheckResult::Blocked {
+                            check: PreCheck::VerifyProcessState,
+                            reason: "target disappeared during observation".to_string(),
+                        }
+                    }
+                });
+            match result {
+                PreCheckResult::Blocked { reason, .. } if passed => {
+                    assert!(reason.contains("operation deadline"));
+                }
+                PreCheckResult::Blocked { reason, .. } => {
+                    assert_eq!(reason, "target disappeared during observation");
+                }
+                PreCheckResult::Passed => panic!("expired observation permitted admission"),
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn insufficient_operation_budget_keeps_native_recent_io_unknown_without_waiting() {
+        let make_provider = || {
+            LivePreCheckProvider::new(
+                None,
+                LivePreCheckConfig {
+                    block_if_open_write_fds: false,
+                    block_if_locked_files: false,
+                    block_if_active_tty: false,
+                    block_if_deleted_cwd: false,
+                    block_if_recent_io_seconds: 60,
+                    enhanced_session_safety: false,
+                    ..LivePreCheckConfig::default()
+                },
+            )
+            .expect("I/O-only provider")
+        };
+        let pid = std::process::id();
+        let window = Duration::from_secs(60);
+        let provider = make_provider().with_deadline(Some(Instant::now() + Duration::from_secs(5)));
+        let started = Instant::now();
+        provider.prime_recent_io(&[pid]);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let cache = provider.recent_io.lock().unwrap();
+        let observation = cache.get(&pid).expect("cache the unavailable full window");
+        assert_eq!(observation.window, window);
+        assert!(matches!(
+            observation.evidence(),
+            RecentIoEvidence::Unknown(reason)
+                if reason.contains("complete 60s") && reason.contains("not shortened")
+        ));
+        drop(cache);
+        assert!(matches!(
+            provider.check_data_loss(pid),
+            PreCheckResult::Blocked { check: PreCheck::CheckDataLossGate, reason }
+                if reason.contains("complete 60s")
+        ));
+
+        let unprimed = make_provider().with_deadline(Some(Instant::now() + Duration::from_secs(5)));
+        assert!(matches!(
+            unprimed.has_recent_io(pid, window),
+            RecentIoEvidence::Unknown(reason) if reason.contains("complete 60s")
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(make_provider().operation_deadline(), None);
     }
 
     #[test]
@@ -5535,6 +5787,16 @@ finally:
                 child.0.try_wait().unwrap().is_none(),
                 "owned process must survive"
             );
+
+            // A completed saved window is usable even when a fresh full window
+            // would exceed the remaining operation budget.
+            let bounded =
+                io_only_provider(2).with_deadline(Some(Instant::now() + Duration::from_secs(1)));
+            bounded.prime_recent_io_from_baselines(
+                std::slice::from_ref(&target),
+                std::slice::from_ref(&restored),
+            );
+            assert!(bounded.check_data_loss(pid).is_passed());
 
             // Ambiguous evidence cannot choose whichever baseline grants action.
             let provider = io_only_provider(1);
