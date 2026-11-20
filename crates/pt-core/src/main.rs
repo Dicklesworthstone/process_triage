@@ -20384,17 +20384,25 @@ fn daemon_planner_spec(
 fn collect_daemon_metrics() -> pt_core::daemon::TickMetrics {
     let observed_at = std::time::Instant::now();
     let pressure = pt_core::collect::pressure::read_pressure_snapshot();
-    let mut metrics =
-        daemon_metrics_from_pressure(pressure, collect_process_count(), collect_orphan_count());
+    let mut metrics = daemon_metrics_from_pressure(pressure, collect_daemon_process_census());
     metrics.pressure_observed_at = Some(observed_at);
     metrics
+}
+
+/// Availability is separate for process state and orphan provenance: an
+/// unclassified cgroup cannot erase an otherwise observed zombie or D state.
+#[cfg(feature = "daemon")]
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DaemonProcessCensus {
+    process_count: Option<u32>,
+    orphan_count: Option<u32>,
+    states: Option<pt_core::decision::pressure_regime::ProcessCensus>,
 }
 
 #[cfg(feature = "daemon")]
 fn daemon_metrics_from_pressure(
     pressure: pt_core::collect::pressure::PressureSnapshot,
-    process_count: u32,
-    orphan_count: Option<u32>,
+    census: DaemonProcessCensus,
 ) -> pt_core::daemon::TickMetrics {
     let load_avg_1 = pressure.load.map(|load| load.one).unwrap_or(0.0);
     let load_avg_5 = pressure.load.map(|load| load.five).unwrap_or(0.0);
@@ -20418,8 +20426,9 @@ fn daemon_metrics_from_pressure(
         memory_used_mb,
         memory_total_mb,
         swap_used_mb,
-        process_count,
-        orphan_count,
+        process_count: census.process_count.unwrap_or(0),
+        orphan_count: census.orphan_count,
+        process_census: census.states,
         // Legacy scalar gauges retain their previous zero fallback. The pressure
         // state machine consumes this observed snapshot and never those fallbacks.
         pressure: Some(pressure),
@@ -20943,7 +20952,14 @@ mod daemon_pressure_tests {
         )
         .unwrap();
         let pressure = pt_core::collect::pressure::read_pressure_snapshot_from(fixture.path(), 4);
-        let mut metrics = daemon_metrics_from_pressure(pressure, 42, Some(0));
+        let mut metrics = daemon_metrics_from_pressure(
+            pressure,
+            DaemonProcessCensus {
+                process_count: Some(42),
+                orphan_count: Some(0),
+                states: None,
+            },
+        );
         let config = DaemonConfig::default();
         let mut state = DaemonState::new();
         let mut triggers = pt_core::daemon::triggers::TriggerState::new(&config.triggers);
@@ -21054,79 +21070,155 @@ mod daemon_pressure_tests {
 }
 
 #[cfg(all(feature = "daemon", target_os = "linux"))]
-fn collect_orphan_count() -> Option<u32> {
-    collect_orphan_count_from(Path::new("/proc"), |path| std::fs::read_to_string(path))
+fn collect_daemon_process_census() -> DaemonProcessCensus {
+    let started = std::time::Instant::now();
+    collect_daemon_process_census_from(Path::new("/proc"), read_daemon_census_file, || {
+        started.elapsed() > std::time::Duration::from_millis(500)
+    })
 }
 
-/// A cheap, conservative census, not an action authorization. A PID-1 child is
-/// counted only when it retained another job's session/group and its placement
-/// establishes a user workload rather than a service or container. Unavailable
-/// evidence invalidates the count; it must not look like observed recovery.
+/// Procfs metadata only: never follow a target's cwd, executable or descriptors.
 #[cfg(all(feature = "daemon", target_os = "linux"))]
-fn collect_orphan_count_from(
+fn read_daemon_census_file(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    const MAX_BYTES: u64 = 64 * 1024;
+    let mut content = String::new();
+    std::fs::File::open(path)?
+        .take(MAX_BYTES + 1)
+        .read_to_string(&mut content)?;
+    if content.len() as u64 > MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "daemon census metadata exceeds the byte budget",
+        ));
+    }
+    Ok(content)
+}
+
+/// One bounded walk supplies total, state and orphan counts. Only PID-1
+/// adoptees require placement reads. Unknown placement invalidates the orphan
+/// count independently; incomplete stat evidence invalidates the entire census.
+/// A process that disappears during observation contributes nothing.
+#[cfg(all(feature = "daemon", target_os = "linux"))]
+fn collect_daemon_process_census_from(
     proc_root: &Path,
     mut read: impl FnMut(&Path) -> std::io::Result<String>,
-) -> Option<u32> {
+    mut exhausted: impl FnMut() -> bool,
+) -> DaemonProcessCensus {
     use pt_core::collect::cgroup::CgroupRole;
+    use pt_core::collect::ProcessState;
+    use pt_core::decision::pressure_regime::ProcessCensus;
 
-    let mut count = 0u32;
-    let entries = std::fs::read_dir(proc_root).ok()?;
+    let mut total = 0u32;
+    let mut orphan_count = Some(0u32);
+    let mut states = ProcessCensus::default();
+    let Ok(entries) = std::fs::read_dir(proc_root) else {
+        return DaemonProcessCensus::default();
+    };
 
-    for entry in entries {
-        let entry = entry.ok()?;
+    for (index, entry) in entries.enumerate() {
+        if index >= 131_072 || exhausted() {
+            return DaemonProcessCensus::default();
+        }
+        let Ok(entry) = entry else {
+            return DaemonProcessCensus::default();
+        };
         let file_name = entry.file_name();
         let Some(pid) = file_name.to_str().and_then(|name| name.parse::<u32>().ok()) else {
             continue;
         };
-        if pid <= 1 {
+        if pid == 0 {
             continue;
         }
         let stat_path = entry.path().join("stat");
-        let before = match read(&stat_path) {
-            Ok(stat) => daemon_orphan_identity(pid, &stat)?,
+        let stat = match read(&stat_path) {
+            Ok(stat) => stat,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => return None,
+            Err(_) => return DaemonProcessCensus::default(),
+        };
+        let (Some(before), Some(mut state)) = (
+            daemon_orphan_identity(pid, &stat),
+            daemon_census_process_state(&stat),
+        ) else {
+            return DaemonProcessCensus::default();
         };
         let (ppid, pgid, sid, _) = before;
-        if ppid != 1 {
-            continue;
-        }
-        let own_leader = if sid != 0 {
-            sid == pid
-        } else if pgid != 0 {
-            pgid == pid
-        } else {
-            return None;
-        };
-        if own_leader {
-            continue;
-        }
-        if before.3 == 0 {
-            return None;
+        if pid > 1 && ppid == 1 && orphan_count.is_some() {
+            let own_leader = if sid != 0 {
+                Some(sid == pid)
+            } else if pgid != 0 {
+                Some(pgid == pid)
+            } else {
+                None
+            };
+            if own_leader.is_none() || (own_leader == Some(false) && before.3 == 0) {
+                orphan_count = None;
+            } else if own_leader == Some(false) {
+                if exhausted() {
+                    return DaemonProcessCensus::default();
+                }
+                // Revalidate the birth and lineage around the placement read.
+                // A changed state is normal; use its latest observed value.
+                let membership = read(&entry.path().join("cgroup"));
+                let after_stat = match read(&stat_path) {
+                    Ok(stat) => stat,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(_) => return DaemonProcessCensus::default(),
+                };
+                let (Some(after), Some(after_state)) = (
+                    daemon_orphan_identity(pid, &after_stat),
+                    daemon_census_process_state(&after_stat),
+                ) else {
+                    return DaemonProcessCensus::default();
+                };
+                if before != after {
+                    return DaemonProcessCensus::default();
+                }
+                state = after_state;
+                match membership
+                    .ok()
+                    .as_deref()
+                    .and_then(daemon_orphan_cgroup_role)
+                {
+                    Some(CgroupRole::LoginSession | CgroupRole::TransientScope) => {
+                        orphan_count = orphan_count.and_then(|count| count.checked_add(1));
+                    }
+                    Some(
+                        CgroupRole::SystemService | CgroupRole::UserService | CgroupRole::Container,
+                    ) => {}
+                    Some(CgroupRole::Unknown) | None => orphan_count = None,
+                }
+            }
         }
 
-        // Bind placement to the same birth and parent/session before counting.
-        // An exited process contributes nothing; a replacement is not evidence
-        // about the process whose placement we just inspected.
-        let membership = read(&entry.path().join("cgroup"));
-        let after = match read(&stat_path) {
-            Ok(stat) => daemon_orphan_identity(pid, &stat)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => return None,
-        };
-        if before != after {
-            return None;
-        }
-        match daemon_orphan_cgroup_role(&membership.ok()?)? {
-            CgroupRole::LoginSession | CgroupRole::TransientScope => {
-                count = count.saturating_add(1);
-            }
-            CgroupRole::SystemService | CgroupRole::UserService | CgroupRole::Container => {}
-            CgroupRole::Unknown => return None,
+        // The entry budget keeps these bounded well below u32::MAX.
+        total += 1;
+        match state {
+            ProcessState::Zombie => states.zombies += 1,
+            ProcessState::DiskSleep => states.dstate += 1,
+            _ => {}
         }
     }
 
-    Some(count)
+    if exhausted() {
+        return DaemonProcessCensus::default();
+    }
+    DaemonProcessCensus {
+        process_count: Some(total),
+        orphan_count,
+        states: Some(states),
+    }
+}
+
+#[cfg(all(feature = "daemon", target_os = "linux"))]
+fn daemon_census_process_state(stat: &str) -> Option<ProcessState> {
+    let field = stat
+        .get(stat.rfind(')')? + 1..)?
+        .split_whitespace()
+        .next()?;
+    let mut chars = field.chars();
+    let state = ProcessState::from_char(chars.next()?);
+    (chars.next().is_none() && state != ProcessState::Unknown).then_some(state)
 }
 
 #[cfg(all(feature = "daemon", target_os = "linux"))]
@@ -21203,7 +21295,197 @@ mod daemon_orphan_tests {
     }
 
     fn count(root: &Path) -> Option<u32> {
-        collect_orphan_count_from(root, |path| std::fs::read_to_string(path))
+        census(root).orphan_count
+    }
+
+    fn census(root: &Path) -> DaemonProcessCensus {
+        collect_daemon_process_census_from(root, read_daemon_census_file, || false)
+    }
+
+    fn process_state(root: &Path, pid: u32, ppid: u32, state: char, membership: &str) {
+        process(root, pid, ppid, 42, 42, membership);
+        std::fs::write(
+            root.join(pid.to_string()).join("stat"),
+            stat(pid, ppid, 42, 42, 123).replacen(") S ", &format!(") {state} "), 1),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn daemon_state_census_feeds_real_regime_triggers_in_one_process_walk() {
+        let root = tempfile::tempdir().unwrap();
+        process_state(root.path(), 1, 0, 'S', "0::/init.scope\n");
+        // State pressure includes services and kernel tasks, not just actionable
+        // orphan candidates. A trigger requests a review; it authorizes no kill.
+        process_state(root.path(), 2, 0, 'D', "0::/\n");
+        for pid in 100..125 {
+            process_state(root.path(), pid, 90, 'Z', "0::/system.slice/job.service\n");
+        }
+        for pid in 200..203 {
+            process_state(root.path(), pid, 90, 'D', SESSION);
+        }
+        process_state(root.path(), 300, 90, 'R', SESSION);
+
+        let mut stat_reads = 0;
+        let observed = collect_daemon_process_census_from(
+            root.path(),
+            |path| {
+                assert!(path.ends_with("stat"), "non-orphans need no placement read");
+                stat_reads += 1;
+                read_daemon_census_file(path)
+            },
+            || false,
+        );
+        assert_eq!(stat_reads, 31);
+        assert_eq!(observed.process_count, Some(31));
+        assert_eq!(observed.orphan_count, Some(0));
+        assert_eq!(
+            observed.states,
+            Some(ProcessCensus {
+                zombies: 25,
+                dstate: 4
+            })
+        );
+
+        let pressure = pt_core::collect::pressure::read_pressure_snapshot_from(root.path(), 2);
+        let mut metrics = daemon_metrics_from_pressure(pressure, observed);
+        assert_eq!(metrics.process_count, 31);
+        let config = TriggerConfig {
+            sustained_ticks: 2,
+            ..Default::default()
+        };
+        let mut state = TriggerState::new(&config);
+        let now = std::time::Instant::now();
+        metrics.pressure_observed_at = Some(now);
+        assert!(evaluate_triggers(&config, &mut state, &metrics).is_empty());
+        metrics.pressure_observed_at = Some(now + std::time::Duration::from_secs(1));
+        let fired = evaluate_triggers(&config, &mut state, &metrics);
+        let regimes: std::collections::BTreeSet<_> = fired
+            .iter()
+            .filter_map(|trigger| trigger.pressure_regime.as_ref().map(|regime| regime.kind))
+            .collect();
+        assert_eq!(
+            regimes,
+            std::collections::BTreeSet::from([RegimeKind::ZombieLeak, RegimeKind::DstateStorm])
+        );
+        assert!(fired
+            .iter()
+            .all(|trigger| trigger.kind == TriggerKind::PressureRegime));
+    }
+
+    #[test]
+    fn daemon_state_census_does_not_depend_on_orphan_placement_availability() {
+        for membership in ["0::/\n", "malformed", ""] {
+            let root = tempfile::tempdir().unwrap();
+            process_state(root.path(), 100, 1, 'Z', membership);
+            process_state(root.path(), 101, 1, 'D', membership);
+            let observed = census(root.path());
+            assert_eq!(observed.process_count, Some(2));
+            assert_eq!(observed.orphan_count, None);
+            assert_eq!(
+                observed.states,
+                Some(ProcessCensus {
+                    zombies: 1,
+                    dstate: 1
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn daemon_state_census_retains_unknown_for_incomplete_or_over_budget_reads() {
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(census(empty.path()).process_count, Some(0));
+        assert_eq!(census(empty.path()).states, Some(ProcessCensus::default()));
+        assert_eq!(
+            census(&empty.path().join("absent")),
+            DaemonProcessCensus::default()
+        );
+
+        let root = tempfile::tempdir().unwrap();
+        process_state(root.path(), 100, 90, 'Z', SESSION);
+        process_state(root.path(), 101, 90, 'D', SESSION);
+        for invalid in [
+            "101 (worker) D 90 42 42".to_string(),
+            stat(102, 90, 42, 42, 123),
+            stat(101, 90, 42, 42, 123).replacen(") S ", ") ? ", 1),
+            stat(101, 90, 42, 42, 123).replacen(") S ", ") ZZ ", 1),
+        ] {
+            let observed = collect_daemon_process_census_from(
+                root.path(),
+                |path| {
+                    if path == root.path().join("101/stat") {
+                        Ok(invalid.clone())
+                    } else {
+                        read_daemon_census_file(path)
+                    }
+                },
+                || false,
+            );
+            assert_eq!(observed, DaemonProcessCensus::default(), "{invalid}");
+        }
+        let mut reads = 0;
+        let observed =
+            collect_daemon_process_census_from(root.path(), read_daemon_census_file, || {
+                reads += 1;
+                reads > 1
+            });
+        assert_eq!(
+            observed,
+            DaemonProcessCensus::default(),
+            "never publish a partial census"
+        );
+
+        let oversized = root.path().join("oversized");
+        std::fs::write(&oversized, "x".repeat(64 * 1024 + 1)).unwrap();
+        assert_eq!(
+            read_daemon_census_file(&oversized).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn daemon_state_census_observes_a_real_owned_zombie_and_its_reaping() {
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let mut child = OwnedChild(std::process::Command::new("/bin/true").spawn().unwrap());
+        let pid = child.0.id();
+        std::fs::create_dir(root.path().join(pid.to_string())).unwrap();
+        // Restrict enumeration to our own disposable child; metadata still comes
+        // from the real kernel. No other process is signalled or reaped.
+        let observed = || {
+            collect_daemon_process_census_from(
+                root.path(),
+                |path| {
+                    read_daemon_census_file(
+                        &Path::new("/proc").join(path.strip_prefix(root.path()).unwrap()),
+                    )
+                },
+                || false,
+            )
+        };
+        let started = std::time::Instant::now();
+        loop {
+            if observed().states.is_some_and(|census| census.zombies == 1) {
+                break;
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "child did not become a zombie"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(observed().process_count, Some(1));
+        assert!(child.0.wait().unwrap().success());
+        assert_eq!(observed().states, Some(ProcessCensus::default()));
+        assert_eq!(observed().process_count, Some(0));
     }
 
     #[test]
@@ -21264,7 +21546,7 @@ mod daemon_orphan_tests {
             file_handles: None,
             unavailable: Vec::new(),
         };
-        let metrics = daemon_metrics_from_pressure(pressure.clone(), 28, count(root.path()));
+        let metrics = daemon_metrics_from_pressure(pressure.clone(), census(root.path()));
         assert!(evaluate_triggers(&config, &mut state, &metrics).is_empty());
 
         process(root.path(), 400, 1, 100, 100, SESSION);
@@ -21278,7 +21560,7 @@ mod daemon_orphan_tests {
         );
         process(root.path(), 402, 400, 100, 100, SESSION);
         assert_eq!(count(root.path()), Some(2));
-        let metrics = daemon_metrics_from_pressure(pressure, 31, count(root.path()));
+        let metrics = daemon_metrics_from_pressure(pressure, census(root.path()));
         let fired = evaluate_triggers(&config, &mut state, &metrics);
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].kind, TriggerKind::OrphanSpike);
@@ -21317,10 +21599,12 @@ mod daemon_orphan_tests {
 
         std::fs::create_dir(root.path().join("100/stat")).unwrap();
         assert_eq!(count(root.path()), None);
-        let result = collect_orphan_count_from(root.path(), |_| {
-            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
-        });
-        assert_eq!(result, None);
+        let result = collect_daemon_process_census_from(
+            root.path(),
+            |_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            || false,
+        );
+        assert_eq!(result, DaemonProcessCensus::default());
     }
 
     #[test]
@@ -21335,29 +21619,43 @@ mod daemon_orphan_tests {
             stat(101, 1, 42, 42, 123),
         ] {
             let mut stat_reads = 0;
-            let result = collect_orphan_count_from(root.path(), |path| {
-                if path.ends_with("stat") {
-                    stat_reads += 1;
-                    if stat_reads == 2 {
-                        return Ok(changed.clone());
+            let result = collect_daemon_process_census_from(
+                root.path(),
+                |path| {
+                    if path.ends_with("stat") {
+                        stat_reads += 1;
+                        if stat_reads == 2 {
+                            return Ok(changed.clone());
+                        }
                     }
-                }
-                std::fs::read_to_string(path)
-            });
-            assert_eq!(result, None, "{changed}");
+                    std::fs::read_to_string(path)
+                },
+                || false,
+            );
+            assert_eq!(result, DaemonProcessCensus::default(), "{changed}");
         }
 
         let mut stat_reads = 0;
-        let result = collect_orphan_count_from(root.path(), |path| {
-            if path.ends_with("stat") {
-                stat_reads += 1;
-                if stat_reads == 2 {
-                    return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        let result = collect_daemon_process_census_from(
+            root.path(),
+            |path| {
+                if path.ends_with("stat") {
+                    stat_reads += 1;
+                    if stat_reads == 2 {
+                        return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+                    }
                 }
-            }
-            std::fs::read_to_string(path)
-        });
-        assert_eq!(result, Some(0), "exited before placement was bound");
+                std::fs::read_to_string(path)
+            },
+            || false,
+        );
+        assert_eq!(
+            result.orphan_count,
+            Some(0),
+            "exited before placement was bound"
+        );
+        assert_eq!(result.process_count, Some(0));
+        assert_eq!(result.states, Some(ProcessCensus::default()));
     }
 
     #[test]
@@ -21417,8 +21715,8 @@ fn current_rss_mb() -> Option<u64> {
 }
 
 #[cfg(all(feature = "daemon", not(target_os = "linux")))]
-fn collect_orphan_count() -> Option<u32> {
-    None
+fn collect_daemon_process_census() -> DaemonProcessCensus {
+    DaemonProcessCensus::default()
 }
 
 #[cfg(all(feature = "daemon", not(target_os = "linux")))]

@@ -225,11 +225,12 @@ impl PressureTriggerState {
                 .and_then(|elapsed| pressure_window_with_elapsed(before, snapshot, elapsed))
         });
         self.previous = Some((snapshot.clone(), observed_at));
-        let assessment = assess(snapshot, window.as_ref(), None, &settings.1.thresholds);
+        let census = metrics.process_census.as_ref();
+        let assessment = assess(snapshot, window.as_ref(), census, &settings.1.thresholds);
         let observed = |kind| {
             // The existing load trigger handles hosts without CPU PSI. An
             // observed PSI episode must never clear through that fallback.
-            regime_evidence_available(kind, snapshot, window.as_ref(), None, true, false)
+            regime_evidence_available(kind, snapshot, window.as_ref(), census, true, false)
         };
         self.active = self
             .tracker
@@ -733,6 +734,7 @@ mod tests {
             swap_used_mb: 0,
             process_count: 200,
             orphan_count: Some(orphans),
+            process_census: None,
             pressure: Some(pressure(load, 2)),
             pressure_observed_at: None,
         }
@@ -882,6 +884,94 @@ mod tests {
                 .is_empty(),
             "a delivered critical episode does not repeat when it improves to warning"
         );
+    }
+
+    #[test]
+    fn census_regimes_require_complete_confirmation_and_recovery_samples() {
+        use crate::decision::pressure_regime::ProcessCensus;
+
+        let mut config = cfg(2, 0);
+        config.pressure_regimes.exit_after_ticks = 2;
+        let mut state = TriggerState::new(&config);
+        let start = Instant::now();
+        let high = Some(ProcessCensus {
+            zombies: 25,
+            dstate: 4,
+        });
+        let healthy = Some(ProcessCensus::default());
+        let reading = |tick, census| {
+            let mut value = cpu_reading(start, tick, 0.0, 0);
+            value.process_census = census;
+            value
+        };
+        let kinds = [RegimeKind::ZombieLeak, RegimeKind::DstateStorm];
+
+        assert!(evaluate_triggers(&config, &mut state, &reading(0, high)).is_empty());
+        assert!(evaluate_triggers(&config, &mut state, &reading(1, None)).is_empty());
+        assert!(evaluate_triggers(&config, &mut state, &reading(2, high)).is_empty());
+        let fired = evaluate_triggers(&config, &mut state, &reading(3, high));
+        assert_eq!(fired.len(), 2);
+        for kind in kinds {
+            assert!(fired.iter().any(|trigger| {
+                trigger.kind == TriggerKind::PressureRegime
+                    && trigger
+                        .pressure_regime
+                        .as_ref()
+                        .is_some_and(|regime| regime.kind == kind)
+            }));
+        }
+        state.pressure.acknowledge(&fired);
+
+        // Unknown census breaks both entry and recovery streaks. Neither the
+        // legacy total count nor another observed sensor may stand in for it.
+        for (tick, census) in [(4, None), (5, healthy), (6, None), (7, healthy)] {
+            assert!(evaluate_triggers(&config, &mut state, &reading(tick, census)).is_empty());
+            for kind in kinds {
+                assert!(
+                    state.pressure.active.contains_key(&kind),
+                    "tick {tick}: {kind:?}"
+                );
+            }
+        }
+        assert!(evaluate_triggers(&config, &mut state, &reading(8, healthy)).is_empty());
+        assert!(kinds
+            .iter()
+            .all(|kind| !state.pressure.active.contains_key(kind)));
+        assert!(evaluate_triggers(&config, &mut state, &reading(9, high)).is_empty());
+        assert_eq!(
+            evaluate_triggers(&config, &mut state, &reading(10, high)).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn dstate_recovery_requires_cpu_capacity_but_zombie_census_does_not() {
+        use crate::decision::pressure_regime::ProcessCensus;
+
+        let mut config = cfg(1, 0);
+        config.pressure_regimes.exit_after_ticks = 1;
+        let mut state = TriggerState::new(&config);
+        let start = Instant::now();
+        let mut high = cpu_reading(start, 0, 0.0, 0);
+        high.process_census = Some(ProcessCensus {
+            zombies: 25,
+            dstate: 4,
+        });
+        let fired = evaluate_triggers(&config, &mut state, &high);
+        assert_eq!(fired.len(), 2);
+        state.pressure.acknowledge(&fired);
+
+        let mut missing_capacity = cpu_reading(start, 1, 0.0, 0);
+        missing_capacity.pressure.as_mut().unwrap().cpus = 0;
+        missing_capacity.process_census = Some(ProcessCensus::default());
+        assert!(evaluate_triggers(&config, &mut state, &missing_capacity).is_empty());
+        assert!(!state.pressure.active.contains_key(&RegimeKind::ZombieLeak));
+        assert!(state.pressure.active.contains_key(&RegimeKind::DstateStorm));
+
+        missing_capacity.pressure_observed_at = Some(start + std::time::Duration::from_secs(2));
+        missing_capacity.pressure.as_mut().unwrap().cpus = 2;
+        assert!(evaluate_triggers(&config, &mut state, &missing_capacity).is_empty());
+        assert!(!state.pressure.active.contains_key(&RegimeKind::DstateStorm));
     }
 
     #[test]

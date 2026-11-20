@@ -155,6 +155,11 @@ pub struct TickMetrics {
     /// never an observed zero. Existing numeric telemetry remains readable.
     #[serde(default)]
     pub orphan_count: Option<u32>,
+    /// Complete process-state census from the same visible process-table walk.
+    /// Missing, unreadable or over-budget observations stay unknown; they cannot
+    /// confirm recovery from a zombie leak or uninterruptible-sleep storm.
+    #[serde(default)]
+    pub process_census: Option<crate::decision::pressure_regime::ProcessCensus>,
     /// The actual pressure reading, including unavailable sensors. Older callers
     /// without a reading cannot supply CPU capacity or memory-pressure recovery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -570,6 +575,7 @@ mod tests {
             swap_used_mb: 0,
             process_count: 200,
             orphan_count: Some(orphans),
+            process_census: None,
             pressure: None,
             pressure_observed_at: None,
         }
@@ -589,6 +595,34 @@ mod tests {
         value.as_object_mut().unwrap().remove("orphan_count");
         let absent: TickMetrics = serde_json::from_value(value).unwrap();
         assert_eq!(absent.orphan_count, None);
+    }
+
+    #[test]
+    fn process_census_serialization_preserves_observed_and_unavailable_evidence() {
+        use crate::decision::pressure_regime::ProcessCensus;
+
+        let mut tick = test_metrics(1.0, 2000, 0);
+        let mut legacy = serde_json::to_value(&tick).unwrap();
+        assert!(legacy["process_census"].is_null());
+        legacy.as_object_mut().unwrap().remove("process_census");
+        let restored: TickMetrics = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.process_census, None);
+
+        for census in [
+            ProcessCensus::default(),
+            ProcessCensus {
+                zombies: 25,
+                dstate: 7,
+            },
+        ] {
+            tick.process_census = Some(census);
+            let json = serde_json::to_value(&tick).unwrap();
+            assert_eq!(json["process_census"]["zombies"], census.zombies);
+            assert_eq!(json["process_census"]["dstate"], census.dstate);
+            let restored: TickMetrics = serde_json::from_value(json).unwrap();
+            assert_eq!(restored.process_census, Some(census));
+            assert!(restored.pressure_observed_at.is_none());
+        }
     }
 
     #[test]

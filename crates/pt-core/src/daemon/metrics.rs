@@ -461,6 +461,7 @@ mod tests {
             swap_used_mb: 100,
             process_count: 300,
             orphan_count: Some(5),
+            process_census: None,
             pressure: None,
             pressure_observed_at: None,
         };
