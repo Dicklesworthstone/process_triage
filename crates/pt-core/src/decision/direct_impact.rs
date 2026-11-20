@@ -9,7 +9,8 @@
 
 use crate::collect::shared_resource_graph::{BlastRadius, SharedResourceGraph};
 use pt_common::{
-    ProvenanceConfidence, RawLineageEvidence, ResourceKind, ResourceState, SupervisorKind,
+    normalize_lineage, ProvenanceConfidence, RawLineageEvidence, ResourceKind, ResourceState,
+    SupervisorKind,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -100,7 +101,8 @@ pub struct DirectImpactComponents {
     pub child_count: usize,
     /// Normalized child score [0, 1].
     pub child_score: f64,
-    /// Whether the process is an orphan (PPID=1).
+    /// Whether normalized ownership identifies an adopted orphan. Unknown
+    /// ownership never qualifies for the lower-impact orphan discount.
     pub is_orphan: bool,
 }
 
@@ -119,7 +121,12 @@ pub fn compute_direct_impact(
 
     let (is_supervised, supervision_score, supervision_reason) = supervision_impact(lineage);
 
-    let is_orphan = lineage.map(|l| l.ppid == 1).unwrap_or(false);
+    // Use the same ownership fact as inference: a supervised PID-1 child is
+    // not an abandoned job, and a job adopted by a user subreaper can be one.
+    // A missing or unrelated lineage cannot justify reducing collateral risk.
+    let is_orphan = lineage
+        .filter(|lineage| lineage.pid == pid)
+        .is_some_and(|lineage| normalize_lineage(lineage).is_orphaned);
 
     let child_count = child_pids.len();
 
@@ -514,7 +521,10 @@ mod tests {
     fn orphan_discount_reduces_score() {
         let graph = SharedResourceGraph::from_evidence(&[(100, vec![listener_ev(100, 8080)])]);
         let non_orphan = minimal_lineage(100, 500, false);
-        let orphan = minimal_lineage(100, 1, false);
+        let mut orphan = minimal_lineage(100, 1, false);
+        // An adopted job retains its original session. A session leader under
+        // init with no readable ownership is unknown, not proven orphaned.
+        orphan.sid = 90;
 
         let score_non_orphan =
             compute_direct_impact(100, &graph, Some(&non_orphan), &[], &Default::default()).score;
@@ -525,6 +535,74 @@ mod tests {
             score_orphan < score_non_orphan,
             "orphan={score_orphan} should be less than non-orphan={score_non_orphan}"
         );
+    }
+
+    #[test]
+    fn adopted_job_impact_is_independent_of_reaper() {
+        let graph = SharedResourceGraph::from_evidence(&[
+            (
+                100,
+                vec![listener_ev(100, 8080), lock_ev(100, "/shared.lock")],
+            ),
+            (200, vec![lock_ev(200, "/shared.lock")]),
+        ]);
+        let mut init_orphan = minimal_lineage(100, 1, false);
+        init_orphan.sid = 90;
+        let mut subreaper_orphan = init_orphan.clone();
+        subreaper_orphan.ppid = 500;
+        subreaper_orphan.ancestors = vec![pt_common::AncestorEntry {
+            pid: 500,
+            comm: "systemd".to_string(),
+            uid: 1000,
+        }];
+
+        let under_init =
+            compute_direct_impact(100, &graph, Some(&init_orphan), &[300], &Default::default());
+        let under_subreaper = compute_direct_impact(
+            100,
+            &graph,
+            Some(&subreaper_orphan),
+            &[300],
+            &Default::default(),
+        );
+        assert!(under_init.components.is_orphan);
+        assert!(under_subreaper.components.is_orphan);
+        assert!(
+            under_init.score > 0.0,
+            "shared resources still carry impact"
+        );
+        assert_eq!(under_init.score, under_subreaper.score);
+        assert_eq!(under_init.summary, under_subreaper.summary);
+    }
+
+    #[test]
+    fn supervised_and_unknown_init_children_receive_no_orphan_discount() {
+        let graph = SharedResourceGraph::from_evidence(&[(100, vec![listener_ev(100, 8080)])]);
+        let mut service = minimal_lineage(100, 1, true);
+        // Supervision takes precedence even when a worker retains another
+        // session, which by itself would look like an adopted orphan.
+        service.sid = 90;
+        let unknown = minimal_lineage(100, 1, false);
+        let config = DirectImpactConfig::default();
+        let without_discount = DirectImpactConfig {
+            orphan_discount: 1.0,
+            ..config.clone()
+        };
+        for lineage in [&service, &unknown] {
+            let result = compute_direct_impact(100, &graph, Some(lineage), &[], &config);
+            let undiscounted =
+                compute_direct_impact(100, &graph, Some(lineage), &[], &without_discount);
+            assert!(!result.components.is_orphan);
+            assert_eq!(result.score, undiscounted.score);
+            assert!(!result.summary.contains("orphaned"));
+        }
+
+        let mut other_process = minimal_lineage(999, 1, false);
+        other_process.sid = 90;
+        let mismatched = compute_direct_impact(100, &graph, Some(&other_process), &[], &config);
+        let missing = compute_direct_impact(100, &graph, None, &[], &config);
+        assert!(!mismatched.components.is_orphan);
+        assert_eq!(mismatched.score, missing.score);
     }
 
     // ── Score bounds ──────────────────────────────────────────────────

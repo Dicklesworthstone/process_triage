@@ -32237,7 +32237,7 @@ fn build_process_explanation(
             "cpu_occupancy": cpu_occupancy,
             "io_active": io_active,
             "runtime_seconds": proc.elapsed.as_secs_f64(),
-            "is_orphan": proc.is_orphan(),
+            "is_orphan": score.orphaned,
             "has_tty": proc.has_tty(),
             "state": proc.state.to_string(),
         });

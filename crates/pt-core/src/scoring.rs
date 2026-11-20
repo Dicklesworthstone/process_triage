@@ -256,6 +256,9 @@ fn age_gated_signature(
 pub struct ProcessScore<'a> {
     pub posterior: PosteriorResult,
     pub ledger: EvidenceLedger,
+    /// The orphan fact actually scored, after reconciling snapshot and lineage
+    /// observations. Explanations must not recompute it from PPID alone.
+    pub orphaned: Option<bool>,
     /// Identity-bound windowed activity, including reasons for missing signals.
     /// None when no window was requested; then snapshot CPU remains the input.
     pub activity: Option<ProcessActivity>,
@@ -299,6 +302,7 @@ pub struct ProcessScore<'a> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScoringObservations {
     pub pid: u32,
+    pub ppid: u32,
     pub start_id: pt_common::StartId,
     pub uid: u32,
     // Explicit null is meaningful; omitted fields are incomplete recordings.
@@ -328,6 +332,7 @@ pub struct ScoringObservations {
 impl ScoringObservations {
     pub fn matches_record(&self, process: &ProcessRecord) -> bool {
         self.pid == process.pid.0
+            && self.ppid == process.ppid.0
             && self.start_id == process.start_id
             && self.uid == process.uid
             && self.pgid == process.pgid
@@ -1117,6 +1122,7 @@ impl Scorer {
     ) -> ScoringObservations {
         ScoringObservations {
             pid: process.pid.0,
+            ppid: process.ppid.0,
             start_id: process.start_id.clone(),
             uid: process.uid,
             pgid: process.pgid,
@@ -1133,7 +1139,10 @@ impl Scorer {
             provenance: self
                 .provenance
                 .as_ref()
-                .filter(|bundle| bundle.lineages.contains_key(&process.pid.0))
+                .filter(|bundle| {
+                    bundle.lineages.contains_key(&process.pid.0)
+                        || bundle.lineage_unavailable.contains_key(&process.pid.0)
+                })
                 .map(|bundle| derive_provenance_adjustment(process.pid.0, bundle)),
         }
     }
@@ -1179,6 +1188,31 @@ impl Scorer {
             // says nothing about abandonment.
             evidence.tty = None;
         }
+
+        #[cfg(target_os = "linux")]
+        let provenance = observations.provenance.map(|mut adjustment| {
+            if desktop_app.is_some() {
+                // Desktop-application ownership is the more specific ownership
+                // fact, as it is for the other lineage ownership terms below.
+                adjustment
+                    .evidence_terms
+                    .retain(|term| !term.feature.starts_with("provenance_ownership_"));
+            } else {
+                // A job adopted by systemd --user has PPID != 1. Its normalized
+                // lineage resolves the same orphan fact as reparenting to init;
+                // it must not coexist with the snapshot's orphan=false term.
+                // Recognized supervision can likewise disprove a snapshot-only
+                // orphan guess. Unknown lineage does not invent either verdict.
+                if let Some(orphaned) = adjustment.orphaned {
+                    evidence.orphan = Some(orphaned);
+                }
+                adjustment
+                    .evidence_terms
+                    .retain(|term| term.feature != "provenance_ownership_orphaned");
+            }
+            adjustment
+        });
+        let orphaned = evidence.orphan;
 
         let mut match_ctx = ProcessMatchContext::with_comm(&proc.comm);
         if !proc.cmd.is_empty() {
@@ -1279,22 +1313,7 @@ impl Scorer {
         #[cfg(target_os = "linux")]
         // Only processes the provenance was collected for: an empty lineage would read
         // as "nothing depends on it" and push toward abandoned.
-        let provenance = observations.provenance.map(|mut adjustment| {
-            // The base `orphan` term already carries "reparented to init"; counting the
-            // lineage's orphaned verdict again double-counts one fact under naive Bayes.
-            // Keep it only when it adds information (lineage sees an orphan that the
-            // base check does not, e.g. reparented to a user subreaper).
-            if proc.is_orphan() {
-                adjustment
-                    .evidence_terms
-                    .retain(|t| t.feature != "provenance_ownership_orphaned");
-            }
-            // Desktop-application ownership is the more specific ownership fact.
-            if desktop_app.is_some() {
-                adjustment
-                    .evidence_terms
-                    .retain(|t| !t.feature.starts_with("provenance_ownership_"));
-            }
+        let provenance = provenance.map(|adjustment| {
             provenance::apply_adjustment(pid, &adjustment, &mut posterior, &mut ledger);
             adjustment
         });
@@ -1413,6 +1432,7 @@ impl Scorer {
         Some(ProcessScore {
             posterior,
             ledger,
+            orphaned,
             activity,
             prior_source,
             signature,
@@ -1434,6 +1454,7 @@ impl Scorer {
 
 #[cfg(target_os = "linux")]
 mod provenance {
+    use serde::Deserialize;
     use std::collections::HashMap;
 
     use pt_common::{
@@ -1441,6 +1462,7 @@ mod provenance {
         ProvenanceFeatureInput, ProvenanceRedactionState, RawLineageEvidence,
     };
 
+    use crate::action::{IdentityProvider, LiveIdentityProvider};
     use crate::collect::network_resource_collector::collect_fd_ipc_resources_with_runner;
     use crate::collect::resource_collector::{
         collect_local_resource_evidence_with_runner, resource_probe_runner,
@@ -1462,6 +1484,8 @@ mod provenance {
     pub struct ProvenanceInferenceBundle {
         pub resource_graph: SharedResourceGraph,
         pub lineages: HashMap<u32, RawLineageEvidence>,
+        /// Lineage could not be bound to the scanned process incarnation.
+        pub lineage_unavailable: HashMap<u32, String>,
         pub children: HashMap<u32, Vec<u32>>,
         /// Failed network observations are not empty resource inventories.
         pub network_errors: HashMap<u32, String>,
@@ -1472,6 +1496,11 @@ mod provenance {
     /// Provenance-derived evidence terms and confidence caveats for one process.
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
     pub struct ProvenanceScoreAdjustment {
+        /// Normalized lineage's orphan verdict. Unknown/missing lineage is null,
+        /// not evidence that a parent is alive. Required in recorded observations
+        /// so an incomplete capture cannot silently acquire a negative verdict.
+        #[serde(deserialize_with = "Option::deserialize")]
+        pub orphaned: Option<bool>,
         pub evidence_terms: Vec<EvidenceTerm>,
         pub evidence_completeness: f64,
         pub confidence_penalty_steps: usize,
@@ -1511,14 +1540,57 @@ mod provenance {
         }
     }
 
+    /// Read ancestry only while the original process identity remains valid.
+    /// Resource collectors have separate validation and availability reporting.
+    pub(super) fn collect_bound_lineage(
+        process: &ProcessRecord,
+        identity_provider: &dyn IdentityProvider,
+        collect: impl FnOnce(u32) -> RawLineageEvidence,
+    ) -> Result<RawLineageEvidence, &'static str> {
+        let quality = match super::agent_start_parts(process) {
+            Some(("unknown" | "synthetic", _)) => pt_common::IdentityQuality::NoBootId,
+            Some(_) => pt_common::IdentityQuality::Full,
+            None => pt_common::IdentityQuality::PidOnly,
+        };
+        let identity = pt_common::ProcessIdentity::full(
+            process.pid.0,
+            process.start_id.clone(),
+            process.uid,
+            process.pgid,
+            process.sid,
+            quality,
+        );
+        if !identity.can_safely_revalidate() {
+            return Err("process birth identity is unavailable for lineage collection");
+        }
+        if !matches!(identity_provider.revalidate(&identity), Ok(true)) {
+            return Err("identity changed or unavailable before lineage collection");
+        }
+        let lineage = collect(process.pid.0);
+        if !matches!(identity_provider.revalidate(&identity), Ok(true)) {
+            return Err("identity changed or unavailable during lineage collection");
+        }
+        if lineage.pid != process.pid.0
+            || lineage.ppid != process.ppid.0
+            || lineage.uid != process.uid
+            || process.pgid.is_some_and(|pgid| pgid != lineage.pgid)
+            || process.sid.is_some_and(|sid| sid != lineage.sid)
+        {
+            return Err("lineage PID, parent, owner, or session differs from scan");
+        }
+        Ok(lineage)
+    }
+
     /// Collect lineage and shared-resource evidence for `processes`.
     pub fn build_provenance_bundle(processes: &[&ProcessRecord]) -> ProvenanceInferenceBundle {
         let mut lineages = HashMap::new();
+        let mut lineage_unavailable = HashMap::new();
         let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
         let mut network_errors = HashMap::new();
         let mut per_process_resources: Vec<(u32, Vec<pt_common::RawResourceEvidence>)> = Vec::new();
         let mut all_resources = Vec::new();
         let resource_runner = resource_probe_runner();
+        let identity_provider = LiveIdentityProvider::new();
         let mut resource_unavailable = HashMap::new();
         // One socket-table snapshot for the whole scan (was re-parsed per process).
         let network_snapshot = if processes.is_empty() {
@@ -1530,7 +1602,14 @@ mod provenance {
         for proc in processes {
             let pid = proc.pid.0;
             children.entry(proc.ppid.0).or_default().push(pid);
-            lineages.insert(pid, collect_lineage_for_pid(pid));
+            match collect_bound_lineage(proc, &identity_provider, collect_lineage_for_pid) {
+                Ok(lineage) => {
+                    lineages.insert(pid, lineage);
+                }
+                Err(reason) => {
+                    lineage_unavailable.insert(pid, reason.to_string());
+                }
+            }
 
             let fd_info = parse_fd(pid);
             let mut resources = collect_local_resource_evidence_with_runner(
@@ -1589,6 +1668,7 @@ mod provenance {
         ProvenanceInferenceBundle {
             resource_graph,
             lineages,
+            lineage_unavailable,
             children,
             network_errors,
             resource_unavailable,
@@ -1641,6 +1721,13 @@ mod provenance {
     ) -> ProvenanceScoreAdjustment {
         let lineage = bundle.lineages.get(&pid);
         let normalized_lineage = lineage.map(normalize_lineage);
+        let orphaned = normalized_lineage
+            .as_ref()
+            .and_then(|lineage| match &lineage.ownership {
+                OwnershipState::Unknown => None,
+                OwnershipState::Orphaned => Some(true),
+                _ => Some(false),
+            });
         let child_pids = bundle
             .children
             .get(&pid)
@@ -1751,7 +1838,13 @@ mod provenance {
             confidence_penalty_steps += 1;
         }
         if lineage.is_none() {
-            confidence_notes.push("missing lineage provenance".to_string());
+            confidence_notes.push(
+                bundle
+                    .lineage_unavailable
+                    .get(&pid)
+                    .map(|reason| format!("lineage unavailable: {reason}"))
+                    .unwrap_or_else(|| "missing lineage provenance".to_string()),
+            );
             confidence_penalty_steps += 1;
         }
         if unresolved_resources > 0 {
@@ -1864,6 +1957,7 @@ mod provenance {
         }
 
         ProvenanceScoreAdjustment {
+            orphaned,
             evidence_terms,
             evidence_completeness,
             confidence_penalty_steps: confidence_penalty_steps.min(3),
@@ -3094,13 +3188,11 @@ mod tests {
             actual.activity.as_ref().unwrap().cpu_occupancy_fraction(),
             Some(1.0)
         );
-        assert!(
-            actual
-                .ledger
-                .top_evidence
-                .iter()
-                .any(|line| line.contains("CPU occupancy 100.00%") && line.contains("0.100"))
-        );
+        assert!(actual
+            .ledger
+            .top_evidence
+            .iter()
+            .any(|line| line.contains("CPU occupancy 100.00%") && line.contains("0.100")));
     }
 
     #[test]
@@ -3930,6 +4022,325 @@ mod provenance_tests {
             features.contains("provenance_ownership_orphaned"),
             "{features}"
         );
+    }
+
+    fn adopted_job(ppid: u32) -> (ProcessRecord, RawLineageEvidence) {
+        let process = crate::mock_process::MockProcessBuilder::new()
+            .pid(500)
+            .ppid(ppid)
+            .pgid(450)
+            .sid(450)
+            .comm("worker")
+            .cmd("worker --job")
+            .elapsed(Duration::from_secs(7200))
+            .build();
+        let mut observed = lineage(500, ppid, None);
+        observed.pgid = 450;
+        observed.sid = 450;
+        observed.ancestors = vec![AncestorEntry {
+            pid: ppid,
+            comm: "systemd".to_string(),
+            uid: if ppid == 1 { 0 } else { process.uid },
+        }];
+        (process, observed)
+    }
+
+    fn scorer_with_lineage(observed: RawLineageEvidence) -> Scorer {
+        let mut scorer = Scorer::new(
+            Priors::default(),
+            DecisionStore::default(),
+            SignatureDatabase::new(),
+            FastPathConfig::disabled(),
+        );
+        scorer.provenance = Some(ProvenanceInferenceBundle {
+            lineages: HashMap::from([(observed.pid, observed)]),
+            ..Default::default()
+        });
+        scorer
+    }
+
+    #[test]
+    fn subreaper_orphan_scores_like_an_orphan_of_init() {
+        let mut init_posterior = None;
+        let mut init_blast_radius = None;
+        for ppid in [1, 2000] {
+            let (process, observed) = adopted_job(ppid);
+            let evidence = Evidence::from_snapshot(&process);
+            assert_eq!(evidence.orphan, Some(ppid == 1));
+            let mut scorer = scorer_with_lineage(observed);
+            scorer.provenance.as_mut().unwrap().resource_graph =
+                SharedResourceGraph::from_evidence(&[
+                    (500, vec![listener_ev(500, 8080)]),
+                    (
+                        600,
+                        vec![
+                            listener_ev(600, 8080),
+                            lock_ev(600, "/shared.lock", ResourceState::Active),
+                        ],
+                    ),
+                    (
+                        700,
+                        vec![lock_ev(700, "/shared.lock", ResourceState::Active)],
+                    ),
+                ]);
+            let score = scorer
+                .score_with_desktop(&process, evidence, None)
+                .expect("the same adopted job must score under either reaper");
+            assert_eq!(score.orphaned, Some(true));
+            assert_eq!(
+                score
+                    .posterior
+                    .evidence_terms
+                    .iter()
+                    .filter(|term| term.feature.contains("orphan"))
+                    .map(|term| term.feature.as_str())
+                    .collect::<Vec<_>>(),
+                ["orphan"],
+                "one orphan fact must produce exactly one likelihood"
+            );
+            assert_eq!(
+                score
+                    .ledger
+                    .bayes_factors
+                    .iter()
+                    .filter(|term| term.feature.contains("orphan"))
+                    .map(|term| term.feature.as_str())
+                    .collect::<Vec<_>>(),
+                ["orphan"],
+                "the explanation must not contain contradictory orphan facts"
+            );
+            assert!(!feature_names(score.provenance.as_ref().unwrap())
+                .contains(&"provenance_ownership_orphaned"));
+            let blast_radius = &score.provenance.as_ref().unwrap().blast_radius;
+            assert!(blast_radius.total_affected > 0);
+            assert!(blast_radius.direct.components.is_orphan);
+            if let Some(expected) = init_blast_radius {
+                assert_eq!(blast_radius.risk_score, expected);
+            } else {
+                init_blast_radius = Some(blast_radius.risk_score);
+            }
+            if let Some(expected) = &init_posterior {
+                assert_eq!(&score.posterior, expected);
+            } else {
+                init_posterior = Some(score.posterior.clone());
+            }
+        }
+    }
+
+    #[test]
+    fn recognized_supervision_resolves_snapshot_orphan_guess() {
+        for ppid in [1, 2000] {
+            let (process, mut observed) = adopted_job(ppid);
+            observed.supervisor = Some(SupervisorEvidence {
+                kind: SupervisorKind::Systemd,
+                unit_name: Some("worker.service".to_string()),
+                auto_restart: Some(true),
+                confidence: ProvenanceConfidence::High,
+            });
+            let scorer = scorer_with_lineage(observed);
+            let score = scorer
+                .score_with_desktop(&process, Evidence::from_snapshot(&process), None)
+                .unwrap();
+            assert_eq!(score.orphaned, Some(false));
+            let features = feature_names(score.provenance.as_ref().unwrap());
+            assert!(features.contains(&"provenance_ownership_supervised"));
+            assert!(!features.contains(&"provenance_ownership_orphaned"));
+            let orphan = score
+                .ledger
+                .bayes_factors
+                .iter()
+                .find(|term| term.feature == "orphan")
+                .unwrap();
+            assert!(orphan.log_bf < 0.0, "a supervised service is not abandoned");
+        }
+    }
+
+    #[test]
+    fn unknown_and_desktop_lineage_do_not_invent_orphanhood() {
+        let (process, mut observed) = adopted_job(2000);
+        observed.ancestors.clear();
+        let scorer = scorer_with_lineage(observed);
+        let score = scorer
+            .score_with_desktop(
+                &process,
+                Evidence {
+                    orphan: None,
+                    ..Evidence::from_snapshot(&process)
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(score.provenance.as_ref().unwrap().orphaned, None);
+        assert_eq!(score.orphaned, None);
+        assert!(!score
+            .posterior
+            .evidence_terms
+            .iter()
+            .any(|term| term.feature.contains("orphan")));
+        let attached = scorer
+            .score_with_desktop(&process, Evidence::from_snapshot(&process), None)
+            .unwrap();
+        assert_eq!(attached.orphaned, Some(false));
+
+        let (process, observed) = adopted_job(2000);
+        let scorer = scorer_with_lineage(observed);
+        let score = scorer
+            .score_with_desktop(
+                &process,
+                Evidence::from_snapshot(&process),
+                Some("app-worker.scope".to_string()),
+            )
+            .unwrap();
+        assert_eq!(score.orphaned, Some(false));
+        assert!(score.desktop_app_credited);
+        assert!(!score
+            .posterior
+            .evidence_terms
+            .iter()
+            .any(|term| term.feature.starts_with("provenance_ownership_")));
+    }
+
+    #[test]
+    fn recorded_orphan_verdict_replays_and_rejects_reused_identity() {
+        let (process, observed) = adopted_job(2000);
+        let mut scorer = scorer_with_lineage(observed);
+        let observations = scorer.recorded_observations(&process, None);
+        assert_eq!(
+            observations.provenance.as_ref().unwrap().orphaned,
+            Some(true)
+        );
+        let expected = scorer
+            .score_with_desktop(&process, Evidence::from_snapshot(&process), None)
+            .unwrap()
+            .ledger;
+        let encoded = serde_json::to_value(&observations).unwrap();
+        let restored: ScoringObservations = serde_json::from_value(encoded.clone()).unwrap();
+        scorer.provenance = None;
+        let replayed = scorer
+            .score_recorded(
+                &process,
+                Evidence::from_snapshot(&process),
+                restored.clone(),
+            )
+            .unwrap();
+        assert_eq!(replayed.orphaned, Some(true));
+        assert_eq!(replayed.ledger, expected);
+
+        let mut reused = process.clone();
+        reused.start_id = pt_common::StartId::from_linux("new-boot", 99, reused.pid.0);
+        assert!(scorer
+            .score_recorded(&reused, Evidence::from_snapshot(&reused), restored.clone())
+            .is_none());
+        let mut reparented = process.clone();
+        reparented.ppid = pt_common::ProcessId(3000);
+        assert!(scorer
+            .score_recorded(&reparented, Evidence::from_snapshot(&reparented), restored)
+            .is_none());
+
+        let mut incomplete = encoded;
+        incomplete["provenance"]
+            .as_object_mut()
+            .unwrap()
+            .remove("orphaned");
+        let error = serde_json::from_value::<ScoringObservations>(incomplete).unwrap_err();
+        assert!(error.to_string().contains("orphaned"));
+    }
+
+    #[test]
+    fn lineage_collection_requires_identity_before_and_after_reading() {
+        struct ObservedIdentity {
+            checks: std::cell::Cell<usize>,
+            valid: [bool; 2],
+        }
+        impl crate::action::IdentityProvider for ObservedIdentity {
+            fn revalidate(
+                &self,
+                _target: &pt_common::ProcessIdentity,
+            ) -> Result<bool, crate::action::ActionError> {
+                let index = self.checks.get();
+                self.checks.set(index + 1);
+                Ok(self.valid[index])
+            }
+        }
+        let (process, observed) = adopted_job(2000);
+        for valid in [[false, true], [true, false], [true, true]] {
+            let provider = ObservedIdentity {
+                checks: std::cell::Cell::new(0),
+                valid,
+            };
+            let collected = std::cell::Cell::new(false);
+            let result = provenance::collect_bound_lineage(&process, &provider, |_| {
+                collected.set(true);
+                observed.clone()
+            });
+            assert_eq!(collected.get(), valid[0]);
+            assert_eq!(provider.checks.get(), if valid[0] { 2 } else { 1 });
+            assert_eq!(result.is_ok(), valid[0] && valid[1]);
+        }
+
+        let identity = pt_common::ProcessIdentity::full(
+            process.pid.0,
+            process.start_id.clone(),
+            process.uid,
+            process.pgid,
+            process.sid,
+            pt_common::IdentityQuality::Full,
+        );
+        let provider = crate::action::StaticIdentityProvider::default().with_identity(identity);
+        for field in ["pid", "ppid", "uid", "pgid", "sid"] {
+            let mut changed = observed.clone();
+            match field {
+                "pid" => changed.pid += 1,
+                "ppid" => changed.ppid += 1,
+                "uid" => changed.uid += 1,
+                "pgid" => changed.pgid += 1,
+                "sid" => changed.sid += 1,
+                _ => unreachable!(),
+            }
+            let result = provenance::collect_bound_lineage(&process, &provider, |_| changed);
+            assert!(result.is_err(), "changed {field} must not supply ancestry");
+        }
+        let mut unbound = process.clone();
+        unbound.start_id = pt_common::StartId("unknown".to_string());
+        let provider = ObservedIdentity {
+            checks: std::cell::Cell::new(0),
+            valid: [true, true],
+        };
+        assert!(provenance::collect_bound_lineage(&unbound, &provider, |_| {
+            panic!("an unbound PID must not supply ancestry")
+        })
+        .is_err());
+        assert_eq!(provider.checks.get(), 0);
+    }
+
+    #[test]
+    fn unavailable_lineage_is_recorded_without_erasing_resource_observations() {
+        let (process, observed) = adopted_job(2000);
+        let mut scorer = scorer_with_lineage(observed);
+        let bundle = scorer.provenance.as_mut().unwrap();
+        bundle.lineages.clear();
+        bundle.lineage_unavailable.insert(
+            process.pid.0,
+            "identity changed or unavailable during lineage collection".to_string(),
+        );
+        bundle.resource_graph = SharedResourceGraph::from_evidence(&[(
+            process.pid.0,
+            vec![listener_ev(process.pid.0, 8080)],
+        )]);
+        let score = scorer
+            .score_with_desktop(&process, Evidence::from_snapshot(&process), None)
+            .unwrap();
+        let adjustment = score.provenance.as_ref().unwrap();
+        assert_eq!(adjustment.orphaned, None);
+        assert!(feature_names(adjustment).contains(&"provenance_active_listener"));
+        assert!(!feature_names(adjustment)
+            .iter()
+            .any(|feature| feature.starts_with("provenance_ownership_")));
+        assert!(adjustment
+            .confidence_notes
+            .iter()
+            .any(|note| note.contains("identity changed or unavailable")));
+        assert!(adjustment.confidence_penalty_steps > 0);
     }
 
     #[test]
