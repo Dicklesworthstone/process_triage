@@ -30535,7 +30535,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
 
         if let Some(ref mut recorder) = shadow_recorder {
             match recorder.record_candidate(proc, posterior, ledger, &decision_outcome) {
-                Ok(()) => shadow_recorded = shadow_recorded.saturating_add(1),
+                Ok(()) => shadow_recorded = recorder.recorded_count(),
                 Err(err) => {
                     eprintln!(
                         "shadow mode: failed to record observation for pid {}: {:?}",

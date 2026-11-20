@@ -515,7 +515,7 @@ impl ValidationEngine {
         // prediction. Verdicts precede equal-time predictions: a label must be
         // strictly later than the prediction it evaluates.
         ordered.sort_by_key(|(at, order, _, _)| (*at, *order));
-        let mut latest_predictions = HashMap::new();
+        let mut latest_predictions: HashMap<(String, u32), usize> = HashMap::new();
         let mut verdict_identities = HashSet::new();
 
         for (_, _, obs, event) in ordered {
@@ -552,6 +552,37 @@ impl ValidationEngine {
             }
 
             if let Some(exit_event) = event {
+                if obs.belief.recommendation == "observed_exit" {
+                    // Kernel exit observations are events, not predictions.
+                    // They may refine a prior disappearance, but neither a
+                    // successful exit nor a signal is a human verdict.
+                    let Some(&index) = latest_predictions.get(&key) else {
+                        continue;
+                    };
+                    let record: &mut ValidationRecord = &mut engine.records[index];
+                    if record.predicted_at >= exit_event.timestamp {
+                        continue;
+                    }
+                    let (truth, code, signal, source) = map_exit_event(exit_event);
+                    record.exit_code = code.or(record.exit_code);
+                    record.exit_signal = signal.or(record.exit_signal);
+                    if record.ground_truth.is_none()
+                        || record.ground_truth == Some(GroundTruth::Vanished)
+                    {
+                        record.ground_truth = Some(truth);
+                        record.resolved_at = Some(exit_event.timestamp);
+                        record.outcome_source = source;
+                    }
+                    continue;
+                }
+                if latest_predictions
+                    .get(&key)
+                    .is_some_and(|&index| engine.records[index].ground_truth.is_some())
+                {
+                    // Repeated or later censored exit observations cannot
+                    // manufacture another prediction after a known outcome.
+                    continue;
+                }
                 if !engine.has_unresolved_identity(&obs.identity_hash, obs.pid) {
                     let comm = extract_comm_from_events(&obs.events)
                         .unwrap_or_else(|| "unknown".to_string());
@@ -2282,6 +2313,76 @@ mod tests {
             map_exit_event(&event(serde_json::json!({"reason": "missing"}))).0,
             GroundTruth::Vanished
         );
+    }
+
+    #[test]
+    fn observed_kernel_exit_refines_censoring_without_creating_predictions_or_labels() {
+        let at = Utc::now();
+        let prediction = human_label_prediction(at, 100, "worker", 0.8);
+        let make_exit = |seconds: i64, observed: bool, details: JsonValue| {
+            let timestamp = at + Duration::seconds(seconds);
+            Observation {
+                timestamp,
+                pid: 100,
+                identity_hash: "worker".to_string(),
+                state: StateSnapshot::default(),
+                events: vec![ProcessEvent {
+                    timestamp,
+                    event_type: EventType::ProcessExit,
+                    details: Some(details.to_string()),
+                }],
+                belief: BeliefState {
+                    recommendation: if observed { "observed_exit" } else { "keep" }.to_string(),
+                    ..BeliefState::default()
+                },
+            }
+        };
+        let early_missing = make_exit(1, false, serde_json::json!({"reason": "missing"}));
+        let observed = make_exit(
+            2,
+            true,
+            serde_json::json!({
+                "reason": "observed_zombie", "source": "proc_stat", "exit_code": 7,
+            }),
+        );
+        let late_missing = make_exit(3, false, serde_json::json!({"reason": "missing"}));
+        for with_early_missing in [false, true] {
+            let mut observations = vec![prediction.clone(), observed.clone(), late_missing.clone()];
+            if with_early_missing {
+                observations.push(early_missing.clone());
+            }
+            let engine = ValidationEngine::from_shadow_observations(&observations, 0.5);
+            assert_eq!(engine.records().len(), 1);
+            let record = &engine.records()[0];
+            assert_eq!(record.ground_truth, Some(GroundTruth::Crash));
+            assert_eq!(record.exit_code, Some(7));
+            assert_eq!(
+                record.outcome_source.as_deref(),
+                Some("shadow:observed_zombie")
+            );
+            assert!((record.predicted_abandoned - 0.8).abs() < 1e-6);
+            let report = engine.compute_report().unwrap();
+            assert_eq!(report.unlabeled_outcomes, 1);
+            assert_eq!((report.positive_labels, report.negative_labels), (0, 0));
+            assert!(report.metrics.is_none());
+        }
+        assert!(
+            ValidationEngine::from_shadow_observations(&[observed.clone()], 0.5)
+                .records()
+                .is_empty(),
+            "an observed exit cannot invent an earlier prediction"
+        );
+        let label = human_label_observation(at + Duration::seconds(1), 100, "worker", "spare");
+        let engine = ValidationEngine::from_shadow_observations(
+            &[prediction, label, observed, late_missing],
+            0.5,
+        );
+        assert_eq!(engine.records().len(), 1);
+        let record = &engine.records()[0];
+        assert_eq!(record.ground_truth, Some(GroundTruth::UserSpared));
+        assert_eq!(record.exit_code, Some(7));
+        assert_eq!(record.outcome_source.as_deref(), Some("human:agent_label"));
+        assert_eq!(record.resolved_at, Some(at + Duration::seconds(1)));
     }
 
     fn shadow_exit_observation(

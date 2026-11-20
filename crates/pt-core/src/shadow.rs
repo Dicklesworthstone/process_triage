@@ -141,6 +141,22 @@ struct PendingObservation {
     belief: BeliefState,
     state: StateSnapshot,
     comm: String,
+    /// The live command line disappears when a process becomes a zombie. Keep
+    /// its birth and owner separately so its exit still joins the earlier
+    /// prediction instead of a new hash of an empty command line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity: Option<ProcessIdentity>,
+    #[serde(default)]
+    exit_recorded: bool,
+}
+
+/// Kernel-observed termination, not a judgment that the process was abandoned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ObservedExit {
+    wait_status: i32,
+    exit_code: Option<i32>,
+    exit_signal: Option<i32>,
+    core_dumped: bool,
 }
 
 /// Records shadow observations into local storage.
@@ -148,6 +164,7 @@ pub struct ShadowRecorder {
     storage: ShadowStorage,
     recorded: u64,
     pending: HashMap<String, PendingObservation>,
+    latest_pending_by_pid: HashMap<u32, String>,
     seen_identities: HashSet<String>,
     seen_pids: HashMap<u32, String>,
     pending_path: PathBuf,
@@ -170,10 +187,24 @@ impl ShadowRecorder {
                 HashMap::new()
             }
         };
+        let mut latest: HashMap<u32, &PendingObservation> = HashMap::new();
+        for entry in pending.values() {
+            let previous = latest.entry(entry.pid).or_insert(entry);
+            if (entry.last_seen, &entry.identity_hash)
+                > (previous.last_seen, &previous.identity_hash)
+            {
+                *previous = entry;
+            }
+        }
+        let latest_pending_by_pid = latest
+            .into_iter()
+            .map(|(pid, entry)| (pid, entry.identity_hash.clone()))
+            .collect();
         Ok(Self {
             storage,
             recorded: 0,
             pending,
+            latest_pending_by_pid,
             seen_identities: HashSet::new(),
             seen_pids: HashMap::new(),
             pending_path,
@@ -190,6 +221,9 @@ impl ShadowRecorder {
         decision: &DecisionOutcome,
     ) -> Result<(), ShadowRecordError> {
         self.had_records = true;
+        if proc.state.is_zombie() {
+            return self.record_zombie_exit(proc);
+        }
         let identity_hash = compute_identity_hash(proc);
         let state_char = proc.state.to_string().chars().next().unwrap_or('?');
         let score = (posterior.abandonment_probability() * 100.0) as f32;
@@ -248,6 +282,8 @@ impl ShadowRecorder {
 
         self.seen_identities.insert(identity_hash.clone());
         self.seen_pids.insert(proc.pid.0, identity_hash.clone());
+        self.latest_pending_by_pid
+            .insert(proc.pid.0, identity_hash.clone());
         self.pending.insert(
             identity_hash.clone(),
             PendingObservation {
@@ -258,8 +294,111 @@ impl ShadowRecorder {
                 belief,
                 state,
                 comm: proc.comm.clone(),
+                identity: Some(ProcessIdentity::new(
+                    proc.pid.0,
+                    proc.start_id.clone(),
+                    proc.uid,
+                )),
+                exit_recorded: false,
             },
         );
+        Ok(())
+    }
+
+    /// Record an observed exit once, keeping it associated with the last live
+    /// prediction even though /proc no longer supplies its command line. A
+    /// terminal-only observation deliberately carries no model prediction.
+    fn record_zombie_exit(&mut self, proc: &ProcessRecord) -> Result<(), ShadowRecordError> {
+        self.record_zombie_exit_with(proc, observe_zombie_exit)
+    }
+
+    fn record_zombie_exit_with(
+        &mut self,
+        proc: &ProcessRecord,
+        observe: impl FnOnce(&ProcessRecord) -> Option<ObservedExit>,
+    ) -> Result<(), ShadowRecordError> {
+        let identity = ProcessIdentity::new(proc.pid.0, proc.start_id.clone(), proc.uid);
+        let previous = self
+            .latest_pending_by_pid
+            .get(&proc.pid.0)
+            .and_then(|hash| self.pending.get(hash))
+            .filter(|entry| {
+                entry
+                    .identity
+                    .as_ref()
+                    .is_some_and(|recorded| recorded.matches(&identity))
+            })
+            .cloned();
+        if let Some(entry) = previous.as_ref().filter(|entry| entry.exit_recorded) {
+            self.seen_identities.insert(entry.identity_hash.clone());
+            self.seen_pids
+                .insert(proc.pid.0, entry.identity_hash.clone());
+            return Ok(());
+        }
+        let Some(exit) = observe(proc) else {
+            // The leader may be a zombie before its remaining threads exit,
+            // or its exit evidence may temporarily be unreadable. Neither
+            // permits a new prediction from the zombie's empty command line.
+            // Preserve the last live prediction until a trusted exit arrives.
+            if let Some(entry) = previous {
+                self.seen_identities.insert(entry.identity_hash.clone());
+                self.seen_pids.insert(proc.pid.0, entry.identity_hash);
+            }
+            return Ok(());
+        };
+        let now = Utc::now();
+        let mut pending = previous.unwrap_or_else(|| PendingObservation {
+            identity_hash: compute_identity_hash(proc),
+            pid: proc.pid.0,
+            last_seen: now,
+            miss_count: 0,
+            belief: BeliefState::default(),
+            state: StateSnapshot::default(),
+            comm: proc.comm.clone(),
+            identity: Some(identity),
+            exit_recorded: false,
+        });
+        let details = serde_json::json!({
+            "reason": "observed_zombie",
+            "source": "proc_stat",
+            "comm": pending.comm,
+            "wait_status": exit.wait_status,
+            "exit_code": exit.exit_code,
+            "exit_signal": exit.exit_signal,
+            "core_dumped": exit.core_dumped,
+        });
+        let mut state = pending.state.clone();
+        state.state_char = 'Z';
+        self.storage.record(Observation {
+            timestamp: now,
+            pid: proc.pid.0,
+            identity_hash: pending.identity_hash.clone(),
+            state,
+            events: vec![ProcessEvent {
+                timestamp: now,
+                event_type: EventType::ProcessExit,
+                details: Some(details.to_string()),
+            }],
+            belief: BeliefState {
+                p_abandoned: 0.0,
+                p_legitimate: 0.0,
+                p_zombie: 0.0,
+                p_useful_but_bad: 0.0,
+                confidence: 0.0,
+                score: 0.0,
+                recommendation: "observed_exit".to_string(),
+            },
+        })?;
+        self.recorded = self.recorded.saturating_add(1);
+        pending.last_seen = now;
+        pending.miss_count = 0;
+        pending.exit_recorded = true;
+        self.seen_identities.insert(pending.identity_hash.clone());
+        self.seen_pids
+            .insert(proc.pid.0, pending.identity_hash.clone());
+        self.latest_pending_by_pid
+            .insert(proc.pid.0, pending.identity_hash.clone());
+        self.pending.insert(pending.identity_hash.clone(), pending);
         Ok(())
     }
 
@@ -298,7 +437,20 @@ impl ShadowRecorder {
         }
 
         for entry in resolved {
+            // A filtered/incomplete scan is not proof that a previously
+            // observed zombie has been reaped. Keep its deduplication marker
+            // until its full incarnation is actually gone or replaced.
+            if entry.exit_recorded && !observed_exit_target_gone(&entry) {
+                continue;
+            }
             self.pending.remove(&entry.identity_hash);
+            if self.latest_pending_by_pid.get(&entry.pid) == Some(&entry.identity_hash) {
+                self.latest_pending_by_pid.remove(&entry.pid);
+            }
+            if entry.exit_recorded {
+                // Never replace a known wait status with a later "missing".
+                continue;
+            }
             let reuse = self
                 .seen_pids
                 .get(&entry.pid)
@@ -334,6 +486,200 @@ impl ShadowRecorder {
         self.had_records = false;
         Ok(())
     }
+}
+
+#[cfg(target_os = "linux")]
+fn observe_zombie_exit(proc: &ProcessRecord) -> Option<ObservedExit> {
+    let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    observe_zombie_exit_from(proc, std::path::Path::new("/proc"), boot_id.trim(), || {})
+}
+
+#[cfg(not(target_os = "linux"))]
+fn observe_zombie_exit(_proc: &ProcessRecord) -> Option<ObservedExit> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn recorded_linux_birth(identity: &ProcessIdentity, boot_id: &str) -> Option<u64> {
+    if boot_id.is_empty() || boot_id == "unknown" || identity.pid.0 == 0 {
+        return None;
+    }
+    let mut parts = identity.start_id.0.split(':');
+    if parts.next()? != boot_id {
+        return None;
+    }
+    let ticks = parts.next()?.parse::<u64>().ok()?;
+    let pid = parts.next()?.parse::<u32>().ok()?;
+    (parts.next().is_none() && ticks > 0 && pid == identity.pid.0).then_some(ticks)
+}
+
+#[cfg(target_os = "linux")]
+fn observe_zombie_exit_from(
+    proc: &ProcessRecord,
+    proc_root: &std::path::Path,
+    boot_id: &str,
+    between_reads: impl FnOnce(),
+) -> Option<ObservedExit> {
+    if !proc.state.is_zombie() {
+        return None;
+    }
+    let identity = ProcessIdentity::new(proc.pid.0, proc.start_id.clone(), proc.uid);
+    let ticks = recorded_linux_birth(&identity, boot_id)?;
+    let directory = proc_root.join(proc.pid.0.to_string());
+    // stat's exit_code is [PT]: failed ptrace access silently reports zero.
+    // Namespace readlink uses the same PTRACE_MODE_READ_FSCREDS check, and
+    // unlike a zero stat field, fails explicitly. The user namespace remains
+    // available for a zombie even after its other namespaces have gone.
+    let namespace = fs::read_link(directory.join("ns/user")).ok()?;
+    let before = fs::read_to_string(directory.join("stat")).ok()?;
+    let exit = parse_zombie_exit_stat(&before, proc.pid.0, ticks)?;
+    zombie_owner_and_threads(
+        &fs::read_to_string(directory.join("status")).ok()?,
+        proc.uid,
+    )?;
+    between_reads();
+    if fs::read_link(directory.join("ns/user")).ok()? != namespace {
+        return None;
+    }
+    zombie_owner_and_threads(
+        &fs::read_to_string(directory.join("status")).ok()?,
+        proc.uid,
+    )?;
+    let after = fs::read_to_string(directory.join("stat")).ok()?;
+    (parse_zombie_exit_stat(&after, proc.pid.0, ticks)? == exit).then_some(exit)
+}
+
+#[cfg(target_os = "linux")]
+fn zombie_owner_and_threads(status: &str, expected_uid: u32) -> Option<()> {
+    let mut uid = None;
+    let mut threads = None;
+    for line in status.lines() {
+        if let Some(value) = line.strip_prefix("Uid:") {
+            if uid.is_some() {
+                return None;
+            }
+            let values = value
+                .split_whitespace()
+                .map(str::parse::<u32>)
+                .collect::<Result<Vec<_>, _>>()
+                .ok()?;
+            if values.len() != 4 {
+                return None;
+            }
+            uid = values.first().copied();
+        } else if let Some(value) = line.strip_prefix("Threads:") {
+            if threads.is_some() {
+                return None;
+            }
+            threads = Some(value.trim().parse::<u32>().ok()?);
+        }
+    }
+    // A zombie group leader may still have running threads. Its thread exit
+    // status does not establish that the process has terminated.
+    (uid == Some(expected_uid) && threads == Some(1)).then_some(())
+}
+
+#[cfg(target_os = "linux")]
+fn parse_zombie_exit_stat(content: &str, pid: u32, ticks: u64) -> Option<ObservedExit> {
+    let open = content.find('(')?;
+    let close = content.rfind(')')?;
+    if close < open || content[..open].trim().parse::<u32>().ok()? != pid {
+        return None;
+    }
+    let fields: Vec<_> = content[close + 1..].split_whitespace().collect();
+    // Field 3 is state, 22 is starttime, and 52 is the wait status. Field 38
+    // is the signal sent to the parent, NOT the terminating signal.
+    if fields.first() != Some(&"Z") || fields.get(19)?.parse::<u64>().ok()? != ticks {
+        return None;
+    }
+    let wait_status = fields.get(49)?.parse::<u16>().ok()? as i32;
+    if libc::WIFEXITED(wait_status) && wait_status & 0xff == 0 {
+        Some(ObservedExit {
+            wait_status,
+            exit_code: Some(libc::WEXITSTATUS(wait_status)),
+            exit_signal: None,
+            core_dumped: false,
+        })
+    } else if libc::WIFSIGNALED(wait_status)
+        && wait_status & 0xff00 == 0
+        && (1..=libc::SIGRTMAX()).contains(&libc::WTERMSIG(wait_status))
+    {
+        Some(ObservedExit {
+            wait_status,
+            exit_code: None,
+            exit_signal: Some(libc::WTERMSIG(wait_status)),
+            core_dumped: libc::WCOREDUMP(wait_status),
+        })
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn observed_exit_target_gone(entry: &PendingObservation) -> bool {
+    let Some(identity) = &entry.identity else {
+        return false;
+    };
+    let Ok(boot_id) = fs::read_to_string("/proc/sys/kernel/random/boot_id") else {
+        return false;
+    };
+    observed_exit_target_gone_with(
+        identity,
+        boot_id.trim(),
+        |pid| crate::collect::proc_parsers::read_required_proc_stat(pid).map(|stat| stat.starttime),
+        |pid| {
+            let Ok(pid) = libc::pid_t::try_from(pid) else {
+                return false;
+            };
+            if pid <= 0 {
+                return false;
+            }
+            // A procfs mount from another PID namespace can make ESRCH refer
+            // to a different process table, not the recorded incarnation.
+            if crate::action::signal::ensure_action_pid_namespace().is_err() {
+                return false;
+            }
+            // SAFETY: signal zero probes only this validated positive PID.
+            let result = unsafe { libc::kill(pid, 0) };
+            result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        },
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn observed_exit_target_gone_with(
+    identity: &ProcessIdentity,
+    current_boot: &str,
+    read_birth: impl FnOnce(u32) -> Result<u64, crate::collect::proc_parsers::StatReadError>,
+    probe_absent: impl FnOnce(u32) -> bool,
+) -> bool {
+    if current_boot.is_empty() || current_boot == "unknown" {
+        return false;
+    }
+    let Some(recorded_boot) = identity.start_id.0.split(':').next() else {
+        return false;
+    };
+    let Some(ticks) = recorded_linux_birth(identity, recorded_boot) else {
+        return false;
+    };
+    if recorded_boot != current_boot {
+        // A fully identified process from an earlier boot cannot survive it.
+        return true;
+    }
+    match read_birth(identity.pid.0) {
+        Ok(current_ticks) => current_ticks != ticks,
+        Err(crate::collect::proc_parsers::StatReadError::Read { source, .. }) => {
+            // hidepid and changing procfs visibility can also produce ENOENT.
+            // Only an independent ESRCH permits retiring the terminal marker.
+            source.kind() == std::io::ErrorKind::NotFound && probe_absent(identity.pid.0)
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn observed_exit_target_gone(_entry: &PendingObservation) -> bool {
+    false
 }
 
 fn action_to_recommendation(action: Action) -> &'static str {
@@ -541,6 +887,8 @@ mod tests {
                 belief: BeliefState::default(),
                 state: StateSnapshot::default(),
                 comm: "sleep".to_string(),
+                identity: None,
+                exit_recorded: false,
             },
         );
 
@@ -662,6 +1010,398 @@ mod tests {
             belief: BeliefState::default(),
             state: StateSnapshot::default(),
             comm: comm.to_string(),
+            identity: None,
+            exit_recorded: false,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn zombie_stat(pid: u32, ticks: u64, wait_status: &str) -> String {
+        let mut fields = vec!["0".to_string(); 50];
+        fields[0] = "Z".to_string();
+        fields[19] = ticks.to_string();
+        fields[35] = libc::SIGCHLD.to_string();
+        fields[49] = wait_status.to_string();
+        format!("{pid} (worker (exit) probe) {}\n", fields.join(" "))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn zombie_wait_status_distinguishes_exit_signal_and_nonterminal_states() {
+        for (raw, code, signal, core) in [
+            (0, Some(0), None, false),
+            (7 << 8, Some(7), None, false),
+            (255 << 8, Some(255), None, false),
+            (libc::SIGTERM, None, Some(libc::SIGTERM), false),
+            (libc::SIGSEGV | 0x80, None, Some(libc::SIGSEGV), true),
+        ] {
+            let status = parse_zombie_exit_stat(&zombie_stat(42, 123, &raw.to_string()), 42, 123)
+                .expect("terminal wait status");
+            assert_eq!(status.wait_status, raw);
+            assert_eq!(status.exit_code, code);
+            assert_eq!(status.exit_signal, signal);
+            assert_eq!(status.core_dumped, core);
+        }
+        for raw in ["-1", "65536", "n/a", "65535", "4991", "128", "65", "271"] {
+            assert!(parse_zombie_exit_stat(&zombie_stat(42, 123, raw), 42, 123).is_none());
+        }
+        let valid = zombie_stat(42, 123, "0");
+        assert!(parse_zombie_exit_stat(&valid, 43, 123).is_none());
+        assert!(parse_zombie_exit_stat(&valid, 42, 124).is_none());
+        assert!(parse_zombie_exit_stat(&valid.replace(") Z ", ") T "), 42, 123).is_none());
+        assert!(parse_zombie_exit_stat(&valid.replace(") Z ", ") R "), 42, 123).is_none());
+        assert!(parse_zombie_exit_stat("42 (worker) Z 1 2", 42, 123).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn zombie_fixture(root: &std::path::Path, namespace_readable: bool) -> ProcessRecord {
+        let directory = root.join("42");
+        fs::create_dir_all(directory.join("ns")).unwrap();
+        fs::write(directory.join("stat"), zombie_stat(42, 5, "0")).unwrap();
+        fs::write(
+            directory.join("status"),
+            "Uid:\t1000 1000 1000 1000\nThreads:\t1\n",
+        )
+        .unwrap();
+        if namespace_readable {
+            std::os::unix::fs::symlink("user:[1]", directory.join("ns/user")).unwrap();
+        }
+        let mut proc = make_proc(42, "worker", "worker --old-command");
+        proc.state = crate::collect::ProcessState::Zombie;
+        proc
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn zombie_exit_requires_readable_stable_birth_owner_and_single_thread() {
+        let directory = TempDir::new().unwrap();
+        let proc = zombie_fixture(directory.path(), true);
+        let observe =
+            |proc: &ProcessRecord| observe_zombie_exit_from(proc, directory.path(), "boot", || {});
+        assert_eq!(observe(&proc).unwrap().exit_code, Some(0));
+        let mut wrong = proc.clone();
+        wrong.uid = 1001;
+        assert!(observe(&wrong).is_none());
+        wrong = proc.clone();
+        wrong.start_id = pt_common::StartId::from_linux("other-boot", 5, 42);
+        assert!(observe(&wrong).is_none());
+        wrong.start_id = pt_common::StartId::from_linux("boot", 6, 42);
+        assert!(observe(&wrong).is_none());
+        wrong.start_id = pt_common::StartId::from_linux("boot", 5, 43);
+        assert!(observe(&wrong).is_none());
+        for status in [
+            "Uid:\t1000 1000 1000 1000\nThreads:\t2\n",
+            "Uid:\t1000 1000 1000 1000\n",
+            "Threads:\t1\n",
+            "Uid:\t1000 1000 1000 1000\nThreads:\t1\nThreads:\t1\n",
+        ] {
+            fs::write(directory.path().join("42/status"), status).unwrap();
+            assert!(observe(&proc).is_none());
+        }
+        fs::write(
+            directory.path().join("42/status"),
+            "Uid:\t1000 1000 1000 1000\nThreads:\t1\n",
+        )
+        .unwrap();
+        assert!(
+            observe_zombie_exit_from(&proc, directory.path(), "boot", || {
+                fs::write(directory.path().join("42/stat"), zombie_stat(42, 6, "0")).unwrap();
+            })
+            .is_none(),
+            "PID reuse between reads is not the original exit"
+        );
+
+        let denied = TempDir::new().unwrap();
+        let proc = zombie_fixture(denied.path(), false);
+        assert!(
+            observe_zombie_exit_from(&proc, denied.path(), "boot", || {}).is_none(),
+            "a readable zero in stat without ptrace access is not exit zero"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminal_marker_retirement_requires_positive_absence_or_a_different_boot() {
+        let identity =
+            ProcessIdentity::new(42, pt_common::StartId::from_linux("boot", 5, 42), 1000);
+        let missing = |_| {
+            Err(crate::collect::proc_parsers::StatReadError::Read {
+                pid: 42,
+                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+            })
+        };
+        assert!(
+            !observed_exit_target_gone_with(&identity, "boot", missing, |_| false),
+            "hidden or inaccessible is not gone"
+        );
+        assert!(observed_exit_target_gone_with(
+            &identity,
+            "boot",
+            missing,
+            |_| true
+        ));
+        assert!(!observed_exit_target_gone_with(
+            &identity,
+            "boot",
+            |_| Ok(5),
+            |_| true
+        ));
+        assert!(observed_exit_target_gone_with(
+            &identity,
+            "boot",
+            |_| Ok(6),
+            |_| false
+        ));
+        assert!(observed_exit_target_gone_with(
+            &identity,
+            "new-boot",
+            |_| panic!("old boot"),
+            |_| false
+        ));
+        for boot in ["", "unknown"] {
+            assert!(!observed_exit_target_gone_with(
+                &identity,
+                boot,
+                missing,
+                |_| true
+            ));
+        }
+        let unknown =
+            ProcessIdentity::new(42, pt_common::StartId::from_linux("unknown", 5, 42), 1000);
+        assert!(!observed_exit_target_gone_with(
+            &unknown,
+            "boot",
+            missing,
+            |_| true
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn temporarily_unavailable_zombie_exit_preserves_the_last_live_prediction() {
+        let proc_root = TempDir::new().unwrap();
+        let mut proc = zombie_fixture(proc_root.path(), true);
+        proc.state = crate::collect::ProcessState::Running;
+        let original_hash = compute_identity_hash(&proc);
+        let directory = TempDir::new().unwrap();
+        let config = ShadowStorageConfig {
+            base_dir: directory.path().to_path_buf(),
+            auto_compact: false,
+            delete_expired: false,
+            ..Default::default()
+        };
+        let mut recorder = ShadowRecorder::with_config(config).unwrap();
+        let posterior = ClassScores {
+            useful: 0.8,
+            useful_bad: 0.1,
+            abandoned: 0.1,
+            zombie: 0.0,
+        };
+        let ledger = make_ledger(Confidence::Medium, vec![], vec![], "live prediction");
+        let decision = make_decision(Action::Keep);
+        recorder
+            .record_candidate(&proc, &posterior, &ledger, &decision)
+            .unwrap();
+        recorder.flush().unwrap();
+        proc.state = crate::collect::ProcessState::Zombie;
+        proc.cmd.clear();
+        let zombie_hash = compute_identity_hash(&proc);
+        assert_ne!(original_hash, zombie_hash);
+        for status in ["Uid:\t1000 1000 1000 1000\nThreads:\t2\n", "Threads:\t1\n"] {
+            fs::write(proc_root.path().join("42/status"), status).unwrap();
+            recorder.had_records = true;
+            recorder
+                .record_zombie_exit_with(&proc, |proc| {
+                    observe_zombie_exit_from(proc, proc_root.path(), "boot", || {})
+                })
+                .unwrap();
+            recorder.flush().unwrap();
+            assert_eq!(recorder.pending.len(), 1);
+            assert_eq!(
+                recorder.latest_pending_by_pid.get(&42),
+                Some(&original_hash)
+            );
+            let pending = &recorder.pending[&original_hash];
+            assert!(!pending.exit_recorded);
+            assert_eq!(pending.miss_count, 0);
+            assert_eq!(pending.belief.p_abandoned, 0.1);
+            assert_eq!(
+                recorder.recorded_count(),
+                1,
+                "no post-death prediction or false exit"
+            );
+        }
+        fs::write(
+            proc_root.path().join("42/status"),
+            "Uid:\t1000 1000 1000 1000\nThreads:\t1\n",
+        )
+        .unwrap();
+        recorder.had_records = true;
+        recorder
+            .record_zombie_exit_with(&proc, |proc| {
+                observe_zombie_exit_from(proc, proc_root.path(), "boot", || {})
+            })
+            .unwrap();
+        recorder.flush().unwrap();
+        assert_eq!(recorder.pending.len(), 1);
+        assert!(recorder.pending[&original_hash].exit_recorded);
+        assert!(!recorder.pending.contains_key(&zombie_hash));
+        assert_eq!(recorder.recorded_count(), 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_zombie_outcomes_keep_prediction_identity_and_remain_unlabeled() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        for (script, signal, expected_code, expected_signal) in [
+            ("read ignored; exit 0", None, Some(0), None),
+            ("read ignored; exit 7", None, Some(7), None),
+            (
+                "read ignored; exit 0",
+                Some(libc::SIGTERM),
+                None,
+                Some(libc::SIGTERM),
+            ),
+        ] {
+            let mut child = ChildGuard(
+                Command::new("sh")
+                    .args(["-c", script])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+            let pid = child.0.id();
+            let stat = crate::collect::proc_parsers::read_required_proc_stat(pid).unwrap();
+            let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+            let mut proc = make_proc(pid, "sh", &format!("sh -c {script}"));
+            // SAFETY: geteuid only reads this test's effective owner identity.
+            proc.uid = unsafe { libc::geteuid() };
+            proc.start_id = pt_common::StartId::from_linux(boot.trim(), stat.starttime, pid);
+            let identity_hash = compute_identity_hash(&proc);
+            let directory = TempDir::new().unwrap();
+            let config = ShadowStorageConfig {
+                base_dir: directory.path().to_path_buf(),
+                auto_compact: false,
+                delete_expired: false,
+                ..Default::default()
+            };
+            let posterior = ClassScores {
+                useful: 0.8,
+                useful_bad: 0.1,
+                abandoned: 0.1,
+                zombie: 0.0,
+            };
+            let ledger = make_ledger(Confidence::Medium, vec![], vec![], "live prediction");
+            let decision = make_decision(Action::Keep);
+            let mut recorder = ShadowRecorder::with_config(config.clone()).unwrap();
+            recorder
+                .record_candidate(&proc, &posterior, &ledger, &decision)
+                .unwrap();
+            recorder.flush().unwrap();
+            if let Some(signal) = signal {
+                // SAFETY: this test owns the unreaped child at this positive PID.
+                assert_eq!(unsafe { libc::kill(pid as libc::pid_t, signal) }, 0);
+            } else {
+                child
+                    .0
+                    .stdin
+                    .as_mut()
+                    .unwrap()
+                    .write_all(b"done\n")
+                    .unwrap();
+            }
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                if crate::collect::proc_parsers::read_required_proc_stat(pid)
+                    .unwrap()
+                    .state
+                    == 'Z'
+                {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "child did not become a zombie");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            proc.state = crate::collect::ProcessState::Zombie;
+            proc.cmd.clear();
+            assert_ne!(compute_identity_hash(&proc), identity_hash);
+            recorder
+                .record_candidate(&proc, &posterior, &ledger, &decision)
+                .unwrap();
+            recorder.flush().unwrap();
+            drop(recorder);
+            let mut recorder = ShadowRecorder::with_config(config.clone()).unwrap();
+            recorder
+                .record_candidate(&proc, &posterior, &ledger, &decision)
+                .unwrap();
+            recorder.flush().unwrap();
+            assert_eq!(
+                recorder.recorded_count(),
+                0,
+                "terminal event is durable and deduplicated"
+            );
+            recorder.miss_threshold = 1;
+            recorder.had_records = true;
+            recorder.record_outcomes_for_missing().unwrap();
+            assert!(
+                recorder.pending.contains_key(&identity_hash),
+                "filtered scan cannot reap a zombie"
+            );
+            child.0.wait().unwrap();
+            recorder.had_records = true;
+            recorder.flush().unwrap();
+            assert!(!recorder.pending.contains_key(&identity_hash));
+
+            let mut observations = Vec::new();
+            for entry in fs::read_dir(directory.path().join(format!("hot/pid_{pid}"))).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+                    let batch: Vec<Observation> =
+                        serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+                    observations.extend(batch);
+                }
+            }
+            assert_eq!(
+                observations.len(),
+                2,
+                "one prediction and one observed exit"
+            );
+            let observed = observations
+                .iter()
+                .find(|obs| obs.belief.recommendation == "observed_exit")
+                .unwrap();
+            assert_eq!(observed.identity_hash, identity_hash);
+            let details: serde_json::Value =
+                serde_json::from_str(observed.events[0].details.as_deref().unwrap()).unwrap();
+            assert_eq!(details["exit_code"], serde_json::json!(expected_code));
+            assert_eq!(details["exit_signal"], serde_json::json!(expected_signal));
+            assert_eq!(details["reason"], "observed_zombie");
+            assert!(details.get("outcome_hint").is_none());
+            let engine = crate::calibrate::validation::ValidationEngine::from_shadow_observations(
+                &observations,
+                0.5,
+            );
+            assert_eq!(engine.records().len(), 1);
+            let record = &engine.records()[0];
+            assert_eq!(record.exit_code, expected_code);
+            assert_eq!(record.exit_signal, expected_signal);
+            let report = engine.compute_report().unwrap();
+            assert_eq!((report.positive_labels, report.negative_labels), (0, 0));
+            assert_eq!(report.unlabeled_outcomes, 1);
+            assert!(report.metrics.is_none());
         }
     }
 
@@ -1051,6 +1791,7 @@ mod tests {
             storage,
             recorded: 0,
             pending: HashMap::new(),
+            latest_pending_by_pid: HashMap::new(),
             seen_identities: HashSet::new(),
             seen_pids: HashMap::new(),
             pending_path: directory.path().join("pending.json"),
@@ -1204,6 +1945,8 @@ mod tests {
                 belief: BeliefState::default(),
                 state: StateSnapshot::default(),
                 comm: "test".to_string(),
+                identity: None,
+                exit_recorded: false,
             },
         );
         recorder.seen_identities.insert("seen_hash".to_string());

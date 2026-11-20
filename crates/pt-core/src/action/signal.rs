@@ -264,7 +264,7 @@ fn wait_for_signal_observation(
 /// even a matching start time in `/proc/PID` does not identify `kill(PID)` or
 /// `pidfd_open(PID)` in the caller's namespace. Do not cache this check; a mount
 /// namespace or its procfs mount can change while the process is running.
-pub(super) fn ensure_action_pid_namespace() -> Result<(), ActionError> {
+pub(crate) fn ensure_action_pid_namespace() -> Result<(), ActionError> {
     #[cfg(target_os = "linux")]
     {
         let proc_self = std::fs::read_link("/proc/self").map_err(|error| {
