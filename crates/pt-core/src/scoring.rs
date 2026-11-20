@@ -1482,13 +1482,15 @@ mod provenance {
     };
 
     use crate::action::{IdentityProvider, LiveIdentityProvider};
-    use crate::collect::network_resource_collector::collect_fd_ipc_resources_with_runner;
+    use crate::collect::network_resource_collector::{
+        collect_fd_ipc_resources_with_runner, collect_listener_resources_for_identity,
+    };
     use crate::collect::resource_collector::{
         collect_local_resource_evidence_with_runner, resource_probe_runner,
     };
     use crate::collect::{
-        collect_lineage_for_pid, collect_listener_resources_with_diagnostics,
-        detect_listener_conflicts, parse_fd, NetworkSnapshot, ProcessRecord, SharedResourceGraph,
+        collect_lineage_for_pid, detect_listener_conflicts, parse_fd, NetworkSnapshot,
+        ProcessRecord, SharedResourceGraph,
     };
     use crate::decision::{
         estimate_blast_radius, BlastRadiusEstimate, BlastRadiusEstimatorConfig, RiskLevel,
@@ -1626,6 +1628,46 @@ mod provenance {
         Ok(lineage)
     }
 
+    /// Bracket all provenance probes with the same complete process identity.
+    /// A failed bracket discards the entire observation, including positive
+    /// edges: they may belong to a replacement process and cannot be attached
+    /// to the earlier scan. The caller retains the failure as missing coverage.
+    pub(super) fn with_provenance_identity<T>(
+        proc_root: &std::path::Path,
+        boot_id: &str,
+        process: &ProcessRecord,
+        collect: impl FnOnce(&pt_common::ProcessIdentity) -> T,
+    ) -> Result<T, String> {
+        if uuid::Uuid::parse_str(boot_id).is_err() {
+            return Err("provenance requires an observed boot identity".to_string());
+        }
+        let pid = process.pid.0;
+        let process_dir = proc_root.join(pid.to_string());
+        let read_identity = || {
+            crate::collect::network::read_network_process_identity(&process_dir, pid)
+                .map_err(|error| format!("provenance process identity unavailable: {error}"))
+        };
+        let before = read_identity()?;
+        if process.start_id != pt_common::StartId::from_linux(boot_id, before.2, pid)
+            || process.uid != before.3
+        {
+            return Err("provenance process identity no longer matches the scan".to_string());
+        }
+        let expected = pt_common::ProcessIdentity::full(
+            pid,
+            process.start_id.clone(),
+            process.uid,
+            process.pgid,
+            process.sid,
+            pt_common::IdentityQuality::Full,
+        );
+        let observed = collect(&expected);
+        if read_identity()? != before {
+            return Err("process identity changed during provenance collection".to_string());
+        }
+        Ok(observed)
+    }
+
     /// One identity-bound observation. Keep failures alongside positive evidence;
     /// an unreadable peer cannot establish that a target has no dependents.
     pub(super) struct ProcessProvenance {
@@ -1652,51 +1694,57 @@ mod provenance {
         } else {
             NetworkSnapshot::collect()
         };
+        let proc_root = std::path::Path::new("/proc");
+        let boot_id = std::fs::read_to_string(proc_root.join("sys/kernel/random/boot_id"))
+            .unwrap_or_default();
 
         build_provenance_bundle_with(
             targets,
             population,
             census_complete,
             |process, is_target| {
-                let pid = process.pid.0;
-                let identity = process_identity(process);
-                if !identity.can_safely_revalidate() {
-                    return Err(
-                        "process birth identity is unavailable for provenance collection"
-                            .to_string(),
-                    );
-                }
-                let validate = || match identity_provider.revalidate(&identity) {
-                    Ok(true) => Ok(()),
-                    Ok(false) => Err(
-                        "process identity is missing or changed during provenance collection"
-                            .to_string(),
-                    ),
-                    Err(error) => Err(format!(
-                        "process identity unavailable during provenance collection: {error}"
-                    )),
-                };
-                validate()?;
-                let (lineage, lineage_error) = if is_target {
-                    match collect_bound_lineage(
-                        process,
-                        &identity_provider,
-                        collect_lineage_for_pid,
-                    ) {
-                        Ok(lineage) => (Some(lineage), None),
-                        Err(reason) => (None, Some(reason.to_string())),
+                with_provenance_identity(proc_root, boot_id.trim(), process, |expected| {
+                    let pid = process.pid.0;
+                    let identity = process_identity(process);
+                    if !identity.can_safely_revalidate() {
+                        return Err(
+                            "process birth identity is unavailable for provenance collection"
+                                .to_string(),
+                        );
                     }
-                } else {
-                    (None, None)
-                };
-                let fd_info = parse_fd(pid);
-                let mut resources = collect_local_resource_evidence_with_runner(
-                    pid,
-                    fd_info.as_ref(),
-                    &resource_runner,
-                );
-                let network_error =
-                    match collect_listener_resources_with_diagnostics(pid, &network_snapshot) {
+                    let validate = || match identity_provider.revalidate(&identity) {
+                        Ok(true) => Ok(()),
+                        Ok(false) => Err(
+                            "process identity is missing or changed during provenance collection"
+                                .to_string(),
+                        ),
+                        Err(error) => Err(format!(
+                            "process identity unavailable during provenance collection: {error}"
+                        )),
+                    };
+                    validate()?;
+                    let (lineage, lineage_error) = if is_target {
+                        match collect_bound_lineage(
+                            process,
+                            &identity_provider,
+                            collect_lineage_for_pid,
+                        ) {
+                            Ok(lineage) => (Some(lineage), None),
+                            Err(reason) => (None, Some(reason.to_string())),
+                        }
+                    } else {
+                        (None, None)
+                    };
+                    let fd_info = parse_fd(pid);
+                    let mut resources = collect_local_resource_evidence_with_runner(
+                        pid,
+                        fd_info.as_ref(),
+                        &resource_runner,
+                    );
+                    let network_error = match collect_listener_resources_for_identity(
+                        expected,
+                        &network_snapshot,
+                    ) {
                         Ok(observed) => {
                             resources.extend(observed.resources);
                             (!observed.unavailable.is_empty())
@@ -1704,25 +1752,26 @@ mod provenance {
                         }
                         Err(error) => Some(error.to_string()),
                     };
-                let mut ipc = collect_fd_ipc_resources_with_runner(pid, &resource_runner);
-                if fd_info.as_ref().is_none_or(|info| {
-                    info.truncated || info.by_type.values().sum::<usize>() != info.count
-                }) {
-                    ipc.unavailable
-                        .push("file_descriptor_evidence_incomplete".to_string());
-                }
-                resources.extend(ipc.resources);
-                // Never retain resources from a replacement process, even when the
-                // first identity check or the scan's own observation was valid.
-                validate()?;
-                Ok(ProcessProvenance {
-                    identity,
-                    lineage,
-                    lineage_error,
-                    resources,
-                    network_error,
-                    unavailable: ipc.unavailable,
-                })
+                    let mut ipc = collect_fd_ipc_resources_with_runner(pid, &resource_runner);
+                    if fd_info.as_ref().is_none_or(|info| {
+                        info.truncated || info.by_type.values().sum::<usize>() != info.count
+                    }) {
+                        ipc.unavailable
+                            .push("file_descriptor_evidence_incomplete".to_string());
+                    }
+                    resources.extend(ipc.resources);
+                    // Never retain resources from a replacement process, even when the
+                    // first identity check or the scan's own observation was valid.
+                    validate()?;
+                    Ok(ProcessProvenance {
+                        identity,
+                        lineage,
+                        lineage_error,
+                        resources,
+                        network_error,
+                        unavailable: ipc.unavailable,
+                    })
+                })?
             },
         )
     }
@@ -4494,6 +4543,168 @@ mod provenance_tests {
             .confidence_notes
             .iter()
             .any(|note| note.contains("network resource evidence unavailable")));
+        assert!(!bundle.lineages.contains_key(&missing.pid.0));
+        assert!(!feature_names(&adjustment)
+            .iter()
+            .any(|feature| feature.starts_with("provenance_ownership_")));
+    }
+
+    fn provenance_identity_fixture() -> (tempfile::TempDir, ProcessRecord) {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let process_dir = root.path().join("42");
+        std::fs::create_dir(&process_dir).unwrap();
+        std::fs::write(
+            process_dir.join("stat"),
+            "42 (owned fixture) S 1 42 42 0 -1 0 0 0 0 0 0 0 0 0 0 0 1 0 123 0 0",
+        )
+        .unwrap();
+        let process = crate::mock_process::MockProcessBuilder::new()
+            .pid(42)
+            .ppid(1)
+            .uid(std::fs::metadata(&process_dir).unwrap().uid())
+            .start_id(pt_common::StartId::from_linux(
+                "12345678-1234-1234-1234-123456789abc",
+                123,
+                42,
+            ))
+            .build();
+        (root, process)
+    }
+
+    #[test]
+    fn provenance_requires_the_scanned_birth_boot_and_owner_before_collecting() {
+        use super::provenance::with_provenance_identity;
+        const BOOT: &str = "12345678-1234-1234-1234-123456789abc";
+        let (root, process) = provenance_identity_fixture();
+        let collected = with_provenance_identity(root.path(), BOOT, &process, |expected| {
+            assert_eq!(expected.start_id, process.start_id);
+            assert_eq!(expected.uid, process.uid);
+            vec![listener_ev(42, 8080)]
+        })
+        .unwrap();
+        assert_eq!(collected.len(), 1);
+
+        for change in ["birth", "boot", "owner", "embedded_pid", "unavailable_boot"] {
+            let mut stale = process.clone();
+            let mut boot = BOOT;
+            match change {
+                "birth" => stale.start_id = pt_common::StartId::from_linux(BOOT, 122, 42),
+                "boot" => {
+                    stale.start_id = pt_common::StartId::from_linux(
+                        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                        123,
+                        42,
+                    );
+                }
+                "owner" => stale.uid = stale.uid.wrapping_add(1),
+                "embedded_pid" => stale.start_id = pt_common::StartId::from_linux(BOOT, 123, 43),
+                "unavailable_boot" => boot = "unknown",
+                _ => unreachable!(),
+            }
+            let mut collected = false;
+            let observed = with_provenance_identity(root.path(), boot, &stale, |_| {
+                collected = true;
+            });
+            assert!(observed.is_err(), "{change}");
+            assert!(
+                !collected,
+                "must reject {change} before probing the replacement"
+            );
+        }
+    }
+
+    #[test]
+    fn provenance_discards_all_edges_when_identity_changes_during_collection() {
+        use super::provenance::with_provenance_identity;
+        const BOOT: &str = "12345678-1234-1234-1234-123456789abc";
+        for change in ["birth", "directory", "unreadable"] {
+            let (root, process) = provenance_identity_fixture();
+            let process_dir = root.path().join("42");
+            let observed = with_provenance_identity(root.path(), BOOT, &process, |_| {
+                let resources = vec![listener_ev(42, 8080)];
+                match change {
+                    "birth" => std::fs::write(
+                        process_dir.join("stat"),
+                        "42 (replacement) S 1 42 42 0 -1 0 0 0 0 0 0 0 0 0 0 0 1 0 124 0 0",
+                    )
+                    .unwrap(),
+                    "directory" => {
+                        std::fs::rename(&process_dir, root.path().join("old-process")).unwrap();
+                        std::fs::create_dir(&process_dir).unwrap();
+                        std::fs::copy(
+                            root.path().join("old-process/stat"),
+                            process_dir.join("stat"),
+                        )
+                        .unwrap();
+                    }
+                    "unreadable" => {
+                        std::fs::rename(process_dir.join("stat"), process_dir.join("old-stat"))
+                            .unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                resources
+            });
+            assert!(
+                observed.is_err(),
+                "{change} must discard the collected edges"
+            );
+        }
+    }
+
+    #[test]
+    fn live_provenance_does_not_attach_a_current_process_to_a_stale_scan_record() {
+        let pid = std::process::id();
+        let stale = crate::mock_process::MockProcessBuilder::new()
+            .pid(pid)
+            .start_id(pt_common::StartId::from_linux(
+                "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                0,
+                pid,
+            ))
+            .build();
+        let bundle = build_provenance_bundle(&[&stale], std::slice::from_ref(&stale), true);
+        assert!(bundle.lineages.is_empty());
+        assert!(bundle.resource_graph.process_resources.is_empty());
+        assert_eq!(bundle.population_count, 1);
+        assert!(bundle.target_identities.contains_key(&pid));
+        assert!(bundle.lineage_unavailable.contains_key(&pid));
+        assert!(bundle.network_errors.contains_key(&pid));
+        assert!(bundle.resource_unavailable.contains_key(&pid));
+        let adjustment = derive_provenance_adjustment(pid, &bundle);
+        assert!(adjustment.evidence_terms.is_empty());
+        assert!(adjustment.confidence_penalty_steps > 0);
+
+        let mut scorer = Scorer::new(
+            Priors::default(),
+            DecisionStore::default(),
+            SignatureDatabase::new(),
+            FastPathConfig::disabled(),
+        );
+        scorer.provenance = Some(bundle);
+        let observations = scorer.recorded_observations(&stale, None);
+        let recorded = observations.provenance.as_ref().unwrap();
+        assert!(recorded.evidence_terms.is_empty());
+        assert!(recorded.confidence_penalty_steps > 0);
+        assert!(recorded
+            .confidence_notes
+            .iter()
+            .any(|note| note.contains("identity no longer matches the scan")));
+        let measured = scorer
+            .score_recorded(
+                &stale,
+                Evidence::from_snapshot(&stale),
+                observations.clone(),
+            )
+            .unwrap()
+            .ledger;
+        let restored = serde_json::from_value(serde_json::to_value(observations).unwrap()).unwrap();
+        scorer.provenance = None;
+        let replayed = scorer
+            .score_recorded(&stale, Evidence::from_snapshot(&stale), restored)
+            .unwrap();
+        assert_eq!(replayed.ledger, measured);
     }
 
     #[test]

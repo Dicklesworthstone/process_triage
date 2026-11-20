@@ -63,6 +63,17 @@ pub fn collect_listener_resources_with_diagnostics(
     listener_resources_from_observation(pid, snapshot.observe_process(pid)?)
 }
 
+/// Join resources to the process incarnation captured by the scan, rather than
+/// whichever process currently occupies its PID. Keep partial network coverage
+/// explicit even when the expected incarnation is still present.
+#[cfg(target_os = "linux")]
+pub(crate) fn collect_listener_resources_for_identity(
+    expected: &pt_common::ProcessIdentity,
+    snapshot: &super::network::NetworkSnapshot,
+) -> std::io::Result<ListenerResources> {
+    listener_resources_from_observation(expected.pid.0, snapshot.observe_identity(expected)?)
+}
+
 #[cfg(target_os = "linux")]
 fn listener_resources_from_observation(
     pid: u32,
