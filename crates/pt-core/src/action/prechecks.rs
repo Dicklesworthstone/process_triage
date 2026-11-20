@@ -57,6 +57,100 @@ fn recent_io_probe_window(window: Duration) -> Duration {
     }
 }
 
+/// A failed observation is not proof of exit. In particular, procfs may hide a
+/// live process and native process APIs may refuse a process owned by someone
+/// else. Signal zero only tests existence; EPERM still proves the PID is live.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn process_is_absent(pid: u32) -> Result<bool, String> {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        // This value cannot name a process on either supported platform.
+        return Ok(true);
+    };
+    if pid <= 0 {
+        return Err("invalid process PID; refusing a process-group probe".to_string());
+    }
+    // SAFETY: the positive PID names one process and signal zero sends no signal.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return Ok(false);
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(true),
+        Some(libc::EPERM) => Ok(false),
+        _ => Err(format!(
+            "cannot establish whether PID {pid} exited: {error}"
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_process_state_from_proc(
+    pid: u32,
+    proc_root: &std::path::Path,
+) -> Result<Option<ProcessState>, String> {
+    let path = proc_root.join(pid.to_string()).join("stat");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return if process_is_absent(pid)? {
+                Ok(None)
+            } else {
+                Err(format!(
+                    "cannot read {} for a still-present process: {error}",
+                    path.display()
+                ))
+            };
+        }
+        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+    };
+    let stat = crate::collect::proc_parsers::parse_required_proc_stat_content(pid, &content)
+        .map_err(|error| error.to_string())?;
+    Ok(Some(ProcessState::from_char(stat.state)))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn process_state_precheck(
+    observation: Result<Option<ProcessState>, String>,
+    wchan: Option<&str>,
+) -> PreCheckResult {
+    let state = match observation {
+        Ok(Some(state)) => state,
+        // Identity validation and signal delivery independently reject a gone
+        // process. This gate must not turn a confirmed exit into an I/O failure.
+        Ok(None) => return PreCheckResult::Passed,
+        Err(error) => {
+            return PreCheckResult::Blocked {
+                check: PreCheck::VerifyProcessState,
+                reason: format!("process state evidence unavailable: {error}"),
+            };
+        }
+    };
+    let reason = match state {
+        ProcessState::Unknown => {
+            "process state evidence unavailable: unknown process state".to_string()
+        }
+        ProcessState::Zombie => "process is a zombie (Z state): already dead, cannot be killed. \
+             The parent process must reap it."
+            .to_string(),
+        ProcessState::Dead => "process is already dead (X state): cannot be killed".to_string(),
+        ProcessState::DiskSleep => {
+            let wchan_info = wchan
+                .map(|wchan| format!(" (blocked in: {wchan})"))
+                .unwrap_or_default();
+            format!(
+                "process is in uninterruptible sleep (D state){wchan_info}: \
+                 kill action may not succeed. Consider investigating the \
+                 underlying I/O issue instead."
+            )
+        }
+        _ => return PreCheckResult::Passed,
+    };
+    PreCheckResult::Blocked {
+        check: PreCheck::VerifyProcessState,
+        reason,
+    }
+}
+
 #[cfg(any(target_os = "linux", test))]
 fn parse_supervision_cgroup_path(pid: u32, content: &str) -> Result<Option<String>, String> {
     let invalid =
@@ -1277,11 +1371,35 @@ enum RecentIoEvidence {
     Active,
     #[cfg(target_os = "linux")]
     Idle,
-    /// The platform has no per-process I/O counters (macOS). Not activity: as in
-    /// v2.2.1 the gate passes, since refusing here blocked every macOS action.
-    #[cfg(not(target_os = "linux"))]
+    /// The current collector cannot observe this platform's process I/O.
+    /// An explicitly enabled gate must refuse without that evidence.
+    #[cfg(any(not(target_os = "linux"), test))]
     Unsupported,
     Unknown(String),
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn recent_io_precheck(evidence: RecentIoEvidence, window: Duration) -> PreCheckResult {
+    let reason = match evidence {
+        #[cfg(target_os = "linux")]
+        RecentIoEvidence::Idle => return PreCheckResult::Passed,
+        #[cfg(target_os = "linux")]
+        RecentIoEvidence::Active => {
+            format!("recent I/O activity within {}s window", window.as_secs())
+        }
+        #[cfg(any(not(target_os = "linux"), test))]
+        RecentIoEvidence::Unsupported => format!(
+            "recent I/O evidence unavailable: this platform cannot observe the configured {}s window",
+            window.as_secs()
+        ),
+        RecentIoEvidence::Unknown(reason) => {
+            format!("recent I/O evidence unavailable: {reason}")
+        }
+    };
+    PreCheckResult::Blocked {
+        check: PreCheck::CheckDataLossGate,
+        reason,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1941,31 +2059,23 @@ impl LivePreCheckProvider {
         Ok(target.to_string_lossy().ends_with(" (deleted)"))
     }
 
-    /// Read process state.
-    fn read_process_state(&self, pid: u32) -> Option<ProcessState> {
+    /// Read process state, distinguishing confirmed exit from unavailable data.
+    fn read_process_state(&self, pid: u32) -> Result<Option<ProcessState>, String> {
         #[cfg(target_os = "linux")]
         {
-            let stat_path = format!("/proc/{pid}/stat");
-            let content_bytes = std::fs::read(&stat_path).ok()?;
-            let content = String::from_utf8_lossy(&content_bytes);
-
-            // Parse state from stat: pid (comm) state ...
-            // State is the first character after the closing paren
-            let comm_end = content.rfind(')')?;
-            let after_comm = content.get(comm_end + 2..)?;
-            let state_char = after_comm.chars().next()?;
-
-            Some(ProcessState::from_char(state_char))
+            read_process_state_from_proc(pid, std::path::Path::new("/proc"))
         }
         #[cfg(target_os = "macos")]
         {
-            crate::collect::read_process_snapshot(pid)
-                .map(|info| ProcessState::from_char(info.state))
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-            let _ = pid;
-            None
+            if let Some(stat) = crate::collect::macos::read_session_stat(pid) {
+                Ok(Some(ProcessState::from_char(stat.state)))
+            } else if process_is_absent(pid)? {
+                Ok(None)
+            } else {
+                Err(format!(
+                    "cannot read native process state for live PID {pid}"
+                ))
+            }
         }
     }
 
@@ -2499,32 +2609,9 @@ impl PreCheckProvider for LivePreCheckProvider {
         // Enabled I/O gates require a complete observation, including identity.
         if self.config.block_if_recent_io_seconds > 0 {
             let window = Duration::from_secs(self.config.block_if_recent_io_seconds);
-            match self.has_recent_io(pid, window) {
-                #[cfg(target_os = "linux")]
-                RecentIoEvidence::Idle => {}
-                #[cfg(not(target_os = "linux"))]
-                RecentIoEvidence::Unsupported => {}
-                RecentIoEvidence::Unknown(reason) => {
-                    return PreCheckResult::Blocked {
-                        check: PreCheck::CheckDataLossGate,
-                        reason: format!("recent I/O evidence unavailable: {reason}"),
-                    };
-                }
-                #[cfg(target_os = "linux")]
-                RecentIoEvidence::Active => {
-                    debug!(
-                        pid,
-                        window_s = self.config.block_if_recent_io_seconds,
-                        "process has recent I/O activity"
-                    );
-                    return PreCheckResult::Blocked {
-                        check: PreCheck::CheckDataLossGate,
-                        reason: format!(
-                            "recent I/O activity within {}s window",
-                            self.config.block_if_recent_io_seconds
-                        ),
-                    };
-                }
+            let result = recent_io_precheck(self.has_recent_io(pid, window), window);
+            if !result.is_passed() {
+                return result;
             }
         }
 
@@ -2707,50 +2794,16 @@ impl PreCheckProvider for LivePreCheckProvider {
 
     fn check_process_state(&self, pid: u32) -> PreCheckResult {
         trace!(pid, "checking process state for kill viability");
-
-        // Read current process state
-        let state = match self.read_process_state(pid) {
-            Some(s) => s,
-            None => {
-                // Process may have exited - treat as passed (nothing to check)
-                trace!(pid, "could not read process state, assuming gone");
-                return PreCheckResult::Passed;
-            }
-        };
-
-        // Check for zombie state - cannot be killed
-        if state.is_zombie() {
-            debug!(pid, "process is a zombie (Z state)");
-            return PreCheckResult::Blocked {
-                check: PreCheck::VerifyProcessState,
-                reason: "process is a zombie (Z state): already dead, cannot be killed. \
-                     The parent process must reap it."
-                    .to_string(),
-            };
-        }
-
-        // Check for D-state (uninterruptible sleep) - kill may not work
+        let observation = self.read_process_state(pid);
         #[cfg(target_os = "linux")]
-        if state.is_disksleep() {
-            let wchan = self.read_wchan(pid);
-            let wchan_info = wchan
-                .as_ref()
-                .map(|w| format!(" (blocked in: {})", w))
-                .unwrap_or_default();
-
-            debug!(pid, ?wchan, "process is in D-state (uninterruptible sleep)");
-            return PreCheckResult::Blocked {
-                check: PreCheck::VerifyProcessState,
-                reason: format!(
-                    "process is in uninterruptible sleep (D state){}: \
-                     kill action may not succeed. Consider investigating the \
-                     underlying I/O issue instead.",
-                    wchan_info
-                ),
-            };
-        }
-
-        PreCheckResult::Passed
+        let wchan = if matches!(observation, Ok(Some(ProcessState::DiskSleep))) {
+            self.read_wchan(pid)
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "linux"))]
+        let wchan: Option<String> = None;
+        process_state_precheck(observation, wchan.as_deref())
     }
 }
 
@@ -3739,6 +3792,79 @@ mod tests {
         assert_eq!(reason, "open write fds");
     }
 
+    #[test]
+    fn process_state_gate_refuses_unavailable_unknown_and_dead_evidence() {
+        for (observation, expected) in [
+            (Err("permission denied".to_string()), "permission denied"),
+            (Ok(Some(ProcessState::Unknown)), "unknown process state"),
+            (Ok(Some(ProcessState::Dead)), "already dead"),
+            (Ok(Some(ProcessState::Zombie)), "parent process must reap"),
+            (Ok(Some(ProcessState::DiskSleep)), "uninterruptible sleep"),
+        ] {
+            assert!(matches!(
+                process_state_precheck(observation, Some("io_schedule")),
+                PreCheckResult::Blocked { check, reason }
+                    if check == PreCheck::VerifyProcessState && reason.contains(expected)
+            ));
+        }
+        assert!(matches!(
+            process_state_precheck(Ok(Some(ProcessState::DiskSleep)), Some("io_schedule")),
+            PreCheckResult::Blocked { reason, .. } if reason.contains("io_schedule")
+        ));
+    }
+
+    #[test]
+    fn process_state_gate_preserves_known_live_and_confirmed_exit_paths() {
+        for state in [
+            ProcessState::Running,
+            ProcessState::Sleeping,
+            ProcessState::Stopped,
+            ProcessState::Idle,
+        ] {
+            assert!(process_state_precheck(Ok(Some(state)), None).is_passed());
+        }
+        assert!(process_state_precheck(Ok(None), None).is_passed());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn enabled_recent_io_gate_refuses_unsupported_and_unknown_observations() {
+        let window = Duration::from_secs(60);
+        for evidence in [
+            RecentIoEvidence::Unsupported,
+            RecentIoEvidence::Unknown("permission denied".to_string()),
+        ] {
+            assert!(matches!(
+                recent_io_precheck(evidence, window),
+                PreCheckResult::Blocked { check, reason }
+                    if check == PreCheck::CheckDataLossGate
+                        && reason.contains("recent I/O evidence unavailable")
+            ));
+        }
+        assert!(matches!(
+            recent_io_precheck(RecentIoEvidence::Unsupported, window),
+            PreCheckResult::Blocked { reason, .. } if reason.contains("60s window")
+        ));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn disabled_recent_io_gate_does_not_require_an_observation() {
+        let provider = LivePreCheckProvider::new(
+            None,
+            LivePreCheckConfig {
+                block_if_open_write_fds: false,
+                block_if_locked_files: false,
+                block_if_active_tty: false,
+                block_if_deleted_cwd: false,
+                block_if_recent_io_seconds: 0,
+                ..LivePreCheckConfig::default()
+            },
+        )
+        .unwrap();
+        assert!(provider.check_data_loss(u32::MAX).is_passed());
+    }
+
     // ── NoopPreCheckProvider ────────────────────────────────────────
 
     #[test]
@@ -4288,10 +4414,10 @@ mod tests {
     mod macos_tests {
         use super::*;
 
-        /// macOS has no per-process I/O counters; as in v2.2.1, an enabled
-        /// recent-I/O gate does not refuse on that alone.
+        /// An explicit policy window is a required observation even when the
+        /// platform collector cannot supply it. Disabling the gate is separate.
         #[test]
-        fn recent_io_gate_passes_without_io_counters_on_macos() {
+        fn recent_io_gate_refuses_without_io_counters_on_macos() {
             let config = LivePreCheckConfig {
                 block_if_open_write_fds: false,
                 block_if_locked_files: false,
@@ -4303,7 +4429,12 @@ mod tests {
             };
             let provider = LivePreCheckProvider::new(None, config).expect("provider");
             let result = provider.check_data_loss(std::process::id());
-            assert!(result.is_passed(), "{result:?}");
+            assert!(matches!(
+                result,
+                PreCheckResult::Blocked { check, reason }
+                    if check == PreCheck::CheckDataLossGate
+                        && reason.contains("cannot observe the configured 1s window")
+            ));
         }
 
         /// The parent lookup and launchd check run on macOS, and missing Linux-only
@@ -4365,6 +4496,95 @@ mod tests {
     mod linux_tests {
         use super::*;
         use crate::live_test_harness::run_owned_unprivileged_case;
+
+        #[test]
+        fn process_state_observation_refuses_hidden_live_and_invalid_proc_records() {
+            let root = tempfile::tempdir().unwrap().keep();
+            let pid = std::process::id();
+            let path = root.join(pid.to_string()).join("stat");
+            // ENOENT alone is ambiguous (for example, hidepid=2). A kernel
+            // existence check must distinguish it from a confirmed exit.
+            assert!(matches!(
+                process_state_precheck(read_process_state_from_proc(pid, &root), None),
+                PreCheckResult::Blocked { check, reason }
+                    if check == PreCheck::VerifyProcessState
+                        && reason.contains("still-present process")
+            ));
+            assert_eq!(read_process_state_from_proc(u32::MAX, &root), Ok(None));
+
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            assert!(read_process_state_from_proc(pid, &root).is_err());
+            let fields = "1 42 42 0 -1 0 0 0 0 0 0 0 0 0 0 0 1 0 123 0 0";
+            std::fs::write(
+                &path,
+                format!("{pid} (fixture ) with parentheses) S {fields}"),
+            )
+            .unwrap();
+            assert_eq!(
+                read_process_state_from_proc(pid, &root),
+                Ok(Some(ProcessState::Sleeping))
+            );
+
+            for content in [
+                format!("{pid} (fixture) ? {fields}"),
+                format!("{pid} (fixture) SS {fields}"),
+                format!("{pid} (fixture) S 1"),
+                format!("{} (fixture) S {fields}", pid + 1),
+                "unparseable process state".to_string(),
+            ] {
+                std::fs::write(&path, content).unwrap();
+                assert!(matches!(
+                    process_state_precheck(read_process_state_from_proc(pid, &root), None),
+                    PreCheckResult::Blocked { check, reason }
+                        if check == PreCheck::VerifyProcessState
+                            && reason.contains("process state evidence unavailable")
+                ));
+            }
+            std::fs::write(&path, [0xff]).unwrap();
+            assert!(read_process_state_from_proc(pid, &root).is_err());
+
+            // A directory yields a real I/O error even for root, so this does
+            // not depend on chmod succeeding against a privileged test runner.
+            let unreadable = tempfile::tempdir().unwrap().keep();
+            std::fs::create_dir_all(unreadable.join(pid.to_string()).join("stat")).unwrap();
+            assert!(matches!(
+                process_state_precheck(read_process_state_from_proc(pid, &unreadable), None),
+                PreCheckResult::Blocked { check, reason }
+                    if check == PreCheck::VerifyProcessState && reason.contains("cannot read")
+            ));
+        }
+
+        #[test]
+        fn process_state_observation_distinguishes_owned_live_process_and_exit() {
+            use std::process::{Command, Stdio};
+
+            let mut fixture = DescriptorChild {
+                child: Command::new("sleep")
+                    .arg("30")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+                reader: None,
+            };
+            let pid = fixture.child.id();
+            let provider = LivePreCheckProvider::with_defaults();
+            assert_eq!(process_is_absent(pid), Ok(false));
+            let state = provider.read_process_state(pid).unwrap().unwrap();
+            assert!(!matches!(
+                state,
+                ProcessState::Unknown | ProcessState::Dead | ProcessState::Zombie
+            ));
+            assert!(provider.check_process_state(pid).is_passed());
+
+            fixture.child.kill().unwrap();
+            fixture.child.wait().unwrap();
+            assert_eq!(process_is_absent(pid), Ok(true));
+            assert_eq!(provider.read_process_state(pid), Ok(None));
+            assert!(provider.check_process_state(pid).is_passed());
+            assert!(process_is_absent(0).is_err());
+        }
 
         fn lock_only_provider() -> LivePreCheckProvider {
             LivePreCheckProvider::new(
@@ -6191,7 +6411,9 @@ while True:
         fn live_provider_read_process_state_self() {
             let provider = LivePreCheckProvider::with_defaults();
             let pid = std::process::id();
-            let state = provider.read_process_state(pid);
+            let state = provider
+                .read_process_state(pid)
+                .expect("read live process state");
             assert!(state.is_some());
             // Test process should be running or sleeping, not zombie
             let state = state.unwrap();
@@ -6201,7 +6423,9 @@ while True:
         #[test]
         fn live_provider_read_process_state_nonexistent() {
             let provider = LivePreCheckProvider::with_defaults();
-            let state = provider.read_process_state(u32::MAX);
+            let state = provider
+                .read_process_state(u32::MAX)
+                .expect("confirm absent process");
             assert!(state.is_none());
         }
 
