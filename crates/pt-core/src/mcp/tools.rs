@@ -3,6 +3,7 @@
 //! Tools expose scanning, planning, explanations and explicit human feedback.
 
 use crate::collect::protected::{ProtectedFilter, ProtectedMatch};
+use crate::collect::tool_runner::{ToolConfig, ToolOutput, ToolRunner, ToolSpec};
 #[cfg(target_os = "linux")]
 use crate::collect::{deep_scan, DeepScanOptions, DeepScanRecord};
 use crate::collect::{quick_scan, ProcessActivity, ProcessRecord, QuickScanOptions, ScanResult};
@@ -12,11 +13,26 @@ use crate::signature_cli::load_user_signatures;
 use crate::supervision::signature::ProcessMatchContext;
 use crate::supervision::{SignatureDatabase, SupervisorCategory};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const DEFAULT_ACTIVITY_WINDOW_MS: u64 = 500;
 const MAX_ACTIVITY_WINDOW_MS: u64 = 60_000;
+const DEFAULT_PLAN_TIMEOUT_SECS: u64 = 120;
+const MAX_PLAN_TIMEOUT_SECS: u64 = 600;
+
+fn plan_timeout(params: &serde_json::Value) -> Result<Duration, String> {
+    let seconds = match params.get("timeout_secs") {
+        None => DEFAULT_PLAN_TIMEOUT_SECS,
+        Some(value) => value
+            .as_u64()
+            .filter(|seconds| (1..=MAX_PLAN_TIMEOUT_SECS).contains(seconds))
+            .ok_or_else(|| {
+                format!("timeout_secs must be an integer between 1 and {MAX_PLAN_TIMEOUT_SECS}")
+            })?,
+    };
+    Ok(Duration::from_secs(seconds))
+}
 
 fn activity_window_ms(params: &serde_json::Value) -> Result<u64, String> {
     match params.get("window_ms") {
@@ -359,6 +375,7 @@ fn plan_command_args(params: &serde_json::Value) -> Result<Vec<String>, String> 
         .as_object()
         .ok_or_else(|| "pt_plan arguments must be an object".to_string())?;
     let window_ms = activity_window_ms(params)?;
+    plan_timeout(params)?;
     for key in object.keys() {
         if !matches!(
             key.as_str(),
@@ -366,6 +383,7 @@ fn plan_command_args(params: &serde_json::Value) -> Result<Vec<String>, String> 
                 | "min_score"
                 | "min_age"
                 | "window_ms"
+                | "timeout_secs"
                 | "goal"
                 | "pids"
                 | "max_candidates"
@@ -663,6 +681,13 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "maximum": u64::MAX
                     },
                     "window_ms": activity_window_schema(),
+                    "timeout_secs": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_PLAN_TIMEOUT_SECS,
+                        "default": DEFAULT_PLAN_TIMEOUT_SECS,
+                        "description": "Total planner deadline in seconds, including probes and output collection; an incomplete or timed-out response is an error"
+                    },
                     "goal": {
                         "type": "string",
                         "minLength": 1,
@@ -1069,29 +1094,143 @@ fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
 /// loss matrix, and recommended `kill` for zombies (which a signal cannot reap).
 fn tool_plan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
     let args = plan_command_args(params)?;
+    let timeout = plan_timeout(params)?;
+    let config = crate::config::resolve_config_dir(&crate::mcp::config_options())
+        .map_err(|error| format!("cannot resolve plan config directory: {error}"))?;
     let exe = std::env::current_exe().map_err(|e| format!("cannot locate pt-core: {e}"))?;
-    let output = std::process::Command::new(&exe)
-        .arg("--config")
-        .arg(config_dir())
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|e| format!("failed to run `{} agent plan`: {e}", exe.display()))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    // agent plan exits 0 (nothing to do) or 1 (plan ready); anything else is an error.
-    let ok = matches!(output.status.code(), Some(0) | Some(1));
-    if !ok || serde_json::from_str::<serde_json::Value>(&stdout).is_err() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let tail: String = stderr.lines().rev().take(5).collect::<Vec<_>>().join("\n");
-        return Err(format!(
-            "agent plan failed (exit {:?}): {tail}",
-            output.status.code()
-        ));
-    }
+    let spec = plan_worker_spec(&exe, &config, args, timeout)?;
+    let stdout = run_plan_worker(&spec)?;
     Ok(vec![ToolContent {
         content_type: "text".to_string(),
         text: stdout,
     }])
+}
+
+/// Keep the planner's configured policy and storage location while preventing
+/// inherited output overrides or lock-bypass variables from changing its contract.
+fn plan_worker_spec(
+    executable: &Path,
+    config: &Path,
+    args: Vec<String>,
+    timeout: Duration,
+) -> Result<ToolSpec, String> {
+    let executable = executable
+        .to_str()
+        .ok_or("MCP planner executable path is not UTF-8")?;
+    let config = config
+        .to_str()
+        .ok_or("MCP planner config path is not UTF-8")?;
+    let mut command_args = vec![
+        "--config".to_string(),
+        config.to_string(),
+        format!("--timeout={}", timeout.as_secs()),
+    ];
+    command_args.extend(args);
+    let mut spec = ToolSpec::new(executable, command_args).with_timeout(timeout);
+    #[cfg(target_os = "linux")]
+    {
+        // The runner retains the leader's identity until all owned descendants
+        // and inherited output pipes have been cancelled on completion/timeout.
+        spec.isolate_process_group = true;
+    }
+    for key in [
+        "HOME",
+        "HOSTNAME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_STATE_HOME",
+        "XDG_RUNTIME_DIR",
+        "PROCESS_TRIAGE_DATA",
+        "PROCESS_TRIAGE_CONFIG",
+        "PROCESS_TRIAGE_CONFIG_DIR",
+        "PROCESS_TRIAGE_PRIORS",
+        "PROCESS_TRIAGE_POLICY",
+        "PROCESS_TRIAGE_RETENTION",
+        "KUBERNETES_SERVICE_HOST",
+        "TMPDIR",
+    ] {
+        match std::env::var(key) {
+            Ok(value) => {
+                spec.env.insert(key.to_string(), value);
+            }
+            Err(std::env::VarError::NotPresent) => {}
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(format!("MCP planner environment {key} is not UTF-8"));
+            }
+        }
+    }
+    Ok(spec)
+}
+
+fn run_plan_worker(spec: &ToolSpec) -> Result<String, String> {
+    let timeout = spec
+        .timeout
+        .unwrap_or(Duration::from_secs(DEFAULT_PLAN_TIMEOUT_SECS));
+    let runner = ToolRunner::new(ToolConfig {
+        default_timeout: timeout,
+        // The generic collector's five-second budget is not a planning budget.
+        budget_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+        use_nice: false,
+        #[cfg(target_os = "linux")]
+        use_ionice: false,
+        ..ToolConfig::default()
+    });
+    let output = runner
+        .run(spec)
+        .map_err(|error| format!("agent plan could not complete: {error}"))?;
+    parse_plan_worker_output(&output)
+}
+
+fn parse_plan_worker_output(output: &ToolOutput) -> Result<String, String> {
+    if output.timed_out {
+        return Err("agent plan timed out; no complete plan was returned".into());
+    }
+    if output.truncated {
+        return Err("agent plan output was truncated; no complete plan was returned".into());
+    }
+    // A valid JSON prefix is not success if the child failed afterwards.
+    if !matches!(output.exit_code, Some(0) | Some(1)) {
+        let stderr = output.stderr_str();
+        let tail = stderr
+            .lines()
+            .rev()
+            .take(5)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(format!(
+            "agent plan failed (exit {:?}): {tail}",
+            output.exit_code
+        ));
+    }
+    let stdout = std::str::from_utf8(&output.stdout)
+        .map_err(|_| "agent plan returned invalid UTF-8".to_string())?;
+    let document: serde_json::Value = serde_json::from_str(stdout)
+        .map_err(|error| format!("agent plan returned invalid JSON: {error}"))?;
+    let plan: crate::plan::Plan = serde_json::from_value(document.clone())
+        .map_err(|error| format!("agent plan returned an incomplete plan: {error}"))?;
+    if document["command"] != "agent plan"
+        || pt_common::SessionId::parse(&plan.session_id).is_none()
+        || plan.plan_id.is_empty()
+    {
+        return Err("agent plan returned an invalid plan identity".into());
+    }
+    let candidates = document["candidates"]
+        .as_array()
+        .ok_or("agent plan returned no candidate inventory")?;
+    let count = candidates.len() as u64;
+    if document["summary"]["candidates_returned"].as_u64() != Some(count)
+        || !document["summary"]["total_processes_scanned"]
+            .as_u64()
+            .is_some_and(|scanned| scanned >= count)
+        || output.exit_code != Some(i32::from(count > 0))
+    {
+        return Err("agent plan returned inconsistent candidate counts or exit status".into());
+    }
+    Ok(stdout.to_string())
 }
 
 /// Persist through the shipped CLI so MCP uses the same locking, decay,
@@ -1271,6 +1410,185 @@ fn tool_capabilities(_params: &serde_json::Value) -> Result<Vec<ToolContent>, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn worker_plan_document(count: usize) -> serde_json::Value {
+        serde_json::json!({
+            "command": "agent plan",
+            "plan_id": "mcp-worker-plan",
+            "session_id": pt_common::SessionId::new().0,
+            "generated_at": "2026-11-20T12:00:00Z",
+            "policy_id": null,
+            "policy_version": "1.0.0",
+            "actions": [],
+            "pre_toggled": [],
+            "gates_summary": {
+                "total_candidates": count,
+                "blocked_candidates": 0,
+                "pre_toggled_actions": 0,
+            },
+            "candidates": (0..count).map(|index| serde_json::json!({"pid": index + 100}))
+                .collect::<Vec<_>>(),
+            "summary": {"candidates_returned": count, "total_processes_scanned": count + 1},
+        })
+    }
+
+    #[test]
+    fn plan_deadline_is_bounded_and_part_of_the_tool_contract() {
+        assert_eq!(
+            plan_timeout(&serde_json::json!({})).unwrap(),
+            Duration::from_secs(120)
+        );
+        for seconds in [1, 120, MAX_PLAN_TIMEOUT_SECS] {
+            let params = serde_json::json!({"timeout_secs": seconds});
+            assert!(plan_command_args(&params).is_ok());
+            assert_eq!(plan_timeout(&params).unwrap(), Duration::from_secs(seconds));
+        }
+        for seconds in [
+            serde_json::Value::Null,
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("120"),
+            serde_json::json!(MAX_PLAN_TIMEOUT_SECS + 1),
+            serde_json::json!(u64::MAX),
+        ] {
+            assert!(plan_command_args(&serde_json::json!({"timeout_secs": seconds})).is_err());
+        }
+        let definition = tool_definitions()
+            .into_iter()
+            .find(|tool| tool.name == "pt_plan")
+            .unwrap();
+        let schema = &definition.input_schema["properties"]["timeout_secs"];
+        assert_eq!(schema["minimum"], 1);
+        assert_eq!(schema["maximum"], MAX_PLAN_TIMEOUT_SECS);
+        assert_eq!(schema["default"], DEFAULT_PLAN_TIMEOUT_SECS);
+
+        let spec = plan_worker_spec(
+            Path::new("/tmp/pt core"),
+            Path::new("/tmp/config with spaces"),
+            plan_command_args(&serde_json::json!({"timeout_secs": 7})).unwrap(),
+            Duration::from_secs(7),
+        )
+        .unwrap();
+        assert_eq!(spec.command, "/tmp/pt core");
+        assert_eq!(
+            &spec.args[..3],
+            ["--config", "/tmp/config with spaces", "--timeout=7"]
+        );
+        assert_eq!(spec.timeout, Some(Duration::from_secs(7)));
+        assert!(!spec.env.contains_key("PT_SKIP_GLOBAL_LOCK"));
+        assert!(!spec.env.contains_key("PT_FORMAT"));
+        assert!(!spec.env.contains_key("LD_PRELOAD"));
+        #[cfg(target_os = "linux")]
+        assert!(spec.isolate_process_group);
+    }
+
+    #[test]
+    fn plan_worker_rejects_incomplete_or_inconsistent_success() {
+        let document = worker_plan_document(0);
+        let original = ToolOutput {
+            command: "pt-core".into(),
+            args: Vec::new(),
+            stdout: document.to_string().into_bytes(),
+            stderr: Vec::new(),
+            exit_code: Some(0),
+            truncated: false,
+            duration: Duration::ZERO,
+            timed_out: false,
+        };
+        assert_eq!(
+            parse_plan_worker_output(&original).unwrap(),
+            document.to_string()
+        );
+        for (path, value) in [
+            ("/command", serde_json::json!("agent scan")),
+            ("/plan_id", serde_json::json!("")),
+            ("/session_id", serde_json::json!("not-a-session")),
+            ("/actions", serde_json::Value::Null),
+            ("/candidates", serde_json::Value::Null),
+            ("/summary/candidates_returned", serde_json::json!(1)),
+            ("/summary/total_processes_scanned", serde_json::Value::Null),
+        ] {
+            let mut invalid = document.clone();
+            *invalid.pointer_mut(path).unwrap() = value;
+            let mut output = original.clone();
+            output.stdout = invalid.to_string().into_bytes();
+            assert!(
+                parse_plan_worker_output(&output).is_err(),
+                "accepted {path}"
+            );
+        }
+        for bytes in [b"{}".to_vec(), b"{\"command\":".to_vec(), vec![0xff]] {
+            let mut output = original.clone();
+            output.stdout = bytes;
+            assert!(parse_plan_worker_output(&output).is_err());
+        }
+        for status in [None, Some(1), Some(20)] {
+            let mut output = original.clone();
+            output.exit_code = status;
+            assert!(parse_plan_worker_output(&output).is_err());
+        }
+        let mut output = original.clone();
+        output.timed_out = true;
+        assert!(parse_plan_worker_output(&output)
+            .unwrap_err()
+            .contains("timed out"));
+        let mut output = original;
+        output.truncated = true;
+        assert!(parse_plan_worker_output(&output)
+            .unwrap_err()
+            .contains("truncated"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_worker_deadlines_cover_child_exit_output_and_owned_descendants() {
+        for count in [0, 1] {
+            let document = worker_plan_document(count).to_string();
+            let spec = ToolSpec::new(
+                "/bin/sh",
+                vec![
+                    "-c".into(),
+                    "printf '%s' \"$1\"; exit \"$2\"".into(),
+                    "mcp-planner-fixture".into(),
+                    document.clone(),
+                    count.to_string(),
+                ],
+            )
+            .with_timeout(Duration::from_secs(5));
+            assert_eq!(run_plan_worker(&spec).unwrap(), document);
+            assert!(run_plan_worker(&spec.with_max_output(16))
+                .unwrap_err()
+                .contains("truncated"));
+        }
+        let sleeper = ToolSpec::new("/bin/sh", vec!["-c".into(), "exec sleep 30".into()])
+            .with_timeout(Duration::from_millis(100));
+        let started = std::time::Instant::now();
+        assert!(run_plan_worker(&sleeper).unwrap_err().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        #[cfg(target_os = "linux")]
+        {
+            // A successful leader can leave a child holding the output pipes.
+            // The original deadline must still apply to the complete response.
+            let held_pipe = ToolSpec::new(
+                "/bin/sh",
+                vec![
+                    "-c".into(),
+                    "sleep 30 & printf '%s' \"$1\"; exit 0".into(),
+                    "mcp-planner-held-pipe".into(),
+                    worker_plan_document(0).to_string(),
+                ],
+            )
+            .with_timeout(Duration::from_millis(100))
+            .with_process_group();
+            let started = std::time::Instant::now();
+            assert!(run_plan_worker(&held_pipe)
+                .unwrap_err()
+                .contains("timed out"));
+            assert!(started.elapsed() < Duration::from_secs(5));
+        }
+    }
 
     fn protection_test_scan() -> ScanResult {
         const BASE: u32 = 1 << 22;

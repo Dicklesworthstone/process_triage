@@ -1208,6 +1208,60 @@ fn actual_mcp_sampling_windows_are_advertised_and_rejected_before_process_work()
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn actual_mcp_plan_deadline_releases_the_server_for_the_next_request() {
+    use assert_cmd::cargo::cargo_bin_cmd;
+
+    let root = std::env::temp_dir().join(format!("pt-mcp-deadline-{}", uuid::Uuid::new_v4()));
+    let config = root.join("config");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("policy.json"),
+        serde_json::to_vec(&pt_core::config::Policy::default()).unwrap(),
+    )
+    .unwrap();
+    // The real planner samples the complete census even when no process passes
+    // this age floor. Its 30-second sampling window must not hold the MCP server
+    // beyond the caller's one-second total deadline.
+    let plan = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "pt_plan", "arguments": {
+            "min_age": u64::MAX, "window_ms": 30_000, "timeout_secs": 1,
+        }},
+    });
+    let ping = serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "ping"});
+    let started = std::time::Instant::now();
+    let output = cargo_bin_cmd!("pt-core")
+        .arg("--config")
+        .arg(&config)
+        .arg("mcp")
+        .env_remove("PT_CONFIG_DIR")
+        .env_remove("PT_SKIP_GLOBAL_LOCK")
+        .env("PROCESS_TRIAGE_DATA", root.join("data"))
+        .env("PROCESS_TRIAGE_RETENTION", "off")
+        .write_stdin(format!("{plan}\n{ping}\n"))
+        .timeout(std::time::Duration::from_secs(15))
+        .output()
+        .expect("run actual MCP server with a bounded planner");
+    assert!(started.elapsed() < std::time::Duration::from_secs(15));
+    assert!(output.status.success(), "{output:?}");
+    let responses: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(responses.len(), 2, "{responses:?}");
+    assert_eq!(responses[0]["id"], 1);
+    assert_eq!(responses[0]["result"]["isError"], true, "{}", responses[0]);
+    assert!(responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("timed out"));
+    assert_eq!(responses[1]["id"], 2);
+    assert_eq!(responses[1]["result"], serde_json::json!({}));
+}
+
 #[test]
 fn actual_mcp_plan_child_uses_the_servers_explicit_config() {
     use assert_cmd::cargo::cargo_bin_cmd;
