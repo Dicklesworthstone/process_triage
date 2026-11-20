@@ -418,6 +418,7 @@ enum Commands {
 // ============================================================================
 
 const DEFAULT_PROBE_BUDGET_MS: u64 = 3000;
+const DEFAULT_CANDIDATE_MIN_POSTERIOR: f64 = 0.7;
 
 #[derive(Args, Debug)]
 struct RunArgs {
@@ -451,6 +452,15 @@ struct RunArgs {
     /// Only consider processes older than threshold (seconds)
     #[arg(long)]
     min_age: Option<u64>,
+
+    /// Minimum intervention probability to display (0 includes useful pressure candidates; safety gates still apply)
+    #[arg(
+        long = "min-posterior",
+        visible_alias = "threshold",
+        default_value_t = DEFAULT_CANDIDATE_MIN_POSTERIOR,
+        value_parser = parse_probability
+    )]
+    min_posterior: f64,
 
     /// Resource recovery goal for goal-oriented optimization
     #[arg(
@@ -1258,7 +1268,8 @@ struct AgentPlanArgs {
     #[arg(
         long = "min-posterior",
         visible_alias = "threshold",
-        default_value = "0.7"
+        default_value_t = DEFAULT_CANDIDATE_MIN_POSTERIOR,
+        value_parser = parse_probability
     )]
     min_posterior: f64,
 
@@ -2226,6 +2237,7 @@ fn main() {
                     signatures: None,
                     community_signatures: false,
                     min_age: None,
+                    min_posterior: DEFAULT_CANDIDATE_MIN_POSTERIOR,
                     goal: None,
                     theme: None,
                     high_contrast: false,
@@ -2352,6 +2364,37 @@ mod cli_definition_tests {
                 let mut args = prefix.clone();
                 args.extend(["--window-ms", invalid]);
                 assert!(super::Cli::try_parse_from(args).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn interactive_and_agent_candidate_thresholds_share_defaults_and_validation() {
+        for prefix in [vec!["pt-core", "run"], vec!["pt-core", "agent", "plan"]] {
+            for flag in ["--min-posterior", "--threshold"] {
+                for (value, expected) in [(None, 0.7), (Some("0"), 0.0), (Some("1"), 1.0)] {
+                    let mut args = prefix.clone();
+                    if let Some(value) = value {
+                        args.extend([flag, value]);
+                    }
+                    let parsed = super::Cli::try_parse_from(args).unwrap();
+                    let actual = match parsed.command.unwrap() {
+                        super::Commands::Run(args) => args.min_posterior,
+                        super::Commands::Agent(super::AgentArgs {
+                            command: super::AgentCommands::Plan(args),
+                        }) => args.min_posterior,
+                        _ => panic!("unexpected command"),
+                    };
+                    assert_eq!(actual, expected);
+                }
+                for invalid in ["NaN", "inf", "-inf", "-0.1", "1.01", "invalid"] {
+                    let argument = format!("{flag}={invalid}");
+                    let args = prefix.iter().copied().chain([argument.as_str()]);
+                    assert!(
+                        super::Cli::try_parse_from(args).is_err(),
+                        "accepted {argument}"
+                    );
+                }
             }
         }
     }
@@ -2658,6 +2701,7 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
         let probe_budget_r = planning_probe_budget(args.probe_budget_ms, global.timeout);
         let window_ms_r = args.window_ms;
         let min_age_r = args.min_age;
+        let min_posterior_r = args.min_posterior;
         let goal_r = args.goal.clone();
         let policy_scan_r = policy.clone();
         let decisions_r = Arc::clone(&decisions);
@@ -2692,6 +2736,7 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
                     &scan_result.processes,
                     scan_result.metadata.warnings.is_empty(),
                     min_age_r,
+                    min_posterior_r,
                     deep_r,
                     probe_budget_r,
                     window_ms_r,
@@ -3132,6 +3177,7 @@ fn build_tui_data_from_live_scan(
         &scan_result.processes,
         scan_result.metadata.warnings.is_empty(),
         args.min_age,
+        args.min_posterior,
         args.deep,
         planning_probe_budget(args.probe_budget_ms, global.timeout),
         args.window_ms,
@@ -3152,6 +3198,7 @@ fn score_tui_rows(
     population: &[ProcessRecord],
     census_complete: bool,
     min_age: Option<u64>,
+    min_posterior: f64,
     deep: bool,
     probe_budget: Duration,
     window_ms: u64,
@@ -3184,6 +3231,7 @@ fn score_tui_rows(
         population,
         census_complete,
         Some(min_age),
+        min_posterior,
         deep_signals,
         Some(&probe_advice),
         &scorer,
@@ -7116,6 +7164,7 @@ fn build_tui_rows(
     population: &[ProcessRecord],
     census_complete: bool,
     min_age: Option<u64>,
+    min_posterior: f64,
     deep_signals: Option<&HashMap<u32, DeepSignals>>,
     probe_advice: Option<&HashMap<u32, ProbeAdvice>>,
     scorer: &Scorer,
@@ -7124,7 +7173,6 @@ fn build_tui_rows(
     session_id: &SessionId,
     pressure: &PlanningPressure,
 ) -> Result<TuiBuildOutput, String> {
-    const MIN_POSTERIOR: f64 = 0.7;
     const MAX_CANDIDATES: usize = 50;
 
     let decision_policy = policy.clone();
@@ -7252,9 +7300,10 @@ fn build_tui_rows(
                 }
             }
         }
-        // Show rows where some intervention is plausibly warranted (never max-class:
-        // that admitted confidently-useful processes).
-        if posterior_result.posterior.intervention_probability() < MIN_POSTERIOR {
+        // Match agent plan's candidate filter. An explicit zero includes useful
+        // workloads for pressure review; it does not change their action policy.
+        // Never use max-class probability, which changes the event being filtered.
+        if posterior_result.posterior.intervention_probability() < min_posterior {
             continue;
         }
 
@@ -22067,6 +22116,99 @@ mod process_tree_safety_tests {
             fn executable(&self, selected: &[u32]) -> Plan {
                 build_plan_from_selection(&self.session, &self.policy, selected, &self.inputs)
                     .unwrap()
+            }
+        }
+
+        #[test]
+        fn expanded_candidate_threshold_keeps_tui_policy_and_goal_refusals() {
+            // Equal observation likelihoods isolate the configured class prior.
+            // The candidate is mostly useful-bad, with P(intervention)=0.6;
+            // changing display coverage must not authorize its unavailable PID.
+            let mut priors = Priors::default();
+            let neutral = priors.classes.useful.clone();
+            priors.classes.useful_bad = neutral.clone();
+            priors.classes.abandoned = neutral.clone();
+            priors.classes.zombie = neutral;
+            priors.classes.useful.prior_prob = 0.4;
+            priors.classes.useful_bad.prior_prob = 0.59;
+            priors.classes.abandoned.prior_prob = 0.009;
+            priors.classes.zombie.prior_prob = 0.001;
+            priors.state_flags = None;
+            priors.command_categories = None;
+            let scorer = Scorer::new(
+                priors,
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            );
+            let process = rec(
+                2_000_000_000,
+                1,
+                "pt-threshold-fixture",
+                ProcessState::Sleeping,
+            );
+            let posterior = scorer
+                .score(&process, Evidence::from_snapshot(&process))
+                .unwrap();
+            assert!((posterior.posterior.posterior.intervention_probability() - 0.6).abs() < 1e-10);
+            let mut policy = pt_core::config::Policy::default();
+            // Exercise a real proposed intervention without changing any guard.
+            for row in [
+                &mut policy.loss_matrix.useful,
+                &mut policy.loss_matrix.useful_bad,
+                &mut policy.loss_matrix.abandoned,
+                &mut policy.loss_matrix.zombie,
+            ] {
+                row.keep = 2.0;
+                row.renice = Some(0.0);
+            }
+            let population = [process];
+            let session = SessionId::new();
+            let pressure = PlanningPressure::default();
+            for goal in [None, Some("relieve")] {
+                let rows_for = |threshold| {
+                    build_tui_rows(
+                        &population,
+                        &population,
+                        true,
+                        None,
+                        threshold,
+                        None,
+                        None,
+                        &scorer,
+                        &policy,
+                        goal,
+                        &session,
+                        &pressure,
+                    )
+                    .unwrap()
+                };
+                assert!(
+                    rows_for(DEFAULT_CANDIDATE_MIN_POSTERIOR)
+                        .snapshot
+                        .rows
+                        .is_empty()
+                );
+                assert!(rows_for(0.61).snapshot.rows.is_empty());
+                for threshold in [0.0, 0.59] {
+                    let output = rows_for(threshold);
+                    assert_eq!(output.snapshot.rows.len(), 1);
+                    let row = &output.snapshot.rows[0];
+                    assert_eq!(row.pid, population[0].pid.0);
+                    assert_eq!(row.classification, "REVIEW");
+                    assert!(!row.selected);
+                    assert!(
+                        build_plan_from_selection(
+                            &session,
+                            &policy,
+                            &[row.pid],
+                            &output.plan_candidates,
+                        )
+                        .unwrap()
+                        .actions
+                        .is_empty()
+                    );
+                }
             }
         }
 
