@@ -26,7 +26,7 @@ use serde::Serialize;
 use std::collections::HashSet;
 use std::fmt;
 use std::time::Duration;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::time::Instant;
 use thiserror::Error;
 use tracing::{debug, trace};
@@ -48,7 +48,7 @@ fn user_name_for_uid(uid: u32) -> Option<String> {
     Some(name.to_string_lossy().into_owned())
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn recent_io_probe_window(window: Duration) -> Duration {
     if window.is_zero() {
         Duration::from_millis(10)
@@ -57,20 +57,76 @@ fn recent_io_probe_window(window: Duration) -> Duration {
     }
 }
 
+/// Both platforms expose native parent, birth and state facts. An unavailable
+/// read is not evidence that a process has no supervisor or has exited.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn read_precheck_stat(pid: u32) -> Result<crate::collect::proc_parsers::ProcessStat, String> {
+    #[cfg(target_os = "linux")]
+    {
+        read_required_proc_stat(pid).map_err(|error| error.to_string())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        crate::collect::macos::read_session_stat(pid)
+            .ok_or_else(|| format!("cannot read native process identity and state for PID {pid}"))
+    }
+}
+
+/// Bind a parent name to the same child and parent incarnations on both sides
+/// of the observation. This also validates a parentless namespace boundary.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn parent_comm_from_observations(
+    pid: u32,
+    mut read: impl FnMut(u32) -> Result<crate::collect::proc_parsers::ProcessStat, String>,
+) -> Result<Option<String>, String> {
+    let mut observed = |expected_pid| {
+        let stat = read(expected_pid)?;
+        if stat.pid != expected_pid || stat.comm.trim().is_empty() {
+            return Err(format!(
+                "invalid parent supervision identity for PID {expected_pid}"
+            ));
+        }
+        Ok(stat)
+    };
+    let before = observed(pid)?;
+    if before.ppid == pid {
+        return Err(format!(
+            "parent supervision evidence for PID {pid} has a self-parent loop"
+        ));
+    }
+    let parent = if before.ppid == 0 {
+        None
+    } else {
+        let parent = observed(before.ppid)?;
+        let after = observed(before.ppid)?;
+        if after.starttime != parent.starttime || after.comm != parent.comm {
+            return Err(format!("parent supervision evidence changed for PID {pid}"));
+        }
+        Some(parent.comm)
+    };
+    let after = observed(pid)?;
+    if after.starttime != before.starttime || after.ppid != before.ppid || after.comm != before.comm
+    {
+        return Err(format!("parent supervision evidence changed for PID {pid}"));
+    }
+    Ok(parent)
+}
+
 /// A failed observation is not proof of exit. In particular, procfs may hide a
 /// live process and native process APIs may refuse a process owned by someone
 /// else. Signal zero only tests existence; EPERM still proves the PID is live.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn process_is_absent(pid: u32) -> Result<bool, String> {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
-        // This value cannot name a process on either supported platform.
+    let Ok(native_pid) = libc::pid_t::try_from(pid) else {
+        // Do not cast an out-of-range ID into a negative process-group request.
         return Ok(true);
     };
-    if pid <= 0 {
+    if native_pid <= 0 {
         return Err("invalid process PID; refusing a process-group probe".to_string());
     }
+    super::signal::ensure_action_pid_namespace().map_err(|error| error.to_string())?;
     // SAFETY: the positive PID names one process and signal zero sends no signal.
-    if unsafe { libc::kill(pid, 0) } == 0 {
+    if unsafe { libc::kill(native_pid, 0) } == 0 {
         return Ok(false);
     }
     let error = std::io::Error::last_os_error();
@@ -1367,31 +1423,18 @@ pub fn open_write_fd_count(pid: u32) -> Option<u32> {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RecentIoEvidence {
-    #[cfg(target_os = "linux")]
     Active,
-    #[cfg(target_os = "linux")]
     Idle,
-    /// The current collector cannot observe this platform's process I/O.
-    /// An explicitly enabled gate must refuse without that evidence.
-    #[cfg(any(not(target_os = "linux"), test))]
-    Unsupported,
     Unknown(String),
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn recent_io_precheck(evidence: RecentIoEvidence, window: Duration) -> PreCheckResult {
     let reason = match evidence {
-        #[cfg(target_os = "linux")]
         RecentIoEvidence::Idle => return PreCheckResult::Passed,
-        #[cfg(target_os = "linux")]
         RecentIoEvidence::Active => {
             format!("recent I/O activity within {}s window", window.as_secs())
         }
-        #[cfg(any(not(target_os = "linux"), test))]
-        RecentIoEvidence::Unsupported => format!(
-            "recent I/O evidence unavailable: this platform cannot observe the configured {}s window",
-            window.as_secs()
-        ),
         RecentIoEvidence::Unknown(reason) => {
             format!("recent I/O evidence unavailable: {reason}")
         }
@@ -1402,10 +1445,14 @@ fn recent_io_precheck(evidence: RecentIoEvidence, window: Duration) -> PreCheckR
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone)]
 struct IoSample {
+    /// Linux start ticks or macOS process-start absolute time. Only observations
+    /// from one native reader are compared; persisted baselines are Linux-only.
     birth_ticks: u64,
+    /// Linux wchar or macOS logical writes. Physical disk writes are observed
+    /// separately so delayed writeback also blocks an apparently idle target.
     wchar: u64,
     write_bytes: u64,
     started_at: Instant,
@@ -1582,7 +1629,7 @@ impl RecentIoBaseline {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone)]
 struct RecentIoObservation {
     before: Result<IoSample, String>,
@@ -1590,7 +1637,7 @@ struct RecentIoObservation {
     window: Duration,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl RecentIoObservation {
     fn evidence(&self) -> RecentIoEvidence {
         let (before, after) = match (&self.before, &self.after) {
@@ -1720,6 +1767,53 @@ fn read_io_sample(pid: u32) -> Result<IoSample, String> {
     })
 }
 
+/// Darwin exposes both logical and physical file-write counters through
+/// RUSAGE_INFO_V4. Do not substitute zero counters when this API is unavailable.
+/// API/field definitions: Apple's xnu/libsyscall/wrappers/libproc/libproc.h and
+/// xnu/bsd/kern/kern_resource.c (gather_rusage_info, RUSAGE_INFO_V4).
+#[cfg(target_os = "macos")]
+fn read_io_sample(pid: u32) -> Result<IoSample, String> {
+    let started_at = Instant::now();
+    let native_pid = i32::try_from(pid)
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| format!("invalid I/O observation PID {pid}"))?;
+    let identity = || {
+        crate::collect::macos::read_bsd_info(pid)
+            .ok_or_else(|| format!("cannot read native I/O identity for PID {pid}"))
+    };
+    let before = identity()?;
+    // SAFETY: rusage_info_v4 contains only integers/arrays; the documented V4
+    // flavor writes exactly this structure into our valid, aligned buffer.
+    let mut usage: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        libc::proc_pid_rusage(
+            native_pid,
+            libc::RUSAGE_INFO_V4,
+            (&mut usage as *mut libc::rusage_info_v4).cast(),
+        )
+    };
+    if result != 0 {
+        return Err(format!(
+            "cannot read native logical and physical write counters for PID {pid}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if before != identity()? || usage.ri_proc_start_abstime == 0 || usage.ri_proc_exit_abstime != 0
+    {
+        return Err(format!(
+            "process changed or exited during native I/O observation for PID {pid}"
+        ));
+    }
+    Ok(IoSample {
+        birth_ticks: usage.ri_proc_start_abstime,
+        wchar: usage.ri_logical_writes,
+        write_bytes: usage.ri_diskio_byteswritten,
+        started_at,
+        finished_at: Instant::now(),
+    })
+}
+
 /// Live pre-check provider that reads from /proc (Linux) or sysctl/lsof (macOS).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub struct LivePreCheckProvider {
@@ -1728,7 +1822,6 @@ pub struct LivePreCheckProvider {
     /// Known supervisor comm names.
     known_supervisors: HashSet<String>,
     /// Recent-I/O results sampled up front for many pids (see `prime_recent_io`).
-    #[cfg(target_os = "linux")]
     recent_io: std::sync::Mutex<std::collections::HashMap<u32, RecentIoObservation>>,
 }
 
@@ -1787,10 +1880,6 @@ impl LivePreCheckProvider {
     /// the full window, 60 s by default, per target). Pids not primed are probed
     /// individually as before.
     pub fn prime_recent_io(&self, pids: &[u32]) {
-        // Unsupported probes become Unknown when the enabled gate is evaluated.
-        #[cfg(not(target_os = "linux"))]
-        let _ = pids;
-        #[cfg(target_os = "linux")]
         if self.config.block_if_recent_io_seconds > 0 && !pids.is_empty() {
             let before: Vec<_> = pids.iter().map(|&pid| (pid, read_io_sample(pid))).collect();
             let window = Duration::from_secs(self.config.block_if_recent_io_seconds);
@@ -1844,7 +1933,6 @@ impl LivePreCheckProvider {
             protected_filter,
             config,
             known_supervisors,
-            #[cfg(target_os = "linux")]
             recent_io: Default::default(),
         })
     }
@@ -1962,7 +2050,6 @@ impl LivePreCheckProvider {
             protected_filter,
             config: LivePreCheckConfig::default(),
             known_supervisors,
-            #[cfg(target_os = "linux")]
             recent_io: Default::default(),
         }
     }
@@ -1975,42 +2062,33 @@ impl LivePreCheckProvider {
 
     /// Observe a full I/O window, retaining unreadable and invalid evidence.
     fn has_recent_io(&self, pid: u32, window: Duration) -> RecentIoEvidence {
-        #[cfg(target_os = "linux")]
-        {
-            let cached = self
-                .recent_io
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&pid)
-                .cloned();
-            if let Some(cached) = cached {
-                if cached.window != window {
-                    return RecentIoEvidence::Unknown(
-                        "cached I/O window differs from the required window".to_string(),
-                    );
-                }
-                return cached.revalidate(read_io_sample(pid));
+        let cached = self
+            .recent_io
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&pid)
+            .cloned();
+        if let Some(cached) = cached {
+            if cached.window != window {
+                return RecentIoEvidence::Unknown(
+                    "cached I/O window differs from the required window".to_string(),
+                );
             }
-            let before = read_io_sample(pid);
-            std::thread::sleep(recent_io_probe_window(window));
-            let observation = RecentIoObservation {
-                before,
-                after: read_io_sample(pid),
-                window,
-            };
-            let evidence = observation.evidence();
-            self.recent_io
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(pid, observation);
-            evidence
+            return cached.revalidate(read_io_sample(pid));
         }
-        #[cfg(target_os = "macos")]
-        {
-            let _ = pid;
-            let _ = window;
-            RecentIoEvidence::Unsupported
-        }
+        let before = read_io_sample(pid);
+        std::thread::sleep(recent_io_probe_window(window));
+        let observation = RecentIoObservation {
+            before,
+            after: read_io_sample(pid),
+            window,
+        };
+        let evidence = observation.evidence();
+        self.recent_io
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(pid, observation);
+        evidence
     }
 
     /// Check locks without treating unavailable evidence as an unlocked process.
@@ -2096,42 +2174,7 @@ impl LivePreCheckProvider {
 
     /// Get parent process comm name.
     fn get_ppid_comm(&self, pid: u32) -> Result<Option<String>, String> {
-        #[cfg(target_os = "linux")]
-        {
-            let before = read_required_proc_stat(pid).map_err(|error| error.to_string())?;
-            if before.ppid == 0 {
-                return Ok(None);
-            }
-            if before.ppid == pid {
-                return Err(format!(
-                    "parent supervision evidence for PID {pid} has a self-parent loop"
-                ));
-            }
-            let parent = read_required_proc_stat(before.ppid).map_err(|error| error.to_string())?;
-            let parent_after =
-                read_required_proc_stat(before.ppid).map_err(|error| error.to_string())?;
-            let after = read_required_proc_stat(pid).map_err(|error| error.to_string())?;
-            if after.starttime != before.starttime
-                || after.ppid != before.ppid
-                || parent_after.starttime != parent.starttime
-                || parent_after.comm != parent.comm
-            {
-                return Err(format!("parent supervision evidence changed for PID {pid}"));
-            }
-            Ok(Some(parent.comm))
-        }
-        // No /proc here: take the parent from `ps`, as v2.2.1 did, so the launchd
-        // check below still runs. Refusing instead blocked every macOS action.
-        #[cfg(target_os = "macos")]
-        {
-            Ok(crate::collect::read_process_snapshot(pid)
-                .and_then(|info| self.read_comm(info.ppid)))
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-            let _ = pid;
-            Ok(None)
-        }
+        parent_comm_from_observations(pid, read_precheck_stat)
     }
 
     /// Check if process is managed by a known supervisor.
@@ -2840,6 +2883,214 @@ impl PreCheckProvider for NoopPreCheckProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parent_supervision_requires_complete_stable_child_and_parent_observations() {
+        use crate::collect::proc_parsers::ProcessStat;
+        let child = ProcessStat {
+            pid: 42,
+            ppid: 7,
+            comm: "worker".to_string(),
+            starttime: 20,
+            ..ProcessStat::default()
+        };
+        let parent = ProcessStat {
+            pid: 7,
+            ppid: 1,
+            comm: "supervisord".to_string(),
+            starttime: 10,
+            ..ProcessStat::default()
+        };
+        let complete = [child.clone(), parent.clone(), parent.clone(), child.clone()];
+        let read = |observations: Vec<Result<ProcessStat, String>>| {
+            let mut observations = observations.into_iter();
+            let mut expected = [42, 7, 7, 42].into_iter();
+            parent_comm_from_observations(42, |pid| {
+                assert_eq!(Some(pid), expected.next());
+                observations.next().expect("bounded parent observation")
+            })
+        };
+        assert_eq!(
+            read(complete.iter().cloned().map(Ok).collect()).unwrap(),
+            Some("supervisord".to_string())
+        );
+        // Loss of any one required observation must not turn into "unsupervised".
+        for missing in 0..complete.len() {
+            let mut observations: Vec<_> = complete.iter().cloned().map(Ok).collect();
+            observations[missing] = Err(format!("unreadable observation {missing}"));
+            assert_eq!(
+                read(observations).unwrap_err(),
+                format!("unreadable observation {missing}")
+            );
+        }
+        for changed in [
+            "parent_birth",
+            "child_birth",
+            "parent_command",
+            "child_command",
+            "child_parent",
+            "wrong_parent_pid",
+            "empty_parent_name",
+        ] {
+            let mut observations = complete.clone();
+            match changed {
+                "parent_birth" => observations[2].starttime += 1,
+                "child_birth" => observations[3].starttime += 1,
+                "parent_command" => observations[2].comm = "replacement".to_string(),
+                "child_command" => observations[3].comm = "replacement".to_string(),
+                "child_parent" => observations[3].ppid = 8,
+                "wrong_parent_pid" => observations[2].pid = 8,
+                "empty_parent_name" => observations[1].comm.clear(),
+                _ => unreachable!(),
+            }
+            assert!(
+                read(observations.into_iter().map(Ok).collect()).is_err(),
+                "accepted changed supervision evidence: {changed}"
+            );
+        }
+        let mut parentless = child.clone();
+        parentless.ppid = 0;
+        assert_eq!(
+            parent_comm_from_observations(42, |_| Ok(parentless.clone())).unwrap(),
+            None
+        );
+        let mut reads = 0;
+        assert!(parent_comm_from_observations(42, |_| {
+            reads += 1;
+            Ok(if reads == 1 {
+                parentless.clone()
+            } else {
+                child.clone()
+            })
+        })
+        .is_err());
+        let mut self_parent = child;
+        self_parent.ppid = self_parent.pid;
+        assert!(parent_comm_from_observations(42, |_| Ok(self_parent.clone())).is_err());
+    }
+
+    #[test]
+    fn process_state_characters_preserve_viability_policy() {
+        for (raw, expected, viable) in [
+            ('R', ProcessState::Running, true),
+            ('S', ProcessState::Sleeping, true),
+            ('D', ProcessState::DiskSleep, false),
+            ('Z', ProcessState::Zombie, false),
+            ('T', ProcessState::Stopped, true),
+            ('t', ProcessState::Stopped, true),
+            ('I', ProcessState::Idle, true),
+            ('X', ProcessState::Dead, false),
+            ('x', ProcessState::Dead, false),
+        ] {
+            let state = ProcessState::from_char(raw);
+            assert_eq!(state, expected);
+            assert_eq!(
+                process_state_precheck(Ok(Some(state)), None).is_passed(),
+                viable,
+                "unexpected viability for state {raw}"
+            );
+        }
+        for unknown in ['?', '\0', 'Q'] {
+            assert!(matches!(
+                process_state_precheck(Ok(Some(ProcessState::from_char(unknown))), None),
+                PreCheckResult::Blocked { check: PreCheck::VerifyProcessState, reason }
+                    if reason.contains("unknown process state")
+            ));
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn native_process_exit_probe_never_uses_process_group_ids() {
+        assert!(process_is_absent(0).is_err());
+        assert!(process_is_absent(u32::MAX).unwrap());
+        assert!(!process_is_absent(std::process::id()).unwrap());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn live_native_parent_and_state_checks_preserve_idle_and_exited_targets() {
+        let provider = LivePreCheckProvider::with_defaults();
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .env_clear()
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn owned idle target");
+        let pid = child.id();
+        let parent = provider.get_ppid_comm(pid);
+        let state = provider.read_process_state(pid);
+        let expected_parent = read_precheck_stat(std::process::id()).map(|stat| stat.comm);
+        // Reap the owned process before assertions so a failure cannot leak it.
+        let _ = child.kill();
+        child.wait().expect("reap owned target");
+        assert_eq!(parent.unwrap(), Some(expected_parent.unwrap()));
+        assert!(state.unwrap().expect("live process state").is_active());
+        assert_eq!(provider.read_process_state(pid).unwrap(), None);
+        assert!(provider.check_process_state(pid).is_passed());
+        assert!(matches!(
+            provider.check_supervisor(pid),
+            PreCheckResult::Blocked { check: PreCheck::CheckSupervisor, reason }
+                if reason.contains("supervisor evidence unavailable")
+        ));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn native_io_windows_never_accept_missing_reset_or_reused_observations() {
+        let start = Instant::now();
+        let window = Duration::from_secs(10);
+        let sample = |at, birth_ticks, logical, physical| IoSample {
+            birth_ticks,
+            wchar: logical,
+            write_bytes: physical,
+            started_at: at,
+            finished_at: at,
+        };
+        let before = sample(start, 100, 4096, 8192);
+        let after = sample(start + window, 100, 4096, 8192);
+        let observation = |after| RecentIoObservation {
+            before: Ok(before.clone()),
+            after,
+            window,
+        };
+        let idle = observation(Ok(after.clone()));
+        assert_eq!(idle.evidence(), RecentIoEvidence::Idle);
+        assert_eq!(
+            observation(Ok(sample(start + window, 100, 8192, 8192))).evidence(),
+            RecentIoEvidence::Active
+        );
+        assert_eq!(
+            observation(Ok(sample(start + window, 100, 4096, 16384))).evidence(),
+            RecentIoEvidence::Active
+        );
+        for invalid in [
+            Err("native I/O API unavailable".to_string()),
+            Ok(sample(start + window, 101, 4096, 8192)),
+            Ok(sample(start + window, 100, 0, 8192)),
+            Ok(sample(start + window, 100, 4096, 0)),
+            Ok(sample(start, 100, 4096, 8192)),
+        ] {
+            assert!(matches!(
+                observation(invalid).evidence(),
+                RecentIoEvidence::Unknown(_)
+            ));
+        }
+        assert!(matches!(
+            idle.revalidate(Err("permission lost".to_string())),
+            RecentIoEvidence::Unknown(reason) if reason.contains("permission lost")
+        ));
+        assert_eq!(
+            idle.revalidate(Ok(sample(start + window * 2, 100, 8192, 8192))),
+            RecentIoEvidence::Active
+        );
+        assert!(matches!(
+            idle.revalidate(Ok(sample(start + window * 2, 101, 4096, 8192))),
+            RecentIoEvidence::Unknown(reason) if reason.contains("birth changed")
+        ));
+    }
 
     #[test]
     fn protection_metadata_requires_each_complete_observation() {
@@ -3831,7 +4082,9 @@ mod tests {
     fn enabled_recent_io_gate_refuses_unsupported_and_unknown_observations() {
         let window = Duration::from_secs(60);
         for evidence in [
-            RecentIoEvidence::Unsupported,
+            RecentIoEvidence::Unknown(
+                "native I/O API does not support this observation".to_string(),
+            ),
             RecentIoEvidence::Unknown("permission denied".to_string()),
         ] {
             assert!(matches!(
@@ -3841,8 +4094,9 @@ mod tests {
                         && reason.contains("recent I/O evidence unavailable")
             ));
         }
+        assert!(recent_io_precheck(RecentIoEvidence::Idle, window).is_passed());
         assert!(matches!(
-            recent_io_precheck(RecentIoEvidence::Unsupported, window),
+            recent_io_precheck(RecentIoEvidence::Active, window),
             PreCheckResult::Blocked { reason, .. } if reason.contains("60s window")
         ));
     }
@@ -4414,27 +4668,83 @@ mod tests {
     mod macos_tests {
         use super::*;
 
-        /// An explicit policy window is a required observation even when the
-        /// platform collector cannot supply it. Disabling the gate is separate.
-        #[test]
-        fn recent_io_gate_refuses_without_io_counters_on_macos() {
+        fn io_only_provider(seconds: u64) -> LivePreCheckProvider {
             let config = LivePreCheckConfig {
                 block_if_open_write_fds: false,
                 block_if_locked_files: false,
                 block_if_active_tty: false,
                 block_if_deleted_cwd: false,
-                block_if_recent_io_seconds: 1,
+                block_if_recent_io_seconds: seconds,
                 enhanced_session_safety: false,
                 ..LivePreCheckConfig::default()
             };
-            let provider = LivePreCheckProvider::new(None, config).expect("provider");
-            let result = provider.check_data_loss(std::process::id());
+            LivePreCheckProvider::new(None, config).expect("provider")
+        }
+
+        #[test]
+        fn recent_io_gate_accepts_complete_native_idle_window_on_macos() {
+            let mut child = std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .env_clear()
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn owned idle target");
+            let provider = io_only_provider(1);
+            let began = Instant::now();
+            provider.prime_recent_io(&[child.id()]);
+            let elapsed = began.elapsed();
+            let first = provider.check_data_loss(child.id());
+            let cached = provider.check_data_loss(child.id());
+            let _ = child.kill();
+            child.wait().expect("reap owned idle target");
+            assert!(elapsed >= Duration::from_secs(1));
+            assert!(first.is_passed(), "{first:?}");
+            assert!(cached.is_passed(), "{cached:?}");
+            assert!(read_io_sample(child.id()).is_err());
+        }
+
+        #[test]
+        fn recent_io_native_counters_detect_file_writes_on_macos() {
+            use std::io::Write;
+
+            let mut file = tempfile::tempfile().expect("create owned write target");
+            let pid = std::process::id();
+            let before = read_io_sample(pid).expect("read initial native I/O counters");
+            for _ in 0..64 {
+                file.write_all(&[0xa5; 16 * 1024])
+                    .expect("write owned target");
+            }
+            file.sync_all().expect("flush owned write target");
+            let window = Duration::from_millis(20);
+            std::thread::sleep(window);
+            let after = read_io_sample(pid).expect("read updated native I/O counters");
+            assert!(
+                after.wchar > before.wchar,
+                "native logical writes did not account for a completed file write"
+            );
+            let observation = RecentIoObservation {
+                before: Ok(before),
+                after: Ok(after),
+                window,
+            };
+            assert_eq!(observation.evidence(), RecentIoEvidence::Active);
+        }
+
+        #[test]
+        fn recent_io_gate_blocks_missing_native_evidence_on_macos() {
+            let provider = io_only_provider(1);
+            provider.prime_recent_io(&[u32::MAX]);
             assert!(matches!(
-                result,
-                PreCheckResult::Blocked { check, reason }
-                    if check == PreCheck::CheckDataLossGate
-                        && reason.contains("cannot observe the configured 1s window")
+                provider.check_data_loss(u32::MAX),
+                PreCheckResult::Blocked { check: PreCheck::CheckDataLossGate, reason }
+                    if reason.contains("recent I/O evidence unavailable")
+                        && reason.contains("before sample")
+                        && reason.contains("after sample")
             ));
+            assert!(io_only_provider(0).check_data_loss(u32::MAX).is_passed());
+            assert!(read_io_sample(0).is_err());
         }
 
         /// The parent lookup and launchd check run on macOS, and missing Linux-only
