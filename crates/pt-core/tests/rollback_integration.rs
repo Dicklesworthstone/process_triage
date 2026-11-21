@@ -421,7 +421,8 @@ mod signature_verification_tests {
 
     /// Helper: generate a fresh ECDSA P-256 key pair.
     fn test_keypair() -> (p256::ecdsa::SigningKey, p256::ecdsa::VerifyingKey) {
-        let sk = p256::ecdsa::SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        use p256::elliptic_curve::Generate;
+        let sk = p256::ecdsa::SigningKey::generate();
         let vk = *sk.verifying_key();
         (sk, vk)
     }

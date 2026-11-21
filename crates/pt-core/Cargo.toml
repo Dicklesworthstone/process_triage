@@ -37,7 +37,7 @@ toon = { workspace = true }
 tempfile = { version = "3", optional = true }
 
 # ECDSA signature verification for release binaries
-p256 = { version = "0.13", features = ["ecdsa"] }
+p256 = { version = "0.14", features = ["ecdsa", "getrandom"] }
 base64 = "0.23"
 
 # Structured logging

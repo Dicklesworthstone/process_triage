@@ -259,7 +259,8 @@ pub fn sign_bytes(data: &[u8], signing_key: &p256::ecdsa::SigningKey) -> Vec<u8>
 /// Returns `(signing_key_sec1_bytes, verifying_key_sec1_bytes)`.
 /// Useful for test fixtures and initial key generation.
 pub fn generate_keypair() -> (Vec<u8>, Vec<u8>) {
-    let sk = p256::ecdsa::SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+    use p256::elliptic_curve::Generate;
+    let sk = p256::ecdsa::SigningKey::generate();
     let vk = sk.verifying_key();
     (sk.to_bytes().to_vec(), vk.to_sec1_bytes().to_vec())
 }
@@ -275,7 +276,8 @@ mod tests {
     use tempfile::TempDir;
 
     fn test_keypair() -> (SigningKey, VerifyingKey) {
-        let sk = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        use p256::elliptic_curve::Generate;
+        let sk = SigningKey::generate();
         let vk = *sk.verifying_key();
         (sk, vk)
     }
@@ -640,7 +642,7 @@ mod tests {
         assert_eq!(vk_bytes[0], 0x04); // Uncompressed point prefix
 
         // Verify the pair is consistent
-        let sk = SigningKey::from_bytes(sk_bytes.as_slice().into()).unwrap();
+        let sk = SigningKey::from_slice(&sk_bytes).unwrap();
         let vk = parse_sec1_key(&vk_bytes).unwrap();
         let data = b"roundtrip test";
         let sig_der = sign_bytes(data, &sk);
