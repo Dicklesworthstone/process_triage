@@ -14,14 +14,14 @@ chrono.workspace = true
 thiserror.workspace = true
 
 # Templating
-askama = { version = "0.12", features = ["with-axum"] }
+askama = "0.16"
 
 # Asset processing
 base64 = "0.22"
-minify-html = "0.15"
+minify-html = "0.16"
 
 # HTTP client (for embed mode)
-ureq = { version = "2", features = ["json"], optional = true }
+ureq = { version = "3", features = ["json"], optional = true }
 
 # Logging
 tracing = "0.1"
