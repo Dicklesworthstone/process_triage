@@ -10,6 +10,43 @@ Repository: <https://github.com/Dicklesworthstone/process_triage>
 
 ---
 
+## [v2.4.0] -- 2026-11-21 **[GitHub Release]**
+
+194 commits since v2.3.0 (through `cfbebcf`).
+This release hardens live safety and identity bindings across Linux and macOS, adds read-only fleet health/doctor inspection and SSH-config discovery, expands bounded telemetry querying/redaction and execution-bound resource-relief verification, upgrades workspace dependencies (resolving 17 RustSec advisories), and enforces `opt-level = 3` across native release profiles.
+
+### Added
+
+- **Read-only fleet inspection and SSH discovery.** `agent fleet health` and `agent fleet doctor` inspect remote hosts without generating action plans, keeping timeouts distinct from quiet hosts and retaining remote remedies as report data only. `agent fleet inventory` discovers concrete `~/.ssh/config` aliases (without running `Match exec`), and `agent fleet plan --ssh-config --host-filter` persists the exact transport config for later bound `agent fleet apply`.
+- **Execution-bound resource-relief verification and replay.** `agent apply` captures bounded before/after host resource windows (`--settle`), binds planning-time private-memory, host-CPU, FD, process-count, and filesystem-scoped disk forecasts to the canonical plan, and replays them in `agent verify` without fabricating causal relief.
+- **Reversible control durability and recovery.** Durable undo receipts bind `renice`, `pause`, `freeze`, `throttle`, `cap-memory`, and `quarantine` reversals to the canonical plan SHA-256 and exact process/thread identity; expired journaled freezes recover automatically across daemon ticks and apply runs.
+- **Bounded telemetry queries, exports, and private redaction.** `pt query telemetry` and `pt telemetry export` support bounded event-time range and session filtering over Parquet tables, and `pt telemetry redact --all --output <dir>` writes a private redacted copy without modifying source telemetry.
+- **Native macOS deep scans, I/O observation, and identity-bound renice.** macOS gains bounded deep scans with explicit coverage metadata, native process I/O and memory/swap pressure readings, parent supervision binding, and identity-bound priority changes and restoration.
+- **Adaptive SIGTERM grace, zombie/D-state daemon triggers, and VOI deep probing.** Kill actions support learned per-command `term_grace_ms` with ignored-`SIGTERM` shortcutting on Linux, overlapping cleanup within durable kill budgets, daemon zombie-leak and D-state storm detection, agent-activity and ancestor memory-limit surfacing across plan/watch/fleet, and `--record-replay` snapshots in `pt scan`.
+
+### Changed
+
+- **Monotonic idle-CPU inference and unit-unbiased goal ranking.** Idle CPU likelihoods are unified across abandoned and zombie classes (`bd-sbcb`), and goal optimization normalizes marginal progress by target with overshoot capping so resource units do not bias candidate ranking.
+- **Explicit calibration labels and stricter apply previews.** Shadow calibration treats raw process exit codes as unlabeled outcomes unless backed by explicit human verdicts, and `agent apply --dry-run` / `--shadow` enforce the same live safety gates and cumulative budgets as real execution without mutating persistent rate-limit history.
+- **Native release builds enforce `opt-level = 3`.** Both `[profile.release]` and `[profile.release-small]` now compile with `opt-level = 3`, fat LTO, single codegen unit, `strip = true`, and `panic = "abort"`.
+- **Refreshed shell completions with freshness test (`bd-u3dp`).** Committed `completions/` files for bash, zsh, fish, and PowerShell are regenerated from the live CLI definitions and guarded by a regression test.
+
+### Security & Dependencies
+
+- **Workspace dependency upgrades (17 RustSec advisories resolved).** Upgraded `zip` to `9.7.3`, `arrow`/`parquet` to `60.1.0`, `p256` to `0.14.0` (`crypto-bigint 0.7.11`), `askama` to `0.16.1`, `minify-html` to `0.16.5`, `ureq` to `3.5.2`, `toml` to `1.2.2`, `base64` to `0.23.1`, `dirs` to `6.0.0`, and refreshed 100 semver-compatible crates.
+- **Hardened redaction staging and multi-thread Linux safety checks.** Telemetry redaction staging directories use mode `0o700`, and Linux prechecks inspect every task's descriptor, socket, FUSE, and lock tables before clearing protection.
+
+### Fixed
+
+- **Linux Docker `nsfs` mountinfo parsing.** `parse_mountinfo` now accepts kernel `nsfs` roots (`net:[<ino>]`, etc.) instead of failing with `filesystem_mount_table_invalid` on Docker hosts.
+- **Canonical replay SHA-256 float stability.** Enabled `serde_json`'s `float_roundtrip` feature so floating-point blast-radius scores round-trip identically without breaking `pt replay` checksum verification.
+- **Capabilities `ps` probe truncation.** Probing `ps` now runs bounded `ps -p 1 -o pid=` instead of `ps -ef` into a 4 KiB buffer, fixing false `ps.works = false` reports on hosts with many processes.
+- **Fleet SSH client environment.** `fleet plan/health/doctor/apply` now retain standard OpenSSH client variables (`HOME`, `USER`, `LOGNAME`, `SSH_AUTH_SOCK`, `SSH_AGENT_PID`, `KRB5CCNAME`, `XDG_RUNTIME_DIR`, `TMPDIR`) after `env_clear()` so `~/.ssh/config`, keys, and `ssh-agent` work reliably.
+- **Watch self-targeting, zombie parent supervision, Safe bundle timeouts, and dry-run progress.** `agent watch` excludes its own PID even with `builtin_protection = false`, routed zombie remedies retain `zombie_parent` supervision and rationale when the parent is unreadable, Safe bundle exports preserve `term_grace_ms` and `term_grace_command_sha256`, and `goal_progress` no longer emits `-0.0` on empty sums or masks unavailable dry-run forecasts.
+- **Stock macOS Bash 3.2 installer compatibility.** Fixed empty-array expansion and `mapfile` usage in `install.sh`.
+
+---
+
 ## [v2.3.0] -- 2026-10-08 **[GitHub Release]**
 
 184 commits since v2.2.1 (through `2636e64`).
