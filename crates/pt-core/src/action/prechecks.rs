@@ -677,13 +677,16 @@ impl From<&DataLossGates> for LivePreCheckConfig {
     }
 }
 
-/// Whether `/proc/locks` content lists `pid` as a lock holder or blocked waiter.
+/// Whether `/proc/locks` lists a matching task as a lock holder or blocked waiter.
 ///
 /// Holder lines: `1: POSIX  ADVISORY  WRITE 12345 08:02:1234 0 EOF`.
 /// Waiter lines insert `->`: `1: -> POSIX  ADVISORY  WRITE 12346 08:02:1234 0 EOF`,
 /// shifting every field by one; the old fixed-index parse missed all waiters.
 #[cfg(any(target_os = "linux", test))]
-fn proc_locks_mentions_pid(content: &str, pid: u32) -> Result<bool, String> {
+fn proc_locks_mentions_target(
+    content: &str,
+    matches_pid: impl Fn(u32) -> bool,
+) -> Result<bool, String> {
     if !content.is_empty() && !content.ends_with('\n') {
         return Err("incomplete lock table".to_string());
     }
@@ -691,7 +694,7 @@ fn proc_locks_mentions_pid(content: &str, pid: u32) -> Result<bool, String> {
     for (index, line) in content.lines().enumerate() {
         let owner = parse_proc_lock_owner(line)
             .map_err(|error| format!("invalid lock row {}: {error}", index + 1))?;
-        found |= owner == i64::from(pid);
+        found |= u32::try_from(owner).is_ok_and(&matches_pid);
     }
     Ok(found)
 }
@@ -791,30 +794,91 @@ fn fdinfo_has_lock(content: &str) -> Result<bool, String> {
 
 #[cfg(target_os = "linux")]
 fn read_locked_files_from_proc(pid: u32, proc_root: &std::path::Path) -> Result<bool, String> {
+    let deadline = Instant::now()
+        .checked_add(WRITE_FD_INSPECTION_TIMEOUT)
+        .ok_or_else(|| "locked-file inspection deadline is unavailable".to_string())?;
     let locks_path = proc_root.join("locks");
-    let content = std::fs::read_to_string(&locks_path)
-        .map_err(|error| format!("cannot read {}: {error}", locks_path.display()))?;
-    if proc_locks_mentions_pid(&content, pid)
-        .map_err(|error| format!("{}: {error}", locks_path.display()))?
-    {
+    let content = read_bounded_lock_table(&locks_path, deadline, MAX_LOCK_TABLE_BYTES)?;
+    let process_dir = proc_root.join(pid.to_string());
+    locked_file_evidence(&content, deadline, || {
+        write_fd_snapshot_from(
+            &process_dir,
+            pid,
+            deadline,
+            MAX_WRITE_FD_TASKS,
+            MAX_WRITE_FD_INSPECTION,
+        )
+    })
+    .map_err(|error| format!("{}: {error}", process_dir.display()))
+}
+
+#[cfg(target_os = "linux")]
+const MAX_LOCK_TABLE_BYTES: u64 = 8 * 1024 * 1024;
+
+#[cfg(target_os = "linux")]
+fn read_bounded_lock_table(
+    path: &std::path::Path,
+    deadline: Instant,
+    max_bytes: u64,
+) -> Result<String, String> {
+    use std::io::Read;
+
+    if Instant::now() >= deadline {
+        return Err("locked-file inspection deadline expired".to_string());
+    }
+    let mut content = String::new();
+    std::fs::File::open(path)
+        .and_then(|file| {
+            file.take(max_bytes.saturating_add(1))
+                .read_to_string(&mut content)
+        })
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    if content.len() as u64 > max_bytes {
+        return Err(format!(
+            "{} exceeds the {max_bytes}-byte locked-file inspection limit",
+            path.display()
+        ));
+    }
+    if Instant::now() >= deadline {
+        return Err("locked-file inspection deadline expired".to_string());
+    }
+    Ok(content)
+}
+
+/// The global table cannot attribute OFD locks (owner -1), or inherited flock
+/// locks whose original owner has exited. Inspect every task's actual descriptor
+/// table, including read-only handles and private tables after CLONE_FILES is
+/// unshared. Only complete, stable observations can prove the absence of locks.
+#[cfg(target_os = "linux")]
+fn locked_file_evidence(
+    global_locks: &str,
+    deadline: Instant,
+    mut snapshot: impl FnMut() -> Option<WriteFdSnapshot>,
+) -> Result<bool, String> {
+    if Instant::now() >= deadline {
+        return Err("locked-file inspection deadline expired".to_string());
+    }
+    let unavailable = || {
+        "cannot inspect complete task identity and fdinfo evidence within locked-file limits"
+            .to_string()
+    };
+    let before = snapshot().ok_or_else(unavailable)?;
+    let globally_locked =
+        proc_locks_mentions_target(global_locks, |owner| before.tasks.contains_key(&owner))?;
+    if globally_locked || before.descriptors.values().any(|fd| fd.has_lock) {
         return Ok(true);
     }
-
-    // The global table cannot attribute OFD locks (owner -1), or inherited
-    // flock locks whose original owner has exited. fdinfo lists locks attached
-    // to this target's actual open descriptions, including either case.
-    let fdinfo_dir = proc_root.join(pid.to_string()).join("fdinfo");
-    let entries = std::fs::read_dir(&fdinfo_dir)
-        .map_err(|error| format!("cannot inspect {}: {error}", fdinfo_dir.display()))?;
-    for entry in entries {
-        let entry =
-            entry.map_err(|error| format!("cannot enumerate {}: {error}", fdinfo_dir.display()))?;
-        let path = entry.path();
-        let content = std::fs::read_to_string(&path)
-            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-        if fdinfo_has_lock(&content).map_err(|error| format!("{}: {error}", path.display()))? {
-            return Ok(true);
-        }
+    let after = snapshot().ok_or_else(unavailable)?;
+    if after.descriptors.values().any(|fd| fd.has_lock) {
+        return Ok(true);
+    }
+    if before != after {
+        return Err(
+            "task identities or descriptor tables changed during lock inspection".to_string(),
+        );
+    }
+    if Instant::now() >= deadline {
+        return Err("locked-file inspection deadline expired".to_string());
     }
     Ok(false)
 }
@@ -1090,6 +1154,7 @@ struct WriteFdObservation {
     flags: u32,
     inode: u64,
     mount_id: u64,
+    has_lock: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -1102,6 +1167,7 @@ impl WriteFdObservation {
 /// Every thread can own a different descriptor table after unshare(CLONE_FILES).
 /// Keep its identity and the complete table, including read-only descriptors,
 /// so a new task or reopened descriptor invalidates a negative observation.
+/// Writable-file and locked-file gates share this bounded kernel evidence.
 #[cfg(target_os = "linux")]
 #[derive(Debug, PartialEq, Eq)]
 struct WriteFdSnapshot {
@@ -1272,6 +1338,7 @@ fn write_fd_snapshot_from(
                 return None;
             }
             let (flags, inode, mount_id) = write_fd_flags_and_identity(&content)?;
+            let has_lock = fdinfo_has_lock(&content).ok()?;
             let path = task_dir.join("fd").join(name).to_str()?.to_string();
             if observed
                 .descriptors
@@ -1282,6 +1349,7 @@ fn write_fd_snapshot_from(
                         flags,
                         inode,
                         mount_id,
+                        has_lock,
                     },
                 )
                 .is_some()
@@ -3574,24 +3642,29 @@ mod tests {
                        1: -> POSIX  ADVISORY  WRITE 12346 08:02:1234 0 EOF\n\
                        2: FLOCK  ADVISORY  WRITE 777 00:1a:99 0 EOF\n\
                        3: OFDLCK ADVISORY  READ  -1 00:1a:5 0 EOF\n";
-        assert!(proc_locks_mentions_pid(content, 12345).unwrap(), "holder");
         assert!(
-            proc_locks_mentions_pid(content, 12346).unwrap(),
+            proc_locks_mentions_target(content, |pid| pid == 12345).unwrap(),
+            "holder"
+        );
+        assert!(
+            proc_locks_mentions_target(content, |pid| pid == 12346).unwrap(),
             "blocked waiter"
         );
         assert!(
-            proc_locks_mentions_pid(content, 777).unwrap(),
+            proc_locks_mentions_target(content, |pid| pid == 777).unwrap(),
             "flock holder"
         );
         assert!(
-            !proc_locks_mentions_pid(content, 1).unwrap(),
+            !proc_locks_mentions_target(content, |pid| pid == 1).unwrap(),
             "lock index is not a pid"
         );
         assert!(
-            !proc_locks_mentions_pid(content, 99).unwrap(),
+            !proc_locks_mentions_target(content, |pid| pid == 99).unwrap(),
             "inode is not a pid"
         );
-        assert!(!proc_locks_mentions_pid("", 12345).unwrap());
+        assert!(!proc_locks_mentions_target("", |pid| pid == 12345).unwrap());
+        assert!(proc_locks_mentions_target(content, |pid| [12345, 12346].contains(&pid)).unwrap());
+        assert!(!proc_locks_mentions_target(content, |pid| [42, 43].contains(&pid)).unwrap());
     }
 
     #[test]
@@ -3605,15 +3678,24 @@ mod tests {
             "1: POSIX ADVISORY WRITE 42 08:02:1234 0 EOF extra\n",
             "1: POSIX ADVISORY WRITE 42 08:02:1234 0 EOF\n2: truncated\n",
         ] {
-            assert!(proc_locks_mentions_pid(content, 42).is_err(), "{content}");
+            assert!(
+                proc_locks_mentions_target(content, |pid| pid == 42).is_err(),
+                "{content}"
+            );
         }
         let leases = "1: LEASE ACTIVE READ 42 08:02:1234 0 EOF\n\
                       2: LEASE BREAKING UNLCK 43 08:02:1235 0 EOF\n\
                       3: DELEG BREAKER READ 44 <none>:0 0 EOF\n";
         for pid in [42, 43, 44] {
-            assert_eq!(proc_locks_mentions_pid(leases, pid), Ok(true));
+            assert_eq!(
+                proc_locks_mentions_target(leases, |owner| owner == pid),
+                Ok(true)
+            );
         }
-        assert_eq!(proc_locks_mentions_pid(leases, 45), Ok(false));
+        assert_eq!(
+            proc_locks_mentions_target(leases, |pid| pid == 45),
+            Ok(false)
+        );
     }
 
     fn lsof_output(stdout: &str) -> crate::collect::tool_runner::ToolOutput {
@@ -4002,6 +4084,7 @@ mod tests {
             flags: flags as u32,
             inode: 42,
             mount_id: 7,
+            has_lock: false,
         }
     }
 
@@ -4085,6 +4168,7 @@ mod tests {
             "unreadable_task",
             "unreadable_fdinfo",
             "malformed_fdinfo",
+            "oversized_fdinfo",
             "wrong_task_identity",
             "oversized_stat",
             "task_limit",
@@ -4111,6 +4195,16 @@ mod tests {
                 }
                 "malformed_fdinfo" => {
                     std::fs::write(process.join("task/43/fdinfo/3"), "flags:\t1\n").unwrap();
+                }
+                "oversized_fdinfo" => {
+                    std::fs::write(
+                        process.join("task/43/fdinfo/3"),
+                        format!(
+                            "pos:\t0\nflags:\t0100000\nmnt_id:\t7\nino:\t42\n{}\n",
+                            "x".repeat(64 * 1024)
+                        ),
+                    )
+                    .unwrap();
                 }
                 "wrong_task_identity" => {
                     let leader = std::fs::read(process.join("task/42/stat")).unwrap();
@@ -5204,21 +5298,24 @@ mod tests {
             assert!(read_locked_files_from_proc(42, &root)
                 .unwrap_err()
                 .contains("cannot read"));
+            write_fd_fixture_task(&root.join("42"), 42, 100);
             std::fs::write(root.join("locks"), "1: truncated\n").unwrap();
             assert!(read_locked_files_from_proc(42, &root)
                 .unwrap_err()
                 .contains("invalid lock row"));
             std::fs::write(root.join("locks"), "").unwrap();
+            assert!(read_locked_files_from_proc(43, &root)
+                .unwrap_err()
+                .contains("fdinfo"));
+            let fdinfo = root.join("42/task/42/fdinfo");
+            assert_eq!(read_locked_files_from_proc(42, &root), Ok(false));
+            std::fs::write(fdinfo.join("3"), "pos:\t0\n").unwrap();
+            assert!(fdinfo_has_lock("pos:\t0\n")
+                .unwrap_err()
+                .contains("missing descriptor"));
             assert!(read_locked_files_from_proc(42, &root)
                 .unwrap_err()
                 .contains("fdinfo"));
-            let fdinfo = root.join("42/fdinfo");
-            std::fs::create_dir_all(&fdinfo).unwrap();
-            assert_eq!(read_locked_files_from_proc(42, &root), Ok(false));
-            std::fs::write(fdinfo.join("3"), "pos:\t0\n").unwrap();
-            assert!(read_locked_files_from_proc(42, &root)
-                .unwrap_err()
-                .contains("missing descriptor"));
             let complete = "pos:\t0\nflags:\t0100002\nmnt_id:\t1\nino:\t5\n";
             std::fs::write(fdinfo.join("3"), complete).unwrap();
             assert_eq!(read_locked_files_from_proc(42, &root), Ok(false));
@@ -5234,10 +5331,140 @@ mod tests {
             // silently skipped as if the descriptor had no lock.
             let unreadable = tempfile::tempdir().unwrap().keep();
             std::fs::write(unreadable.join("locks"), "").unwrap();
-            std::fs::create_dir_all(unreadable.join("42/fdinfo/3")).unwrap();
+            write_fd_fixture_task(&unreadable.join("42"), 42, 100);
+            let descriptor = unreadable.join("42/task/42/fdinfo/3");
+            std::fs::rename(&descriptor, unreadable.join("retained-fdinfo")).unwrap();
+            std::fs::create_dir(descriptor).unwrap();
             assert!(read_locked_files_from_proc(42, &unreadable)
                 .unwrap_err()
-                .contains("cannot read"));
+                .contains("fdinfo"));
+        }
+
+        #[test]
+        fn locked_file_observation_covers_private_task_tables_and_read_only_locks() {
+            let root = tempfile::tempdir().unwrap().keep();
+            let process = root.join("42");
+            let locks = root.join("locks");
+            write_fd_fixture_task(&process, 42, 100);
+            write_fd_fixture_task(&process, 43, 101);
+            let private_fdinfo = process.join("task/43/fdinfo/3");
+            let complete = "pos:\t0\nflags:\t0100000\nmnt_id:\t7\nino:\t42\n";
+            std::fs::write(&private_fdinfo, complete).unwrap();
+            std::fs::write(&locks, "1: OFDLCK ADVISORY READ -1 00:01:42 0 EOF\n").unwrap();
+            assert_eq!(read_locked_files_from_proc(42, &root), Ok(false));
+            for lock in ["OFDLCK ADVISORY READ -1", "FLOCK ADVISORY READ 99"] {
+                std::fs::write(
+                    &private_fdinfo,
+                    format!("{complete}lock:\t1: {lock} 00:01:42 0 EOF\n"),
+                )
+                .unwrap();
+                assert_eq!(
+                    read_locked_files_from_proc(42, &root),
+                    Ok(true),
+                    "a read-only private-thread descriptor still holds {lock}"
+                );
+            }
+            std::fs::write(&private_fdinfo, complete).unwrap();
+            std::fs::write(&locks, "1: -> POSIX ADVISORY WRITE 43 00:01:42 0 EOF\n").unwrap();
+            assert_eq!(read_locked_files_from_proc(42, &root), Ok(true));
+            std::fs::write(&locks, "1: FLOCK ADVISORY READ 99 00:01:42 0 EOF\n").unwrap();
+            assert_eq!(read_locked_files_from_proc(42, &root), Ok(false));
+        }
+
+        #[test]
+        fn locked_file_observation_rejects_process_task_and_descriptor_churn() {
+            for change in [
+                "new_task",
+                "leader_reused",
+                "task_reused",
+                "reopened_fd",
+                "missing_fdinfo",
+            ] {
+                let root = tempfile::tempdir().unwrap().keep();
+                let process = root.join("42");
+                write_fd_fixture_task(&process, 42, 100);
+                write_fd_fixture_task(&process, 43, 101);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut reads = 0;
+                let result = locked_file_evidence("", deadline, || {
+                    if reads == 1 {
+                        match change {
+                            "new_task" => write_fd_fixture_task(&process, 44, 102),
+                            "leader_reused" | "task_reused" => {
+                                let (tid, birth) = if change == "leader_reused" {
+                                    (42, 100)
+                                } else {
+                                    (43, 101)
+                                };
+                                let stat = process.join(format!("task/{tid}/stat"));
+                                let original = std::fs::read_to_string(&stat).unwrap();
+                                std::fs::write(stat, original.replace(&birth.to_string(), "999"))
+                                    .unwrap();
+                            }
+                            "reopened_fd" => {
+                                std::fs::write(
+                                    process.join("task/43/fdinfo/3"),
+                                    "pos:\t0\nflags:\t0100000\nmnt_id:\t7\nino:\t43\n",
+                                )
+                                .unwrap();
+                            }
+                            "missing_fdinfo" => {
+                                std::fs::rename(
+                                    process.join("task/43/fdinfo/3"),
+                                    root.join("retained-fdinfo"),
+                                )
+                                .unwrap();
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    reads += 1;
+                    write_fd_snapshot_from(&process, 42, deadline, 3, 3)
+                });
+                assert_eq!(reads, 2);
+                assert!(result.is_err(), "{change} cannot prove absence of locks");
+            }
+        }
+
+        #[test]
+        fn locked_file_observation_enforces_byte_time_task_and_descriptor_bounds() {
+            let root = tempfile::tempdir().unwrap().keep();
+            let locks = root.join("locks");
+            let content = "1: POSIX ADVISORY READ 99 00:01:42 0 EOF\n";
+            std::fs::write(&locks, content).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            assert_eq!(
+                read_bounded_lock_table(&locks, deadline, content.len() as u64),
+                Ok(content.to_string())
+            );
+            assert!(
+                read_bounded_lock_table(&locks, deadline, content.len() as u64 - 1)
+                    .unwrap_err()
+                    .contains("inspection limit")
+            );
+            assert!(read_bounded_lock_table(&locks, Instant::now(), u64::MAX)
+                .unwrap_err()
+                .contains("deadline"));
+            assert!(locked_file_evidence("", Instant::now(), || {
+                panic!("an expired probe cannot start new reads")
+            })
+            .is_err());
+
+            let process = root.join("42");
+            write_fd_fixture_task(&process, 42, 100);
+            write_fd_fixture_task(&process, 43, 101);
+            for (tasks, descriptors) in [(1, 2), (2, 1)] {
+                assert!(locked_file_evidence("", deadline, || {
+                    write_fd_snapshot_from(&process, 42, deadline, tasks, descriptors)
+                })
+                .is_err());
+            }
+            assert_eq!(
+                locked_file_evidence("", deadline, || {
+                    write_fd_snapshot_from(&process, 42, deadline, 2, 2)
+                }),
+                Ok(false)
+            );
         }
 
         struct DescriptorChild {
@@ -5311,6 +5538,7 @@ mod tests {
         fn thread_descriptor_child(
             path: &std::path::Path,
             mode: &str,
+            inherited: Option<std::fs::File>,
         ) -> Option<ThreadDescriptorChild> {
             use std::io::BufRead;
             use std::process::{Command, Stdio};
@@ -5323,7 +5551,7 @@ libc.unshare.restype = ctypes.c_int
 path, mode = sys.argv[1:]
 ready = queue.Queue()
 release = threading.Event()
-shared = os.open(path, os.O_WRONLY) if mode == 'shared' else None
+shared = 2 if mode == 'inherited_lock' else os.open(path, os.O_WRONLY) if mode == 'shared' else None
 def worker():
     if libc.unshare(0x400) != 0:
         ready.put(('unsupported', ctypes.get_errno()))
@@ -5338,6 +5566,8 @@ def worker():
 threads = [threading.Thread(target=worker)]
 threads[0].start()
 event = ready.get(timeout=5)
+if event[0] == 'ready' and mode == 'inherited_lock':
+    os.close(shared)
 print(*event, flush=True)
 if event[0] == 'unsupported':
     threads[0].join()
@@ -5353,7 +5583,7 @@ finally:
     release.set()
     for thread in threads:
         thread.join()
-    if shared is not None:
+    if shared is not None and mode != 'inherited_lock':
         os.close(shared)
 "#;
             let mut fixture = DescriptorChild {
@@ -5363,7 +5593,7 @@ finally:
                     .arg(mode)
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
-                    .stderr(Stdio::null())
+                    .stderr(inherited.map_or_else(Stdio::null, Stdio::from))
                     .spawn()
                     .expect("spawn owned thread descriptor fixture"),
                 reader: None,
@@ -5434,7 +5664,7 @@ finally:
                 } else if mode != "device" {
                     std::fs::write(&path, b"valuable data").unwrap();
                 }
-                let Some(mut child) = thread_descriptor_child(&path, mode) else {
+                let Some(mut child) = thread_descriptor_child(&path, mode, None) else {
                     return;
                 };
                 let pid = child.fixture.child.id();
@@ -5473,7 +5703,7 @@ finally:
             let directory = tempfile::tempdir().unwrap().keep();
             let path = directory.join("read-only-data");
             std::fs::write(&path, b"valuable data").unwrap();
-            let Some(mut child) = thread_descriptor_child(&path, "read_only") else {
+            let Some(mut child) = thread_descriptor_child(&path, "read_only", None) else {
                 return;
             };
             let pid = child.fixture.child.id();
@@ -5556,7 +5786,10 @@ finally:
                 let holder = descriptor_child(file, false);
                 let pid = holder.child.id();
                 let global = std::fs::read_to_string("/proc/locks").unwrap();
-                assert_eq!(proc_locks_mentions_pid(&global, pid), Ok(false));
+                assert_eq!(
+                    proc_locks_mentions_target(&global, |owner| owner == pid),
+                    Ok(false)
+                );
                 let descriptor = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/2")).unwrap();
                 assert!(descriptor.contains(if ofd { "OFDLCK" } else { "FLOCK" }));
                 assert_eq!(provider.has_locked_files(pid), Ok(true));
@@ -5564,6 +5797,60 @@ finally:
                     matches!(provider.check_data_loss(pid), PreCheckResult::Blocked { check, reason }
                     if check == PreCheck::CheckDataLossGate && reason == "process has locked files")
                 );
+            }
+        }
+
+        #[test]
+        fn locked_file_observation_detects_inherited_locks_in_owned_private_threads() {
+            use std::os::fd::AsRawFd;
+
+            for ofd in [false, true] {
+                let root = tempfile::tempdir().unwrap().keep();
+                let path = root.join("thread.lock");
+                std::fs::write(&path, b"valuable data").unwrap();
+                let file = std::fs::File::open(&path).unwrap();
+                let rc = if ofd {
+                    // SAFETY: this initialized flock and owned read-only handle
+                    // are valid for the nonblocking OFD read-lock operation.
+                    let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+                    lock.l_type = libc::F_RDLCK as i16;
+                    lock.l_whence = libc::SEEK_SET as i16;
+                    unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_SETLK, &lock) }
+                } else {
+                    // SAFETY: flock observes only our owned read-only handle.
+                    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) }
+                };
+                assert_eq!(rc, 0, "owned lock: {}", std::io::Error::last_os_error());
+                let Some(mut child) = thread_descriptor_child(&path, "inherited_lock", Some(file))
+                else {
+                    return;
+                };
+                let pid = child.fixture.child.id();
+                // The original owner is this test process (flock) or -1 (OFD),
+                // and the child leader has closed its copy. Only the private
+                // worker table proves that this child still holds the lock.
+                let global = std::fs::read_to_string("/proc/locks").unwrap();
+                assert_eq!(
+                    proc_locks_mentions_target(&global, |owner| owner == pid || owner == child.tid),
+                    Ok(false)
+                );
+                assert_eq!(
+                    std::fs::read_link(format!("/proc/{pid}/fd/{}", child.fd))
+                        .unwrap_err()
+                        .kind(),
+                    std::io::ErrorKind::NotFound
+                );
+                let private = std::fs::read_to_string(format!(
+                    "/proc/{pid}/task/{}/fdinfo/{}",
+                    child.tid, child.fd
+                ))
+                .unwrap();
+                assert!(fdinfo_has_lock(&private).unwrap());
+                assert_eq!(
+                    read_locked_files_from_proc(pid, std::path::Path::new("/proc")),
+                    Ok(true)
+                );
+                assert!(child.fixture.child.try_wait().unwrap().is_none());
             }
         }
 
