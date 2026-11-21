@@ -6298,7 +6298,7 @@ mod planning_probe_tests {
         assert_eq!(forced.len(), processes.len());
         assert_eq!(
             forced.into_iter().collect::<HashSet<_>>(),
-            (10..=70).step_by(10).collect()
+            (10..=70).step_by(10).collect::<HashSet<_>>()
         );
         assert!(select_deep_probe_targets(&[], &advice, true).is_empty());
     }
@@ -35623,7 +35623,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     }
                 }
             }
-            finish_pending!(usize::MAX);
+            let _ = finish_pending!(usize::MAX);
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {

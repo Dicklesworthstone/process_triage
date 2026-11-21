@@ -4931,7 +4931,7 @@ fn agent_apply_zero_timeout_refuses_before_mutation_or_budget_charge() {
         assert_eq!(result["operation_timed_out"], true);
         assert_eq!(result["summary"]["attempted"], 0);
         assert!(result["outcomes"].as_array().unwrap().is_empty());
-        assert_eq!(nice_of(victim.pid), Some(original_nice));
+        assert_eq!(nice_of(victim.pid), Ok(original_nice));
         assert_eq!(live_identity(victim.pid), identity);
         assert!(!data_dir.path().join("rate_limit.json").exists());
     }
