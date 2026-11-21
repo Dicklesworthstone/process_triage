@@ -116,7 +116,9 @@ mod scan_command {
             .args(["scan", "--help"])
             .assert()
             .success()
-            .stdout(predicate::str::contains("Quick multi-sample scan"));
+            .stdout(predicate::str::contains(
+                "Scan processes, record observations, or replay recorded scores",
+            ));
     }
 
     #[test]
@@ -197,7 +199,9 @@ mod query_command {
             .args(["query", "telemetry", "--help"])
             .assert()
             .success()
-            .stdout(predicate::str::contains("Query telemetry data"));
+            .stdout(predicate::str::contains(
+                "Query recent rows from a persisted Parquet telemetry table",
+            ));
     }
 }
 

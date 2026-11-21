@@ -13,16 +13,26 @@
 use assert_cmd::cargo::cargo_bin_cmd;
 use assert_cmd::Command;
 use serde_json::Value;
+use std::sync::OnceLock;
 use std::time::Duration;
+use tempfile::TempDir;
 
 // ============================================================================
 // Helpers
 // ============================================================================
 
+fn isolated_cache_dir() -> &'static std::path::Path {
+    static CACHE_DIR: OnceLock<TempDir> = OnceLock::new();
+    CACHE_DIR
+        .get_or_init(|| TempDir::new().expect("create isolated capabilities cache dir"))
+        .path()
+}
+
 /// Get a Command for pt-core binary.
 fn pt_core() -> Command {
     let mut cmd = cargo_bin_cmd!("pt-core");
     cmd.timeout(Duration::from_secs(60));
+    cmd.env("XDG_CACHE_HOME", isolated_cache_dir());
     cmd
 }
 
@@ -561,9 +571,23 @@ fn test_check_action_common_actions() {
 
 #[test]
 fn test_capabilities_cache_hit_returns_same_detected_at() {
+    // Dedicated cache directory avoids cold-start races with parallel tests.
+    let cache_dir = TempDir::new().expect("dedicated capabilities cache dir");
+    let run_once = || -> Value {
+        let output = pt_core()
+            .env("XDG_CACHE_HOME", cache_dir.path())
+            .args(["--format", "json", "agent", "capabilities"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        serde_json::from_slice(&output).expect("parse capabilities JSON")
+    };
+
     // First run populates cache; second run within TTL should use cached result.
-    let json1 = capabilities_json();
-    let json2 = capabilities_json();
+    let json1 = run_once();
+    let json2 = run_once();
 
     let detected_at_1 = json1["detected_at"].as_str().expect("detected_at 1");
     let detected_at_2 = json2["detected_at"].as_str().expect("detected_at 2");

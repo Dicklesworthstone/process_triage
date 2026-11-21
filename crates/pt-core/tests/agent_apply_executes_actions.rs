@@ -991,7 +991,9 @@ fn default_robot_policy_preserves_the_actual_useful_spare_target() {
         serde_json::to_vec_pretty(&policy).unwrap(),
     )
     .unwrap();
-    let victim = ForeignTarget::spawn_with_tty("sleep 355");
+    let victim = ForeignTarget::spawn_with_tty(
+        "exec python3 -c 'import time\nwhile True:\n t=time.monotonic()+0.02\n while time.monotonic()<t: pass\n time.sleep(0.08)'",
+    );
     let identity = live_identity(victim.pid);
     let observation = quick_scan(&QuickScanOptions {
         pids: vec![victim.pid],
@@ -3337,16 +3339,20 @@ finally:
             assert_eq!(outcomes.len(), 1);
             assert_eq!(outcomes[0]["pid"], supervision_pid);
             assert_eq!(outcomes[0]["action_id"], action_id);
-            assert_eq!(outcomes[0]["status"], "precheck_blocked");
             if dry_run {
-                assert_eq!(outcomes[0]["check"], "check_agent_supervision");
-                assert_eq!(outcomes[0]["reason"], mandatory_reason);
+                assert_eq!(outcomes[0]["status"], "blocked_by_policy");
+                assert_eq!(outcomes[0]["reason"], "policy_evidence_unavailable");
+                assert_eq!(
+                    outcomes[0]["error"],
+                    "cannot inspect FUSE device descriptors; refusing without complete infrastructure evidence"
+                );
             } else {
-                // The default live file gate runs before supervision detection.
-                assert_eq!(outcomes[0]["check"], "check_data_loss_gate");
+                // The FUSE infrastructure check runs before data-loss and supervision gates.
+                assert_eq!(outcomes[0]["status"], "precheck_blocked");
+                assert_eq!(outcomes[0]["check"], "check_not_protected");
                 assert_eq!(
                     outcomes[0]["reason"],
-                    "cannot inspect open files; refusing without complete data-loss evidence"
+                    "cannot inspect FUSE device descriptors; refusing without complete infrastructure evidence"
                 );
             }
             assert!(state_of(supervision_pid).is_some_and(|state| state != 'Z'));
@@ -3632,7 +3638,12 @@ fn agent_apply_executes_renice_then_kill_on_live_process() {
     let history: Value = serde_json::from_slice(&output).unwrap();
     assert_eq!(history["total_count"], 1);
     assert_eq!(history["actions"][0]["session_id"], s2);
-    assert_eq!(history["actions"][0]["outcome"], json["outcomes"][0]);
+    let mut expected_journal_outcome = json["outcomes"][0].clone();
+    if let Some(obj) = expected_journal_outcome.as_object_mut() {
+        obj.remove("respawn_detected");
+        obj.remove("goal_progress");
+    }
+    assert_eq!(history["actions"][0]["outcome"], expected_journal_outcome);
 }
 
 /// Exercise the real apply -> receipt -> undo -> verify commands. Unchanged
@@ -4177,7 +4188,7 @@ fn agent_apply_records_and_replays_bound_resource_windows_without_inventing_rate
         assert_eq!(artifact[phase]["samples"].as_array().unwrap().len(), 1);
     }
 
-    let verify = |step: &str| -> Value {
+    let verify_expecting = |step: &str, expected_code: i32| -> Value {
         let output = cargo_bin_cmd!("pt-core")
             .timeout(Duration::from_secs(60))
             .env("PT_SKIP_GLOBAL_LOCK", "1")
@@ -4193,9 +4204,10 @@ fn agent_apply_records_and_replays_bound_resource_windows_without_inventing_rate
             &output.stderr,
         )
         .unwrap();
-        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(output.status.code(), Some(expected_code), "{output:?}");
         serde_json::from_slice(&output.stdout).expect("verify JSON")
     };
+    let verify = |step: &str| verify_expecting(step, 0);
     let verified = verify("resource-replay");
     assert_eq!(
         verified["resource_observation_source"],
@@ -4220,13 +4232,16 @@ fn agent_apply_records_and_replays_bound_resource_windows_without_inventing_rate
     assert_eq!(fs::read(&journal_path).unwrap(), journal_bytes);
 
     // Even a byte-only change to a still-valid canonical plan must reject old
-    // resource evidence. The separately observed renice postcondition remains
-    // valid, so an evidence rejection must not turn it into a failed action.
+    // resource evidence and flag the durable renice undo receipt binding as
+    // unverified (PartialFail / exit 3).
     let mut changed_plan = original_plan.clone();
     changed_plan.push(b'\n');
     fs::write(&plan_path, changed_plan).unwrap();
-    let stale = verify("stale-resource-binding");
-    assert_eq!(stale["action_outcomes"][0]["verified"], true);
+    let stale = verify_expecting("stale-resource-binding", 3);
+    assert_eq!(
+        stale["action_outcomes"][0]["outcome"],
+        "restoration_unverified"
+    );
     assert!(stale["resource_delta"].is_null());
     assert!(stale["resource_runs"]["reports"]
         .as_array()
@@ -5182,9 +5197,9 @@ fn agent_apply_probes_recent_io_once_for_all_targets() {
     let a = ForeignTarget::spawn("sleep 308");
     let b = ForeignTarget::spawn("sleep 309");
     // Opens, appends and closes every 5 s: no fd held open, only recent I/O shows it.
+    let log_escaped = log.to_str().unwrap().replace('\'', "'\\''");
     let w = ForeignTarget::spawn(&format!(
-        "sh -c 'while :; do echo x >> \"{}\"; sleep 5; done'",
-        log.display()
+        "exec python3 -c 'import sys,time\np=sys.argv[1]\nwhile True:\n with open(p,\"a\") as f:\n  f.write(\"x\\n\")\n time.sleep(5)' '{log_escaped}'"
     ));
     std::thread::sleep(Duration::from_millis(300));
 

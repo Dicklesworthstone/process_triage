@@ -1113,10 +1113,7 @@ fn query_actions_refuses_fifo_journals_without_waiting_for_a_writer() {
 /// stubs cannot silently exit 0; this checks the shipped ones end to end.)
 #[test]
 fn every_stub_command_exits_capability_error() {
-    let mut stubs: Vec<Vec<&str>> = vec![
-        vec!["query", "last hour kills"],
-        vec!["telemetry", "redact"],
-    ];
+    let mut stubs: Vec<Vec<&str>> = vec![vec!["query", "last hour kills"]];
     if !cfg!(target_os = "linux") {
         stubs.push(vec!["deep-scan"]);
     }

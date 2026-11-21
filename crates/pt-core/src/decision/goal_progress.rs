@@ -245,7 +245,7 @@ fn compute_expected_total(outcomes: &[ActionOutcome]) -> Result<f64, &'static st
         .iter()
         .filter(|action| action.success)
         .filter_map(|action| action.expected_contribution)
-        .sum();
+        .fold(0.0, |acc, value| acc + value);
     if !total.is_finite() {
         return Err("The complete expected contribution total is not finite");
     }

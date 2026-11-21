@@ -243,9 +243,13 @@ fn fleet_plan_uses_discovered_alias_and_retains_explicit_ssh_config() {
         "Host worker-a worker-b\n  HostName never-connect.invalid\n  Port 2222\n",
     )
     .unwrap();
+    let argv_escaped = argv.to_str().unwrap().replace('\'', "'\\''");
+    let response_escaped = response.to_str().unwrap().replace('\'', "'\\''");
     std::fs::write(
         &ssh,
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$PT_TEST_SSH_ARGV\"\n/bin/cat \"$PT_TEST_REMOTE_PLAN\"\n",
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{argv_escaped}'\n/bin/cat '{response_escaped}'\n"
+        ),
     )
     .unwrap();
     std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();

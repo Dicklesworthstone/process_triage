@@ -617,7 +617,7 @@ fn detect_tools(_platform: &PlatformInfo) -> ToolCapabilities {
     let timeout = Duration::from_millis(TOOL_PROBE_TIMEOUT_MS);
 
     ToolCapabilities {
-        ps: probe_tool("ps", &["--version"], &["-ef"], timeout),
+        ps: probe_tool("ps", &["--version"], &["-p", "1", "-o", "pid="], timeout),
         lsof: probe_tool("lsof", &["-v"], &["-c", "nonexistent123"], timeout),
         ss: probe_tool("ss", &["-V"], &["-tuln"], timeout),
         netstat: probe_tool("netstat", &["--version"], &["-tuln"], timeout),

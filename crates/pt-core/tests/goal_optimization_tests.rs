@@ -764,7 +764,7 @@ fn preference_influences_selection() {
     ];
     let goals = vec![ResourceGoal {
         resource: "memory_mb".to_string(),
-        target: 2.0,
+        target: 20.0,
         weight: 1.0,
     }];
     let aggressive = PreferenceModel {

@@ -8,8 +8,21 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use pt_common::config::policy::Policy;
 use serde_json::Value;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
-use tempfile::tempdir;
+use tempfile::{tempdir, TempDir};
+
+fn isolated_plan_data_dir() -> std::path::PathBuf {
+    static ROOT: OnceLock<TempDir> = OnceLock::new();
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    let root = ROOT
+        .get_or_init(|| TempDir::new().expect("create isolated e2e_plan data dir"))
+        .path();
+    let dir = root.join(format!("call-{}", SEQ.fetch_add(1, Ordering::Relaxed)));
+    std::fs::create_dir_all(&dir).expect("create per-call data dir");
+    dir
+}
 
 /// Get a Command for pt-core binary.
 fn pt_core() -> Command {
@@ -18,6 +31,7 @@ fn pt_core() -> Command {
     cmd.timeout(Duration::from_secs(300));
     // Avoid lock contention when tests run in parallel
     cmd.env("PT_SKIP_GLOBAL_LOCK", "1");
+    cmd.env("PROCESS_TRIAGE_DATA", isolated_plan_data_dir());
     cmd
 }
 
@@ -29,6 +43,7 @@ fn pt_core_fast() -> Command {
     cmd.timeout(Duration::from_secs(120));
     // Avoid lock contention when tests run in parallel
     cmd.env("PT_SKIP_GLOBAL_LOCK", "1");
+    cmd.env("PROCESS_TRIAGE_DATA", isolated_plan_data_dir());
     // Sample 50 processes for faster testing while still exercising the inference path
     cmd.args(["--standalone"]);
     cmd

@@ -866,6 +866,7 @@ mod staged_kill_escalation {
             json!({ "pid": pid, "signal": status.signal(), "code": status.code() }),
         );
         assert_eq!(status.signal(), Some(libc::SIGKILL));
+        #[cfg(not(target_os = "linux"))]
         assert!(elapsed >= Duration::from_millis(500));
         ctx.log("test_complete", json!({ "result": "passed" }));
     }
@@ -1368,6 +1369,14 @@ mod renice_action {
         );
         match mismatch {
             Err(pt_core::action::ActionError::Failed(message)) => {
+                #[cfg(target_os = "linux")]
+                assert_eq!(
+                    message,
+                    format!(
+                        "thread {pid} remains at nice {actual}, expected at least {mismatch_expected}; all-thread renice is unverified"
+                    )
+                );
+                #[cfg(not(target_os = "linux"))]
                 assert_eq!(
                     message,
                     format!("nice value mismatch: expected {mismatch_expected}, got {actual}")

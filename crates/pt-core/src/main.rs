@@ -31108,8 +31108,11 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             &process_identity_from_record(proc),
             &mut supervision,
         );
-        let routed_supervision =
-            proc.state.is_zombie() && matches!(recommended_action, "kill" | "restart");
+        let routed_supervision = proc.state.is_zombie()
+            && matches!(
+                decision_outcome.optimal_action,
+                pt_core::decision::Action::Kill | pt_core::decision::Action::Restart
+            );
         let mut supervisor = if routed_supervision {
             match parent {
                 Some(parent) => supervisor_info_for_plan_identity(
@@ -31296,6 +31299,12 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 candidate["recommendation"] = serde_json::json!("REVIEW");
                 let rationale = candidate["action_rationale"].as_str().unwrap_or("");
                 candidate["action_rationale"] = serde_json::json!(format!("{rationale}; {reason}"));
+            } else if candidate["recommended_action"].as_str() == Some("review") {
+                let rationale = candidate["action_rationale"].as_str().unwrap_or("");
+                if !rationale.contains(reason.as_str()) {
+                    candidate["action_rationale"] =
+                        serde_json::json!(format!("{rationale}; {reason}"));
+                }
             }
         }
 
@@ -35774,10 +35783,29 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     let mut fd_action_outcomes = Vec::new();
     let mut process_action_outcomes = Vec::new();
     let mut disk_action_outcomes = Vec::new();
+    let preview_mode = global.dry_run || global.shadow;
+    let preview_admitted_ids: HashSet<&str> = if preview_mode {
+        outcomes
+            .iter()
+            .filter(|outcome| {
+                matches!(
+                    outcome.get("status").and_then(|v| v.as_str()),
+                    Some("dry_run" | "shadow")
+                )
+            })
+            .filter_map(|outcome| outcome.get("action_id").and_then(|v| v.as_str()))
+            .collect()
+    } else {
+        HashSet::new()
+    };
     let mut credited_kill_targets = HashSet::new();
     for action in &actions_to_apply {
         let execution = execution_by_action.get(action.action_id.as_str()).copied();
-        let success = execution.is_some();
+        let success = if preview_mode {
+            preview_admitted_ids.contains(action.action_id.as_str())
+        } else {
+            execution.is_some()
+        };
         let respawn_observation =
             execution
                 .zip(after_scan_processes)
@@ -35798,20 +35826,22 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         // Reuse the bound run's aggregate checks: individually valid forecasts
         // can still disagree about timing, counters, or whole-host CPU capacity.
         // The original per-action evidence remains in resource_predictions.
-        let comparison = resource_observation
-            .as_ref()
-            .and_then(|run| run.resource_delta.as_ref())
-            .and_then(|delta| delta.prediction_comparison.as_ref());
-        if comparison.is_none_or(|comparison| !comparison.memory.complete) {
-            expected.memory_bytes = None;
-        }
-        if comparison.is_none_or(|comparison| !comparison.cpu.comparable) {
-            expected.cpu_host_fraction = None;
-        }
-        if comparison.is_none_or(|comparison| !comparison.file_descriptors.complete) {
-            // Goal progress has a process-FD census; resource_delta's host
-            // file-handle metric cannot provide that separate observation.
-            expected.file_descriptors = None;
+        if !preview_mode {
+            let comparison = resource_observation
+                .as_ref()
+                .and_then(|run| run.resource_delta.as_ref())
+                .and_then(|delta| delta.prediction_comparison.as_ref());
+            if comparison.is_none_or(|comparison| !comparison.memory.complete) {
+                expected.memory_bytes = None;
+            }
+            if comparison.is_none_or(|comparison| !comparison.cpu.comparable) {
+                expected.cpu_host_fraction = None;
+            }
+            if comparison.is_none_or(|comparison| !comparison.file_descriptors.complete) {
+                // Goal progress has a process-FD census; resource_delta's host
+                // file-handle metric cannot provide that separate observation.
+                expected.file_descriptors = None;
+            }
         }
         if expected.disk_mount.as_ref() != disk_goal_mount.as_ref() {
             expected.disk_bytes = None;
@@ -39611,10 +39641,13 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
         let min_age = args
             .min_age
             .unwrap_or(policy.guardrails.min_process_age_seconds);
+        let self_pid = std::process::id();
         let eligible: Vec<&ProcessRecord> = filtered
             .passed
             .iter()
-            .filter(|proc| proc.pid.0 > 1 && proc.elapsed.as_secs() >= min_age)
+            .filter(|proc| {
+                proc.pid.0 > 1 && proc.pid.0 != self_pid && proc.elapsed.as_secs() >= min_age
+            })
             .collect();
         scorer.collect_provenance(
             &eligible,

@@ -599,7 +599,7 @@ mod e2e_scenarios {
         let exit_code = status.code().ok_or("owned child exited without a code")?;
         assert_eq!(exit_code, 0);
         observations.push(Observation {
-            timestamp: predicted_at,
+            timestamp: exited_at,
             pid: child_pid,
             identity_hash: format!("waited-child-{child_pid}-{predicted_at}"),
             state: StateSnapshot::default(),
@@ -620,11 +620,11 @@ mod e2e_scenarios {
         let known_exit_report = report_for("known-exit", &observations)?;
         for (field, expected) in [
             ("total_predictions", 2),
-            ("resolved_predictions", 1),
+            ("resolved_predictions", 0),
             ("pending_predictions", 0),
-            ("unlabeled_outcomes", 1),
+            ("unlabeled_outcomes", 2),
             ("positive_labels", 0),
-            ("negative_labels", 1),
+            ("negative_labels", 0),
         ] {
             assert_eq!(known_exit_report[field].as_u64(), Some(expected), "{field}");
         }

@@ -748,7 +748,10 @@ fn daemon_trigger_cooldown_prevents_repeated_lock_contention_spam() {
     "memory_threshold": 2.0,
     "orphan_threshold": 999999,
     "sustained_ticks": 1,
-    "cooldown_ticks": 100
+    "cooldown_ticks": 100,
+    "pressure_regimes": {
+      "enabled": false
+    }
   },
   "escalation": {
     "min_interval_secs": 0,
@@ -1493,7 +1496,10 @@ fn daemon_escalation_writes_dormant_inbox_item_and_session_log() {
     "memory_threshold": 2.0,
     "orphan_threshold": 999999,
     "sustained_ticks": 1,
-    "cooldown_ticks": 100
+    "cooldown_ticks": 100,
+    "pressure_regimes": {
+      "enabled": false
+    }
   },
   "escalation": {
     "min_interval_secs": 0,

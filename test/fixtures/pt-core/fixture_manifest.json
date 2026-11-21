@@ -9,7 +9,10 @@
       "cp crates/pt-core/tests/fixtures/*.json test/fixtures/pt-core/",
       "add provenance fixture pack and debug trace fixtures"
     ],
-    "paths": ["crates/pt-core/tests/fixtures", "test/fixtures/pt-core"]
+    "paths": [
+      "crates/pt-core/tests/fixtures",
+      "test/fixtures/pt-core"
+    ]
   },
   "tool_versions": {
     "fixture_capture": "1.0.0",
@@ -21,8 +24,8 @@
     {
       "path": "inference_cases_expected.json",
       "kind": "config",
-      "sha256": "b46b43666af7d0d0635460328ad1eacb2492982c20372e60d1380b8f202b76e8",
-      "bytes": 2614,
+      "sha256": "3f51acb061eca527857dc11b09dd387af7c342688748abd17726449ef20a2299",
+      "bytes": 2615,
       "redaction_profile": "safe"
     },
     {
@@ -104,5 +107,5 @@
     }
   ],
   "description": "pt-core policy/priors + inference + provenance fixtures",
-  "manifest_sha256": "244520ac40d2284f307a05d6cab3bd0098f7bb45abe4801f1d79f51717ab3f92"
+  "manifest_sha256": "f8d41f1a5862ccaec5a9d0a8b803a6ed31cf62868d1c414fb2b46cf6106bbf26"
 }

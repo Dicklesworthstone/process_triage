@@ -858,7 +858,7 @@ pub fn execute_fleet_apply(
         config,
         |_, args, timeout| {
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
-            crate::collect::tool_runner::run_tool("ssh", &args, Some(timeout), None)
+            crate::collect::tool_runner::run_ssh_tool(&args, Some(timeout), None)
                 .map_err(|error| error.to_string())
         },
         record,

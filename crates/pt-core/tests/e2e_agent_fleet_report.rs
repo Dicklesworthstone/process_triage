@@ -819,24 +819,38 @@ mod live_inspection {
         let bin = directory.join("bin");
         fs::create_dir(&bin).unwrap();
         let script = bin.join("ssh");
-        fs::write(&script, r#"#!/bin/sh
+        let root_escaped = directory.to_str().unwrap().replace('\'', "'\\''");
+        let log_escaped = directory
+            .join("calls.log")
+            .to_str()
+            .unwrap()
+            .replace('\'', "'\\''");
+        fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
 set -eu
+ROOT='{root_escaped}'
+LOG='{log_escaped}'
 while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done
 [ "$#" -eq 3 ] || exit 98
 shift
 host=$1
 command=$2
-printf '%s\t%s\n' "$host" "$command" >> "$PT_FLEET_TEST_LOG"
+printf '%s\t%s\n' "$host" "$command" >> "$LOG"
 case "$host" in
   bad*) printf 'connection refused by fixture\n' >&2; exit 255 ;;
   slow) sleep 10 ;;
 esac
 case "$command" in
-  *' --format json agent snapshot --minimal') cat "$PT_FLEET_TEST_ROOT/$host.health.json"; exit 0 ;;
-  *' --format json doctor') cat "$PT_FLEET_TEST_ROOT/$host.doctor.json"; exit "$(cat "$PT_FLEET_TEST_ROOT/$host.exit")" ;;
+  *' --format json agent snapshot --minimal') cat "$ROOT/$host.health.json"; exit 0 ;;
+  *' --format json doctor') cat "$ROOT/$host.doctor.json"; exit "$(cat "$ROOT/$host.exit")" ;;
   *) printf 'unexpected remote command\n' >&2; exit 99 ;;
 esac
-"#).unwrap();
+"#
+            ),
+        )
+        .unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
         bin
     }

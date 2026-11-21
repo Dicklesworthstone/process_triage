@@ -6,7 +6,7 @@
 //! distinct, and remote suggested commands are retained only as report data.
 
 use super::ssh_scan::{build_ssh_command_args, remote_health, run_host_pool, SshScanConfig};
-use crate::collect::tool_runner::{run_tool, ToolError, ToolOutput};
+use crate::collect::tool_runner::{run_ssh_tool, ToolError, ToolOutput};
 use crate::decision::pressure_regime::{PressureAssessment, Severity};
 use crate::session::fleet::{HostHealth, HostHealthStatus, PressureCoverage};
 use serde::{Deserialize, Serialize};
@@ -515,8 +515,7 @@ pub fn inspect_host(host: &str, config: &SshScanConfig, kind: InspectionKind) ->
         Err(error) => return HostInspection::failed(host, error, 0),
     };
     let args_ref: Vec<_> = args.iter().map(String::as_str).collect();
-    match run_tool(
-        "ssh",
+    match run_ssh_tool(
         &args_ref,
         Some(Duration::from_secs(config.command_timeout.max(1))),
         None,

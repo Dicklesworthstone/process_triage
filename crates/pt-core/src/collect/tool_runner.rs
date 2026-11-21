@@ -1124,6 +1124,42 @@ pub fn run_tool(
     runner.run_tool(cmd, args, None)
 }
 
+/// Run `ssh` with `ToolRunner` bounds while retaining only standard OpenSSH
+/// client environment variables (HOME, SSH_AUTH_SOCK, etc.) after `env_clear`.
+pub fn run_ssh_tool(
+    args: &[&str],
+    timeout: Option<Duration>,
+    max_output: Option<usize>,
+) -> Result<ToolOutput, ToolError> {
+    let mut config = ToolConfig::default();
+    if let Some(t) = timeout {
+        config.default_timeout = t;
+        config.budget_ms = config
+            .budget_ms
+            .max(u64::try_from(t.as_millis()).unwrap_or(u64::MAX));
+    }
+    if let Some(m) = max_output {
+        config.max_output_bytes = m;
+    }
+    let mut spec = ToolSpec::new("ssh", args.iter().map(|s| (*s).to_string()).collect());
+    for key in [
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SSH_AUTH_SOCK",
+        "SSH_AGENT_PID",
+        "KRB5CCNAME",
+        "XDG_RUNTIME_DIR",
+        "TMPDIR",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            spec = spec.with_env(key, value);
+        }
+    }
+    let runner = ToolRunner::new(config);
+    runner.run(&spec)
+}
+
 /// Convenience function to run multiple tools in parallel.
 pub fn run_tools_parallel(
     specs: &[ToolSpec],

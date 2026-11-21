@@ -338,24 +338,15 @@ fn agent_apply_dry_run_returns_actions_ok() {
             assert_eq!(goal_progress[phase].get(metric), Some(&Value::Null));
         }
     }
-    // This plan has no memory forecast. Lifetime process CPU and socket counts
-    // cannot become host-capacity or exclusive-port predictions in dry-run.
-    for metric in ["memory", "cpu", "ports"] {
+    // This plan has no saved resource_predictions. Without saved planning-time
+    // predictions, apply must not fabricate memory, CPU, port, or FD forecasts.
+    for metric in ["memory", "cpu", "ports", "file_descriptors"] {
         assert_eq!(metrics[metric].get("expected_progress"), Some(&Value::Null));
         assert_eq!(
             metrics[metric]["action_outcomes"][0].get("expected_contribution"),
             Some(&Value::Null)
         );
     }
-    #[cfg(target_os = "linux")]
-    assert!(metrics["file_descriptors"]["expected_progress"]
-        .as_f64()
-        .is_some_and(|value| value > 0.0));
-    #[cfg(target_os = "macos")]
-    assert_eq!(
-        metrics["file_descriptors"].get("expected_progress"),
-        Some(&Value::Null)
-    );
     for metric in ["memory", "cpu", "ports", "file_descriptors"] {
         let report = metrics.get(metric).expect("recorded metric");
         assert_eq!(report.get("observed_progress"), Some(&Value::Null));

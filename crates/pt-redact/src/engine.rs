@@ -494,7 +494,7 @@ fn is_export_field(key: &str) -> bool {
             pid ppid uid gid euid egid start_id comm cmd cmdline command command_line command_short
             cmd_short cmd_full target plan_id pre_toggled gates_summary policy_snapshot
             policy_id pgid sid quality pre_checks timeouts order stage blocked routing
-            preflight_ms execute_ms verify_ms on_success on_failure details
+            preflight_ms execute_ms verify_ms term_grace_ms term_grace_command_sha256 on_success on_failure details
             blocked_candidates pre_toggled_actions original_zombie_target d_state_diagnostics
             expected_recovery expected_recovery_stddev posterior_odds_abandoned_vs_useful
             sprt_boundary log_odds_threshold numerator denominator has_known_signature category

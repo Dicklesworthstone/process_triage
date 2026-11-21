@@ -4,14 +4,20 @@
     {
       "case_id": "idle_orphan_low_io",
       "posterior": {
-        "useful": 0.01080879191427037,
-        "useful_bad": 0.005594081278602078,
-        "abandoned": 0.6719117624209086,
-        "zombie": 0.31168536438621897
+        "useful": 0.005924975058232032,
+        "useful_bad": 0.0030664659207362915,
+        "abandoned": 0.8201543114185629,
+        "zombie": 0.1708542476024686
       },
       "classification": "abandoned",
-      "confidence": "low",
+      "confidence": "medium",
       "top_evidence": [
+        {
+          "feature": "cpu",
+          "direction": "supports abandoned",
+          "strength": "strong",
+          "delta_bits": 2.1640425613334453
+        },
         {
           "feature": "runtime",
           "direction": "supports abandoned",
@@ -23,12 +29,6 @@
           "direction": "supports abandoned",
           "strength": "substantial",
           "delta_bits": 1.9886399617499584
-        },
-        {
-          "feature": "prior",
-          "direction": "supports useful",
-          "strength": "substantial",
-          "delta_bits": -1.807354922057604
         }
       ]
     },
@@ -66,10 +66,10 @@
     {
       "case_id": "mixed_idle_with_tty",
       "posterior": {
-        "useful": 0.5752717552221259,
-        "useful_bad": 0.07508516009887006,
-        "abandoned": 0.341503823440333,
-        "zombie": 0.008139261238670831
+        "useful": 0.5594187362324742,
+        "useful_bad": 0.07301600502896956,
+        "abandoned": 0.33209285106268194,
+        "zombie": 0.03547240767587441
       },
       "classification": "useful",
       "confidence": "low",

@@ -670,8 +670,7 @@ pub fn ssh_scan_host(host: &str, config: &SshScanConfig) -> HostScanResult {
     let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let timeout = Duration::from_secs(config.command_timeout);
 
-    let output = match crate::collect::tool_runner::run_tool("ssh", &args_ref, Some(timeout), None)
-    {
+    let output = match crate::collect::tool_runner::run_ssh_tool(&args_ref, Some(timeout), None) {
         Ok(output) => output,
         Err(crate::collect::tool_runner::ToolError::CommandNotFound(_)) => {
             return HostScanResult {
