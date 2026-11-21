@@ -23,11 +23,11 @@ serde.workspace = true
 serde_json.workspace = true
 yaml_serde = "0.10.7"
 schemars = { version = "1.2.3", features = ["chrono04"] }
-toml = "0.8"
+toml = "1.2"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 thiserror.workspace = true
-dirs = "5"
+dirs = "6"
 libc = "0.2"
 regex = "1.13.2"
 sha2 = "0.10"
@@ -38,7 +38,7 @@ tempfile = { version = "3", optional = true }
 
 # ECDSA signature verification for release binaries
 p256 = { version = "0.13", features = ["ecdsa"] }
-base64 = "0.22"
+base64 = "0.23"
 
 # Structured logging
 tracing = "0.1"

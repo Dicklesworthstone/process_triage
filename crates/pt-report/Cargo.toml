@@ -17,7 +17,7 @@ thiserror.workspace = true
 askama = "0.16"
 
 # Asset processing
-base64 = "0.22"
+base64 = "0.23"
 minify-html = "0.16"
 
 # HTTP client (for embed mode)
