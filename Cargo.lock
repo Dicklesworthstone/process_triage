@@ -4195,7 +4195,7 @@ dependencies = [
 
 [[package]]
 name = "pt-core"
-version = "2.4.1"
+version = "2.4.2"
 dependencies = [
  "assert_cmd",
  "base64",

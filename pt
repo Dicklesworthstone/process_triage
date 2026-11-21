@@ -7,7 +7,7 @@
 #
 set -euo pipefail
 
-readonly VERSION="2.4.1"
+readonly VERSION="2.4.2"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Configuration

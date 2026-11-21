@@ -10,10 +10,10 @@ Repository: <https://github.com/Dicklesworthstone/process_triage>
 
 ---
 
-## [v2.4.1] -- 2026-11-21 **[GitHub Release]**
+## [v2.4.2] -- 2026-11-21 **[GitHub Release]**
 
-195 commits since v2.3.0 (superseding git-only tag `v2.4.0`, which required GLIBC 2.28 for `libc::renameat2`).
-This release invokes Linux `SYS_renameat2` directly to preserve the `GLIBC 2.17` and static `musl` compatibility floor, hardens live safety and identity bindings across Linux and macOS, adds read-only fleet health/doctor inspection and SSH-config discovery, expands bounded telemetry querying/redaction and execution-bound resource-relief verification, upgrades workspace dependencies (resolving 17 RustSec advisories), and enforces `opt-level = 3` across native release profiles.
+196 commits since v2.3.0 (superseding git-only tags `v2.4.0` and `v2.4.1`, which hit GLIBC 2.28 `libc::renameat2` and macOS `libc::openat` variadic `mode_t` compilation issues during cross-platform release builds).
+This release invokes Linux `SYS_renameat2` directly to preserve the `GLIBC 2.17` and static `musl` compatibility floor, fixes macOS `openat` variadic mode promotion and Darwin test compilation, hardens live safety and identity bindings across Linux and macOS, adds read-only fleet health/doctor inspection and SSH-config discovery, expands bounded telemetry querying/redaction and execution-bound resource-relief verification, upgrades workspace dependencies (resolving 17 RustSec advisories), and enforces `opt-level = 3` across native release profiles.
 
 ### Added
 
@@ -38,6 +38,7 @@ This release invokes Linux `SYS_renameat2` directly to preserve the `GLIBC 2.17`
 
 ### Fixed
 
+- **GLIBC 2.17 / static musl and macOS build compatibility.** `pt_telemetry::redact::publish_directory` invokes Linux `SYS_renameat2` directly instead of linking glibc 2.28+'s `renameat2` wrapper, `session::ArtifactDir::create_temporary` widens `0o600` to `libc::c_uint` for variadic `openat` on macOS (`mode_t` is `u16`), and Linux-only `cpu_capacity` assertions in `cgroup` tests are gated cleanly on Darwin.
 - **Linux Docker `nsfs` mountinfo parsing.** `parse_mountinfo` now accepts kernel `nsfs` roots (`net:[<ino>]`, etc.) instead of failing with `filesystem_mount_table_invalid` on Docker hosts.
 - **Canonical replay SHA-256 float stability.** Enabled `serde_json`'s `float_roundtrip` feature so floating-point blast-radius scores round-trip identically without breaking `pt replay` checksum verification.
 - **Capabilities `ps` probe truncation.** Probing `ps` now runs bounded `ps -p 1 -o pid=` instead of `ps -ef` into a 4 KiB buffer, fixing false `ps.works = false` reports on hosts with many processes.

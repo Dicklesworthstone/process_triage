@@ -40203,11 +40203,13 @@ mod memory_limit_diagnostic_tests {
     };
 
     fn unit(inode: u64, current: u64) -> ResponsibleUnit {
-        let mut headroom = CgroupMemoryHeadroom::default();
-        headroom.hierarchy_complete = true;
-        headroom.high_complete = true;
-        headroom.max_complete = true;
-        headroom.swap_complete = true;
+        let mut headroom = CgroupMemoryHeadroom {
+            hierarchy_complete: true,
+            high_complete: true,
+            max_complete: true,
+            swap_complete: true,
+            ..CgroupMemoryHeadroom::default()
+        };
         headroom.scopes.push(CgroupMemoryScope {
             path: format!("/user.slice/limit-{inode}"),
             directory_device: 2,

@@ -1730,14 +1730,19 @@ mod tests {
             limits.effective_limit_path.as_deref(),
             root.join("slice/cpu.max").to_str()
         );
-        let capacity =
-            super::super::cpu_capacity::compute_cpu_capacity(std::process::id(), Some(&details));
-        assert_eq!(capacity.quota_cores, Some(0.5));
-        assert_eq!(capacity.n_eff_cores, 0.5);
-        assert_eq!(
-            capacity.provenance.quota_source,
-            super::super::cpu_capacity::QuotaSource::CgroupV2CpuMax
-        );
+        #[cfg(target_os = "linux")]
+        {
+            let capacity = super::super::cpu_capacity::compute_cpu_capacity(
+                std::process::id(),
+                Some(&details),
+            );
+            assert_eq!(capacity.quota_cores, Some(0.5));
+            assert_eq!(capacity.n_eff_cores, 0.5);
+            assert_eq!(
+                capacity.provenance.quota_source,
+                super::super::cpu_capacity::QuotaSource::CgroupV2CpuMax
+            );
+        }
     }
 
     #[test]

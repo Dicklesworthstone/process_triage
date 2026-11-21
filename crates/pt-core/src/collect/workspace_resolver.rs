@@ -379,6 +379,7 @@ mod tests {
     struct GitFixture {
         root: PathBuf,
         subdir: PathBuf,
+        #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
         non_repo: PathBuf,
         commit: String,
     }
