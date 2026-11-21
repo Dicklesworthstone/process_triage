@@ -4,11 +4,11 @@
 //! directory component. A metadata query against an unknown FUSE or network
 //! filesystem would itself be an unsafe way to decide whether it can be read.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
@@ -47,6 +47,204 @@ pub(crate) fn open_directory(path: &Path) -> Result<File, &'static str> {
 
 pub(crate) fn directory_path(file: &File, suffix: &str) -> PathBuf {
     PathBuf::from(format!("/proc/self/fd/{}/{}", file.as_raw_fd(), suffix))
+}
+
+/// A complete, stable view of each task's descriptor table. Threads can unshare
+/// their file table, so `/proc/PID/fd` alone cannot establish socket ownership.
+///
+/// `process_dir` must name the caller's pinned procfs process directory. Every
+/// task and descriptor entry shares one deadline/work budget across both passes.
+/// Only descriptor links are read: no descriptor target is opened or stat'ed.
+/// Unknown or changing evidence is an error, never an empty descriptor table.
+pub(crate) fn task_descriptor_snapshot(
+    process_dir: &Path,
+    pid: u32,
+    deadline: Instant,
+    max_tasks: usize,
+    max_entries: usize,
+) -> Result<BTreeMap<u32, BTreeMap<u32, PathBuf>>, &'static str> {
+    task_descriptor_snapshot_with(process_dir, pid, deadline, max_tasks, max_entries, || {})
+}
+
+struct TaskDescriptorBudget {
+    deadline: Instant,
+    remaining_entries: usize,
+    max_tasks: usize,
+}
+
+impl TaskDescriptorBudget {
+    fn check(&self) -> Result<(), &'static str> {
+        if Instant::now() >= self.deadline {
+            Err("task_descriptor_budget_exhausted")
+        } else {
+            Ok(())
+        }
+    }
+
+    fn visit(&mut self) -> Result<(), &'static str> {
+        self.check()?;
+        self.remaining_entries = self
+            .remaining_entries
+            .checked_sub(1)
+            .ok_or("task_descriptor_budget_exhausted")?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TaskDescriptorIdentity {
+    device: u64,
+    inode: u64,
+    uid: u32,
+    birth_ticks: u64,
+}
+
+type TaskDescriptorObservation = BTreeMap<u32, (TaskDescriptorIdentity, BTreeMap<u32, PathBuf>)>;
+
+fn task_descriptor_id(name: &std::ffi::OsStr, allow_zero: bool) -> Result<u32, &'static str> {
+    let text = name.to_str().ok_or("task_descriptor_invalid_entry")?;
+    let id = text
+        .parse::<u32>()
+        .map_err(|_| "task_descriptor_invalid_entry")?;
+    if text != id.to_string() || id > i32::MAX as u32 || (!allow_zero && id == 0) {
+        return Err("task_descriptor_invalid_entry");
+    }
+    Ok(id)
+}
+
+fn task_descriptor_ids(
+    process_dir: &Path,
+    pid: u32,
+    budget: &mut TaskDescriptorBudget,
+) -> Result<BTreeSet<u32>, &'static str> {
+    budget.check()?;
+    let entries = std::fs::read_dir(process_dir.join("task"))
+        .map_err(|_| "task_descriptor_tasks_unavailable")?;
+    let mut tids = BTreeSet::new();
+    for entry in entries {
+        budget.visit()?;
+        let entry = entry.map_err(|_| "task_descriptor_tasks_unavailable")?;
+        if tids.len() >= budget.max_tasks {
+            return Err("task_descriptor_task_limit");
+        }
+        let tid = task_descriptor_id(&entry.file_name(), false)?;
+        if !entry
+            .file_type()
+            .map_err(|_| "task_descriptor_tasks_unavailable")?
+            .is_dir()
+            || !tids.insert(tid)
+        {
+            return Err("task_descriptor_invalid_entry");
+        }
+    }
+    budget.check()?;
+    if !tids.contains(&pid) {
+        return Err("task_descriptor_leader_unavailable");
+    }
+    Ok(tids)
+}
+
+fn task_descriptor_identity(
+    directory: &File,
+    path: &Path,
+    tid: u32,
+    budget: &TaskDescriptorBudget,
+) -> Result<TaskDescriptorIdentity, &'static str> {
+    budget.check()?;
+    let pinned = directory
+        .metadata()
+        .map_err(|_| "task_descriptor_identity_unavailable")?;
+    let current =
+        std::fs::symlink_metadata(path).map_err(|_| "task_descriptor_identity_unavailable")?;
+    if !current.is_dir()
+        || pinned.dev() != current.dev()
+        || pinned.ino() != current.ino()
+        || pinned.uid() != current.uid()
+    {
+        return Err("task_descriptor_identity_changed");
+    }
+    let bytes = read_bounded(&directory_path(directory, "stat"), 16 * 1024)?;
+    let content =
+        std::str::from_utf8(&bytes).map_err(|_| "task_descriptor_identity_unavailable")?;
+    let stat = super::proc_parsers::parse_required_proc_stat_content(tid, content)
+        .map_err(|_| "task_descriptor_identity_unavailable")?;
+    budget.check()?;
+    Ok(TaskDescriptorIdentity {
+        device: pinned.dev(),
+        inode: pinned.ino(),
+        uid: pinned.uid(),
+        birth_ticks: stat.starttime,
+    })
+}
+
+fn task_descriptor_observation(
+    process_dir: &Path,
+    pid: u32,
+    budget: &mut TaskDescriptorBudget,
+) -> Result<TaskDescriptorObservation, &'static str> {
+    let tids = task_descriptor_ids(process_dir, pid, budget)?;
+    let mut tasks = BTreeMap::new();
+    for &tid in &tids {
+        budget.check()?;
+        let path = process_dir.join("task").join(tid.to_string());
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)
+            .map_err(|_| "task_descriptor_identity_unavailable")?;
+        let before = task_descriptor_identity(&directory, &path, tid, budget)?;
+        let entries = std::fs::read_dir(directory_path(&directory, "fd"))
+            .map_err(|_| "task_descriptor_table_unavailable")?;
+        let mut descriptors = BTreeMap::new();
+        for entry in entries {
+            budget.visit()?;
+            let entry = entry.map_err(|_| "task_descriptor_table_unavailable")?;
+            let fd = task_descriptor_id(&entry.file_name(), true)?;
+            let target =
+                std::fs::read_link(entry.path()).map_err(|_| "task_descriptor_link_unavailable")?;
+            if descriptors.insert(fd, target).is_some() {
+                return Err("task_descriptor_invalid_entry");
+            }
+        }
+        let after = task_descriptor_identity(&directory, &path, tid, budget)?;
+        if before != after {
+            return Err("task_descriptor_identity_changed");
+        }
+        tasks.insert(tid, (before, descriptors));
+    }
+    if task_descriptor_ids(process_dir, pid, budget)? != tids {
+        return Err("task_descriptor_task_set_changed");
+    }
+    Ok(tasks)
+}
+
+fn task_descriptor_snapshot_with(
+    process_dir: &Path,
+    pid: u32,
+    deadline: Instant,
+    max_tasks: usize,
+    max_entries: usize,
+    before_recheck: impl FnOnce(),
+) -> Result<BTreeMap<u32, BTreeMap<u32, PathBuf>>, &'static str> {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return Err("task_descriptor_invalid_pid");
+    }
+    let mut budget = TaskDescriptorBudget {
+        deadline,
+        remaining_entries: max_entries,
+        max_tasks,
+    };
+    let before = task_descriptor_observation(process_dir, pid, &mut budget)?;
+    before_recheck();
+    let after = task_descriptor_observation(process_dir, pid, &mut budget)?;
+    budget.check()?;
+    if before != after {
+        return Err("task_descriptor_observation_changed");
+    }
+    Ok(before
+        .into_iter()
+        .map(|(tid, (_, descriptors))| (tid, descriptors))
+        .collect())
 }
 
 /// One complete mountinfo record. Paths have the kernel's octal escapes
@@ -291,6 +489,214 @@ mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, MetadataExt};
     use std::time::Duration;
+
+    fn descriptor_fixture_task(process: &Path, tid: u32, birth: u64) -> PathBuf {
+        let task = process.join("task").join(tid.to_string());
+        std::fs::create_dir_all(task.join("fd")).unwrap();
+        let mut fields = vec!["0".to_string(); 22];
+        fields[0] = "S".to_string();
+        fields[1] = "1".to_string();
+        fields[17] = "2".to_string();
+        fields[19] = birth.to_string();
+        std::fs::write(
+            task.join("stat"),
+            format!("{tid} (worker) {}\n", fields.join(" ")),
+        )
+        .unwrap();
+        task
+    }
+
+    fn descriptor_fixture_snapshot(
+        process: &Path,
+    ) -> Result<BTreeMap<u32, BTreeMap<u32, PathBuf>>, &'static str> {
+        let held = open_directory(process).unwrap();
+        task_descriptor_snapshot(
+            &directory_path(&held, ""),
+            42,
+            Instant::now() + Duration::from_secs(5),
+            16,
+            1000,
+        )
+    }
+
+    #[test]
+    fn descriptor_snapshot_includes_private_thread_sockets_without_following_targets() {
+        let process = tempfile::tempdir().unwrap().keep();
+        let leader = descriptor_fixture_task(&process, 42, 100);
+        let worker = descriptor_fixture_task(&process, 43, 101);
+        symlink("/dev/null", leader.join("fd/0")).unwrap();
+        symlink("socket:[501]", leader.join("fd/3")).unwrap();
+        symlink("socket:[501]", worker.join("fd/3")).unwrap();
+        symlink("socket:[900]", worker.join("fd/8")).unwrap();
+        // A link to a missing or unhealthy mount must not be followed just to
+        // establish that this is not the socket being attributed.
+        symlink("/unavailable-fuse-mount/file", worker.join("fd/9")).unwrap();
+
+        let tables = descriptor_fixture_snapshot(&process).unwrap();
+        assert_eq!(tables.len(), 2);
+        assert_eq!(tables[&42].len(), 2);
+        assert!(!tables[&42].contains_key(&8));
+        assert_eq!(tables[&43][&8], Path::new("socket:[900]"));
+        assert_eq!(tables[&43][&9], Path::new("/unavailable-fuse-mount/file"));
+    }
+
+    #[test]
+    fn descriptor_snapshot_rejects_task_identity_and_descriptor_churn() {
+        for mutation in [
+            "new_task",
+            "departed_task",
+            "changed_birth",
+            "replaced_task_directory",
+            "new_fd",
+            "closed_fd",
+            "replaced_fd",
+        ] {
+            let process = tempfile::tempdir().unwrap().keep();
+            descriptor_fixture_task(&process, 42, 100);
+            let worker = descriptor_fixture_task(&process, 43, 101);
+            symlink("socket:[900]", worker.join("fd/8")).unwrap();
+            let held = open_directory(&process).unwrap();
+            let observed = task_descriptor_snapshot_with(
+                &directory_path(&held, ""),
+                42,
+                Instant::now() + Duration::from_secs(5),
+                16,
+                1000,
+                || match mutation {
+                    "new_task" => {
+                        descriptor_fixture_task(&process, 44, 102);
+                    }
+                    "departed_task" => {
+                        std::fs::rename(&worker, process.join("retained-worker")).unwrap();
+                    }
+                    "changed_birth" => {
+                        descriptor_fixture_task(&process, 43, 999);
+                    }
+                    "replaced_task_directory" => {
+                        std::fs::rename(&worker, process.join("retained-worker")).unwrap();
+                        let replacement = descriptor_fixture_task(&process, 43, 101);
+                        symlink("socket:[900]", replacement.join("fd/8")).unwrap();
+                    }
+                    "new_fd" => {
+                        symlink("socket:[901]", worker.join("fd/9")).unwrap();
+                    }
+                    "closed_fd" => {
+                        std::fs::rename(worker.join("fd/8"), process.join("retained-fd")).unwrap();
+                    }
+                    "replaced_fd" => {
+                        std::fs::rename(worker.join("fd/8"), process.join("retained-fd")).unwrap();
+                        symlink("socket:[901]", worker.join("fd/8")).unwrap();
+                    }
+                    _ => unreachable!(),
+                },
+            );
+            assert!(observed.is_err(), "{mutation}: {observed:?}");
+        }
+    }
+
+    #[test]
+    fn descriptor_snapshot_rejects_missing_and_malformed_task_evidence() {
+        for malformed in [
+            "missing_task_table",
+            "missing_leader",
+            "missing_fd_table",
+            "missing_stat",
+            "invalid_stat",
+            "wrong_stat_pid",
+            "non_link_fd",
+            "symlink_task",
+        ] {
+            let process = tempfile::tempdir().unwrap().keep();
+            let leader = descriptor_fixture_task(&process, 42, 100);
+            match malformed {
+                "missing_task_table" => {
+                    std::fs::rename(process.join("task"), process.join("retained-task-table"))
+                        .unwrap();
+                }
+                "missing_leader" => {
+                    std::fs::rename(&leader, process.join("retained-leader")).unwrap();
+                    descriptor_fixture_task(&process, 43, 101);
+                }
+                "missing_fd_table" => {
+                    let worker = descriptor_fixture_task(&process, 43, 101);
+                    std::fs::rename(worker.join("fd"), process.join("retained-fds")).unwrap();
+                }
+                "missing_stat" => {
+                    std::fs::rename(leader.join("stat"), process.join("retained-stat")).unwrap();
+                }
+                "invalid_stat" => {
+                    std::fs::write(leader.join("stat"), "42 (worker) S 1\n").unwrap();
+                }
+                "wrong_stat_pid" => {
+                    let other = descriptor_fixture_task(&process, 43, 101);
+                    std::fs::copy(other.join("stat"), leader.join("stat")).unwrap();
+                }
+                "non_link_fd" => {
+                    std::fs::write(leader.join("fd/0"), "socket:[900]").unwrap();
+                }
+                "symlink_task" => {
+                    std::fs::rename(&leader, process.join("retained-leader")).unwrap();
+                    symlink(process.join("retained-leader"), leader).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                descriptor_fixture_snapshot(&process).is_err(),
+                "{malformed}"
+            );
+        }
+        for name in ["+43", "043", "0", "-1", "2147483648", "worker"] {
+            let process = tempfile::tempdir().unwrap().keep();
+            descriptor_fixture_task(&process, 42, 100);
+            std::fs::create_dir(process.join("task").join(name)).unwrap();
+            assert!(
+                descriptor_fixture_snapshot(&process).is_err(),
+                "task {name}"
+            );
+        }
+        for name in ["+8", "08", "-1", "2147483648", "socket"] {
+            let process = tempfile::tempdir().unwrap().keep();
+            let leader = descriptor_fixture_task(&process, 42, 100);
+            symlink("socket:[900]", leader.join("fd").join(name)).unwrap();
+            assert!(descriptor_fixture_snapshot(&process).is_err(), "fd {name}");
+        }
+    }
+
+    #[test]
+    fn descriptor_snapshot_shares_task_entry_and_time_budgets_across_passes() {
+        let process = tempfile::tempdir().unwrap().keep();
+        let leader = descriptor_fixture_task(&process, 42, 100);
+        symlink("socket:[900]", leader.join("fd/0")).unwrap();
+        let held = open_directory(&process).unwrap();
+        let path = directory_path(&held, "");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // Both task enumerations and the FD walk consume the same budget in
+        // each pass. A complete first pass does not reset that allowance.
+        assert!(task_descriptor_snapshot(&path, 42, deadline, 1, 6).is_ok());
+        assert_eq!(
+            task_descriptor_snapshot(&path, 42, deadline, 1, 5),
+            Err("task_descriptor_budget_exhausted")
+        );
+        assert_eq!(
+            task_descriptor_snapshot(&path, 42, deadline, 0, 100),
+            Err("task_descriptor_task_limit")
+        );
+        assert_eq!(
+            task_descriptor_snapshot(&path, 42, Instant::now(), 1, 100),
+            Err("task_descriptor_budget_exhausted")
+        );
+        for pid in [0, i32::MAX as u32 + 1] {
+            assert_eq!(
+                task_descriptor_snapshot(&path, pid, deadline, 1, 100),
+                Err("task_descriptor_invalid_pid")
+            );
+        }
+        descriptor_fixture_task(&process, 43, 101);
+        assert_eq!(
+            task_descriptor_snapshot(&path, 42, deadline, 1, 100),
+            Err("task_descriptor_task_limit")
+        );
+    }
 
     #[test]
     fn mountinfo_decodes_paths_once_and_retains_bind_mount_identity() {

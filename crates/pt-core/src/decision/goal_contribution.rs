@@ -545,14 +545,30 @@ fn goal_procfs_has_unrestricted_view(mounts: &str) -> bool {
 }
 
 /// Inspect links only: do not stat descriptor targets, which may be on a
-/// stalled FUSE/network filesystem. One walk supplies both counts and sockets.
+/// stalled FUSE/network filesystem. Port ownership must include every thread:
+/// a non-leader can retain a socket in a private descriptor table after the
+/// leader closes its copy. Count only the leader's table for the existing FD
+/// metric; summing thread tables would count shared descriptors repeatedly.
 #[cfg(target_os = "linux")]
 fn read_goal_descriptors(
     pid: u32,
     sockets: bool,
 ) -> Result<(u64, std::collections::BTreeSet<u64>), String> {
+    if sockets {
+        let process = GoalProcDirectory::open(pid)?;
+        let directory = crate::collect::procfs::directory_path(&process.handle, "");
+        let tables = crate::collect::procfs::task_descriptor_snapshot(
+            &directory,
+            pid,
+            std::time::Instant::now() + std::time::Duration::from_millis(250),
+            4_096,
+            200_000,
+        )
+        .map_err(str::to_string)?;
+        return socket_resources_from_task_tables(pid, &tables);
+    }
+
     let mut count = 0;
-    let mut inodes = std::collections::BTreeSet::new();
     let entries =
         std::fs::read_dir(format!("/proc/{pid}/fd")).map_err(|error| error.to_string())?;
     for entry in entries {
@@ -569,16 +585,37 @@ fn read_goal_descriptors(
         if count > 50_000 {
             return Err("descriptor observation budget exceeded".into());
         }
-        if sockets {
-            let target = std::fs::read_link(entry.path()).map_err(|error| error.to_string())?;
-            let target = target.to_string_lossy();
-            if let Some(inode) = target
-                .strip_prefix("socket:[")
-                .and_then(|s| s.strip_suffix(']'))
-            {
-                inodes.insert(inode.parse().map_err(|_| "invalid socket descriptor")?);
-            }
-        }
+    }
+    Ok((count, std::collections::BTreeSet::new()))
+}
+
+#[cfg(target_os = "linux")]
+fn socket_resources_from_task_tables(
+    pid: u32,
+    tables: &BTreeMap<u32, BTreeMap<u32, std::path::PathBuf>>,
+) -> Result<(u64, std::collections::BTreeSet<u64>), String> {
+    let count = tables
+        .get(&pid)
+        .ok_or("leader descriptor table is unavailable")?
+        .len() as u64;
+    let mut inodes = std::collections::BTreeSet::new();
+    for target in tables.values().flat_map(|table| table.values()) {
+        let Some(target) = target.to_str() else {
+            // Non-UTF-8 file names are legitimate. Kernel socket links
+            // always use the ASCII socket:[inode] representation.
+            continue;
+        };
+        let Some(socket) = target.strip_prefix("socket:") else {
+            continue;
+        };
+        let inode = socket
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+            .filter(|value| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|&value| value != 0)
+            .ok_or("invalid socket descriptor")?;
+        inodes.insert(inode);
     }
     Ok((count, inodes))
 }
@@ -967,6 +1004,116 @@ pub fn estimate_fd_contribution(candidate: &ContributionCandidate) -> GoalContri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    mod socket_goal_resources {
+        use super::super::socket_resources_from_task_tables;
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::path::PathBuf;
+
+        #[test]
+        fn private_worker_socket_is_required_when_the_leader_has_closed_it() {
+            let tables = BTreeMap::from([
+                (
+                    42,
+                    BTreeMap::from([
+                        (0, PathBuf::from("/dev/null")),
+                        (1, PathBuf::from("pipe:[100]")),
+                    ]),
+                ),
+                (
+                    43,
+                    BTreeMap::from([
+                        (0, PathBuf::from("/dev/null")),
+                        (1, PathBuf::from("pipe:[100]")),
+                        (2, PathBuf::from("socket:[1234]")),
+                        (7, PathBuf::from("socket:[5678]")),
+                    ]),
+                ),
+            ]);
+            let (fd_count, sockets) = socket_resources_from_task_tables(42, &tables).unwrap();
+            assert_eq!(fd_count, 2, "FD metric retains the leader-table scope");
+            assert_eq!(sockets, BTreeSet::from([1234, 5678]));
+        }
+
+        #[test]
+        fn shared_thread_tables_do_not_multiply_fd_or_socket_counts() {
+            let descriptors = BTreeMap::from([
+                (0, PathBuf::from("/dev/null")),
+                (3, PathBuf::from("socket:[900]")),
+                (4, PathBuf::from("socket:[900]")),
+            ]);
+            let tables = BTreeMap::from([
+                (42, descriptors.clone()),
+                (43, descriptors.clone()),
+                (44, descriptors),
+            ]);
+            let (fd_count, sockets) = socket_resources_from_task_tables(42, &tables).unwrap();
+            assert_eq!(fd_count, 3);
+            assert_eq!(sockets, BTreeSet::from([900]));
+        }
+
+        #[test]
+        fn missing_leader_table_is_unknown_instead_of_zero_resources() {
+            for tables in [
+                BTreeMap::new(),
+                BTreeMap::from([(43, BTreeMap::from([(2, PathBuf::from("socket:[1234]"))]))]),
+            ] {
+                assert_eq!(
+                    socket_resources_from_task_tables(42, &tables).unwrap_err(),
+                    "leader descriptor table is unavailable"
+                );
+            }
+        }
+
+        #[test]
+        fn malformed_worker_socket_links_fail_closed() {
+            for malformed in [
+                "socket:",
+                "socket:[]",
+                "socket:[0]",
+                "socket:[-1]",
+                "socket:[+1]",
+                "socket:[ 1]",
+                "socket:[1 ]",
+                "socket:[1\n]",
+                "socket:[1",
+                "socket:1]",
+                "socket:[1]trailing",
+                "socket:[[1]]",
+                "socket:[18446744073709551616]",
+            ] {
+                let tables = BTreeMap::from([
+                    (42, BTreeMap::from([(0, PathBuf::from("/dev/null"))])),
+                    (43, BTreeMap::from([(2, PathBuf::from(malformed))])),
+                ]);
+                assert!(
+                    socket_resources_from_task_tables(42, &tables).is_err(),
+                    "malformed socket evidence must not be ignored: {malformed:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn ordinary_non_utf8_files_do_not_invalidate_socket_evidence() {
+            use std::os::unix::ffi::OsStringExt;
+
+            let filename = std::ffi::OsString::from_vec(b"/tmp/worker-\xff.log".to_vec());
+            let tables = BTreeMap::from([(
+                42,
+                BTreeMap::from([
+                    (0, PathBuf::from(filename)),
+                    (1, PathBuf::from("pipe:[10]")),
+                    (2, PathBuf::from("anon_inode:[eventpoll]")),
+                    (3, PathBuf::from("/tmp/socket:[99]")),
+                    (4, PathBuf::from("socket:[18446744073709551615]")),
+                ]),
+            )]);
+            let (fd_count, sockets) = socket_resources_from_task_tables(42, &tables).unwrap();
+            assert_eq!(fd_count, 5);
+            assert_eq!(sockets, BTreeSet::from([u64::MAX]));
+        }
+    }
 
     #[test]
     fn memory_and_cpu_goals_do_not_collect_descriptor_evidence() {

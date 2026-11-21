@@ -6,6 +6,259 @@ use pt_core::decision::goal_optimizer::{
 use pt_core::decision::goal_parser::{parse_goal, Goal};
 use pt_core::decision::goal_plan::{optimize_goal_plan, PlanCandidate, PlanConstraints};
 
+#[cfg(target_os = "linux")]
+mod live_descriptor_goals {
+    use super::parse_goal;
+    use pt_core::decision::goal_contribution::GoalResourceSnapshot;
+    use std::io::{BufRead, Write};
+    use std::net::TcpListener;
+    use std::os::fd::{AsRawFd, OwnedFd};
+    use std::process::{Child, Command, Stdio};
+    use std::sync::mpsc::{self, Receiver};
+    use std::time::Duration;
+
+    struct SocketHolder {
+        child: Child,
+        events: Receiver<std::io::Result<String>>,
+        reader: Option<std::thread::JoinHandle<()>>,
+        tid: u32,
+    }
+
+    impl Drop for SocketHolder {
+        fn drop(&mut self) {
+            // This child remains owned and unreaped, so the PID cannot refer to
+            // another process. Killing it also terminates its fixture thread.
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            if let Some(reader) = self.reader.take() {
+                let _ = reader.join();
+            }
+        }
+    }
+
+    impl SocketHolder {
+        fn spawn(listener: &TcpListener, private_table: bool) -> Option<Self> {
+            const SCRIPT: &str = r#"
+import ctypes, os, queue, sys, threading
+libc = ctypes.CDLL(None, use_errno=True)
+libc.unshare.argtypes = [ctypes.c_int]
+libc.unshare.restype = ctypes.c_int
+private_table = sys.argv[1] == 'private'
+ready = queue.Queue()
+close_socket = threading.Event()
+socket_closed = threading.Event()
+finish = threading.Event()
+def worker():
+    if private_table and libc.unshare(0x400) != 0:
+        ready.put(('unsupported', ctypes.get_errno()))
+        return
+    ready.put(('ready', threading.get_native_id()))
+    close_socket.wait()
+    os.close(2)
+    socket_closed.set()
+    finish.wait()
+thread = threading.Thread(target=worker)
+thread.start()
+event = ready.get(timeout=5)
+if event[0] == 'unsupported':
+    print(*event, flush=True)
+    thread.join()
+    sys.exit(0)
+if private_table:
+    os.close(2)
+print(*event, flush=True)
+try:
+    for line in sys.stdin:
+        if line.strip() == 'close-socket':
+            close_socket.set()
+            if not socket_closed.wait(5):
+                raise RuntimeError('worker failed to close owned socket')
+            print('closed', flush=True)
+finally:
+    close_socket.set()
+    finish.set()
+    thread.join()
+"#;
+            let socket: OwnedFd = listener
+                .try_clone()
+                .expect("duplicate owned listener")
+                .into();
+            let mut command = Command::new("python3");
+            command
+                .args(["-u", "-c", SCRIPT])
+                .arg(if private_table { "private" } else { "shared" })
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::from(socket));
+            let child = match command.spawn() {
+                Ok(child) => child,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    eprintln!("SKIP live descriptor goals: python3 is unavailable");
+                    return None;
+                }
+                Err(error) => panic!("spawn owned socket holder: {error}"),
+            };
+            // Do not leave an extra listener reference in the parent command.
+            drop(command);
+            let (sender, events) = mpsc::channel();
+            let mut holder = Self {
+                child,
+                events,
+                reader: None,
+                tid: 0,
+            };
+            let stdout = holder.child.stdout.take().expect("fixture stdout");
+            holder.reader = Some(std::thread::spawn(move || {
+                for line in std::io::BufReader::new(stdout).lines() {
+                    if sender.send(line).is_err() {
+                        break;
+                    }
+                }
+            }));
+            let ready = holder.event();
+            if let Some(errno) = ready.strip_prefix("unsupported ") {
+                let errno = errno.parse::<i32>().expect("numeric unshare error");
+                assert!(
+                    matches!(errno, libc::EPERM | libc::EACCES | libc::ENOSYS),
+                    "unexpected unshare(CLONE_FILES) failure: {errno}"
+                );
+                eprintln!(
+                    "SKIP private descriptor table: unshare(CLONE_FILES) unavailable: {}",
+                    std::io::Error::from_raw_os_error(errno)
+                );
+                return None;
+            }
+            holder.tid = ready
+                .strip_prefix("ready ")
+                .expect("owned worker readiness")
+                .parse()
+                .expect("numeric worker identity");
+            assert_ne!(holder.tid, holder.child.id());
+            Some(holder)
+        }
+
+        fn event(&self) -> String {
+            self.events
+                .recv_timeout(Duration::from_secs(10))
+                .expect("bounded owned socket-holder response")
+                .expect("read owned socket-holder response")
+        }
+
+        fn close_socket(&mut self) {
+            writeln!(
+                self.child.stdin.as_mut().expect("fixture stdin"),
+                "close-socket"
+            )
+            .expect("request owned socket close");
+            assert_eq!(self.event(), "closed");
+        }
+
+        fn worker_descriptor(&self) -> std::path::PathBuf {
+            format!("/proc/{}/task/{}/fd/2", self.child.id(), self.tid).into()
+        }
+    }
+
+    fn assert_observed_holders(snapshot: &GoalResourceSnapshot, port: u16, pids: &[u32]) {
+        let observed = &snapshot.ports[&port];
+        assert!(observed.bound_socket_count.is_some_and(|count| count > 0));
+        if let Some(holders) = &observed.holders {
+            for pid in pids {
+                assert!(
+                    holders.iter().any(|holder| holder.pid.0 == *pid),
+                    "port {port} remains held by pid {pid}: {observed:?}"
+                );
+            }
+        } else {
+            // CI may prohibit inspecting unrelated users' processes. Such an
+            // incomplete census must be explicit and cannot become A-only
+            // ownership. Deterministic sampler tests cover that regression
+            // independently of these host permissions.
+            assert!(snapshot
+                .warnings
+                .contains(&format!("port_{port}_ownership_incomplete")));
+            eprintln!("live port census remains unknown: {:?}", snapshot.warnings);
+        }
+    }
+
+    #[test]
+    fn port_census_retains_private_worker_holder_of_another_process_socket() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind owned listener");
+        let address = listener.local_addr().expect("owned listener address");
+        let expected_socket = std::fs::read_link(format!("/proc/self/fd/{}", listener.as_raw_fd()))
+            .expect("owned socket inode");
+        let Some(mut holder) = SocketHolder::spawn(&listener, true) else {
+            return;
+        };
+        assert_eq!(
+            std::fs::read_link(holder.worker_descriptor()).expect("private worker socket"),
+            expected_socket
+        );
+        assert_eq!(
+            std::fs::read_link(format!("/proc/{}/fd/2", holder.child.id()))
+                .expect_err("leader closed its copy")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+
+        let goal = parse_goal(&format!("free port {}", address.port())).unwrap();
+        // Passing no candidates must not hide either process from ownership.
+        let observed = GoalResourceSnapshot::collect(&goal, &[]);
+        assert_observed_holders(
+            &observed,
+            address.port(),
+            &[std::process::id(), holder.child.id()],
+        );
+
+        // Releasing the visible owner's copy does not release the port: the
+        // non-leader's private table still owns this exact socket inode.
+        drop(listener);
+        assert_eq!(
+            TcpListener::bind(address)
+                .expect_err("private worker still retains the listener")
+                .kind(),
+            std::io::ErrorKind::AddrInUse
+        );
+        assert_eq!(
+            std::fs::read_link(holder.worker_descriptor()).unwrap(),
+            expected_socket
+        );
+
+        // An owned negative control proves that the worker reference, rather
+        // than a leaked parent descriptor, was what kept the port occupied.
+        holder.close_socket();
+        let _rebound = TcpListener::bind(address).expect("port freed after last owner closes");
+    }
+
+    #[test]
+    fn fd_goal_does_not_count_a_shared_thread_descriptor_table_twice() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind owned listener");
+        let Some(holder) = SocketHolder::spawn(&listener, false) else {
+            return;
+        };
+        let population = pt_core::collect::quick_scan(&pt_core::collect::QuickScanOptions {
+            pids: vec![holder.child.id()],
+            ..Default::default()
+        })
+        .expect("observe owned multithreaded process")
+        .processes;
+        let process = population
+            .iter()
+            .find(|process| process.pid.0 == holder.child.id())
+            .expect("owned process in census");
+        let identity =
+            pt_common::ProcessIdentity::new(process.pid.0, process.start_id.clone(), process.uid);
+        let count = std::fs::read_dir(format!("/proc/{}/fd", holder.child.id()))
+            .expect("owned leader descriptor table")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("complete owned descriptor entries")
+            .len() as u64;
+        assert!(count >= 3, "stdio descriptors are held by both threads");
+        let observed =
+            GoalResourceSnapshot::collect(&parse_goal("free 1 fd").unwrap(), &population);
+        assert_eq!(observed.fd_count(&identity), Some(count));
+    }
+}
+
 #[test]
 fn memory_pressure_risk_budget_prefers_low_risk_set() {
     let candidates = vec![
