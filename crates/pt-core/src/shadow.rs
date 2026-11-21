@@ -1827,7 +1827,10 @@ mod tests {
                 .map(|entry| entry.unwrap().path())
                 .collect();
             assert_eq!(files.len(), 1);
-            let obs: Observation = serde_json::from_slice(&fs::read(&files[0]).unwrap()).unwrap();
+            let mut batch: Vec<Observation> =
+                serde_json::from_slice(&fs::read(&files[0]).unwrap()).unwrap();
+            assert_eq!(batch.len(), 1);
+            let obs = batch.pop().unwrap();
             let details: serde_json::Value =
                 serde_json::from_str(obs.events[0].details.as_deref().unwrap()).unwrap();
             assert_eq!(details["host_id"], "host-a");

@@ -557,13 +557,18 @@ mod tests {
         assert!(negative.ancestry.is_none());
         assert!(negative.ipc.is_none());
 
-        for marker in ["CLAUDECODE", "CODEX_SESSION_ID", "VSCODE_PID", "TMUX"] {
+        for (marker, value) in [
+            ("CLAUDECODE", "1"),
+            ("CODEX_SESSION_ID", "present"),
+            ("VSCODE_PID", "present"),
+            ("TMUX", "present"),
+        ] {
             let environment = std::collections::HashMap::from([
                 (
                     "XPC_SERVICE_NAME".to_string(),
                     "com.example.service".to_string(),
                 ),
-                (marker.to_string(), "present".to_string()),
+                (marker.to_string(), value.to_string()),
             ]);
             let observed = environment_only_supervision(Ok(analyzer.analyze_env(&environment)))
                 .expect("readable supervision evidence");

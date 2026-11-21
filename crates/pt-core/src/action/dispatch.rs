@@ -1515,8 +1515,12 @@ mod tests {
         let runner = CompositeActionRunner::with_defaults();
         let mut action = make_action();
         action.action = Action::Restart;
-        // verify for restart is Ok (no verification needed)
-        assert!(runner.verify(&action).is_ok());
+        // Direct (unrouted) restart verification is refused; a supported
+        // supervisor or zombie-parent route is required.
+        let err = runner
+            .verify(&action)
+            .expect_err("unrouted restart verify must fail closed");
+        assert!(format!("{err:?}").contains("supported supervisor or zombie-parent route"));
     }
 
     #[cfg(not(target_os = "linux"))]

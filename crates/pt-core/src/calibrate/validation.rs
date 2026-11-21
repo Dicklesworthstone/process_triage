@@ -2494,7 +2494,14 @@ mod tests {
         assert!(report.metrics.is_none());
         assert!(report.quality.is_none());
         assert!(report.bias.is_none());
-        assert!(report.by_category.is_empty());
+        assert!(report.by_category.iter().all(|cat| {
+            cat.resolved == 0
+                && cat.positive_labels == 0
+                && cat.negative_labels == 0
+                && cat.metrics.is_none()
+                && cat.quality.is_none()
+                && cat.curve.is_none()
+        }));
         assert!(report.top_false_positives.is_empty());
         assert!(report.top_false_negatives.is_empty());
         assert!(report.recommendations.is_empty());

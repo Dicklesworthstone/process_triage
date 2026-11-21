@@ -978,25 +978,31 @@ mod tests {
             assert!(
                 matches!(&result.outcomes[0].status, ActionStatus::PreCheckBlocked {
                     check: PreCheck::CheckNotProtected, reason
-                } if reason.contains("complete infrastructure evidence")),
+                } if reason.contains("complete infrastructure evidence")
+                    || reason.contains("protection evidence unavailable")),
                 "{action:?}: {:?}",
                 result.outcomes[0].status
             );
         }
-        for action in [
-            Action::Keep,
-            Action::Resume,
-            Action::Unfreeze,
-            Action::Unquarantine,
-        ] {
+        plan.actions[0].action = Action::Keep;
+        let executor = ActionExecutor::new(&runner, &identity_provider, dir.join("lock"))
+            .with_pre_check_provider(&provider);
+        let result = executor.execute_plan(&plan).unwrap();
+        assert_eq!(result.outcomes[0].status, ActionStatus::Success, "Keep");
+
+        // Unreadable metadata must also refuse recovery actions until identity
+        // metadata is observable; explicit protected PIDs still take precedence.
+        for action in [Action::Resume, Action::Unfreeze, Action::Unquarantine] {
             plan.actions[0].action = action;
             let executor = ActionExecutor::new(&runner, &identity_provider, dir.join("lock"))
                 .with_pre_check_provider(&provider);
             let result = executor.execute_plan(&plan).unwrap();
-            assert_eq!(
-                result.outcomes[0].status,
-                ActionStatus::Success,
-                "{action:?}"
+            assert!(
+                matches!(&result.outcomes[0].status, ActionStatus::PreCheckBlocked {
+                    check: PreCheck::CheckNotProtected, reason
+                } if reason.contains("protection evidence unavailable")),
+                "{action:?}: {:?}",
+                result.outcomes[0].status
             );
         }
 

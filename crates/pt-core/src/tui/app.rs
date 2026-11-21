@@ -532,42 +532,63 @@ impl App {
     }
 
     fn execute_palette_action(&mut self, action_id: &str) -> FtuiCmd<Msg> {
-        self.announce_accessible(format!(
-            "Command executed: {}",
-            Self::palette_action_label(action_id)
-        ));
-        match action_id {
-            "action.execute" => self.show_execute_confirmation(),
-            "action.refresh" => return self.handle_msg(Msg::RequestRefresh),
+        let mut known = true;
+        let cmd = match action_id {
+            "action.execute" => {
+                self.show_execute_confirmation();
+                FtuiCmd::none()
+            }
+            "action.refresh" => self.handle_msg(Msg::RequestRefresh),
 
-            "navigation.first" => self.process_table.cursor_home(),
-            "navigation.last" => self.process_table.cursor_end(),
-            "navigation.page_down" => self
-                .process_table
-                .page_down(self.process_table.last_visible_height),
-            "navigation.page_up" => self
-                .process_table
-                .page_up(self.process_table.last_visible_height),
+            "navigation.first" => {
+                self.process_table.cursor_home();
+                FtuiCmd::none()
+            }
+            "navigation.last" => {
+                self.process_table.cursor_end();
+                FtuiCmd::none()
+            }
+            "navigation.page_down" => {
+                self.process_table
+                    .page_down(self.process_table.last_visible_height);
+                FtuiCmd::none()
+            }
+            "navigation.page_up" => {
+                self.process_table
+                    .page_up(self.process_table.last_visible_height);
+                FtuiCmd::none()
+            }
             "search.open" => {
                 self.state = AppState::Searching;
                 self.focus = FocusTarget::Search;
                 self.update_focus();
+                FtuiCmd::none()
             }
 
-            "selection.recommended" => return self.handle_msg(Msg::SelectRecommended),
-            "selection.all" => return self.handle_msg(Msg::SelectAll),
-            "selection.none" => return self.handle_msg(Msg::DeselectAll),
-            "selection.invert" => return self.handle_msg(Msg::InvertSelection),
+            "selection.recommended" => self.handle_msg(Msg::SelectRecommended),
+            "selection.all" => self.handle_msg(Msg::SelectAll),
+            "selection.none" => self.handle_msg(Msg::DeselectAll),
+            "selection.invert" => self.handle_msg(Msg::InvertSelection),
 
-            "view.toggle_detail" => self.toggle_detail_visibility(),
-            "view.summary" => self.set_detail_view(DetailView::Summary),
-            "view.genealogy" => self.set_detail_view(DetailView::Genealogy),
+            "view.toggle_detail" => {
+                self.toggle_detail_visibility();
+                FtuiCmd::none()
+            }
+            "view.summary" => {
+                self.set_detail_view(DetailView::Summary);
+                FtuiCmd::none()
+            }
+            "view.genealogy" => {
+                self.set_detail_view(DetailView::Genealogy);
+                FtuiCmd::none()
+            }
             "view.galaxy" => {
                 if self.detail_view == DetailView::GalaxyBrain {
                     self.set_detail_view(DetailView::Summary);
                 } else {
                     self.set_detail_view(DetailView::GalaxyBrain);
                 }
+                FtuiCmd::none()
             }
             "view.goal" => {
                 if self.process_table.has_goal_order() {
@@ -579,24 +600,48 @@ impl App {
                 } else {
                     self.set_status("Goal view unavailable");
                 }
+                FtuiCmd::none()
             }
-            "view.help" => self.state = AppState::Help,
+            "view.help" => {
+                self.state = AppState::Help;
+                FtuiCmd::none()
+            }
 
-            "settings.theme.dark" => self.theme = Theme::dark(),
-            "settings.theme.light" => self.theme = Theme::light(),
-            "settings.theme.high_contrast" => self.theme = Theme::high_contrast(),
-            "settings.theme.no_color" => self.theme = Theme::no_color(),
+            "settings.theme.dark" => {
+                self.theme = Theme::dark();
+                FtuiCmd::none()
+            }
+            "settings.theme.light" => {
+                self.theme = Theme::light();
+                FtuiCmd::none()
+            }
+            "settings.theme.high_contrast" => {
+                self.theme = Theme::high_contrast();
+                FtuiCmd::none()
+            }
+            "settings.theme.no_color" => {
+                self.theme = Theme::no_color();
+                FtuiCmd::none()
+            }
 
             _ => {
+                known = false;
                 tracing::warn!(
                     target: "tui.command_palette",
                     action_id,
                     "Unknown command palette action"
                 );
                 self.set_status(format!("Unknown command: {}", action_id));
+                FtuiCmd::none()
             }
+        };
+        if known {
+            self.announce_accessible(format!(
+                "Command executed: {}",
+                Self::palette_action_label(action_id)
+            ));
         }
-        FtuiCmd::none()
+        cmd
     }
 
     fn handle_command_palette_key(&mut self, key: FtuiKeyEvent) -> Option<FtuiCmd<Msg>> {

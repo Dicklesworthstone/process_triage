@@ -102,6 +102,24 @@ fn decode_mount_field(field: &str) -> Result<String, &'static str> {
     String::from_utf8(output).map_err(|_| "filesystem_mount_table_invalid")
 }
 
+fn is_kernel_nsfs_root(filesystem_type: &str, root: &str) -> bool {
+    if filesystem_type != "nsfs" {
+        return false;
+    }
+    let Some((namespace, rest)) = root.split_once(":[") else {
+        return false;
+    };
+    let Some(inode) = rest.strip_suffix(']') else {
+        return false;
+    };
+    !namespace.is_empty()
+        && namespace
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        && !inode.is_empty()
+        && inode.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 /// Parse the complete kernel mount table. Unknown optional fields are ignored
 /// as required by procfs; malformed required fields invalidate the whole view.
 pub(crate) fn parse_mountinfo(bytes: &[u8]) -> Result<BTreeMap<u64, MountInfo>, &'static str> {
@@ -137,7 +155,10 @@ pub(crate) fn parse_mountinfo(bytes: &[u8]) -> Result<BTreeMap<u64, MountInfo>, 
             .ok_or("filesystem_mount_table_invalid")?;
         let root = decode_mount_field(before[3])?;
         let mount_point = decode_mount_field(before[4])?;
-        if !root.starts_with('/') || !mount_point.starts_with('/') {
+        let filesystem_type = decode_mount_field(after[0])?;
+        if !mount_point.starts_with('/')
+            || (!root.starts_with('/') && !is_kernel_nsfs_root(&filesystem_type, &root))
+        {
             return Err("filesystem_mount_table_invalid");
         }
         for options in [before[5], after[2]] {
@@ -154,7 +175,7 @@ pub(crate) fn parse_mountinfo(bytes: &[u8]) -> Result<BTreeMap<u64, MountInfo>, 
             device_minor: unsigned(minor)?,
             root,
             mount_point,
-            filesystem_type: decode_mount_field(after[0])?,
+            filesystem_type,
             source: decode_mount_field(after[1])?,
             mount_options: before[5].to_string(),
             super_options: after[2].to_string(),
@@ -298,6 +319,22 @@ mod tests {
         assert_eq!(procfs.filesystem_type, "proc");
         assert_eq!(procfs.mount_options, "rw,nosuid,nodev,noexec");
         assert_eq!(procfs.super_options, "rw,hidepid=2,subset=pid");
+    }
+
+    #[test]
+    fn mountinfo_accepts_kernel_nsfs_namespace_roots() {
+        let table = parse_mountinfo(
+            b"470 31 0:5 net:[4026531833] /run/docker/netns/default rw shared:392 - nsfs nsfs rw\n",
+        )
+        .unwrap();
+        let nsfs = &table[&470];
+        assert_eq!(nsfs.filesystem_type, "nsfs");
+        assert_eq!(nsfs.root, "net:[4026531833]");
+        assert_eq!(nsfs.mount_point, "/run/docker/netns/default");
+        assert!(parse_mountinfo(
+            b"470 31 0:5 net:[4026531833] /run/docker/netns/default rw - tmpfs tmpfs rw\n",
+        )
+        .is_err());
     }
 
     #[test]

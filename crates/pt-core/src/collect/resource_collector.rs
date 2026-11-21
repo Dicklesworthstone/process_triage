@@ -658,6 +658,15 @@ mod tests {
                 .expect("spawn owned resource holder"),
         );
         let pid = child.0.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if let Ok(stat) = super::proc_parsers::read_required_proc_stat(pid) {
+                if stat.comm == "sleep" && stat.state == 'S' {
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         fs::write(&pidfile_path, format!("{pid}\n")).expect("record owned child PID");
         fs::write(&lockfile_path, "held\n").expect("record held lock");
         assert_eq!(

@@ -914,15 +914,24 @@ mod tests {
             }
 
             fn with_socket(socket: OwnedFd, stderr: Stdio) -> Self {
-                Self(
-                    Command::new("sleep")
-                        .arg("60")
-                        .stdin(Stdio::from(socket))
-                        .stdout(Stdio::null())
-                        .stderr(stderr)
-                        .spawn()
-                        .unwrap(),
-                )
+                let child = Command::new("sleep")
+                    .arg("60")
+                    .stdin(Stdio::from(socket))
+                    .stdout(Stdio::null())
+                    .stderr(stderr)
+                    .spawn()
+                    .unwrap();
+                let pid = child.id();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while std::time::Instant::now() < deadline {
+                    if let Ok(stat) = crate::collect::proc_parsers::read_required_proc_stat(pid) {
+                        if stat.comm == "sleep" && stat.state == 'S' {
+                            break;
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Self(child)
             }
 
             pub(super) fn pid(&self) -> u32 {

@@ -2792,8 +2792,17 @@ mod tests {
                 action.timeouts.verify_ms = saved_verify_ms;
                 let sessions_root = dir.path().join("sessions");
                 let session_id = "pt-zero-pause-budget";
-                let action_directory = sessions_root.join(session_id).join("action");
-                std::fs::create_dir_all(&action_directory).unwrap();
+                let session_directory = sessions_root.join(session_id);
+                let action_directory = session_directory.join("action");
+                for path in [&sessions_root, &session_directory, &action_directory] {
+                    std::fs::create_dir_all(path).unwrap();
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                            .unwrap();
+                    }
+                }
                 let journal = Arc::new(
                     ReversalJournal::new(
                         action_directory,
@@ -2848,8 +2857,17 @@ mod tests {
                 action.action = Action::Pause;
                 let sessions_root = dir.path().join("sessions");
                 let session_id = "pt-unsent-pause";
-                let action_directory = sessions_root.join(session_id).join("action");
-                std::fs::create_dir_all(&action_directory).unwrap();
+                let session_directory = sessions_root.join(session_id);
+                let action_directory = session_directory.join("action");
+                for path in [&sessions_root, &session_directory, &action_directory] {
+                    std::fs::create_dir_all(path).unwrap();
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                            .unwrap();
+                    }
+                }
                 let journal = Arc::new(
                     ReversalJournal::new(
                         action_directory,

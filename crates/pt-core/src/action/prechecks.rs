@@ -2481,10 +2481,14 @@ impl LivePreCheckProvider {
     fn check_not_protected_with_service(
         &self,
         pid: u32,
-        _action: Action,
+        action: Action,
         bound_user_service: bool,
     ) -> PreCheckResult {
         trace!(pid, "checking protection status");
+
+        if action == Action::Keep {
+            return PreCheckResult::Passed;
+        }
 
         if let Some(ref filter) = self.protected_filter {
             // Check protected PIDs first (fast lookup)
@@ -2532,7 +2536,7 @@ impl LivePreCheckProvider {
                 {
                     let result = fuse_action_precheck(
                         crate::collect::protected::holds_fuse_device(pid),
-                        _action,
+                        action,
                     );
                     if !result.is_passed() {
                         return result;

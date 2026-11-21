@@ -1802,7 +1802,10 @@ mod tests {
     #[test]
     fn memory_cap_verification_distinguishes_configuration_from_memory_recovery() {
         let action = memory_cap_action();
-        let saved = execution(&action);
+        let mut saved = execution(&action);
+        if let Some(clock) = saved.execution_clock.as_mut() {
+            clock.boot_id = "11111111-2222-4333-8444-555555555555".to_string();
+        }
         let mut current = make_proc(123, 1000, "worker", 5, ProcessState::Sleeping);
         current.start_id = action.target.start_id.clone();
         let plan = make_plan(vec![action]);

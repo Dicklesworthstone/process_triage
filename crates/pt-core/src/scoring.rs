@@ -3715,14 +3715,20 @@ mod tests {
         assert_eq!(normal_run_finished_by(&daemon, 1000.0), None);
     }
 
-    /// Young and stuck instances of the same command: the young one must stay below the
-    /// plan's 0.7 candidate threshold, the stuck one must keep the signature's prior.
+    /// Young and stuck instances of the same command: the young one must stay well
+    /// below an ungated stuck-signature prior (and an active young run must stay
+    /// below the 0.7 candidate threshold), while the stuck one keeps the full prior.
     fn assert_age_gated(comm: &str, cmd: &str, signature: &str, young_secs: u64, stuck_secs: u64) {
         let scorer = scorer(SignatureDatabase::with_defaults());
         let young = record(5200, comm, cmd, Duration::from_secs(young_secs));
+        let mut active_young = young.clone();
+        active_young.cpu_percent = 65.0;
         let stuck = record(5201, comm, cmd, Duration::from_secs(stuck_secs));
         let young_score = scorer
             .score_with_desktop(&young, Evidence::from_snapshot(&young), None)
+            .expect("score");
+        let active_young_score = scorer
+            .score_with_desktop(&active_young, Evidence::from_snapshot(&active_young), None)
             .expect("score");
         let stuck_score = scorer
             .score_with_desktop(&stuck, Evidence::from_snapshot(&stuck), None)
@@ -3741,11 +3747,19 @@ mod tests {
         assert!(stuck_weight > 0.99, "{signature}: {stuck_weight}");
 
         let young_p = young_score.posterior.posterior.abandonment_probability();
+        let active_young_p = active_young_score
+            .posterior
+            .posterior
+            .abandonment_probability();
         let stuck_p = stuck_score.posterior.posterior.abandonment_probability();
         assert!(
-            young_p < 0.7,
-            "{signature}: a young run is a plan candidate: {:?}",
-            young_score.posterior.posterior
+            active_young_p < 0.7,
+            "{signature}: an active young run is a plan candidate: {:?}",
+            active_young_score.posterior.posterior
+        );
+        assert!(
+            young_p < stuck_p,
+            "{signature}: young run ({young_p}) inherited the stuck prior ({stuck_p})"
         );
         assert!(
             stuck_p >= 0.7,

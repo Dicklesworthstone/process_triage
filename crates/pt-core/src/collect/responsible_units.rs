@@ -3098,7 +3098,7 @@ mod tests {
 
         let proc_root = fixture.path().join("proc");
         let deep_path = format!(
-            "/user.slice/{}/worker.scope",
+            "/user.slice/{}/run-worker.scope",
             vec!["nested.slice"; MAX_MEMORY_HIERARCHY_DEPTH].join("/")
         );
         let mount_point = fixture.path().join("cgroup");

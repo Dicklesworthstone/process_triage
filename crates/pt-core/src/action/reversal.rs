@@ -3084,9 +3084,25 @@ mod tests {
         journal_in_sessions(&directory.join("sessions"), "pt-20261108-120000-abcd")
     }
 
+    fn create_private_test_dir(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::create_dir_all(path).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            fs::create_dir_all(path).unwrap();
+        }
+    }
+
     fn journal_in_sessions(sessions_root: &Path, session_id: &str) -> Arc<ReversalJournal> {
-        let action_directory = sessions_root.join(session_id).join("action");
-        fs::create_dir_all(&action_directory).unwrap();
+        let session_directory = sessions_root.join(session_id);
+        let action_directory = session_directory.join("action");
+        create_private_test_dir(sessions_root);
+        create_private_test_dir(&session_directory);
+        create_private_test_dir(&action_directory);
         Arc::new(
             ReversalJournal::new(action_directory, session_id, "a".repeat(64), sessions_root)
                 .unwrap(),
@@ -5039,6 +5055,7 @@ mod tests {
     #[test]
     fn private_directory_identity_replacement_is_rejected() {
         let parent = tempfile::tempdir().unwrap();
+        create_private_test_dir(parent.path());
         let path = parent.path().join("reversals");
         let pinned = JournalDirectory::open(&path, true).unwrap().unwrap();
         fs::rename(&path, parent.path().join("retained")).unwrap();
@@ -5049,6 +5066,7 @@ mod tests {
     #[test]
     fn durable_byte_writer_preserves_prior_record_when_replacement_cannot_be_created() {
         let parent = tempfile::tempdir().unwrap();
+        create_private_test_dir(parent.path());
         let directory = JournalDirectory::open(&parent.path().join("reversals"), true)
             .unwrap()
             .unwrap();
@@ -5098,6 +5116,7 @@ mod tests {
     #[test]
     fn durable_byte_writer_refuses_symlink_and_out_of_directory_destinations() {
         let parent = tempfile::tempdir().unwrap();
+        create_private_test_dir(parent.path());
         let directory = JournalDirectory::open(&parent.path().join("reversals"), true)
             .unwrap()
             .unwrap();
