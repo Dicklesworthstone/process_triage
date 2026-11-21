@@ -173,7 +173,10 @@ impl GoalResourceSnapshot {
         if let Some(error) = &self.disk_error {
             return Err(error.clone());
         }
-        let mount = self.disk_mount.as_ref().ok_or("disk filesystem was not observed")?;
+        let mount = self
+            .disk_mount
+            .as_ref()
+            .ok_or("disk filesystem was not observed")?;
         mount.validate_capacity()?;
         self.disk
             .as_ref()
@@ -1018,7 +1021,10 @@ mod tests {
         snapshot.mark_census_incomplete();
         assert!(snapshot.process_count.is_none());
         assert!(snapshot.warnings[0].starts_with("process_count_unavailable"));
-        assert_eq!(GoalResourceSnapshot::collect(&goal, &[]).process_count, Some(0));
+        assert_eq!(
+            GoalResourceSnapshot::collect(&goal, &[]).process_count,
+            Some(0)
+        );
 
         let unrelated = super::super::goal_parser::parse_goal("free 20% CPU").unwrap();
         assert!(GoalResourceSnapshot::collect(&unrelated, &population)

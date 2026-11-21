@@ -642,15 +642,10 @@ mod tests {
             ..EscalationConfig::default()
         };
         let mut state = EscalationState::new();
-        state.last_escalation_at =
-            Some((Utc::now() - Duration::seconds(301)).to_rfc3339());
+        state.last_escalation_at = Some((Utc::now() - Duration::seconds(301)).to_rfc3339());
         assert_eq!(check_cooldown(&config, &state), None);
-        state.last_escalation_at =
-            Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        assert_eq!(
-            check_cooldown(&config, &state),
-            Some(DeferReason::Cooldown)
-        );
+        state.last_escalation_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        assert_eq!(check_cooldown(&config, &state), Some(DeferReason::Cooldown));
         let zero = EscalationConfig {
             min_interval_secs: 0,
             ..config

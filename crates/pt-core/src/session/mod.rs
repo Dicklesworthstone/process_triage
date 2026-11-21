@@ -528,7 +528,10 @@ impl SessionStore {
                         source,
                     })?;
                 if !metadata.is_dir() {
-                    return Err(history_data_error(path, "expected a real session directory"));
+                    return Err(history_data_error(
+                        path,
+                        "expected a real session directory",
+                    ));
                 }
             }
             let path = dir.join(MANIFEST_FILE);
@@ -544,26 +547,25 @@ impl SessionStore {
             {
                 return Err(history_data_error(&path, "session manifest exceeds 1 MiB"));
             }
-            let manifest: SessionManifest = serde_json::from_reader(std::io::Read::take(
-                file,
-                MAX_HISTORY_RECORD_BYTES,
-            ))
-            .map_err(|source| SessionError::Json {
-                path: path.clone(),
-                source,
-            })?;
+            let manifest: SessionManifest =
+                serde_json::from_reader(std::io::Read::take(file, MAX_HISTORY_RECORD_BYTES))
+                    .map_err(|source| SessionError::Json {
+                        path: path.clone(),
+                        source,
+                    })?;
             if manifest.session_id != id.0 {
                 return Err(history_data_error(
                     &path,
                     "manifest session identity differs",
                 ));
             }
-            let created_at = DateTime::parse_from_rfc3339(&manifest.timing.created_at).map_err(
-                |error| history_data_error(&path, &format!("invalid creation time: {error}")),
-            )?;
+            let created_at =
+                DateTime::parse_from_rfc3339(&manifest.timing.created_at).map_err(|error| {
+                    history_data_error(&path, &format!("invalid creation time: {error}"))
+                })?;
             ordered.push((created_at, id));
         }
-        ordered.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.0.cmp(&b.1.0)));
+        ordered.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1 .0.cmp(&b.1 .0)));
 
         let mut history = ActionHistory::default();
         let mut retained_bytes = 0;
@@ -1926,9 +1928,7 @@ mod tests {
     fn action_history_byte_budget_keeps_the_latest_complete_attempts() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("outcomes.jsonl");
-        let row = |pid| {
-            format!("{{\"action_id\":\"a\",\"pid\":{pid},\"status\":\"failed\"}}\n")
-        };
+        let row = |pid| format!("{{\"action_id\":\"a\",\"pid\":{pid},\"status\":\"failed\"}}\n");
         let first = row(1);
         std::fs::write(&path, format!("{}{}{}", first, row(2), row(3))).unwrap();
         let id = SessionId::new();

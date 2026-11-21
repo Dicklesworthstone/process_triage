@@ -96,10 +96,7 @@ mod replay_recording {
         }
     }
 
-    fn assert_complete_scoring_census(
-        output: &serde_json::Value,
-        inventory: &serde_json::Value,
-    ) {
+    fn assert_complete_scoring_census(output: &serde_json::Value, inventory: &serde_json::Value) {
         assert!(output["schema_version"].is_string(), "{output}");
         assert_eq!(output["command"], "scan replay-scores");
         let replay = &output["replay"];
@@ -109,12 +106,21 @@ mod replay_recording {
             "current_configuration_and_current_learned_verdict_decay"
         );
         assert_eq!(replay["requested_window_ms"], 0);
-        assert!(replay["limitations"].as_array().is_some_and(|items| !items.is_empty()));
+        assert!(replay["limitations"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()));
 
         let expected = inventory.as_array().expect("recorded scan census");
         let rows = replay["processes"].as_array().expect("scoring census");
-        assert_eq!(replay["population_size"].as_u64(), Some(expected.len() as u64));
-        assert_eq!(rows.len(), expected.len(), "no protected or unavailable row is dropped");
+        assert_eq!(
+            replay["population_size"].as_u64(),
+            Some(expected.len() as u64)
+        );
+        assert_eq!(
+            rows.len(),
+            expected.len(),
+            "no protected or unavailable row is dropped"
+        );
         let mut counted = 0;
         for (status, counter) in [
             ("scored", "scored_count"),
@@ -123,7 +129,11 @@ mod replay_recording {
             ("unavailable", "unavailable_count"),
         ] {
             let actual = rows.iter().filter(|row| row["status"] == status).count() as u64;
-            assert_eq!(replay[counter].as_u64(), Some(actual), "{counter}: {replay}");
+            assert_eq!(
+                replay[counter].as_u64(),
+                Some(actual),
+                "{counter}: {replay}"
+            );
             counted += actual;
         }
         assert_eq!(counted, expected.len() as u64);
@@ -288,7 +298,11 @@ mod replay_recording {
         let pid = target.0.id();
         let path = case.root.join("owned-process.json");
         let captured = case.record(&path);
-        assert!(target.0.try_wait().expect("target alive during capture").is_none());
+        assert!(target
+            .0
+            .try_wait()
+            .expect("target alive during capture")
+            .is_none());
         let original = std::fs::read(&path).expect("retained capture bytes");
         let inventory = &captured["scan"]["processes"];
         let recorded = inventory
@@ -298,9 +312,8 @@ mod replay_recording {
             .find(|process| process["pid"].as_u64() == Some(u64::from(pid)))
             .expect("live owned target was captured");
 
-        let before: serde_json::Value =
-            serde_json::from_slice(&case.replay(&path, "json").stdout)
-                .expect("scoring replay JSON");
+        let before: serde_json::Value = serde_json::from_slice(&case.replay(&path, "json").stdout)
+            .expect("scoring replay JSON");
         assert_complete_scoring_census(&before, inventory);
         let before_row = before["replay"]["processes"]
             .as_array()
@@ -310,29 +323,34 @@ mod replay_recording {
             .unwrap();
         assert_eq!(before_row["status"], "scored", "{before_row}");
         assert_eq!(before_row["start_id"], recorded["start_id"]);
-        assert!(target.0.try_wait().expect("scoring never signals targets").is_none());
+        assert!(target
+            .0
+            .try_wait()
+            .expect("scoring never signals targets")
+            .is_none());
 
         target.0.kill().expect("end only the owned source process");
         target.0.wait().expect("reap owned source process");
         // A new live process is unrelated to the recorded denominator. It also
         // detects an accidental action side effect while replaying stale PIDs.
         let mut sentinel = ChildGuard::spawn();
-        let after: serde_json::Value =
-            serde_json::from_slice(&case.replay(&path, "json").stdout)
-                .expect("offline scoring JSON");
+        let after: serde_json::Value = serde_json::from_slice(&case.replay(&path, "json").stdout)
+            .expect("offline scoring JSON");
         assert_complete_scoring_census(&after, inventory);
         assert_eq!(
-            after["replay"]["processes"],
-            before["replay"]["processes"],
+            after["replay"]["processes"], before["replay"]["processes"],
             "live process exit must not change a recorded scoring input"
         );
-        assert!(sentinel.0.try_wait().expect("sentinel survives replay").is_none());
+        assert!(sentinel
+            .0
+            .try_wait()
+            .expect("sentinel survives replay")
+            .is_none());
 
         policy.guardrails.min_process_age_seconds = u64::MAX;
         case.write_policy(&policy);
-        let current: serde_json::Value =
-            serde_json::from_slice(&case.replay(&path, "json").stdout)
-                .expect("current-policy replay");
+        let current: serde_json::Value = serde_json::from_slice(&case.replay(&path, "json").stdout)
+            .expect("current-policy replay");
         assert_complete_scoring_census(&current, inventory);
         let current_row = current["replay"]["processes"]
             .as_array()
@@ -344,7 +362,11 @@ mod replay_recording {
         assert_eq!(current_row["start_id"], recorded["start_id"]);
         assert!(current_row["posterior"].is_null());
         assert!(current_row["ledger"].is_null());
-        assert!(sentinel.0.try_wait().expect("policy replay is read-only").is_none());
+        assert!(sentinel
+            .0
+            .try_wait()
+            .expect("policy replay is read-only")
+            .is_none());
         assert_eq!(std::fs::read(&path).unwrap(), original);
     }
 
@@ -356,7 +378,10 @@ mod replay_recording {
         let original = std::fs::read(&path).expect("captured bytes");
         let output = case.replay(&path, "jsonl");
         let text = String::from_utf8(output.stdout).expect("JSONL UTF-8");
-        let lines: Vec<_> = text.lines().filter(|line| !line.trim().is_empty()).collect();
+        let lines: Vec<_> = text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
         assert_eq!(lines.len(), 1, "JSONL emits one complete record: {text}");
         let report: serde_json::Value = serde_json::from_str(lines[0]).expect("one JSONL record");
         assert_complete_scoring_census(&report, &captured["scan"]["processes"]);
@@ -364,7 +389,11 @@ mod replay_recording {
         let snapshot: serde_json::Value =
             serde_json::from_slice(&original).expect("capture document");
         let mut legacy = snapshot.clone();
-        assert!(legacy.as_object_mut().unwrap().remove("scoring_context").is_some());
+        assert!(legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("scoring_context")
+            .is_some());
         let legacy_path = case.root.join("inventory-only.json");
         std::fs::write(&legacy_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
         case.command()
@@ -431,13 +460,18 @@ mod replay_recording {
         let original = std::fs::read(&labels_path).expect("private review template");
         let labels: serde_json::Value =
             serde_json::from_slice(&original).expect("review template JSON");
-        let rows = labels["processes"].as_array().expect("complete review census");
+        let rows = labels["processes"]
+            .as_array()
+            .expect("complete review census");
         let inventory = captured["scan"]["processes"].as_array().unwrap();
         assert_eq!(rows.len(), inventory.len());
         assert_eq!(labels["host_id"], "owned-cli-fixture");
         assert_eq!(labels["split"], "holdout");
         for process in inventory {
-            let row = rows.iter().find(|row| row["pid"] == process["pid"]).unwrap();
+            let row = rows
+                .iter()
+                .find(|row| row["pid"] == process["pid"])
+                .unwrap();
             assert_eq!(row["start_id"], process["start_id"]);
             assert_eq!(row["uid"], process["uid"]);
             assert_eq!(row["cmd"], process["cmd"]);
@@ -449,7 +483,11 @@ mod replay_recording {
         {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(
-                std::fs::metadata(&labels_path).unwrap().permissions().mode() & 0o077,
+                std::fs::metadata(&labels_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o077,
                 0
             );
         }
@@ -470,7 +508,8 @@ mod replay_recording {
         let mut policy = pt_core::config::Policy::default();
         policy.guardrails.min_process_age_seconds = u64::MAX;
         case.write_policy(&policy);
-        let output = case.command()
+        let output = case
+            .command()
             .args(["replay", "evaluate", "--snapshot"])
             .arg(&snapshot_path)
             .arg("--labels")
@@ -484,7 +523,11 @@ mod replay_recording {
             .stdout
             .clone();
         let text = String::from_utf8(output).unwrap();
-        assert_eq!(text.lines().count(), 1, "comparison JSONL is one complete record");
+        assert_eq!(
+            text.lines().count(),
+            1,
+            "comparison JSONL is one complete record"
+        );
         let output: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(output["command"], "replay evaluate");
         let comparison = &output["comparison"];
@@ -530,7 +573,9 @@ mod replay_recording {
             .arg(&baseline_config)
             .assert()
             .failure()
-            .stderr(predicate::str::contains("baseline model could not be loaded completely"));
+            .stderr(predicate::str::contains(
+                "baseline model could not be loaded completely",
+            ));
         assert_eq!(std::fs::read(&signatures_path).unwrap(), corrupt_signatures);
         assert_eq!(std::fs::read(&labels_path).unwrap(), original);
     }
@@ -748,7 +793,14 @@ mod partial_deep_scan {
             vec!["--timeout", "0"],
         ] {
             let output = pt_core()
-                .args(["deep-scan", "--allow-partial", "--format", "json", "--pids", &pid])
+                .args([
+                    "deep-scan",
+                    "--allow-partial",
+                    "--format",
+                    "json",
+                    "--pids",
+                    &pid,
+                ])
                 .args(limits)
                 .timeout(Duration::from_secs(10))
                 .assert()
@@ -764,11 +816,9 @@ mod partial_deep_scan {
             assert_eq!(collection["timed_out"], true);
             assert_eq!(collection["budget_ms"], 0);
             assert_eq!(collection["processed_count"], 0);
-            assert!(
-                scan["metadata"]["warnings"]
-                    .as_array()
-                    .is_some_and(|warnings| !warnings.is_empty())
-            );
+            assert!(scan["metadata"]["warnings"]
+                .as_array()
+                .is_some_and(|warnings| !warnings.is_empty()));
         }
     }
 
@@ -816,7 +866,14 @@ mod partial_deep_scan {
     #[test]
     fn partial_jsonl_is_one_parseable_record_and_exitcode_is_quiet() {
         let output = pt_core()
-            .args(["deep-scan", "--allow-partial", "--budget", "0", "--format", "jsonl"])
+            .args([
+                "deep-scan",
+                "--allow-partial",
+                "--budget",
+                "0",
+                "--format",
+                "jsonl",
+            ])
             .timeout(Duration::from_secs(10))
             .assert()
             .code(22)
@@ -826,7 +883,10 @@ mod partial_deep_scan {
         let text = String::from_utf8(output).unwrap();
         assert_eq!(text.lines().count(), 1);
         let result: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(result["deep_scan"]["metadata"]["collection"]["timed_out"], true);
+        assert_eq!(
+            result["deep_scan"]["metadata"]["collection"]["timed_out"],
+            true
+        );
         let estimate = pt_core()
             .args([
                 "deep-scan",
@@ -850,7 +910,14 @@ mod partial_deep_scan {
         assert!(estimate.get("deep_scan").is_none());
 
         pt_core()
-            .args(["deep-scan", "--allow-partial", "--budget", "0", "--format", "exitcode"])
+            .args([
+                "deep-scan",
+                "--allow-partial",
+                "--budget",
+                "0",
+                "--format",
+                "exitcode",
+            ])
             .timeout(Duration::from_secs(10))
             .assert()
             .code(22)

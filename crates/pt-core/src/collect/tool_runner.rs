@@ -599,10 +599,8 @@ impl ToolRunner {
             // Preparation consumed the reservation even though no tool started.
             // Refunding here makes repeated pre-spawn timeouts free forever.
             let charged_ms = charged_budget_ms(start.elapsed());
-            self.used_ms.fetch_add(
-                charged_ms.saturating_sub(allocated_ms),
-                Ordering::SeqCst,
-            );
+            self.used_ms
+                .fetch_add(charged_ms.saturating_sub(allocated_ms), Ordering::SeqCst);
             return Err(ToolError::Timeout(timeout));
         }
 
@@ -1284,7 +1282,10 @@ mod tests {
     fn pre_spawn_timeout_consumes_budget_without_starting_the_command() {
         let directory = tempfile::tempdir().unwrap();
         let marker = directory.path().join("started");
-        let runner = ToolRunnerBuilder::new().use_nice(false).budget_ms(1).build();
+        let runner = ToolRunnerBuilder::new()
+            .use_nice(false)
+            .budget_ms(1)
+            .build();
         let spec = ToolSpec::new(
             "sh",
             vec![
@@ -1300,8 +1301,10 @@ mod tests {
         assert!(!marker.exists(), "an expired deadline must prevent launch");
         assert!(runner.used_budget_ms() >= 1);
         assert_eq!(runner.remaining_budget_ms(), 0);
-        assert!(matches!(runner.run(&spec), Err(ToolError::BudgetExhausted { .. })),
-            "repeated preparation timeouts must not bypass cumulative budgeting");
+        assert!(
+            matches!(runner.run(&spec), Err(ToolError::BudgetExhausted { .. })),
+            "repeated preparation timeouts must not bypass cumulative budgeting"
+        );
         assert!(!marker.exists());
     }
 
@@ -1371,16 +1374,19 @@ mod tests {
             marker.to_str().expect("fixture marker is UTF-8"),
         );
         let runner = test_runner();
-        let mut worker = ToolChildGuard(Some(
-            runner
-                .build_command(&spec)
-                .expect("build owned worker")
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("start owned worker"),
-        ), false);
+        let mut worker = ToolChildGuard(
+            Some(
+                runner
+                    .build_command(&spec)
+                    .expect("build owned worker")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("start owned worker"),
+            ),
+            false,
+        );
 
         let started = Instant::now();
         let helper_pid: u32 = loop {
@@ -1459,24 +1465,30 @@ mod tests {
 
         let (reader, writer) = UnixStream::pair().expect("output pair");
         let holder_writer = writer.try_clone().expect("holder output");
-        let mut holder = ToolChildGuard(Some(
-            Command::new("sleep")
-                .arg("30")
-                .stdin(Stdio::null())
-                .stdout(Stdio::from(OwnedFd::from(holder_writer)))
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("owned output holder"),
-        ), false);
-        let mut tool = ToolChildGuard(Some(
-            Command::new("sh")
-                .args(["-c", "exit 0"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::from(OwnedFd::from(writer)))
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("owned exiting tool"),
-        ), false);
+        let mut holder = ToolChildGuard(
+            Some(
+                Command::new("sleep")
+                    .arg("30")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::from(OwnedFd::from(holder_writer)))
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .expect("owned output holder"),
+            ),
+            false,
+        );
+        let mut tool = ToolChildGuard(
+            Some(
+                Command::new("sh")
+                    .args(["-c", "exit 0"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::from(OwnedFd::from(writer)))
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("owned exiting tool"),
+            ),
+            false,
+        );
         let child = tool.0.as_mut().unwrap();
         child.stdout = Some(std::process::ChildStdout::from(OwnedFd::from(reader)));
         let fixture_start = Instant::now();
@@ -1490,7 +1502,15 @@ mod tests {
         }
         let started = Instant::now();
         let (_, _, code, truncated, timed_out) = test_runner()
-            .execute_with_timeout(child, started, Duration::from_millis(100), 1024, None, false, None)
+            .execute_with_timeout(
+                child,
+                started,
+                Duration::from_millis(100),
+                1024,
+                None,
+                false,
+                None,
+            )
             .expect("bounded inherited output");
         assert_eq!(code, Some(0));
         assert!(timed_out);
@@ -1511,33 +1531,50 @@ mod tests {
         // A successful leader exit must not release its PID before group cleanup.
         for (script, expect_timeout) in [
             ("sleep 30 & printf '%s\\n' \"$!\"; exit 0", true),
-            ("sleep 30 >/dev/null 2>&1 & printf '%s\\n' \"$!\"; exit 0", false),
+            (
+                "sleep 30 >/dev/null 2>&1 & printf '%s\\n' \"$!\"; exit 0",
+                false,
+            ),
         ] {
-            let output = test_runner().run(
-                &ToolSpec::new("sh", vec!["-c".into(), script.into()])
-                    .with_process_group()
-                    .with_timeout(Duration::from_millis(750)),
-            ).unwrap();
+            let output = test_runner()
+                .run(
+                    &ToolSpec::new("sh", vec!["-c".into(), script.into()])
+                        .with_process_group()
+                        .with_timeout(Duration::from_millis(750)),
+                )
+                .unwrap();
             assert_eq!(output.timed_out, expect_timeout, "{output:?}");
-            assert_eq!(output.exit_code, Some(0), "leader exit was observed without reaping");
+            assert_eq!(
+                output.exit_code,
+                Some(0),
+                "leader exit was observed without reaping"
+            );
             let descendant: u32 = output.stdout_str().trim().parse().unwrap();
             let cleanup_start = Instant::now();
             loop {
                 #[cfg(target_os = "linux")]
                 let state = std::fs::read_to_string(format!("/proc/{descendant}/stat"))
-                    .ok().and_then(|stat| stat.rsplit_once(") ").and_then(|(_, rest)| rest.chars().next()));
+                    .ok()
+                    .and_then(|stat| {
+                        stat.rsplit_once(") ")
+                            .and_then(|(_, rest)| rest.chars().next())
+                    });
                 #[cfg(target_os = "macos")]
                 let state =
                     crate::collect::macos::read_session_stat(descendant).map(|stat| stat.state);
                 if matches!(state, None | Some('Z') | Some('X')) {
                     break;
                 }
-                assert!(cleanup_start.elapsed() < Duration::from_secs(3),
-                    "worker descendant {descendant} survived cancellation in state {state:?}");
+                assert!(
+                    cleanup_start.elapsed() < Duration::from_secs(3),
+                    "worker descendant {descendant} survived cancellation in state {state:?}"
+                );
                 thread::sleep(Duration::from_millis(5));
             }
-            assert!(unrelated.0.as_mut().unwrap().try_wait().unwrap().is_none(),
-                "group cancellation must leave the caller's other children alive");
+            assert!(
+                unrelated.0.as_mut().unwrap().try_wait().unwrap().is_none(),
+                "group cancellation must leave the caller's other children alive"
+            );
         }
     }
 
@@ -1547,16 +1584,26 @@ mod tests {
         let mut observed = Vec::new();
         let mut handler = |bytes: &[u8]| {
             observed.extend_from_slice(bytes);
-            Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid worker protocol"))
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid worker protocol",
+            ))
         };
         let started = Instant::now();
-        let error = test_runner().run_with_stdout_handler(
-            &ToolSpec::new("sh", vec!["-c".into(), "printf 'bad-message\\n'; exec sleep 30".into()])
+        let error = test_runner()
+            .run_with_stdout_handler(
+                &ToolSpec::new(
+                    "sh",
+                    vec!["-c".into(), "printf 'bad-message\\n'; exec sleep 30".into()],
+                )
                 .with_process_group()
                 .with_timeout(Duration::from_secs(10)),
-            Some(&mut handler),
-        ).unwrap_err();
-        assert!(matches!(error, ToolError::Io(ref error) if error.kind() == std::io::ErrorKind::InvalidData));
+                Some(&mut handler),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error, ToolError::Io(ref error) if error.kind() == std::io::ErrorKind::InvalidData)
+        );
         assert_eq!(observed, b"bad-message\n");
         assert!(started.elapsed() < Duration::from_secs(5));
     }

@@ -421,17 +421,18 @@ mod tests {
             ("CI", "true"),
             ("TMUX", "/tmp/tmux-1000/default,42,0"),
         ] {
-            let environment = std::collections::HashMap::from([(
-                name.to_string(),
-                value.to_string(),
-            )]);
+            let environment =
+                std::collections::HashMap::from([(name.to_string(), value.to_string())]);
             let mut result = combined_orchestrator();
             result.environ = Some(EnvironAnalyzer::new().analyze_env(&environment));
             assert!(
                 is_human_supervised(&result),
                 "independent {name} evidence cannot be canceled: {result:?}"
             );
-            assert_eq!(result.supervisor_type, Some(SupervisorCategory::Orchestrator));
+            assert_eq!(
+                result.supervisor_type,
+                Some(SupervisorCategory::Orchestrator)
+            );
             assert_eq!(result.confidence, 0.95);
         }
     }
@@ -453,7 +454,10 @@ mod tests {
             result.ipc.as_ref().unwrap().category,
             Some(SupervisorCategory::Orchestrator)
         );
-        assert_eq!(result.supervisor_type, Some(SupervisorCategory::Orchestrator));
+        assert_eq!(
+            result.supervisor_type,
+            Some(SupervisorCategory::Orchestrator)
+        );
     }
 
     #[test]

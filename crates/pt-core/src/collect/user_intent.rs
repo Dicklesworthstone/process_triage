@@ -1175,8 +1175,7 @@ mod tests {
                 fs::File::open(path)
                     .unwrap()
                     .set_times(
-                        fs::FileTimes::new()
-                            .set_modified(self.now - Duration::from_secs(seconds)),
+                        fs::FileTimes::new().set_modified(self.now - Duration::from_secs(seconds)),
                     )
                     .unwrap();
             }

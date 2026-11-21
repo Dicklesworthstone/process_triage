@@ -387,8 +387,7 @@ impl CommandNormalizer {
         let skip = Self::command_word_count(process_name, &args);
         let args_to_process = &args[skip..];
         let inline_index = Self::inline_program_index(process_name, args_to_process);
-        let inline_program =
-            inline_index.and_then(|_| Self::argument_suffix(cmdline, &args, skip));
+        let inline_program = inline_index.and_then(|_| Self::argument_suffix(cmdline, &args, skip));
         let ordinary_args = &args_to_process[..inline_index.unwrap_or(args_to_process.len())];
 
         let mut candidates = Vec::new();

@@ -694,7 +694,10 @@ mod tests {
             ("TMUX", "/tmp/tmux-1000/default,42,0"),
         ] {
             let env = HashMap::from([
-                ("XPC_SERVICE_NAME".to_string(), "com.example.service".to_string()),
+                (
+                    "XPC_SERVICE_NAME".to_string(),
+                    "com.example.service".to_string(),
+                ),
                 (name.to_string(), value.to_string()),
             ]);
             let result = analyzer.analyze_env(&env);

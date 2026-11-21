@@ -918,7 +918,11 @@ fn query_actions_preserves_attempts_details_order_and_session_filter() {
         }
         let old_record = serde_json::json!({"action_id":"old", "pid":42, "status":"failed", "error":"permission denied"});
         fs::write(
-            store.open(&older).unwrap().dir.join("action/outcomes.jsonl"),
+            store
+                .open(&older)
+                .unwrap()
+                .dir
+                .join("action/outcomes.jsonl"),
             format!("{old_record}\n"),
         )
         .unwrap();
@@ -927,8 +931,15 @@ fn query_actions_preserves_attempts_details_order_and_session_filter() {
             serde_json::json!({"action_id":"same", "pid":99, "action":"kill", "status":"success", "executed_at":"2026-01-01T00:10:00Z"}),
             serde_json::json!({"action_id":"same", "pid":99, "status":"already_completed"}),
         ];
-        let journal = attempts.iter().map(|v| format!("{v}\n")).collect::<String>();
-        let path = store.open(&newer).unwrap().dir.join("action/outcomes.jsonl");
+        let journal = attempts
+            .iter()
+            .map(|v| format!("{v}\n"))
+            .collect::<String>();
+        let path = store
+            .open(&newer)
+            .unwrap()
+            .dir
+            .join("action/outcomes.jsonl");
         fs::write(&path, &journal).unwrap();
 
         let output = pt_core_fast()
@@ -961,7 +972,12 @@ fn query_actions_preserves_attempts_details_order_and_session_filter() {
 
         let output = pt_core_fast()
             .args([
-                "--format", "jsonl", "query", "actions", "--session", &newer.0,
+                "--format",
+                "jsonl",
+                "query",
+                "actions",
+                "--session",
+                &newer.0,
             ])
             .assert()
             .success()

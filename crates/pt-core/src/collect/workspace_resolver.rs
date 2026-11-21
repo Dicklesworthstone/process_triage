@@ -140,7 +140,10 @@ pub fn find_repo_root(start: &Path) -> (Option<RawPathEvidence>, Option<RawPathE
                 // A broken nearest checkout is still a boundary. Returning
                 // unresolved evidence avoids attributing an enclosing repo.
                 return (
-                    Some(RawPathEvidence::unresolved(current.to_string_lossy(), error)),
+                    Some(RawPathEvidence::unresolved(
+                        current.to_string_lossy(),
+                        error,
+                    )),
                     None,
                 );
             }

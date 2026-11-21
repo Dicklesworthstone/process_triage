@@ -736,9 +736,9 @@ fn read_user_memory_config(root: &Path, unit: &str, defaults_only: bool) -> User
                             by_name.entry(name).or_insert_with(|| entry.path());
                         }
                         Some(_) => {}
-                        None => result.unavailable.push(format!(
-                            "/{rel}: a drop-in filename is not valid UTF-8"
-                        )),
+                        None => result
+                            .unavailable
+                            .push(format!("/{rel}: a drop-in filename is not valid UTF-8")),
                     }
                 }
                 Err(error) => result.unavailable.push(format!("/{rel}: {error}")),
@@ -1289,7 +1289,11 @@ fn check_negated_limits(id: &'static str, config: &UserMemoryConfig, out: &mut V
             .iter()
             .find(|(_, value)| finite_memory_limit(value) == Some(true))
         {
-            let scope = if config.defaults_only { " defaults" } else { "" };
+            let scope = if config.defaults_only {
+                " defaults"
+            } else {
+                ""
+            };
             out.push(
                 finding(
                     id,
@@ -2299,16 +2303,15 @@ mod tests {
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].level, Level::Crit);
         assert!(failures[0].summary.starts_with("user-1000.slice:"));
-        assert_eq!(
-            failures[0].commands,
-            vec!["systemctl cat user-1000.slice"]
-        );
+        assert_eq!(failures[0].commands, vec!["systemctl cat user-1000.slice"]);
         let affected = user_memory(&report, "user-1000.slice");
         assert!(!affected.defaults_only);
         assert_eq!(affected.memory_max.as_deref(), Some("infinity"));
         assert_eq!(affected.memory_high.as_deref(), Some("70%"));
         assert_eq!(
-            user_memory(&report, "user-1001.slice").memory_max.as_deref(),
+            user_memory(&report, "user-1001.slice")
+                .memory_max
+                .as_deref(),
             Some("60%")
         );
         assert_eq!(report.facts.user_memory.len(), 4);
@@ -2367,7 +2370,9 @@ mod tests {
         let report = root.report();
         assert!(find(&report, "oomd.user_slice_limits").is_none());
         assert_eq!(
-            user_memory(&report, "user-1000.slice").memory_max.as_deref(),
+            user_memory(&report, "user-1000.slice")
+                .memory_max
+                .as_deref(),
             Some("60%")
         );
     }
@@ -2540,7 +2545,10 @@ mod tests {
         let report = root.report();
         let config = user_memory(&report, "user@1000.service");
         assert!(config.memory_max.is_none());
-        assert!(config.unavailable.iter().any(|reason| reason.contains("alias")));
+        assert!(config
+            .unavailable
+            .iter()
+            .any(|reason| reason.contains("alias")));
         assert_eq!(
             find(&report, "oomd.user_manager_limits").unwrap().level,
             Level::Info

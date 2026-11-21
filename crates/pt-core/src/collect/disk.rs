@@ -202,10 +202,16 @@ impl DiskResourceSnapshot {
         let matches: Vec<_> = self
             .processes
             .iter()
-            .filter(|process| process.identity.matches(identity)
-                && process.identity.can_safely_revalidate()
-                && identity.pgid.is_none_or(|pgid| process.identity.pgid == Some(pgid))
-                && identity.sid.is_none_or(|sid| process.identity.sid == Some(sid)))
+            .filter(|process| {
+                process.identity.matches(identity)
+                    && process.identity.can_safely_revalidate()
+                    && identity
+                        .pgid
+                        .is_none_or(|pgid| process.identity.pgid == Some(pgid))
+                    && identity
+                        .sid
+                        .is_none_or(|sid| process.identity.sid == Some(sid))
+            })
             .collect();
         if matches.len() != 1 || !matches[0].complete {
             return Err("disk_process_ownership_unavailable".into());
@@ -344,7 +350,10 @@ mod linux {
                 filesystem_type: mount.filesystem_type.clone(),
                 mount_root_sha256: digest([mount.root.as_bytes()]),
                 mount_source_sha256: digest([mount.source.as_bytes()]),
-                mount_options_sha256: digest([mount.mount_options.as_bytes(), mount.super_options.as_bytes()]),
+                mount_options_sha256: digest([
+                    mount.mount_options.as_bytes(),
+                    mount.super_options.as_bytes(),
+                ]),
             }
         }
 
@@ -605,8 +614,11 @@ mod linux {
             let sid = fields[3]
                 .parse::<u32>()
                 .map_err(|_| "disk_process_stat_invalid")?;
-            let threads = fields[17].parse::<usize>()
-                .ok().filter(|threads| *threads > 0).ok_or("disk_task_count_invalid")?;
+            let threads = fields[17]
+                .parse::<usize>()
+                .ok()
+                .filter(|threads| *threads > 0)
+                .ok_or("disk_task_count_invalid")?;
             let flags = fields[6]
                 .parse::<u64>()
                 .map_err(|_| "disk_process_stat_invalid")?;
@@ -810,15 +822,27 @@ mod linux {
         allocations: BTreeMap<FileKey, Allocation>,
     }
 
-    fn task_census(process: &PinnedProcess, deadline: Instant) -> Result<BTreeSet<u32>, &'static str> {
-        let entries = fs::read_dir(process.path("task")).map_err(|_| "disk_task_census_unavailable")?;
+    fn task_census(
+        process: &PinnedProcess,
+        deadline: Instant,
+    ) -> Result<BTreeSet<u32>, &'static str> {
+        let entries =
+            fs::read_dir(process.path("task")).map_err(|_| "disk_task_census_unavailable")?;
         let mut tasks = BTreeSet::new();
         for entry in entries {
-            if tasks.len() >= MAX_TASKS { return Err("disk_task_count_limit"); }
-            if Instant::now() >= deadline { return Err("disk_collection_time_budget"); }
+            if tasks.len() >= MAX_TASKS {
+                return Err("disk_task_count_limit");
+            }
+            if Instant::now() >= deadline {
+                return Err("disk_collection_time_budget");
+            }
             let entry = entry.map_err(|_| "disk_task_census_incomplete")?;
-            let tid = entry.file_name().to_str().and_then(|value| value.parse::<u32>().ok())
-                .filter(|tid| *tid > 0).ok_or("disk_task_id_invalid")?;
+            let tid = entry
+                .file_name()
+                .to_str()
+                .and_then(|value| value.parse::<u32>().ok())
+                .filter(|tid| *tid > 0)
+                .ok_or("disk_task_id_invalid")?;
             tasks.insert(tid);
         }
         Ok(tasks)
@@ -833,7 +857,8 @@ mod linux {
         sample: &mut ProcessSample,
     ) -> Result<(), &'static str> {
         use std::os::unix::ffi::OsStrExt;
-        let entries = fs::read_dir(process.path("fd")).map_err(|_| "disk_descriptor_table_unavailable")?;
+        let entries =
+            fs::read_dir(process.path("fd")).map_err(|_| "disk_descriptor_table_unavailable")?;
         let mut task_fds = 0;
         // Keep the iterator alive while inspecting entries. The collector's
         // transient procfs handles are excluded by filesystem type.
@@ -841,41 +866,82 @@ mod linux {
             if task_fds >= MAX_FDS || *total_fds >= MAX_TOTAL_FDS {
                 return Err("disk_descriptor_count_limit");
             }
-            if Instant::now() >= deadline { return Err("disk_collection_time_budget"); }
+            if Instant::now() >= deadline {
+                return Err("disk_collection_time_budget");
+            }
             let entry = entry.map_err(|_| "disk_descriptor_table_incomplete")?;
-            let fd = entry.file_name().to_str().and_then(|name| name.parse::<u32>().ok())
+            let fd = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
                 .ok_or("disk_descriptor_name_invalid")?;
             task_fds += 1;
             *total_fds += 1;
             // Retain the leader count for conventional per-process FD displays;
             // every task's table still participates in ownership and budgets.
-            if task_id == sample.state.identity.pid.0 { sample.fd_count += 1; }
-            let target = fs::read_link(entry.path()).map_err(|_| "disk_descriptor_link_unavailable")?;
+            if task_id == sample.state.identity.pid.0 {
+                sample.fd_count += 1;
+            }
+            let target =
+                fs::read_link(entry.path()).map_err(|_| "disk_descriptor_link_unavailable")?;
             let target = target.as_os_str().as_bytes();
-            if !target.starts_with(b"/") || target.starts_with(b"/memfd:") { continue; }
-            let (mount_id, inode, flags) = descriptor_info(&process.read(&format!("fdinfo/{fd}"), MAX_FIELD)?)?;
-            let mount = context.mounts.get(&mount_id).ok_or("disk_descriptor_mount_outside_scope")?;
-            if !supported_disk(&mount.filesystem_type) { continue; }
-            sample.descriptors.insert(Descriptor { task_id, fd, mount_id, inode, flags, link_sha256: digest([target]) });
-            if !target.ends_with(b" (deleted)") { continue; }
-            let handle = OpenOptions::new().read(true).custom_flags(libc::O_PATH | libc::O_CLOEXEC)
-                .open(entry.path()).map_err(|_| "disk_file_handle_unavailable")?;
-            let expected = FileKey { major: mount.device_major, minor: mount.device_minor, inode };
+            if !target.starts_with(b"/") || target.starts_with(b"/memfd:") {
+                continue;
+            }
+            let (mount_id, inode, flags) =
+                descriptor_info(&process.read(&format!("fdinfo/{fd}"), MAX_FIELD)?)?;
+            let mount = context
+                .mounts
+                .get(&mount_id)
+                .ok_or("disk_descriptor_mount_outside_scope")?;
+            if !supported_disk(&mount.filesystem_type) {
+                continue;
+            }
+            sample.descriptors.insert(Descriptor {
+                task_id,
+                fd,
+                mount_id,
+                inode,
+                flags,
+                link_sha256: digest([target]),
+            });
+            if !target.ends_with(b" (deleted)") {
+                continue;
+            }
+            let handle = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+                .open(entry.path())
+                .map_err(|_| "disk_file_handle_unavailable")?;
+            let expected = FileKey {
+                major: mount.device_major,
+                minor: mount.device_minor,
+                inode,
+            };
             if let Some(observed) = allocation_from_handle(context, &handle, &expected, target)? {
-                if sample.allocations.len() >= MAX_FILES && !sample.allocations.contains_key(&expected) {
+                if sample.allocations.len() >= MAX_FILES
+                    && !sample.allocations.contains_key(&expected)
+                {
                     return Err("disk_file_count_limit");
                 }
                 if let Some(previous) = sample.allocations.get_mut(&expected) {
-                    if previous.key != observed.key || previous.bytes != observed.bytes || previous.logical != observed.logical {
+                    if previous.key != observed.key
+                        || previous.bytes != observed.bytes
+                        || previous.logical != observed.logical
+                    {
                         return Err("disk_file_allocation_changed");
                     }
                     previous.unnamed_temporary |= observed.unnamed_temporary;
-                    if observed.path_sha256 < previous.path_sha256 { previous.path_sha256 = observed.path_sha256; }
+                    if observed.path_sha256 < previous.path_sha256 {
+                        previous.path_sha256 = observed.path_sha256;
+                    }
                 } else {
                     sample.allocations.insert(expected, observed);
                 }
             }
-            if descriptor_info(&process.read(&format!("fdinfo/{fd}"), MAX_FIELD)?)? != (mount_id, inode, flags) {
+            if descriptor_info(&process.read(&format!("fdinfo/{fd}"), MAX_FIELD)?)?
+                != (mount_id, inode, flags)
+            {
                 return Err("disk_descriptor_file_changed");
             }
         }
@@ -889,12 +955,18 @@ mod linux {
         deadline: Instant,
         total_fds: &mut usize,
     ) -> Result<ProcessSample, &'static str> {
-        if Instant::now() >= deadline { return Err("disk_collection_time_budget"); }
+        if Instant::now() >= deadline {
+            return Err("disk_collection_time_budget");
+        }
         let process = PinnedProcess::open(root, pid)?;
         let state = process.identity(pid, &context.boot)?;
         let mut sample = ProcessSample {
-            state, tasks: BTreeMap::new(), fd_count: 0, descriptors: BTreeSet::new(),
-            mappings: BTreeSet::new(), allocations: BTreeMap::new(),
+            state,
+            tasks: BTreeMap::new(),
+            fd_count: 0,
+            descriptors: BTreeSet::new(),
+            mappings: BTreeSet::new(),
+            allocations: BTreeMap::new(),
         };
         if sample.state.threads == 1 {
             inspect_descriptors(&process, pid, context, deadline, total_fds, &mut sample)?;
@@ -911,10 +983,14 @@ mod linux {
                     return Err("disk_task_identity_inconsistent");
                 }
                 inspect_descriptors(&task, tid, context, deadline, total_fds, &mut sample)?;
-                if task.identity(tid, &context.boot)? != before { return Err("disk_task_identity_changed"); }
+                if task.identity(tid, &context.boot)? != before {
+                    return Err("disk_task_identity_changed");
+                }
                 sample.tasks.insert(tid, before);
             }
-            if task_census(&process, deadline)? != tasks { return Err("disk_task_census_changed"); }
+            if task_census(&process, deadline)? != tasks {
+                return Err("disk_task_census_changed");
+            }
         }
         // Threads in a stable thread group share the mm. Per-task FD tables
         // may differ after unshare(CLONE_FILES), so all of those were inspected.
@@ -946,17 +1022,29 @@ mod linux {
     }
 
     fn unrestricted_procfs(context: &Context) -> bool {
-        let proc_mounts: Vec<_> = context.mounts.values()
-            .filter(|mount| mount.mount_point == "/proc").collect();
+        let proc_mounts: Vec<_> = context
+            .mounts
+            .values()
+            .filter(|mount| mount.mount_point == "/proc")
+            .collect();
         if proc_mounts.len() != 1 || proc_mounts[0].filesystem_type != "proc" {
             return false;
         }
         let mount = proc_mounts[0];
-        let split = |character: char| character == ',' || character.is_whitespace() || character == ';';
-        !mount.mount_options.split(split).chain(mount.super_options.split(split)).any(|option| {
-            option.strip_prefix("hidepid=").is_some_and(|value| !matches!(value, "0" | "off"))
-                || option.strip_prefix("subset=").is_some_and(|value| value != "all")
-        })
+        let split =
+            |character: char| character == ',' || character.is_whitespace() || character == ';';
+        !mount
+            .mount_options
+            .split(split)
+            .chain(mount.super_options.split(split))
+            .any(|option| {
+                option
+                    .strip_prefix("hidepid=")
+                    .is_some_and(|value| !matches!(value, "0" | "off"))
+                    || option
+                        .strip_prefix("subset=")
+                        .is_some_and(|value| value != "all")
+            })
     }
 
     fn mount_observations(
@@ -1088,11 +1176,17 @@ mod linux {
         let (samples, valid_processes) = process_samples;
         for (&pid, mappings) in measurements {
             for mapping in mappings {
-                let Some(file) = files.get_mut(&mapping.key) else { continue; };
+                let Some(file) = files.get_mut(&mapping.key) else {
+                    continue;
+                };
                 let result = if valid_processes.contains(&pid) && Instant::now() < deadline {
-                    samples.get(&pid).ok_or("disk_mapping_process_unavailable")
+                    samples
+                        .get(&pid)
+                        .ok_or("disk_mapping_process_unavailable")
                         .and_then(|sample| mapping_allocation(root, sample, mapping, context))
-                } else { Err("disk_mapping_revalidation_unavailable") };
+                } else {
+                    Err("disk_mapping_revalidation_unavailable")
+                };
                 match result {
                     Ok(Some(allocation)) => add_allocation(file, &allocation),
                     Ok(None) => {
@@ -1323,7 +1417,10 @@ mod linux {
                     match mapping_allocation(root, sample, mapping, &context) {
                         Ok(Some(allocation)) => {
                             add_allocation(&mut file, &allocation);
-                            mapping_measurements.entry(sample.state.identity.pid.0).or_default().push(mapping.clone());
+                            mapping_measurements
+                                .entry(sample.state.identity.pid.0)
+                                .or_default()
+                                .push(mapping.clone());
                         }
                         Ok(None) => file.unlinked = Some(false),
                         Err(reason) => snapshot.note(Some(sample.state.identity.pid.0), reason),
@@ -1363,8 +1460,15 @@ mod linux {
                 Err(reason) => snapshot.diagnostic(Some(pid), reason),
             }
         }
-        revalidate_mapping_allocations(root, &context, deadline, (&samples, &valid_processes),
-            &mapping_measurements, &mut files, &mut snapshot);
+        revalidate_mapping_allocations(
+            root,
+            &context,
+            deadline,
+            (&samples, &valid_processes),
+            &mapping_measurements,
+            &mut files,
+            &mut snapshot,
+        );
         if census(root).ok().as_ref() != Some(&pids) {
             snapshot.diagnostic(None, "disk_process_census_changed");
         }
@@ -1376,7 +1480,13 @@ mod linux {
         }) {
             snapshot.diagnostic(None, "disk_mount_namespace_changed");
         }
-        attach_holders(&mut snapshot, &samples, &mut files, &valid_processes, &incomplete_catalogs);
+        attach_holders(
+            &mut snapshot,
+            &samples,
+            &mut files,
+            &valid_processes,
+            &incomplete_catalogs,
+        );
         for file in files.values_mut() {
             file.holders.sort_by_key(|holder| holder.pid.0);
             file.holders_complete = snapshot.complete;
@@ -1391,19 +1501,35 @@ mod linux {
         use super::*;
 
         fn identity(pid: u32) -> ProcessIdentity {
-            ProcessIdentity::full(pid, StartId::from_linux("disk-test-boot", 10, pid), 1000, Some(500), Some(400), IdentityQuality::Full)
+            ProcessIdentity::full(
+                pid,
+                StartId::from_linux("disk-test-boot", 10, pid),
+                1000,
+                Some(500),
+                Some(400),
+                IdentityQuality::Full,
+            )
         }
 
         fn mount() -> DiskMountObservation {
             DiskMountObservation {
                 identity: DiskMountIdentity {
-                    boot_id: "disk-test-boot".into(), mount_namespace_device: 4,
-                    mount_namespace_inode: 5, mount_id: 6, device_major: 8, device_minor: 1,
-                    filesystem_type: "ext4".into(), mount_root_sha256: digest([b"/"]),
-                    mount_source_sha256: digest([b"device"]), mount_options_sha256: digest([b"rw"]),
+                    boot_id: "disk-test-boot".into(),
+                    mount_namespace_device: 4,
+                    mount_namespace_inode: 5,
+                    mount_id: 6,
+                    device_major: 8,
+                    device_minor: 1,
+                    filesystem_type: "ext4".into(),
+                    mount_root_sha256: digest([b"/"]),
+                    mount_source_sha256: digest([b"device"]),
+                    mount_options_sha256: digest([b"rw"]),
                 },
-                mount_point: "/private/test-volume".into(), total_bytes: Some(100_000),
-                free_bytes: Some(5000), available_bytes: Some(4000), ..Default::default()
+                mount_point: "/private/test-volume".into(),
+                total_bytes: Some(100_000),
+                free_bytes: Some(5000),
+                available_bytes: Some(4000),
+                ..Default::default()
             }
         }
 
@@ -1412,13 +1538,27 @@ mod linux {
             DiskResourceSnapshot {
                 complete: true,
                 files: vec![DeletedFileObservation {
-                    id: "file-one".into(), device_major: 8, device_minor: 1, inode: 17,
-                    allocated_bytes: Some(4096), logical_bytes: Some(1 << 30),
-                    unlinked: Some(true), holders: vec![identity(101)], mount_keys: vec![mount.identity.key()],
-                    allocation_stable: true, holders_complete: true, ..Default::default()
+                    id: "file-one".into(),
+                    device_major: 8,
+                    device_minor: 1,
+                    inode: 17,
+                    allocated_bytes: Some(4096),
+                    logical_bytes: Some(1 << 30),
+                    unlinked: Some(true),
+                    holders: vec![identity(101)],
+                    mount_keys: vec![mount.identity.key()],
+                    allocation_stable: true,
+                    holders_complete: true,
+                    ..Default::default()
                 }],
-                processes: vec![DiskProcessObservation { identity: identity(101), fd_count: 2, complete: true, file_ids: vec!["file-one".into()] }],
-                mounts: vec![mount], ..Default::default()
+                processes: vec![DiskProcessObservation {
+                    identity: identity(101),
+                    fd_count: 2,
+                    complete: true,
+                    file_ids: vec!["file-one".into()],
+                }],
+                mounts: vec![mount],
+                ..Default::default()
             }
         }
 
@@ -1431,11 +1571,21 @@ mod linux {
             let alias_key = alias.identity.key();
             snapshot.files[0].mount_keys.push(alias_key.clone());
             snapshot.mounts.push(alias);
-            assert_eq!(snapshot.exclusive_allocated_bytes(&identity(101), None), Ok(4096));
-            assert_eq!(snapshot.exclusive_allocated_bytes(&identity(101), Some(&alias_key)), Ok(4096));
-            assert!(snapshot.exclusive_allocated_bytes(&identity(101), Some("not-observed")).is_err());
+            assert_eq!(
+                snapshot.exclusive_allocated_bytes(&identity(101), None),
+                Ok(4096)
+            );
+            assert_eq!(
+                snapshot.exclusive_allocated_bytes(&identity(101), Some(&alias_key)),
+                Ok(4096)
+            );
+            assert!(snapshot
+                .exclusive_allocated_bytes(&identity(101), Some("not-observed"))
+                .is_err());
             snapshot.processes[0].file_ids.push("file-one".into());
-            assert!(snapshot.exclusive_allocated_bytes(&identity(101), None).is_err());
+            assert!(snapshot
+                .exclusive_allocated_bytes(&identity(101), None)
+                .is_err());
         }
 
         #[test]
@@ -1443,9 +1593,14 @@ mod linux {
             let mut snapshot = owned_snapshot();
             snapshot.files[0].holders.push(identity(102));
             snapshot.mark_census_incomplete();
-            assert_eq!(snapshot.exclusive_allocated_bytes(&identity(101), None), Ok(0));
+            assert_eq!(
+                snapshot.exclusive_allocated_bytes(&identity(101), None),
+                Ok(0)
+            );
             snapshot.processes[0].complete = false;
-            assert!(snapshot.exclusive_allocated_bytes(&identity(101), None).is_err());
+            assert!(snapshot
+                .exclusive_allocated_bytes(&identity(101), None)
+                .is_err());
         }
 
         #[test]
@@ -1460,7 +1615,12 @@ mod linux {
                     4 => snapshot.files[0].holders_complete = false,
                     _ => snapshot.processes[0].complete = false,
                 }
-                assert!(snapshot.exclusive_allocated_bytes(&identity(101), None).is_err(), "mode {mode}");
+                assert!(
+                    snapshot
+                        .exclusive_allocated_bytes(&identity(101), None)
+                        .is_err(),
+                    "mode {mode}"
+                );
             }
             let snapshot = owned_snapshot();
             for mode in 0..5 {
@@ -1485,11 +1645,14 @@ mod linux {
             let mut invalid = mount();
             invalid.available_bytes = Some(6000);
             assert!(invalid.validate_capacity().is_err());
-            invalid = mount(); invalid.total_bytes = None;
+            invalid = mount();
+            invalid.total_bytes = None;
             assert!(invalid.validate_capacity().is_err());
-            invalid = mount(); invalid.identity.mount_namespace_inode = 0;
+            invalid = mount();
+            invalid.identity.mount_namespace_inode = 0;
             assert!(invalid.validate_capacity().is_err());
-            invalid = mount(); invalid.identity.mount_options_sha256 = "invalid".into();
+            invalid = mount();
+            invalid.identity.mount_options_sha256 = "invalid".into();
             assert!(invalid.validate_capacity().is_err());
             let mut changed = mount().identity;
             let key = changed.key();
@@ -1501,8 +1664,16 @@ mod linux {
         fn mapping_parser_keeps_file_holders_without_requiring_descriptor_or_path_match() {
             let parsed = mappings(b"1000-2000 rw-s 00000000 08:01 17 /private/path with spaces (deleted)\n2000-3000 r--p 00001000 08:01 17 /different-open-name\n3000-4000 rw-p 00000000 00:00 0 [heap]\n").unwrap();
             assert_eq!(parsed.len(), 2);
-            assert!(parsed.iter().all(|mapping| mapping.key == FileKey { major: 8, minor: 1, inode: 17 }));
-            assert_eq!(parsed.iter().filter(|mapping| mapping.deleted_name).count(), 1);
+            assert!(parsed.iter().all(|mapping| mapping.key
+                == FileKey {
+                    major: 8,
+                    minor: 1,
+                    inode: 17
+                }));
+            assert_eq!(
+                parsed.iter().filter(|mapping| mapping.deleted_name).count(),
+                1
+            );
             assert!(mappings(b"1000-2000 rw-s 0 08:01 17 /x (deleted)").is_err());
             assert!(mappings(b"2000-1000 rw-s 0 08:01 17 /x\n").is_err());
             assert!(mappings(b"1000-2000 xxxx 0 08:01 17 /x\n").is_err());
@@ -1512,18 +1683,34 @@ mod linux {
 
         #[test]
         fn descriptor_parser_requires_unambiguous_mount_inode_and_flags() {
-            assert_eq!(descriptor_info(b"pos: 0\nflags: 0100002\nmnt_id: 6\nino: 17\n"), Ok((6, 17, 0o100002)));
-            for bad in [b"flags: 2\nino: 17\n".as_slice(), b"flags: 2\nmnt_id: 6\nino: 17\nino: 18\n", b"flags: 9\nmnt_id: 6\nino: 17\n", b"flags: 2\nmnt_id: 6\nino: 17"] {
+            assert_eq!(
+                descriptor_info(b"pos: 0\nflags: 0100002\nmnt_id: 6\nino: 17\n"),
+                Ok((6, 17, 0o100002))
+            );
+            for bad in [
+                b"flags: 2\nino: 17\n".as_slice(),
+                b"flags: 2\nmnt_id: 6\nino: 17\nino: 18\n",
+                b"flags: 9\nmnt_id: 6\nino: 17\n",
+                b"flags: 2\nmnt_id: 6\nino: 17",
+            ] {
                 assert!(descriptor_info(bad).is_err());
             }
         }
 
         fn persistent_directory() -> PathBuf {
-            let mut candidates = vec![std::env::current_dir().unwrap(), PathBuf::from("/tmp"), PathBuf::from("/var/tmp")];
+            let mut candidates = vec![
+                std::env::current_dir().unwrap(),
+                PathBuf::from("/tmp"),
+                PathBuf::from("/var/tmp"),
+            ];
             if Path::new(file!()).is_absolute() {
-                if let Some(parent) = Path::new(file!()).parent() { candidates.push(parent.to_path_buf()); }
+                if let Some(parent) = Path::new(file!()).parent() {
+                    candidates.push(parent.to_path_buf());
+                }
             }
-            candidates.into_iter().find(|directory| resolve_mount(directory.to_str()).is_ok())
+            candidates
+                .into_iter()
+                .find(|directory| resolve_mount(directory.to_str()).is_ok())
                 .expect("a local persistent filesystem is required for disk collection tests")
         }
 
@@ -1553,21 +1740,30 @@ mod linux {
             assert!(!encoded.contains("secret-file-name"));
             let restored: DiskResourceSnapshot = serde_json::from_str(&encoded).unwrap();
             assert_eq!(restored.files[0].allocated_bytes, None);
-            assert!(restored.exclusive_allocated_bytes(&identity(101), None).is_err());
+            assert!(restored
+                .exclusive_allocated_bytes(&identity(101), None)
+                .is_err());
         }
 
         fn allocated_unnamed_file() -> File {
             use std::io::Write;
             let context = Context::load().unwrap();
             let directory = persistent_directory();
-            let handle = context.resolve(directory.to_str(), Instant::now() + BUDGET).unwrap();
+            let handle = context
+                .resolve(directory.to_str(), Instant::now() + BUDGET)
+                .unwrap();
             // O_TMPFILE has link count zero from creation; no directory entry is
             // deleted. One MiB is allocated and the rest is deliberately sparse.
-            let mut file = OpenOptions::new().read(true).write(true)
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
                 .custom_flags(libc::O_TMPFILE | libc::O_CLOEXEC)
-                .open(procfs::directory_path(&handle, "")).unwrap();
+                .open(procfs::directory_path(&handle, ""))
+                .unwrap();
             let block = vec![0x5a; 65_536];
-            for _ in 0..16 { file.write_all(&block).unwrap(); }
+            for _ in 0..16 {
+                file.write_all(&block).unwrap();
+            }
             file.set_len(64 * 1024 * 1024).unwrap();
             file.sync_data().unwrap();
             assert_eq!(file.metadata().unwrap().nlink(), 0);
@@ -1603,29 +1799,52 @@ sys.stdin.readline()
 "#;
                 let fd = file.as_raw_fd();
                 let mut command = Command::new("python3");
-                command.args(["-c", SCRIPT, &fd.to_string(), if mapping_only { "mapping" } else { "descriptor" }])
-                    .env_clear().env("PATH", "/usr/bin:/bin")
-                    .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+                command
+                    .args([
+                        "-c",
+                        SCRIPT,
+                        &fd.to_string(),
+                        if mapping_only {
+                            "mapping"
+                        } else {
+                            "descriptor"
+                        },
+                    ])
+                    .env_clear()
+                    .env("PATH", "/usr/bin:/bin")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::inherit());
                 // SAFETY: only fcntl on the explicitly owned fixture descriptor
                 // runs after fork; it neither allocates nor touches other tasks.
                 unsafe {
                     command.pre_exec(move || {
                         let flags = libc::fcntl(fd, libc::F_GETFD);
-                        if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                        if flags < 0
+                            || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
+                        {
                             return Err(std::io::Error::last_os_error());
                         }
                         Ok(())
                     });
                 }
-                let mut fixture = Self { child: command.spawn().expect("spawn owned disk fixture"), reader: None };
+                let mut fixture = Self {
+                    child: command.spawn().expect("spawn owned disk fixture"),
+                    reader: None,
+                };
                 let output = fixture.child.stdout.take().unwrap();
                 let (sender, receiver) = std::sync::mpsc::channel();
                 fixture.reader = Some(std::thread::spawn(move || {
                     let mut line = String::new();
-                    let result = std::io::BufReader::new(output).read_line(&mut line).map(|_| line);
+                    let result = std::io::BufReader::new(output)
+                        .read_line(&mut line)
+                        .map(|_| line);
                     let _ = sender.send(result);
                 }));
-                let ready = receiver.recv_timeout(Duration::from_secs(5)).expect("bounded disk fixture readiness").unwrap();
+                let ready = receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("bounded disk fixture readiness")
+                    .unwrap();
                 assert_eq!(ready.trim(), "PT_DISK_READY");
                 fixture
             }
@@ -1636,9 +1855,14 @@ sys.stdin.readline()
                 // Only our still-owned child is stopped and reaped.
                 match self.child.try_wait() {
                     Ok(Some(_)) => {}
-                    _ => { let _ = self.child.kill(); let _ = self.child.wait(); }
+                    _ => {
+                        let _ = self.child.kill();
+                        let _ = self.child.wait();
+                    }
                 }
-                if let Some(reader) = self.reader.take() { let _ = reader.join(); }
+                if let Some(reader) = self.reader.take() {
+                    let _ = reader.join();
+                }
             }
         }
 
@@ -1654,25 +1878,63 @@ sys.stdin.readline()
             let mapping = LiveChild::spawn(&file, true);
             drop(file);
             let mut total_fds = 0;
-            let first = sample_process(Path::new("/proc"), descriptor.child.id(), &context, Instant::now() + BUDGET, &mut total_fds).unwrap();
-            let second = sample_process(Path::new("/proc"), mapping.child.id(), &context, Instant::now() + BUDGET, &mut total_fds).unwrap();
+            let first = sample_process(
+                Path::new("/proc"),
+                descriptor.child.id(),
+                &context,
+                Instant::now() + BUDGET,
+                &mut total_fds,
+            )
+            .unwrap();
+            let second = sample_process(
+                Path::new("/proc"),
+                mapping.child.id(),
+                &context,
+                Instant::now() + BUDGET,
+                &mut total_fds,
+            )
+            .unwrap();
             assert_eq!(first.allocations.get(&key).unwrap().bytes, expected);
-            assert!(!second.allocations.contains_key(&key), "mapping fixture must close every descriptor for the inode");
+            assert!(
+                !second.allocations.contains_key(&key),
+                "mapping fixture must close every descriptor for the inode"
+            );
             assert!(second.mappings.iter().any(|entry| entry.key == key));
             let first_identity = first.state.identity.clone();
-            let samples = BTreeMap::from([(first_identity.pid.0, first), (second.state.identity.pid.0, second)]);
+            let samples = BTreeMap::from([
+                (first_identity.pid.0, first),
+                (second.state.identity.pid.0, second),
+            ]);
             let mut files = BTreeMap::new();
             let mut observed = new_file(&context, &key);
-            add_allocation(&mut observed, samples[&first_identity.pid.0].allocations.get(&key).unwrap());
+            add_allocation(
+                &mut observed,
+                samples[&first_identity.pid.0]
+                    .allocations
+                    .get(&key)
+                    .unwrap(),
+            );
             files.insert(key, observed);
-            let mut snapshot = DiskResourceSnapshot { complete: false, ..Default::default() };
+            let mut snapshot = DiskResourceSnapshot {
+                complete: false,
+                ..Default::default()
+            };
             let valid = samples.keys().copied().collect();
-            attach_holders(&mut snapshot, &samples, &mut files, &valid, &BTreeSet::new());
+            attach_holders(
+                &mut snapshot,
+                &samples,
+                &mut files,
+                &valid,
+                &BTreeSet::new(),
+            );
             snapshot.files = files.into_values().collect();
             assert_eq!(snapshot.files.len(), 1);
             assert_eq!(snapshot.files[0].holders.len(), 2);
             assert_eq!(snapshot.files[0].allocated_bytes, Some(expected));
-            assert_eq!(snapshot.exclusive_allocated_bytes(&first_identity, None), Ok(0));
+            assert_eq!(
+                snapshot.exclusive_allocated_bytes(&first_identity, None),
+                Ok(0)
+            );
         }
 
         #[test]
@@ -1684,9 +1946,20 @@ sys.stdin.readline()
             let key = FileKey::from_metadata(&metadata);
             let child = LiveChild::spawn(&file, true);
             drop(file);
-            let sample = sample_process(Path::new("/proc"), child.child.id(), &context, Instant::now() + BUDGET, &mut 0).unwrap();
+            let sample = sample_process(
+                Path::new("/proc"),
+                child.child.id(),
+                &context,
+                Instant::now() + BUDGET,
+                &mut 0,
+            )
+            .unwrap();
             assert!(!sample.allocations.contains_key(&key));
-            let mapping = sample.mappings.iter().find(|mapping| mapping.key == key).unwrap();
+            let mapping = sample
+                .mappings
+                .iter()
+                .find(|mapping| mapping.key == key)
+                .unwrap();
             match mapping_allocation(Path::new("/proc"), &sample, mapping, &context) {
                 Ok(Some(allocation)) => assert_eq!(allocation.bytes, expected),
                 Err(reason) => assert_eq!(reason, "disk_mapping_allocation_unavailable"),
@@ -1694,17 +1967,35 @@ sys.stdin.readline()
             }
         }
 
-        fn fixture_process(directory: &Path, pid: u32, threads: usize, descriptor_source: Option<u32>) {
+        fn fixture_process(
+            directory: &Path,
+            pid: u32,
+            threads: usize,
+            descriptor_source: Option<u32>,
+        ) {
             fs::create_dir_all(directory).unwrap();
             let mut fields = vec!["0".to_string(); 22];
-            fields[0] = "S".into(); fields[1] = "1".into(); fields[2] = "500".into(); fields[3] = "400".into();
-            fields[17] = threads.to_string(); fields[19] = "10".into();
-            fs::write(directory.join("stat"), format!("{pid} (fixture) {}\n", fields.join(" "))).unwrap();
+            fields[0] = "S".into();
+            fields[1] = "1".into();
+            fields[2] = "500".into();
+            fields[3] = "400".into();
+            fields[17] = threads.to_string();
+            fields[19] = "10".into();
+            fs::write(
+                directory.join("stat"),
+                format!("{pid} (fixture) {}\n", fields.join(" ")),
+            )
+            .unwrap();
             fs::write(directory.join("status"), "Uid: 1000 1000 1000 1000\n").unwrap();
             fs::write(directory.join("maps"), "").unwrap();
             if let Some(source) = descriptor_source {
-                std::os::unix::fs::symlink(format!("/proc/{source}/fd"), directory.join("fd")).unwrap();
-                std::os::unix::fs::symlink(format!("/proc/{source}/fdinfo"), directory.join("fdinfo")).unwrap();
+                std::os::unix::fs::symlink(format!("/proc/{source}/fd"), directory.join("fd"))
+                    .unwrap();
+                std::os::unix::fs::symlink(
+                    format!("/proc/{source}/fdinfo"),
+                    directory.join("fdinfo"),
+                )
+                .unwrap();
             } else {
                 fs::create_dir(directory.join("fd")).unwrap();
                 fs::create_dir(directory.join("fdinfo")).unwrap();
@@ -1714,7 +2005,8 @@ sys.stdin.readline()
         #[test]
         fn procfs_super_options_control_visibility_and_mount_binding() {
             let mut context = Context::load().unwrap();
-            context.mounts = procfs::parse_mountinfo(b"10 1 0:1 / /proc rw - proc proc rw,hidepid=2\n").unwrap();
+            context.mounts =
+                procfs::parse_mountinfo(b"10 1 0:1 / /proc rw - proc proc rw,hidepid=2\n").unwrap();
             assert!(!unrestricted_procfs(&context));
             let hidden = context.identity(&context.mounts[&10]).key();
             context.mounts.get_mut(&10).unwrap().super_options = "rw,hidepid=0".into();
@@ -1733,20 +2025,39 @@ sys.stdin.readline()
             let second_key = FileKey::from_metadata(&second.metadata().unwrap());
             let first_child = LiveChild::spawn(&first, false);
             let second_child = LiveChild::spawn(&second, false);
-            drop(first); drop(second);
+            drop(first);
+            drop(second);
             let root = tempfile::tempdir().unwrap().keep();
             fixture_process(&root.join("4001"), 4001, 3, None);
             fixture_process(&root.join("4001/task/4001"), 4001, 3, None);
-            fixture_process(&root.join("4001/task/4002"), 4002, 3, Some(first_child.child.id()));
-            fixture_process(&root.join("4001/task/4003"), 4003, 3, Some(second_child.child.id()));
-            let sample = sample_process(&root, 4001, &context, Instant::now() + BUDGET, &mut 0).unwrap();
+            fixture_process(
+                &root.join("4001/task/4002"),
+                4002,
+                3,
+                Some(first_child.child.id()),
+            );
+            fixture_process(
+                &root.join("4001/task/4003"),
+                4003,
+                3,
+                Some(second_child.child.id()),
+            );
+            let sample =
+                sample_process(&root, 4001, &context, Instant::now() + BUDGET, &mut 0).unwrap();
             assert_eq!(sample.tasks.len(), 3);
-            assert_eq!(sample.fd_count, 0, "leader's empty FD table must not hide private task tables");
+            assert_eq!(
+                sample.fd_count, 0,
+                "leader's empty FD table must not hide private task tables"
+            );
             assert_eq!(sample.allocations.len(), 2);
             assert!(sample.allocations.contains_key(&first_key));
             assert!(sample.allocations.contains_key(&second_key));
-            assert!(sample.descriptors.iter().any(|entry| entry.task_id == 4002 && entry.fd == 7 && entry.inode == first_key.inode));
-            assert!(sample.descriptors.iter().any(|entry| entry.task_id == 4003 && entry.fd == 7 && entry.inode == second_key.inode));
+            assert!(sample.descriptors.iter().any(|entry| entry.task_id == 4002
+                && entry.fd == 7
+                && entry.inode == first_key.inode));
+            assert!(sample.descriptors.iter().any(|entry| entry.task_id == 4003
+                && entry.fd == 7
+                && entry.inode == second_key.inode));
             let mut files = BTreeMap::new();
             for allocation in sample.allocations.values() {
                 let mut file = new_file(&context, &allocation.key);
@@ -1755,10 +2066,21 @@ sys.stdin.readline()
             }
             let samples = BTreeMap::from([(4001, sample)]);
             let mut snapshot = DiskResourceSnapshot::default();
-            attach_holders(&mut snapshot, &samples, &mut files, &BTreeSet::from([4001]), &BTreeSet::new());
-            assert!(files.values().all(|file| file.holders.len() == 1 && file.holders[0].pid.0 == 4001));
+            attach_holders(
+                &mut snapshot,
+                &samples,
+                &mut files,
+                &BTreeSet::from([4001]),
+                &BTreeSet::new(),
+            );
+            assert!(files
+                .values()
+                .all(|file| file.holders.len() == 1 && file.holders[0].pid.0 == 4001));
             fixture_process(&root.join("4001/task/4004"), 4004, 4, None);
-            assert_eq!(sample_process(&root, 4001, &context, Instant::now() + BUDGET, &mut 0).err(), Some("disk_task_census_changed"));
+            assert_eq!(
+                sample_process(&root, 4001, &context, Instant::now() + BUDGET, &mut 0).err(),
+                Some("disk_task_census_changed")
+            );
         }
 
         #[test]
@@ -1771,15 +2093,23 @@ sys.stdin.readline()
             let root = tempfile::tempdir().unwrap().keep();
             let process = root.join("5001");
             fixture_process(&process, 5001, 1, None);
-            let table = format!("1000-2000 r--s 00000000 {:02x}:{:02x} {} /private/#{} (deleted)\n",
-                key.major, key.minor, key.inode, key.inode);
+            let table = format!(
+                "1000-2000 r--s 00000000 {:02x}:{:02x} {} /private/#{} (deleted)\n",
+                key.major, key.minor, key.inode, key.inode
+            );
             fs::write(process.join("maps"), &table).unwrap();
             fs::create_dir(process.join("map_files")).unwrap();
-            std::os::unix::fs::symlink(format!("/proc/self/fd/{}", file.as_raw_fd()),
-                process.join("map_files/1000-2000")).unwrap();
-            let sample = sample_process(&root, 5001, &context, Instant::now() + BUDGET, &mut 0).unwrap();
+            std::os::unix::fs::symlink(
+                format!("/proc/self/fd/{}", file.as_raw_fd()),
+                process.join("map_files/1000-2000"),
+            )
+            .unwrap();
+            let sample =
+                sample_process(&root, 5001, &context, Instant::now() + BUDGET, &mut 0).unwrap();
             let mapping = sample.mappings.iter().next().unwrap().clone();
-            let allocation = mapping_allocation(&root, &sample, &mapping, &context).unwrap().unwrap();
+            let allocation = mapping_allocation(&root, &sample, &mapping, &context)
+                .unwrap()
+                .unwrap();
             assert_eq!(allocation.bytes, initial_bytes);
             let mut observed = new_file(&context, &key);
             add_allocation(&mut observed, &allocation);
@@ -1788,14 +2118,26 @@ sys.stdin.readline()
             let measurements = BTreeMap::from([(5001, vec![mapping])]);
             file.seek(SeekFrom::Start(4 * 1024 * 1024)).unwrap();
             let block = vec![0x3c; 65_536];
-            for _ in 0..16 { file.write_all(&block).unwrap(); }
+            for _ in 0..16 {
+                file.write_all(&block).unwrap();
+            }
             file.sync_data().unwrap();
             assert!(file.metadata().unwrap().blocks() * 512 > initial_bytes);
             assert_eq!(fs::read_to_string(process.join("maps")).unwrap(), table);
-            let mut snapshot = DiskResourceSnapshot { complete: true, ..Default::default() };
+            let mut snapshot = DiskResourceSnapshot {
+                complete: true,
+                ..Default::default()
+            };
             let valid = BTreeSet::from([5001]);
-            revalidate_mapping_allocations(&root, &context, Instant::now() + BUDGET,
-                (&samples, &valid), &measurements, &mut files, &mut snapshot);
+            revalidate_mapping_allocations(
+                &root,
+                &context,
+                Instant::now() + BUDGET,
+                (&samples, &valid),
+                &measurements,
+                &mut files,
+                &mut snapshot,
+            );
             assert!(!files[&key].allocation_stable);
             assert_eq!(files[&key].allocated_bytes, Some(initial_bytes));
         }

@@ -286,15 +286,17 @@ fn read_user_signatures(path: &Path) -> Result<Option<SignatureSchema>, std::io:
             ));
         }
     };
-    SignatureSchema::from_json(&content).map(Some).map_err(|error| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "failed to parse user signatures at {}: {error}",
-                path.display()
-            ),
-        )
-    })
+    SignatureSchema::from_json(&content)
+        .map(Some)
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "failed to parse user signatures at {}: {error}",
+                    path.display()
+                ),
+            )
+        })
 }
 
 /// Load optional signatures for best-effort read-only displays. Callers that
@@ -1695,12 +1697,10 @@ mod tests {
         // runner, unlike a chmod-only permission fixture. Do not select legacy.
         let unreadable_dir = root.join("unreadable");
         std::fs::create_dir_all(user_signatures_path(&unreadable_dir)).unwrap();
-        assert!(try_load_user_signatures_in(
-            &unreadable_dir,
-            &unreadable_dir,
-            Some(&legacy_dir),
-        )
-        .is_err());
+        assert!(
+            try_load_user_signatures_in(&unreadable_dir, &unreadable_dir, Some(&legacy_dir),)
+                .is_err()
+        );
     }
 
     #[cfg(unix)]
@@ -1714,12 +1714,9 @@ mod tests {
         let target = root.join("missing-signatures.json");
         let path = user_signatures_path(&default_dir);
         std::os::unix::fs::symlink(&target, &path).unwrap();
-        assert!(try_load_user_signatures_in(
-            &default_dir,
-            &default_dir,
-            Some(&legacy_dir),
-        )
-        .is_err());
+        assert!(
+            try_load_user_signatures_in(&default_dir, &default_dir, Some(&legacy_dir),).is_err()
+        );
         assert!(std::fs::symlink_metadata(&path)
             .unwrap()
             .file_type()

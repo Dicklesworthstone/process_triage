@@ -19,7 +19,7 @@ use pt_redact::{Action, ExportProfile, FieldClass, RedactionEngine};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::query::{QueryError, READ_BATCH_SIZE, scan_table_batches};
+use crate::query::{scan_table_batches, QueryError, READ_BATCH_SIZE};
 use crate::schema::{TableName, TelemetrySchema};
 
 /// Counts describe published data, never an incomplete staging directory.
@@ -395,7 +395,7 @@ fn publish_directory(staging: &Path, output: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
     use arrow::array::{
-        ArrayRef, BooleanArray, Float32Array, Int8Array, Int16Array, Int32Array, Int64Array,
+        ArrayRef, BooleanArray, Float32Array, Int16Array, Int32Array, Int64Array, Int8Array,
         TimestampMicrosecondArray,
     };
     use arrow::datatypes::{Field, Schema};
@@ -625,13 +625,11 @@ mod tests {
         assert_eq!(details["session_id"], string_at(&audit, "session_id", 0));
         assert_eq!(details["start_id"], string_at(&audit, "target_start_id", 0));
         assert_eq!(details["environment"], "[REDACTED]");
-        assert!(
-            details["environment_vars"]
-                .as_object()
-                .unwrap()
-                .values()
-                .all(|value| value == "[REDACTED]")
-        );
+        assert!(details["environment_vars"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|value| value == "[REDACTED]"));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -716,13 +714,11 @@ mod tests {
         let file = File::open(output.join("audit/part-00000.parquet")).unwrap();
         let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
         assert!(builder.metadata().num_row_groups() > 1);
-        assert!(
-            builder
-                .metadata()
-                .row_groups()
-                .iter()
-                .all(|group| group.num_rows() <= READ_BATCH_SIZE as i64)
-        );
+        assert!(builder
+            .metadata()
+            .row_groups()
+            .iter()
+            .all(|group| group.num_rows() <= READ_BATCH_SIZE as i64));
     }
 
     #[test]

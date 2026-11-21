@@ -1614,12 +1614,7 @@ mod tests {
                     .unwrap();
                 }
                 assert_eq!(
-                    holds_fuse_device_from(
-                        process.path(),
-                        42,
-                        &mut fuse_fixture_budget(),
-                        || {},
-                    ),
+                    holds_fuse_device_from(process.path(), 42, &mut fuse_fixture_budget(), || {},),
                     Some(true),
                     "{target}, leader_available={leader_available}"
                 );
@@ -1654,8 +1649,11 @@ mod tests {
             match failure {
                 "missing_leader" => pid = 41,
                 "missing_worker_fds" => {
-                    std::fs::rename(worker.join("fd"), process.path().join("retained-worker-fds"))
-                        .unwrap();
+                    std::fs::rename(
+                        worker.join("fd"),
+                        process.path().join("retained-worker-fds"),
+                    )
+                    .unwrap();
                 }
                 "missing_worker_stat" => {
                     std::fs::rename(

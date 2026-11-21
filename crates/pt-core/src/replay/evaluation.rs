@@ -496,14 +496,10 @@ fn paired_probability_metrics(
     baseline: &[CalibrationData],
     candidate: &[CalibrationData],
 ) -> Result<PairedProbabilityMetrics, ReplayEvaluationError> {
-    let baseline_metrics = ProbabilityMetrics::from_calibration(
-        compute_metrics(baseline, 0.5)?,
-        baseline,
-    );
-    let candidate_metrics = ProbabilityMetrics::from_calibration(
-        compute_metrics(candidate, 0.5)?,
-        candidate,
-    );
+    let baseline_metrics =
+        ProbabilityMetrics::from_calibration(compute_metrics(baseline, 0.5)?, baseline);
+    let candidate_metrics =
+        ProbabilityMetrics::from_calibration(compute_metrics(candidate, 0.5)?, candidate);
     let abandoned_count = baseline.iter().filter(|datum| datum.actual).count();
     let candidate_minus_baseline = ProbabilityMetricDelta {
         brier_score: candidate_metrics.brier_score - baseline_metrics.brier_score,
@@ -988,7 +984,14 @@ mod tests {
         changed.processes[0].verdict = None;
         assert!(changed.validate_structure().is_err());
         let serialized = serde_json::to_value(&labels).unwrap();
-        for field in ["pgid", "sid", "verdict", "reviewer", "reviewed_at", "rationale"] {
+        for field in [
+            "pgid",
+            "sid",
+            "verdict",
+            "reviewer",
+            "reviewed_at",
+            "rationale",
+        ] {
             let mut incomplete = serialized.clone();
             incomplete["processes"][0]
                 .as_object_mut()
@@ -1185,13 +1188,21 @@ mod tests {
             .as_ref()
             .unwrap();
         let early_count = early
-            .score_recorded(process, Evidence::from_snapshot(process), observations.clone())
+            .score_recorded(
+                process,
+                Evidence::from_snapshot(process),
+                observations.clone(),
+            )
             .unwrap()
             .learned_prior
             .unwrap()
             .effective_sample_count;
         let late_count = late
-            .score_recorded(process, Evidence::from_snapshot(process), observations.clone())
+            .score_recorded(
+                process,
+                Evidence::from_snapshot(process),
+                observations.clone(),
+            )
             .unwrap()
             .learned_prior
             .unwrap()

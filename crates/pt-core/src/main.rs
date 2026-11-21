@@ -43043,7 +43043,10 @@ mod completions_freshness_tests {
                     .enumerate()
                     .find(|(_, (a, b))| a != b)
                     .map(|(idx, (a, b))| {
-                        format!("first diff at line {}: committed={a:?} vs generated={b:?}", idx + 1)
+                        format!(
+                            "first diff at line {}: committed={a:?} vs generated={b:?}",
+                            idx + 1
+                        )
                     })
                     .unwrap_or_else(|| {
                         format!(

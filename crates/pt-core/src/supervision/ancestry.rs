@@ -585,7 +585,10 @@ wait "$!"
 
         let result = AncestryAnalyzer::new().analyze(tree.target).unwrap();
         assert_eq!(result.supervisor_name.as_deref(), Some("systemd"));
-        assert_eq!(result.supervisor_type, Some(SupervisorCategory::Orchestrator));
+        assert_eq!(
+            result.supervisor_type,
+            Some(SupervisorCategory::Orchestrator)
+        );
         assert_eq!(result.supervisor_pid, Some(ProcessId(inner_pid)));
         assert_eq!(result.depth, Some(1));
         assert!(result.human_supervised);

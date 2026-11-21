@@ -124,9 +124,15 @@ impl ServiceDefinition {
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from)
                 .unwrap_or_else(|| home.join(".config"));
-            (ServicePlatform::SystemdUser, config_home.join("systemd/user"))
+            (
+                ServicePlatform::SystemdUser,
+                config_home.join("systemd/user"),
+            )
         } else if cfg!(target_os = "macos") {
-            (ServicePlatform::LaunchdAgent, home.join("Library/LaunchAgents"))
+            (
+                ServicePlatform::LaunchdAgent,
+                home.join("Library/LaunchAgents"),
+            )
         } else {
             return Err(ServiceError::Invalid(
                 "daemon services support Linux systemd --user and macOS launch agents".into(),
@@ -140,7 +146,13 @@ impl ServiceDefinition {
             path: config_dir.to_path_buf(),
             source,
         })?;
-        Self::new(platform, &directory, &executable, &config_dir, current_uid())
+        Self::new(
+            platform,
+            &directory,
+            &executable,
+            &config_dir,
+            current_uid(),
+        )
     }
 
     /// Build both platform formats without touching the filesystem or a manager.
@@ -217,7 +229,10 @@ impl ServiceDefinition {
 
     pub fn install(&self, activate: bool, dry_run: bool) -> Result<ServiceReport, ServiceError> {
         let existing = self.read_managed()?;
-        if existing.as_ref().is_some_and(|content| content != &self.content) {
+        if existing
+            .as_ref()
+            .is_some_and(|content| content != &self.content)
+        {
             return Err(self.unmanaged(
                 "a different managed definition already exists; inspect it and uninstall before reinstalling",
             ));
@@ -436,10 +451,7 @@ impl ServiceDefinition {
 
     fn manager_owns_path(&self, result: &ManagerResult) -> Result<bool, ServiceError> {
         if self.platform == ServicePlatform::SystemdUser {
-            if result.timed_out
-                || result.truncated
-                || !matches!(result.exit_code, Some(0 | 1))
-            {
+            if result.timed_out || result.truncated || !matches!(result.exit_code, Some(0 | 1)) {
                 return Err(manager_error(result, "cannot verify service ownership"));
             }
             let property = |name: &str| -> Result<&str, ServiceError> {
@@ -471,7 +483,10 @@ impl ServiceDefinition {
                 return Ok(false);
             }
             if !result.success() || load_state != "loaded" {
-                return Err(manager_error(result, "unit is not a verified loaded definition"));
+                return Err(manager_error(
+                    result,
+                    "unit is not a verified loaded definition",
+                ));
             }
             if Some(path) != self.path.to_str() {
                 return Err(self.unmanaged(&format!(
@@ -747,9 +762,9 @@ mod tests {
             ServicePlatform::SystemdUser,
             Path::new("/home/user/.config/systemd/user"),
         );
-        assert!(service.content.contains(
-            "ExecStart=:\"/opt/pt \\\"quoted\\\"/%%literal/${HOME}/pt-core\""
-        ));
+        assert!(service
+            .content
+            .contains("ExecStart=:\"/opt/pt \\\"quoted\\\"/%%literal/${HOME}/pt-core\""));
         assert!(service
             .content
             .contains("\"/home/user/config & <literal>/'quotes'/$HOME/%%n\""));
@@ -766,7 +781,9 @@ mod tests {
             ServicePlatform::LaunchdAgent,
             Path::new("/Users/user/Library/LaunchAgents"),
         );
-        assert!(service.content.contains("&quot;quoted&quot;/%literal/${HOME}"));
+        assert!(service
+            .content
+            .contains("&quot;quoted&quot;/%literal/${HOME}"));
         assert!(service
             .content
             .contains("config &amp; &lt;literal&gt;/&apos;quotes&apos;/$HOME/%n"));
@@ -786,7 +803,10 @@ mod tests {
             ServicePlatform::SystemdUser,
             Path::new("/home/user/.config/systemd/user"),
         );
-        assert_eq!(linux.activation_commands(false)[1], linux.ownership_command());
+        assert_eq!(
+            linux.activation_commands(false)[1],
+            linux.ownership_command()
+        );
         assert_eq!(
             linux.activation_commands(false)[2].args,
             [
@@ -898,7 +918,8 @@ mod tests {
         let mut result = ManagerResult {
             command: service.ownership_command(),
             exit_code: Some(0),
-            stdout: "LoadState=loaded\nFragmentPath=/etc/systemd/user/ptd.service\nDropInPaths=\n".into(),
+            stdout: "LoadState=loaded\nFragmentPath=/etc/systemd/user/ptd.service\nDropInPaths=\n"
+                .into(),
             stderr: String::new(),
             timed_out: false,
             truncated: false,
@@ -909,7 +930,9 @@ mod tests {
             service.path.display()
         );
         assert!(service.manager_owns_path(&result).unwrap());
-        result.stdout.push_str("DropInPaths=/home/user/override.conf\n");
+        result
+            .stdout
+            .push_str("DropInPaths=/home/user/override.conf\n");
         assert!(service.manager_owns_path(&result).is_err());
         result.stdout = "LoadState=not-found\nFragmentPath=\nDropInPaths=\n".into();
         assert!(!service.manager_owns_path(&result).unwrap());
@@ -924,7 +947,10 @@ mod tests {
             assert!(service.manager_owns_path(&result).is_err());
         }
         result.exit_code = Some(0);
-        result.stdout = format!("LoadState=loaded\nFragmentPath={}\n", service.path.display());
+        result.stdout = format!(
+            "LoadState=loaded\nFragmentPath={}\n",
+            service.path.display()
+        );
         assert!(service.manager_owns_path(&result).is_err());
         result.stdout = "LoadState=not-found\nFragmentPath=\nDropInPaths=\n".into();
         result.timed_out = true;
@@ -941,7 +967,8 @@ mod tests {
             command: service.ownership_command(),
             exit_code: Some(113),
             stdout: String::new(),
-            stderr: "Could not find service \"com.processtriage.ptd\" in domain for user gui: 501".into(),
+            stderr: "Could not find service \"com.processtriage.ptd\" in domain for user gui: 501"
+                .into(),
             timed_out: false,
             truncated: false,
         };
