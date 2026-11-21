@@ -1,27 +1,27 @@
 # Print an optspec for argparse to handle cmd's options that are independent of any subcommand.
 function __fish_pt_core_global_optspecs
-	string join \n capabilities= config= f/format= v/verbose q/quiet no-color timeout= robot shadow dry-run standalone fields= compact max-tokens= estimate-tokens h/help V/version
+    string join \n capabilities= config= f/format= v/verbose q/quiet no-color timeout= robot shadow dry-run standalone fields= compact max-tokens= estimate-tokens h/help V/version
 end
 
 function __fish_pt_core_needs_command
-	# Figure out if the current invocation already has a command.
-	set -l cmd (commandline -opc)
-	set -e cmd[1]
-	argparse -s (__fish_pt_core_global_optspecs) -- $cmd 2>/dev/null
-	or return
-	if set -q argv[1]
-		# Also print the command, so this can be used to figure out what it is.
-		echo $argv[1]
-		return 1
-	end
-	return 0
+    # Figure out if the current invocation already has a command.
+    set -l cmd (commandline -opc)
+    set -e cmd[1]
+    argparse -s (__fish_pt_core_global_optspecs) -- $cmd 2>/dev/null
+    or return
+    if set -q argv[1]
+        # Also print the command, so this can be used to figure out what it is.
+        echo $argv[1]
+        return 1
+    end
+    return 0
 end
 
 function __fish_pt_core_using_subcommand
-	set -l cmd (__fish_pt_core_needs_command)
-	test -z "$cmd"
-	and return 1
-	contains -- $cmd[1] $argv
+    set -l cmd (__fish_pt_core_needs_command)
+    test -z "$cmd"
+    and return 1
+    contains -- $cmd[1] $argv
 end
 
 complete -c pt-core -n "__fish_pt_core_needs_command" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
@@ -50,17 +50,21 @@ complete -c pt-core -n "__fish_pt_core_needs_command" -l estimate-tokens -d 'Est
 complete -c pt-core -n "__fish_pt_core_needs_command" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c pt-core -n "__fish_pt_core_needs_command" -s V -l version -d 'Print version'
 complete -c pt-core -n "__fish_pt_core_needs_command" -f -a "run" -d 'Interactive golden path: scan → infer → plan → TUI approval → staged apply'
-complete -c pt-core -n "__fish_pt_core_needs_command" -f -a "scan" -d 'Quick multi-sample scan only (no inference or action)'
+complete -c pt-core -n "__fish_pt_core_needs_command" -f -a "scan" -d 'Scan processes, record observations, or replay recorded scores (no actions)'
+complete -c pt-core -n "__fish_pt_core_needs_command" -f -a "replay" -d 'Review recorded processes and compare scoring configurations without actions'
 complete -c pt-core -n "__fish_pt_core_needs_command" -f -a "deep-scan" -d 'Full deep scan with all available probes'
+complete -c pt-core -n "__fish_pt_core_needs_command" -f -a "__deep-scan-worker"
 complete -c pt-core -n "__fish_pt_core_needs_command" -f -a "diff" -d 'Compare two sessions and show differences'
 complete -c pt-core -n "__fish_pt_core_needs_command" -f -a "query" -d 'Query telemetry and history'
 complete -c pt-core -n "__fish_pt_core_needs_command" -f -a "bundle" -d 'Create or inspect diagnostic bundles'
 complete -c pt-core -n "__fish_pt_core_needs_command" -f -a "report" -d 'Generate HTML reports'
 complete -c pt-core -n "__fish_pt_core_needs_command" -f -a "check" -d 'Validate configuration and environment'
+complete -c pt-core -n "__fish_pt_core_needs_command" -f -a "doctor" -d 'Read-only host hygiene audit: VM tuning, swap/zram, oomd limits, journald, file-handle/inotify limits, zombie parents (suggests commands, never runs them)'
 complete -c pt-core -n "__fish_pt_core_needs_command" -f -a "learn" -d 'Interactive tutorials and onboarding guidance'
 complete -c pt-core -n "__fish_pt_core_needs_command" -f -a "agent" -d 'Agent/robot subcommands for automated operation'
 complete -c pt-core -n "__fish_pt_core_needs_command" -f -a "robot" -d 'Agent/robot subcommands for automated operation'
 complete -c pt-core -n "__fish_pt_core_needs_command" -f -a "config" -d 'Configuration management'
+complete -c pt-core -n "__fish_pt_core_needs_command" -f -a "daemon" -d 'Background monitoring daemon'
 complete -c pt-core -n "__fish_pt_core_needs_command" -f -a "telemetry" -d 'Telemetry management'
 complete -c pt-core -n "__fish_pt_core_needs_command" -f -a "shadow" -d 'Shadow mode observation management'
 complete -c pt-core -n "__fish_pt_core_needs_command" -f -a "signature" -d 'Signature management (list, add, remove user signatures)'
@@ -70,9 +74,12 @@ complete -c pt-core -n "__fish_pt_core_needs_command" -f -a "mcp" -d 'MCP server
 complete -c pt-core -n "__fish_pt_core_needs_command" -f -a "completions" -d 'Generate shell completion scripts'
 complete -c pt-core -n "__fish_pt_core_needs_command" -f -a "version" -d 'Print version information'
 complete -c pt-core -n "__fish_pt_core_needs_command" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand run" -l probe-budget-ms -d 'Maximum deep collection time per refresh in milliseconds (0 skips probes)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand run" -l window-ms -d 'Activity sampling window in milliseconds (0 uses lifetime CPU averages)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand run" -l signatures -d 'Load additional signature patterns' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand run" -l min-age -d 'Only consider processes older than threshold (seconds)' -r
-complete -c pt-core -n "__fish_pt_core_using_subcommand run" -l goal -d 'Resource recovery goal, e.g. \'free 4GB RAM\'' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand run" -l min-posterior -l threshold -d 'Minimum intervention probability to display (0 includes useful pressure candidates; safety gates still apply)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand run" -l goal -d 'Resource goal (e.g. \'free 4GB RAM\') or pressure relief: relieve, cpu-pressure, mem-pressure, io-pressure' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand run" -l theme -d 'TUI color theme (overrides environment detection)' -r -f -a "dark\t''
 light\t''
 high-contrast\t''
@@ -91,7 +98,7 @@ prose\t'Structured natural language for agent-to-user communication'"
 complete -c pt-core -n "__fish_pt_core_using_subcommand run" -l timeout -d 'Abort if operation exceeds time limit (seconds)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand run" -l fields -d 'Select specific output fields (comma-separated or preset: minimal, standard, full)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand run" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
-complete -c pt-core -n "__fish_pt_core_using_subcommand run" -l deep -d 'Force deep scan with all available probes'
+complete -c pt-core -n "__fish_pt_core_using_subcommand run" -l deep -d 'Deep-scan every eligible candidate within the probe budget'
 complete -c pt-core -n "__fish_pt_core_using_subcommand run" -l inline -d 'Render the TUI inline (preserves scrollback) instead of using the alternate screen'
 complete -c pt-core -n "__fish_pt_core_using_subcommand run" -l community-signatures -d 'Include signed community signatures'
 complete -c pt-core -n "__fish_pt_core_using_subcommand run" -l high-contrast -d 'Enable high-contrast mode (WCAG AAA). Shorthand for --theme=high-contrast'
@@ -111,6 +118,9 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand run" -s V -l version -d 
 complete -c pt-core -n "__fish_pt_core_using_subcommand scan" -l samples -d 'Number of samples to collect' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand scan" -l interval -d 'Interval between samples (milliseconds)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand scan" -l goal -d 'Resource recovery goal (advisory only)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand scan" -l record-replay -d 'Record this quick scan and scoring observations privately (contains raw commands). The destination must not exist. Redact and review before sharing' -r -F
+complete -c pt-core -n "__fish_pt_core_using_subcommand scan" -l record-replay-window-ms -d 'Activity window for replay recording in milliseconds (default: 500; 0 uses lifetime CPU)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand scan" -l replay-scores -d 'Score a recorded census with current configuration, without inspecting live processes. Requires scoring observations from --record-replay. Never authorizes actions' -r -F
 complete -c pt-core -n "__fish_pt_core_using_subcommand scan" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand scan" -l config -d 'Override config directory' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand scan" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
@@ -138,8 +148,97 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand scan" -l compact -d 'Ena
 complete -c pt-core -n "__fish_pt_core_using_subcommand scan" -l estimate-tokens -d 'Estimate token count without full response'
 complete -c pt-core -n "__fish_pt_core_using_subcommand scan" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c pt-core -n "__fish_pt_core_using_subcommand scan" -s V -l version -d 'Print version'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -l config -d 'Override config directory' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
+toon\t'Token-Optimized Object Notation (TOON)'
+md\t'Human-readable Markdown'
+jsonl\t'Streaming JSON Lines for progress events'
+summary\t'One-line summary for quick status checks'
+metrics\t'Key=value pairs for monitoring systems'
+slack\t'Human-friendly narrative for chat/notifications'
+exitcode\t'Minimal output (exit code only)'
+prose\t'Structured natural language for agent-to-user communication'"
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -l timeout -d 'Abort if operation exceeds time limit (seconds)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -l fields -d 'Select specific output fields (comma-separated or preset: minimal, standard, full)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -s v -l verbose -d 'Increase verbosity (-v, -vv, -vvv)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -s q -l quiet -d 'Decrease verbosity (quiet mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -l no-color -d 'Disable colored output'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -l robot -d 'Non-interactive mode; execute policy-approved actions automatically'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -l shadow -d 'Full pipeline but never execute actions (calibration mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -l dry-run -d 'Compute plan only, no execution even with --robot'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -l standalone -d 'Run without wrapper (uses detected/default capabilities)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -l compact -d 'Enable compact output (short keys, minified JSON)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -l estimate-tokens -d 'Estimate token count without full response'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -s h -l help -d 'Print help (see more with \'--help\')'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -s V -l version -d 'Print version'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -f -a "label-template" -d 'Create a private review document with every captured identity left unlabeled'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -f -a "evaluate" -d 'Compare an incumbent and the current --config using the same reviewed capture'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from label-template" -l snapshot -r -F
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from label-template" -l output -d 'New private destination; existing files and symlinks are refused' -r -F
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from label-template" -l host-id -d 'Operator-supplied host identifier for the review cohort' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from label-template" -l split -d 'Declared dataset split; this does not prove a host was held out of training' -r -f -a "training\t''
+holdout\t''"
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from label-template" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from label-template" -l config -d 'Override config directory' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from label-template" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
+toon\t'Token-Optimized Object Notation (TOON)'
+md\t'Human-readable Markdown'
+jsonl\t'Streaming JSON Lines for progress events'
+summary\t'One-line summary for quick status checks'
+metrics\t'Key=value pairs for monitoring systems'
+slack\t'Human-friendly narrative for chat/notifications'
+exitcode\t'Minimal output (exit code only)'
+prose\t'Structured natural language for agent-to-user communication'"
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from label-template" -l timeout -d 'Abort if operation exceeds time limit (seconds)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from label-template" -l fields -d 'Select specific output fields (comma-separated or preset: minimal, standard, full)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from label-template" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from label-template" -s v -l verbose -d 'Increase verbosity (-v, -vv, -vvv)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from label-template" -s q -l quiet -d 'Decrease verbosity (quiet mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from label-template" -l no-color -d 'Disable colored output'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from label-template" -l robot -d 'Non-interactive mode; execute policy-approved actions automatically'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from label-template" -l shadow -d 'Full pipeline but never execute actions (calibration mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from label-template" -l dry-run -d 'Compute plan only, no execution even with --robot'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from label-template" -l standalone -d 'Run without wrapper (uses detected/default capabilities)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from label-template" -l compact -d 'Enable compact output (short keys, minified JSON)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from label-template" -l estimate-tokens -d 'Estimate token count without full response'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from label-template" -s h -l help -d 'Print help (see more with \'--help\')'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from label-template" -s V -l version -d 'Print version'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from evaluate" -l snapshot -r -F
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from evaluate" -l labels -r -F
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from evaluate" -l baseline-config -d 'Existing configuration directory for the incumbent model' -r -F
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from evaluate" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from evaluate" -l config -d 'Override config directory' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from evaluate" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
+toon\t'Token-Optimized Object Notation (TOON)'
+md\t'Human-readable Markdown'
+jsonl\t'Streaming JSON Lines for progress events'
+summary\t'One-line summary for quick status checks'
+metrics\t'Key=value pairs for monitoring systems'
+slack\t'Human-friendly narrative for chat/notifications'
+exitcode\t'Minimal output (exit code only)'
+prose\t'Structured natural language for agent-to-user communication'"
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from evaluate" -l timeout -d 'Abort if operation exceeds time limit (seconds)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from evaluate" -l fields -d 'Select specific output fields (comma-separated or preset: minimal, standard, full)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from evaluate" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from evaluate" -s v -l verbose -d 'Increase verbosity (-v, -vv, -vvv)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from evaluate" -s q -l quiet -d 'Decrease verbosity (quiet mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from evaluate" -l no-color -d 'Disable colored output'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from evaluate" -l robot -d 'Non-interactive mode; execute policy-approved actions automatically'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from evaluate" -l shadow -d 'Full pipeline but never execute actions (calibration mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from evaluate" -l dry-run -d 'Compute plan only, no execution even with --robot'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from evaluate" -l standalone -d 'Run without wrapper (uses detected/default capabilities)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from evaluate" -l compact -d 'Enable compact output (short keys, minified JSON)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from evaluate" -l estimate-tokens -d 'Estimate token count without full response'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from evaluate" -s h -l help -d 'Print help (see more with \'--help\')'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from evaluate" -s V -l version -d 'Print version'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from help" -f -a "label-template" -d 'Create a private review document with every captured identity left unlabeled'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from help" -f -a "evaluate" -d 'Compare an incumbent and the current --config using the same reviewed capture'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand deep-scan" -l pids -d 'Target specific PIDs only' -r
-complete -c pt-core -n "__fish_pt_core_using_subcommand deep-scan" -l budget -d 'Maximum time budget for deep scan (seconds)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand deep-scan" -l budget -d 'Wall-clock deadline for deep collection (seconds); incomplete scans fail with exit 22' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand deep-scan" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand deep-scan" -l config -d 'Override config directory' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand deep-scan" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
@@ -154,6 +253,7 @@ prose\t'Structured natural language for agent-to-user communication'"
 complete -c pt-core -n "__fish_pt_core_using_subcommand deep-scan" -l timeout -d 'Abort if operation exceeds time limit (seconds)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand deep-scan" -l fields -d 'Select specific output fields (comma-separated or preset: minimal, standard, full)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand deep-scan" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand deep-scan" -l allow-partial -d 'Retain completed records on timeout; requires --budget or --timeout'
 complete -c pt-core -n "__fish_pt_core_using_subcommand deep-scan" -s v -l verbose -d 'Increase verbosity (-v, -vv, -vvv)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand deep-scan" -s q -l quiet -d 'Decrease verbosity (quiet mode)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand deep-scan" -l no-color -d 'Disable colored output'
@@ -165,6 +265,31 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand deep-scan" -l compact -d
 complete -c pt-core -n "__fish_pt_core_using_subcommand deep-scan" -l estimate-tokens -d 'Estimate token count without full response'
 complete -c pt-core -n "__fish_pt_core_using_subcommand deep-scan" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c pt-core -n "__fish_pt_core_using_subcommand deep-scan" -s V -l version -d 'Print version'
+complete -c pt-core -n "__fish_pt_core_using_subcommand __deep-scan-worker" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand __deep-scan-worker" -l config -d 'Override config directory' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand __deep-scan-worker" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
+toon\t'Token-Optimized Object Notation (TOON)'
+md\t'Human-readable Markdown'
+jsonl\t'Streaming JSON Lines for progress events'
+summary\t'One-line summary for quick status checks'
+metrics\t'Key=value pairs for monitoring systems'
+slack\t'Human-friendly narrative for chat/notifications'
+exitcode\t'Minimal output (exit code only)'
+prose\t'Structured natural language for agent-to-user communication'"
+complete -c pt-core -n "__fish_pt_core_using_subcommand __deep-scan-worker" -l timeout -d 'Abort if operation exceeds time limit (seconds)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand __deep-scan-worker" -l fields -d 'Select specific output fields (comma-separated or preset: minimal, standard, full)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand __deep-scan-worker" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand __deep-scan-worker" -s v -l verbose -d 'Increase verbosity (-v, -vv, -vvv)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand __deep-scan-worker" -s q -l quiet -d 'Decrease verbosity (quiet mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand __deep-scan-worker" -l no-color -d 'Disable colored output'
+complete -c pt-core -n "__fish_pt_core_using_subcommand __deep-scan-worker" -l robot -d 'Non-interactive mode; execute policy-approved actions automatically'
+complete -c pt-core -n "__fish_pt_core_using_subcommand __deep-scan-worker" -l shadow -d 'Full pipeline but never execute actions (calibration mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand __deep-scan-worker" -l dry-run -d 'Compute plan only, no execution even with --robot'
+complete -c pt-core -n "__fish_pt_core_using_subcommand __deep-scan-worker" -l standalone -d 'Run without wrapper (uses detected/default capabilities)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand __deep-scan-worker" -l compact -d 'Enable compact output (short keys, minified JSON)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand __deep-scan-worker" -l estimate-tokens -d 'Estimate token count without full response'
+complete -c pt-core -n "__fish_pt_core_using_subcommand __deep-scan-worker" -s h -l help -d 'Print help (see more with \'--help\')'
+complete -c pt-core -n "__fish_pt_core_using_subcommand __deep-scan-worker" -s V -l version -d 'Print version'
 complete -c pt-core -n "__fish_pt_core_using_subcommand diff" -l category -d 'Filter by category: new, resolved, changed, unchanged, worsened, improved' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand diff" -l min-score-delta -d 'Minimum score delta to consider a change' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand diff" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
@@ -222,7 +347,7 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand query; and not __fish_se
 complete -c pt-core -n "__fish_pt_core_using_subcommand query; and not __fish_seen_subcommand_from sessions actions telemetry help" -s V -l version -d 'Print version'
 complete -c pt-core -n "__fish_pt_core_using_subcommand query; and not __fish_seen_subcommand_from sessions actions telemetry help" -a "sessions" -d 'Query recent sessions'
 complete -c pt-core -n "__fish_pt_core_using_subcommand query; and not __fish_seen_subcommand_from sessions actions telemetry help" -a "actions" -d 'Query action history'
-complete -c pt-core -n "__fish_pt_core_using_subcommand query; and not __fish_seen_subcommand_from sessions actions telemetry help" -a "telemetry" -d 'Query telemetry data'
+complete -c pt-core -n "__fish_pt_core_using_subcommand query; and not __fish_seen_subcommand_from sessions actions telemetry help" -a "telemetry" -d 'Query recent rows from a persisted Parquet telemetry table'
 complete -c pt-core -n "__fish_pt_core_using_subcommand query; and not __fish_seen_subcommand_from sessions actions telemetry help" -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand query; and __fish_seen_subcommand_from sessions" -l limit -d 'Maximum sessions to return' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand query; and __fish_seen_subcommand_from sessions" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
@@ -251,6 +376,7 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand query; and __fish_seen_s
 complete -c pt-core -n "__fish_pt_core_using_subcommand query; and __fish_seen_subcommand_from sessions" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c pt-core -n "__fish_pt_core_using_subcommand query; and __fish_seen_subcommand_from sessions" -s V -l version -d 'Print version'
 complete -c pt-core -n "__fish_pt_core_using_subcommand query; and __fish_seen_subcommand_from actions" -l session -d 'Filter by session ID' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand query; and __fish_seen_subcommand_from actions" -l limit -d 'Maximum journal records to return (newest sessions, latest entries first)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand query; and __fish_seen_subcommand_from actions" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand query; and __fish_seen_subcommand_from actions" -l config -d 'Override config directory' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand query; and __fish_seen_subcommand_from actions" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
@@ -276,7 +402,11 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand query; and __fish_seen_s
 complete -c pt-core -n "__fish_pt_core_using_subcommand query; and __fish_seen_subcommand_from actions" -l estimate-tokens -d 'Estimate token count without full response'
 complete -c pt-core -n "__fish_pt_core_using_subcommand query; and __fish_seen_subcommand_from actions" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c pt-core -n "__fish_pt_core_using_subcommand query; and __fish_seen_subcommand_from actions" -s V -l version -d 'Print version'
-complete -c pt-core -n "__fish_pt_core_using_subcommand query; and __fish_seen_subcommand_from telemetry" -l range -d 'Time range (e.g., "1h", "24h", "7d")' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand query; and __fish_seen_subcommand_from telemetry" -l range -d 'Event-time range (e.g., "1h", "24h", "7d")' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand query; and __fish_seen_subcommand_from telemetry" -l table -d 'Table: runs, proc_samples, proc_features, proc_inference, outcomes, audit, signature_matches' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand query; and __fish_seen_subcommand_from telemetry" -l session -d 'Filter rows by exact session ID' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand query; and __fish_seen_subcommand_from telemetry" -l limit -d 'Maximum rows to return, newest event first' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand query; and __fish_seen_subcommand_from telemetry" -l telemetry-dir -d 'Telemetry root directory (defaults to XDG data dir)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand query; and __fish_seen_subcommand_from telemetry" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand query; and __fish_seen_subcommand_from telemetry" -l config -d 'Override config directory' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand query; and __fish_seen_subcommand_from telemetry" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
@@ -304,7 +434,7 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand query; and __fish_seen_s
 complete -c pt-core -n "__fish_pt_core_using_subcommand query; and __fish_seen_subcommand_from telemetry" -s V -l version -d 'Print version'
 complete -c pt-core -n "__fish_pt_core_using_subcommand query; and __fish_seen_subcommand_from help" -f -a "sessions" -d 'Query recent sessions'
 complete -c pt-core -n "__fish_pt_core_using_subcommand query; and __fish_seen_subcommand_from help" -f -a "actions" -d 'Query action history'
-complete -c pt-core -n "__fish_pt_core_using_subcommand query; and __fish_seen_subcommand_from help" -f -a "telemetry" -d 'Query telemetry data'
+complete -c pt-core -n "__fish_pt_core_using_subcommand query; and __fish_seen_subcommand_from help" -f -a "telemetry" -d 'Query recent rows from a persisted Parquet telemetry table'
 complete -c pt-core -n "__fish_pt_core_using_subcommand query; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand bundle; and not __fish_seen_subcommand_from create inspect extract help" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand bundle; and not __fish_seen_subcommand_from create inspect extract help" -l config -d 'Override config directory' -r
@@ -443,6 +573,7 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand report" -l timeout -d 'A
 complete -c pt-core -n "__fish_pt_core_using_subcommand report" -l fields -d 'Select specific output fields (comma-separated or preset: minimal, standard, full)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand report" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand report" -l include-ledger -d 'Include detailed math ledger'
+complete -c pt-core -n "__fish_pt_core_using_subcommand report" -l embed-assets -d 'Generate self-contained HTML with built-in styles and readable tables'
 complete -c pt-core -n "__fish_pt_core_using_subcommand report" -s v -l verbose -d 'Increase verbosity (-v, -vv, -vvv)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand report" -s q -l quiet -d 'Decrease verbosity (quiet mode)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand report" -l no-color -d 'Disable colored output'
@@ -483,6 +614,32 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand check" -l compact -d 'En
 complete -c pt-core -n "__fish_pt_core_using_subcommand check" -l estimate-tokens -d 'Estimate token count without full response'
 complete -c pt-core -n "__fish_pt_core_using_subcommand check" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c pt-core -n "__fish_pt_core_using_subcommand check" -s V -l version -d 'Print version'
+complete -c pt-core -n "__fish_pt_core_using_subcommand doctor" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand doctor" -l config -d 'Override config directory' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand doctor" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
+toon\t'Token-Optimized Object Notation (TOON)'
+md\t'Human-readable Markdown'
+jsonl\t'Streaming JSON Lines for progress events'
+summary\t'One-line summary for quick status checks'
+metrics\t'Key=value pairs for monitoring systems'
+slack\t'Human-friendly narrative for chat/notifications'
+exitcode\t'Minimal output (exit code only)'
+prose\t'Structured natural language for agent-to-user communication'"
+complete -c pt-core -n "__fish_pt_core_using_subcommand doctor" -l timeout -d 'Abort if operation exceeds time limit (seconds)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand doctor" -l fields -d 'Select specific output fields (comma-separated or preset: minimal, standard, full)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand doctor" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand doctor" -l fix-script -d 'Print the suggested commands as a commented shell script (never executed)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand doctor" -s v -l verbose -d 'Increase verbosity (-v, -vv, -vvv)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand doctor" -s q -l quiet -d 'Decrease verbosity (quiet mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand doctor" -l no-color -d 'Disable colored output'
+complete -c pt-core -n "__fish_pt_core_using_subcommand doctor" -l robot -d 'Non-interactive mode; execute policy-approved actions automatically'
+complete -c pt-core -n "__fish_pt_core_using_subcommand doctor" -l shadow -d 'Full pipeline but never execute actions (calibration mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand doctor" -l dry-run -d 'Compute plan only, no execution even with --robot'
+complete -c pt-core -n "__fish_pt_core_using_subcommand doctor" -l standalone -d 'Run without wrapper (uses detected/default capabilities)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand doctor" -l compact -d 'Enable compact output (short keys, minified JSON)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand doctor" -l estimate-tokens -d 'Estimate token count without full response'
+complete -c pt-core -n "__fish_pt_core_using_subcommand doctor" -s h -l help -d 'Print help (see more with \'--help\')'
+complete -c pt-core -n "__fish_pt_core_using_subcommand doctor" -s V -l version -d 'Print version'
 complete -c pt-core -n "__fish_pt_core_using_subcommand learn; and not __fish_seen_subcommand_from list show verify complete reset help" -l verify-budget-ms -d 'Per-check verification budget in milliseconds' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand learn; and not __fish_seen_subcommand_from list show verify complete reset help" -l total-budget-ms -d 'Total verification budget in milliseconds' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand learn; and not __fish_seen_subcommand_from list show verify complete reset help" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
@@ -649,9 +806,9 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand learn; and __fish_seen_s
 complete -c pt-core -n "__fish_pt_core_using_subcommand learn; and __fish_seen_subcommand_from help" -f -a "complete" -d 'Mark a tutorial as completed manually'
 complete -c pt-core -n "__fish_pt_core_using_subcommand learn; and __fish_seen_subcommand_from help" -f -a "reset" -d 'Reset all tutorial progress'
 complete -c pt-core -n "__fish_pt_core_using_subcommand learn; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -l config -d 'Override config directory' -r
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -l config -d 'Override config directory' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
 toon\t'Token-Optimized Object Notation (TOON)'
 md\t'Human-readable Markdown'
 jsonl\t'Streaming JSON Lines for progress events'
@@ -660,49 +817,55 @@ metrics\t'Key=value pairs for monitoring systems'
 slack\t'Human-friendly narrative for chat/notifications'
 exitcode\t'Minimal output (exit code only)'
 prose\t'Structured natural language for agent-to-user communication'"
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -l timeout -d 'Abort if operation exceeds time limit (seconds)' -r
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -l fields -d 'Select specific output fields (comma-separated or preset: minimal, standard, full)' -r
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -s v -l verbose -d 'Increase verbosity (-v, -vv, -vvv)'
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -s q -l quiet -d 'Decrease verbosity (quiet mode)'
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -l no-color -d 'Disable colored output'
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -l robot -d 'Non-interactive mode; execute policy-approved actions automatically'
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -l shadow -d 'Full pipeline but never execute actions (calibration mode)'
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -l dry-run -d 'Compute plan only, no execution even with --robot'
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -l standalone -d 'Run without wrapper (uses detected/default capabilities)'
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -l compact -d 'Enable compact output (short keys, minified JSON)'
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -l estimate-tokens -d 'Estimate token count without full response'
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -s h -l help -d 'Print help (see more with \'--help\')'
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -s V -l version -d 'Print version'
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -f -a "plan" -d 'Generate action plan without execution'
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -f -a "explain" -d 'Explain reasoning for specific candidates'
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -f -a "apply" -d 'Execute actions from a session'
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -f -a "verify" -d 'Verify action outcomes'
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -f -a "diff" -d 'Show changes between sessions'
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -f -a "snapshot" -d 'Create session snapshot for later comparison'
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -f -a "capabilities" -d 'Dump current capabilities manifest'
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -f -a "sessions" -d 'List and manage sessions'
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -f -a "list-priors" -d 'List current prior configuration'
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -f -a "inbox" -d 'View pending plans and notifications'
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -f -a "tail" -d 'Stream session progress events (JSONL)'
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -f -a "watch" -d 'Watch for new candidates and emit notifications'
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -f -a "export-priors" -d 'Export priors to file for transfer between machines'
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -f -a "import-priors" -d 'Import priors from file (bootstrap from external source)'
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -f -a "init" -d 'Initialize pt for installed coding agents'
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -f -a "export" -d 'Export session bundle (alias for bundle create)'
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -f -a "fleet" -d 'Fleet-wide operations across multiple hosts'
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -l timeout -d 'Abort if operation exceeds time limit (seconds)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -l fields -d 'Select specific output fields (comma-separated or preset: minimal, standard, full)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -s v -l verbose -d 'Increase verbosity (-v, -vv, -vvv)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -s q -l quiet -d 'Decrease verbosity (quiet mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -l no-color -d 'Disable colored output'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -l robot -d 'Non-interactive mode; execute policy-approved actions automatically'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -l shadow -d 'Full pipeline but never execute actions (calibration mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -l dry-run -d 'Compute plan only, no execution even with --robot'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -l standalone -d 'Run without wrapper (uses detected/default capabilities)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -l compact -d 'Enable compact output (short keys, minified JSON)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -l estimate-tokens -d 'Estimate token count without full response'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -s h -l help -d 'Print help (see more with \'--help\')'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -s V -l version -d 'Print version'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "plan" -d 'Generate action plan without execution'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "explain" -d 'Explain reasoning for specific candidates'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "apply" -d 'Execute actions from a session'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "undo" -d 'Inspect or restore the recorded state of a reversible cgroup action'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "verify" -d 'Verify action outcomes'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "diff" -d 'Show changes between sessions'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "snapshot" -d 'Create session snapshot for later comparison'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "capabilities" -d 'Dump current capabilities manifest'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "sessions" -d 'List and manage sessions'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "list-priors" -d 'List current prior configuration'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "label" -d 'Record a human kill/spare verdict so future plans learn from it'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "inbox" -d 'View pending plans and notifications'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "tail" -d 'Stream session progress events (JSONL)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "watch" -d 'Watch for new candidates and emit notifications'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "export-priors" -d 'Export priors to file for transfer between machines'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "import-priors" -d 'Import priors from file (bootstrap from external source)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "report" -d 'Generate HTML report from session'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "init" -d 'Initialize pt for installed coding agents'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "export" -d 'Export session bundle (alias for bundle create)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "fleet" -d 'Fleet-wide operations across multiple hosts'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from plan" -l session -d 'Resume existing session' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from plan" -l label -d 'Label for this plan session (e.g. "baseline" for diff --baseline)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from plan" -l max-candidates -d 'Maximum candidates to return' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from plan" -l pids -d 'Restrict inference to selected PIDs (comma-separated); ancestry and safety checks still use the full scan' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from plan" -l min-posterior -l threshold -d 'Minimum posterior probability threshold for candidate selection' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from plan" -l only -d 'Filter by recommendation (kill, review, all)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from plan" -l probe-budget-ms -d 'Maximum deep collection time in milliseconds (0 skips automatic and forced probes)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from plan" -l window-ms -d 'Activity sampling window in milliseconds (0 uses lifetime CPU averages)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from plan" -l min-age -d 'Only consider processes older than threshold (seconds)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from plan" -l sample-size -d 'Limit inference to a random sample of N processes (for testing)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from plan" -l prediction-fields -d 'Select prediction subfields to include (comma-separated) Options: memory,cpu,eta_abandoned,eta_resource_limit,trajectory,diagnostics' -r
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from plan" -l since -d 'Compare against prior session (coming in v1.2)' -r
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from plan" -l since-time -d 'Compare against time, e.g. \'2h\' or ISO timestamp (coming in v1.2)' -r
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from plan" -l goal -d 'Resource recovery goal, e.g. \'free 4GB RAM\'' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from plan" -l since -d 'Add an advisory comparison with a prior session to the complete fresh plan' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from plan" -l since-time -d 'Compare with the latest same-host snapshot at or before \'2h\' ago or an RFC3339 timestamp; always generate a complete fresh plan' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from plan" -l goal -d 'Resource goal (e.g. \'free 4GB RAM\') or pressure relief: relieve, cpu-pressure, mem-pressure, io-pressure' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from plan" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from plan" -l config -d 'Override config directory' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from plan" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
@@ -719,7 +882,7 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_s
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from plan" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from plan" -l yes -d 'Skip safety gate confirmations (use with caution)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from plan" -l include-kernel-threads -d 'Include kernel threads as candidates (default: exclude)'
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from plan" -l deep -d 'Force deep scan with all available probes'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from plan" -l deep -d 'Deep-scan every eligible candidate within the probe budget'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from plan" -l include-predictions -d 'Include trajectory prediction analysis in output'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from plan" -l minimal -d 'Minimal JSON output (PIDs, scores, and recommendations only)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from plan" -l pretty -d 'Pretty-print JSON output'
@@ -737,8 +900,9 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_s
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from plan" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from plan" -s V -l version -d 'Print version'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from explain" -l session -d 'Session ID (required)' -r
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from explain" -l pids -d 'PIDs to explain' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from explain" -l pids -d 'PIDs whose recorded session decisions should be explained' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from explain" -l target -d 'Target process with stable identity (format: pid:start_id)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from explain" -l window-ms -d 'Live activity sampling window in milliseconds (0 uses lifetime CPU averages)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from explain" -l include -d 'Include evidence breakdown' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from explain" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from explain" -l config -d 'Override config directory' -r
@@ -754,6 +918,7 @@ prose\t'Structured natural language for agent-to-user communication'"
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from explain" -l timeout -d 'Abort if operation exceeds time limit (seconds)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from explain" -l fields -d 'Select specific output fields (comma-separated or preset: minimal, standard, full)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from explain" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from explain" -l live -d 'Rescan live processes with current configuration instead of reading saved evidence'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from explain" -l galaxy-brain -d 'Include galaxy-brain math ledger'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from explain" -l show-dependencies -d 'Show process dependencies tree'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from explain" -l show-blast-radius -d 'Show blast radius impact analysis'
@@ -780,6 +945,9 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_s
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from apply" -l max-kills -d 'Max kills per run' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from apply" -l only-categories -d 'Only act on specific categories' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from apply" -l exclude-categories -d 'Exclude specific categories' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from apply" -l settle -d 'Observe host resources after executed actions for this many seconds (0 skips the interval)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from apply" -l expected-host-id -d 'Refuse if the current host or recorded plan host differs from this ID' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from apply" -l expected-plan-sha256 -d 'Refuse if the complete saved plan differs from this approved SHA-256' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from apply" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from apply" -l config -d 'Override config directory' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from apply" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
@@ -810,6 +978,35 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_s
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from apply" -l estimate-tokens -d 'Estimate token count without full response'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from apply" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from apply" -s V -l version -d 'Print version'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from undo" -l session -d 'Session containing the original action and its durable reversal receipt' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from undo" -l action-id -d 'Canonical action ID from the saved plan' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from undo" -l attempt-id -d 'Select an execution attempt when the action has more than one receipt' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from undo" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from undo" -l config -d 'Override config directory' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from undo" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
+toon\t'Token-Optimized Object Notation (TOON)'
+md\t'Human-readable Markdown'
+jsonl\t'Streaming JSON Lines for progress events'
+summary\t'One-line summary for quick status checks'
+metrics\t'Key=value pairs for monitoring systems'
+slack\t'Human-friendly narrative for chat/notifications'
+exitcode\t'Minimal output (exit code only)'
+prose\t'Structured natural language for agent-to-user communication'"
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from undo" -l timeout -d 'Abort if operation exceeds time limit (seconds)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from undo" -l fields -d 'Select specific output fields (comma-separated or preset: minimal, standard, full)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from undo" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from undo" -l confirm -d 'Restore the recorded state (otherwise inspect receipts without mutation)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from undo" -s v -l verbose -d 'Increase verbosity (-v, -vv, -vvv)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from undo" -s q -l quiet -d 'Decrease verbosity (quiet mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from undo" -l no-color -d 'Disable colored output'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from undo" -l robot -d 'Non-interactive mode; execute policy-approved actions automatically'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from undo" -l shadow -d 'Full pipeline but never execute actions (calibration mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from undo" -l dry-run -d 'Compute plan only, no execution even with --robot'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from undo" -l standalone -d 'Run without wrapper (uses detected/default capabilities)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from undo" -l compact -d 'Enable compact output (short keys, minified JSON)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from undo" -l estimate-tokens -d 'Estimate token count without full response'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from undo" -s h -l help -d 'Print help (see more with \'--help\')'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from undo" -s V -l version -d 'Print version'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from verify" -l session -d 'Session ID (required)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from verify" -l wait -d 'Wait for process termination with timeout in seconds (default: 0 = no wait)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from verify" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
@@ -868,6 +1065,7 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_s
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from diff" -s V -l version -d 'Print version'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from snapshot" -l label -d 'Label for the snapshot' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from snapshot" -l top -d 'Limit to top N processes by resource usage (CPU+memory)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from snapshot" -l window-ms -d 'Activity sampling window in milliseconds (0 uses lifetime CPU averages)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from snapshot" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from snapshot" -l config -d 'Override config directory' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from snapshot" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
@@ -884,7 +1082,7 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_s
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from snapshot" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from snapshot" -l include-env -d 'Include environment variables in snapshot (redacted by default)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from snapshot" -l include-network -d 'Include network connection information'
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from snapshot" -l minimal -d 'Minimal JSON output (host info and basic stats only)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from snapshot" -l minimal -d 'Observe pressure and the top ten responsible units without process inference'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from snapshot" -l pretty -d 'Pretty-print JSON output'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from snapshot" -s v -l verbose -d 'Increase verbosity (-v, -vv, -vvv)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from snapshot" -s q -l quiet -d 'Decrease verbosity (quiet mode)'
@@ -981,6 +1179,36 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_s
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from list-priors" -l estimate-tokens -d 'Estimate token count without full response'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from list-priors" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from list-priors" -s V -l version -d 'Print version'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from label" -l pid -d 'Live process whose command pattern to label' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from label" -l cmd -d 'Command line to label (instead of a live --pid)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from label" -l comm -d 'Process name for --cmd (default: basename of its first word)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from label" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from label" -l config -d 'Override config directory' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from label" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
+toon\t'Token-Optimized Object Notation (TOON)'
+md\t'Human-readable Markdown'
+jsonl\t'Streaming JSON Lines for progress events'
+summary\t'One-line summary for quick status checks'
+metrics\t'Key=value pairs for monitoring systems'
+slack\t'Human-friendly narrative for chat/notifications'
+exitcode\t'Minimal output (exit code only)'
+prose\t'Structured natural language for agent-to-user communication'"
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from label" -l timeout -d 'Abort if operation exceeds time limit (seconds)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from label" -l fields -d 'Select specific output fields (comma-separated or preset: minimal, standard, full)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from label" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from label" -l kill -d 'Processes like this should be killed'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from label" -l spare -d 'Processes like this should be left alone'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from label" -s v -l verbose -d 'Increase verbosity (-v, -vv, -vvv)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from label" -s q -l quiet -d 'Decrease verbosity (quiet mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from label" -l no-color -d 'Disable colored output'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from label" -l robot -d 'Non-interactive mode; execute policy-approved actions automatically'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from label" -l shadow -d 'Full pipeline but never execute actions (calibration mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from label" -l dry-run -d 'Compute plan only, no execution even with --robot'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from label" -l standalone -d 'Run without wrapper (uses detected/default capabilities)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from label" -l compact -d 'Enable compact output (short keys, minified JSON)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from label" -l estimate-tokens -d 'Estimate token count without full response'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from label" -s h -l help -d 'Print help (see more with \'--help\')'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from label" -s V -l version -d 'Print version'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from inbox" -l ack -d 'Acknowledge/dismiss an item by ID' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from inbox" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from inbox" -l config -d 'Override config directory' -r
@@ -1043,6 +1271,7 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_s
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from watch" -l threshold -d 'Trigger sensitivity (low|medium|high|critical)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from watch" -l interval -d 'Check interval in seconds' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from watch" -l min-age -d 'Only consider processes older than threshold (seconds)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from watch" -l window-ms -d 'Activity sampling window in milliseconds (0 uses lifetime CPU averages)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from watch" -l goal-memory-available-gb -d 'Goal: minimum memory available (GB) before alerting' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from watch" -l goal-load-max -d 'Goal: maximum 1-minute load average before alerting' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from watch" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
@@ -1128,6 +1357,41 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_s
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from import-priors" -l estimate-tokens -d 'Estimate token count without full response'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from import-priors" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from import-priors" -s V -l version -d 'Print version'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from report" -l session -d 'Session ID to generate report for (required unless using --bundle)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from report" -l bundle -d 'Path to a .ptb bundle file (alternative to --session)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from report" -s o -l out -d 'Output path for the HTML report' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from report" -l profile -d 'Redaction profile: minimal, safe (default), forensic' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from report" -l report-format -d 'Report output format: html (default), slack, prose' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from report" -l prose-style -d 'Prose style: terse, conversational (default), formal, technical' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from report" -l title -d 'Custom report title' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from report" -l theme -d 'Report theme: light, dark, auto (default)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from report" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from report" -l config -d 'Override config directory' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from report" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
+toon\t'Token-Optimized Object Notation (TOON)'
+md\t'Human-readable Markdown'
+jsonl\t'Streaming JSON Lines for progress events'
+summary\t'One-line summary for quick status checks'
+metrics\t'Key=value pairs for monitoring systems'
+slack\t'Human-friendly narrative for chat/notifications'
+exitcode\t'Minimal output (exit code only)'
+prose\t'Structured natural language for agent-to-user communication'"
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from report" -l timeout -d 'Abort if operation exceeds time limit (seconds)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from report" -l fields -d 'Select specific output fields (comma-separated or preset: minimal, standard, full)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from report" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from report" -l galaxy-brain -d 'Include full math ledger in report (galaxy-brain mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from report" -l embed-assets -d 'Inline CDN assets for offline viewing (file:// support)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from report" -s v -l verbose -d 'Increase verbosity (-v, -vv, -vvv)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from report" -s q -l quiet -d 'Decrease verbosity (quiet mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from report" -l no-color -d 'Disable colored output'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from report" -l robot -d 'Non-interactive mode; execute policy-approved actions automatically'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from report" -l shadow -d 'Full pipeline but never execute actions (calibration mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from report" -l dry-run -d 'Compute plan only, no execution even with --robot'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from report" -l standalone -d 'Run without wrapper (uses detected/default capabilities)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from report" -l compact -d 'Enable compact output (short keys, minified JSON)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from report" -l estimate-tokens -d 'Estimate token count without full response'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from report" -s h -l help -d 'Print help (see more with \'--help\')'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from report" -s V -l version -d 'Print version'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from init" -l agent -d 'Configure specific agent only (claude, codex, copilot, cursor, windsurf)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from init" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from init" -l config -d 'Override config directory' -r
@@ -1213,6 +1477,9 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_s
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from fleet" -l estimate-tokens -d 'Estimate token count without full response'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from fleet" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from fleet" -s V -l version -d 'Print version'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from fleet" -f -a "inventory" -d 'Preview fleet hosts without connecting (defaults to ~/.ssh/config)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from fleet" -f -a "health" -d 'Inspect current pressure and responsible units on remote hosts (read-only)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from fleet" -f -a "doctor" -d 'Audit remote host hygiene and show suggested remedies (never executed)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from fleet" -f -a "plan" -d 'Generate a fleet-wide plan across multiple hosts'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from fleet" -f -a "apply" -d 'Apply a fleet plan for a fleet session'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from fleet" -f -a "report" -d 'Generate a fleet report from a fleet session'
@@ -1222,24 +1489,27 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_s
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from help" -f -a "plan" -d 'Generate action plan without execution'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from help" -f -a "explain" -d 'Explain reasoning for specific candidates'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from help" -f -a "apply" -d 'Execute actions from a session'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from help" -f -a "undo" -d 'Inspect or restore the recorded state of a reversible cgroup action'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from help" -f -a "verify" -d 'Verify action outcomes'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from help" -f -a "diff" -d 'Show changes between sessions'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from help" -f -a "snapshot" -d 'Create session snapshot for later comparison'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from help" -f -a "capabilities" -d 'Dump current capabilities manifest'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from help" -f -a "sessions" -d 'List and manage sessions'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from help" -f -a "list-priors" -d 'List current prior configuration'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from help" -f -a "label" -d 'Record a human kill/spare verdict so future plans learn from it'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from help" -f -a "inbox" -d 'View pending plans and notifications'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from help" -f -a "tail" -d 'Stream session progress events (JSONL)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from help" -f -a "watch" -d 'Watch for new candidates and emit notifications'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from help" -f -a "export-priors" -d 'Export priors to file for transfer between machines'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from help" -f -a "import-priors" -d 'Import priors from file (bootstrap from external source)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from help" -f -a "report" -d 'Generate HTML report from session'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from help" -f -a "init" -d 'Initialize pt for installed coding agents'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from help" -f -a "export" -d 'Export session bundle (alias for bundle create)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from help" -f -a "fleet" -d 'Fleet-wide operations across multiple hosts'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -l config -d 'Override config directory' -r
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -l config -d 'Override config directory' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
 toon\t'Token-Optimized Object Notation (TOON)'
 md\t'Human-readable Markdown'
 jsonl\t'Streaming JSON Lines for progress events'
@@ -1248,49 +1518,55 @@ metrics\t'Key=value pairs for monitoring systems'
 slack\t'Human-friendly narrative for chat/notifications'
 exitcode\t'Minimal output (exit code only)'
 prose\t'Structured natural language for agent-to-user communication'"
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -l timeout -d 'Abort if operation exceeds time limit (seconds)' -r
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -l fields -d 'Select specific output fields (comma-separated or preset: minimal, standard, full)' -r
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -s v -l verbose -d 'Increase verbosity (-v, -vv, -vvv)'
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -s q -l quiet -d 'Decrease verbosity (quiet mode)'
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -l no-color -d 'Disable colored output'
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -l robot -d 'Non-interactive mode; execute policy-approved actions automatically'
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -l shadow -d 'Full pipeline but never execute actions (calibration mode)'
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -l dry-run -d 'Compute plan only, no execution even with --robot'
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -l standalone -d 'Run without wrapper (uses detected/default capabilities)'
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -l compact -d 'Enable compact output (short keys, minified JSON)'
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -l estimate-tokens -d 'Estimate token count without full response'
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -s h -l help -d 'Print help (see more with \'--help\')'
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -s V -l version -d 'Print version'
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -f -a "plan" -d 'Generate action plan without execution'
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -f -a "explain" -d 'Explain reasoning for specific candidates'
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -f -a "apply" -d 'Execute actions from a session'
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -f -a "verify" -d 'Verify action outcomes'
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -f -a "diff" -d 'Show changes between sessions'
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -f -a "snapshot" -d 'Create session snapshot for later comparison'
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -f -a "capabilities" -d 'Dump current capabilities manifest'
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -f -a "sessions" -d 'List and manage sessions'
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -f -a "list-priors" -d 'List current prior configuration'
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -f -a "inbox" -d 'View pending plans and notifications'
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -f -a "tail" -d 'Stream session progress events (JSONL)'
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -f -a "watch" -d 'Watch for new candidates and emit notifications'
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -f -a "export-priors" -d 'Export priors to file for transfer between machines'
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -f -a "import-priors" -d 'Import priors from file (bootstrap from external source)'
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -f -a "init" -d 'Initialize pt for installed coding agents'
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -f -a "export" -d 'Export session bundle (alias for bundle create)'
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -f -a "fleet" -d 'Fleet-wide operations across multiple hosts'
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply verify diff snapshot capabilities sessions list-priors inbox tail watch export-priors import-priors init export fleet help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -l timeout -d 'Abort if operation exceeds time limit (seconds)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -l fields -d 'Select specific output fields (comma-separated or preset: minimal, standard, full)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -s v -l verbose -d 'Increase verbosity (-v, -vv, -vvv)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -s q -l quiet -d 'Decrease verbosity (quiet mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -l no-color -d 'Disable colored output'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -l robot -d 'Non-interactive mode; execute policy-approved actions automatically'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -l shadow -d 'Full pipeline but never execute actions (calibration mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -l dry-run -d 'Compute plan only, no execution even with --robot'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -l standalone -d 'Run without wrapper (uses detected/default capabilities)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -l compact -d 'Enable compact output (short keys, minified JSON)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -l estimate-tokens -d 'Estimate token count without full response'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -s h -l help -d 'Print help (see more with \'--help\')'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -s V -l version -d 'Print version'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "plan" -d 'Generate action plan without execution'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "explain" -d 'Explain reasoning for specific candidates'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "apply" -d 'Execute actions from a session'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "undo" -d 'Inspect or restore the recorded state of a reversible cgroup action'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "verify" -d 'Verify action outcomes'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "diff" -d 'Show changes between sessions'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "snapshot" -d 'Create session snapshot for later comparison'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "capabilities" -d 'Dump current capabilities manifest'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "sessions" -d 'List and manage sessions'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "list-priors" -d 'List current prior configuration'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "label" -d 'Record a human kill/spare verdict so future plans learn from it'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "inbox" -d 'View pending plans and notifications'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "tail" -d 'Stream session progress events (JSONL)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "watch" -d 'Watch for new candidates and emit notifications'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "export-priors" -d 'Export priors to file for transfer between machines'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "import-priors" -d 'Import priors from file (bootstrap from external source)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "report" -d 'Generate HTML report from session'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "init" -d 'Initialize pt for installed coding agents'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "export" -d 'Export session bundle (alias for bundle create)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "fleet" -d 'Fleet-wide operations across multiple hosts'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and not __fish_seen_subcommand_from plan explain apply undo verify diff snapshot capabilities sessions list-priors label inbox tail watch export-priors import-priors report init export fleet help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from plan" -l session -d 'Resume existing session' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from plan" -l label -d 'Label for this plan session (e.g. "baseline" for diff --baseline)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from plan" -l max-candidates -d 'Maximum candidates to return' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from plan" -l pids -d 'Restrict inference to selected PIDs (comma-separated); ancestry and safety checks still use the full scan' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from plan" -l min-posterior -l threshold -d 'Minimum posterior probability threshold for candidate selection' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from plan" -l only -d 'Filter by recommendation (kill, review, all)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from plan" -l probe-budget-ms -d 'Maximum deep collection time in milliseconds (0 skips automatic and forced probes)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from plan" -l window-ms -d 'Activity sampling window in milliseconds (0 uses lifetime CPU averages)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from plan" -l min-age -d 'Only consider processes older than threshold (seconds)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from plan" -l sample-size -d 'Limit inference to a random sample of N processes (for testing)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from plan" -l prediction-fields -d 'Select prediction subfields to include (comma-separated) Options: memory,cpu,eta_abandoned,eta_resource_limit,trajectory,diagnostics' -r
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from plan" -l since -d 'Compare against prior session (coming in v1.2)' -r
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from plan" -l since-time -d 'Compare against time, e.g. \'2h\' or ISO timestamp (coming in v1.2)' -r
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from plan" -l goal -d 'Resource recovery goal, e.g. \'free 4GB RAM\'' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from plan" -l since -d 'Add an advisory comparison with a prior session to the complete fresh plan' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from plan" -l since-time -d 'Compare with the latest same-host snapshot at or before \'2h\' ago or an RFC3339 timestamp; always generate a complete fresh plan' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from plan" -l goal -d 'Resource goal (e.g. \'free 4GB RAM\') or pressure relief: relieve, cpu-pressure, mem-pressure, io-pressure' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from plan" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from plan" -l config -d 'Override config directory' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from plan" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
@@ -1307,7 +1583,7 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_s
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from plan" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from plan" -l yes -d 'Skip safety gate confirmations (use with caution)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from plan" -l include-kernel-threads -d 'Include kernel threads as candidates (default: exclude)'
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from plan" -l deep -d 'Force deep scan with all available probes'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from plan" -l deep -d 'Deep-scan every eligible candidate within the probe budget'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from plan" -l include-predictions -d 'Include trajectory prediction analysis in output'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from plan" -l minimal -d 'Minimal JSON output (PIDs, scores, and recommendations only)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from plan" -l pretty -d 'Pretty-print JSON output'
@@ -1325,8 +1601,9 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_s
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from plan" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from plan" -s V -l version -d 'Print version'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from explain" -l session -d 'Session ID (required)' -r
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from explain" -l pids -d 'PIDs to explain' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from explain" -l pids -d 'PIDs whose recorded session decisions should be explained' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from explain" -l target -d 'Target process with stable identity (format: pid:start_id)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from explain" -l window-ms -d 'Live activity sampling window in milliseconds (0 uses lifetime CPU averages)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from explain" -l include -d 'Include evidence breakdown' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from explain" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from explain" -l config -d 'Override config directory' -r
@@ -1342,6 +1619,7 @@ prose\t'Structured natural language for agent-to-user communication'"
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from explain" -l timeout -d 'Abort if operation exceeds time limit (seconds)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from explain" -l fields -d 'Select specific output fields (comma-separated or preset: minimal, standard, full)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from explain" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from explain" -l live -d 'Rescan live processes with current configuration instead of reading saved evidence'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from explain" -l galaxy-brain -d 'Include galaxy-brain math ledger'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from explain" -l show-dependencies -d 'Show process dependencies tree'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from explain" -l show-blast-radius -d 'Show blast radius impact analysis'
@@ -1368,6 +1646,9 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_s
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from apply" -l max-kills -d 'Max kills per run' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from apply" -l only-categories -d 'Only act on specific categories' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from apply" -l exclude-categories -d 'Exclude specific categories' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from apply" -l settle -d 'Observe host resources after executed actions for this many seconds (0 skips the interval)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from apply" -l expected-host-id -d 'Refuse if the current host or recorded plan host differs from this ID' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from apply" -l expected-plan-sha256 -d 'Refuse if the complete saved plan differs from this approved SHA-256' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from apply" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from apply" -l config -d 'Override config directory' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from apply" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
@@ -1398,6 +1679,35 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_s
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from apply" -l estimate-tokens -d 'Estimate token count without full response'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from apply" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from apply" -s V -l version -d 'Print version'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from undo" -l session -d 'Session containing the original action and its durable reversal receipt' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from undo" -l action-id -d 'Canonical action ID from the saved plan' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from undo" -l attempt-id -d 'Select an execution attempt when the action has more than one receipt' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from undo" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from undo" -l config -d 'Override config directory' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from undo" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
+toon\t'Token-Optimized Object Notation (TOON)'
+md\t'Human-readable Markdown'
+jsonl\t'Streaming JSON Lines for progress events'
+summary\t'One-line summary for quick status checks'
+metrics\t'Key=value pairs for monitoring systems'
+slack\t'Human-friendly narrative for chat/notifications'
+exitcode\t'Minimal output (exit code only)'
+prose\t'Structured natural language for agent-to-user communication'"
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from undo" -l timeout -d 'Abort if operation exceeds time limit (seconds)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from undo" -l fields -d 'Select specific output fields (comma-separated or preset: minimal, standard, full)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from undo" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from undo" -l confirm -d 'Restore the recorded state (otherwise inspect receipts without mutation)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from undo" -s v -l verbose -d 'Increase verbosity (-v, -vv, -vvv)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from undo" -s q -l quiet -d 'Decrease verbosity (quiet mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from undo" -l no-color -d 'Disable colored output'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from undo" -l robot -d 'Non-interactive mode; execute policy-approved actions automatically'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from undo" -l shadow -d 'Full pipeline but never execute actions (calibration mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from undo" -l dry-run -d 'Compute plan only, no execution even with --robot'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from undo" -l standalone -d 'Run without wrapper (uses detected/default capabilities)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from undo" -l compact -d 'Enable compact output (short keys, minified JSON)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from undo" -l estimate-tokens -d 'Estimate token count without full response'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from undo" -s h -l help -d 'Print help (see more with \'--help\')'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from undo" -s V -l version -d 'Print version'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from verify" -l session -d 'Session ID (required)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from verify" -l wait -d 'Wait for process termination with timeout in seconds (default: 0 = no wait)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from verify" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
@@ -1456,6 +1766,7 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_s
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from diff" -s V -l version -d 'Print version'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from snapshot" -l label -d 'Label for the snapshot' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from snapshot" -l top -d 'Limit to top N processes by resource usage (CPU+memory)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from snapshot" -l window-ms -d 'Activity sampling window in milliseconds (0 uses lifetime CPU averages)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from snapshot" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from snapshot" -l config -d 'Override config directory' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from snapshot" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
@@ -1472,7 +1783,7 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_s
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from snapshot" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from snapshot" -l include-env -d 'Include environment variables in snapshot (redacted by default)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from snapshot" -l include-network -d 'Include network connection information'
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from snapshot" -l minimal -d 'Minimal JSON output (host info and basic stats only)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from snapshot" -l minimal -d 'Observe pressure and the top ten responsible units without process inference'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from snapshot" -l pretty -d 'Pretty-print JSON output'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from snapshot" -s v -l verbose -d 'Increase verbosity (-v, -vv, -vvv)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from snapshot" -s q -l quiet -d 'Decrease verbosity (quiet mode)'
@@ -1569,6 +1880,36 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_s
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from list-priors" -l estimate-tokens -d 'Estimate token count without full response'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from list-priors" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from list-priors" -s V -l version -d 'Print version'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from label" -l pid -d 'Live process whose command pattern to label' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from label" -l cmd -d 'Command line to label (instead of a live --pid)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from label" -l comm -d 'Process name for --cmd (default: basename of its first word)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from label" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from label" -l config -d 'Override config directory' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from label" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
+toon\t'Token-Optimized Object Notation (TOON)'
+md\t'Human-readable Markdown'
+jsonl\t'Streaming JSON Lines for progress events'
+summary\t'One-line summary for quick status checks'
+metrics\t'Key=value pairs for monitoring systems'
+slack\t'Human-friendly narrative for chat/notifications'
+exitcode\t'Minimal output (exit code only)'
+prose\t'Structured natural language for agent-to-user communication'"
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from label" -l timeout -d 'Abort if operation exceeds time limit (seconds)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from label" -l fields -d 'Select specific output fields (comma-separated or preset: minimal, standard, full)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from label" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from label" -l kill -d 'Processes like this should be killed'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from label" -l spare -d 'Processes like this should be left alone'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from label" -s v -l verbose -d 'Increase verbosity (-v, -vv, -vvv)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from label" -s q -l quiet -d 'Decrease verbosity (quiet mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from label" -l no-color -d 'Disable colored output'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from label" -l robot -d 'Non-interactive mode; execute policy-approved actions automatically'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from label" -l shadow -d 'Full pipeline but never execute actions (calibration mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from label" -l dry-run -d 'Compute plan only, no execution even with --robot'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from label" -l standalone -d 'Run without wrapper (uses detected/default capabilities)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from label" -l compact -d 'Enable compact output (short keys, minified JSON)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from label" -l estimate-tokens -d 'Estimate token count without full response'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from label" -s h -l help -d 'Print help (see more with \'--help\')'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from label" -s V -l version -d 'Print version'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from inbox" -l ack -d 'Acknowledge/dismiss an item by ID' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from inbox" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from inbox" -l config -d 'Override config directory' -r
@@ -1631,6 +1972,7 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_s
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from watch" -l threshold -d 'Trigger sensitivity (low|medium|high|critical)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from watch" -l interval -d 'Check interval in seconds' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from watch" -l min-age -d 'Only consider processes older than threshold (seconds)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from watch" -l window-ms -d 'Activity sampling window in milliseconds (0 uses lifetime CPU averages)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from watch" -l goal-memory-available-gb -d 'Goal: minimum memory available (GB) before alerting' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from watch" -l goal-load-max -d 'Goal: maximum 1-minute load average before alerting' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from watch" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
@@ -1716,6 +2058,41 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_s
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from import-priors" -l estimate-tokens -d 'Estimate token count without full response'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from import-priors" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from import-priors" -s V -l version -d 'Print version'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from report" -l session -d 'Session ID to generate report for (required unless using --bundle)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from report" -l bundle -d 'Path to a .ptb bundle file (alternative to --session)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from report" -s o -l out -d 'Output path for the HTML report' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from report" -l profile -d 'Redaction profile: minimal, safe (default), forensic' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from report" -l report-format -d 'Report output format: html (default), slack, prose' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from report" -l prose-style -d 'Prose style: terse, conversational (default), formal, technical' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from report" -l title -d 'Custom report title' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from report" -l theme -d 'Report theme: light, dark, auto (default)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from report" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from report" -l config -d 'Override config directory' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from report" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
+toon\t'Token-Optimized Object Notation (TOON)'
+md\t'Human-readable Markdown'
+jsonl\t'Streaming JSON Lines for progress events'
+summary\t'One-line summary for quick status checks'
+metrics\t'Key=value pairs for monitoring systems'
+slack\t'Human-friendly narrative for chat/notifications'
+exitcode\t'Minimal output (exit code only)'
+prose\t'Structured natural language for agent-to-user communication'"
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from report" -l timeout -d 'Abort if operation exceeds time limit (seconds)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from report" -l fields -d 'Select specific output fields (comma-separated or preset: minimal, standard, full)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from report" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from report" -l galaxy-brain -d 'Include full math ledger in report (galaxy-brain mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from report" -l embed-assets -d 'Inline CDN assets for offline viewing (file:// support)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from report" -s v -l verbose -d 'Increase verbosity (-v, -vv, -vvv)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from report" -s q -l quiet -d 'Decrease verbosity (quiet mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from report" -l no-color -d 'Disable colored output'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from report" -l robot -d 'Non-interactive mode; execute policy-approved actions automatically'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from report" -l shadow -d 'Full pipeline but never execute actions (calibration mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from report" -l dry-run -d 'Compute plan only, no execution even with --robot'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from report" -l standalone -d 'Run without wrapper (uses detected/default capabilities)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from report" -l compact -d 'Enable compact output (short keys, minified JSON)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from report" -l estimate-tokens -d 'Estimate token count without full response'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from report" -s h -l help -d 'Print help (see more with \'--help\')'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from report" -s V -l version -d 'Print version'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from init" -l agent -d 'Configure specific agent only (claude, codex, copilot, cursor, windsurf)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from init" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from init" -l config -d 'Override config directory' -r
@@ -1801,6 +2178,9 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_s
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from fleet" -l estimate-tokens -d 'Estimate token count without full response'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from fleet" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from fleet" -s V -l version -d 'Print version'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from fleet" -f -a "inventory" -d 'Preview fleet hosts without connecting (defaults to ~/.ssh/config)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from fleet" -f -a "health" -d 'Inspect current pressure and responsible units on remote hosts (read-only)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from fleet" -f -a "doctor" -d 'Audit remote host hygiene and show suggested remedies (never executed)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from fleet" -f -a "plan" -d 'Generate a fleet-wide plan across multiple hosts'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from fleet" -f -a "apply" -d 'Apply a fleet plan for a fleet session'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from fleet" -f -a "report" -d 'Generate a fleet report from a fleet session'
@@ -1810,17 +2190,20 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_s
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from help" -f -a "plan" -d 'Generate action plan without execution'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from help" -f -a "explain" -d 'Explain reasoning for specific candidates'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from help" -f -a "apply" -d 'Execute actions from a session'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from help" -f -a "undo" -d 'Inspect or restore the recorded state of a reversible cgroup action'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from help" -f -a "verify" -d 'Verify action outcomes'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from help" -f -a "diff" -d 'Show changes between sessions'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from help" -f -a "snapshot" -d 'Create session snapshot for later comparison'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from help" -f -a "capabilities" -d 'Dump current capabilities manifest'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from help" -f -a "sessions" -d 'List and manage sessions'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from help" -f -a "list-priors" -d 'List current prior configuration'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from help" -f -a "label" -d 'Record a human kill/spare verdict so future plans learn from it'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from help" -f -a "inbox" -d 'View pending plans and notifications'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from help" -f -a "tail" -d 'Stream session progress events (JSONL)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from help" -f -a "watch" -d 'Watch for new candidates and emit notifications'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from help" -f -a "export-priors" -d 'Export priors to file for transfer between machines'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from help" -f -a "import-priors" -d 'Import priors from file (bootstrap from external source)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from help" -f -a "report" -d 'Generate HTML report from session'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from help" -f -a "init" -d 'Initialize pt for installed coding agents'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from help" -f -a "export" -d 'Export session bundle (alias for bundle create)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from help" -f -a "fleet" -d 'Fleet-wide operations across multiple hosts'
@@ -1858,7 +2241,7 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand config; and not __fish_s
 complete -c pt-core -n "__fish_pt_core_using_subcommand config; and not __fish_seen_subcommand_from show schema validate list-presets show-preset diff-preset export-preset help" -f -a "diff-preset" -d 'Compare a preset with current configuration'
 complete -c pt-core -n "__fish_pt_core_using_subcommand config; and not __fish_seen_subcommand_from show schema validate list-presets show-preset diff-preset export-preset help" -f -a "export-preset" -d 'Export a preset to a file'
 complete -c pt-core -n "__fish_pt_core_using_subcommand config; and not __fish_seen_subcommand_from show schema validate list-presets show-preset diff-preset export-preset help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
-complete -c pt-core -n "__fish_pt_core_using_subcommand config; and __fish_seen_subcommand_from show" -l file -d 'Show specific config file (priors, policy, capabilities)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand config; and __fish_seen_subcommand_from show" -l file -d 'Show specific config file (priors or policy)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand config; and __fish_seen_subcommand_from show" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand config; and __fish_seen_subcommand_from show" -l config -d 'Override config directory' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand config; and __fish_seen_subcommand_from show" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
@@ -1884,7 +2267,7 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand config; and __fish_seen_
 complete -c pt-core -n "__fish_pt_core_using_subcommand config; and __fish_seen_subcommand_from show" -l estimate-tokens -d 'Estimate token count without full response'
 complete -c pt-core -n "__fish_pt_core_using_subcommand config; and __fish_seen_subcommand_from show" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c pt-core -n "__fish_pt_core_using_subcommand config; and __fish_seen_subcommand_from show" -s V -l version -d 'Print version'
-complete -c pt-core -n "__fish_pt_core_using_subcommand config; and __fish_seen_subcommand_from schema" -l file -d 'Schema to print (priors, policy, capabilities)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand config; and __fish_seen_subcommand_from schema" -l file -d 'Schema to print (priors or policy)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand config; and __fish_seen_subcommand_from schema" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand config; and __fish_seen_subcommand_from schema" -l config -d 'Override config directory' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand config; and __fish_seen_subcommand_from schema" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
@@ -2044,6 +2427,197 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand config; and __fish_seen_
 complete -c pt-core -n "__fish_pt_core_using_subcommand config; and __fish_seen_subcommand_from help" -f -a "diff-preset" -d 'Compare a preset with current configuration'
 complete -c pt-core -n "__fish_pt_core_using_subcommand config; and __fish_seen_subcommand_from help" -f -a "export-preset" -d 'Export a preset to a file'
 complete -c pt-core -n "__fish_pt_core_using_subcommand config; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and not __fish_seen_subcommand_from start stop status install service-status uninstall help" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and not __fish_seen_subcommand_from start stop status install service-status uninstall help" -l config -d 'Override config directory' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and not __fish_seen_subcommand_from start stop status install service-status uninstall help" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
+toon\t'Token-Optimized Object Notation (TOON)'
+md\t'Human-readable Markdown'
+jsonl\t'Streaming JSON Lines for progress events'
+summary\t'One-line summary for quick status checks'
+metrics\t'Key=value pairs for monitoring systems'
+slack\t'Human-friendly narrative for chat/notifications'
+exitcode\t'Minimal output (exit code only)'
+prose\t'Structured natural language for agent-to-user communication'"
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and not __fish_seen_subcommand_from start stop status install service-status uninstall help" -l timeout -d 'Abort if operation exceeds time limit (seconds)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and not __fish_seen_subcommand_from start stop status install service-status uninstall help" -l fields -d 'Select specific output fields (comma-separated or preset: minimal, standard, full)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and not __fish_seen_subcommand_from start stop status install service-status uninstall help" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and not __fish_seen_subcommand_from start stop status install service-status uninstall help" -s v -l verbose -d 'Increase verbosity (-v, -vv, -vvv)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and not __fish_seen_subcommand_from start stop status install service-status uninstall help" -s q -l quiet -d 'Decrease verbosity (quiet mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and not __fish_seen_subcommand_from start stop status install service-status uninstall help" -l no-color -d 'Disable colored output'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and not __fish_seen_subcommand_from start stop status install service-status uninstall help" -l robot -d 'Non-interactive mode; execute policy-approved actions automatically'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and not __fish_seen_subcommand_from start stop status install service-status uninstall help" -l shadow -d 'Full pipeline but never execute actions (calibration mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and not __fish_seen_subcommand_from start stop status install service-status uninstall help" -l dry-run -d 'Compute plan only, no execution even with --robot'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and not __fish_seen_subcommand_from start stop status install service-status uninstall help" -l standalone -d 'Run without wrapper (uses detected/default capabilities)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and not __fish_seen_subcommand_from start stop status install service-status uninstall help" -l compact -d 'Enable compact output (short keys, minified JSON)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and not __fish_seen_subcommand_from start stop status install service-status uninstall help" -l estimate-tokens -d 'Estimate token count without full response'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and not __fish_seen_subcommand_from start stop status install service-status uninstall help" -s h -l help -d 'Print help (see more with \'--help\')'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and not __fish_seen_subcommand_from start stop status install service-status uninstall help" -s V -l version -d 'Print version'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and not __fish_seen_subcommand_from start stop status install service-status uninstall help" -f -a "start" -d 'Start the daemon'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and not __fish_seen_subcommand_from start stop status install service-status uninstall help" -f -a "stop" -d 'Stop the daemon'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and not __fish_seen_subcommand_from start stop status install service-status uninstall help" -f -a "status" -d 'Check daemon status'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and not __fish_seen_subcommand_from start stop status install service-status uninstall help" -f -a "install" -d 'Install a per-user monitoring service (use --dry-run to preview)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and not __fish_seen_subcommand_from start stop status install service-status uninstall help" -f -a "service-status" -d 'Inspect the installed service definition and service-manager state'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and not __fish_seen_subcommand_from start stop status install service-status uninstall help" -f -a "uninstall" -d 'Disable, stop, and remove the verified managed service definition'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and not __fish_seen_subcommand_from start stop status install service-status uninstall help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from start" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from start" -l config -d 'Override config directory' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from start" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
+toon\t'Token-Optimized Object Notation (TOON)'
+md\t'Human-readable Markdown'
+jsonl\t'Streaming JSON Lines for progress events'
+summary\t'One-line summary for quick status checks'
+metrics\t'Key=value pairs for monitoring systems'
+slack\t'Human-friendly narrative for chat/notifications'
+exitcode\t'Minimal output (exit code only)'
+prose\t'Structured natural language for agent-to-user communication'"
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from start" -l timeout -d 'Abort if operation exceeds time limit (seconds)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from start" -l fields -d 'Select specific output fields (comma-separated or preset: minimal, standard, full)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from start" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from start" -l foreground -d 'Run in foreground'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from start" -s v -l verbose -d 'Increase verbosity (-v, -vv, -vvv)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from start" -s q -l quiet -d 'Decrease verbosity (quiet mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from start" -l no-color -d 'Disable colored output'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from start" -l robot -d 'Non-interactive mode; execute policy-approved actions automatically'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from start" -l shadow -d 'Full pipeline but never execute actions (calibration mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from start" -l dry-run -d 'Compute plan only, no execution even with --robot'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from start" -l standalone -d 'Run without wrapper (uses detected/default capabilities)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from start" -l compact -d 'Enable compact output (short keys, minified JSON)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from start" -l estimate-tokens -d 'Estimate token count without full response'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from start" -s h -l help -d 'Print help (see more with \'--help\')'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from start" -s V -l version -d 'Print version'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from stop" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from stop" -l config -d 'Override config directory' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from stop" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
+toon\t'Token-Optimized Object Notation (TOON)'
+md\t'Human-readable Markdown'
+jsonl\t'Streaming JSON Lines for progress events'
+summary\t'One-line summary for quick status checks'
+metrics\t'Key=value pairs for monitoring systems'
+slack\t'Human-friendly narrative for chat/notifications'
+exitcode\t'Minimal output (exit code only)'
+prose\t'Structured natural language for agent-to-user communication'"
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from stop" -l timeout -d 'Abort if operation exceeds time limit (seconds)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from stop" -l fields -d 'Select specific output fields (comma-separated or preset: minimal, standard, full)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from stop" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from stop" -s v -l verbose -d 'Increase verbosity (-v, -vv, -vvv)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from stop" -s q -l quiet -d 'Decrease verbosity (quiet mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from stop" -l no-color -d 'Disable colored output'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from stop" -l robot -d 'Non-interactive mode; execute policy-approved actions automatically'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from stop" -l shadow -d 'Full pipeline but never execute actions (calibration mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from stop" -l dry-run -d 'Compute plan only, no execution even with --robot'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from stop" -l standalone -d 'Run without wrapper (uses detected/default capabilities)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from stop" -l compact -d 'Enable compact output (short keys, minified JSON)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from stop" -l estimate-tokens -d 'Estimate token count without full response'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from stop" -s h -l help -d 'Print help (see more with \'--help\')'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from stop" -s V -l version -d 'Print version'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from status" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from status" -l config -d 'Override config directory' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from status" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
+toon\t'Token-Optimized Object Notation (TOON)'
+md\t'Human-readable Markdown'
+jsonl\t'Streaming JSON Lines for progress events'
+summary\t'One-line summary for quick status checks'
+metrics\t'Key=value pairs for monitoring systems'
+slack\t'Human-friendly narrative for chat/notifications'
+exitcode\t'Minimal output (exit code only)'
+prose\t'Structured natural language for agent-to-user communication'"
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from status" -l timeout -d 'Abort if operation exceeds time limit (seconds)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from status" -l fields -d 'Select specific output fields (comma-separated or preset: minimal, standard, full)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from status" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from status" -s v -l verbose -d 'Increase verbosity (-v, -vv, -vvv)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from status" -s q -l quiet -d 'Decrease verbosity (quiet mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from status" -l no-color -d 'Disable colored output'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from status" -l robot -d 'Non-interactive mode; execute policy-approved actions automatically'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from status" -l shadow -d 'Full pipeline but never execute actions (calibration mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from status" -l dry-run -d 'Compute plan only, no execution even with --robot'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from status" -l standalone -d 'Run without wrapper (uses detected/default capabilities)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from status" -l compact -d 'Enable compact output (short keys, minified JSON)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from status" -l estimate-tokens -d 'Estimate token count without full response'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from status" -s h -l help -d 'Print help (see more with \'--help\')'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from status" -s V -l version -d 'Print version'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from install" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from install" -l config -d 'Override config directory' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from install" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
+toon\t'Token-Optimized Object Notation (TOON)'
+md\t'Human-readable Markdown'
+jsonl\t'Streaming JSON Lines for progress events'
+summary\t'One-line summary for quick status checks'
+metrics\t'Key=value pairs for monitoring systems'
+slack\t'Human-friendly narrative for chat/notifications'
+exitcode\t'Minimal output (exit code only)'
+prose\t'Structured natural language for agent-to-user communication'"
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from install" -l timeout -d 'Abort if operation exceeds time limit (seconds)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from install" -l fields -d 'Select specific output fields (comma-separated or preset: minimal, standard, full)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from install" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from install" -l activate -d 'Enable and start monitoring; the installed daemon only generates review plans'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from install" -s v -l verbose -d 'Increase verbosity (-v, -vv, -vvv)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from install" -s q -l quiet -d 'Decrease verbosity (quiet mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from install" -l no-color -d 'Disable colored output'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from install" -l robot -d 'Non-interactive mode; execute policy-approved actions automatically'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from install" -l shadow -d 'Full pipeline but never execute actions (calibration mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from install" -l dry-run -d 'Compute plan only, no execution even with --robot'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from install" -l standalone -d 'Run without wrapper (uses detected/default capabilities)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from install" -l compact -d 'Enable compact output (short keys, minified JSON)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from install" -l estimate-tokens -d 'Estimate token count without full response'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from install" -s h -l help -d 'Print help (see more with \'--help\')'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from install" -s V -l version -d 'Print version'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from service-status" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from service-status" -l config -d 'Override config directory' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from service-status" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
+toon\t'Token-Optimized Object Notation (TOON)'
+md\t'Human-readable Markdown'
+jsonl\t'Streaming JSON Lines for progress events'
+summary\t'One-line summary for quick status checks'
+metrics\t'Key=value pairs for monitoring systems'
+slack\t'Human-friendly narrative for chat/notifications'
+exitcode\t'Minimal output (exit code only)'
+prose\t'Structured natural language for agent-to-user communication'"
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from service-status" -l timeout -d 'Abort if operation exceeds time limit (seconds)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from service-status" -l fields -d 'Select specific output fields (comma-separated or preset: minimal, standard, full)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from service-status" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from service-status" -s v -l verbose -d 'Increase verbosity (-v, -vv, -vvv)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from service-status" -s q -l quiet -d 'Decrease verbosity (quiet mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from service-status" -l no-color -d 'Disable colored output'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from service-status" -l robot -d 'Non-interactive mode; execute policy-approved actions automatically'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from service-status" -l shadow -d 'Full pipeline but never execute actions (calibration mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from service-status" -l dry-run -d 'Compute plan only, no execution even with --robot'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from service-status" -l standalone -d 'Run without wrapper (uses detected/default capabilities)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from service-status" -l compact -d 'Enable compact output (short keys, minified JSON)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from service-status" -l estimate-tokens -d 'Estimate token count without full response'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from service-status" -s h -l help -d 'Print help (see more with \'--help\')'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from service-status" -s V -l version -d 'Print version'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from uninstall" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from uninstall" -l config -d 'Override config directory' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from uninstall" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
+toon\t'Token-Optimized Object Notation (TOON)'
+md\t'Human-readable Markdown'
+jsonl\t'Streaming JSON Lines for progress events'
+summary\t'One-line summary for quick status checks'
+metrics\t'Key=value pairs for monitoring systems'
+slack\t'Human-friendly narrative for chat/notifications'
+exitcode\t'Minimal output (exit code only)'
+prose\t'Structured natural language for agent-to-user communication'"
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from uninstall" -l timeout -d 'Abort if operation exceeds time limit (seconds)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from uninstall" -l fields -d 'Select specific output fields (comma-separated or preset: minimal, standard, full)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from uninstall" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from uninstall" -s v -l verbose -d 'Increase verbosity (-v, -vv, -vvv)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from uninstall" -s q -l quiet -d 'Decrease verbosity (quiet mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from uninstall" -l no-color -d 'Disable colored output'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from uninstall" -l robot -d 'Non-interactive mode; execute policy-approved actions automatically'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from uninstall" -l shadow -d 'Full pipeline but never execute actions (calibration mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from uninstall" -l dry-run -d 'Compute plan only, no execution even with --robot'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from uninstall" -l standalone -d 'Run without wrapper (uses detected/default capabilities)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from uninstall" -l compact -d 'Enable compact output (short keys, minified JSON)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from uninstall" -l estimate-tokens -d 'Estimate token count without full response'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from uninstall" -s h -l help -d 'Print help (see more with \'--help\')'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from uninstall" -s V -l version -d 'Print version'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from help" -f -a "start" -d 'Start the daemon'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from help" -f -a "stop" -d 'Stop the daemon'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from help" -f -a "status" -d 'Check daemon status'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from help" -f -a "install" -d 'Install a per-user monitoring service (use --dry-run to preview)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from help" -f -a "service-status" -d 'Inspect the installed service definition and service-manager state'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from help" -f -a "uninstall" -d 'Disable, stop, and remove the verified managed service definition'
+complete -c pt-core -n "__fish_pt_core_using_subcommand daemon; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and not __fish_seen_subcommand_from status export prune redact help" -l telemetry-dir -d 'Telemetry root directory (defaults to XDG data dir)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and not __fish_seen_subcommand_from status export prune redact help" -l retention-config -d 'Retention config JSON path (defaults to config dir telemetry_retention.json if present)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and not __fish_seen_subcommand_from status export prune redact help" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
@@ -2072,9 +2646,9 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and not __fis
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and not __fish_seen_subcommand_from status export prune redact help" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and not __fish_seen_subcommand_from status export prune redact help" -s V -l version -d 'Print version'
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and not __fish_seen_subcommand_from status export prune redact help" -f -a "status" -d 'Show telemetry status'
-complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and not __fish_seen_subcommand_from status export prune redact help" -f -a "export" -d 'Export telemetry data'
+complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and not __fish_seen_subcommand_from status export prune redact help" -f -a "export" -d 'Export one persisted telemetry table without changing its stored redaction'
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and not __fish_seen_subcommand_from status export prune redact help" -f -a "prune" -d 'Prune old telemetry data'
-complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and not __fish_seen_subcommand_from status export prune redact help" -f -a "redact" -d 'Redact sensitive data'
+complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and not __fish_seen_subcommand_from status export prune redact help" -f -a "redact" -d 'Create a private redacted copy of all persisted telemetry tables'
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and not __fish_seen_subcommand_from status export prune redact help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from status" -l telemetry-dir -d 'Telemetry root directory (defaults to XDG data dir)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from status" -l retention-config -d 'Retention config JSON path (defaults to config dir telemetry_retention.json if present)' -r
@@ -2103,12 +2677,27 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_se
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from status" -l estimate-tokens -d 'Estimate token count without full response'
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from status" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from status" -s V -l version -d 'Print version'
-complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from export" -s o -l output -d 'Output path' -r
-complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from export" -l format -d 'Export format (parquet, csv, json)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from export" -s o -l output -d 'Output path (must not exist, and must be outside the telemetry directory)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from export" -l export-format -d 'Export format (separate from the global output format)' -r -f -a "parquet\t''
+csv\t''
+json\t''
+jsonl\t''"
+complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from export" -l table -d 'Table: runs, proc_samples, proc_features, proc_inference, outcomes, audit, signature_matches' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from export" -l range -d 'Export only this event-time range (default: all stored rows)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from export" -l session -d 'Filter rows by exact session ID' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from export" -l telemetry-dir -d 'Telemetry root directory (defaults to XDG data dir)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from export" -l retention-config -d 'Retention config JSON path (defaults to config dir telemetry_retention.json if present)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from export" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from export" -l config -d 'Override config directory' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from export" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
+toon\t'Token-Optimized Object Notation (TOON)'
+md\t'Human-readable Markdown'
+jsonl\t'Streaming JSON Lines for progress events'
+summary\t'One-line summary for quick status checks'
+metrics\t'Key=value pairs for monitoring systems'
+slack\t'Human-friendly narrative for chat/notifications'
+exitcode\t'Minimal output (exit code only)'
+prose\t'Structured natural language for agent-to-user communication'"
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from export" -l timeout -d 'Abort if operation exceeds time limit (seconds)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from export" -l fields -d 'Select specific output fields (comma-separated or preset: minimal, standard, full)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from export" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
@@ -2121,7 +2710,7 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_se
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from export" -l standalone -d 'Run without wrapper (uses detected/default capabilities)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from export" -l compact -d 'Enable compact output (short keys, minified JSON)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from export" -l estimate-tokens -d 'Estimate token count without full response'
-complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from export" -s h -l help -d 'Print help'
+complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from export" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from export" -s V -l version -d 'Print version'
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from prune" -l keep -d 'Keep data newer than (e.g., "30d", "90d")' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from prune" -l telemetry-dir -d 'Telemetry root directory (defaults to XDG data dir)' -r
@@ -2152,6 +2741,9 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_se
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from prune" -l estimate-tokens -d 'Estimate token count without full response'
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from prune" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from prune" -s V -l version -d 'Print version'
+complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from redact" -s o -l output -d 'New output directory, outside the source telemetry directory' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from redact" -l profile -d 'Sharing profile; one fresh pseudonymization key is used for the entire copy' -r -f -a "safe\t''
+minimal\t''"
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from redact" -l telemetry-dir -d 'Telemetry root directory (defaults to XDG data dir)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from redact" -l retention-config -d 'Retention config JSON path (defaults to config dir telemetry_retention.json if present)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from redact" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
@@ -2168,7 +2760,7 @@ prose\t'Structured natural language for agent-to-user communication'"
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from redact" -l timeout -d 'Abort if operation exceeds time limit (seconds)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from redact" -l fields -d 'Select specific output fields (comma-separated or preset: minimal, standard, full)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from redact" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
-complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from redact" -l all -d 'Apply redaction to all stored telemetry'
+complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from redact" -l all -d 'Include all persisted tables (source data is never modified)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from redact" -s v -l verbose -d 'Increase verbosity (-v, -vv, -vvv)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from redact" -s q -l quiet -d 'Decrease verbosity (quiet mode)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from redact" -l no-color -d 'Disable colored output'
@@ -2181,9 +2773,9 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_se
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from redact" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from redact" -s V -l version -d 'Print version'
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from help" -f -a "status" -d 'Show telemetry status'
-complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from help" -f -a "export" -d 'Export telemetry data'
+complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from help" -f -a "export" -d 'Export one persisted telemetry table without changing its stored redaction'
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from help" -f -a "prune" -d 'Prune old telemetry data'
-complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from help" -f -a "redact" -d 'Redact sensitive data'
+complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from help" -f -a "redact" -d 'Create a private redacted copy of all persisted telemetry tables'
 complete -c pt-core -n "__fish_pt_core_using_subcommand telemetry; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand shadow; and not __fish_seen_subcommand_from start run stop status export report help" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand shadow; and not __fish_seen_subcommand_from start run stop status export report help" -l config -d 'Override config directory' -r
@@ -2439,7 +3031,12 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand signature; and not __fis
 complete -c pt-core -n "__fish_pt_core_using_subcommand signature; and not __fish_seen_subcommand_from list show add remove test validate export disable enable import stats help" -f -a "import" -d 'Import signatures from a file or .ptb bundle'
 complete -c pt-core -n "__fish_pt_core_using_subcommand signature; and not __fish_seen_subcommand_from list show add remove test validate export disable enable import stats help" -f -a "stats" -d 'Show signature performance statistics'
 complete -c pt-core -n "__fish_pt_core_using_subcommand signature; and not __fish_seen_subcommand_from list show add remove test validate export disable enable import stats help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
-complete -c pt-core -n "__fish_pt_core_using_subcommand signature; and __fish_seen_subcommand_from list" -l category -d 'Filter by category (agent, ide, ci, orchestrator, terminal, other)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand signature; and __fish_seen_subcommand_from list" -l category -d 'Filter by category' -r -f -a "agent\t'AI coding agents (Claude, Codex, Aider, Cursor)'
+ide\t'IDEs and development tools (VS Code, JetBrains)'
+ci\t'CI/CD systems (GitHub Actions, GitLab Runner, Jenkins)'
+orchestrator\t'Process orchestrators (systemd, launchd)'
+terminal\t'Terminal multiplexers (tmux, screen)'
+other\t'Other known supervisors'"
 complete -c pt-core -n "__fish_pt_core_using_subcommand signature; and __fish_seen_subcommand_from list" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand signature; and __fish_seen_subcommand_from list" -l config -d 'Override config directory' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand signature; and __fish_seen_subcommand_from list" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
@@ -2492,13 +3089,20 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand signature; and __fish_se
 complete -c pt-core -n "__fish_pt_core_using_subcommand signature; and __fish_seen_subcommand_from show" -l estimate-tokens -d 'Estimate token count without full response'
 complete -c pt-core -n "__fish_pt_core_using_subcommand signature; and __fish_seen_subcommand_from show" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c pt-core -n "__fish_pt_core_using_subcommand signature; and __fish_seen_subcommand_from show" -s V -l version -d 'Print version'
-complete -c pt-core -n "__fish_pt_core_using_subcommand signature; and __fish_seen_subcommand_from add" -l category -d 'Category (agent, ide, ci, orchestrator, terminal, other)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand signature; and __fish_seen_subcommand_from add" -l category -d 'Category' -r -f -a "agent\t'AI coding agents (Claude, Codex, Aider, Cursor)'
+ide\t'IDEs and development tools (VS Code, JetBrains)'
+ci\t'CI/CD systems (GitHub Actions, GitLab Runner, Jenkins)'
+orchestrator\t'Process orchestrators (systemd, launchd)'
+terminal\t'Terminal multiplexers (tmux, screen)'
+other\t'Other known supervisors'"
 complete -c pt-core -n "__fish_pt_core_using_subcommand signature; and __fish_seen_subcommand_from add" -l pattern -d 'Process name patterns (regex)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand signature; and __fish_seen_subcommand_from add" -l arg-pattern -d 'Command line argument patterns (regex)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand signature; and __fish_seen_subcommand_from add" -l env-var -d 'Environment variable (format: NAME=VALUE_REGEX)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand signature; and __fish_seen_subcommand_from add" -l confidence -d 'Confidence weight (0.0-1.0)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand signature; and __fish_seen_subcommand_from add" -l notes -d 'Optional notes about the signature' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand signature; and __fish_seen_subcommand_from add" -l priority -d 'Priority (higher = checked first)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand signature; and __fish_seen_subcommand_from add" -l prior -d 'What matching processes usually are. Sets the signature\'s class priors, which is what changes their score: `useful` (normal; keep them) or `abandoned` (usually left behind; safe to clean up). Without it the signature only labels matches' -r -f -a "useful\t'Normal, wanted processes (~90% useful prior)'
+abandoned\t'Processes that are usually left behind (~80% abandoned prior)'"
 complete -c pt-core -n "__fish_pt_core_using_subcommand signature; and __fish_seen_subcommand_from add" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand signature; and __fish_seen_subcommand_from add" -l config -d 'Override config directory' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand signature; and __fish_seen_subcommand_from add" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
@@ -3011,29 +3615,35 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand version" -l compact -d '
 complete -c pt-core -n "__fish_pt_core_using_subcommand version" -l estimate-tokens -d 'Estimate token count without full response'
 complete -c pt-core -n "__fish_pt_core_using_subcommand version" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c pt-core -n "__fish_pt_core_using_subcommand version" -s V -l version -d 'Print version'
-complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan deep-scan diff query bundle report check learn agent config telemetry shadow signature schema update mcp completions version help" -f -a "run" -d 'Interactive golden path: scan → infer → plan → TUI approval → staged apply'
-complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan deep-scan diff query bundle report check learn agent config telemetry shadow signature schema update mcp completions version help" -f -a "scan" -d 'Quick multi-sample scan only (no inference or action)'
-complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan deep-scan diff query bundle report check learn agent config telemetry shadow signature schema update mcp completions version help" -f -a "deep-scan" -d 'Full deep scan with all available probes'
-complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan deep-scan diff query bundle report check learn agent config telemetry shadow signature schema update mcp completions version help" -f -a "diff" -d 'Compare two sessions and show differences'
-complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan deep-scan diff query bundle report check learn agent config telemetry shadow signature schema update mcp completions version help" -f -a "query" -d 'Query telemetry and history'
-complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan deep-scan diff query bundle report check learn agent config telemetry shadow signature schema update mcp completions version help" -f -a "bundle" -d 'Create or inspect diagnostic bundles'
-complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan deep-scan diff query bundle report check learn agent config telemetry shadow signature schema update mcp completions version help" -f -a "report" -d 'Generate HTML reports'
-complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan deep-scan diff query bundle report check learn agent config telemetry shadow signature schema update mcp completions version help" -f -a "check" -d 'Validate configuration and environment'
-complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan deep-scan diff query bundle report check learn agent config telemetry shadow signature schema update mcp completions version help" -f -a "learn" -d 'Interactive tutorials and onboarding guidance'
-complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan deep-scan diff query bundle report check learn agent config telemetry shadow signature schema update mcp completions version help" -f -a "agent" -d 'Agent/robot subcommands for automated operation'
-complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan deep-scan diff query bundle report check learn agent config telemetry shadow signature schema update mcp completions version help" -f -a "config" -d 'Configuration management'
-complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan deep-scan diff query bundle report check learn agent config telemetry shadow signature schema update mcp completions version help" -f -a "telemetry" -d 'Telemetry management'
-complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan deep-scan diff query bundle report check learn agent config telemetry shadow signature schema update mcp completions version help" -f -a "shadow" -d 'Shadow mode observation management'
-complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan deep-scan diff query bundle report check learn agent config telemetry shadow signature schema update mcp completions version help" -f -a "signature" -d 'Signature management (list, add, remove user signatures)'
-complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan deep-scan diff query bundle report check learn agent config telemetry shadow signature schema update mcp completions version help" -f -a "schema" -d 'Generate JSON schemas for agent output types'
-complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan deep-scan diff query bundle report check learn agent config telemetry shadow signature schema update mcp completions version help" -f -a "update" -d 'Update management: rollback, backup, version history'
-complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan deep-scan diff query bundle report check learn agent config telemetry shadow signature schema update mcp completions version help" -f -a "mcp" -d 'MCP server for AI agent integration'
-complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan deep-scan diff query bundle report check learn agent config telemetry shadow signature schema update mcp completions version help" -f -a "completions" -d 'Generate shell completion scripts'
-complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan deep-scan diff query bundle report check learn agent config telemetry shadow signature schema update mcp completions version help" -f -a "version" -d 'Print version information'
-complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan deep-scan diff query bundle report check learn agent config telemetry shadow signature schema update mcp completions version help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan replay deep-scan __deep-scan-worker diff query bundle report check doctor learn agent config daemon telemetry shadow signature schema update mcp completions version help" -f -a "run" -d 'Interactive golden path: scan → infer → plan → TUI approval → staged apply'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan replay deep-scan __deep-scan-worker diff query bundle report check doctor learn agent config daemon telemetry shadow signature schema update mcp completions version help" -f -a "scan" -d 'Scan processes, record observations, or replay recorded scores (no actions)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan replay deep-scan __deep-scan-worker diff query bundle report check doctor learn agent config daemon telemetry shadow signature schema update mcp completions version help" -f -a "replay" -d 'Review recorded processes and compare scoring configurations without actions'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan replay deep-scan __deep-scan-worker diff query bundle report check doctor learn agent config daemon telemetry shadow signature schema update mcp completions version help" -f -a "deep-scan" -d 'Full deep scan with all available probes'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan replay deep-scan __deep-scan-worker diff query bundle report check doctor learn agent config daemon telemetry shadow signature schema update mcp completions version help" -f -a "__deep-scan-worker"
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan replay deep-scan __deep-scan-worker diff query bundle report check doctor learn agent config daemon telemetry shadow signature schema update mcp completions version help" -f -a "diff" -d 'Compare two sessions and show differences'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan replay deep-scan __deep-scan-worker diff query bundle report check doctor learn agent config daemon telemetry shadow signature schema update mcp completions version help" -f -a "query" -d 'Query telemetry and history'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan replay deep-scan __deep-scan-worker diff query bundle report check doctor learn agent config daemon telemetry shadow signature schema update mcp completions version help" -f -a "bundle" -d 'Create or inspect diagnostic bundles'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan replay deep-scan __deep-scan-worker diff query bundle report check doctor learn agent config daemon telemetry shadow signature schema update mcp completions version help" -f -a "report" -d 'Generate HTML reports'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan replay deep-scan __deep-scan-worker diff query bundle report check doctor learn agent config daemon telemetry shadow signature schema update mcp completions version help" -f -a "check" -d 'Validate configuration and environment'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan replay deep-scan __deep-scan-worker diff query bundle report check doctor learn agent config daemon telemetry shadow signature schema update mcp completions version help" -f -a "doctor" -d 'Read-only host hygiene audit: VM tuning, swap/zram, oomd limits, journald, file-handle/inotify limits, zombie parents (suggests commands, never runs them)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan replay deep-scan __deep-scan-worker diff query bundle report check doctor learn agent config daemon telemetry shadow signature schema update mcp completions version help" -f -a "learn" -d 'Interactive tutorials and onboarding guidance'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan replay deep-scan __deep-scan-worker diff query bundle report check doctor learn agent config daemon telemetry shadow signature schema update mcp completions version help" -f -a "agent" -d 'Agent/robot subcommands for automated operation'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan replay deep-scan __deep-scan-worker diff query bundle report check doctor learn agent config daemon telemetry shadow signature schema update mcp completions version help" -f -a "config" -d 'Configuration management'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan replay deep-scan __deep-scan-worker diff query bundle report check doctor learn agent config daemon telemetry shadow signature schema update mcp completions version help" -f -a "daemon" -d 'Background monitoring daemon'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan replay deep-scan __deep-scan-worker diff query bundle report check doctor learn agent config daemon telemetry shadow signature schema update mcp completions version help" -f -a "telemetry" -d 'Telemetry management'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan replay deep-scan __deep-scan-worker diff query bundle report check doctor learn agent config daemon telemetry shadow signature schema update mcp completions version help" -f -a "shadow" -d 'Shadow mode observation management'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan replay deep-scan __deep-scan-worker diff query bundle report check doctor learn agent config daemon telemetry shadow signature schema update mcp completions version help" -f -a "signature" -d 'Signature management (list, add, remove user signatures)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan replay deep-scan __deep-scan-worker diff query bundle report check doctor learn agent config daemon telemetry shadow signature schema update mcp completions version help" -f -a "schema" -d 'Generate JSON schemas for agent output types'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan replay deep-scan __deep-scan-worker diff query bundle report check doctor learn agent config daemon telemetry shadow signature schema update mcp completions version help" -f -a "update" -d 'Update management: rollback, backup, version history'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan replay deep-scan __deep-scan-worker diff query bundle report check doctor learn agent config daemon telemetry shadow signature schema update mcp completions version help" -f -a "mcp" -d 'MCP server for AI agent integration'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan replay deep-scan __deep-scan-worker diff query bundle report check doctor learn agent config daemon telemetry shadow signature schema update mcp completions version help" -f -a "completions" -d 'Generate shell completion scripts'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan replay deep-scan __deep-scan-worker diff query bundle report check doctor learn agent config daemon telemetry shadow signature schema update mcp completions version help" -f -a "version" -d 'Print version information'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan replay deep-scan __deep-scan-worker diff query bundle report check doctor learn agent config daemon telemetry shadow signature schema update mcp completions version help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from replay" -f -a "label-template" -d 'Create a private review document with every captured identity left unlabeled'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from replay" -f -a "evaluate" -d 'Compare an incumbent and the current --config using the same reviewed capture'
 complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from query" -f -a "sessions" -d 'Query recent sessions'
 complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from query" -f -a "actions" -d 'Query action history'
-complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from query" -f -a "telemetry" -d 'Query telemetry data'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from query" -f -a "telemetry" -d 'Query recent rows from a persisted Parquet telemetry table'
 complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from bundle" -f -a "create" -d 'Create a new diagnostic bundle from a session'
 complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from bundle" -f -a "inspect" -d 'Inspect an existing bundle'
 complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from bundle" -f -a "extract" -d 'Extract bundle contents'
@@ -3045,17 +3655,20 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_su
 complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from agent" -f -a "plan" -d 'Generate action plan without execution'
 complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from agent" -f -a "explain" -d 'Explain reasoning for specific candidates'
 complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from agent" -f -a "apply" -d 'Execute actions from a session'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from agent" -f -a "undo" -d 'Inspect or restore the recorded state of a reversible cgroup action'
 complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from agent" -f -a "verify" -d 'Verify action outcomes'
 complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from agent" -f -a "diff" -d 'Show changes between sessions'
 complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from agent" -f -a "snapshot" -d 'Create session snapshot for later comparison'
 complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from agent" -f -a "capabilities" -d 'Dump current capabilities manifest'
 complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from agent" -f -a "sessions" -d 'List and manage sessions'
 complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from agent" -f -a "list-priors" -d 'List current prior configuration'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from agent" -f -a "label" -d 'Record a human kill/spare verdict so future plans learn from it'
 complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from agent" -f -a "inbox" -d 'View pending plans and notifications'
 complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from agent" -f -a "tail" -d 'Stream session progress events (JSONL)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from agent" -f -a "watch" -d 'Watch for new candidates and emit notifications'
 complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from agent" -f -a "export-priors" -d 'Export priors to file for transfer between machines'
 complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from agent" -f -a "import-priors" -d 'Import priors from file (bootstrap from external source)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from agent" -f -a "report" -d 'Generate HTML report from session'
 complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from agent" -f -a "init" -d 'Initialize pt for installed coding agents'
 complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from agent" -f -a "export" -d 'Export session bundle (alias for bundle create)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from agent" -f -a "fleet" -d 'Fleet-wide operations across multiple hosts'
@@ -3066,10 +3679,16 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_su
 complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from config" -f -a "show-preset" -d 'Show configuration values for a preset'
 complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from config" -f -a "diff-preset" -d 'Compare a preset with current configuration'
 complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from config" -f -a "export-preset" -d 'Export a preset to a file'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from daemon" -f -a "start" -d 'Start the daemon'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from daemon" -f -a "stop" -d 'Stop the daemon'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from daemon" -f -a "status" -d 'Check daemon status'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from daemon" -f -a "install" -d 'Install a per-user monitoring service (use --dry-run to preview)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from daemon" -f -a "service-status" -d 'Inspect the installed service definition and service-manager state'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from daemon" -f -a "uninstall" -d 'Disable, stop, and remove the verified managed service definition'
 complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from telemetry" -f -a "status" -d 'Show telemetry status'
-complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from telemetry" -f -a "export" -d 'Export telemetry data'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from telemetry" -f -a "export" -d 'Export one persisted telemetry table without changing its stored redaction'
 complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from telemetry" -f -a "prune" -d 'Prune old telemetry data'
-complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from telemetry" -f -a "redact" -d 'Redact sensitive data'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from telemetry" -f -a "redact" -d 'Create a private redacted copy of all persisted telemetry tables'
 complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from shadow" -f -a "start" -d 'Start shadow mode observation loop'
 complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from shadow" -f -a "run" -d 'Run a foreground shadow loop (internal)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from shadow" -f -a "stop" -d 'Stop background shadow observer'

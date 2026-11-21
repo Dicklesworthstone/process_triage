@@ -43009,3 +43009,54 @@ fn parse_duration(s: &str) -> Option<chrono::Duration> {
         _ => None,
     }
 }
+
+#[cfg(all(test, feature = "ui", feature = "report", feature = "daemon"))]
+mod completions_freshness_tests {
+    use super::Cli;
+    use clap::CommandFactory;
+    use clap_complete::Shell;
+    use std::path::Path;
+
+    #[test]
+    fn committed_shell_completions_match_generated() {
+        let completions_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../completions");
+        for (shell, filename) in [
+            (Shell::Bash, "pt-core.bash"),
+            (Shell::Zsh, "_pt-core"),
+            (Shell::Fish, "pt-core.fish"),
+        ] {
+            let mut generated = Vec::new();
+            clap_complete::generate(shell, &mut Cli::command(), "pt-core", &mut generated);
+            let generated =
+                String::from_utf8(generated).expect("generated completions must be valid UTF-8");
+            let path = completions_dir.join(filename);
+            let committed = std::fs::read_to_string(&path).unwrap_or_else(|err| {
+                panic!(
+                    "failed to read committed completion file {}: {err}; regenerate with `just completions`",
+                    path.display()
+                )
+            });
+            if committed != generated {
+                let first_diff = committed
+                    .lines()
+                    .zip(generated.lines())
+                    .enumerate()
+                    .find(|(_, (a, b))| a != b)
+                    .map(|(idx, (a, b))| {
+                        format!("first diff at line {}: committed={a:?} vs generated={b:?}", idx + 1)
+                    })
+                    .unwrap_or_else(|| {
+                        format!(
+                            "line count mismatch: committed={} vs generated={}",
+                            committed.lines().count(),
+                            generated.lines().count()
+                        )
+                    });
+                panic!(
+                    "committed completion file {} is stale ({first_diff}); run `just completions` to regenerate",
+                    path.display()
+                );
+            }
+        }
+    }
+}
