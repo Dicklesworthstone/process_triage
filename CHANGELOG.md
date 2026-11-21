@@ -10,10 +10,10 @@ Repository: <https://github.com/Dicklesworthstone/process_triage>
 
 ---
 
-## [v2.4.0] -- 2026-11-21 **[GitHub Release]**
+## [v2.4.1] -- 2026-11-21 **[GitHub Release]**
 
-194 commits since v2.3.0 (through `cfbebcf`).
-This release hardens live safety and identity bindings across Linux and macOS, adds read-only fleet health/doctor inspection and SSH-config discovery, expands bounded telemetry querying/redaction and execution-bound resource-relief verification, upgrades workspace dependencies (resolving 17 RustSec advisories), and enforces `opt-level = 3` across native release profiles.
+195 commits since v2.3.0 (superseding git-only tag `v2.4.0`, which required GLIBC 2.28 for `libc::renameat2`).
+This release invokes Linux `SYS_renameat2` directly to preserve the `GLIBC 2.17` and static `musl` compatibility floor, hardens live safety and identity bindings across Linux and macOS, adds read-only fleet health/doctor inspection and SSH-config discovery, expands bounded telemetry querying/redaction and execution-bound resource-relief verification, upgrades workspace dependencies (resolving 17 RustSec advisories), and enforces `opt-level = 3` across native release profiles.
 
 ### Added
 

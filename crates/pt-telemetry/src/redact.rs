@@ -363,13 +363,17 @@ fn publish_directory(staging: &Path, output: &Path) -> io::Result<()> {
         #[cfg(target_os = "linux")]
         // SAFETY: both C strings are owned and live for this syscall; the
         // operation only renames the completed private directory without replace.
+        // Call SYS_renameat2 directly so Linux release binaries stay compatible
+        // with GLIBC 2.17 and musl (glibc added the renameat2 wrapper in 2.28).
         let result = unsafe {
-            libc::renameat2(
+            const RENAME_NOREPLACE: libc::c_uint = 1;
+            libc::syscall(
+                libc::SYS_renameat2,
                 libc::AT_FDCWD,
                 staging.as_ptr(),
                 libc::AT_FDCWD,
                 output.as_ptr(),
-                libc::RENAME_NOREPLACE,
+                RENAME_NOREPLACE,
             )
         };
         #[cfg(target_os = "macos")]
