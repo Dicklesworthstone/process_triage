@@ -22813,7 +22813,13 @@ mod process_tree_safety_tests {
             assert!(output.selected_pids.is_empty());
             assert_eq!(output.result.total_contributions, [0.0]);
             assert!(fixture.rows.iter().all(|row| !row.selected));
-            assert!(fixture.executable(&output.selected_pids).actions.is_empty());
+            assert!(build_plan_from_selection(
+                &fixture.session,
+                &fixture.policy,
+                &output.selected_pids,
+                &fixture.inputs,
+            )
+            .is_err());
         }
 
         #[test]
@@ -23268,7 +23274,7 @@ mod process_tree_safety_tests {
             vec![super::GoalActionOutcome {
                 pid: 100,
                 label: "sleep 600".to_string(),
-                success: false,
+                success: true,
                 respawn_detected: false,
                 expected_contribution: Some(50.0),
             }],
@@ -23496,7 +23502,7 @@ mod process_tree_safety_tests {
         let error =
             super::build_plan_from_selection(&session, &policy, &[100, 200, 300], &candidates)
                 .unwrap_err();
-        assert!(error.contains("selected 3 kills exceed the per-run policy limit 2"));
+        assert!(error.contains("selected 3 kills/restarts exceed the per-run policy limit 2"));
         policy.guardrails.max_kills_per_run = 0;
         assert!(super::build_plan_from_selection(&session, &policy, &[100], &candidates).is_err());
     }
@@ -37639,7 +37645,7 @@ mod agent_undo_tests {
                     "uid": 1000,
                     "pgid": 40,
                     "sid": 30,
-                    "quality": "full",
+                    "quality": "Full",
                 },
                 "action": "freeze",
                 "order": 0,
