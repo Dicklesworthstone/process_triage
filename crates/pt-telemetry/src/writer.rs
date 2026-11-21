@@ -209,7 +209,7 @@ impl BatchedWriter {
         let props = WriterProperties::builder()
             .set_writer_version(WriterVersion::PARQUET_2_0)
             .set_compression(self.config.compression)
-            .set_max_row_group_size(self.config.row_group_size)
+            .set_max_row_group_row_count(Some(self.config.row_group_size))
             // Dictionary encoding for string columns
             .set_dictionary_enabled(true)
             // Use plain encoding for numeric columns

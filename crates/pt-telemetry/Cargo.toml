@@ -7,8 +7,8 @@ license = "MIT"
 
 [dependencies]
 # Arrow/Parquet
-arrow = { version = "53", features = ["prettyprint"] }
-parquet = { version = "53", features = ["zstd", "snap", "async"] }
+arrow = { version = "60", features = ["prettyprint", "chrono-tz"] }
+parquet = { version = "60", features = ["zstd", "async"] }
 
 # Core dependencies
 serde.workspace = true

@@ -99,9 +99,14 @@ pub fn redact_telemetry(
         Err(error) => return Err(error.into()),
     }
 
-    let staging = tempfile::Builder::new()
-        .prefix(".pt-redacted-")
-        .tempdir_in(&parent)?;
+    let mut staging_builder = tempfile::Builder::new();
+    staging_builder.prefix(".pt-redacted-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        staging_builder.permissions(fs::Permissions::from_mode(0o700));
+    }
+    let staging = staging_builder.tempdir_in(&parent)?;
     let schemas = TelemetrySchema::new();
     let mut summary = RedactionSummary::default();
     for table in TableName::ALL {
@@ -109,7 +114,7 @@ pub fn redact_telemetry(
         create_private_directory(&directory)?;
         let mut file = create_private_file(&directory.join("part-00000.parquet"))?;
         let properties = WriterProperties::builder()
-            .set_max_row_group_size(READ_BATCH_SIZE)
+            .set_max_row_group_row_count(Some(READ_BATCH_SIZE))
             .build();
         let mut writer = ArrowWriter::try_new(&mut file, schemas.get(table), Some(properties))?;
         let mut values_redacted = 0;
