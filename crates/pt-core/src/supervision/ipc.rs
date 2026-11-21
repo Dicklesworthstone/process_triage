@@ -5,8 +5,8 @@
 use super::types::{EvidenceType, SupervisionEvidence, SupervisorCategory};
 #[cfg(target_os = "linux")]
 use crate::collect::network::{
-    has_inet_socket_inode, parse_proc_net_unix, read_network_process_identity,
-    read_task_network_inventory, revalidate_network_observation,
+    has_inet_socket_inode, parse_proc_net_unix, read_inet_socket_inodes,
+    read_network_process_identity, read_task_network_inventory, revalidate_network_observation,
     NetworkNamespace as ObservedNetworkNamespace, NETWORK_MAX_DESCRIPTORS, NETWORK_MAX_TASKS,
 };
 #[cfg(target_os = "linux")]
@@ -21,7 +21,7 @@ use std::os::unix::fs::MetadataExt;
 #[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -343,6 +343,11 @@ fn read_socket_paths_with_refresh(
                 } else {
                     None
                 };
+                // TCP/UDP descriptors are not in the Unix table. Resolve them
+                // through one scan-scoped namespace inventory, rather than
+                // reparsing every protocol table for each descriptor. Live
+                // action checks intentionally continue to collect fresh proof.
+                let mut inet = None;
                 for &inode in socket_inodes {
                     let observed = match table.get(&inode) {
                         Some(None) if unnamed.is_some() => {
@@ -354,14 +359,24 @@ fn read_socket_paths_with_refresh(
                         if let Some(path) = path {
                             sockets.push(path.clone());
                         }
-                    } else if !has_inet_socket_inode(pid, inode).map_err(|source| {
-                        IpcError::IoError {
-                            pid,
-                            path: format!("/proc/{pid}/net TCP/UDP tables"),
-                            source,
+                    } else {
+                        let known_inet = if let Some(snapshot) = scan {
+                            if inet.is_none() {
+                                inet = Some(snapshot.inet_table_for(pid, namespace, handle)?);
+                            }
+                            inet.as_ref().is_some_and(|table| table.contains(&inode))
+                        } else {
+                            has_inet_socket_inode(pid, inode).map_err(|source| {
+                                IpcError::IoError {
+                                    pid,
+                                    path: format!("/proc/{pid}/net TCP/UDP tables"),
+                                    source,
+                                }
+                            })?
+                        };
+                        if !known_inet {
+                            return Err(IpcError::UnclassifiedSocket { pid, inode });
                         }
-                    })? {
-                        return Err(IpcError::UnclassifiedSocket { pid, inode });
                     }
                 }
             }
@@ -432,15 +447,21 @@ type UnixSocketPaths = HashMap<u64, Option<String>>;
 #[cfg(target_os = "linux")]
 #[derive(Default)]
 struct ScanUnixSocketPaths {
-    tables: Mutex<HashMap<NetworkNamespace, ScanUnixSocketTable>>,
+    tables: Mutex<HashMap<NetworkNamespace, Arc<ScanUnixSocketTable>>>,
     #[cfg(test)]
     table_reads: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    inet_table_reads: std::sync::atomic::AtomicUsize,
 }
+
+#[cfg(target_os = "linux")]
+type ObservedInetSocketInodes = Result<Arc<HashSet<u64>>, (std::io::ErrorKind, String)>;
 
 #[cfg(target_os = "linux")]
 struct ScanUnixSocketTable {
     _namespace: fs::File,
     table: Arc<UnixSocketPaths>,
+    inet: OnceLock<ObservedInetSocketInodes>,
 }
 
 #[cfg(target_os = "linux")]
@@ -451,13 +472,22 @@ impl ScanUnixSocketPaths {
         namespace: NetworkNamespace,
         handle: &fs::File,
     ) -> Result<Arc<UnixSocketPaths>, IpcError> {
+        Ok(Arc::clone(&self.entry_for(pid, namespace, handle)?.table))
+    }
+
+    fn entry_for(
+        &self,
+        pid: u32,
+        namespace: NetworkNamespace,
+        handle: &fs::File,
+    ) -> Result<Arc<ScanUnixSocketTable>, IpcError> {
         check_network_namespace(pid, namespace)?;
         let mut tables = self
             .tables
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(entry) = tables.get(&namespace) {
-            return Ok(Arc::clone(&entry.table));
+            return Ok(Arc::clone(entry));
         }
         #[cfg(test)]
         self.table_reads
@@ -469,14 +499,46 @@ impl ScanUnixSocketPaths {
             path: format!("/proc/{pid}/ns/net"),
             source,
         })?;
-        tables.insert(
-            namespace,
-            ScanUnixSocketTable {
-                _namespace: namespace_handle,
-                table: Arc::clone(&table),
-            },
-        );
-        Ok(table)
+        let entry = Arc::new(ScanUnixSocketTable {
+            _namespace: namespace_handle,
+            table,
+            inet: OnceLock::new(),
+        });
+        tables.insert(namespace, Arc::clone(&entry));
+        Ok(entry)
+    }
+
+    fn inet_table_for(
+        &self,
+        pid: u32,
+        namespace: NetworkNamespace,
+        handle: &fs::File,
+    ) -> Result<Arc<HashSet<u64>>, IpcError> {
+        let entry = self.entry_for(pid, namespace, handle)?;
+        let observed = entry.inet.get_or_init(|| {
+            #[cfg(test)]
+            self.inet_table_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Cache failures too: one malformed namespace must not trigger the
+            // same expensive parse for every candidate. Namespace changes poison
+            // this view instead of saving tables under the wrong namespace key.
+            read_inet_socket_inodes(pid)
+                .and_then(|table| {
+                    check_network_namespace(pid, namespace)
+                        .map_err(|error| std::io::Error::other(error.to_string()))?;
+                    Ok(Arc::new(table))
+                })
+                .map_err(|error| (error.kind(), error.to_string()))
+        });
+        check_network_namespace(pid, namespace)?;
+        match observed {
+            Ok(table) => Ok(Arc::clone(table)),
+            Err((kind, reason)) => Err(IpcError::IoError {
+                pid,
+                path: format!("/proc/{pid}/net TCP/UDP tables"),
+                source: std::io::Error::new(*kind, reason.clone()),
+            }),
+        }
     }
 }
 
@@ -573,7 +635,7 @@ impl IpcAnalyzer {
         }
     }
 
-    /// Reuse one strict Unix-socket view per network namespace during a read-only
+    /// Reuse strict socket views per network namespace during a read-only
     /// scan. Descriptors and process/namespace identities are still read live;
     /// sockets absent from that view must be classified or reported as unknown.
     /// Known unnamed sockets are refreshed because a later bind can name them.
@@ -1074,6 +1136,70 @@ mod tests {
                 let _ = self.0.kill();
                 let _ = self.0.wait();
             }
+        }
+
+        #[test]
+        fn scan_reuses_one_inet_inventory_across_candidates_and_descriptors() {
+            let children: Vec<_> = (0..12)
+                .map(|_| {
+                    let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                    let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+                    SocketChild::with_socket(tcp.into(), Stdio::from(OwnedFd::from(udp)))
+                })
+                .collect();
+            let scan = IpcAnalyzer::for_scan();
+            let live = IpcAnalyzer::new();
+            for child in &children {
+                for _ in 0..2 {
+                    let observed = scan.analyze(child.pid()).unwrap();
+                    let current = live.analyze(child.pid()).unwrap();
+                    assert!(!observed.is_supervised);
+                    assert_eq!(observed.is_supervised, current.is_supervised);
+                    assert_eq!(observed.matched_sockets, current.matched_sockets);
+                }
+            }
+            let snapshot = scan.scan.as_ref().unwrap();
+            assert_eq!(snapshot.table_reads.load(Ordering::Relaxed), 1);
+            assert_eq!(snapshot.inet_table_reads.load(Ordering::Relaxed), 1);
+            let tables = snapshot.tables.lock().unwrap();
+            assert_eq!(tables.len(), 1);
+            assert!(tables
+                .values()
+                .all(|entry| entry.inet.get().unwrap().is_ok()));
+            assert!(live.scan.is_none());
+        }
+
+        #[test]
+        fn scan_refuses_new_inet_inodes_while_live_and_new_scan_refresh() {
+            let original = SocketChild::with_socket(
+                std::net::TcpListener::bind("127.0.0.1:0").unwrap().into(),
+                Stdio::null(),
+            );
+            let scan = IpcAnalyzer::for_scan();
+            assert!(!scan.analyze(original.pid()).unwrap().is_supervised);
+
+            let new_sockets: [OwnedFd; 2] = [
+                std::net::TcpListener::bind("127.0.0.1:0").unwrap().into(),
+                std::net::UdpSocket::bind("127.0.0.1:0").unwrap().into(),
+            ];
+            for socket in new_sockets {
+                let child = SocketChild::with_socket(socket, Stdio::null());
+                assert!(matches!(
+                    scan.analyze(child.pid()),
+                    Err(IpcError::UnclassifiedSocket { pid, .. }) if pid == child.pid()
+                ));
+                for analyzer in [IpcAnalyzer::new(), IpcAnalyzer::for_scan()] {
+                    assert!(!analyzer.analyze(child.pid()).unwrap().is_supervised);
+                }
+            }
+            assert_eq!(
+                scan.scan
+                    .as_ref()
+                    .unwrap()
+                    .inet_table_reads
+                    .load(Ordering::Relaxed),
+                1
+            );
         }
 
         #[test]

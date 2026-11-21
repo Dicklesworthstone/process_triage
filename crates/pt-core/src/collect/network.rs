@@ -1062,6 +1062,45 @@ pub(crate) fn has_inet_socket_inode(pid: u32, inode: u64) -> std::io::Result<boo
     Ok(false)
 }
 
+/// Read one bounded TCP/UDP inode inventory for a scan's network namespace.
+/// Every present table is validated before it can establish a socket's protocol.
+/// Missing protocol modules are permitted, but an inode absent from this set
+/// remains unclassified; an empty set never proves that a process has no IPC.
+#[cfg(target_os = "linux")]
+pub(crate) fn read_inet_socket_inodes(pid: u32) -> std::io::Result<HashSet<u64>> {
+    read_inet_socket_inodes_from(&PathBuf::from(format!("/proc/{pid}/net")), 16 * 1024 * 1024)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn read_inet_socket_inodes_from(
+    net_dir: &Path,
+    mut remaining_bytes: usize,
+) -> std::io::Result<HashSet<u64>> {
+    let mut inodes = HashSet::new();
+    for (protocol, ipv6) in [
+        ("tcp", false),
+        ("udp", false),
+        ("tcp6", true),
+        ("udp6", true),
+    ] {
+        let path = net_dir.join(protocol);
+        let Some(content) = read_optional_socket_table(&path, &mut remaining_bytes)? else {
+            continue;
+        };
+        let observed = validate_inet_table(&content, ipv6).map_err(|error| {
+            std::io::Error::new(error.kind(), format!("{}: {error}", path.display()))
+        })?;
+        for inode in observed {
+            if !inodes.insert(inode) {
+                return Err(invalid_network(
+                    "socket inode appears in multiple TCP/UDP protocol tables",
+                ));
+            }
+        }
+    }
+    Ok(inodes)
+}
+
 #[cfg(any(target_os = "linux", test))]
 fn inet_table_has_inode<R: BufRead>(reader: R, inode: u64) -> std::io::Result<bool> {
     Ok(inet_table_inodes_until(reader, Some(inode))?.contains(&inode))
@@ -1145,8 +1184,8 @@ fn inet_table_inodes_until<R: BufRead>(
     Ok(inodes)
 }
 
-fn validate_inet_table(content: &str, ipv6: bool) -> std::io::Result<()> {
-    inet_table_inodes(content.as_bytes())?;
+fn validate_inet_table(content: &str, ipv6: bool) -> std::io::Result<HashSet<u64>> {
+    let inodes = inet_table_inodes(content.as_bytes())?;
     let address_len = if ipv6 { 32 } else { 8 };
     for line in content
         .lines()
@@ -1166,7 +1205,7 @@ fn validate_inet_table(content: &str, ipv6: bool) -> std::io::Result<()> {
             ));
         }
     }
-    Ok(())
+    Ok(inodes)
 }
 
 fn named_inode_table(content: &str) -> std::io::Result<HashSet<u64>> {
@@ -1868,6 +1907,72 @@ mod tests {
         let (addr, port) = parse_addr_port("00000000:1F90", false);
         assert_eq!(addr, "0.0.0.0");
         assert_eq!(port, 8080);
+    }
+
+    #[test]
+    fn scan_inet_inventory_collects_all_protocols_with_one_byte_budget() {
+        const HEADER: &str = "sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n";
+        let directory = tempfile::tempdir().unwrap();
+        let mut bytes = 0;
+        for (index, protocol) in ["tcp", "udp", "tcp6", "udp6"].iter().enumerate() {
+            let address = if protocol.ends_with('6') {
+                "00000000000000000000000000000001"
+            } else {
+                "0100007F"
+            };
+            let content = format!(
+                "{HEADER}0: {address}:1F90 {address}:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 {}\n",
+                42 + index
+            );
+            bytes += content.len();
+            fs::write(directory.path().join(protocol), content).unwrap();
+        }
+        assert_eq!(
+            read_inet_socket_inodes_from(directory.path(), bytes).unwrap(),
+            HashSet::from([42, 43, 44, 45])
+        );
+        let error = read_inet_socket_inodes_from(directory.path(), bytes - 1).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("byte limit exceeded"));
+    }
+
+    #[test]
+    fn scan_inet_inventory_rejects_incomplete_and_ambiguous_tables() {
+        const HEADER: &str = "sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n";
+        const ROW: &str =
+            "0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 42\n";
+        for content in [
+            String::new(),
+            format!("{HEADER}{ROW}truncated\n"),
+            format!("{HEADER}{ROW}{ROW}"),
+            format!(
+                "{HEADER}0: 00000000000000000000000000000001:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 42\n"
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            fs::write(directory.path().join("tcp"), &content).unwrap();
+            let error = read_inet_socket_inodes_from(directory.path(), 4096).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{content}");
+        }
+        let duplicate = tempfile::tempdir().unwrap();
+        for protocol in ["tcp", "udp"] {
+            fs::write(duplicate.path().join(protocol), format!("{HEADER}{ROW}")).unwrap();
+        }
+        assert!(read_inet_socket_inodes_from(duplicate.path(), 4096)
+            .unwrap_err()
+            .to_string()
+            .contains("multiple TCP/UDP protocol tables"));
+
+        let unreadable = tempfile::tempdir().unwrap();
+        fs::create_dir(unreadable.path().join("tcp")).unwrap();
+        assert!(read_inet_socket_inodes_from(unreadable.path(), 4096).is_err());
+
+        // Kernels without a protocol module may omit a table. The missing
+        // table grants no positive protocol classification for any descriptor.
+        let absent = tempfile::tempdir().unwrap();
+        assert!(read_inet_socket_inodes_from(absent.path(), 4096)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
