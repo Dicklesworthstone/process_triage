@@ -20,7 +20,7 @@ hex = "0.4"
 base64 = "0.22"
 
 # Pattern matching
-regex = "1.13.1"
+regex = "1.13.2"
 once_cell = "1.21.4"
 
 # Random key generation

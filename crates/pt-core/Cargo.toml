@@ -17,19 +17,19 @@ name = "pt-core"
 path = "src/main.rs"
 
 [dependencies]
-clap = { version = "4.6.7", features = ["derive", "env", "string"] }
+clap = { version = "4.6.9", features = ["derive", "env", "string"] }
 clap_complete = "4"
 serde.workspace = true
 serde_json.workspace = true
 yaml_serde = "0.10.7"
-schemars = { version = "1.2.2", features = ["chrono04"] }
+schemars = { version = "1.2.3", features = ["chrono04"] }
 toml = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 thiserror.workspace = true
 dirs = "5"
 libc = "0.2"
-regex = "1.13.1"
+regex = "1.13.2"
 sha2 = "0.10"
 hex = "0.4"
 rand = "0.9.5"
@@ -80,7 +80,7 @@ assert_cmd = "2"
 criterion = "0.5"
 predicates = "3"
 tempfile = "3"
-regex = "1.13.1"
+regex = "1.13.2"
 proptest = "1"
 filetime = "0.2"
 ftui-harness = "0.2.0"
