@@ -20985,7 +20985,8 @@ mod daemon_pressure_tests {
         };
         let trigger = critical_io_trigger();
         let item =
-            persist_daemon_review_request(Some(&store), &result, &[trigger.clone()]).unwrap();
+            persist_daemon_review_request(Some(&store), &result, std::slice::from_ref(&trigger))
+                .unwrap();
         let persisted = store.list().unwrap();
         assert_eq!(persisted.len(), 1);
         assert_eq!(persisted[0].id, item.id);

@@ -165,9 +165,11 @@ fn prior_transfer_command(data_dir: &TempDir, config_dir: &TempDir) -> Command {
 fn distinct_transfer_priors() -> (pt_core::config::Priors, pt_core::config::Priors) {
     use pt_core::config::priors::{BetaParams, GammaParams, Priors};
 
-    let mut local = Priors::default();
-    local.description = Some("local model".to_string());
-    local.host_profile = Some("workstation".to_string());
+    let mut local = Priors {
+        description: Some("local model".to_string()),
+        host_profile: Some("workstation".to_string()),
+        ..Default::default()
+    };
     local.classes.useful.prior_prob = 0.6;
     local.classes.useful_bad.prior_prob = 0.2;
     local.classes.abandoned.prior_prob = 0.1;

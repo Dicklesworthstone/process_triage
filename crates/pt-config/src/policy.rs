@@ -964,8 +964,10 @@ mod tests {
 
     #[test]
     fn parallel_kill_admission_obeys_both_current_and_saved_policy() {
-        let mut recorded = SignalPolicy::default();
-        recorded.max_parallel_kills = 2;
+        let mut recorded = SignalPolicy {
+            max_parallel_kills: 2,
+            ..Default::default()
+        };
         let saved = serde_json::to_string(&recorded).unwrap();
         let mut current = recorded.clone();
         current.max_parallel_kills = 8;

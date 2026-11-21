@@ -754,7 +754,10 @@ mod tests {
                 assert_eq!(result.status, ReliefStatus::RemediesAvailable);
                 assert_eq!(result.selected_tier, Some(ReliefTier::Pause));
                 assert_eq!(result.selected_pids, [100]);
-                assert_eq!(result.selected_action_ids, [original_id.clone()]);
+                assert_eq!(
+                    result.selected_action_ids,
+                    std::slice::from_ref(&original_id)
+                );
                 assert_eq!(result.remediation_ladder[0].action, stop);
                 assert_eq!(result.remediation_ladder[0].target, identity(100));
                 assert!((result.total_modeled_relief - 0.4).abs() < 1e-12);

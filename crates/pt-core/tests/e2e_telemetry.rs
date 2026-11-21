@@ -37,8 +37,8 @@ fn create_fake_parquet(path: &Path, size_bytes: usize, age_days: u64) -> std::io
     file.sync_all()?;
 
     let mtime = SystemTime::now() - Duration::from_secs(age_days * 86400);
-    let atime = filetime::FileTime::from_system_time(mtime);
-    filetime::set_file_times(path, atime, atime)?;
+    let times = fs::FileTimes::new().set_accessed(mtime).set_modified(mtime);
+    file.set_times(times)?;
     Ok(())
 }
 

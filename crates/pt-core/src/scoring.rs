@@ -1332,9 +1332,8 @@ impl Scorer {
         #[cfg(target_os = "linux")]
         // Only processes the provenance was collected for: an empty lineage would read
         // as "nothing depends on it" and push toward abandoned.
-        let provenance = provenance.map(|adjustment| {
-            provenance::apply_adjustment(pid, &adjustment, &mut posterior, &mut ledger);
-            adjustment
+        let provenance = provenance.inspect(|adjustment| {
+            provenance::apply_adjustment(pid, adjustment, &mut posterior, &mut ledger);
         });
 
         if let Some(unit) = desktop_app.as_deref() {
@@ -3062,7 +3061,7 @@ mod tests {
         let mut measured = scorer(SignatureDatabase::with_defaults());
         let evidence = Evidence::from_snapshot(&current[0]);
         let baseline = serde_json::to_value(
-            &measured
+            measured
                 .score_with_desktop(&current[0], evidence.clone(), None)
                 .unwrap()
                 .posterior
@@ -3074,7 +3073,7 @@ mod tests {
             .score_with_desktop(&current[0], evidence, None)
             .unwrap();
         assert_eq!(
-            serde_json::to_value(&scored.posterior.posterior).unwrap(),
+            serde_json::to_value(scored.posterior.posterior).unwrap(),
             baseline
         );
         let summary = scored.respawn_history.as_ref().unwrap();

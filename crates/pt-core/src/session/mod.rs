@@ -1068,10 +1068,10 @@ fn retention_has_reversal_artifacts(session_path: &Path) -> bool {
         Err(error) => return error.kind() != std::io::ErrorKind::NotFound,
         Ok(_) => {}
     }
-    match std::fs::symlink_metadata(action_path.join("reversals")) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        _ => true,
-    }
+    !matches!(
+        std::fs::symlink_metadata(action_path.join("reversals")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
 }
 
 fn retention_requires_preservation(

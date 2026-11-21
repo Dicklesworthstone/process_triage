@@ -1,7 +1,6 @@
 //! Shadow retention pipeline tests using real storage and timestamps.
 
 use chrono::{Duration as ChronoDuration, Utc};
-use filetime::FileTime;
 use pt_telemetry::shadow::{
     BeliefState, Observation, ShadowStorage, ShadowStorageConfig, StateSnapshot,
 };
@@ -133,8 +132,15 @@ fn shadow_cleanup_removes_expired_archive_files() {
 
     let stale_time =
         std::time::SystemTime::now() - std::time::Duration::from_secs(60 * 60 * 24 * 40);
-    let stale_ft = FileTime::from_system_time(stale_time);
-    filetime::set_file_times(&stale_path, stale_ft, stale_ft).unwrap();
+    let stale_times = fs::FileTimes::new()
+        .set_accessed(stale_time)
+        .set_modified(stale_time);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&stale_path)
+        .unwrap()
+        .set_times(stale_times)
+        .unwrap();
 
     let cleaned = storage.cleanup().unwrap();
     assert!(cleaned >= 1);
@@ -160,8 +166,15 @@ fn shadow_cleanup_removes_expired_nested_archive_files() {
 
     let stale_time =
         std::time::SystemTime::now() - std::time::Duration::from_secs(60 * 60 * 24 * 40);
-    let stale_ft = FileTime::from_system_time(stale_time);
-    filetime::set_file_times(&stale_path, stale_ft, stale_ft).unwrap();
+    let stale_times = fs::FileTimes::new()
+        .set_accessed(stale_time)
+        .set_modified(stale_time);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&stale_path)
+        .unwrap()
+        .set_times(stale_times)
+        .unwrap();
 
     let cleaned = storage.cleanup().unwrap();
     assert!(cleaned >= 1);

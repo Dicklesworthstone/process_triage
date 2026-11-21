@@ -149,8 +149,8 @@ mod tests {
 
     #[test]
     fn scenario_missing_inference_is_a_change_not_a_silent_match() {
-        let procs = vec![proc(100, "b1:100:100", "worker", "worker", 3600)];
-        let infs = vec![inf(100, "b1:100:100", "useful", 15, "keep", 0.05)];
+        let procs = [proc(100, "b1:100:100", "worker", "worker", 3600)];
+        let infs = [inf(100, "b1:100:100", "useful", 15, "keep", 0.05)];
         for (old, new) in [(&infs[..], &[][..]), (&[][..], &infs[..])] {
             let diff = compute_diff(
                 "before",

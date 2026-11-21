@@ -1045,9 +1045,9 @@ pub fn is_explicit_shadow_verdict(event: &ProcessEvent) -> bool {
     map_explicit_verdict(event).is_some()
 }
 
-fn map_explicit_verdict(
-    event: &ProcessEvent,
-) -> Option<(GroundTruth, Option<i32>, Option<i32>, Option<String>)> {
+type ExplicitVerdict = (GroundTruth, Option<i32>, Option<i32>, Option<String>);
+
+fn map_explicit_verdict(event: &ProcessEvent) -> Option<ExplicitVerdict> {
     match event.event_type {
         EventType::HumanVerdict => {
             let (verdict, source) = map_human_verdict(event)?;
@@ -2367,7 +2367,7 @@ mod tests {
             assert!(report.metrics.is_none());
         }
         assert!(
-            ValidationEngine::from_shadow_observations(&[observed.clone()], 0.5)
+            ValidationEngine::from_shadow_observations(std::slice::from_ref(&observed), 0.5)
                 .records()
                 .is_empty(),
             "an observed exit cannot invent an earlier prediction"

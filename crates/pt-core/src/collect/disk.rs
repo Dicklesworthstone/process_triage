@@ -702,39 +702,27 @@ mod linux {
                 .ok_or("disk_descriptor_information_invalid")?;
             match name {
                 "mnt_id" => {
-                    if mount
-                        .replace(
-                            value
-                                .trim()
-                                .parse::<u64>()
-                                .map_err(|_| "disk_descriptor_mount_invalid")?,
-                        )
-                        .is_some()
-                    {
+                    let parsed = value
+                        .trim()
+                        .parse::<u64>()
+                        .map_err(|_| "disk_descriptor_mount_invalid")?;
+                    if mount.replace(parsed).is_some() {
                         return Err("disk_descriptor_mount_ambiguous");
                     }
                 }
                 "ino" => {
-                    if inode
-                        .replace(
-                            value
-                                .trim()
-                                .parse::<u64>()
-                                .map_err(|_| "disk_descriptor_inode_invalid")?,
-                        )
-                        .is_some()
-                    {
+                    let parsed = value
+                        .trim()
+                        .parse::<u64>()
+                        .map_err(|_| "disk_descriptor_inode_invalid")?;
+                    if inode.replace(parsed).is_some() {
                         return Err("disk_descriptor_inode_ambiguous");
                     }
                 }
                 "flags" => {
-                    if flags
-                        .replace(
-                            u32::from_str_radix(value.trim(), 8)
-                                .map_err(|_| "disk_descriptor_flags_invalid")?,
-                        )
-                        .is_some()
-                    {
+                    let parsed = u32::from_str_radix(value.trim(), 8)
+                        .map_err(|_| "disk_descriptor_flags_invalid")?;
+                    if flags.replace(parsed).is_some() {
                         return Err("disk_descriptor_flags_ambiguous");
                     }
                 }
@@ -859,10 +847,9 @@ mod linux {
         use std::os::unix::ffi::OsStrExt;
         let entries =
             fs::read_dir(process.path("fd")).map_err(|_| "disk_descriptor_table_unavailable")?;
-        let mut task_fds = 0;
         // Keep the iterator alive while inspecting entries. The collector's
         // transient procfs handles are excluded by filesystem type.
-        for entry in entries {
+        for (task_fds, entry) in entries.enumerate() {
             if task_fds >= MAX_FDS || *total_fds >= MAX_TOTAL_FDS {
                 return Err("disk_descriptor_count_limit");
             }
@@ -875,7 +862,6 @@ mod linux {
                 .to_str()
                 .and_then(|name| name.parse::<u32>().ok())
                 .ok_or("disk_descriptor_name_invalid")?;
-            task_fds += 1;
             *total_fds += 1;
             // Retain the leader count for conventional per-process FD displays;
             // every task's table still participates in ownership and budgets.
@@ -1052,17 +1038,16 @@ mod linux {
         deadline: Instant,
         snapshot: &mut DiskResourceSnapshot,
     ) {
-        let mut count = 0;
-        for mount in context
+        for (count, mount) in context
             .mounts
             .values()
             .filter(|mount| supported_disk(&mount.filesystem_type))
+            .enumerate()
         {
             if count >= MAX_MOUNTS || Instant::now() >= deadline {
                 snapshot.note(None, "disk_mount_observation_budget");
                 break;
             }
-            count += 1;
             let observation = context
                 .resolve(Some(&mount.mount_point), deadline)
                 .and_then(|handle| capacity(context, &handle))
@@ -1343,18 +1328,17 @@ mod linux {
                         && sample.state.parent == 0
                         && sample.state.identity.uid == 0
                         && sample.state.comm == "kthreadd";
-                    if !sample.state.kernel_thread {
-                        if !expected
+                    if !sample.state.kernel_thread
+                        && !expected
                             .get(&pid)
                             .copied()
                             .flatten()
                             .is_some_and(|process| sample.state.matches_record(process))
-                        {
-                            snapshot.diagnostic(
-                                Some(pid),
-                                "disk_supplied_census_identity_missing_or_changed",
-                            );
-                        }
+                    {
+                        snapshot.diagnostic(
+                            Some(pid),
+                            "disk_supplied_census_identity_missing_or_changed",
+                        );
                     }
                     samples.insert(pid, sample);
                 }

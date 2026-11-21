@@ -817,7 +817,7 @@ mod tests {
         let target = plan.actions[0].target.clone();
         assert_eq!(
             checked_observation_targets(&plan, &[target.clone(), target.clone()]).unwrap(),
-            [target.clone()]
+            std::slice::from_ref(&target)
         );
         let mut foreign = target.clone();
         foreign.uid = 1001;
@@ -900,7 +900,7 @@ mod tests {
                 Ok(window)
             },
         );
-        assert_eq!(run.observed_targets, [target.clone()]);
+        assert_eq!(run.observed_targets, std::slice::from_ref(&target));
         let report = finish_resource_run_with(
             run,
             &plan,

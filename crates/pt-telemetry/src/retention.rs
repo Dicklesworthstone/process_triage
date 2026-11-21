@@ -1003,8 +1003,8 @@ mod tests {
 
         // Set modification time to simulate age
         let mtime = SystemTime::now() - Duration::from_secs(age_days * 86400);
-        let atime = filetime::FileTime::from_system_time(mtime);
-        filetime::set_file_times(path, atime, atime)?;
+        let times = fs::FileTimes::new().set_accessed(mtime).set_modified(mtime);
+        file.set_times(times)?;
 
         Ok(())
     }

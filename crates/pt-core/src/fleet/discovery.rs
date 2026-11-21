@@ -430,7 +430,7 @@ impl SshConfigParser {
             if self.directives.len() >= 32_768 {
                 return Err(fail("directive limit exceeded"));
             }
-            let values = ssh_config_arguments(values).map_err(|message| fail(message))?;
+            let values = ssh_config_arguments(values).map_err(fail)?;
             if values.is_empty() {
                 return Err(fail("missing directive arguments"));
             }
