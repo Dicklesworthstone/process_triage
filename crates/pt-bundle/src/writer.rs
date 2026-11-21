@@ -10,7 +10,7 @@ use std::fs::File;
 use std::io::{Cursor, Write};
 use std::path::Path;
 use tracing::{debug, info};
-use zip::write::{FileOptions, ZipWriter};
+use zip::write::{SimpleFileOptions, ZipWriter};
 use zip::CompressionMethod;
 
 /// File type hints for MIME type assignment.
@@ -390,7 +390,7 @@ impl BundleWriter {
         let file = File::create(path)?;
         let mut zip = ZipWriter::new(file);
 
-        let options: FileOptions<'_, ()> = FileOptions::default()
+        let options = SimpleFileOptions::default()
             .compression_method(CompressionMethod::Deflated)
             .unix_permissions(0o644);
 
@@ -454,7 +454,7 @@ impl BundleWriter {
         {
             let mut zip = ZipWriter::new(&mut buffer);
 
-            let options: FileOptions<'_, ()> = FileOptions::default()
+            let options = SimpleFileOptions::default()
                 .compression_method(CompressionMethod::Deflated)
                 .unix_permissions(0o644);
 

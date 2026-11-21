@@ -13,7 +13,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::io::{Cursor, Read, Write};
 use tempfile::TempDir;
-use zip::write::FileOptions;
+use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 // ============================================================================
@@ -436,12 +436,11 @@ fn test_checksum_verification_detects_tampered_content() {
     // ZIP CRCs stay valid, so rejection must come from the bundle checksum gate.
     let mut original_zip = ZipArchive::new(Cursor::new(bytes1)).expect("open original ZIP");
     let mut tampered_zip = ZipWriter::new(Cursor::new(Vec::new()));
-    let options: FileOptions<'_, ()> =
-        FileOptions::default().compression_method(CompressionMethod::Deflated);
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     let mut changed_payloads = 0;
     for index in 0..original_zip.len() {
         let mut entry = original_zip.by_index(index).expect("ZIP entry");
-        let path = entry.name().to_string();
+        let path = entry.name().expect("ZIP entry name").into_owned();
         let mut data = Vec::new();
         entry.read_to_end(&mut data).expect("read ZIP entry");
         if path == "telemetry/audit.parquet" {

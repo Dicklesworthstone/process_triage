@@ -14,7 +14,7 @@ chrono.workspace = true
 thiserror.workspace = true
 
 # Bundle format (ZIP)
-zip = { version = "2", default-features = false, features = ["deflate", "time"] }
+zip = { version = ">=9.7.3, <9.8.0", default-features = false, features = ["deflate", "time"] }
 
 # Checksums
 sha2 = "0.10"
