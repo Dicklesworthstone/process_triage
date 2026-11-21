@@ -104,10 +104,11 @@ This project uses **Cargo** for the Rust workspace and **Bash** for the wrapper 
 
 ### Release Profile
 
-The release build optimizes for size (used for musl distribution builds):
+The release build optimizes for speed (used for all distribution builds, including musl):
 
 ```toml
 [profile.release]
+opt-level = 3
 lto = "fat"             # Full link-time optimization
 codegen-units = 1       # Single codegen unit for better optimization
 strip = true            # Remove debug symbols
@@ -115,7 +116,7 @@ panic = "abort"         # Smaller binary, no unwinding
 
 [profile.release-small]
 inherits = "release"
-opt-level = "s"         # Size-optimized for distribution
+opt-level = 3           # Speed-optimized (size-opt disabled per perf policy)
 ```
 
 ---

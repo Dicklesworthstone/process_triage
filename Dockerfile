@@ -14,7 +14,7 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 
-# Build release binary with size optimizations
+# Build release binary with speed optimizations
 RUN cargo build --release --bin pt-core \
     --target x86_64-unknown-linux-musl \
     -p pt-core 2>/dev/null \
