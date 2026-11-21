@@ -1291,7 +1291,10 @@ mod tests {
              0: 00000000000000000000000001000000:0BB8 00000000000000000000000000000000:0000 07 00000000:00000000 00:00000000 00000000 1000 0 102\n",
             &mut bindings,
         ).unwrap();
-        assert_eq!(bindings[&3000], [0, 100, 101, 102].into());
+        assert_eq!(
+            bindings[&3000],
+            std::collections::BTreeSet::from([0, 100, 101, 102])
+        );
         assert_eq!(bindings.len(), 1);
         for bad in [
             "",
