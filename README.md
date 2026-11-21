@@ -1062,23 +1062,23 @@ pt report --session <id> --output report.html --include-ledger --embed-assets
 
 ```bash
 # Preview SSH aliases locally; reads ~/.ssh/config without connecting
-pt-core agent fleet inventory --host-filter 'dev-*,vmi*,!vmi-retired'
+pt-core agent fleet inventory --host-filter 'dev-*,worker-*,!worker-retired'
 
 # Inspect current pressure and workload attribution without creating action plans
-pt-core --format json agent fleet health --hosts trj,ts1,hz3 --parallel 4
+pt-core --format json agent fleet health --hosts host-a,host-b,host-c --parallel 4
 
 # Collect host hygiene findings and suggested fixes without executing them
 pt-core --format json agent fleet doctor --inventory hosts.toml
 
 # Use the same explicit SSH config for discovery, planning, and saved apply
 pt-core agent fleet plan --ssh-config ~/.ssh/config \
-  --host-filter 'dev-*,vmi*,!vmi-retired' --parallel 10
+  --host-filter 'dev-*,worker-*,!worker-retired' --parallel 10
 
 # Plan across hosts (inventory: TOML, YAML or JSON by extension)
 pt-core agent fleet plan --inventory hosts.toml --parallel 10
 
 # Or list hosts directly; kills pooled across hosts within an expected FDR of 5%
-pt-core agent fleet plan --hosts trj,ts1,hz3 --max-fdr 0.05
+pt-core agent fleet plan --hosts host-a,host-b,host-c --max-fdr 0.05
 
 # Inspect the saved selection locally; this starts no SSH command
 pt-core agent fleet apply --session pt-YYYYMMDD-HHMMSS-xxxx
