@@ -175,6 +175,10 @@ impl std::fmt::Display for GoalParseError {
 /// - "free-disk 4GB" (filesystem containing the current directory)
 /// - "free-disk 4 GB on /data" (one filesystem per goal request)
 /// - Composition: "free 4GB RAM AND release port 3000"
+///
+/// Composition uses only AND or only OR in a request; mixed operators and
+/// parenthesized expressions are unsupported. Every target consumes its full
+/// input, so unknown qualifiers cannot silently change the requested cleanup.
 pub fn parse_goal(input: &str) -> Result<Goal, GoalParseError> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -192,11 +196,18 @@ pub fn parse_goal(input: &str) -> Result<Goal, GoalParseError> {
         return Ok(Goal::Relieve(scope));
     }
 
-    // Check for composition.
-    // Split on " AND " or " OR " (case insensitive).
-    let parts = split_preserving_case(trimmed, " AND ");
-    if parts.len() > 1 {
-        let goals: Result<Vec<Goal>, GoalParseError> = parts
+    // Only flat conjunctions or flat disjunctions have defined optimizer
+    // semantics. Never resolve mixed operators by silently dropping a branch.
+    // Quoted disk paths may contain either word without composing the goal.
+    let and_parts = split_preserving_case(trimmed, " AND ");
+    let or_parts = split_preserving_case(trimmed, " OR ");
+    if and_parts.len() > 1 && or_parts.len() > 1 {
+        return Err(GoalParseError::Ambiguous(
+            "Mixed AND/OR goals are unsupported; use only AND or only OR in a request".to_string(),
+        ));
+    }
+    if and_parts.len() > 1 {
+        let goals: Result<Vec<Goal>, GoalParseError> = and_parts
             .iter()
             .map(|p| parse_single_goal(p.trim()).map(Goal::Target))
             .collect();
@@ -205,9 +216,8 @@ pub fn parse_goal(input: &str) -> Result<Goal, GoalParseError> {
         return Ok(Goal::And(goals));
     }
 
-    let parts = split_preserving_case(trimmed, " OR ");
-    if parts.len() > 1 {
-        let goals: Result<Vec<Goal>, GoalParseError> = parts
+    if or_parts.len() > 1 {
+        let goals: Result<Vec<Goal>, GoalParseError> = or_parts
             .iter()
             .map(|p| parse_single_goal(p.trim()).map(Goal::Target))
             .collect();
@@ -265,8 +275,7 @@ fn split_preserving_case<'a>(input: &'a str, sep: &str) -> Vec<&'a str> {
         }
         if !quoted
             && pos >= start
-            && upper_input.as_bytes().get(pos..pos + upper_sep.len())
-                == Some(upper_sep.as_bytes())
+            && upper_input.as_bytes().get(pos..pos + upper_sep.len()) == Some(upper_sep.as_bytes())
         {
             parts.push(&input[start..pos]);
             start = pos + sep.len();
@@ -373,9 +382,8 @@ fn parse_single_goal(input: &str) -> Result<ResourceTarget, GoalParseError> {
         }
 
         // FDs: "free 100 FDs" or "free 100 file descriptors"
-        if tokens[2] == "fds"
-            || tokens[2] == "fd"
-            || (tokens.len() >= 4 && tokens[2] == "file" && tokens[3] == "descriptors")
+        if (tokens.len() == 3 && matches!(tokens[2], "fds" | "fd"))
+            || (tokens.len() == 4 && tokens[2] == "file" && tokens[3] == "descriptors")
         {
             let n: f64 = amount_str
                 .parse()
@@ -390,7 +398,7 @@ fn parse_single_goal(input: &str) -> Result<ResourceTarget, GoalParseError> {
         }
 
         // Memory: "free 4GB RAM" or "free 500MB memory"
-        if tokens[2] == "ram" || tokens[2] == "memory" || tokens[2] == "mem" {
+        if tokens.len() == 3 && matches!(tokens[2], "ram" | "memory" | "mem") {
             let bytes = parse_memory_amount(amount_str)?;
             return Ok(ResourceTarget {
                 metric: Metric::Memory,
@@ -536,9 +544,17 @@ mod tests {
     fn disk_goals_bind_one_preserved_path_and_roundtrip() {
         for (input, expected_bytes, path) in [
             ("free-disk 1.5GB", 1_610_612_736.0, None),
-            ("FREE-DISK 2 GiB on /Data/Builds", 2_147_483_648.0, Some("/Data/Builds")),
+            (
+                "FREE-DISK 2 GiB on /Data/Builds",
+                2_147_483_648.0,
+                Some("/Data/Builds"),
+            ),
             ("free-disk 0B on /", 0.0, Some("/")),
-            (r#"free-disk 1MB on "/dåta/Build AND Cache""#, 1_048_576.0, Some("/dåta/Build AND Cache")),
+            (
+                r#"free-disk 1MB on "/dåta/Build AND Cache""#,
+                1_048_576.0,
+                Some("/dåta/Build AND Cache"),
+            ),
         ] {
             let goal = parse_goal(input).unwrap();
             let target = goal.disk_target().unwrap().unwrap();
@@ -547,14 +563,20 @@ mod tests {
             assert_eq!(target.disk_path.as_deref(), path);
             assert_eq!(target.port, None);
             assert_eq!(parse_goal(&goal.canonical()).unwrap(), goal);
-            assert_eq!(serde_json::from_str::<Goal>(&serde_json::to_string(&goal).unwrap()).unwrap(), goal);
+            assert_eq!(
+                serde_json::from_str::<Goal>(&serde_json::to_string(&goal).unwrap()).unwrap(),
+                goal
+            );
         }
     }
 
     #[test]
     fn disk_composition_keeps_filesystem_scope_unambiguous() {
         let goal = parse_goal(r#"free-disk 1GB on "/Build AND Cache" AND free 2GB RAM"#).unwrap();
-        assert_eq!(goal.disk_target().unwrap().unwrap().disk_path.as_deref(), Some("/Build AND Cache"));
+        assert_eq!(
+            goal.disk_target().unwrap().unwrap().disk_path.as_deref(),
+            Some("/Build AND Cache")
+        );
         for input in [
             "free-disk 1GB on /data AND free-disk 2GB on /other",
             "free-disk 1GB OR free-disk 2GB",
@@ -569,7 +591,10 @@ mod tests {
         ] {
             assert!(parse_goal(input).is_err(), "accepted {input:?}");
         }
-        let typed = Goal::And(vec![parse_goal("free-disk 1GB").unwrap(), parse_goal("free-disk 2GB").unwrap()]);
+        let typed = Goal::And(vec![
+            parse_goal("free-disk 1GB").unwrap(),
+            parse_goal("free-disk 2GB").unwrap(),
+        ]);
         assert!(typed.disk_target().is_err());
     }
 
@@ -796,6 +821,105 @@ mod tests {
             assert!((t.value - 50.0).abs() < 0.01);
         } else {
             panic!("Expected Target");
+        }
+    }
+
+    #[test]
+    fn memory_and_fd_targets_consume_every_token() {
+        for target in [
+            "free 4GB RAM",
+            "free 500MB memory",
+            "free 256B mem",
+            "free 100 FDs",
+            "free 1 fd",
+            "free 50 file descriptors",
+        ] {
+            assert!(parse_goal(target).is_ok(), "valid target: {target}");
+            for suffix in [
+                " extra",
+                " except important workloads",
+                " on /data",
+                " AND",
+                " OR",
+                " && release port 3000",
+                " || release port 3000",
+                "\tAND\trelease port 3000",
+            ] {
+                let input = format!("{target}{suffix}");
+                assert!(parse_goal(&input).is_err(), "accepted {input:?}");
+            }
+        }
+
+        // Exact matching must retain documented aliases, case folding and
+        // whitespace within an individual target.
+        let memory = parse_goal("free 4GB RAM").unwrap();
+        for input in ["FrEe 4gb MeMoRy", " free\t4GB\tmem "] {
+            assert_eq!(parse_goal(input), Ok(memory.clone()), "{input:?}");
+        }
+        let fds = parse_goal("free 50 FDs").unwrap();
+        for input in ["free 50 fd", " FrEe\t50\tFiLe\tDeScRiPtOrS "] {
+            assert_eq!(parse_goal(input), Ok(fds.clone()), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn mixed_boolean_goals_never_discard_a_branch() {
+        for input in [
+            "free 4GB RAM OR release port 3000 AND free 100 FDs",
+            "free 50 file descriptors OR free 20% CPU AND free 4GB RAM",
+            "release port 3000 AND free 100 FDs OR free 4GB RAM",
+            "free 4GB RAM and release port 3000 or free 100 FDs",
+            "free 4GB RAM OR (release port 3000 AND free 100 FDs)",
+        ] {
+            assert!(
+                matches!(parse_goal(input), Err(GoalParseError::Ambiguous(_))),
+                "mixed operators need an explicit refusal: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn flat_compositions_preserve_all_targets_and_quoted_disk_paths() {
+        let targets = ["free 4GB RAM", "release port 3000", "free 100 FDs"];
+        let expected: Vec<_> = targets
+            .iter()
+            .map(|input| parse_goal(input).unwrap())
+            .collect();
+        assert_eq!(
+            parse_goal(&targets.join(" AND ")),
+            Ok(Goal::And(expected.clone()))
+        );
+        assert_eq!(parse_goal(&targets.join(" or ")), Ok(Goal::Or(expected)));
+
+        let disk = r#"free-disk 1GB on "/Data/Build AND Cache OR Scratch""#;
+        let expected = vec![
+            parse_goal(disk).unwrap(),
+            parse_goal("free 100 file descriptors").unwrap(),
+        ];
+        assert_eq!(
+            parse_goal(&format!("{disk} AND free 100 file descriptors")),
+            Ok(Goal::And(expected.clone()))
+        );
+        assert_eq!(
+            parse_goal(&format!("{disk} OR free 100 file descriptors")),
+            Ok(Goal::Or(expected))
+        );
+    }
+
+    #[test]
+    fn malformed_compositions_never_leave_an_executable_prefix() {
+        for input in [
+            "AND free 4GB RAM",
+            "OR free 100 FDs",
+            "free 4GB RAM AND AND free 100 FDs",
+            "free 100 FDs OR OR free 4GB RAM",
+            "free 4GB RAM AND OR release port 3000",
+            "free 4GB RAM AND (free 100 FDs)",
+            "(free 4GB RAM OR free 100 FDs)",
+            "free 4GB RAM garbage AND free 100 FDs",
+            "release port 3000 OR free 100 file descriptors trailing",
+        ] {
+            assert!(parse_goal(input).is_err(), "accepted {input:?}");
         }
     }
 
