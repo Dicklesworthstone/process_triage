@@ -8,7 +8,7 @@ use crate::collect::tool_runner::{ToolConfig, ToolOutput, ToolRunner, ToolSpec};
 use crate::collect::{deep_scan, DeepScanOptions, DeepScanRecord};
 use crate::collect::{quick_scan, ProcessActivity, ProcessRecord, QuickScanOptions, ScanResult};
 use crate::mcp::protocol::{ToolContent, ToolDefinition};
-use crate::scoring::{ProcessScore, Scorer};
+use crate::scoring::{AgentActivityReport, ProcessScore, Scorer};
 use crate::signature_cli::load_user_signatures;
 use crate::supervision::signature::ProcessMatchContext;
 use crate::supervision::{SignatureDatabase, SupervisorCategory};
@@ -138,6 +138,17 @@ impl Evaluator {
                     && !self.protected.contains_key(&process.pid.0)
             })
             .collect()
+    }
+
+    /// Use one shared window for the complete census, including young and
+    /// protected descendants that can establish an agent root's current work.
+    /// Sampling a process does not make it an action candidate.
+    fn collect_activity(&mut self, scan: &ScanResult, window_ms: u64) -> AgentActivityReport {
+        let population: Vec<_> = scan.processes.iter().collect();
+        self.scorer
+            .collect_activity(&population, Duration::from_millis(window_ms));
+        self.scorer
+            .agent_activity_report(&scan.processes, scan.metadata.warnings.is_empty())
     }
 
     /// Collect across the full census, so age/protection filters cannot hide a
@@ -590,7 +601,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "pt_scan".to_string(),
             description: "Run a process scan and return candidates with scores. \
-                          Returns a JSON array of process records with evidence."
+                          Includes measured agent-tree activity from the complete census, \
+                          even when age or score filters omit processes from the candidate rows."
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -620,7 +632,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "pt_explain".to_string(),
-            description: "Explain a specific process — why it was flagged and its evidence chain."
+            description: "Explain a specific process — why it was flagged and its evidence chain. \
+                          Includes measured agent-tree activity without treating missing observations as inactivity."
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -871,10 +884,7 @@ fn tool_scan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
     } else {
         serde_json::json!({"requested": false, "status": "not_requested"})
     };
-    let eligible = evaluator.eligible_processes(&scan_result);
-    evaluator
-        .scorer
-        .collect_activity(&eligible, Duration::from_millis(window_ms));
+    let agent_activity = evaluator.collect_activity(&scan_result, window_ms);
     let workloads = evaluator.collect_workloads(&scan_result);
 
     // Score = P(abandoned or zombie) from the same posterior `agent plan` uses (it was
@@ -920,6 +930,7 @@ fn tool_scan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
         "warnings": scan_result.metadata.warnings,
         "deep_scan": deep_scan,
         "workloads": workloads,
+        "agent_activity": agent_activity,
         "window_ms": window_ms,
         "total_processes": scan_result.processes.len(),
         "min_age_seconds": evaluator.min_age_seconds,
@@ -1004,9 +1015,7 @@ fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
 
             // The same score and protection rules `agent plan` uses.
             evaluator.collect_provenance(&scan, &[p]);
-            evaluator
-                .scorer
-                .collect_activity(&[p], Duration::from_millis(window_ms));
+            let agent_activity = evaluator.collect_activity(&scan, window_ms);
             let workloads = evaluator.collect_workloads(&scan);
             let activity = evaluator.scorer.activity_for(p);
             let matches = evaluator.scorer.signatures.match_process(&ctx);
@@ -1050,6 +1059,7 @@ fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
                 "rss_bytes": p.rss_bytes,
                 "vsz_bytes": p.vsz_bytes,
                 "elapsed_sec": p.elapsed.as_secs(),
+                "tty": p.tty,
                 "signature_matches": matches.iter().map(|m| {
                     serde_json::json!({
                         "name": m.signature.name,
@@ -1067,6 +1077,7 @@ fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
                 "desktop_app_credited": desktop_app_credited,
                 "work": evaluator.scorer.workload_diagnosis_for(p),
                 "workloads": workloads,
+                "agent_activity": agent_activity,
                 "evidence": evidence_terms,
             });
 

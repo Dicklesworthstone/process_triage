@@ -1610,6 +1610,165 @@ fn actual_mcp_plan_preserves_goals_scope_predictions_comparisons_and_robot_mode(
     );
 }
 
+/// Age filters control candidate rows, not observations of an agent's workers.
+/// Exercise the real MCP protocol with a headless agent and its owned busy child.
+#[cfg(target_os = "linux")]
+#[test]
+fn actual_mcp_agent_activity_includes_young_children_before_candidate_filters() {
+    use assert_cmd::cargo::cargo_bin_cmd;
+    use std::io::BufRead;
+    use std::os::unix::process::CommandExt;
+
+    struct OwnedAgent(std::process::Child);
+    impl Drop for OwnedAgent {
+        fn drop(&mut self) {
+            // setsid below creates a dedicated session/process group. Only this
+            // test's agent and its descendants are signaled, then reaped.
+            unsafe {
+                libc::kill(-(self.0.id() as i32), libc::SIGKILL);
+            }
+            let _ = self.0.wait();
+        }
+    }
+
+    let mut command = std::process::Command::new("/bin/bash");
+    command
+        .arg0("codex")
+        .args([
+            "-c",
+            "sh -c 'while :; do :; done' >/dev/null 2>&1 & worker=$!; printf '%s\\n' \"$worker\"; wait \"$worker\"",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut target = OwnedAgent(command.spawn().expect("spawn owned headless agent"));
+    let agent_pid = target.0.id();
+    let stdout = target.0.stdout.take().expect("worker readiness pipe");
+    let mut ready = String::new();
+    std::io::BufReader::new(stdout)
+        .read_line(&mut ready)
+        .expect("read worker PID");
+    let worker_pid: u32 = ready.trim().parse().expect("owned worker PID");
+    assert_ne!(worker_pid, agent_pid);
+
+    let config = tempfile::tempdir().expect("MCP config");
+    let data = tempfile::tempdir().expect("MCP data");
+    let mut policy = pt_core::config::Policy::default();
+    policy.guardrails.min_process_age_seconds = u64::MAX;
+    std::fs::write(
+        config.path().join("policy.json"),
+        serde_json::to_vec_pretty(&policy).unwrap(),
+    )
+    .unwrap();
+    let requests = [
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": "pt_scan",
+                "arguments": {"window_ms": 1000}
+            }
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {
+                "name": "pt_explain",
+                "arguments": {"pid": agent_pid, "window_ms": 1000}
+            }
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {
+                "name": "pt_explain",
+                "arguments": {"pid": agent_pid, "window_ms": 0}
+            }
+        }),
+    ];
+    let input = requests
+        .iter()
+        .map(|request| format!("{request}\n"))
+        .collect::<String>();
+    let output = cargo_bin_cmd!("pt-core")
+        .arg("--config")
+        .arg(config.path())
+        .arg("mcp")
+        .env_remove("PT_CONFIG_DIR")
+        .env_remove("PT_SKIP_GLOBAL_LOCK")
+        .env("PROCESS_TRIAGE_DATA", data.path())
+        .env("PROCESS_TRIAGE_RETENTION", "off")
+        .write_stdin(input)
+        .timeout(std::time::Duration::from_secs(120))
+        .output()
+        .expect("run actual MCP agent activity requests");
+    assert!(output.status.success(), "{output:?}");
+    let responses: Vec<serde_json::Value> = std::str::from_utf8(&output.stdout)
+        .expect("MCP stdout")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("MCP JSON response"))
+        .collect();
+    assert_eq!(responses.len(), requests.len(), "{responses:?}");
+    let mut root_identity = None;
+    for (index, response) in responses.iter().enumerate() {
+        assert_eq!(response["id"], index + 1, "{response}");
+        assert!(response["error"].is_null(), "{response}");
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let result: serde_json::Value = serde_json::from_str(
+            response["result"]["content"][0]["text"].as_str().unwrap(),
+        )
+        .expect("tool result JSON");
+        if index == 0 {
+            assert_eq!(result["returned"], 0, "{result}");
+            assert!(result["processes"].as_array().unwrap().is_empty());
+            assert_eq!(
+                result["agent_activity"]["input_processes"],
+                result["total_processes"],
+                "{result}"
+            );
+        } else {
+            assert_eq!(result["pid"], agent_pid, "{result}");
+            assert!(result.get("tty").expect("terminal fact").is_null(), "{result}");
+        }
+        let report = &result["agent_activity"];
+        let unit = report["units"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|unit| unit["root"]["pid"] == agent_pid)
+            .expect("agent retained even when all candidate rows are filtered");
+        assert_eq!(unit["kind"], "codex", "{unit}");
+        assert!(unit["member_count"].as_u64().unwrap() >= 2, "{unit}");
+        if let Some(expected) = &root_identity {
+            assert_eq!(&unit["root"], expected, "{unit}");
+        }
+        root_identity = Some(unit["root"].clone());
+        if index < 2 {
+            assert_eq!(report["sampling_window_ms"], 1000, "{report}");
+            assert_eq!(unit["activity"], "activity_observed", "{unit}");
+            assert!(
+                unit["composition"]["active_descendants"].as_u64().unwrap() >= 1,
+                "the worker's measured activity must survive the age filter: {unit}"
+            );
+        } else {
+            assert!(report["sampling_window_ms"].is_null(), "{report}");
+            assert_eq!(unit["activity"], "unknown", "{unit}");
+            assert_eq!(unit["coverage"]["active_members"], 0, "{unit}");
+            assert!(unit["usage"]["cpu_cores"]["observed"].is_null(), "{unit}");
+        }
+    }
+    assert!(
+        target.0.try_wait().unwrap().is_none(),
+        "MCP observations must not signal the agent"
+    );
+}
+
 #[test]
 fn actual_mcp_scan_and_explain_preserve_config_and_invoker_protection() {
     use assert_cmd::cargo::cargo_bin_cmd;
