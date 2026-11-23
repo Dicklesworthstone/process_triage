@@ -1328,7 +1328,9 @@ impl AgentSessionActivity {
         if !self.identity_verified || window_seconds == 0 || self.transcript_count == 0 {
             return None;
         }
-        let age = (self.observed_at - self.latest_modified_at?).to_std().ok()?;
+        let age = (self.observed_at - self.latest_modified_at?)
+            .to_std()
+            .ok()?;
         let recent = age < std::time::Duration::from_secs(window_seconds);
         // A positive observation survives partial collection. Stale evidence
         // cannot establish quiet when another descriptor/task was unavailable.
@@ -1443,10 +1445,7 @@ mod agent_session {
                 .ok_or("session_process_birth_unavailable")?
                 / self.ticks_per_second;
             self.boot_time
-                .checked_add(Duration::new(
-                    ticks / self.ticks_per_second,
-                    nanos as u32,
-                ))
+                .checked_add(Duration::new(ticks / self.ticks_per_second, nanos as u32))
                 .ok_or("session_process_birth_unavailable")
         }
     }
@@ -1636,8 +1635,8 @@ mod agent_session {
         if bytes.last() != Some(&b'\n') {
             return Err("session_descriptor_info_incomplete");
         }
-        let content = std::str::from_utf8(&bytes)
-            .map_err(|_| "session_descriptor_info_unavailable")?;
+        let content =
+            std::str::from_utf8(&bytes).map_err(|_| "session_descriptor_info_unavailable")?;
         let field = |name: &str, radix: u32| -> Result<u64, &'static str> {
             let mut values = content.lines().filter_map(|line| line.strip_prefix(name));
             let value = values
@@ -1745,7 +1744,9 @@ mod agent_session {
             if !matches!(kind, "claude" | "codex") {
                 return Err("session_transcript_layout_unsupported");
             }
-            let deadline = context.deadline.min(Instant::now() + context.process_budget);
+            let deadline = context
+                .deadline
+                .min(Instant::now() + context.process_budget);
             let root = pin_directory(&proc_root.join(process.pid.0.to_string()))?;
             let before = root_identity(&root, process, context)?;
             let birth = context.birth(before.birth_ticks)?;
@@ -1789,44 +1790,43 @@ mod agent_session {
                         .push("session_descriptor_budget_exhausted".to_string());
                     break;
                 }
-                let task_result =
-                    (|| -> Result<BTreeMap<(u64, u64), SystemTime>, &'static str> {
-                        let task = pin_directory(&task_dir.join(tid.to_string()))?;
-                        let (task_before, _) = task_identity(&task, tid, process)?;
-                        let entries = fs::read_dir(directory_path(&task, "fd"))
-                            .map_err(|_| "session_descriptor_table_unavailable")?;
-                        let mut found = BTreeMap::new();
-                        for entry in entries {
-                            if check_budget(deadline).is_err() || remaining == 0 {
-                                result
-                                    .unavailable
-                                    .push("session_descriptor_budget_exhausted".to_string());
-                                break;
-                            }
-                            remaining -= 1;
-                            let fd = entry.ok().and_then(|entry| {
-                                entry.file_name().to_str()?.parse::<u32>().ok()
-                            });
-                            let Some(fd) = fd.filter(|fd| *fd <= i32::MAX as u32) else {
-                                result
-                                    .unavailable
-                                    .push("session_descriptor_entry_unavailable".to_string());
-                                continue;
-                            };
-                            match inspect_descriptor(&task, fd, kind, process, context) {
-                                Ok(Some((identity, modified))) => {
-                                    found.insert(identity, modified);
-                                }
-                                Ok(None) => {}
-                                Err(reason) => result.unavailable.push(reason.to_string()),
-                            }
+                let task_result = (|| -> Result<BTreeMap<(u64, u64), SystemTime>, &'static str> {
+                    let task = pin_directory(&task_dir.join(tid.to_string()))?;
+                    let (task_before, _) = task_identity(&task, tid, process)?;
+                    let entries = fs::read_dir(directory_path(&task, "fd"))
+                        .map_err(|_| "session_descriptor_table_unavailable")?;
+                    let mut found = BTreeMap::new();
+                    for entry in entries {
+                        if check_budget(deadline).is_err() || remaining == 0 {
+                            result
+                                .unavailable
+                                .push("session_descriptor_budget_exhausted".to_string());
+                            break;
                         }
-                        let (task_after, _) = task_identity(&task, tid, process)?;
-                        if task_before != task_after {
-                            return Err("session_task_identity_changed");
+                        remaining -= 1;
+                        let fd = entry
+                            .ok()
+                            .and_then(|entry| entry.file_name().to_str()?.parse::<u32>().ok());
+                        let Some(fd) = fd.filter(|fd| *fd <= i32::MAX as u32) else {
+                            result
+                                .unavailable
+                                .push("session_descriptor_entry_unavailable".to_string());
+                            continue;
+                        };
+                        match inspect_descriptor(&task, fd, kind, process, context) {
+                            Ok(Some((identity, modified))) => {
+                                found.insert(identity, modified);
+                            }
+                            Ok(None) => {}
+                            Err(reason) => result.unavailable.push(reason.to_string()),
                         }
-                        Ok(found)
-                    })();
+                    }
+                    let (task_after, _) = task_identity(&task, tid, process)?;
+                    if task_before != task_after {
+                        return Err("session_task_identity_changed");
+                    }
+                    Ok(found)
+                })();
                 match task_result {
                     Ok(found) => transcripts.extend(found),
                     Err(reason) => result.unavailable.push(reason.to_string()),
@@ -1842,9 +1842,9 @@ mod agent_session {
             let mut latest = None;
             for modified in transcripts.into_values() {
                 if modified < birth || modified > observed_at {
-                    result.unavailable.push(
-                        "session_transcript_mtime_outside_process_lifetime".to_string(),
-                    );
+                    result
+                        .unavailable
+                        .push("session_transcript_mtime_outside_process_lifetime".to_string());
                     continue;
                 }
                 result.transcript_count += 1;
@@ -2043,7 +2043,12 @@ mod agent_session {
             }
 
             fn observe(&self, window_seconds: u64) -> AgentSessionActivity {
-                collect_one(&self.process, window_seconds, &self.proc_root, &self.context)
+                collect_one(
+                    &self.process,
+                    window_seconds,
+                    &self.proc_root,
+                    &self.context,
+                )
             }
         }
 

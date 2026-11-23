@@ -434,8 +434,8 @@ impl SessionStore {
     }
 
     /// Enforce the session retention policy (`PROCESS_TRIAGE_RETENTION` days,
-    /// default 7; `0`/`off`/`never` disables). Best-effort and throttled to once per
-    /// hour via a marker file, so it adds nothing measurable to normal runs.
+    /// default 7; `0`/`off`/`never` disables). Linux advances a bounded, durable
+    /// cleanup cursor; the hourly throttle applies only after a complete pass.
     ///
     /// Before this existed nothing ever removed sessions: a dev box accumulated
     /// 3 017 session dirs (289 MB) from one test burst.
@@ -444,6 +444,21 @@ impl SessionStore {
         else {
             return;
         };
+        #[cfg(target_os = "linux")]
+        {
+            if let Err(error) = automatic_retention::run(self, retention) {
+                tracing::debug!(%error, "session retention deferred");
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        self.auto_gc_portable(retention);
+    }
+
+    // Other platforms retain their existing cleanup semantics until a native
+    // resumable directory iterator is available. POSIX telldir cookies cannot
+    // be persisted and passed to seekdir on a different directory stream.
+    #[cfg(not(target_os = "linux"))]
+    fn auto_gc_portable(&self, retention: Duration) {
         let marker = self.sessions_root.join(".last_gc");
         let recently_ran = std::fs::metadata(&marker)
             .and_then(|m| m.modified())
@@ -829,6 +844,787 @@ impl SessionStore {
         }
 
         Ok(result)
+    }
+}
+
+/// Automatic retention is deliberately independent from the manual cleanup
+/// command: an ordinary scan must not enumerate every plan/journal or recursively
+/// remove an unbounded tree before it can start collecting processes.
+#[cfg(target_os = "linux")]
+mod automatic_retention {
+    use super::*;
+    use std::fs::{self, File};
+    use std::os::{fd::AsRawFd, unix::ffi::OsStringExt, unix::fs::MetadataExt};
+    use std::time::{Duration as WallDuration, Instant};
+
+    const PROGRESS_FILE: &str = ".retention-progress.json";
+    const MAX_PROGRESS_BYTES: u64 = 4096;
+
+    #[derive(Clone, Copy)]
+    pub(super) struct Limits {
+        pub entries: usize,
+        pub sessions: usize,
+        pub tree_nodes: usize,
+        pub wall: WallDuration,
+    }
+
+    impl Default for Limits {
+        fn default() -> Self {
+            Self {
+                entries: 128,
+                sessions: 32,
+                tree_nodes: 256,
+                wall: WallDuration::from_millis(50),
+            }
+        }
+    }
+
+    #[derive(Debug, Default, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Progress {
+        device: u64,
+        inode: u64,
+        offset: i64,
+        in_progress: bool,
+        pending: Option<Pending>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Pending {
+        session_id: String,
+        device: u64,
+        inode: u64,
+    }
+
+    #[derive(Debug, Default, Serialize)]
+    pub(super) struct Report {
+        pub entries: usize,
+        pub sessions: usize,
+        pub tree_nodes: usize,
+        pub removed: usize,
+        pub preserved: usize,
+        pub complete: bool,
+        pub errors: Vec<String>,
+    }
+
+    struct Budget {
+        started: Instant,
+        limits: Limits,
+        report: Report,
+    }
+
+    impl Budget {
+        fn expired(&self) -> bool {
+            self.started.elapsed() >= self.limits.wall
+        }
+
+        fn take_tree_node(&mut self) -> bool {
+            if self.expired() || self.report.tree_nodes >= self.limits.tree_nodes {
+                return false;
+            }
+            self.report.tree_nodes += 1;
+            true
+        }
+    }
+
+    pub(super) fn run(store: &SessionStore, retention: Duration) -> Result<(), SessionError> {
+        let report = run_limited(store, retention, Limits::default(), true)?;
+        if report.entries > 0 || report.tree_nodes > 0 || !report.errors.is_empty() {
+            tracing::debug!(
+                entries = report.entries,
+                inspected = report.sessions,
+                tree_nodes = report.tree_nodes,
+                removed = report.removed,
+                preserved = report.preserved,
+                complete = report.complete,
+                errors = ?report.errors,
+                "bounded session retention cleanup"
+            );
+        }
+        Ok(())
+    }
+
+    /// Limits bound loop work and manifest bytes, not the latency of one kernel
+    /// filesystem operation. A stalled filesystem cannot be given a hard wall
+    /// guarantee by synchronous I/O; no new work starts after the wall budget.
+    pub(super) fn run_limited(
+        store: &SessionStore,
+        retention: Duration,
+        limits: Limits,
+        respect_throttle: bool,
+    ) -> Result<Report, SessionError> {
+        let mut budget = Budget {
+            started: Instant::now(),
+            limits,
+            report: Report::default(),
+        };
+        let lock = SessionCleanupLock::acquire(&store.sessions_root)
+            .map_err(|error| session_io(&store.sessions_root, error))?;
+        let root = JsonDirectory::open(&store.sessions_root)?;
+        let identity = root
+            .handle
+            .metadata()
+            .map_err(|e| session_io(&root.path, e))?;
+        let state_path = root.path.join(PROGRESS_FILE);
+        let mut progress = read_progress(&state_path)?.unwrap_or_default();
+        if progress.device != identity.dev() || progress.inode != identity.ino() {
+            progress = Progress {
+                device: identity.dev(),
+                inode: identity.ino(),
+                ..Progress::default()
+            };
+        }
+        if progress.offset < 0
+            || progress.pending.as_ref().is_some_and(|pending| {
+                SessionId::parse(&pending.session_id).is_none()
+                    || Path::new(&pending.session_id)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        != Some(pending.session_id.as_str())
+            })
+        {
+            return Err(session_io(
+                &state_path,
+                std::io::Error::other("invalid retention cursor"),
+            ));
+        }
+        let marker = root.path.join(".last_gc");
+        if respect_throttle && !progress.in_progress {
+            let recent = fs::symlink_metadata(&marker)
+                .ok()
+                .filter(|metadata| metadata.is_file())
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age < WallDuration::from_secs(3600));
+            if recent {
+                return Ok(budget.report);
+            }
+        }
+        progress.in_progress = true;
+        let mut directory = match DirectoryCursor::open(&root, progress.offset) {
+            Err(SessionError::Io { source, .. })
+                if progress.offset != 0 && source.raw_os_error() == Some(libc::EINVAL) =>
+            {
+                // A filesystem may invalidate an old directory cookie after
+                // mutation. Keep a pending tree's identity, but restart discovery
+                // instead of leaving every future create stuck on the same seek.
+                progress.offset = 0;
+                DirectoryCursor::open(&root, 0)?
+            }
+            opened => opened?,
+        };
+        loop {
+            if budget.expired() || budget.report.sessions >= limits.sessions {
+                break;
+            }
+            lock.revalidate().map_err(|e| session_io(&root.path, e))?;
+            root.revalidate()?;
+            if progress.pending.is_some() {
+                budget.report.sessions += 1;
+            } else {
+                if budget.report.entries >= limits.entries {
+                    break;
+                }
+                let next = match directory.next() {
+                    Err(SessionError::Io { source, .. })
+                        if progress.offset != 0 && source.raw_os_error() == Some(libc::EINVAL) =>
+                    {
+                        // Some filesystems reject the cookie only at getdents.
+                        // Persist the restart and yield, with no hourly throttle.
+                        progress.offset = 0;
+                        break;
+                    }
+                    next => next?,
+                };
+                let Some(name) = next else {
+                    progress.offset = 0;
+                    progress.in_progress = false;
+                    budget.report.complete = true;
+                    break;
+                };
+                budget.report.entries += 1;
+                progress.offset = directory.offset;
+                let Some(name) = name
+                    .to_str()
+                    .filter(|name| SessionId::parse(name).is_some())
+                else {
+                    continue;
+                };
+                let path = root.path.join(name);
+                let metadata = match fs::symlink_metadata(&path) {
+                    Ok(metadata) if metadata.is_dir() && metadata.dev() == identity.dev() => {
+                        metadata
+                    }
+                    _ => continue,
+                };
+                budget.report.sessions += 1;
+                if retention_requires_preservation(&path, name, retention) {
+                    budget.report.preserved += 1;
+                    continue;
+                }
+                progress.pending = Some(Pending {
+                    session_id: name.to_string(),
+                    device: metadata.dev(),
+                    inode: metadata.ino(),
+                });
+                // A crash midway through a large tree must retain both the next
+                // directory position and the exact selected directory identity.
+                write_json_pretty(&state_path, &progress)?;
+            }
+            let pending = progress.pending.as_ref().unwrap();
+            let path = root.path.join(&pending.session_id);
+            let deleted = prune_session(&lock, &root, pending, retention, &mut budget);
+            match deleted {
+                Ok(true) => {
+                    budget.report.removed += 1;
+                    progress.pending = None;
+                }
+                Ok(false) => break,
+                Err(error) => {
+                    // A bad session cannot pin the cursor in front of all other
+                    // sessions forever. Its remaining artifacts are retained.
+                    budget
+                        .report
+                        .errors
+                        .push(format!("{}: {error}", path.display()));
+                    progress.pending = None;
+                }
+            }
+        }
+        lock.revalidate().map_err(|e| session_io(&root.path, e))?;
+        root.revalidate()?;
+        write_json_pretty(&state_path, &progress)?;
+        if budget.report.complete {
+            // Only a fully enumerated pass earns the hourly throttle. Contention,
+            // partial deletion and exhausted budgets resume on the next create.
+            write_json_pretty(&marker, &budget.report)?;
+        }
+        Ok(budget.report)
+    }
+
+    fn read_progress(path: &Path) -> Result<Option<Progress>, SessionError> {
+        use std::io::Read;
+        let file = match open_history_file(path) {
+            Ok(file) => file,
+            Err(SessionError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let mut content = Vec::new();
+        file.take(MAX_PROGRESS_BYTES + 1)
+            .read_to_end(&mut content)
+            .map_err(|e| session_io(path, e))?;
+        if content.len() as u64 > MAX_PROGRESS_BYTES {
+            return Err(session_io(
+                path,
+                std::io::Error::other("retention cursor exceeds 4 KiB"),
+            ));
+        }
+        serde_json::from_slice(&content)
+            .map(Some)
+            .map_err(|source| SessionError::Json {
+                path: path.to_path_buf(),
+                source,
+            })
+    }
+
+    /// Linux directory offsets are opaque filesystem cookies, never byte or
+    /// entry counts. Resuming getdents64 with lseek avoids rescanning an ever-
+    /// growing prefix. Bind cookies to the directory inode and wrap at EOF;
+    /// concurrent additions/deletions may defer an entry to the next full pass.
+    struct DirectoryCursor {
+        file: File,
+        path: PathBuf,
+        buffer: [u8; 4096],
+        position: usize,
+        length: usize,
+        offset: i64,
+    }
+
+    impl DirectoryCursor {
+        fn open(directory: &JsonDirectory, offset: i64) -> Result<Self, SessionError> {
+            use std::os::unix::fs::OpenOptionsExt;
+            let file = File::options()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&directory.path)
+                .map_err(|e| session_io(&directory.path, e))?;
+            directory.revalidate()?;
+            let expected = directory
+                .handle
+                .metadata()
+                .map_err(|e| session_io(&directory.path, e))?;
+            let observed = file
+                .metadata()
+                .map_err(|e| session_io(&directory.path, e))?;
+            if expected.dev() != observed.dev() || expected.ino() != observed.ino() {
+                return Err(session_io(
+                    &directory.path,
+                    std::io::Error::other("retention directory changed"),
+                ));
+            }
+            // SAFETY: file owns a directory descriptor; offset is a previous
+            // kernel cookie for this same directory inode (or zero).
+            if unsafe { libc::lseek(file.as_raw_fd(), offset, libc::SEEK_SET) } < 0 {
+                return Err(session_io(&directory.path, std::io::Error::last_os_error()));
+            }
+            Ok(Self {
+                file,
+                path: directory.path.clone(),
+                buffer: [0; 4096],
+                position: 0,
+                length: 0,
+                offset,
+            })
+        }
+
+        fn next(&mut self) -> Result<Option<std::ffi::OsString>, SessionError> {
+            if self.position == self.length {
+                // SAFETY: getdents64 receives a live directory descriptor and
+                // exclusive access to this correctly sized writable byte buffer.
+                let count = unsafe {
+                    libc::syscall(
+                        libc::SYS_getdents64,
+                        self.file.as_raw_fd(),
+                        self.buffer.as_mut_ptr(),
+                        self.buffer.len(),
+                    )
+                };
+                if count < 0 {
+                    return Err(session_io(&self.path, std::io::Error::last_os_error()));
+                }
+                self.length = count as usize;
+                self.position = 0;
+                if self.length == 0 {
+                    return Ok(None);
+                }
+            }
+            let record = &self.buffer[self.position..self.length];
+            let invalid = || {
+                session_io(
+                    &self.path,
+                    std::io::Error::other("invalid kernel directory record"),
+                )
+            };
+            if record.len() < 20 {
+                return Err(invalid());
+            }
+            let offset = i64::from_ne_bytes(record[8..16].try_into().unwrap());
+            let length = usize::from(u16::from_ne_bytes(record[16..18].try_into().unwrap()));
+            if offset < 0 || length < 20 || length > record.len() {
+                return Err(invalid());
+            }
+            let name = &record[19..length];
+            let end = name
+                .iter()
+                .position(|byte| *byte == 0)
+                .ok_or_else(invalid)?;
+            if end == 0 || name[..end].contains(&b'/') {
+                return Err(invalid());
+            }
+            let name = std::ffi::OsString::from_vec(name[..end].to_vec());
+            self.position += length;
+            self.offset = offset;
+            Ok(Some(name))
+        }
+    }
+
+    fn prune_session(
+        lock: &SessionCleanupLock,
+        root: &JsonDirectory,
+        pending: &Pending,
+        retention: Duration,
+        budget: &mut Budget,
+    ) -> Result<bool, SessionError> {
+        let path = root.path.join(&pending.session_id);
+        let session = match JsonDirectory::open(&path) {
+            Ok(session) => session,
+            Err(SessionError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Ok(true)
+            }
+            Err(error) => return Err(error),
+        };
+        let identity = session
+            .handle
+            .metadata()
+            .map_err(|e| session_io(&path, e))?;
+        if identity.dev() != pending.device || identity.ino() != pending.inode {
+            return Err(session_io(
+                &path,
+                std::io::Error::other("pending retention session was replaced"),
+            ));
+        }
+        if retention_requires_preservation(&path, &pending.session_id, retention) {
+            // If the last pass crashed after removing the manifest, only an
+            // already empty original directory can be completed. Never infer
+            // permission to remove unrecognized files from missing metadata.
+            if fs::symlink_metadata(path.join(MANIFEST_FILE))
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            {
+                lock.revalidate().map_err(|e| session_io(&root.path, e))?;
+                session.revalidate()?;
+                return unlink(root, std::ffi::OsStr::new(&pending.session_id), true)
+                    .map(|()| true);
+            }
+            budget.report.preserved += 1;
+            return Err(session_io(
+                &path,
+                std::io::Error::other("session now requires preservation"),
+            ));
+        }
+        let mount = directory_mount_id(&session)?;
+        if mount != directory_mount_id(root)? {
+            return Err(session_io(
+                &path,
+                std::io::Error::other("retention never traverses a session mount"),
+            ));
+        }
+        if !prune_contents(lock, &session, &session, mount, 0, budget)? || !budget.take_tree_node()
+        {
+            return Ok(false);
+        }
+        lock.revalidate().map_err(|e| session_io(&root.path, e))?;
+        session.revalidate()?;
+        if retention_requires_preservation(&path, &pending.session_id, retention) {
+            return Err(session_io(
+                &path,
+                std::io::Error::other("session changed before final removal"),
+            ));
+        }
+        unlink(&session, std::ffi::OsStr::new(MANIFEST_FILE), false)?;
+        session.revalidate()?;
+        unlink(root, std::ffi::OsStr::new(&pending.session_id), true)?;
+        Ok(true)
+    }
+
+    fn prune_contents(
+        lock: &SessionCleanupLock,
+        session: &JsonDirectory,
+        directory: &JsonDirectory,
+        mount: u64,
+        depth: usize,
+        budget: &mut Budget,
+    ) -> Result<bool, SessionError> {
+        if depth > 32 {
+            return Err(session_io(
+                &directory.path,
+                std::io::Error::other("retention tree exceeds depth limit"),
+            ));
+        }
+        let mut entries = DirectoryCursor::open(directory, 0)?;
+        loop {
+            if !budget.take_tree_node() {
+                return Ok(false);
+            }
+            lock.revalidate()
+                .map_err(|e| session_io(&directory.path, e))?;
+            session.revalidate()?;
+            directory.revalidate()?;
+            let Some(name) = entries.next()? else {
+                return Ok(true);
+            };
+            if name == "." || name == ".." || (depth == 0 && name == MANIFEST_FILE) {
+                continue;
+            }
+            let path = directory.path.join(&name);
+            let metadata = fs::symlink_metadata(&path).map_err(|e| session_io(&path, e))?;
+            if metadata.is_dir() {
+                let session_device = session
+                    .handle
+                    .metadata()
+                    .map_err(|e| session_io(&session.path, e))?
+                    .dev();
+                if metadata.dev() != session_device {
+                    return Err(session_io(
+                        &path,
+                        std::io::Error::other("retention never traverses a mounted filesystem"),
+                    ));
+                }
+                let child = JsonDirectory::open(&path)?;
+                // st_dev alone cannot detect a bind mount of another directory
+                // from the same filesystem. Pin and compare kernel mount IDs.
+                if directory_mount_id(&child)? != mount {
+                    return Err(session_io(
+                        &path,
+                        std::io::Error::other("retention never traverses a mounted directory"),
+                    ));
+                }
+                if !prune_contents(lock, session, &child, mount, depth + 1, budget)? {
+                    return Ok(false);
+                }
+                child.revalidate()?;
+                unlink(directory, &name, true)?;
+            } else {
+                unlink(directory, &name, false)?;
+            }
+        }
+    }
+
+    fn directory_mount_id(directory: &JsonDirectory) -> Result<u64, SessionError> {
+        use std::io::Read;
+        let path = PathBuf::from(format!(
+            "/proc/self/fdinfo/{}",
+            directory.handle.as_raw_fd()
+        ));
+        let mut bytes = Vec::new();
+        File::open(&path)
+            .map_err(|e| session_io(&path, e))?
+            .take(4097)
+            .read_to_end(&mut bytes)
+            .map_err(|e| session_io(&path, e))?;
+        if bytes.len() > 4096 {
+            return Err(session_io(
+                &path,
+                std::io::Error::other("directory fdinfo exceeds retention bound"),
+            ));
+        }
+        let text = std::str::from_utf8(&bytes).map_err(|e| {
+            session_io(
+                &path,
+                std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+            )
+        })?;
+        let mut ids = text.lines().filter_map(|line| line.strip_prefix("mnt_id:"));
+        let id = ids
+            .next()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|value| *value > 0);
+        if ids.next().is_some() {
+            return Err(session_io(
+                &path,
+                std::io::Error::other("ambiguous directory mount identity"),
+            ));
+        }
+        id.ok_or_else(|| {
+            session_io(
+                &path,
+                std::io::Error::other("directory mount identity unavailable"),
+            )
+        })
+    }
+
+    fn unlink(
+        directory: &JsonDirectory,
+        name: &std::ffi::OsStr,
+        is_dir: bool,
+    ) -> Result<(), SessionError> {
+        directory.revalidate()?;
+        let path = directory.path.join(name);
+        let name = artifact_name(name).map_err(|e| session_io(&path, e))?;
+        // SAFETY: both arguments are live, the name is a single component, and
+        // unlinkat never follows a symlink or recurses into a directory.
+        let result = unsafe {
+            libc::unlinkat(
+                directory.handle.as_raw_fd(),
+                name.as_ptr(),
+                if is_dir { libc::AT_REMOVEDIR } else { 0 },
+            )
+        };
+        if result != 0 {
+            return Err(session_io(&path, std::io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn fixture(root: &Path, suffix: &str, old: bool, state: SessionState) -> PathBuf {
+            let id = SessionId(format!("pt-20260101-000000-{suffix}"));
+            assert!(SessionId::parse(&id.0).is_some());
+            let path = root.join(&id.0);
+            fs::create_dir_all(path.join("action")).unwrap();
+            let mut manifest = SessionManifest::new(&id, None, SessionMode::RobotPlan, None);
+            manifest.state = state;
+            if old {
+                manifest.timing.created_at = (Utc::now() - Duration::days(30)).to_rfc3339();
+            }
+            fs::write(
+                path.join(MANIFEST_FILE),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            path
+        }
+
+        fn limits() -> Limits {
+            Limits {
+                entries: 5,
+                sessions: 2,
+                tree_nodes: 32,
+                wall: WallDuration::from_secs(5),
+            }
+        }
+
+        #[test]
+        fn bounded_retention_continues_past_preserved_sessions_and_skips_large_payload_reads() {
+            let temp = tempfile::tempdir().unwrap();
+            let store = SessionStore::at_data_dir(temp.path());
+            fs::create_dir(&store.sessions_root).unwrap();
+            let mut kept = Vec::new();
+            let mut old = Vec::new();
+            for index in 0..20u8 {
+                let suffix = format!("aaa{}", char::from(b'a' + index));
+                kept.push(fixture(
+                    &store.sessions_root,
+                    &suffix,
+                    false,
+                    SessionState::Planned,
+                ));
+            }
+            for index in 0..12u8 {
+                let suffix = format!("bbb{}", char::from(b'a' + index));
+                old.push(fixture(
+                    &store.sessions_root,
+                    &suffix,
+                    true,
+                    SessionState::Completed,
+                ));
+            }
+            // Retention needs only manifest/ownership evidence. A huge journal
+            // must not be read just to compute the session-list action count.
+            File::create(old[0].join("action/outcomes.jsonl"))
+                .unwrap()
+                .set_len(128 * 1024 * 1024)
+                .unwrap();
+            let mut completed = false;
+            for _ in 0..150 {
+                let report = run_limited(&store, Duration::days(7), limits(), false).unwrap();
+                assert!(report.entries <= 5);
+                assert!(report.sessions <= 2);
+                assert!(report.tree_nodes <= 32);
+                assert!(report.errors.is_empty(), "{:?}", report.errors);
+                if report.complete {
+                    completed = true;
+                    break;
+                }
+            }
+            assert!(completed, "cursor must finish despite a preserved prefix");
+            assert!(old.iter().all(|path| !path.exists()));
+            assert!(kept.iter().all(|path| path.join(MANIFEST_FILE).is_file()));
+            assert!(store.sessions_root.join(".last_gc").is_file());
+        }
+
+        #[test]
+        fn bounded_retention_resumes_large_trees_with_the_manifest_intact() {
+            let temp = tempfile::tempdir().unwrap();
+            let store = SessionStore::at_data_dir(temp.path());
+            let old = fixture(&store.sessions_root, "tree", true, SessionState::Planned);
+            let nested = old.join("scan/probes/nested");
+            fs::create_dir_all(&nested).unwrap();
+            for index in 0..90 {
+                fs::write(nested.join(index.to_string()), b"old probe").unwrap();
+            }
+            let mut partial = false;
+            let bounded = Limits {
+                tree_nodes: 24,
+                ..limits()
+            };
+            for _ in 0..100 {
+                let report = run_limited(&store, Duration::days(7), bounded, true).unwrap();
+                assert!(report.tree_nodes <= 24);
+                assert!(report.errors.is_empty(), "{:?}", report.errors);
+                if !old.exists() {
+                    break;
+                }
+                if report.tree_nodes > 0 {
+                    partial = true;
+                    assert!(old.join(MANIFEST_FILE).is_file());
+                    assert!(
+                        !store.sessions_root.join(".last_gc").exists(),
+                        "unfinished work must not be hidden behind the hourly throttle"
+                    );
+                }
+            }
+            assert!(partial, "fixture must require more than one bounded batch");
+            assert!(
+                !old.exists(),
+                "partial tree removal must make progress each batch"
+            );
+        }
+
+        #[test]
+        fn bounded_retention_preserves_execution_reversals_and_unreadable_manifests() {
+            let temp = tempfile::tempdir().unwrap();
+            let store = SessionStore::at_data_dir(temp.path());
+            let executing = fixture(&store.sessions_root, "exec", true, SessionState::Executing);
+            let reversals = fixture(&store.sessions_root, "undo", true, SessionState::Completed);
+            fs::create_dir(reversals.join("action/reversals")).unwrap();
+            let malformed = fixture(&store.sessions_root, "badx", true, SessionState::Completed);
+            fs::write(malformed.join(MANIFEST_FILE), b"partial").unwrap();
+            let missing = store.sessions_root.join("pt-20260101-000000-none");
+            fs::create_dir(&missing).unwrap();
+            let outside = temp.path().join("outside");
+            fs::create_dir(&outside).unwrap();
+            fs::write(outside.join("important"), b"retained").unwrap();
+            let old = fixture(&store.sessions_root, "link", true, SessionState::Cancelled);
+            std::os::unix::fs::symlink(&outside, old.join("linked-artifacts")).unwrap();
+            for _ in 0..50 {
+                let report = run_limited(&store, Duration::days(7), limits(), false).unwrap();
+                if report.complete {
+                    break;
+                }
+            }
+            assert!(executing.exists());
+            assert!(reversals.join("action/reversals").exists());
+            assert_eq!(fs::read(malformed.join(MANIFEST_FILE)).unwrap(), b"partial");
+            assert!(missing.exists());
+            assert_eq!(fs::read(outside.join("important")).unwrap(), b"retained");
+            assert!(!old.exists());
+        }
+
+        #[test]
+        fn bounded_retention_lock_and_zero_budget_do_not_delay_a_later_retry() {
+            let temp = tempfile::tempdir().unwrap();
+            let store = SessionStore::at_data_dir(temp.path());
+            let old = fixture(&store.sessions_root, "oldx", true, SessionState::Completed);
+            let execution = SessionCleanupLock::acquire(&store.sessions_root).unwrap();
+            assert!(run_limited(&store, Duration::days(7), limits(), true).is_err());
+            assert!(!store.sessions_root.join(PROGRESS_FILE).exists());
+            assert!(!store.sessions_root.join(".last_gc").exists());
+            drop(execution);
+            let zero = Limits {
+                wall: WallDuration::ZERO,
+                ..limits()
+            };
+            let report = run_limited(&store, Duration::days(7), zero, true).unwrap();
+            assert_eq!(report.entries, 0);
+            assert!(old.exists());
+            assert!(!store.sessions_root.join(".last_gc").exists());
+            for _ in 0..30 {
+                let report = run_limited(&store, Duration::days(7), limits(), true).unwrap();
+                if report.complete {
+                    break;
+                }
+            }
+            assert!(!old.exists());
+        }
+
+        #[test]
+        fn bounded_retention_rejects_redirected_or_malformed_progress_without_deletion() {
+            for symlink in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let store = SessionStore::at_data_dir(temp.path());
+                let old = fixture(&store.sessions_root, "oldx", true, SessionState::Completed);
+                let state = store.sessions_root.join(PROGRESS_FILE);
+                if symlink {
+                    let outside = temp.path().join("outside.json");
+                    fs::write(&outside, b"{}").unwrap();
+                    std::os::unix::fs::symlink(&outside, &state).unwrap();
+                } else {
+                    fs::write(&state, b"partial").unwrap();
+                }
+                assert!(run_limited(&store, Duration::days(7), limits(), false).is_err());
+                assert!(old.join(MANIFEST_FILE).exists());
+            }
+        }
     }
 }
 
@@ -1272,12 +2068,13 @@ fn retention_from_env(value: Option<String>) -> Option<Duration> {
     match value.as_deref().map(str::trim) {
         None | Some("") => Some(Duration::days(DEFAULT_RETENTION_DAYS)),
         Some(v) if matches!(v.to_ascii_lowercase().as_str(), "0" | "off" | "never") => None,
-        Some(v) => Some(Duration::days(
+        Some(v) => Some(
             v.parse::<i64>()
                 .ok()
                 .filter(|d| *d > 0)
-                .unwrap_or(DEFAULT_RETENTION_DAYS),
-        )),
+                .and_then(Duration::try_days)
+                .unwrap_or_else(|| Duration::days(DEFAULT_RETENTION_DAYS)),
+        ),
     }
 }
 
@@ -2430,6 +3227,11 @@ mod tests {
         assert_eq!(
             retention_from_env(Some("junk".into())),
             Some(Duration::days(7))
+        );
+        assert_eq!(
+            retention_from_env(Some(i64::MAX.to_string())),
+            Some(Duration::days(7)),
+            "out-of-range retention must not panic during session creation"
         );
     }
 

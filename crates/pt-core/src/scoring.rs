@@ -822,7 +822,8 @@ impl Scorer {
             activity_window: None,
             activity: BTreeMap::new(),
             agent_activity: BTreeMap::new(),
-            agent_session_window_seconds: crate::config::policy::DEFAULT_AGENT_SESSION_WINDOW_SECONDS,
+            agent_session_window_seconds:
+                crate::config::policy::DEFAULT_AGENT_SESSION_WINDOW_SECONDS,
             respawn_history: BTreeMap::new(),
             work: None,
             supervisor_restarts: BTreeMap::new(),
@@ -2830,7 +2831,10 @@ mod tests {
             .unwrap()
             .posterior
             .posterior;
-        let mut unit = measured.agent_activity_report(&processes, true).units.remove(0);
+        let mut unit = measured
+            .agent_activity_report(&processes, true)
+            .units
+            .remove(0);
         unit.session_activity = Some(session_activity_sample(process, 600, 1800));
         measured.agent_activity.insert(process.pid.0, unit);
         let score = measured
@@ -2870,7 +2874,10 @@ mod tests {
                 .unwrap();
             let live =
                 assess_agent_liveness(process, score.agent_activity.as_ref(), None, 1800).unwrap();
-            assert_eq!(live.live, expected_live, "session lookback {window_seconds}");
+            assert_eq!(
+                live.live, expected_live,
+                "session lookback {window_seconds}"
+            );
             assert_eq!(
                 score
                     .agent_activity
@@ -2912,7 +2919,9 @@ mod tests {
             unit.session_window_seconds = Some(window);
             unit.session_activity = Some(session_activity_sample(&process, age, window));
             assert_eq!(
-                assess_agent_liveness(&process, Some(&unit), None, 1800).unwrap().live,
+                assess_agent_liveness(&process, Some(&unit), None, 1800)
+                    .unwrap()
+                    .live,
                 expected,
                 "age {age}, lookback {window}"
             );
@@ -2932,7 +2941,9 @@ mod tests {
                 _ => changed.state = ProcessState::Dead,
             }
             assert_eq!(
-                assess_agent_liveness(&changed, Some(&unit), None, 1800).unwrap().live,
+                assess_agent_liveness(&changed, Some(&unit), None, 1800)
+                    .unwrap()
+                    .live,
                 None,
                 "identity variant {variant}"
             );
@@ -2947,7 +2958,9 @@ mod tests {
             }
             unit.session_activity = Some(unavailable);
             assert_eq!(
-                assess_agent_liveness(&process, Some(&unit), None, 1800).unwrap().live,
+                assess_agent_liveness(&process, Some(&unit), None, 1800)
+                    .unwrap()
+                    .live,
                 None,
                 "unavailable variant {variant}"
             );
@@ -2959,7 +2972,9 @@ mod tests {
         let mut process = agent_record(100, 1, "codex");
         process.tty = Some("pts/7".to_string());
         let mut measured = agent_activity_scorer(std::slice::from_ref(&process));
-        measured.activity.insert(100, agent_activity_sample(&process, 100.0, 0.0));
+        measured
+            .activity
+            .insert(100, agent_activity_sample(&process, 100.0, 0.0));
         let mut unit = measured
             .agent_activity_report(std::slice::from_ref(&process), true)
             .units
@@ -2971,7 +2986,11 @@ mod tests {
             assert_eq!(live.live, Some(true));
             assert_eq!(live.sources, vec![AgentLivenessSource::ProcessActivity]);
         }
-        for state in [ProcessState::Zombie, ProcessState::Dead, ProcessState::Unknown] {
+        for state in [
+            ProcessState::Zombie,
+            ProcessState::Dead,
+            ProcessState::Unknown,
+        ] {
             let mut invalid = process.clone();
             invalid.state = state;
             let live = assess_agent_liveness(&invalid, Some(&unit), Some(1), 1800).unwrap();
@@ -2980,13 +2999,19 @@ mod tests {
         }
         unit.sampling_window_ms = None;
         let live = assess_agent_liveness(&process, Some(&unit), Some(1), 1800).unwrap();
-        assert_eq!(live.sources, vec![AgentLivenessSource::RecentTerminalActivity]);
+        assert_eq!(
+            live.sources,
+            vec![AgentLivenessSource::RecentTerminalActivity]
+        );
 
         let mut disabled = measured.with_agent_session_window(0);
         let report = disabled.prepare_agent_activity(std::slice::from_ref(&process), true);
         let session = report.units[0].session_activity.as_ref().unwrap();
         assert_eq!(session.recently_modified(), None);
-        assert!(session.unavailable.iter().any(|reason| reason.contains("disabled")));
+        assert!(session
+            .unavailable
+            .iter()
+            .any(|reason| reason.contains("disabled")));
         assert_eq!(
             assess_agent_liveness(&process, Some(&report.units[0]), None, 1800)
                 .unwrap()
@@ -3003,7 +3028,10 @@ mod tests {
             .agent_activity_report(std::slice::from_ref(&process), true)
             .units
             .remove(0);
-        assert_eq!(unit.activity, AgentActivityState::NoActivityObservedInWindow);
+        assert_eq!(
+            unit.activity,
+            AgentActivityState::NoActivityObservedInWindow
+        );
         unit.session_window_seconds = Some(1800);
         let assess = |unit: &AgentActivityUnit| {
             assess_agent_liveness(&process, Some(unit), None, 1800).unwrap()
@@ -3014,7 +3042,10 @@ mod tests {
         unavailable.unavailable = vec!["descriptor evidence could not be read".to_string()];
         unit.session_activity = Some(unavailable);
         assert_eq!(assess(&unit).status, AgentLivenessState::Unknown);
-        assert_eq!(unit.activity, AgentActivityState::NoActivityObservedInWindow);
+        assert_eq!(
+            unit.activity,
+            AgentActivityState::NoActivityObservedInWindow
+        );
 
         unit.session_window_seconds = Some(0);
         assert_eq!(assess(&unit).live, Some(false));
@@ -3037,7 +3068,10 @@ mod tests {
         let score = disabled
             .score_recorded(&process, Evidence::from_snapshot(&process), captured)
             .unwrap();
-        assert_eq!(assess(score.agent_activity.as_ref().unwrap()).live, Some(false));
+        assert_eq!(
+            assess(score.agent_activity.as_ref().unwrap()).live,
+            Some(false)
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -3070,7 +3104,10 @@ mod tests {
         );
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         let process = loop {
-            assert!(std::time::Instant::now() < deadline, "owned agent did not become ready");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "owned agent did not become ready"
+            );
             let scan = crate::collect::quick_scan(&crate::collect::QuickScanOptions {
                 pids: vec![child.0.id()],
                 timeout: Some(Duration::from_millis(500)),

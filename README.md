@@ -2032,6 +2032,18 @@ including completed restoration histories and incomplete or unreadable
 receipts. Cleanup uses the execution lock so it cannot remove a session while
 an action is preparing the state needed for undo.
 
+On Linux, automatic retention advances in bounded batches when a session is
+created. Each pass inspects at most 128 directory entries and 32 sessions,
+visits at most 256 tree nodes, and stops starting work after 50 ms. The time
+budget is checked between filesystem operations; it cannot bound a blocked
+filesystem call. A durable cursor resumes discovery and partially removed
+expired trees across CLI invocations, and the hourly throttle starts only
+after a complete pass. Large plans and action journals are not loaded to
+decide retention. Executing sessions, reversal evidence, unreadable or missing
+manifests, and mounted directories remain preserved. Symlinks are not followed.
+`PROCESS_TRIAGE_RETENTION=off` disables automatic retention; explicit manual
+cleanup retains its existing behavior.
+
 This command currently covers Linux signal pauses, thread priorities and cgroup-v2 freezer,
 CPU bandwidth, memory soft limits, and cpuset controls from `agent apply`. Hybrid v1 throttling and
 quarantine record that durable undo is unsupported. Resume, service restart, macOS Pause,

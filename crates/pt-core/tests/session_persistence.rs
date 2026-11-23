@@ -226,3 +226,111 @@ fn agent_tail_reads_session_log() {
     assert!(has_inference_started, "missing inference_started event");
     assert!(has_decision_started, "missing decision_started event");
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn session_creation_advances_bounded_retention_across_processes() {
+    use chrono::Utc;
+    use pt_common::SessionId;
+    use pt_core::session::{SessionManifest, SessionMode, SessionState};
+
+    let data_dir = unique_data_dir();
+    let sessions = data_dir.join("sessions");
+    let make_session = |suffix: &str, old: bool, state: SessionState| {
+        let id = SessionId(format!("pt-20260101-000000-{suffix}"));
+        assert!(SessionId::parse(&id.0).is_some());
+        let path = sessions.join(&id.0);
+        fs::create_dir_all(path.join("action")).unwrap();
+        let mut manifest = SessionManifest::new(&id, None, SessionMode::RobotPlan, None);
+        manifest.state = state;
+        if old {
+            manifest.timing.created_at = (Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+        }
+        fs::write(
+            path.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        path
+    };
+    // More preserved entries than a single automatic pass may enumerate. The
+    // cursor must cross this prefix on later real invocations, without parsing
+    // plan/inference payloads or hiding unfinished work behind the hourly marker.
+    let fresh: Vec<_> = (0..140u8)
+        .map(|index| {
+            let suffix = format!(
+                "aa{}{}",
+                char::from(b'a' + index / 26),
+                char::from(b'a' + index % 26)
+            );
+            make_session(&suffix, false, SessionState::Planned)
+        })
+        .collect();
+    let executing = make_session("exec", true, SessionState::Executing);
+    let reversible = make_session("undo", true, SessionState::Completed);
+    fs::create_dir(reversible.join("action/reversals")).unwrap();
+    let malformed = make_session("badx", true, SessionState::Completed);
+    fs::write(malformed.join("manifest.json"), b"incomplete").unwrap();
+    let old = make_session("oldx", true, SessionState::Completed);
+    let tree = make_session("tree", true, SessionState::Scanning);
+    let probes = tree.join("scan/probes");
+    fs::create_dir_all(&probes).unwrap();
+    for index in 0..400 {
+        fs::write(probes.join(index.to_string()), b"expired probe").unwrap();
+    }
+    let mut observed_partial = false;
+    let mut completed = false;
+    // A busy host may consume a whole production GC slice before it gets CPU
+    // time to enumerate anything. Bound the overall test, not the number of
+    // legitimate partial passes, and keep every child inside that same deadline.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
+        if remaining.is_zero() {
+            break;
+        }
+        pt_core_with_data_dir(&data_dir)
+            .timeout(remaining)
+            .env("PROCESS_TRIAGE_RETENTION", "7")
+            .args(["--format", "json", "agent", "snapshot"])
+            .assert()
+            .success();
+        let progress: Value =
+            serde_json::from_slice(&fs::read(sessions.join(".retention-progress.json")).unwrap())
+                .unwrap();
+        if progress["in_progress"] == true {
+            observed_partial = true;
+            assert!(!sessions.join(".last_gc").exists());
+            if tree.exists() {
+                assert!(tree.join("manifest.json").exists());
+            }
+        } else {
+            completed = true;
+            break;
+        }
+    }
+    assert!(
+        observed_partial,
+        "backlog must require multiple bounded invocations"
+    );
+    assert!(
+        completed,
+        "independent processes must resume rather than restart GC within the 60-second deadline"
+    );
+    assert!(!old.exists());
+    assert!(!tree.exists());
+    assert!(fresh
+        .iter()
+        .all(|path| path.join("manifest.json").is_file()));
+    assert!(executing.join("manifest.json").is_file());
+    assert!(reversible.join("action/reversals").is_dir());
+    assert_eq!(
+        fs::read(malformed.join("manifest.json")).unwrap(),
+        b"incomplete"
+    );
+    let report: Value =
+        serde_json::from_slice(&fs::read(sessions.join(".last_gc")).unwrap()).unwrap();
+    assert_eq!(report["complete"], true);
+    assert!(report["entries"].as_u64().unwrap() <= 128);
+    assert!(report["sessions"].as_u64().unwrap() <= 32);
+    assert!(report["tree_nodes"].as_u64().unwrap() <= 256);
+}
