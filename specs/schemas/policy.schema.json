@@ -232,12 +232,22 @@
       "required": ["enabled", "method", "alpha"],
       "properties": {
         "enabled": { "type": "boolean" },
-        "method": { "type": "string", "enum": ["bh", "by", "alpha_investing", "none"] },
+        "method": {
+          "type": "string",
+          "enum": ["bayesian", "bh", "by", "alpha_investing", "none"],
+          "default": "bayesian",
+          "description": "Bayesian mode enforces each kill target's model-estimated null probability. BH, BY and alpha investing require valid statistical evidence unavailable in posterior-only saved plans and refuse those kills."
+        },
         "alpha": { "type": "number", "minimum": 0, "maximum": 1 },
-        "min_candidates": { "type": "integer", "minimum": 1 },
+        "min_candidates": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Advisory batch size; never disables posterior-risk execution checks."
+        },
         "lfdr_null": {
           "type": "array",
-          "items": { "type": "string" }
+          "items": { "type": "string", "enum": ["useful", "useful_bad", "abandoned", "zombie"] },
+          "description": "Null hypothesis classes. Empty or omitted uses useful and useful_bad."
         },
         "alpha_investing": { "$ref": "#/$defs/alpha_investing" }
       }

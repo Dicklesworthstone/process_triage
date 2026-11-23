@@ -50,7 +50,7 @@ pub enum ValidationError {
     #[error("Loss matrix for {class} is incomplete: missing {action}")]
     LossMatrixIncomplete { class: String, action: String },
 
-    #[error("FDR alpha must be in (0, 1] (got {value:.4})")]
+    #[error("FDR alpha must be finite and in [0, 1] (got {value:.4})")]
     FdrAlphaRange { value: f64 },
 
     #[error("Robot mode min_posterior must be in (0, 1] (got {value:.4})")]
@@ -223,10 +223,7 @@ pub fn validate_priors(priors: &Priors) -> Result<(), ValidationError> {
 }
 
 /// Validate class priors.
-fn validate_class_priors(
-    class: &ClassParams,
-    name: &str,
-) -> Result<(), ValidationError> {
+fn validate_class_priors(class: &ClassParams, name: &str) -> Result<(), ValidationError> {
     // Validate prior probability range
     if !(0.0..=1.0).contains(&class.prior_prob) {
         return Err(ValidationError::PriorProbabilityRange {
@@ -348,9 +345,20 @@ pub fn validate_policy(policy: &Policy) -> Result<(), ValidationError> {
     validate_loss_row(&policy.loss_matrix.zombie, "zombie")?;
 
     // Validate FDR alpha
-    if policy.fdr_control.alpha <= 0.0 || policy.fdr_control.alpha > 1.0 {
+    if !policy.fdr_control.alpha.is_finite() || !(0.0..=1.0).contains(&policy.fdr_control.alpha) {
         return Err(ValidationError::FdrAlphaRange {
             value: policy.fdr_control.alpha,
+        });
+    }
+    if policy.fdr_control.lfdr_null.iter().any(|class| {
+        !matches!(
+            class.as_str(),
+            "useful" | "useful_bad" | "abandoned" | "zombie"
+        )
+    }) {
+        return Err(ValidationError::InvalidValue {
+            field: "fdr_control.lfdr_null".to_string(),
+            message: "contains an unknown class".to_string(),
         });
     }
 
@@ -385,8 +393,10 @@ fn validate_load_aware(
         return Ok(());
     }
 
-    let weight_sum =
-        load_aware.weights.queue + load_aware.weights.load + load_aware.weights.memory + load_aware.weights.psi;
+    let weight_sum = load_aware.weights.queue
+        + load_aware.weights.load
+        + load_aware.weights.memory
+        + load_aware.weights.psi;
     if weight_sum <= 0.0 {
         return Err(ValidationError::InvalidValue {
             field: "load_aware.weights".to_string(),
@@ -437,8 +447,7 @@ fn validate_load_aware(
             message: "must be >= 1.0".to_string(),
         });
     }
-    if load_aware.multipliers.reversible_min <= 0.0 || load_aware.multipliers.reversible_min > 1.0
-    {
+    if load_aware.multipliers.reversible_min <= 0.0 || load_aware.multipliers.reversible_min > 1.0 {
         return Err(ValidationError::InvalidValue {
             field: "load_aware.multipliers.reversible_min".to_string(),
             message: "must be in (0, 1]".to_string(),
@@ -544,9 +553,19 @@ mod tests {
     #[test]
     fn test_invalid_fdr_alpha() {
         let mut policy = Policy::default();
-        policy.fdr_control.alpha = 1.5;
-        let result = validate_policy(&policy);
-        assert!(matches!(result, Err(ValidationError::FdrAlphaRange { .. })));
+        for alpha in [1.5, -0.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            policy.fdr_control.alpha = alpha;
+            let result = validate_policy(&policy);
+            assert!(matches!(result, Err(ValidationError::FdrAlphaRange { .. })));
+        }
+        policy.fdr_control.alpha = 0.0;
+        assert!(validate_policy(&policy).is_ok());
+        policy.fdr_control.lfdr_null = vec!["misspelled_class".to_string()];
+        assert!(matches!(
+            validate_policy(&policy),
+            Err(ValidationError::InvalidValue { field, .. })
+                if field == "fdr_control.lfdr_null"
+        ));
     }
 
     #[test]

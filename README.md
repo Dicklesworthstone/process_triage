@@ -634,6 +634,40 @@ A policy file is a complete document (`schema_version`, `loss_matrix`, `guardrai
 
 Check a file with `pt-core config validate policy.json`.
 
+#### Kill risk limit
+
+New policies and presets use `fdr_control.method: "bayesian"`. This is an
+explicit posterior-risk limit for direct kills, enforced by agent planning,
+interactive selection, and both preview and live execution:
+
+```json
+{
+  "fdr_control": {
+    "enabled": true,
+    "method": "bayesian",
+    "alpha": 0.05,
+    "lfdr_null": ["useful", "useful_bad"]
+  }
+}
+```
+
+Each target must have a valid identity and a normalized, finite posterior whose
+probability of belonging to a null class is at most `alpha`. An empty
+`lfdr_null` uses `useful` and `useful_bad`. The limit also applies to a single
+kill: `min_candidates` cannot disable it. Rejected targets become `review`,
+their parents are rechecked for live children, and resource goals cannot count
+the rejected kills. Execution rechecks the actual selected or resumed actions
+under **both** the saved policy and the current policy. A paired pause is also
+refused when its following kill cannot pass the risk gate.
+
+Explicit `bh`, `by`, or `alpha_investing` policies require statistical evidence
+that saved class posteriors do not supply. Direct kills under those methods are
+therefore refused with an evidence-unavailable explanation. To use the
+posterior-based gate, select `bayesian` in your policy and generate a new plan;
+editing current policy does not erase the policy already bound to an old plan.
+`enabled: false` or `method: "none"` disables this gate, while the other safety
+checks continue to apply.
+
 #### Termination cleanup grace
 
 Set `signal.term_grace_ms` in a complete policy to control how long a process may clean up after SIGTERM before escalation to SIGKILL. The default is 5,000 milliseconds; accepted values range from 1 to 300,000 milliseconds. For example:
@@ -2241,7 +2275,28 @@ also exposes cost-aware probe scheduling for its other probe types.
 
 ### FDR Control for Multiple Kill Decisions
 
-When triaging many processes at once, killing the top-N by score without correction inflates the false discovery rate. Single-host plans report the expected false-discovery rate of their kill set (`kill_set_fdr_estimate`, the mean of 1 − P(abandoned or zombie) over it); fleet plans pool kill decisions across hosts and keep the largest kill set, most probable first, whose posterior expected false-discovery proportion is at most `--max-fdr`. This bound is only as good as the posterior's calibration (see Limitations). e-value procedures (eBH, and eBY for arbitrary dependence) are applied when candidates carry genuine e-values; a posterior probability is not one.
+Single-host plans enforce the configured Bayesian risk limit before selecting
+executable kills. Each selected target's posterior null probability must be at
+most `alpha`, which also bounds the modeled expected false-discovery proportion
+of **any subset** of those targets. This conservative rule matters when a target
+exits, fails a live safety check, or is omitted by manual selection or resume:
+a very low-risk process cannot subsidize a riskier kill that might execute alone.
+No independence assumption is needed for this posterior expectation, but its
+accuracy still depends on the model and calibration. It is not a frequentist or
+anytime-valid statistical guarantee.
+
+The plan's `recommendations.fdr_control` reports the initial candidate gate and
+the final executable selection separately, including the method actually
+applied (`subset_safe_bayes_expected_fdr`), null classes, per-target decisions,
+and expected FDR. `kill_set_fdr_estimate` retains the descriptive mean of
+1 − P(abandoned or zombie). Apply reports both policy checks and gives rejected
+actions `check: "fdr_control"` outcomes without signalling them.
+
+Fleet planning additionally pools the locally permitted kill recommendations
+and keeps the largest most-probable-first set within `--max-fdr`. Its pooled
+approval and partial-execution limitations remain separate from each host's
+per-target limit. The e-value library procedures require genuine e-values;
+posteriors are never converted into fabricated p-values or e-values.
 
 ### Contextual Bandits for Action Selection (library-only)
 

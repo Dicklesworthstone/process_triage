@@ -1126,7 +1126,9 @@ mod tests {
         )
         .unwrap();
         let protected_context = protected.scoring_context.as_ref().unwrap();
-        assert!(protected_context.processes[&worker_pid].observations.is_none());
+        assert!(protected_context.processes[&worker_pid]
+            .observations
+            .is_none());
         assert_eq!(
             protected_context.processes[&agent_pid]
                 .observations
@@ -1156,7 +1158,11 @@ mod tests {
             .sources
             .contains(&AgentLivenessSource::DescendantActivity));
         let report = replay_scores(&restored, &replay_scorer(), &policy).unwrap();
-        let root = report.processes.iter().find(|p| p.pid == agent_pid).unwrap();
+        let root = report
+            .processes
+            .iter()
+            .find(|p| p.pid == agent_pid)
+            .unwrap();
         assert_eq!(root.status, ReplayScoreStatus::Scored);
         assert!(root
             .ledger

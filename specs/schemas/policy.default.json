@@ -96,10 +96,10 @@
   },
   "fdr_control": {
     "enabled": true,
-    "method": "bh",
+    "method": "bayesian",
     "alpha": 0.05,
     "min_candidates": 3,
-    "lfdr_null": ["useful"],
+    "lfdr_null": ["useful", "useful_bad"],
     "alpha_investing": {
       "w0": 0.05,
       "alpha_spend": 0.02,

@@ -219,13 +219,13 @@ fn build_summary(priors: Option<&Priors>, policy: Option<&Policy>) -> ConfigSumm
             (
                 p.robot_mode.enabled,
                 p.robot_mode.min_posterior,
-                format!("{:?}", p.fdr_control.method).to_lowercase(),
+                p.fdr_control.method.as_str().to_string(),
                 p.fdr_control.alpha,
                 p.guardrails.max_kills_per_run,
                 p.guardrails.protected_patterns.len(),
             )
         })
-        .unwrap_or((false, 0.99, "bh".to_string(), 0.05, 5, 0));
+        .unwrap_or((false, 0.99, "bayesian".to_string(), 0.05, 5, 0));
 
     ConfigSummary {
         class_priors,

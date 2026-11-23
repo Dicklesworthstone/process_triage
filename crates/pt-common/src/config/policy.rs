@@ -572,11 +572,11 @@ pub struct FdrControl {
     /// Target FDR level
     pub alpha: f64,
 
-    /// Minimum candidates for FDR control
+    /// Advisory batch size; never disables posterior-risk execution checks
     #[serde(default)]
     pub min_candidates: Option<u32>,
 
-    /// Null hypothesis classes for local FDR
+    /// Null hypothesis classes for local FDR; empty means useful and useful_bad
     #[serde(default)]
     pub lfdr_null: Vec<String>,
 
@@ -594,6 +594,16 @@ impl FdrControl {
                 self.alpha
             )));
         }
+        if self.lfdr_null.iter().any(|class| {
+            !matches!(
+                class.as_str(),
+                "useful" | "useful_bad" | "abandoned" | "zombie"
+            )
+        }) {
+            return Err(Error::InvalidPolicy(
+                "fdr_control.lfdr_null contains an unknown class".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -602,10 +612,10 @@ impl Default for FdrControl {
     fn default() -> Self {
         FdrControl {
             enabled: true,
-            method: FdrMethod::Bh,
+            method: FdrMethod::Bayesian,
             alpha: 0.05,
             min_candidates: Some(3),
-            lfdr_null: vec!["useful".to_string()],
+            lfdr_null: vec!["useful".to_string(), "useful_bad".to_string()],
             alpha_investing: Some(AlphaInvesting::default()),
         }
     }
@@ -615,6 +625,8 @@ impl Default for FdrControl {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FdrMethod {
+    /// Subset-safe posterior expected false-discovery control, model-based only.
+    Bayesian,
     /// Benjamini-Hochberg
     Bh,
     /// Benjamini-Yekutieli
@@ -1172,6 +1184,7 @@ mod tests {
     #[test]
     fn fdr_method_serde() {
         for method in &[
+            FdrMethod::Bayesian,
             FdrMethod::Bh,
             FdrMethod::By,
             FdrMethod::AlphaInvesting,

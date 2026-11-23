@@ -180,11 +180,23 @@ pub fn validate_policy(policy: &crate::policy::Policy) -> ValidationResult<()> {
     validate_loss_matrix(&policy.loss_matrix)?;
 
     // Validate FDR alpha is in valid range
-    if policy.fdr_control.alpha < 0.0 || policy.fdr_control.alpha > 1.0 {
+    if !policy.fdr_control.alpha.is_finite() || !(0.0..=1.0).contains(&policy.fdr_control.alpha) {
         return Err(ValidationError::InvalidValue {
             field: "fdr_control.alpha".to_string(),
             message: format!("Must be in [0, 1], got {}", policy.fdr_control.alpha),
         });
+    }
+
+    for class in &policy.fdr_control.lfdr_null {
+        if !matches!(
+            class.as_str(),
+            "useful" | "useful_bad" | "abandoned" | "zombie"
+        ) {
+            return Err(ValidationError::InvalidValue {
+                field: "fdr_control.lfdr_null".to_string(),
+                message: format!("Unknown posterior null class: {class}"),
+            });
+        }
     }
 
     // Validate robot mode settings
@@ -805,6 +817,30 @@ mod tests {
         let mut policy = crate::policy::Policy::default();
         policy.fdr_control.alpha = 1.5;
         assert!(validate_policy(&policy).is_err());
+    }
+
+    #[test]
+    fn fdr_policy_rejects_nonfinite_alpha_and_unknown_null_classes() {
+        let mut policy = crate::policy::Policy::default();
+        for alpha in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            policy.fdr_control.alpha = alpha;
+            assert!(matches!(
+                validate_policy(&policy),
+                Err(ValidationError::InvalidValue { field, .. })
+                    if field == "fdr_control.alpha"
+            ));
+        }
+        policy.fdr_control.alpha = 0.05;
+        policy.fdr_control.lfdr_null = vec!["useful".into(), "usefull".into()];
+        assert!(matches!(
+            validate_policy(&policy),
+            Err(ValidationError::InvalidValue { field, .. })
+                if field == "fdr_control.lfdr_null"
+        ));
+        policy.fdr_control.lfdr_null = vec!["useful".into(), "useful_bad".into()];
+        validate_policy(&policy).expect("recognized null classes");
+        policy.fdr_control.alpha = 0.0;
+        validate_policy(&policy).expect("zero permits only zero modeled null risk");
     }
 
     #[test]

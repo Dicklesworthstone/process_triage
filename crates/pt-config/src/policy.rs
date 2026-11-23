@@ -464,9 +464,12 @@ pub struct FdrControl {
     pub alpha: f64,
 
     #[serde(default)]
+    /// Advisory batch size. Single-host posterior-risk gates still apply to
+    /// smaller execution subsets, including retries and partial successes.
     pub min_candidates: Option<u32>,
 
     #[serde(default)]
+    /// Null classes for posterior risk; an empty list means useful + useful_bad.
     pub lfdr_null: Vec<String>,
 
     #[serde(default)]
@@ -477,6 +480,9 @@ pub struct FdrControl {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum FdrMethod {
+    /// Posterior expected false-discovery control. This is a model-based risk
+    /// limit, not a frequentist guarantee or a substitute for calibration.
+    Bayesian,
     /// Benjamini-Hochberg
     Bh,
     /// Benjamini-Yekutieli
@@ -491,6 +497,7 @@ pub enum FdrMethod {
 impl FdrMethod {
     pub fn as_str(&self) -> &'static str {
         match self {
+            FdrMethod::Bayesian => "bayesian",
             FdrMethod::Bh => "bh",
             FdrMethod::By => "by",
             FdrMethod::AlphaInvesting => "alpha_investing",
@@ -707,7 +714,7 @@ impl Default for FdrControl {
     fn default() -> Self {
         Self {
             enabled: true,
-            method: FdrMethod::Bh,
+            method: FdrMethod::Bayesian,
             alpha: 0.05,
             min_candidates: None,
             lfdr_null: Vec::new(),
@@ -1222,6 +1229,7 @@ mod tests {
 
     #[test]
     fn fdr_method_as_str() {
+        assert_eq!(FdrMethod::Bayesian.as_str(), "bayesian");
         assert_eq!(FdrMethod::Bh.as_str(), "bh");
         assert_eq!(FdrMethod::By.as_str(), "by");
         assert_eq!(FdrMethod::AlphaInvesting.as_str(), "alpha_investing");
@@ -1231,6 +1239,7 @@ mod tests {
     #[test]
     fn fdr_method_serde_roundtrip() {
         for method in &[
+            FdrMethod::Bayesian,
             FdrMethod::Bh,
             FdrMethod::By,
             FdrMethod::AlphaInvesting,
@@ -1370,7 +1379,7 @@ mod tests {
     fn fdr_control_default() {
         let fc = FdrControl::default();
         assert!(fc.enabled);
-        assert_eq!(fc.method, FdrMethod::Bh);
+        assert_eq!(fc.method, FdrMethod::Bayesian);
         assert!((fc.alpha - 0.05).abs() < f64::EPSILON);
         assert!(fc.min_candidates.is_none());
         assert!(fc.alpha_investing.is_none());

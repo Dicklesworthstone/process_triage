@@ -246,7 +246,7 @@ fn developer_preset() -> Policy {
 
         fdr_control: FdrControl {
             enabled: true,
-            method: FdrMethod::Bh,
+            method: FdrMethod::Bayesian,
             alpha: 0.10, // Higher FDR tolerance (10%)
             min_candidates: None,
             lfdr_null: Vec::new(),
@@ -451,9 +451,9 @@ fn server_preset() -> Policy {
 
         fdr_control: FdrControl {
             enabled: true,
-            method: FdrMethod::By,   // Benjamini-Yekutieli (stricter)
+            method: FdrMethod::Bayesian,
             alpha: 0.01,             // Very low FDR tolerance (1%)
-            min_candidates: Some(3), // Require multiple candidates
+            min_candidates: Some(3), // Advisory; small execution subsets are still gated
             lfdr_null: Vec::new(),
             alpha_investing: Some(AlphaInvesting {
                 w0: Some(0.01),
@@ -622,7 +622,7 @@ fn ci_preset() -> Policy {
 
         fdr_control: FdrControl {
             enabled: true,
-            method: FdrMethod::Bh,
+            method: FdrMethod::Bayesian,
             alpha: 0.05,
             min_candidates: None,
             lfdr_null: Vec::new(),
@@ -889,9 +889,9 @@ fn paranoid_preset() -> Policy {
 
         fdr_control: FdrControl {
             enabled: true,
-            method: FdrMethod::By,   // Strictest method
+            method: FdrMethod::Bayesian,
             alpha: 0.001,            // Extremely low FDR tolerance (0.1%)
-            min_candidates: Some(5), // Require many candidates before acting
+            min_candidates: Some(5), // Advisory; small execution subsets are still gated
             lfdr_null: Vec::new(),
             alpha_investing: Some(AlphaInvesting {
                 w0: Some(0.001),
@@ -1231,7 +1231,7 @@ mod tests {
     #[test]
     fn developer_fdr_10pct() {
         let p = get_preset(PresetName::Developer);
-        assert_eq!(p.fdr_control.method, FdrMethod::Bh);
+        assert_eq!(p.fdr_control.method, FdrMethod::Bayesian);
         assert!((p.fdr_control.alpha - 0.10).abs() < 1e-9);
     }
 
@@ -1271,7 +1271,7 @@ mod tests {
     #[test]
     fn server_fdr_1pct() {
         let p = get_preset(PresetName::Server);
-        assert_eq!(p.fdr_control.method, FdrMethod::By);
+        assert_eq!(p.fdr_control.method, FdrMethod::Bayesian);
         assert!((p.fdr_control.alpha - 0.01).abs() < 1e-9);
         assert!(p.fdr_control.alpha_investing.is_some());
     }
@@ -1378,7 +1378,7 @@ mod tests {
     #[test]
     fn paranoid_fdr_0_1pct() {
         let p = get_preset(PresetName::Paranoid);
-        assert_eq!(p.fdr_control.method, FdrMethod::By);
+        assert_eq!(p.fdr_control.method, FdrMethod::Bayesian);
         assert!((p.fdr_control.alpha - 0.001).abs() < 1e-9);
         assert_eq!(p.fdr_control.min_candidates, Some(5));
     }

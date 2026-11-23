@@ -3303,7 +3303,20 @@ fn build_plan_from_selection(
         candidates: plan_candidates,
         generated_at: Some(chrono::Utc::now().to_rfc3339()),
     };
-    let plan = generate_plan(&bundle);
+    let mut plan = generate_plan(&bundle);
+    let fdr = pt_core::decision::apply_plan_fdr_gate(&mut plan, policy);
+    if !fdr.blocked_action_ids.is_empty() {
+        let reasons = fdr
+            .decisions
+            .iter()
+            .filter(|decision| !decision.selected)
+            .map(|decision| format!("PID {}: {}", decision.target.pid.0, decision.reason))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!(
+            "selected kills are blocked by FDR policy: {reasons}"
+        ));
+    }
     let planned_kills = plan
         .actions
         .iter()
@@ -5041,6 +5054,17 @@ fn execute_plan_actions(
                     action.action_id
                 ));
             }
+        }
+        let selected_actions: Vec<_> = plan.actions.iter().collect();
+        let (fdr_refusals, _) = execution_fdr_gate(plan, &selected_actions, policy, None);
+        if !fdr_refusals.is_empty() {
+            let mut reasons: Vec<_> = fdr_refusals.into_values().collect();
+            reasons.sort();
+            reasons.dedup();
+            return Err(format!(
+                "interactive selection is blocked by FDR policy: {}",
+                reasons.join("; "),
+            ));
         }
         handle
             .update_state(SessionState::Executing)
@@ -7092,6 +7116,17 @@ fn finalize_tui_recommendations(
         .collect();
     let mut candidates: Vec<&mut serde_json::Value> = final_candidates.iter_mut().collect();
     apply_planned_kill_budget(&mut candidates, population, policy, false);
+    let action_inputs: HashMap<_, _> = plan_candidates
+        .iter()
+        .map(|(&pid, input)| (pid, input.decision_candidate()))
+        .collect();
+    apply_candidate_fdr_gate(policy, &mut final_candidates, &action_inputs);
+    let mut candidates: Vec<_> = final_candidates.iter_mut().collect();
+    apply_process_tree_safety(
+        &mut candidates,
+        population,
+        policy.guardrails.builtin_protection,
+    );
     for candidate in final_candidates {
         if let Some(pid) = candidate["pid"]
             .as_u64()
@@ -22374,6 +22409,175 @@ mod process_tree_safety_tests {
         serde_json::json!({"pid": pid, "recommended_action": "kill", "recommendation": "KILL"})
     }
 
+    fn fdr_fixture(
+        rows: &[(u32, u32, f64)],
+    ) -> (
+        Vec<ProcessRecord>,
+        Vec<serde_json::Value>,
+        std::collections::HashMap<u32, pt_core::plan::DecisionCandidate>,
+    ) {
+        use pt_core::decision::{decide_action, Action, ActionFeasibility};
+        use pt_core::inference::ClassScores;
+        let policy = pt_core::config::Policy::default();
+        let mut population = Vec::new();
+        let mut candidates = Vec::new();
+        let mut inputs = std::collections::HashMap::new();
+        for &(pid, ppid, risk) in rows {
+            let process = rec(pid, ppid, "worker", ProcessState::Sleeping);
+            let posterior = ClassScores {
+                useful: risk,
+                useful_bad: 0.0,
+                abandoned: 1.0 - risk,
+                zombie: 0.0,
+            };
+            let mut decision =
+                decide_action(&posterior, &policy, &ActionFeasibility::allow_all()).unwrap();
+            // Exercise a saved kill recommendation independently of the loss
+            // matrix: the risk policy must constrain even an older planner.
+            decision.optimal_action = Action::Kill;
+            decision.rationale.posterior = Some(posterior);
+            inputs.insert(
+                pid,
+                pt_core::plan::DecisionCandidate {
+                    identity: process_identity_from_record(&process),
+                    ppid: Some(ppid),
+                    decision,
+                    blocked_reasons: Vec::new(),
+                    stage_pause_before_kill: false,
+                    process_state: Some(process.state),
+                    parent_identity: None,
+                    d_state_diagnostics: None,
+                    supervisor_restart: None,
+                    memory_cap: None,
+                },
+            );
+            let mut candidate = cand(pid);
+            candidate["start_id"] = serde_json::json!(process.start_id);
+            candidate["uid"] = serde_json::json!(process.uid);
+            candidate["posterior"] = serde_json::json!(posterior);
+            candidate["action_rationale"] = serde_json::json!("original model decision");
+            candidates.push(candidate);
+            population.push(process);
+        }
+        (population, candidates, inputs)
+    }
+
+    #[test]
+    fn fdr_planning_reconciles_child_refusals_before_actions_and_goals() {
+        let policy = pt_core::config::Policy::default();
+        let (population, mut candidates, inputs) =
+            fdr_fixture(&[(100, 1, 0.001), (200, 100, 0.099), (300, 1, 0.01)]);
+        let original_posteriors: Vec<_> = candidates
+            .iter()
+            .map(|candidate| candidate["posterior"].clone())
+            .collect();
+        let report = super::apply_candidate_fdr_gate(&policy, &mut candidates, &inputs);
+        assert_eq!(report.selected_targets, 2);
+        assert_eq!(report.blocked_targets, 1);
+        assert_eq!(candidates[1]["recommended_action"], "review");
+        assert_eq!(candidates[1]["fdr_control"]["selected"], false);
+        let mut refs: Vec<_> = candidates.iter_mut().collect();
+        assert_eq!(apply_process_tree_safety(&mut refs, &population, false), 1);
+        assert_eq!(candidates[0]["recommended_action"], "review");
+        assert_eq!(candidates[0]["tree_safety"]["rule"], "live_child");
+        let plan = build_agent_action_plan(
+            &pt_common::SessionId::new(),
+            &policy,
+            &candidates,
+            &inputs,
+            "2026-11-23T00:00:00Z".into(),
+        );
+        assert_eq!(plan.actions.len(), 1);
+        assert_eq!(plan.actions[0].target.pid.0, 300);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate["posterior"].clone())
+                .collect::<Vec<_>>(),
+            original_posteriors,
+        );
+        assert!(!super::candidate_matches_filter(&candidates[0], "kill"));
+        assert!(!super::candidate_matches_filter(&candidates[1], "kill"));
+        assert!(super::candidate_matches_filter(&candidates[2], "kill"));
+    }
+
+    #[test]
+    fn fdr_apply_preserves_both_policies_and_canonical_plan() {
+        let (_, candidates, inputs) = fdr_fixture(&[(100, 1, 0.005), (200, 1, 0.04)]);
+        let mut current = pt_core::config::Policy::default();
+        current.fdr_control.alpha = 0.1;
+        let mut recorded = current.clone();
+        recorded.fdr_control.alpha = 0.01;
+        let plan = build_agent_action_plan(
+            &pt_common::SessionId::new(),
+            &current,
+            &candidates,
+            &inputs,
+            "now".into(),
+        );
+        let original = serde_json::to_value(&plan).unwrap();
+        let selected: Vec<_> = plan.actions.iter().collect();
+        for disable_current in [false, true] {
+            current.fdr_control.enabled = !disable_current;
+            let (refusals, reports) =
+                super::execution_fdr_gate(&plan, &selected, &current, Some(&recorded));
+            assert_eq!(reports.len(), 2);
+            assert_eq!(refusals.len(), 1);
+            let refused = plan
+                .actions
+                .iter()
+                .find(|action| action.target.pid.0 == 200)
+                .unwrap();
+            assert!(refusals[&refused.action_id].contains("recorded policy"));
+            assert_eq!(serde_json::to_value(&plan).unwrap(), original);
+        }
+        current.fdr_control.enabled = true;
+        current.fdr_control.alpha = 0.001;
+        recorded.fdr_control.enabled = false;
+        let (refusals, _) = super::execution_fdr_gate(&plan, &selected, &current, Some(&recorded));
+        assert_eq!(refusals.len(), 2);
+        assert!(refusals
+            .values()
+            .all(|reason| reason.contains("current policy")));
+    }
+
+    #[test]
+    fn fdr_apply_subset_resume_and_pause_cannot_bypass_risk_limit() {
+        let (_, candidates, mut inputs) = fdr_fixture(&[(100, 1, 0.001), (200, 1, 0.099)]);
+        inputs.get_mut(&200).unwrap().stage_pause_before_kill = true;
+        let mut policy = pt_core::config::Policy::default();
+        policy.fdr_control.min_candidates = Some(100);
+        let plan = build_agent_action_plan(
+            &pt_common::SessionId::new(),
+            &policy,
+            &candidates,
+            &inputs,
+            "now".into(),
+        );
+        // The pair's average risk is exactly 0.05, but either the safe kill or
+        // the pause could already be completed when a resumed apply starts.
+        for selected in [
+            plan.actions.iter().collect::<Vec<_>>(),
+            plan.actions
+                .iter()
+                .filter(|action| action.target.pid.0 == 200)
+                .collect(),
+            plan.actions
+                .iter()
+                .filter(|action| action.stage == 1)
+                .collect(),
+        ] {
+            let (refusals, _) = super::execution_fdr_gate(&plan, &selected, &policy, None);
+            assert!(!refusals.is_empty());
+            for action in selected {
+                assert_eq!(
+                    refusals.contains_key(&action.action_id),
+                    action.target.pid.0 == 200
+                );
+            }
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn execution_freeze_recovery_advances_bounded_passes_and_restarts_after_completion() {
@@ -30178,6 +30382,98 @@ fn candidate_matches_filter(candidate: &serde_json::Value, only: &str) -> bool {
     }
 }
 
+/// Apply the risk policy to the same identity-bound actions the planner would
+/// execute, before goals or presentation can select a subset. Each accepted
+/// target independently meets the risk ceiling, so later exclusions cannot
+/// increase the remaining set's modeled FDR above that ceiling.
+fn apply_candidate_fdr_gate(
+    policy: &pt_core::config::Policy,
+    candidates: &mut [serde_json::Value],
+    action_inputs: &HashMap<u32, DecisionCandidate>,
+) -> pt_core::decision::PlanFdrReport {
+    let mut plan = build_agent_action_plan(
+        &SessionId::new(),
+        policy,
+        candidates,
+        action_inputs,
+        chrono::Utc::now().to_rfc3339(),
+    );
+    let report = pt_core::decision::apply_plan_fdr_gate(&mut plan, policy);
+    let decisions: HashMap<_, _> = report
+        .decisions
+        .iter()
+        .map(|decision| (&decision.target, decision))
+        .collect();
+    for candidate in candidates {
+        let input = candidate["pid"]
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok())
+            .and_then(|pid| action_inputs.get(&pid));
+        let Some(decision) = input.and_then(|input| decisions.get(&input.identity)) else {
+            continue;
+        };
+        candidate["fdr_control"] = serde_json::to_value(decision).unwrap_or_default();
+        if !decision.selected {
+            candidate["recommended_action"] = serde_json::json!("review");
+            candidate["recommendation"] = serde_json::json!("REVIEW");
+            let previous = candidate["action_rationale"].as_str().unwrap_or("");
+            candidate["action_rationale"] = serde_json::json!(format!(
+                "Kill downgraded to review by FDR policy: {}; {previous}",
+                decision.reason,
+            ));
+        }
+    }
+    report
+}
+
+/// Recheck exactly the selected, unfinished actions without altering the saved
+/// plan or its execution binding. Both the recorded and current policy apply;
+/// changing a policy, selecting one PID or resuming cannot remove either gate.
+fn execution_fdr_gate(
+    plan: &Plan,
+    actions: &[&PlanAction],
+    current: &pt_core::config::Policy,
+    recorded: Option<&pt_core::config::Policy>,
+) -> (
+    HashMap<String, String>,
+    Vec<pt_core::decision::PlanFdrReport>,
+) {
+    let mut selected = plan.clone();
+    selected.actions = actions.iter().map(|action| (*action).clone()).collect();
+    let mut refusals = HashMap::new();
+    let mut reports = Vec::new();
+    for (label, policy) in
+        std::iter::once(("current", current)).chain(recorded.map(|policy| ("recorded", policy)))
+    {
+        // Evaluate each policy against the original selection so both policies'
+        // reports are complete, even when the first one already refused a PID.
+        let mut checked = selected.clone();
+        let report = pt_core::decision::apply_plan_fdr_gate(&mut checked, policy);
+        for decision in report
+            .decisions
+            .iter()
+            .filter(|decision| !decision.selected)
+        {
+            for action_id in &decision.action_ids {
+                refusals
+                    .entry(action_id.clone())
+                    .and_modify(|reason: &mut String| {
+                        reason.push_str(&format!("; {label} policy: {}", decision.reason));
+                    })
+                    .or_insert_with(|| format!("{label} policy: {}", decision.reason));
+            }
+        }
+        // A rejected staged kill must not leave its prerequisite pause runnable.
+        for action_id in &report.blocked_action_ids {
+            refusals.entry(action_id.clone()).or_insert_with(|| {
+                format!("{label} FDR policy blocks this action or its paired kill")
+            });
+        }
+        reports.push(report);
+    }
+    (refusals, reports)
+}
+
 fn build_agent_action_plan(
     session_id: &SessionId,
     policy: &pt_core::config::Policy,
@@ -31602,6 +31898,19 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         );
     }
 
+    let fdr_control = apply_candidate_fdr_gate(&decision_policy, &mut candidates, &action_inputs);
+    // A rejected child can make a previously safe parent unsafe. The FDR gate
+    // is subset-safe; tree exclusions therefore need no risk-budget recycling.
+    {
+        let mut candidate_values: Vec<_> = candidates.iter_mut().collect();
+        apply_process_tree_safety(
+            &mut candidate_values,
+            &scan_result.processes,
+            decision_policy.guardrails.builtin_protection,
+        );
+    }
+    candidates.retain(|candidate| candidate_matches_filter(candidate, &args.only));
+
     let generated_at = chrono::Utc::now().to_rfc3339();
     let mut action_plan = build_agent_action_plan(
         &session_id,
@@ -31670,6 +31979,15 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     remap_adaptive_term_action_ids(&mut candidates, &adaptive_term_grace);
     if let Some(summary) = goal_summary.as_mut() {
         remap_adaptive_term_goal_action_ids(summary, &adaptive_term_grace);
+    }
+    // Report the exact final action IDs, after goals and timing bindings. The
+    // earlier report retains why candidates were excluded; this one describes
+    // only the plan that will be saved and can actually be selected for apply.
+    let fdr_final_selection =
+        pt_core::decision::apply_plan_fdr_gate(&mut action_plan, &decision_policy);
+    if !fdr_final_selection.blocked_action_ids.is_empty() {
+        eprintln!("agent plan: final action selection violates the FDR policy");
+        return ExitCode::PolicyBlocked;
     }
     let returned_pids: HashSet<u32> = candidates
         .iter()
@@ -31924,6 +32242,10 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             warning.starts_with("private_memory") || warning.as_str() == "goal_resource_identity_unavailable"
         }).collect::<Vec<_>>(),
         "kill_set_fdr_estimate": kill_set_fdr_estimate,
+        "fdr_control": {
+            "candidate_gate": fdr_control,
+            "final_selection": fdr_final_selection,
+        },
     });
     if let Some(goal) = &goal_summary {
         recommendations["goal"] = goal.clone();
@@ -34131,6 +34453,13 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         return ExitCode::Clean;
     }
 
+    let (fdr_refusals, fdr_control) = execution_fdr_gate(
+        &plan,
+        &actions_to_apply,
+        &config.policy,
+        recorded_policy.as_ref(),
+    );
+
     let goal_progress_scan_options = QuickScanOptions {
         pids: vec![],
         // Keep the process-count baseline's scope even when planning explicitly
@@ -34160,7 +34489,11 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         .map(|action| {
             serde_json::json!({
                 "pid": action.target.pid.0,
-                "recommended_action": action.action,
+                "recommended_action": if fdr_refusals.contains_key(&action.action_id) {
+                    "review"
+                } else {
+                    action.action.as_str()
+                },
                 "supervisor_restart": action.supervisor_restart,
             })
         })
@@ -34347,6 +34680,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         let gated: Vec<pt_common::ProcessIdentity> = actions_to_apply
             .iter()
             .filter(|a| !a.blocked && !completed_action_ids.contains(&a.action_id))
+            .filter(|a| !fdr_refusals.contains_key(&a.action_id))
             .filter(|a| {
                 pt_core::plan::effective_pre_checks(a)
                     .contains(&pt_core::plan::PreCheck::CheckDataLossGate)
@@ -34554,6 +34888,29 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     "blocked_by_plan",
                     &[],
                 );
+                continue;
+            }
+
+            if let Some(reason) = fdr_refusals.get(&action.action_id) {
+                blocked_by_prechecks += 1;
+                checkpoint_outcome!(serde_json::json!({
+                    "action_id": action.action_id,
+                    "pid": action.target.pid.0,
+                    "status": "precheck_blocked",
+                    "check": "fdr_control",
+                    "reason": reason,
+                }));
+                emit_action_event(
+                    pt_core::events::event_names::ACTION_COMPLETE,
+                    action_index,
+                    None,
+                    action,
+                    "precheck_blocked",
+                    &[("check", serde_json::json!("fdr_control"))],
+                );
+                if args.abort_on_unknown {
+                    break;
+                }
                 continue;
             }
 
@@ -35111,6 +35468,29 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                         action,
                         "blocked_by_plan",
                         &[],
+                    );
+                    if args.abort_on_unknown {
+                        break;
+                    }
+                    continue;
+                }
+
+                if let Some(reason) = fdr_refusals.get(&action.action_id) {
+                    blocked_by_prechecks += 1;
+                    checkpoint_outcome!(serde_json::json!({
+                        "action_id": action.action_id,
+                        "pid": action.target.pid.0,
+                        "status": "precheck_blocked",
+                        "check": "fdr_control",
+                        "reason": reason,
+                    }));
+                    emit_action_event(
+                        pt_core::events::event_names::ACTION_COMPLETE,
+                        action_index,
+                        None,
+                        action,
+                        "precheck_blocked",
+                        &[("check", serde_json::json!("fdr_control"))],
                     );
                     if args.abort_on_unknown {
                         break;
@@ -36106,6 +36486,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         })),
         "resource_evidence_error": resource_evidence_error,
         "constraints_summary": constraints_summary,
+        "fdr_control": fdr_control,
         "resumed": args.resume
     });
     #[cfg(target_os = "linux")]

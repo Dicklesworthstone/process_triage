@@ -1,12 +1,14 @@
 //! False Discovery Rate (FDR) control for kill-set selection.
 //!
-//! Implements e-value based FDR control (eBH/eBY) for selecting
-//! which processes are safe enough to include in the kill set.
+//! Implements e-value selection for callers with valid e-values, and a distinct
+//! posterior-risk gate for executable plans. Posterior probabilities are never
+//! converted into fabricated e-values.
 //!
 //! See: Plan §5.8 / §4.32
 
 use serde::Serialize;
 use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use thiserror::Error;
 
 /// FDR control method.
@@ -226,9 +228,656 @@ pub fn by_correction_factor(m: usize) -> f64 {
     (1..=m).map(|j| 1.0 / j as f64).sum()
 }
 
+/// Posterior-risk decision for one actual process incarnation. Repeated actions
+/// on the same target cannot dilute the reported risk or count as independent
+/// evidence. This does not establish that the posterior is calibrated.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanFdrDecision {
+    pub target: pt_common::ProcessIdentity,
+    pub action_ids: Vec<String>,
+    pub posterior_null_probability: Option<f64>,
+    pub selected: bool,
+    pub reason: String,
+}
+
+/// What the single-host executable-plan gate actually enforced.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanFdrReport {
+    pub enabled: bool,
+    pub requested_method: String,
+    pub applied_method: Option<String>,
+    pub status: String,
+    /// Invalid nonfinite policy values stay JSON-serializable as unavailable.
+    pub alpha: Option<f64>,
+    pub null_classes: Vec<String>,
+    pub candidate_targets: usize,
+    pub selected_targets: usize,
+    pub blocked_targets: usize,
+    pub selected_action_ids: Vec<String>,
+    /// Includes stage-pause actions paired with a refused kill.
+    pub blocked_action_ids: Vec<String>,
+    pub expected_fdr: Option<f64>,
+    pub min_candidates: Option<u32>,
+    pub selection_scope: String,
+    pub limitation: String,
+    pub unavailable_reason: Option<String>,
+    pub decisions: Vec<PlanFdrDecision>,
+}
+
+struct PlanFdrTarget {
+    target: pt_common::ProcessIdentity,
+    action_indices: Vec<usize>,
+    posterior: Option<crate::inference::ClassScores>,
+    unavailable_reason: Option<String>,
+}
+
+fn plan_fdr_identity_valid(target: &pt_common::ProcessIdentity) -> bool {
+    if target.pid.0 <= 1 || target.quality != pt_common::IdentityQuality::Full {
+        return false;
+    }
+    let mut parts = target.start_id.0.split(':');
+    matches!(parts.next(), Some(boot) if !boot.is_empty() && !matches!(boot, "unknown" | "synthetic"))
+        && parts
+            .next()
+            .and_then(|part| part.parse::<u64>().ok())
+            .is_some()
+        && parts.next().and_then(|part| part.parse::<u32>().ok()) == Some(target.pid.0)
+        && parts.next().is_none()
+}
+
+fn posterior_null_probability(
+    posterior: Option<crate::inference::ClassScores>,
+    null_classes: &[String],
+) -> Result<f64, &'static str> {
+    let posterior = posterior.ok_or("kill target has no recorded class posterior")?;
+    let values = [
+        posterior.useful,
+        posterior.useful_bad,
+        posterior.abandoned,
+        posterior.zombie,
+    ];
+    if values
+        .iter()
+        .any(|value| !value.is_finite() || !(0.0..=1.0).contains(value))
+        || (values.iter().sum::<f64>() - 1.0).abs() > 1e-9
+    {
+        return Err("kill target posterior must contain finite normalized probabilities");
+    }
+    let mut risk = 0.0;
+    for class in null_classes {
+        risk += match class.as_str() {
+            "useful" => posterior.useful,
+            "useful_bad" => posterior.useful_bad,
+            "abandoned" => posterior.abandoned,
+            "zombie" => posterior.zombie,
+            _ => return Err("unknown posterior null class"),
+        };
+    }
+    // Only the accepted normalization roundoff can put a class sum over one.
+    Ok(risk.min(1.0))
+}
+
+/// Enforce a posterior-risk limit on the actual remaining direct kill actions.
+///
+/// Each accepted target has posterior null probability <= alpha. Consequently
+/// every nonempty execution subset also has mean posterior null probability <=
+/// alpha: failed prechecks, cancellation, parallel failures and manual selection
+/// cannot remove low-risk targets that were subsidizing a riskier kill. A largest
+/// mean-risk prefix would not have that property. This is a model-based estimate;
+/// no frequentist or anytime-valid FDR guarantee is claimed.
+///
+/// Callers must run this after final action selection and at apply time against
+/// both the recorded and current policy. Already blocked actions remain blocked.
+/// `min_candidates` is advisory here, never a way to bypass the limit on a small
+/// execution subset. Zombie-parent reaping uses Restart, not Kill, and is outside
+/// this direct-kill gate; a Kill carrying a child's posterior is refused.
+pub fn apply_plan_fdr_gate(
+    plan: &mut crate::plan::Plan,
+    policy: &crate::config::Policy,
+) -> PlanFdrReport {
+    use crate::config::policy::FdrMethod as PolicyMethod;
+    use crate::decision::Action;
+    use crate::plan::ActionRouting;
+
+    let config = &policy.fdr_control;
+    let enabled = config.enabled && config.method != PolicyMethod::None;
+    let null_classes: Vec<String> = if config.lfdr_null.is_empty() {
+        vec!["useful".into(), "useful_bad".into()]
+    } else {
+        config
+            .lfdr_null
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    };
+    let mut report = PlanFdrReport {
+        enabled,
+        requested_method: config.method.as_str().to_string(),
+        applied_method: (enabled && config.method == PolicyMethod::Bayesian)
+            .then(|| "subset_safe_bayes_expected_fdr".to_string()),
+        status: if enabled { "enforced" } else { "disabled" }.to_string(),
+        alpha: config.alpha.is_finite().then_some(config.alpha),
+        null_classes,
+        candidate_targets: 0,
+        selected_targets: 0,
+        blocked_targets: 0,
+        selected_action_ids: Vec::new(),
+        blocked_action_ids: Vec::new(),
+        expected_fdr: None,
+        min_candidates: config.min_candidates,
+        selection_scope: "each direct kill target; remains valid for arbitrary execution subsets".into(),
+        limitation: "Posterior expected false-discovery estimate only; depends on the model and does not establish calibration or a frequentist/anytime-valid FDR guarantee. Minimum candidate count does not disable execution checks.".into(),
+        unavailable_reason: None,
+        decisions: Vec::new(),
+    };
+    if enabled {
+        report.unavailable_reason = if !config.alpha.is_finite()
+            || !(0.0..=1.0).contains(&config.alpha)
+        {
+            Some("FDR alpha must be finite and in [0, 1]".into())
+        } else if report.null_classes.iter().any(|class| {
+            !matches!(
+                class.as_str(),
+                "useful" | "useful_bad" | "abandoned" | "zombie"
+            )
+        }) {
+            Some("FDR null classes must name useful, useful_bad, abandoned or zombie".into())
+        } else {
+            match config.method {
+                PolicyMethod::Bh | PolicyMethod::By => Some(format!(
+                    "FDR method {} requires valid p-values or e-values; the saved plan contains class posteriors, which are not such evidence",
+                    config.method.as_str()
+                )),
+                PolicyMethod::AlphaInvesting => Some("Alpha-investing requires valid sequential evidence and durable alpha-wealth state; neither is supplied by a saved class posterior".into()),
+                PolicyMethod::Bayesian | PolicyMethod::None => None,
+            }
+        };
+        if report.unavailable_reason.is_some() {
+            report.status = "unavailable".into();
+            report.applied_method = None;
+        }
+    }
+
+    let mut action_id_counts = HashMap::new();
+    for action in &plan.actions {
+        *action_id_counts
+            .entry(action.action_id.as_str())
+            .or_insert(0usize) += 1;
+    }
+    let mut targets: BTreeMap<(u32, String, u32), PlanFdrTarget> = BTreeMap::new();
+    for (index, action) in plan
+        .actions
+        .iter()
+        .enumerate()
+        .filter(|(_, action)| action.action == Action::Kill && !action.blocked)
+    {
+        let target = &action.target;
+        let entry = targets
+            .entry((target.pid.0, target.start_id.0.clone(), target.uid))
+            .or_insert_with(|| PlanFdrTarget {
+                target: target.clone(),
+                action_indices: Vec::new(),
+                posterior: action.rationale.posterior,
+                unavailable_reason: None,
+            });
+        entry.action_indices.push(index);
+        let reason = if !plan_fdr_identity_valid(target) {
+            Some("kill target requires a full, consistent process identity")
+        } else if entry.target != *target || entry.posterior != action.rationale.posterior {
+            Some("duplicate kill target has conflicting identity or posterior evidence")
+        } else if action_id_counts.get(action.action_id.as_str()) != Some(&1) {
+            Some("kill action ID is ambiguous in the saved plan")
+        } else if !matches!(
+            action.routing,
+            ActionRouting::Direct | ActionRouting::DStateLowConfidence
+        ) || action.original_zombie_target.is_some()
+            || action.supervisor_restart.is_some()
+        {
+            Some("a routed child's posterior cannot authorize killing its parent or supervisor")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            entry.unavailable_reason = Some(reason.into());
+        }
+    }
+    let mut pid_counts = HashMap::new();
+    for target in targets.values() {
+        *pid_counts.entry(target.target.pid.0).or_insert(0usize) += 1;
+    }
+    report.candidate_targets = targets.len();
+    let mut rejected_indices = BTreeSet::new();
+    let mut selected_risk = 0.0;
+    for mut target in targets.into_values() {
+        if pid_counts[&target.target.pid.0] > 1 {
+            target.unavailable_reason =
+                Some("multiple process incarnations or owners share the same kill PID".into());
+        }
+        let risk = posterior_null_probability(target.posterior, &report.null_classes);
+        let reason = if !enabled {
+            None
+        } else if let Some(reason) = &report.unavailable_reason {
+            Some(reason.clone())
+        } else if let Some(reason) = target.unavailable_reason {
+            Some(reason)
+        } else {
+            match &risk {
+                Err(reason) => Some((*reason).to_string()),
+                Ok(risk) if *risk > config.alpha => Some(format!(
+                    "posterior null probability {risk:.6} exceeds alpha {:.6}; another target cannot subsidize this kill",
+                    config.alpha
+                )),
+                Ok(_) => None,
+            }
+        };
+        let selected = reason.is_none();
+        let action_ids: Vec<_> = target
+            .action_indices
+            .iter()
+            .map(|&index| plan.actions[index].action_id.clone())
+            .collect();
+        if selected {
+            report.selected_targets += 1;
+            report
+                .selected_action_ids
+                .extend(action_ids.iter().cloned());
+            selected_risk += risk.as_ref().copied().unwrap_or(0.0);
+        } else {
+            report.blocked_targets += 1;
+            rejected_indices.extend(target.action_indices);
+        }
+        report.decisions.push(PlanFdrDecision {
+            target: target.target,
+            action_ids,
+            posterior_null_probability: risk.ok(),
+            selected,
+            reason: reason.unwrap_or_else(|| {
+                if enabled {
+                    "recorded posterior null probability is within the per-target limit".into()
+                } else {
+                    "posterior-risk control is disabled by policy".into()
+                }
+            }),
+        });
+    }
+    if enabled && report.unavailable_reason.is_none() && report.selected_targets > 0 {
+        report.expected_fdr = Some(selected_risk / report.selected_targets as f64);
+    }
+    if enabled && report.candidate_targets == 0 && report.unavailable_reason.is_none() {
+        report.status = "no_kill_actions".into();
+    }
+    let rejected_targets: HashSet<_> = rejected_indices
+        .iter()
+        .map(|&index| plan.actions[index].target.clone())
+        .collect();
+    for (index, action) in plan.actions.iter().enumerate() {
+        if action.action == Action::Pause
+            && !action.blocked
+            && rejected_targets.contains(&action.target)
+        {
+            rejected_indices.insert(index);
+        }
+    }
+    for index in rejected_indices {
+        plan.actions[index].blocked = true;
+        report
+            .blocked_action_ids
+            .push(plan.actions[index].action_id.clone());
+    }
+    let blocked_ids: BTreeSet<_> = plan
+        .actions
+        .iter()
+        .filter(|action| action.blocked)
+        .map(|action| action.action_id.as_str())
+        .collect();
+    plan.pre_toggled
+        .retain(|id| !blocked_ids.contains(id.as_str()));
+    plan.gates_summary.blocked_candidates = plan
+        .gates_summary
+        .blocked_candidates
+        .saturating_add(report.blocked_targets);
+    plan.gates_summary.pre_toggled_actions = plan.pre_toggled.len();
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn plan_kill(pid: u32, risk: f64) -> crate::plan::PlanAction {
+        use crate::plan::{ActionConfidence, ActionRationale, ActionRouting, ActionTimeouts};
+        crate::plan::PlanAction {
+            action_id: format!("kill-{pid}"),
+            target: pt_common::ProcessIdentity::new(
+                pid,
+                pt_common::StartId::from_linux("boot", 100, pid),
+                1000,
+            ),
+            action: crate::decision::Action::Kill,
+            order: 0,
+            stage: 0,
+            timeouts: ActionTimeouts::default(),
+            pre_checks: Vec::new(),
+            rationale: ActionRationale {
+                expected_loss: Some(1.0),
+                expected_recovery: None,
+                expected_recovery_stddev: None,
+                posterior_odds_abandoned_vs_useful: None,
+                sprt_boundary: None,
+                posterior: Some(crate::inference::ClassScores {
+                    useful: risk,
+                    useful_bad: 0.0,
+                    abandoned: 1.0 - risk,
+                    zombie: 0.0,
+                }),
+                memory_mb: None,
+                has_known_signature: None,
+                category: None,
+            },
+            on_success: Vec::new(),
+            on_failure: Vec::new(),
+            blocked: false,
+            routing: ActionRouting::Direct,
+            confidence: ActionConfidence::Normal,
+            original_zombie_target: None,
+            d_state_diagnostics: None,
+            supervisor_restart: None,
+            memory_cap: None,
+        }
+    }
+
+    fn plan_with(actions: Vec<crate::plan::PlanAction>) -> crate::plan::Plan {
+        crate::plan::Plan {
+            plan_id: "plan-fdr-test".into(),
+            session_id: "session-fdr-test".into(),
+            generated_at: "2026-11-23T00:00:00Z".into(),
+            policy_id: None,
+            policy_version: "1.0.0".into(),
+            pre_toggled: actions
+                .iter()
+                .map(|action| action.action_id.clone())
+                .collect(),
+            gates_summary: crate::plan::GatesSummary {
+                total_candidates: actions.len(),
+                blocked_candidates: 0,
+                pre_toggled_actions: actions.len(),
+            },
+            actions,
+        }
+    }
+
+    #[test]
+    fn plan_fdr_never_subsidizes_a_risky_kill_with_a_safer_target() {
+        let policy = crate::config::Policy::default();
+        let mut plan = plan_with(vec![plan_kill(10, 0.001), plan_kill(11, 0.099)]);
+        // The pair averages exactly alpha, but a failed first kill would leave
+        // only a 9.9%-risk success. Only the individually bounded target passes.
+        let report = apply_plan_fdr_gate(&mut plan, &policy);
+        assert_eq!(
+            report.applied_method.as_deref(),
+            Some("subset_safe_bayes_expected_fdr")
+        );
+        assert_eq!(report.selected_action_ids, vec!["kill-10"]);
+        assert_eq!(report.blocked_action_ids, vec!["kill-11"]);
+        assert_eq!(report.selected_targets, 1);
+        assert_eq!(report.expected_fdr, Some(0.001));
+        assert_eq!(plan.pre_toggled, vec!["kill-10"]);
+
+        let mut subset = plan_with(vec![plan_kill(11, 0.099)]);
+        assert_eq!(
+            apply_plan_fdr_gate(&mut subset, &policy).selected_targets,
+            0
+        );
+    }
+
+    #[test]
+    fn plan_fdr_all_accepted_execution_subsets_satisfy_the_model_budget() {
+        let policy = crate::config::Policy::default();
+        let mut plan = plan_with(
+            (0..12)
+                .map(|i| plan_kill(100 + i, f64::from(i) / 100.0))
+                .collect(),
+        );
+        let report = apply_plan_fdr_gate(&mut plan, &policy);
+        let risks: Vec<_> = report
+            .decisions
+            .iter()
+            .filter(|row| row.selected)
+            .map(|row| row.posterior_null_probability.unwrap())
+            .collect();
+        assert_eq!(risks.len(), 6);
+        for subset in 1usize..(1 << risks.len()) {
+            let selected: Vec<_> = risks
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| subset & (1 << i) != 0)
+                .map(|(_, risk)| *risk)
+                .collect();
+            assert!(
+                selected.iter().sum::<f64>() / selected.len() as f64 <= policy.fdr_control.alpha
+            );
+        }
+    }
+
+    #[test]
+    fn plan_fdr_blocks_staged_pause_without_touching_unrelated_or_zombie_remedies() {
+        use crate::decision::Action;
+        let policy = crate::config::Policy::default();
+        let mut kill = plan_kill(10, 0.8);
+        kill.stage = 1;
+        let mut pause = kill.clone();
+        pause.action_id = "pause-10".into();
+        pause.action = Action::Pause;
+        pause.stage = 0;
+        let mut renice = plan_kill(11, 0.9);
+        renice.action = Action::Renice;
+        let mut zombie = plan_kill(12, 0.9);
+        zombie.action = Action::Restart;
+        zombie.routing = crate::plan::ActionRouting::ZombieToParent;
+        zombie.original_zombie_target = Some(plan_kill(13, 0.0).target);
+        let mut plan = plan_with(vec![pause, kill, renice, zombie]);
+        let report = apply_plan_fdr_gate(&mut plan, &policy);
+        assert_eq!(report.blocked_action_ids, vec!["pause-10", "kill-10"]);
+        assert_eq!(report.candidate_targets, 1);
+        assert!(!plan.actions[2].blocked);
+        assert!(!plan.actions[3].blocked);
+        assert_eq!(plan.gates_summary.blocked_candidates, 1);
+        assert_eq!(plan.gates_summary.pre_toggled_actions, 2);
+        let again = apply_plan_fdr_gate(&mut plan, &policy);
+        assert_eq!(again.candidate_targets, 0);
+        assert_eq!(plan.gates_summary.blocked_candidates, 1);
+        assert!(plan.actions[0].blocked && plan.actions[1].blocked);
+
+        // Saved plans cannot leave an orphan pause executable by changing its
+        // stage or action order relative to a refused kill.
+        for stage in [0, 1, 2] {
+            let kill = plan_kill(10, 0.8);
+            let mut pause = kill.clone();
+            pause.action_id = "pause-10".into();
+            pause.action = Action::Pause;
+            pause.stage = stage;
+            let mut plan = plan_with(vec![kill, pause]);
+            plan.gates_summary.blocked_candidates = usize::MAX;
+            let report = apply_plan_fdr_gate(&mut plan, &policy);
+            assert_eq!(report.blocked_action_ids, vec!["kill-10", "pause-10"]);
+            assert!(plan.actions.iter().all(|action| action.blocked));
+            assert_eq!(plan.gates_summary.blocked_candidates, usize::MAX);
+        }
+    }
+
+    #[test]
+    fn plan_fdr_rejects_missing_invalid_or_unbound_posteriors() {
+        use crate::inference::ClassScores;
+        let policy = crate::config::Policy::default();
+        let cases = [
+            None,
+            Some(ClassScores {
+                useful: 0.0,
+                useful_bad: 0.0,
+                abandoned: 0.8,
+                zombie: 0.0,
+            }),
+            Some(ClassScores {
+                useful: f64::NAN,
+                useful_bad: 0.0,
+                abandoned: 1.0,
+                zombie: 0.0,
+            }),
+            Some(ClassScores {
+                useful: f64::INFINITY,
+                useful_bad: 0.0,
+                abandoned: 1.0,
+                zombie: 0.0,
+            }),
+            Some(ClassScores {
+                useful: -0.01,
+                useful_bad: 0.0,
+                abandoned: 1.01,
+                zombie: 0.0,
+            }),
+        ];
+        for posterior in cases {
+            let mut action = plan_kill(10, 0.0);
+            action.rationale.posterior = posterior;
+            let mut plan = plan_with(vec![action]);
+            let report = apply_plan_fdr_gate(&mut plan, &policy);
+            assert_eq!(report.selected_targets, 0);
+            assert_eq!(report.blocked_targets, 1);
+            assert!(report.decisions[0].posterior_null_probability.is_none());
+            serde_json::to_string(&report).expect("unavailable evidence remains serializable");
+        }
+        for neighbor in 0..5 {
+            let mut action = plan_kill(10, 0.0);
+            match neighbor {
+                0 => action.target.quality = pt_common::IdentityQuality::PidOnly,
+                1 => action.target.start_id = pt_common::StartId::from_linux("boot", 100, 11),
+                2 => action.target.start_id = pt_common::StartId::from_linux("unknown", 100, 10),
+                3 => action.routing = crate::plan::ActionRouting::ZombieToParent,
+                _ => action.original_zombie_target = Some(plan_kill(11, 0.0).target),
+            }
+            let mut plan = plan_with(vec![action]);
+            assert_eq!(apply_plan_fdr_gate(&mut plan, &policy).selected_targets, 0);
+        }
+    }
+
+    #[test]
+    fn plan_fdr_deduplicates_targets_and_refuses_conflicting_evidence() {
+        let policy = crate::config::Policy::default();
+        let action = plan_kill(10, 0.01);
+        let mut duplicate = action.clone();
+        duplicate.action_id = "kill-10-second".into();
+        let mut plan = plan_with(vec![action.clone(), duplicate.clone()]);
+        let report = apply_plan_fdr_gate(&mut plan, &policy);
+        assert_eq!(report.candidate_targets, 1);
+        assert_eq!(report.selected_targets, 1);
+        assert_eq!(report.selected_action_ids.len(), 2);
+        assert_eq!(report.expected_fdr, Some(0.01));
+        for neighbor in 0..5 {
+            let mut changed = duplicate.clone();
+            match neighbor {
+                0 => changed.rationale.posterior = plan_kill(10, 0.02).rationale.posterior,
+                1 => changed.target.sid = Some(50),
+                2 => changed.target.start_id = pt_common::StartId::from_linux("boot", 101, 10),
+                3 => changed.target.uid = 1001,
+                _ => changed.action_id = action.action_id.clone(),
+            }
+            let mut plan = plan_with(vec![action.clone(), changed]);
+            let report = apply_plan_fdr_gate(&mut plan, &policy);
+            assert_eq!(report.selected_targets, 0, "neighbor {neighbor}");
+            assert!(plan.actions.iter().all(|action| action.blocked));
+        }
+    }
+
+    #[test]
+    fn plan_fdr_honors_null_classes_without_double_counting() {
+        let mut policy = crate::config::Policy::default();
+        let mut action = plan_kill(10, 0.01);
+        action.rationale.posterior = Some(crate::inference::ClassScores {
+            useful: 0.01,
+            useful_bad: 0.09,
+            abandoned: 0.9,
+            zombie: 0.0,
+        });
+        let mut default_null = plan_with(vec![action.clone()]);
+        assert_eq!(
+            apply_plan_fdr_gate(&mut default_null, &policy).selected_targets,
+            0
+        );
+        policy.fdr_control.lfdr_null = vec!["useful".into(), "useful".into()];
+        let mut useful_only = plan_with(vec![action]);
+        let report = apply_plan_fdr_gate(&mut useful_only, &policy);
+        assert_eq!(report.null_classes, vec!["useful"]);
+        assert_eq!(report.selected_targets, 1);
+        assert_eq!(report.expected_fdr, Some(0.01));
+    }
+
+    #[test]
+    fn plan_fdr_explicit_statistical_methods_require_their_own_evidence() {
+        use crate::config::policy::FdrMethod as PolicyMethod;
+        let mut policy = crate::config::Policy::default();
+        for method in [
+            PolicyMethod::Bh,
+            PolicyMethod::By,
+            PolicyMethod::AlphaInvesting,
+        ] {
+            policy.fdr_control.method = method;
+            let mut plan = plan_with(vec![plan_kill(10, 0.0)]);
+            let report = apply_plan_fdr_gate(&mut plan, &policy);
+            assert_eq!(report.status, "unavailable");
+            assert!(report.applied_method.is_none());
+            assert!(report.unavailable_reason.is_some());
+            assert_eq!(report.selected_targets, 0);
+            assert!(plan.actions[0].blocked);
+        }
+    }
+
+    #[test]
+    fn plan_fdr_disabled_and_none_preserve_kills_but_small_batches_do_not_bypass() {
+        let mut policy = crate::config::Policy::default();
+        policy.fdr_control.min_candidates = Some(100);
+        let mut small = plan_with(vec![plan_kill(10, 0.8)]);
+        assert_eq!(apply_plan_fdr_gate(&mut small, &policy).selected_targets, 0);
+        policy.fdr_control.enabled = false;
+        let mut disabled = plan_with(vec![plan_kill(10, 0.8)]);
+        assert_eq!(
+            apply_plan_fdr_gate(&mut disabled, &policy).status,
+            "disabled"
+        );
+        assert!(!disabled.actions[0].blocked);
+        policy.fdr_control.enabled = true;
+        policy.fdr_control.method = crate::config::policy::FdrMethod::None;
+        let mut none = plan_with(vec![plan_kill(10, 0.8)]);
+        assert_eq!(apply_plan_fdr_gate(&mut none, &policy).selected_targets, 1);
+        assert!(!none.actions[0].blocked);
+    }
+
+    #[test]
+    fn plan_fdr_invalid_configuration_fails_closed_and_zero_alpha_is_exact() {
+        let mut policy = crate::config::Policy::default();
+        for alpha in [f64::NAN, f64::INFINITY, -0.1, 1.1] {
+            policy.fdr_control.alpha = alpha;
+            let mut plan = plan_with(vec![plan_kill(10, 0.0)]);
+            let report = apply_plan_fdr_gate(&mut plan, &policy);
+            assert_eq!(report.status, "unavailable");
+            assert!(plan.actions[0].blocked);
+            serde_json::to_string(&report).expect("invalid config still gives structured refusal");
+        }
+        policy.fdr_control.alpha = 0.0;
+        let mut zero = plan_with(vec![plan_kill(10, 0.0), plan_kill(11, 1e-12)]);
+        assert_eq!(
+            apply_plan_fdr_gate(&mut zero, &policy).selected_action_ids,
+            vec!["kill-10"]
+        );
+        policy.fdr_control.lfdr_null = vec!["usefull".into()];
+        let mut invalid_class = plan_with(vec![plan_kill(10, 0.0)]);
+        assert_eq!(
+            apply_plan_fdr_gate(&mut invalid_class, &policy).status,
+            "unavailable"
+        );
+        assert!(invalid_class.actions[0].blocked);
+    }
 
     fn make_candidate(pid: i32, e_value: f64) -> FdrCandidate {
         FdrCandidate {

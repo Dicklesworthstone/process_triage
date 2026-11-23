@@ -98,8 +98,8 @@ pub use expected_loss::{
     ExpectedLoss, SprtBoundary,
 };
 pub use fdr_selection::{
-    by_correction_factor, select_fdr, CandidateSelection, FdrCandidate, FdrError, FdrMethod,
-    FdrSelectionResult, TargetIdentity,
+    apply_plan_fdr_gate, by_correction_factor, select_fdr, CandidateSelection, FdrCandidate,
+    FdrError, FdrMethod, FdrSelectionResult, PlanFdrDecision, PlanFdrReport, TargetIdentity,
 };
 pub use indirect_impact::{
     compute_indirect_impact, HopBreakdown, IndirectImpactConfig, IndirectImpactResult,
