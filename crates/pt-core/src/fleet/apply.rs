@@ -1141,6 +1141,14 @@ mod tests {
                 }
                 _ => {
                     document["candidates"][0]["posterior"]["useful"] = serde_json::json!(0.9);
+                    assert!(parse_remote_plan(&document.to_string())
+                        .unwrap_err()
+                        .contains("posterior probabilities exceed one"));
+                    // The transport parser permits incomplete probability mass;
+                    // the executable-action gate must still require normalization.
+                    // Keep the target's high score so selection cannot hide the
+                    // malformed evidence by rejecting it for excessive risk.
+                    document["candidates"][0]["posterior"]["useful"] = serde_json::json!(0.0);
                     document["actions"][0]["rationale"]["posterior"] =
                         document["candidates"][0]["posterior"].clone();
                 }

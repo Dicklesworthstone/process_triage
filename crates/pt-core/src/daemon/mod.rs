@@ -1996,6 +1996,27 @@ mod tests {
         metrics
     }
 
+    fn incident_metrics_with_cpu_total(
+        started: std::time::Instant,
+        tick: u64,
+        critical: bool,
+        total_us: u64,
+    ) -> TickMetrics {
+        let mut metrics = incident_metrics(started, tick, critical);
+        metrics
+            .pressure
+            .as_mut()
+            .unwrap()
+            .cpu
+            .as_mut()
+            .unwrap()
+            .some
+            .as_mut()
+            .unwrap()
+            .total_us = total_us;
+        metrics
+    }
+
     fn observe_incident(
         tracker: &mut IncidentTracker,
         trigger_state: &mut triggers::TriggerState,
@@ -2268,7 +2289,14 @@ mod tests {
             );
         }
         for tick in 21..=120 {
-            let mut metrics = incident_metrics(started, tick, true);
+            // The live PSI window takes precedence over avg10: sustain 40%
+            // stall during every one-second interval after the healthy baseline.
+            let mut metrics = incident_metrics_with_cpu_total(
+                started,
+                tick,
+                true,
+                10_000 + (tick - 20) * 400_000,
+            );
             metrics.pressure.as_mut().unwrap().unavailable = (0..20)
                 .map(|_| crate::collect::pressure::Unavailable {
                     source: "long sensor name".repeat(100),
@@ -2496,17 +2524,20 @@ mod tests {
         let started = std::time::Instant::now();
         // Simulate a disk outage spanning many independently recovered episodes.
         for episode in 0..5 {
+            // Each critical interval adds 40% observed stall; its following
+            // healthy interval keeps the monotonic counter unchanged.
+            let total_us = 10_000 + (episode + 1) * 400_000;
             observe_incident(
                 &mut tracker,
                 &mut triggers,
                 &config,
-                &incident_metrics(started, episode * 2 + 1, true),
+                &incident_metrics_with_cpu_total(started, episode * 2 + 1, true, total_us),
             );
             observe_incident(
                 &mut tracker,
                 &mut triggers,
                 &config,
-                &incident_metrics(started, episode * 2 + 2, false),
+                &incident_metrics_with_cpu_total(started, episode * 2 + 2, false, total_us),
             );
         }
         assert!(tracker.active_summary().is_none());
