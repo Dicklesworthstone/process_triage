@@ -640,11 +640,12 @@ A policy file is a complete document (`schema_version`, `loss_matrix`, `guardrai
 
 Check a file with `pt-core config validate policy.json`.
 
-#### Kill risk limit
+#### Kill and supervisor-restart risk limit
 
 New policies and presets use `fdr_control.method: "bayesian"`. This is an
-explicit posterior-risk limit for direct kills, enforced by agent planning,
-interactive selection, and both preview and live execution:
+explicit posterior-risk limit for direct kills and supervisor restarts, enforced
+by agent planning, watch, snapshots, interactive selection, and both preview and
+live execution:
 
 ```json
 {
@@ -660,16 +661,19 @@ interactive selection, and both preview and live execution:
 Each target must have a valid identity and a normalized, finite posterior whose
 probability of belonging to a null class is at most `alpha`. An empty
 `lfdr_null` uses `useful` and `useful_bad`. The limit also applies to a single
-kill: `min_candidates` cannot disable it. Rejected targets become `review`,
-their parents are rechecked for live children, and resource goals cannot count
+kill or service restart: `min_candidates` cannot disable it. Rejected targets
+become `review`, their parents are rechecked for live children, and resource goals cannot count
 the rejected kills. Execution rechecks the actual selected or resumed actions
 under **both** the saved policy and the current policy. A paired pause is also
-refused when its following kill cannot pass the risk gate.
+refused when its following destructive action cannot pass the risk gate. A
+supervisor restart must carry the exact target's supported service binding and
+posterior. Zombie-parent reaping notifications do not stop the parent and remain
+outside this destructive-action risk gate.
 
 Explicit `bh`, `by`, or `alpha_investing` policies require statistical evidence
-that saved class posteriors do not supply. Direct kills under those methods are
-therefore refused with an evidence-unavailable explanation. To use the
-posterior-based gate, select `bayesian` in your policy and generate a new plan;
+that saved class posteriors do not supply. Direct kills and supervisor restarts
+under those methods are refused with an evidence-unavailable explanation. To use
+the posterior-based gate, select `bayesian` in your policy and generate a new plan;
 editing current policy does not erase the policy already bound to an old plan.
 `enabled: false` or `method: "none"` disables this gate, while the other safety
 checks continue to apply.
@@ -2323,8 +2327,8 @@ also exposes cost-aware probe scheduling for its other probe types.
 ### FDR Control for Multiple Kill Decisions
 
 Single-host plans enforce the configured Bayesian risk limit before selecting
-executable kills. Each selected target's posterior null probability must be at
-most `alpha`, which also bounds the modeled expected false-discovery proportion
+executable kills or supervisor restarts. Each selected target's posterior null
+probability must be at most `alpha`, which also bounds the modeled expected false-discovery proportion
 of **any subset** of those targets. This conservative rule matters when a target
 exits, fails a live safety check, or is omitted by manual selection or resume:
 a very low-risk process cannot subsidize a riskier kill that might execute alone.

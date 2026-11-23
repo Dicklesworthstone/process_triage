@@ -268,6 +268,7 @@ struct PlanFdrTarget {
     target: pt_common::ProcessIdentity,
     action_indices: Vec<usize>,
     posterior: Option<crate::inference::ClassScores>,
+    supervisor_restart: Option<crate::action::supervisor::SystemdUserServiceBinding>,
     unavailable_reason: Option<String>,
 }
 
@@ -289,7 +290,7 @@ fn posterior_null_probability(
     posterior: Option<crate::inference::ClassScores>,
     null_classes: &[String],
 ) -> Result<f64, &'static str> {
-    let posterior = posterior.ok_or("kill target has no recorded class posterior")?;
+    let posterior = posterior.ok_or("destructive target has no recorded class posterior")?;
     let values = [
         posterior.useful,
         posterior.useful_bad,
@@ -301,7 +302,7 @@ fn posterior_null_probability(
         .any(|value| !value.is_finite() || !(0.0..=1.0).contains(value))
         || (values.iter().sum::<f64>() - 1.0).abs() > 1e-9
     {
-        return Err("kill target posterior must contain finite normalized probabilities");
+        return Err("destructive target posterior must contain finite normalized probabilities");
     }
     let mut risk = 0.0;
     for class in null_classes {
@@ -317,7 +318,7 @@ fn posterior_null_probability(
     Ok(risk.min(1.0))
 }
 
-/// Enforce a posterior-risk limit on the actual remaining direct kill actions.
+/// Enforce a posterior-risk limit on direct kills and supervisor restarts.
 ///
 /// Each accepted target has posterior null probability <= alpha. Consequently
 /// every nonempty execution subset also has mean posterior null probability <=
@@ -329,8 +330,10 @@ fn posterior_null_probability(
 /// Callers must run this after final action selection and at apply time against
 /// both the recorded and current policy. Already blocked actions remain blocked.
 /// `min_candidates` is advisory here, never a way to bypass the limit on a small
-/// execution subset. Zombie-parent reaping uses Restart, not Kill, and is outside
-/// this direct-kill gate; a Kill carrying a child's posterior is refused.
+/// execution subset. Restarting a live service stops its current process and
+/// requires the same risk evidence as a direct kill. Zombie-parent reaping only
+/// sends a notification and stays outside this gate; a destructive action
+/// carrying a child's posterior cannot authorize stopping its parent.
 pub fn apply_plan_fdr_gate(
     plan: &mut crate::plan::Plan,
     policy: &crate::config::Policy,
@@ -367,7 +370,7 @@ pub fn apply_plan_fdr_gate(
         blocked_action_ids: Vec::new(),
         expected_fdr: None,
         min_candidates: config.min_candidates,
-        selection_scope: "each direct kill target; remains valid for arbitrary execution subsets".into(),
+        selection_scope: "each direct kill or supervisor restart target; remains valid for arbitrary execution subsets".into(),
         limitation: "Posterior expected false-discovery estimate only; depends on the model and does not establish calibration or a frequentist/anytime-valid FDR guarantee. Minimum candidate count does not disable execution checks.".into(),
         unavailable_reason: None,
         decisions: Vec::new(),
@@ -407,12 +410,12 @@ pub fn apply_plan_fdr_gate(
             .or_insert(0usize) += 1;
     }
     let mut targets: BTreeMap<(u32, String, u32), PlanFdrTarget> = BTreeMap::new();
-    for (index, action) in plan
-        .actions
-        .iter()
-        .enumerate()
-        .filter(|(_, action)| action.action == Action::Kill && !action.blocked)
-    {
+    for (index, action) in plan.actions.iter().enumerate().filter(|(_, action)| {
+        !action.blocked
+            && (action.action == Action::Kill
+                || (action.action == Action::Restart
+                    && action.routing != ActionRouting::ZombieToParent))
+    }) {
         let target = &action.target;
         let entry = targets
             .entry((target.pid.0, target.start_id.0.clone(), target.uid))
@@ -420,22 +423,38 @@ pub fn apply_plan_fdr_gate(
                 target: target.clone(),
                 action_indices: Vec::new(),
                 posterior: action.rationale.posterior,
+                supervisor_restart: action.supervisor_restart.clone(),
                 unavailable_reason: None,
             });
         entry.action_indices.push(index);
         let reason = if !plan_fdr_identity_valid(target) {
-            Some("kill target requires a full, consistent process identity")
-        } else if entry.target != *target || entry.posterior != action.rationale.posterior {
-            Some("duplicate kill target has conflicting identity or posterior evidence")
+            Some("destructive target requires a full, consistent process identity")
+        } else if entry.target != *target
+            || entry.posterior != action.rationale.posterior
+            || entry.supervisor_restart != action.supervisor_restart
+        {
+            Some("duplicate destructive target has conflicting identity, posterior or supervisor evidence")
         } else if action_id_counts.get(action.action_id.as_str()) != Some(&1) {
-            Some("kill action ID is ambiguous in the saved plan")
+            Some("destructive action ID is ambiguous in the saved plan")
+        } else if action.original_zombie_target.is_some() {
+            Some("a routed child's posterior cannot authorize stopping its parent or supervisor")
+        } else if action.action == Action::Restart {
+            if action.routing != ActionRouting::Supervisor
+                || !action
+                    .supervisor_restart
+                    .as_ref()
+                    .is_some_and(|binding| binding.matches_target(target))
+            {
+                Some("supervisor restart requires a supported route bound to the exact target identity")
+            } else {
+                None
+            }
         } else if !matches!(
             action.routing,
             ActionRouting::Direct | ActionRouting::DStateLowConfidence
-        ) || action.original_zombie_target.is_some()
-            || action.supervisor_restart.is_some()
+        ) || action.supervisor_restart.is_some()
         {
-            Some("a routed child's posterior cannot authorize killing its parent or supervisor")
+            Some("a routed child's posterior cannot authorize stopping its parent or supervisor")
         } else {
             None
         };
@@ -452,8 +471,9 @@ pub fn apply_plan_fdr_gate(
     let mut selected_risk = 0.0;
     for mut target in targets.into_values() {
         if pid_counts[&target.target.pid.0] > 1 {
-            target.unavailable_reason =
-                Some("multiple process incarnations or owners share the same kill PID".into());
+            target.unavailable_reason = Some(
+                "multiple process incarnations or owners share the same destructive PID".into(),
+            );
         }
         let risk = posterior_null_probability(target.posterior, &report.null_classes);
         let reason = if !enabled {
@@ -466,7 +486,7 @@ pub fn apply_plan_fdr_gate(
             match &risk {
                 Err(reason) => Some((*reason).to_string()),
                 Ok(risk) if *risk > config.alpha => Some(format!(
-                    "posterior null probability {risk:.6} exceeds alpha {:.6}; another target cannot subsidize this kill",
+                    "posterior null probability {risk:.6} exceeds alpha {:.6}; another target cannot subsidize this destructive action",
                     config.alpha
                 )),
                 Ok(_) => None,
@@ -606,6 +626,199 @@ mod tests {
             },
             actions,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn plan_restart(pid: u32, risk: f64) -> crate::plan::PlanAction {
+        let mut action = plan_kill(pid, risk);
+        action.action_id = format!("restart-{pid}");
+        action.action = crate::decision::Action::Restart;
+        action.routing = crate::plan::ActionRouting::Supervisor;
+        // SAFETY: geteuid only reads this test process's credentials. The
+        // binding is structural fixture data; no manager command is executed.
+        action.target.uid = unsafe { libc::geteuid() };
+        let uid = action.target.uid;
+        let unit = format!("owned-worker-{pid}.service");
+        action.supervisor_restart = Some(crate::action::supervisor::SystemdUserServiceBinding {
+            target: action.target.clone(),
+            control_group: format!(
+                "/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/{unit}"
+            ),
+            unit,
+            invocation_id: "1".repeat(32),
+        });
+        assert!(action
+            .supervisor_restart
+            .as_ref()
+            .unwrap()
+            .matches_target(&action.target));
+        action
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn plan_fdr_supervisor_restart_cannot_bypass_stricter_risk_policy() {
+        use crate::decision::Action;
+        use crate::plan::ActionRouting;
+
+        let mut policy = crate::config::Policy::default();
+        policy.fdr_control.alpha = 0.01;
+        let safe = plan_restart(10, 0.001);
+        let risky = plan_restart(11, 0.02);
+        // The risky service meets the ordinary 95% abandonment gate, but not
+        // this operator's independently stricter 1% false-discovery limit.
+        assert!(
+            crate::decision::robot_constraints::gate_posterior(
+                &risky.rationale.posterior.unwrap(),
+                risky.action,
+            ) >= 0.95
+        );
+        let mut pause = plan_kill(12, 0.9);
+        pause.action = Action::Pause;
+        pause.action_id = "pause-12".into();
+        let mut zombie_nudge = plan_kill(13, 0.9);
+        zombie_nudge.action = Action::Restart;
+        zombie_nudge.routing = ActionRouting::ZombieToParent;
+        zombie_nudge.original_zombie_target = Some(plan_kill(14, 0.0).target);
+        zombie_nudge.action_id = "nudge-13".into();
+
+        let mut plan = plan_with(vec![safe, risky.clone(), pause, zombie_nudge]);
+        let report = apply_plan_fdr_gate(&mut plan, &policy);
+        assert_eq!(report.candidate_targets, 2);
+        assert_eq!(report.selected_targets, 1);
+        assert_eq!(report.selected_action_ids, ["restart-10"]);
+        assert_eq!(report.blocked_action_ids, ["restart-11"]);
+        assert_eq!(report.expected_fdr, Some(0.001));
+        assert_eq!(plan.pre_toggled, ["restart-10", "pause-12", "nudge-13"]);
+        assert!(!plan.actions[2].blocked && !plan.actions[3].blocked);
+
+        // A manual subset/resume cannot lose the refusal or borrow the safer
+        // target's posterior to authorize the restart.
+        let mut subset = plan_with(vec![risky]);
+        let subset_report = apply_plan_fdr_gate(&mut subset, &policy);
+        assert_eq!(subset_report.selected_targets, 0);
+        assert!(subset.actions[0].blocked);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn plan_fdr_supervisor_restart_requires_its_own_exact_binding_and_posterior() {
+        use crate::plan::ActionRouting;
+
+        let policy = crate::config::Policy::default();
+        for neighbor in [
+            "missing_binding",
+            "direct_route",
+            "wrong_binding_pid",
+            "wrong_binding_owner",
+            "wrong_binding_session",
+            "wrong_service_path",
+            "invalid_invocation",
+            "child_posterior",
+            "missing_posterior",
+            "unnormalized_posterior",
+        ] {
+            let mut restart = plan_restart(11, 0.001);
+            match neighbor {
+                "missing_binding" => restart.supervisor_restart = None,
+                "direct_route" => restart.routing = ActionRouting::Direct,
+                "wrong_binding_pid" => {
+                    restart.supervisor_restart.as_mut().unwrap().target.pid.0 += 1;
+                }
+                "wrong_binding_owner" => {
+                    restart.supervisor_restart.as_mut().unwrap().target.uid ^= 1;
+                }
+                "wrong_binding_session" => {
+                    restart.supervisor_restart.as_mut().unwrap().target.sid = Some(200);
+                }
+                "wrong_service_path" => {
+                    restart.supervisor_restart.as_mut().unwrap().control_group =
+                        "/system.slice/owned-worker-11.service".into();
+                }
+                "invalid_invocation" => {
+                    restart.supervisor_restart.as_mut().unwrap().invocation_id = "0".repeat(32);
+                }
+                "child_posterior" => {
+                    restart.original_zombie_target = Some(plan_kill(12, 0.001).target);
+                }
+                "missing_posterior" => restart.rationale.posterior = None,
+                "unnormalized_posterior" => {
+                    restart.rationale.posterior.as_mut().unwrap().abandoned = 0.5;
+                }
+                _ => unreachable!(),
+            }
+            let mut plan = plan_with(vec![plan_restart(10, 0.001), restart]);
+            let report = apply_plan_fdr_gate(&mut plan, &policy);
+            assert_eq!(report.candidate_targets, 2, "{neighbor}");
+            assert_eq!(report.selected_action_ids, ["restart-10"], "{neighbor}");
+            assert_eq!(report.blocked_action_ids, ["restart-11"], "{neighbor}");
+            assert!(!plan.actions[0].blocked, "{neighbor}");
+            assert!(plan.actions[1].blocked, "{neighbor}");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn plan_fdr_supervisor_restart_requires_evidence_for_requested_statistical_method() {
+        use crate::config::policy::FdrMethod as PolicyMethod;
+
+        let mut policy = crate::config::Policy::default();
+        for method in [
+            PolicyMethod::Bh,
+            PolicyMethod::By,
+            PolicyMethod::AlphaInvesting,
+        ] {
+            policy.fdr_control.method = method;
+            let mut plan = plan_with(vec![plan_restart(10, 0.0)]);
+            let report = apply_plan_fdr_gate(&mut plan, &policy);
+            assert_eq!(report.status, "unavailable");
+            assert_eq!(report.candidate_targets, 1);
+            assert_eq!(report.selected_targets, 0);
+            assert_eq!(report.blocked_action_ids, ["restart-10"]);
+            assert!(report.expected_fdr.is_none());
+            assert!(plan.actions[0].blocked);
+        }
+
+        policy.fdr_control.enabled = false;
+        let mut disabled = plan_with(vec![plan_restart(10, 0.9)]);
+        assert_eq!(
+            apply_plan_fdr_gate(&mut disabled, &policy).status,
+            "disabled"
+        );
+        assert!(!disabled.actions[0].blocked);
+        policy.fdr_control.enabled = true;
+        policy.fdr_control.method = PolicyMethod::None;
+        let mut none = plan_with(vec![plan_restart(10, 0.9)]);
+        assert_eq!(apply_plan_fdr_gate(&mut none, &policy).selected_targets, 1);
+        assert!(!none.actions[0].blocked);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn plan_fdr_duplicate_restarts_cannot_mix_service_invocations() {
+        let policy = crate::config::Policy::default();
+        let restart = plan_restart(10, 0.001);
+        let mut repeated = restart.clone();
+        repeated.action_id = "restart-10-again".into();
+        let mut same = plan_with(vec![restart.clone(), repeated.clone()]);
+        let report = apply_plan_fdr_gate(&mut same, &policy);
+        assert_eq!(report.candidate_targets, 1);
+        assert_eq!(report.selected_targets, 1);
+        assert_eq!(report.selected_action_ids.len(), 2);
+        assert_eq!(report.expected_fdr, Some(0.001));
+
+        repeated.supervisor_restart.as_mut().unwrap().invocation_id = "2".repeat(32);
+        assert!(repeated
+            .supervisor_restart
+            .as_ref()
+            .unwrap()
+            .matches_target(&repeated.target));
+        let mut conflicting = plan_with(vec![restart, repeated]);
+        let report = apply_plan_fdr_gate(&mut conflicting, &policy);
+        assert_eq!(report.selected_targets, 0);
+        assert_eq!(report.blocked_action_ids.len(), 2);
+        assert!(conflicting.actions.iter().all(|action| action.blocked));
+        assert!(report.decisions[0].reason.contains("conflicting"));
     }
 
     #[test]
