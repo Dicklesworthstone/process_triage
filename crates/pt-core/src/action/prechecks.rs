@@ -560,6 +560,182 @@ pub trait PreCheckProvider {
     }
 }
 
+/// The exact child and immediate agent parent shown during an interactive scan.
+/// This is deliberately not serializable: a saved plan cannot grant consent.
+#[derive(Debug, Clone)]
+pub struct AgentChildReview {
+    child: crate::collect::ProcessRecord,
+    parent: crate::collect::ProcessRecord,
+    child_identity: pt_common::ProcessIdentity,
+}
+
+impl AgentChildReview {
+    /// Capture only a same-user, non-agent direct child of a recognized agent.
+    /// Linux supplies the full birth and ancestry observations this route needs.
+    pub fn from_records(
+        child: &crate::collect::ProcessRecord,
+        parent: &crate::collect::ProcessRecord,
+    ) -> Option<Self> {
+        if !cfg!(target_os = "linux")
+            || child.ppid != parent.pid
+            || child.pid == parent.pid
+            || parent.ppid == child.pid
+            || parent.ppid == parent.pid
+            || child.uid != parent.uid
+            || crate::collect::protected::agent_kind(&child.cmd).is_some()
+            || crate::collect::protected::agent_kind(&parent.cmd).is_none()
+            || !reviewed_process_is_live(child)
+            || !reviewed_process_is_live(parent)
+        {
+            return None;
+        }
+        let (child_boot, child_start) = reviewed_process_birth(child)?;
+        let (parent_boot, parent_start) = reviewed_process_birth(parent)?;
+        if child_boot != parent_boot || parent_start > child_start {
+            return None;
+        }
+        Some(Self {
+            child: child.clone(),
+            parent: parent.clone(),
+            child_identity: pt_common::ProcessIdentity::full(
+                child.pid.0,
+                child.start_id.clone(),
+                child.uid,
+                child.pgid,
+                child.sid,
+                pt_common::IdentityQuality::Full,
+            ),
+        })
+    }
+
+    /// Called only after an individual row selection and interactive confirmation.
+    /// It authorizes reconsidering supervision for this exact direct kill, never
+    /// a parent route, a control operation, an agent root or another child.
+    pub fn confirm_kill(&self, action: &PlanAction) -> Option<ConfirmedAgentChildAction> {
+        if !direct_child_kill(action) || action.target != self.child_identity {
+            return None;
+        }
+        Some(ConfirmedAgentChildAction {
+            review: self.clone(),
+            action: action.clone(),
+        })
+    }
+}
+
+/// Ephemeral consent for one explicitly reviewed child action. Its private fields
+/// cannot be supplied by an executable plan, policy setting or PID whitelist.
+#[derive(Debug, Clone)]
+pub struct ConfirmedAgentChildAction {
+    review: AgentChildReview,
+    action: PlanAction,
+}
+
+impl ConfirmedAgentChildAction {
+    /// All reviewed action fields remain binding, including timeouts and routing.
+    pub fn matches_action(&self, action: &PlanAction) -> bool {
+        direct_child_kill(action)
+            && action.target == self.review.child_identity
+            && action.action_id == self.action.action_id
+            && serde_json::to_value(action)
+                .ok()
+                .zip(serde_json::to_value(&self.action).ok())
+                .is_some_and(|(current, confirmed)| current == confirmed)
+    }
+
+    /// Require both original incarnations and their relationship in the same
+    /// fresh census. PID reuse, reparenting, exec or job-control changes expire
+    /// consent. Ordinary scheduler changes do not imply a different process.
+    pub fn validate_population(
+        &self,
+        action: &PlanAction,
+        population: &[crate::collect::ProcessRecord],
+    ) -> Result<(), String> {
+        if !self.matches_action(action) {
+            return Err("interactive agent-child consent does not match this action".to_string());
+        }
+        for original in [&self.review.child, &self.review.parent] {
+            let mut matches = population.iter().filter(|record| record.pid == original.pid);
+            let current = matches.next().ok_or_else(|| {
+                format!("reviewed agent-child process {} is unavailable", original.pid.0)
+            })?;
+            if matches.next().is_some()
+                || !same_reviewed_process(original, current)
+                || !reviewed_process_is_live(current)
+            {
+                return Err(format!(
+                    "reviewed agent-child process {} changed or is ambiguous",
+                    original.pid.0
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn validate_live(&self, action: &PlanAction) -> Result<(), String> {
+        if !cfg!(target_os = "linux") {
+            return Err("interactive agent-child consent requires Linux ancestry evidence".into());
+        }
+        let scan = crate::collect::quick_scan(&crate::collect::QuickScanOptions {
+            pids: vec![self.review.child.pid.0, self.review.parent.pid.0],
+            timeout: Some(Duration::from_secs(2)),
+            ..Default::default()
+        })
+        .map_err(|error| format!("cannot revalidate reviewed agent child: {error}"))?;
+        if !scan.metadata.warnings.is_empty() {
+            return Err("reviewed agent-child census is incomplete".to_string());
+        }
+        self.validate_population(action, &scan.processes)
+    }
+}
+
+fn direct_child_kill(action: &PlanAction) -> bool {
+    action.action == Action::Kill
+        && action.routing == crate::plan::ActionRouting::Direct
+        && !action.blocked
+        && action.supervisor_restart.is_none()
+        && action.original_zombie_target.is_none()
+        && action.memory_cap.is_none()
+        && action.d_state_diagnostics.is_none()
+        && !action.action_id.is_empty()
+        && action.target.quality == pt_common::IdentityQuality::Full
+}
+
+fn reviewed_process_birth(process: &crate::collect::ProcessRecord) -> Option<(&str, u64)> {
+    let mut parts = process.start_id.0.split(':');
+    let boot = parts.next()?;
+    uuid::Uuid::parse_str(boot).ok()?;
+    let start = parts.next()?.parse::<u64>().ok()?;
+    let pid = parts.next()?.parse::<u32>().ok()?;
+    (parts.next().is_none() && pid == process.pid.0 && pid > 1 && pid <= i32::MAX as u32)
+        .then_some((boot, start))
+}
+
+fn reviewed_process_is_live(process: &crate::collect::ProcessRecord) -> bool {
+    matches!(
+        process.state,
+        ProcessState::Running | ProcessState::Sleeping | ProcessState::Stopped | ProcessState::Idle
+    ) && !process.comm.trim().is_empty()
+        && !process.cmd.trim().is_empty()
+        && process.pgid.is_some_and(|id| id > 0)
+        && process.sid.is_some_and(|id| id > 0)
+}
+
+fn same_reviewed_process(
+    original: &crate::collect::ProcessRecord,
+    current: &crate::collect::ProcessRecord,
+) -> bool {
+    original.pid == current.pid
+        && original.ppid == current.ppid
+        && original.start_id == current.start_id
+        && original.uid == current.uid
+        && original.pgid == current.pgid
+        && original.sid == current.sid
+        && original.comm == current.comm
+        && original.cmd == current.cmd
+        && original.tty == current.tty
+}
+
 /// Preserve a real refusal observed by a probe, even when it finished late.
 /// Only a passing result can be replaced by an exhausted operation budget.
 fn precheck_with_deadline(
@@ -1940,10 +2116,22 @@ pub struct LivePreCheckProvider {
     known_supervisors: HashSet<String>,
     /// Recent-I/O results sampled up front for many pids (see `prime_recent_io`).
     recent_io: std::sync::Mutex<std::collections::HashMap<u32, RecentIoObservation>>,
+    /// Ephemeral explicit row confirmations; never consulted by PID-only checks.
+    confirmed_agent_children: Vec<ConfirmedAgentChildAction>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl LivePreCheckProvider {
+    /// Attach confirmations from the current interactive selection only. These
+    /// are considered exclusively by `run_checks_for_plan` for an exact action.
+    pub fn with_confirmed_agent_children(
+        mut self,
+        confirmations: Vec<ConfirmedAgentChildAction>,
+    ) -> Self {
+        self.confirmed_agent_children = confirmations;
+        self
+    }
+
     /// Limit new observations without reducing any policy safety requirement.
     /// Existing callers, including interactive execution, have no deadline
     /// unless they explicitly attach one.
@@ -2116,6 +2304,7 @@ impl LivePreCheckProvider {
             deadline: None,
             known_supervisors,
             recent_io: Default::default(),
+            confirmed_agent_children: Vec::new(),
         })
     }
 
@@ -2234,6 +2423,7 @@ impl LivePreCheckProvider {
             deadline: None,
             known_supervisors,
             recent_io: Default::default(),
+            confirmed_agent_children: Vec::new(),
         }
     }
 
@@ -2763,6 +2953,82 @@ fn detached_service_session_is_safe(result: &crate::supervision::session::Sessio
             .all(|protection| *protection == SessionProtectionType::SessionLeader)
 }
 
+/// Only the full-plan entrypoint can install this action-scoped view. Forward
+/// every other gate unchanged, including live child, infrastructure, session,
+/// data-loss and supervisor restrictions enforced by the surrounding executor.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct ConfirmedAgentChildPreChecks<'a> {
+    provider: &'a LivePreCheckProvider,
+    confirmation: &'a ConfirmedAgentChildAction,
+    action: &'a PlanAction,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl PreCheckProvider for ConfirmedAgentChildPreChecks<'_> {
+    fn operation_deadline(&self) -> Option<Instant> {
+        self.provider.operation_deadline()
+    }
+
+    fn check_not_protected(&self, pid: u32) -> PreCheckResult {
+        self.provider.check_not_protected(pid)
+    }
+
+    fn check_not_protected_for_action(&self, pid: u32, action: Action) -> PreCheckResult {
+        self.provider.check_not_protected_for_action(pid, action)
+    }
+
+    fn check_data_loss(&self, pid: u32) -> PreCheckResult {
+        self.provider.check_data_loss(pid)
+    }
+
+    fn check_supervisor(&self, pid: u32) -> PreCheckResult {
+        self.provider.check_supervisor(pid)
+    }
+
+    fn check_session_safety(&self, pid: u32, sid: Option<u32>) -> PreCheckResult {
+        self.provider.check_session_safety(pid, sid)
+    }
+
+    fn check_process_state(&self, pid: u32) -> PreCheckResult {
+        self.provider.check_process_state(pid)
+    }
+
+    fn check_agent_supervision(&self, pid: u32) -> PreCheckResult {
+        if pid != self.action.target.pid.0 {
+            return self.provider.check_agent_supervision(pid);
+        }
+        let refused = |reason| PreCheckResult::Blocked {
+            check: PreCheck::CheckAgentSupervision,
+            reason,
+        };
+        if let Err(reason) = self.confirmation.validate_live(self.action) {
+            return refused(reason);
+        }
+        let supervision = match detect_supervision(pid) {
+            Ok(observed) => observed,
+            Err(error) => {
+                return refused(format!("agent supervision evidence unavailable: {error}"));
+            }
+        };
+        // Read failures and unavailable ancestry never become consent. Recheck
+        // the original child/parent after the potentially longer detector walk.
+        if supervision.ancestry.is_none() {
+            return refused("agent supervision ancestry evidence is unavailable".to_string());
+        }
+        if let Err(reason) = self.confirmation.validate_live(self.action) {
+            return refused(reason);
+        }
+        debug!(
+            pid,
+            agent_pid = self.confirmation.review.parent.pid.0,
+            action_id = %self.action.action_id,
+            observed_human_supervision = is_human_supervised(&supervision),
+            "validated explicit interactive confirmation for this direct agent child"
+        );
+        PreCheckResult::Passed
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl PreCheckProvider for LivePreCheckProvider {
     fn operation_deadline(&self) -> Option<Instant> {
@@ -2792,6 +3058,23 @@ impl PreCheckProvider for LivePreCheckProvider {
                     reason: "systemd user-service restart requires Linux".to_string(),
                 }];
             }
+        }
+        if let Some(confirmation) = self
+            .confirmed_agent_children
+            .iter()
+            .find(|confirmation| confirmation.matches_action(action))
+        {
+            return ConfirmedAgentChildPreChecks {
+                provider: self,
+                confirmation,
+                action,
+            }
+            .run_checks_for_action(
+                &crate::plan::effective_pre_checks(action),
+                action.target.pid.0,
+                action.target.sid,
+                action.action,
+            );
         }
         self.run_checks_for_action(
             &crate::plan::effective_pre_checks(action),
@@ -3101,6 +3384,190 @@ impl PreCheckProvider for NoopPreCheckProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    fn reviewed_agent_family() -> (crate::collect::ProcessRecord, crate::collect::ProcessRecord) {
+        use crate::collect::ProcessRecord;
+        use pt_common::{ProcessId, StartId};
+
+        let parent = ProcessRecord {
+            pid: ProcessId(70),
+            ppid: ProcessId(2),
+            uid: 1000,
+            user: "fixture".to_string(),
+            pgid: Some(70),
+            sid: Some(70),
+            start_id: StartId::from_linux("12345678-1234-4321-8765-123456789abc", 10, 70),
+            comm: "codex".to_string(),
+            cmd: "codex exec review".to_string(),
+            state: ProcessState::Sleeping,
+            cpu_percent: 0.0,
+            rss_bytes: 0,
+            vsz_bytes: 0,
+            tty: None,
+            start_time_unix: 1,
+            elapsed: Duration::from_secs(3600),
+            source: "test".to_string(),
+            container_info: None,
+        };
+        let mut child = parent.clone();
+        child.pid = ProcessId(71);
+        child.ppid = parent.pid;
+        child.start_id = StartId::from_linux("12345678-1234-4321-8765-123456789abc", 20, 71);
+        child.comm = "sleep".to_string();
+        child.cmd = "sleep 600".to_string();
+        (child, parent)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reviewed_child_action(review: &AgentChildReview) -> PlanAction {
+        PlanAction {
+            action_id: "reviewed-child-kill".to_string(),
+            target: review.child_identity.clone(),
+            action: Action::Kill,
+            order: 0,
+            stage: 0,
+            timeouts: crate::plan::ActionTimeouts::default(),
+            pre_checks: vec![PreCheck::CheckAgentSupervision],
+            rationale: crate::plan::ActionRationale {
+                expected_loss: None,
+                expected_recovery: None,
+                expected_recovery_stddev: None,
+                posterior_odds_abandoned_vs_useful: None,
+                sprt_boundary: None,
+                posterior: None,
+                memory_mb: None,
+                has_known_signature: None,
+                category: None,
+            },
+            on_success: Vec::new(),
+            on_failure: Vec::new(),
+            blocked: false,
+            routing: crate::plan::ActionRouting::Direct,
+            confidence: crate::plan::ActionConfidence::Normal,
+            original_zombie_target: None,
+            d_state_diagnostics: None,
+            supervisor_restart: None,
+            memory_cap: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn agent_child_review_requires_live_same_user_direct_non_agent_child() {
+        let (child, parent) = reviewed_agent_family();
+        assert!(AgentChildReview::from_records(&child, &parent).is_some());
+        for invalid in [
+            "agent_child", "ordinary_parent", "owner", "parent", "loop", "weak_birth",
+            "other_boot", "impossible_birth", "missing_job", "unknown", "zombie", "disk_sleep",
+        ] {
+            let mut child = child.clone();
+            let mut parent = parent.clone();
+            match invalid {
+                "agent_child" => child.cmd = "claude --continue".to_string(),
+                "ordinary_parent" => parent.cmd = "bash".to_string(),
+                "owner" => child.uid += 1,
+                "parent" => child.ppid.0 += 1,
+                "loop" => parent.ppid = child.pid,
+                "weak_birth" => child.start_id = pt_common::StartId::from_linux("unknown", 20, 71),
+                "other_boot" => parent.start_id = pt_common::StartId::from_linux(
+                    "aaaaaaaa-1234-4321-8765-123456789abc", 10, 70,
+                ),
+                "impossible_birth" => parent.start_id = pt_common::StartId::from_linux(
+                    "12345678-1234-4321-8765-123456789abc", 30, 70,
+                ),
+                "missing_job" => child.pgid = None,
+                "unknown" => parent.state = ProcessState::Unknown,
+                "zombie" => parent.state = ProcessState::Zombie,
+                "disk_sleep" => child.state = ProcessState::DiskSleep,
+                _ => unreachable!(),
+            }
+            assert!(AgentChildReview::from_records(&child, &parent).is_none(), "{invalid}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn confirmed_agent_child_consent_cannot_move_to_another_action_or_route() {
+        let (child, parent) = reviewed_agent_family();
+        let review = AgentChildReview::from_records(&child, &parent).unwrap();
+        let action = reviewed_child_action(&review);
+        let consent = review.confirm_kill(&action).unwrap();
+        assert!(consent.matches_action(&action));
+        for changed in [
+            "id", "sibling", "parent", "birth", "owner", "group", "session", "quality",
+            "kind", "blocked", "zombie_route", "supervisor_route", "original_zombie",
+            "timeout", "prechecks", "order",
+        ] {
+            let mut action = action.clone();
+            match changed {
+                "id" => action.action_id.push_str("-new"),
+                "sibling" => action.target.pid.0 += 1,
+                "parent" => action.target.pid = parent.pid,
+                "birth" => action.target.start_id = parent.start_id.clone(),
+                "owner" => action.target.uid += 1,
+                "group" => action.target.pgid = Some(99),
+                "session" => action.target.sid = Some(99),
+                "quality" => action.target.quality = pt_common::IdentityQuality::PidOnly,
+                "kind" => action.action = Action::Pause,
+                "blocked" => action.blocked = true,
+                "zombie_route" => action.routing = crate::plan::ActionRouting::ZombieToParent,
+                "supervisor_route" => action.routing = crate::plan::ActionRouting::Supervisor,
+                "original_zombie" => action.original_zombie_target = Some(action.target.clone()),
+                "timeout" => action.timeouts.execute_ms += 1,
+                "prechecks" => action.pre_checks.clear(),
+                "order" => action.order += 1,
+                _ => unreachable!(),
+            }
+            assert!(!consent.matches_action(&action), "reused consent after {changed}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn confirmed_agent_child_revalidates_both_original_processes_and_relationship() {
+        let (child, parent) = reviewed_agent_family();
+        let review = AgentChildReview::from_records(&child, &parent).unwrap();
+        let action = reviewed_child_action(&review);
+        let consent = review.confirm_kill(&action).unwrap();
+        let original = vec![child, parent];
+        assert!(consent.validate_population(&action, &original).is_ok());
+        let mut scheduled = original.clone();
+        scheduled[0].state = ProcessState::Running;
+        scheduled[0].cpu_percent = 75.0;
+        scheduled[1].elapsed += Duration::from_secs(2);
+        assert!(consent.validate_population(&action, &scheduled).is_ok());
+        for index in 0..2 {
+            for changed in [
+                "birth", "parent", "owner", "group", "session", "comm", "command", "tty",
+                "zombie", "unknown", "missing", "duplicate",
+            ] {
+                let mut population = original.clone();
+                let process = &mut population[index];
+                match changed {
+                    "birth" => process.start_id = pt_common::StartId::from_linux(
+                        "12345678-1234-4321-8765-123456789abc", 100, process.pid.0,
+                    ),
+                    "parent" => process.ppid.0 += 1,
+                    "owner" => process.uid += 1,
+                    "group" => process.pgid = Some(99),
+                    "session" => process.sid = Some(99),
+                    "comm" => process.comm.push_str("-changed"),
+                    "command" => process.cmd.push_str(" --changed"),
+                    "tty" => process.tty = Some("pts/99".to_string()),
+                    "zombie" => process.state = ProcessState::Zombie,
+                    "unknown" => process.state = ProcessState::Unknown,
+                    "missing" => { population.remove(index); }
+                    "duplicate" => population.push(original[index].clone()),
+                    _ => unreachable!(),
+                }
+                assert!(
+                    consent.validate_population(&action, &population).is_err(),
+                    "accepted changed reviewed process {index}: {changed}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn parent_supervision_requires_complete_stable_child_and_parent_observations() {

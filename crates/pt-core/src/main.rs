@@ -2803,6 +2803,7 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
                             &session_id_e,
                             &policy_e,
                             &selected,
+                            &explicitly_selected,
                             &candidates,
                         )?)
                     };
@@ -2844,6 +2845,12 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
                             ))
                         })
                         .collect();
+                    let confirmed_agent_children = plan
+                        .as_ref()
+                        .map(|plan| {
+                            confirmed_agent_child_actions(plan, &explicitly_selected, &candidates)
+                        })
+                        .unwrap_or_default();
                     drop(candidates); // release lock before I/O
 
                     if dry_run || shadow {
@@ -2893,8 +2900,13 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
                         });
                     };
 
-                    let (result, execution_evidence) =
-                        execute_tui_plan_selection(&handle_e, &policy_e, &plan, &mut state)?;
+                    let (result, execution_evidence) = execute_tui_plan_selection(
+                        &handle_e,
+                        &policy_e,
+                        &plan,
+                        &confirmed_agent_children,
+                        &mut state,
+                    )?;
                     if let Ok(mut guard) = decisions_e.lock() {
                         if let Some(store) = guard.as_mut() {
                             record_confirmed_kills(
@@ -2987,16 +2999,39 @@ struct PlanCandidateInput {
     parent_identity: Option<ProcessIdentity>,
     supervisor_restart: Option<pt_core::action::SystemdUserServiceBinding>,
     memory_cap: Option<pt_core::action::memory_cap::MemoryCapPlan>,
+    agent_child_review: Option<TuiAgentChildReview>,
+}
+
+#[cfg(feature = "ui")]
+struct TuiAgentChildReview {
+    observation: pt_core::action::prechecks::AgentChildReview,
+    /// Only the typed agent-descendant rule is eligible for explicit review.
+    /// Every other policy or tree refusal stays in `blocked_reasons`.
+    reason: Option<String>,
 }
 
 #[cfg(feature = "ui")]
 impl PlanCandidateInput {
     fn decision_candidate(&self) -> DecisionCandidate {
+        self.decision_candidate_for_selection(false)
+    }
+
+    fn decision_candidate_for_selection(&self, explicitly_selected: bool) -> DecisionCandidate {
+        let mut blocked_reasons = self.blocked_reasons.clone();
+        if let Some(reason) = self
+            .agent_child_review
+            .as_ref()
+            .and_then(|review| review.reason.as_ref())
+        {
+            if !explicitly_selected || self.decision.optimal_action != Action::Kill {
+                blocked_reasons.push(reason.clone());
+            }
+        }
         DecisionCandidate {
             identity: self.identity.clone(),
             ppid: self.ppid,
             decision: self.decision.clone(),
-            blocked_reasons: self.blocked_reasons.clone(),
+            blocked_reasons,
             stage_pause_before_kill: false,
             process_state: Some(self.process_state),
             parent_identity: self.parent_identity.clone(),
@@ -3283,6 +3318,7 @@ fn build_plan_from_selection(
     session_id: &SessionId,
     policy: &pt_core::config::Policy,
     selected: &[u32],
+    explicitly_selected: &[u32],
     candidates: &HashMap<u32, PlanCandidateInput>,
 ) -> Result<Plan, String> {
     let mut plan_candidates = Vec::new();
@@ -3290,7 +3326,9 @@ fn build_plan_from_selection(
         let Some(candidate) = candidates.get(pid) else {
             continue;
         };
-        plan_candidates.push(candidate.decision_candidate());
+        plan_candidates.push(
+            candidate.decision_candidate_for_selection(explicitly_selected.contains(pid)),
+        );
     }
 
     if plan_candidates.is_empty() {
@@ -3329,6 +3367,29 @@ fn build_plan_from_selection(
         ));
     }
     Ok(plan)
+}
+
+/// Consume only the current confirmation's individual row judgments. Bulk
+/// selection and saved plans cannot create an agent-child authorization.
+#[cfg(feature = "ui")]
+fn confirmed_agent_child_actions(
+    plan: &Plan,
+    explicitly_selected: &[u32],
+    candidates: &HashMap<u32, PlanCandidateInput>,
+) -> Vec<pt_core::action::prechecks::ConfirmedAgentChildAction> {
+    plan.actions
+        .iter()
+        .filter(|action| explicitly_selected.contains(&action.target.pid.0))
+        .filter_map(|action| {
+            let input = candidates.get(&action.target.pid.0)?;
+            if !input.blocked_reasons.is_empty() {
+                return None;
+            }
+            let review = input.agent_child_review.as_ref()?;
+            review.reason.as_ref()?;
+            review.observation.confirm_kill(action)
+        })
+        .collect()
 }
 
 fn session_has_control_receipts(handle: &SessionHandle) -> Result<bool, String> {
@@ -4909,6 +4970,7 @@ fn execute_tui_plan_selection(
     handle: &SessionHandle,
     policy: &pt_core::config::Policy,
     selection: &Plan,
+    confirmed_agent_children: &[pt_core::action::prechecks::ConfirmedAgentChildAction],
     state: &mut TuiExecutionState,
 ) -> Result<RecordedExecution, String> {
     // Keep execution serialized until its evidence and final state have been
@@ -4917,8 +4979,13 @@ fn execute_tui_plan_selection(
     let execution = (|| {
         // Persist every earlier binding, but execute only this new selection.
         write_plan_to_session(handle, selection)?;
-        let ((result, mut evidence), lock) =
-            execute_plan_actions(handle, policy, selection, state)?;
+        let ((result, mut evidence), lock) = execute_plan_actions(
+            handle,
+            policy,
+            selection,
+            confirmed_agent_children,
+            state,
+        )?;
         execution_lock = Some(lock);
         #[cfg(unix)]
         for outcome in &result.outcomes {
@@ -5000,6 +5067,7 @@ fn execute_plan_actions(
     handle: &SessionHandle,
     policy: &pt_core::config::Policy,
     plan: &Plan,
+    confirmed_agent_children: &[pt_core::action::prechecks::ConfirmedAgentChildAction],
     state: &mut TuiExecutionState,
 ) -> Result<(RecordedExecution, GlobalLock), String> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -5097,7 +5165,8 @@ fn execute_plan_actions(
             Some(&policy.guardrails),
             LivePreCheckConfig::from(&policy.data_loss_gates),
         )
-        .map_err(|error| format!("cannot configure safety checks: {error}"))?;
+        .map_err(|error| format!("cannot configure safety checks: {error}"))?
+        .with_confirmed_agent_children(confirmed_agent_children.to_vec());
         let gated: Vec<_> = plan
             .actions
             .iter()
@@ -5169,10 +5238,11 @@ fn execute_plan_actions(
                 let reason = match tree_check {
                     Ok(processes) => {
                         ancestors = execution_ancestors(action.target.pid.0, &processes);
-                        execution_tree_refusal(
-                            action.target.pid.0,
+                        confirmed_tui_tree_refusal(
+                            action,
                             &processes,
                             policy.guardrails.builtin_protection,
+                            confirmed_agent_children,
                         )
                     }
                     Err(reason) => Some(reason),
@@ -5377,6 +5447,7 @@ fn execute_plan_actions(
         let _ = policy;
         let _ = handle;
         let _ = plan;
+        let _ = confirmed_agent_children;
         let _ = state;
         Err("execution not supported on this platform".to_string())
     }
@@ -7159,21 +7230,33 @@ fn sync_tui_recommendations(
         row.selected = action == "kill"
             || (action == "restart" && candidate["supervisor_restart"].is_object());
         if action == "review" {
-            let reason = candidate["action_rationale"]
+            let mut reason = candidate["action_rationale"]
                 .as_str()
                 .unwrap_or("requires review")
                 .to_string();
+            if let Some(input) = plan_candidates.get_mut(&row.pid) {
+                let agent_only_review = input.decision.optimal_action == Action::Kill
+                    && candidate["tree_safety"]["rule"].as_str() == Some("agent_descendant")
+                    && candidate["tree_safety"]["reason"].as_str() == Some(reason.as_str());
+                let agent_review = input
+                    .agent_child_review
+                    .as_mut()
+                    .filter(|_| agent_only_review);
+                if let Some(review) = agent_review {
+                    review.reason = Some(reason.clone());
+                    reason.push_str(
+                        "; explicitly select this child and confirm to request its kill; all other safety checks still apply",
+                    );
+                } else if !input.blocked_reasons.contains(&reason) {
+                    input.blocked_reasons.push(reason.clone());
+                }
+            }
             if !row.top_evidence.contains(&reason) {
                 row.top_evidence.insert(0, reason.clone());
                 row.why_summary = Some(format!(
                     "{} {reason}",
                     row.why_summary.as_deref().unwrap_or("")
                 ));
-            }
-            if let Some(input) = plan_candidates.get_mut(&row.pid) {
-                if !input.blocked_reasons.contains(&reason) {
-                    input.blocked_reasons.push(reason);
-                }
             }
         }
     }
@@ -7540,6 +7623,14 @@ fn build_tui_rows(
                 parent_identity: parent.map(process_identity_from_record),
                 supervisor_restart: scorer.supervisor_restart_for(proc).cloned(),
                 memory_cap: memory_cap.clone(),
+                agent_child_review: parent
+                    .and_then(|parent| {
+                        pt_core::action::prechecks::AgentChildReview::from_records(proc, parent)
+                    })
+                    .map(|observation| TuiAgentChildReview {
+                        observation,
+                        reason: None,
+                    }),
             },
         );
 
@@ -16633,6 +16724,28 @@ fn execution_tree_refusal(
     candidate["action_rationale"].as_str().map(String::from)
 }
 
+/// Reconsider only the agent-ancestor rule for an explicitly confirmed direct
+/// child. The fresh census still enforces every live-child restriction, and the
+/// executor's other checks revalidate the same consent again before delivery.
+#[cfg(feature = "ui")]
+fn confirmed_tui_tree_refusal(
+    action: &PlanAction,
+    processes: &[ProcessRecord],
+    agent_rule: bool,
+    confirmations: &[pt_core::action::prechecks::ConfirmedAgentChildAction],
+) -> Option<String> {
+    if let Some(confirmation) = confirmations
+        .iter()
+        .find(|confirmation| confirmation.matches_action(action))
+    {
+        if let Err(reason) = confirmation.validate_population(action, processes) {
+            return Some(reason);
+        }
+        return execution_tree_refusal(action.target.pid.0, processes, false);
+    }
+    execution_tree_refusal(action.target.pid.0, processes, agent_rule)
+}
+
 fn apply_process_tree_safety(
     candidates: &mut [&mut serde_json::Value],
     processes: &[ProcessRecord],
@@ -16686,7 +16799,7 @@ fn apply_process_tree_safety(
             obj.insert("action_rationale".to_string(), serde_json::json!(reason));
             obj.insert(
                 "tree_safety".to_string(),
-                serde_json::json!({ "rule": rule }),
+                serde_json::json!({ "rule": rule, "reason": reason }),
             );
         }
     };
@@ -22782,6 +22895,7 @@ mod process_tree_safety_tests {
                             parent_identity: None,
                             supervisor_restart: None,
                             memory_cap: None,
+                            agent_child_review: None,
                         },
                     );
                     fixture.rows.push(ProcessRow {
@@ -22847,7 +22961,7 @@ mod process_tree_safety_tests {
             }
 
             fn executable(&self, selected: &[u32]) -> Plan {
-                build_plan_from_selection(&self.session, &self.policy, selected, &self.inputs)
+                build_plan_from_selection(&self.session, &self.policy, selected, &[], &self.inputs)
                     .unwrap()
             }
         }
@@ -22932,6 +23046,7 @@ mod process_tree_safety_tests {
                         &session,
                         &policy,
                         &[row.pid],
+                        &[],
                         &output.plan_candidates,
                     )
                     .unwrap()
@@ -23023,6 +23138,7 @@ mod process_tree_safety_tests {
                 &fixture.session,
                 &fixture.policy,
                 &output.selected_pids,
+                &[],
                 &fixture.inputs,
             )
             .is_err());
@@ -23696,21 +23812,22 @@ mod process_tree_safety_tests {
                         parent_identity: None,
                         supervisor_restart: None,
                         memory_cap: None,
+                        agent_child_review: None,
                     },
                 )
             })
             .collect();
         let session = pt_common::SessionId::new();
         let permitted =
-            super::build_plan_from_selection(&session, &policy, &[100, 200], &candidates).unwrap();
+            super::build_plan_from_selection(&session, &policy, &[100, 200], &[], &candidates).unwrap();
         assert_eq!(permitted.actions.len(), 2);
         assert!(permitted.actions.iter().all(|action| !action.blocked));
         let error =
-            super::build_plan_from_selection(&session, &policy, &[100, 200, 300], &candidates)
+            super::build_plan_from_selection(&session, &policy, &[100, 200, 300], &[], &candidates)
                 .unwrap_err();
         assert!(error.contains("selected 3 kills/restarts exceed the per-run policy limit 2"));
         policy.guardrails.max_kills_per_run = 0;
-        assert!(super::build_plan_from_selection(&session, &policy, &[100], &candidates).is_err());
+        assert!(super::build_plan_from_selection(&session, &policy, &[100], &[], &candidates).is_err());
     }
 
     #[cfg(feature = "ui")]
@@ -23760,6 +23877,7 @@ mod process_tree_safety_tests {
                         parent_identity: None,
                         supervisor_restart: None,
                         memory_cap: None,
+                        agent_child_review: None,
                     },
                 )
             })
@@ -23817,6 +23935,7 @@ mod process_tree_safety_tests {
             &pt_common::SessionId::new(),
             &policy,
             &[100, 200, 300, 400],
+            &[],
             &inputs,
         )
         .unwrap();
@@ -24710,7 +24829,7 @@ mod process_tree_safety_tests {
 
     #[cfg(all(feature = "ui", target_os = "linux"))]
     mod tui_live_fixtures {
-        use std::io::BufRead;
+        use std::io::{BufRead, Read};
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use std::os::unix::process::CommandExt;
         use std::process::{Child, Command, Stdio};
@@ -24935,6 +25054,117 @@ mod process_tree_safety_tests {
             }
         }
 
+        pub(super) struct AgentFamily {
+            pub(super) agent: Child,
+            pub(super) child_pid: u32,
+            pub(super) sibling_pid: u32,
+            child_pidfd: OwnedFd,
+            sibling_pidfd: OwnedFd,
+        }
+
+        impl AgentFamily {
+            pub(super) fn spawn() -> Self {
+                let mut command = Command::new("/bin/bash");
+                command
+                    .arg0("codex")
+                    .args([
+                        "-c",
+                        "/bin/sleep 600 </dev/null >/dev/null 2>&1 & first=$!; /bin/sleep 600 </dev/null >/dev/null 2>&1 & printf '%s %s\\n' \"$first\" \"$!\"; exec 1>/dev/null; wait",
+                    ])
+                    .env_clear()
+                    .env("PATH", "/usr/bin:/bin")
+                    .env("CLAUDECODE", "1")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null());
+                // SAFETY: only this owned launcher enters a separate session.
+                unsafe {
+                    command.pre_exec(|| {
+                        if libc::setsid() == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+                let mut setup = WrapperSetup(Some(command.spawn().expect("spawn owned agent family")));
+                let mut stdout = setup.0.as_mut().unwrap().stdout.take().unwrap();
+                // Bound setup even if the launcher never writes its readiness line.
+                let flags = unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_GETFL) };
+                assert!(flags >= 0);
+                assert_eq!(unsafe {
+                    libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)
+                }, 0);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let mut readiness = Vec::new();
+                loop {
+                    let mut bytes = [0; 64];
+                    match stdout.read(&mut bytes) {
+                        Ok(0) => panic!("owned agent exited before readiness"),
+                        Ok(count) => readiness.extend_from_slice(&bytes[..count]),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(error) => panic!("read owned agent readiness: {error}"),
+                    }
+                    assert!(readiness.len() <= 64, "unexpected agent readiness");
+                    if readiness.contains(&b'\n') {
+                        break;
+                    }
+                    assert!(std::time::Instant::now() < deadline, "agent readiness timed out");
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                let pids: Vec<u32> = std::str::from_utf8(&readiness)
+                    .unwrap()
+                    .split_whitespace()
+                    .map(|pid| pid.parse().unwrap())
+                    .collect();
+                assert_eq!(pids.len(), 2);
+                assert_ne!(pids[0], pids[1]);
+                let bind = |pid| {
+                    // SAFETY: bind only a process emitted by the owned launcher.
+                    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+                    assert!(fd >= 0, "bind agent child: {}", std::io::Error::last_os_error());
+                    unsafe { OwnedFd::from_raw_fd(fd as i32) }
+                };
+                let child_pidfd = bind(pids[0]);
+                let sibling_pidfd = bind(pids[1]);
+                let family = Self {
+                    agent: setup.0.take().unwrap(),
+                    child_pid: pids[0],
+                    sibling_pid: pids[1],
+                    child_pidfd,
+                    sibling_pidfd,
+                };
+                for pid in [family.child_pid, family.sibling_pid] {
+                    while std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                        .map(|comm| comm.trim() != "sleep")
+                        .unwrap_or(true)
+                    {
+                        assert!(std::time::Instant::now() < deadline, "agent child never exec'd");
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
+                family
+            }
+        }
+
+        impl Drop for AgentFamily {
+            fn drop(&mut self) {
+                // SAFETY: both descriptors pin only owned children. The agent
+                // reaps them before its own Child handle is waited on.
+                for fd in [&self.child_pidfd, &self.sibling_pidfd] {
+                    unsafe {
+                        libc::syscall(
+                            libc::SYS_pidfd_send_signal,
+                            fd.as_raw_fd(),
+                            libc::SIGKILL,
+                            std::ptr::null::<libc::siginfo_t>(),
+                            0,
+                        );
+                    }
+                }
+                let _ = self.agent.wait();
+            }
+        }
+
         pub(super) fn case(label: &str) -> (pt_core::session::SessionHandle, std::path::PathBuf) {
             use pt_core::session::{SessionManifest, SessionMode, SessionStore};
 
@@ -25042,10 +25272,11 @@ mod process_tree_safety_tests {
                     parent_identity: None,
                     supervisor_restart: None,
                     memory_cap: None,
+                    agent_child_review: None,
                 },
             )]);
             let plan =
-                super::super::build_plan_from_selection(&handle.id, policy, &[pid], &candidates)
+                super::super::build_plan_from_selection(&handle.id, policy, &[pid], &[], &candidates)
                     .expect("produce canonical selected action");
             assert_eq!(plan.actions.len(), 1);
             assert_eq!(plan.actions[0].action, Action::Kill);
@@ -25156,6 +25387,7 @@ mod process_tree_safety_tests {
                 &handle,
                 &pt_core::config::Policy::default(),
                 &selection,
+                &[],
                 &mut state,
             );
             if case == "order" {
@@ -25318,7 +25550,7 @@ mod process_tree_safety_tests {
             .any(|record| record.pid.0 == missing.pid));
         let mut execution_state = super::TuiExecutionState::default();
         let ((result, execution_evidence), execution_lock) =
-            super::execute_plan_actions(&handle, &policy, &plan, &mut execution_state)
+            super::execute_plan_actions(&handle, &policy, &plan, &[], &mut execution_state)
                 .expect("TUI helper retains results after missing policy evidence");
         super::write_outcomes_from_execution(&handle, &plan, &result, &execution_evidence)
             .expect("save retained TUI outcomes");
@@ -25392,6 +25624,208 @@ mod process_tree_safety_tests {
         assert_eq!(persisted[0]["status"], "success");
         assert_eq!(persisted[1]["action_id"], plan.actions[1].action_id);
         assert_eq!(persisted[1]["status"], "precheck_blocked");
+    }
+
+    /// The actual headless TUI execution boundary consumes a one-selection
+    /// approval for a direct child, while its live agent and sibling survive.
+    #[cfg(all(feature = "ui", target_os = "linux"))]
+    #[test]
+    fn tui_explicit_agent_child_confirmation_executes_only_the_reviewed_child() {
+        use pt_core::action::prechecks::{AgentChildReview, PreCheckProvider};
+        use pt_core::action::{ActionStatus, LivePreCheckConfig, LivePreCheckProvider};
+        use pt_core::collect::{quick_scan, QuickScanOptions};
+        use pt_core::decision::{decide_action, Action, ActionFeasibility};
+        use pt_core::inference::ClassScores;
+        use std::collections::HashMap;
+        use tui_live_fixtures::{case, fd_evidence, policy, record, AgentFamily};
+
+        let (handle, log_dir) = case("tui-confirmed-agent-child");
+        let policy = policy(1);
+        let mut family = AgentFamily::spawn();
+        let options = QuickScanOptions {
+            pids: vec![family.agent.id(), family.child_pid, family.sibling_pid],
+            timeout: Some(std::time::Duration::from_secs(10)),
+            ..Default::default()
+        };
+        let before = quick_scan(&options).expect("observe owned agent and both children");
+        assert!(before.metadata.warnings.is_empty());
+        assert_eq!(before.processes.len(), 3);
+        let parent = before.processes.iter().find(|p| p.pid.0 == family.agent.id()).unwrap();
+        let child = before.processes.iter().find(|p| p.pid.0 == family.child_pid).unwrap();
+        let sibling = before.processes.iter().find(|p| p.pid.0 == family.sibling_pid).unwrap();
+        let parent_identity = process_identity_from_record(parent);
+        let sibling_identity = process_identity_from_record(sibling);
+        let review = AgentChildReview::from_records(child, parent)
+            .expect("review the actual immediate non-agent child");
+        assert_eq!(sibling.ppid, parent.pid);
+        assert_ne!(child.sid, Some(child.pid.0));
+        assert!(fd_evidence(child.pid.0).iter().all(|fd| fd["writable_regular"] == false));
+        let posterior = ClassScores {
+            useful: 0.001,
+            useful_bad: 0.0,
+            abandoned: 0.999,
+            zombie: 0.0,
+        };
+        // Controlled loss inputs exercise execution plumbing. An idle child is
+        // not asserted to be hung or automatically eligible from these samples.
+        let decision = decide_action(&posterior, &policy, &ActionFeasibility::allow_all()).unwrap();
+        assert_eq!(decision.optimal_action, Action::Kill);
+        let mut inputs = HashMap::from([(
+            child.pid.0,
+            super::PlanCandidateInput {
+                identity: process_identity_from_record(child),
+                ppid: Some(child.ppid.0),
+                decision,
+                process_state: child.state,
+                comm: child.comm.clone(),
+                cmd: child.cmd.clone(),
+                blocked_reasons: Vec::new(),
+                parent_identity: Some(parent_identity.clone()),
+                supervisor_restart: None,
+                memory_cap: None,
+                agent_child_review: Some(super::TuiAgentChildReview {
+                    observation: review,
+                    reason: None,
+                }),
+            },
+        )]);
+        let mut candidates = HashMap::from([(
+            child.pid.0,
+            serde_json::json!({
+                "pid": child.pid.0,
+                "recommended_action": "kill",
+                "recommendation": "KILL",
+                "posterior": posterior,
+            }),
+        )]);
+        let mut rows = vec![super::ProcessRow {
+            pid: child.pid.0,
+            score: 99,
+            classification: "KILL".to_string(),
+            runtime: "fresh owned fixture".to_string(),
+            memory: "unknown".to_string(),
+            command: child.cmd.clone(),
+            selected: true,
+            galaxy_brain: None,
+            why_summary: None,
+            top_evidence: Vec::new(),
+            confidence: None,
+            plan_preview: Vec::new(),
+            provenance_headline: None,
+            provenance_sections: Vec::new(),
+            provenance_caveats: Vec::new(),
+            blast_radius_risk: None,
+        }];
+        super::finalize_tui_recommendations(
+            &mut rows, &mut candidates, &mut inputs, &before.processes, &policy,
+        );
+        assert_eq!(rows[0].classification, "REVIEW");
+        assert!(!rows[0].selected);
+        assert!(rows[0].top_evidence.iter().any(|reason| reason.contains("confirm to request its kill")));
+        assert!(inputs[&child.pid.0].blocked_reasons.is_empty());
+        assert_eq!(candidates[&child.pid.0]["tree_safety"]["rule"], "agent_descendant");
+        // Goal finalization repeats synchronization. It must neither select the
+        // child automatically nor lose the narrowly reviewable reason.
+        let goal = super::parse_goal("free 1 process").unwrap();
+        let goal_output = super::finalize_tui_goal_selection(
+            &handle.id, &goal, 0.0, &mut rows, &mut candidates, &mut inputs,
+            &policy, &before.processes, &super::GoalResourceSnapshot::default(),
+        ).unwrap();
+        assert!(goal_output.selected_pids.is_empty());
+        assert!(!rows[0].selected);
+        assert!(inputs[&child.pid.0].blocked_reasons.is_empty());
+        let selected = [child.pid.0];
+        let bulk = super::build_plan_from_selection(&handle.id, &policy, &selected, &[], &inputs).unwrap();
+        assert!(bulk.actions.is_empty());
+        assert!(super::confirmed_agent_child_actions(&bulk, &[], &inputs).is_empty());
+        let plan = super::build_plan_from_selection(&handle.id, &policy, &selected, &selected, &inputs).unwrap();
+        assert_eq!(plan.actions.len(), 1);
+        assert_eq!(plan.actions[0].action, Action::Kill);
+        let confirmations = super::confirmed_agent_child_actions(&plan, &selected, &inputs);
+        assert_eq!(confirmations.len(), 1);
+        assert!(super::confirmed_agent_child_actions(&plan, &[], &inputs).is_empty());
+        inputs
+            .get_mut(&child.pid.0)
+            .unwrap()
+            .blocked_reasons
+            .push("independent policy refusal".to_string());
+        let still_blocked = super::build_plan_from_selection(
+            &handle.id, &policy, &selected, &selected, &inputs,
+        ).unwrap();
+        assert!(still_blocked.actions.is_empty());
+        assert!(super::confirmed_agent_child_actions(&plan, &selected, &inputs).is_empty());
+        assert_eq!(
+            inputs.get_mut(&child.pid.0).unwrap().blocked_reasons.pop().as_deref(),
+            Some("independent policy refusal"),
+        );
+
+        let provider = LivePreCheckProvider::new(
+            Some(&policy.guardrails), LivePreCheckConfig::from(&policy.data_loss_gates),
+        ).unwrap().with_confirmed_agent_children(confirmations.clone());
+        assert!(!provider.check_agent_supervision(child.pid.0).is_passed());
+        assert!(provider.run_checks_for_action(
+            &[pt_core::plan::PreCheck::CheckAgentSupervision], child.pid.0, child.sid, Action::Kill,
+        ).iter().any(|result| !result.is_passed()), "PID-only API cannot consume an action approval");
+        let mut changed = plan.actions[0].clone();
+        changed.action_id.push_str("-another-action");
+        assert!(super::confirmed_tui_tree_refusal(&changed, &before.processes, true, &confirmations).is_some());
+        let mut reparented = before.processes.clone();
+        reparented.iter_mut().find(|p| p.pid == child.pid).unwrap().ppid = sibling.pid;
+        assert!(super::confirmed_tui_tree_refusal(&plan.actions[0], &reparented, true, &confirmations).is_some());
+        let mut has_live_child = before.processes.clone();
+        has_live_child.iter_mut().find(|p| p.pid == sibling.pid).unwrap().ppid = child.pid;
+        assert!(super::confirmed_tui_tree_refusal(&plan.actions[0], &has_live_child, true, &confirmations)
+            .unwrap().contains("has live child"));
+
+        // Serialized evidence never carries the in-memory human approval.
+        super::write_plan_to_session(&handle, &plan).unwrap();
+        let saved_plan = pt_core::verify::parse_agent_plan(
+            &std::fs::read_to_string(handle.dir.join("decision/plan.json")).unwrap(),
+        ).unwrap();
+        let mut state = super::TuiExecutionState::default();
+        let (refused, refusal_evidence) = super::execute_tui_plan_selection(
+            &handle, &policy, &saved_plan, &[], &mut state,
+        ).expect("record refusal without fresh interactive consent");
+        assert_eq!(refused.summary.actions_succeeded, 0);
+        assert!(matches!(&refused.outcomes[0].status, ActionStatus::PreCheckBlocked { reason, .. }
+            if reason.contains("agent session")));
+        assert!(refusal_evidence.is_empty());
+        assert_eq!(state.enforcer.as_ref().unwrap().current_run_kill_count(), 0);
+        record(&log_dir, serde_json::json!({"step": "saved_plan_has_no_consent", "result": refused, "before": before.processes}));
+
+        let (result, evidence) = super::execute_tui_plan_selection(
+            &handle, &policy, &plan, &confirmations, &mut state,
+        ).expect("execute actual individually confirmed child through TUI callback helper");
+        record(&log_dir, serde_json::json!({"step": "confirmed_child_execution", "result": result, "evidence": evidence}));
+        assert_eq!(result.summary.actions_succeeded, 1, "{result:?}");
+        assert_eq!(result.outcomes[0].status, ActionStatus::Success);
+        assert_eq!(evidence[&plan.actions[0].action_id]["kill_signal_delivered"], true);
+        assert_eq!(state.enforcer.as_ref().unwrap().current_run_kill_count(), 1);
+        assert!(family.agent.try_wait().unwrap().is_none());
+        // Signal success can precede the agent's waitpid. Bound that scheduling
+        // interval while continuously checking the two protected survivors.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let after = loop {
+            let after = quick_scan(&options).expect("observe surviving agent and sibling");
+            assert!(after.metadata.warnings.is_empty());
+            for identity in [&parent_identity, &sibling_identity] {
+                let survivor = after.processes.iter().find(|p| p.pid == identity.pid).unwrap();
+                assert!(survivor.state.is_active());
+                assert_eq!(process_identity_from_record(survivor), *identity);
+            }
+            if after.processes.iter().all(|p| p.pid != child.pid) {
+                break after;
+            }
+            assert!(std::time::Instant::now() < deadline, "agent did not reap selected child");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let outcomes = pt_core::verify::parse_action_outcomes(
+            &std::fs::read_to_string(handle.dir.join("action/outcomes.jsonl")).unwrap(),
+        ).unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[0].status, "precheck_blocked");
+        assert_eq!(outcomes[1].status, "success");
+        record(&log_dir, serde_json::json!({"step": "parent_and_sibling_survived", "after": after.processes, "outcomes": outcomes}));
     }
 
     /// An actual wrapper selection must preserve its unselected live child.
@@ -25478,7 +25912,7 @@ mod process_tree_safety_tests {
 
         let mut state = super::TuiExecutionState::default();
         let (result, evidence) =
-            super::execute_tui_plan_selection(&handle, &policy, &selection, &mut state)
+            super::execute_tui_plan_selection(&handle, &policy, &selection, &[], &mut state)
                 .expect("retain actual live-child refusal through the callback helper");
         record(
             &log_dir,
@@ -25563,7 +25997,7 @@ mod process_tree_safety_tests {
         refused_selection.actions[0].target.uid ^= 1;
         let mut state = super::TuiExecutionState::default();
         let (refusal, refusal_evidence) =
-            super::execute_tui_plan_selection(&handle, &policy, &refused_selection, &mut state)
+            super::execute_tui_plan_selection(&handle, &policy, &refused_selection, &[], &mut state)
                 .expect("retain actual runtime identity refusal");
         record(
             &log_dir,
@@ -25581,7 +26015,7 @@ mod process_tree_safety_tests {
             (&second_selection, &mut second),
         ] {
             let (result, evidence) =
-                super::execute_tui_plan_selection(&handle, &policy, selected, &mut state)
+                super::execute_tui_plan_selection(&handle, &policy, selected, &[], &mut state)
                     .expect("execute only the current selection");
             record(
                 &log_dir,
@@ -25737,7 +26171,7 @@ mod process_tree_safety_tests {
         let mut state = super::TuiExecutionState::default();
         let (result, evidence) = std::thread::scope(|scope| {
             let execution = scope
-                .spawn(|| super::execute_tui_plan_selection(&handle, &policy, &batch, &mut state));
+                .spawn(|| super::execute_tui_plan_selection(&handle, &policy, &batch, &[], &mut state));
             wait_for_handler(0);
             wait_for_handler(1);
             // Both handlers are held open by owned input pipes. Their TERM
@@ -25842,7 +26276,7 @@ mod process_tree_safety_tests {
         let mut state = super::TuiExecutionState::default();
         let (result, evidence) = std::thread::scope(|scope| {
             let execution = scope
-                .spawn(|| super::execute_tui_plan_selection(&handle, &policy, &batch, &mut state));
+                .spawn(|| super::execute_tui_plan_selection(&handle, &policy, &batch, &[], &mut state));
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
             while !marker.exists() {
                 assert!(
@@ -25910,7 +26344,7 @@ mod process_tree_safety_tests {
         super::write_plan_to_session(&handle, &second_selection).unwrap();
         let mut state = super::TuiExecutionState::default();
         let (first_result, first_evidence) =
-            super::execute_tui_plan_selection(&handle, &policy, &first_selection, &mut state)
+            super::execute_tui_plan_selection(&handle, &policy, &first_selection, &[], &mut state)
                 .expect("first real delivered kill fits the run budget");
         record(
             &log_dir,
@@ -25927,7 +26361,7 @@ mod process_tree_safety_tests {
             .wait()
             .expect("reap first actually killed target");
         let (second_result, second_evidence) =
-            super::execute_tui_plan_selection(&handle, &policy, &second_selection, &mut state)
+            super::execute_tui_plan_selection(&handle, &policy, &second_selection, &[], &mut state)
                 .expect("record refusal of the second real selection");
         record(
             &log_dir,
@@ -25995,7 +26429,7 @@ mod process_tree_safety_tests {
         // delivered kill in the error response, never report a clean session.
         std::fs::create_dir_all(handle.dir.join("action/outcomes.jsonl")).unwrap();
         let mut state = super::TuiExecutionState::default();
-        let error = super::execute_tui_plan_selection(&handle, &policy, &selected, &mut state)
+        let error = super::execute_tui_plan_selection(&handle, &policy, &selected, &[], &mut state)
             .expect_err("directory cannot accept append-only outcome records");
         target
             .leader
