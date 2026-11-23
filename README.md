@@ -886,20 +886,43 @@ reports do not relax agent protection or authorize group actions.
 
 The shared recommendation path also uses these observations in `agent_liveness`.
 An identified agent with recent terminal activity, measured CPU/I/O progress
-in its own process or an attributed child, or a recently modified open session
+in its own process or an attributed child, or a recently modified associated session
 transcript is retained with a `keep` recommendation and an explanation of the
 observation. This includes headless agents whose work happens in child tools.
 The assessment is bound to the agent's process identity; it does not give
 descendants additional protection.
 
+On Linux, an otherwise eligible direct child of a recognized AI agent remains a
+REVIEW item. To request its termination, toggle that individual row and confirm
+the TUI action; selecting all rows or accepting recommended selections does not
+grant this permission. Confirmation applies only to that exact non-agent child
+and direct kill, with the original child and parent identities, commands and
+parent relationship revalidated before execution. The agent parent and siblings
+are not included. Saved plans, robot/apply commands and later selections do not
+inherit confirmation. Protected-process, live-child, session, supervisor,
+data-loss, FDR and rate-limit checks can still refuse the action.
+
 On Linux, Codex and Claude can also contribute session-transcript evidence.
 Collection inspects recognized transcript files that the agent itself holds open
 for writing, checking process identity, descriptor ownership and safe filesystem
-placement around the metadata read. It does not search for the newest file in a
-session directory, read transcript contents, or persist transcript paths.
-A missing, closed, unreadable, replaced, future-dated, or unsupported transcript
-remains unknown; recent modification does not identify who wrote it or establish
-a particular conversation ID.
+placement around the metadata read. Their closed transcripts remain unknown.
+
+Native Pi can contribute evidence from an explicit absolute
+`--session /path/to/session.jsonl` argument even after it closes the transcript
+between saves. Collection checks the original NUL-delimited arguments, process
+identity, filesystem root and exact selected file around the metadata read.
+Only understood native invocation forms are accepted; relative paths, session
+IDs, positional prompts, ambiguous options and hosted launchers remain unknown.
+Path lookup must succeed from the kernel cache without following symlinks, using
+Linux `openat2` with `RESOLVE_CACHED` (Linux 5.12 or later). Unsupported kernels,
+blocked syscalls, uncached paths, foreign mount namespaces and unsafe filesystems
+remain unknown. The explanation calls this a **startup-selected** transcript:
+Pi can switch sessions after startup, and this observation does not establish
+which conversation is currently active or who wrote the file.
+
+Neither source searches for the newest file in a session directory, reads
+transcript contents, or persists transcript paths. Missing, unreadable, replaced,
+future-dated or otherwise unsupported transcript evidence remains unknown.
 
 Set `guardrails.agent_session_window_seconds` in `policy.json` to control the
 transcript recency window (default `1800`, or 30 minutes). A value of `0` disables
@@ -907,7 +930,9 @@ this observation. It is independent of the CPU/I/O sampling window: a verified
 recent transcript can retain an otherwise idle headless agent even with
 `--window-ms 0`. The metadata summary is saved in
 `agent_liveness.activity.session_activity`; positive evidence appears in
-`sources` as `recent_session_transcript_activity`.
+`sources` as `recent_session_transcript_activity`. The metadata's `source` is
+`held_writable_descriptor` or `explicit_session_argument`; older recordings
+without this field retain their original descriptor-based interpretation.
 
 `agent_liveness.live` is `true` for positive activity, `false` for a fully observed
 quiet sampling window, and `null` when evidence is incomplete. Its `status`,

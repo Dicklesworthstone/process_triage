@@ -591,12 +591,20 @@ pub fn assess_agent_liveness(
             sources.push(AgentLivenessSource::RecentTerminalActivity);
             reasons.push("terminal has recent activity".to_string());
         }
-        if session_activity.is_some_and(|session| {
+        if let Some(session) = session_activity.filter(|session| {
             session.matches_record(process)
                 && session.recently_modified_within(session_window_seconds) == Some(true)
         }) {
             sources.push(AgentLivenessSource::RecentSessionTranscriptActivity);
-            reasons.push("an open session transcript was recently modified".to_string());
+            reasons.push(
+                match session.source {
+                    Some(crate::collect::protected::AgentSessionActivitySource::ExplicitSessionArgument) => {
+                        "a startup-selected session transcript was recently modified"
+                    }
+                    _ => "an open session transcript was recently modified",
+                }
+                .to_string(),
+            );
         }
         if let Some(unit) = sampled_activity.filter(|unit| {
             unit.activity == AgentActivityState::ActivityObserved
@@ -2816,6 +2824,9 @@ mod tests {
             ),
             ppid: process.ppid.0,
             command_sha256: hex::encode(sha2::Sha256::digest(process.cmd.as_bytes())),
+            source: Some(
+                crate::collect::protected::AgentSessionActivitySource::HeldWritableDescriptor,
+            ),
             identity_verified: true,
             observed_at,
             window_seconds,
@@ -2988,6 +2999,53 @@ mod tests {
     }
 
     #[test]
+    fn explicit_session_activity_keeps_its_source_through_replay() {
+        use crate::collect::protected::{AgentSessionActivity, AgentSessionActivitySource};
+
+        let process = agent_record(100, 1, "pi --session /workspace/selected.jsonl");
+        let measured = scorer(SignatureDatabase::with_defaults());
+        let mut session = session_activity_sample(&process, 600, 1800);
+        session.source = Some(AgentSessionActivitySource::ExplicitSessionArgument);
+        let mut unit = measured
+            .agent_activity_report(std::slice::from_ref(&process), true)
+            .units
+            .remove(0);
+        unit.session_activity = Some(session.clone());
+        let mut captured = measured.recorded_observations(&process, None);
+        captured.agent_activity = Some(unit);
+        let encoded = serde_json::to_string(&captured).unwrap();
+        assert!(encoded.contains("explicit_session_argument"));
+
+        let replay = scorer(SignatureDatabase::with_defaults()).with_evaluation_time(
+            chrono::DateTime::parse_from_rfc3339("2040-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        let score = replay
+            .score_recorded(
+                &process,
+                Evidence::from_snapshot(&process),
+                serde_json::from_str(&encoded).unwrap(),
+            )
+            .unwrap();
+        let live =
+            assess_agent_liveness(&process, score.agent_activity.as_ref(), None, 1800).unwrap();
+        assert_eq!(live.live, Some(true));
+        assert_eq!(live.requested_activity_window_ms, None);
+        assert!(live.reason.contains("startup-selected session transcript"));
+        assert!(!live.reason.contains("open session transcript"));
+        assert!(score.ledger.why_summary.contains(&live.reason));
+
+        // Older capture digests must not change when a newly optional source
+        // was absent. Absence continues to describe the original FD-only data.
+        let mut legacy = serde_json::to_value(&session).unwrap();
+        legacy.as_object_mut().unwrap().remove("source");
+        let decoded: AgentSessionActivity = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(decoded.source, None);
+        assert_eq!(serde_json::to_value(decoded).unwrap(), legacy);
+    }
+
+    #[test]
     fn session_liveness_boundary_unavailable_and_wrong_identity_remain_unknown() {
         let process = agent_record(100, 1, "claude --continue");
         let measured = scorer(SignatureDatabase::with_defaults());
@@ -3157,6 +3215,232 @@ mod tests {
         assert_eq!(
             assess(score.agent_activity.as_ref().unwrap()).live,
             Some(false)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn explicit_pi_session_keeps_closed_transcript_and_replays_after_exit() {
+        use crate::collect::protected::AgentSessionActivitySource;
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+        use std::process::{Child, Command, ExitStatus, Stdio};
+        use std::time::Instant;
+
+        let cached_lookup = crate::collect::protected::cached_session_lookup_available_for_test();
+
+        struct OwnedChild {
+            child: Child,
+            reaped: bool,
+        }
+        impl OwnedChild {
+            fn poll(&mut self) -> Option<ExitStatus> {
+                let status = self.child.try_wait().unwrap();
+                self.reaped |= status.is_some();
+                status
+            }
+
+            fn wait(&mut self, duration: Duration, label: &str) -> ExitStatus {
+                let deadline = Instant::now() + duration;
+                loop {
+                    if let Some(status) = self.poll() {
+                        return status;
+                    }
+                    assert!(Instant::now() < deadline, "{label} timed out");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                if !self.reaped {
+                    // SAFETY: each command created its own process group.
+                    // The unreaped leader pins this PID until wait, so group
+                    // cleanup cannot target a reused unrelated process group.
+                    unsafe {
+                        libc::kill(-(self.child.id() as i32), libc::SIGKILL);
+                    }
+                    let _ = self.child.wait();
+                }
+            }
+        }
+
+        // A native fixture is necessary: an interpreter or sleep process does
+        // not accept Pi's actual argv. Compile this small owned helper with the
+        // C toolchain already required by the Rust workspace's native crates.
+        const HELPER: &str = r#"#include <errno.h>
+#include <fcntl.h>
+#include <string.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    if (argc != 3 || strcmp(argv[1], "--session") != 0) return 2;
+    int fd = open(argv[2], O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0) return 3;
+    if (write(fd, "{}\n", 3) != 3 || close(fd) != 0) return 4;
+    if (write(STDOUT_FILENO, "R", 1) != 1) return 5;
+    char byte;
+    while (read(STDIN_FILENO, &byte, 1) < 0 && errno == EINTR) {}
+    return 0;
+}
+"#;
+        let directory = tempfile::tempdir().unwrap();
+        let helper = directory.path().join("pi-session-fixture");
+        let mut compiler = OwnedChild {
+            child: Command::new("cc")
+                .args(["-x", "c", "-std=gnu99", "-O0", "-o"])
+                .arg(&helper)
+                .arg("-")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .process_group(0)
+                .spawn()
+                .expect("native Pi session fixture requires a working C compiler (cc)"),
+            reaped: false,
+        };
+        compiler
+            .child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(HELPER.as_bytes())
+            .unwrap();
+        assert!(
+            compiler
+                .wait(Duration::from_secs(10), "native fixture compilation")
+                .success(),
+            "native Pi session fixture compilation failed; a working C compiler (cc) is required"
+        );
+
+        let transcript = directory.path().join("selected.jsonl");
+        let mut child = OwnedChild {
+            child: Command::new(&helper)
+                .arg0("pi")
+                .arg("--session")
+                .arg(&transcript)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+            reaped: false,
+        };
+        let mut ready = child.child.stdout.take().unwrap();
+        // SAFETY: ready owns this descriptor; both fcntl operations use valid
+        // integer flags and do not extend its lifetime beyond the pipe handle.
+        let flags = unsafe { libc::fcntl(ready.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(ready.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "native fixture readiness timed out"
+            );
+            let mut marker = [0_u8; 1];
+            match ready.read(&mut marker) {
+                Ok(1) => {
+                    assert_eq!(marker, [b'R']);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => panic!("native fixture readiness failed: {result:?}"),
+            }
+            assert!(
+                child.poll().is_none(),
+                "native fixture exited before readiness"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let scan = crate::collect::quick_scan(&crate::collect::QuickScanOptions {
+            pids: vec![child.child.id()],
+            timeout: Some(Duration::from_millis(500)),
+            ..Default::default()
+        })
+        .unwrap();
+        let process = scan.processes.into_iter().next().unwrap();
+        assert_eq!(process.cmd, format!("pi --session {}", transcript.display()));
+        for descriptor in std::fs::read_dir(format!("/proc/{}/fd", process.pid.0)).unwrap() {
+            let target = std::fs::read_link(descriptor.unwrap().path()).unwrap();
+            assert_ne!(
+                target, transcript,
+                "fixture must close the transcript before collection"
+            );
+        }
+
+        let mut measured = scorer(SignatureDatabase::with_defaults());
+        measured.collect_activity(&[&process], Duration::ZERO);
+        measured.prepare_agent_activity(std::slice::from_ref(&process), false);
+        let score = measured
+            .score_with_desktop(&process, Evidence::from_snapshot(&process), None)
+            .unwrap();
+        let live =
+            assess_agent_liveness(&process, score.agent_activity.as_ref(), None, 1800).unwrap();
+        let assert_liveness = |live: &AgentLiveness| {
+            assert_eq!(live.requested_activity_window_ms, None);
+            if cached_lookup {
+                assert_eq!(live.live, Some(true), "{live:?}");
+                assert_eq!(
+                    live.sources,
+                    [AgentLivenessSource::RecentSessionTranscriptActivity]
+                );
+                assert!(live.reason.contains("startup-selected session transcript"));
+            } else {
+                assert_eq!(live.live, None, "{live:?}");
+                assert_eq!(live.status, AgentLivenessState::Unknown);
+                assert!(live.sources.is_empty());
+                assert!(!live.reason.starts_with("Keep:"));
+                assert!(live
+                    .unavailable
+                    .iter()
+                    .any(|reason| reason == "session_explicit_path_cached_lookup_unavailable"));
+            }
+        };
+        assert_liveness(&live);
+        let session = score
+            .agent_activity
+            .as_ref()
+            .unwrap()
+            .session_activity
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            session.source,
+            Some(AgentSessionActivitySource::ExplicitSessionArgument)
+        );
+        assert_eq!(session.identity_verified, cached_lookup);
+        assert_eq!(session.transcript_count, usize::from(cached_lookup));
+        let captured = serde_json::to_string(&measured.recorded_observations(&process, None)).unwrap();
+        assert!(!captured.contains(transcript.to_str().unwrap()));
+        // Releasing the owned input pipe lets the helper exit normally. Replay
+        // must continue to use the captured observation after its PID is gone.
+        drop(child.child.stdin.take());
+        assert!(child
+            .wait(Duration::from_secs(5), "native fixture shutdown")
+            .success());
+        let replay_scorer = scorer(SignatureDatabase::with_defaults());
+        let replay = replay_scorer
+            .score_recorded(
+                &process,
+                Evidence::from_snapshot(&process),
+                serde_json::from_str(&captured).unwrap(),
+            )
+            .unwrap();
+        let replay_live =
+            assess_agent_liveness(&process, replay.agent_activity.as_ref(), None, 1800).unwrap();
+        assert_liveness(&replay_live);
+        assert_eq!(
+            replay
+                .ledger
+                .why_summary
+                .contains("startup-selected session transcript"),
+            cached_lookup
         );
     }
 

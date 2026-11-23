@@ -1259,14 +1259,26 @@ pub fn agent_kind(cmd: &str) -> Option<&'static str> {
     })
 }
 
-/// Activity on a transcript that the recognized agent itself held writable.
-/// This does not identify a particular conversation or establish abandonment
-/// when no transcript was observed. Paths and transcript contents are omitted.
+/// How a transcript was associated with the recognized agent. Neither source
+/// identifies the writer of a particular modification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSessionActivitySource {
+    HeldWritableDescriptor,
+    ExplicitSessionArgument,
+}
+
+/// Activity on a transcript associated with the recognized agent.
+/// This does not establish abandonment when no transcript was observed.
+/// Paths and transcript contents are omitted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSessionActivity {
     pub identity: pt_common::ProcessIdentity,
     pub ppid: u32,
     pub command_sha256: String,
+    /// Older observations used held writable descriptors exclusively.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<AgentSessionActivitySource>,
     pub identity_verified: bool,
     pub observed_at: chrono::DateTime<chrono::Utc>,
     pub window_seconds: u64,
@@ -1288,6 +1300,7 @@ impl AgentSessionActivity {
             ),
             ppid: process.ppid.0,
             command_sha256: agent_command_digest(&process.cmd),
+            source: None,
             identity_verified: false,
             observed_at: chrono::Utc::now(),
             window_seconds,
@@ -1344,9 +1357,10 @@ fn agent_command_digest(command: &str) -> String {
 }
 
 /// Collect transcript metadata once for a scan's recognized agent roots.
-/// Only held writable descriptors are considered, never another session's
-/// newest file or a path supplied through an environment variable. Missing,
-/// closed, unsupported or unreadable transcript evidence remains unknown.
+/// Inspect held writable descriptors, or a native Pi invocation's unambiguous
+/// absolute --session argument. Never choose another session's newest file or
+/// a path supplied through an environment variable. Missing, unsupported or
+/// unreadable transcript evidence remains unknown.
 pub fn collect_agent_session_activity(
     processes: &[&ProcessRecord],
     window_seconds: u64,
@@ -1378,15 +1392,74 @@ pub fn collect_agent_session_activity(
     }
 }
 
+/// Probe the test host separately from collection. Known kernel/seccomp refusal
+/// still exercises the production Unknown contract; unexpected errors fail.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn cached_session_lookup_available_for_test() -> bool {
+    use std::ffi::CString;
+    use std::fs::{File, OpenOptions};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::OpenOptionsExt;
+
+    #[repr(C)]
+    struct OpenHow {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    }
+    let directory = tempfile::tempdir().unwrap();
+    File::create(directory.path().join("probe.jsonl")).unwrap();
+    let root = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(directory.path())
+        .unwrap();
+    let path = CString::new("probe.jsonl").unwrap();
+    let how = OpenHow {
+        flags: (libc::O_PATH | libc::O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: 0x04 | 0x10 | 0x20,
+    };
+    // SAFETY: the owned root, C string and Linux open_how remain live during
+    // this controlled syscall against a file just created by this test.
+    let descriptor = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            root.as_raw_fd(),
+            path.as_ptr(),
+            &how as *const OpenHow,
+            std::mem::size_of::<OpenHow>(),
+        )
+    };
+    if descriptor >= 0 {
+        // SAFETY: successful openat2 returned a new owned descriptor.
+        drop(unsafe { File::from_raw_fd(descriptor as std::os::fd::RawFd) });
+        true
+    } else {
+        let error = std::io::Error::last_os_error();
+        assert!(
+            matches!(
+                error.raw_os_error(),
+                Some(libc::ENOSYS | libc::EINVAL | libc::EPERM)
+            ),
+            "unexpected failure of the controlled cache-only lookup probe: {error}"
+        );
+        false
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod agent_session {
-    use super::{agent_kind, AgentSessionActivity, ProcessRecord};
+    use super::{agent_kind, AgentSessionActivity, AgentSessionActivitySource, ProcessRecord};
     use crate::collect::proc_parsers::parse_required_proc_stat_content;
     use crate::collect::procfs::{directory_path, mount_id, read_bounded, FilesystemGuard};
     use std::collections::{BTreeMap, BTreeSet};
+    use std::ffi::CString;
     use std::fs::{self, File, OpenOptions};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    use std::path::{Component, Path};
+    use std::path::{Component, Path, PathBuf};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     const MAX_FIELD_BYTES: usize = 65_536;
@@ -1717,6 +1790,217 @@ mod agent_session {
         )))
     }
 
+    /// Native Pi treats --session as a file path and --no-session overrides it
+    /// (pi_agent_rust src/cli.rs and src/session.rs). Its JSONL descriptor is
+    /// closed between saves. Parse NUL-delimited argv, never the flattened
+    /// display command. Unknown flags, duplicate selection, hosted launchers
+    /// and positional prompts are intentionally unsupported rather than guessed.
+    fn native_pi_session_path(command_line: &[u8]) -> Option<PathBuf> {
+        let command_line = command_line.strip_suffix(&[0])?;
+        let mut arguments = command_line.split(|byte| *byte == 0);
+        let executable = std::str::from_utf8(arguments.next()?).ok()?;
+        if executable.rsplit('/').next()? != "pi" {
+            return None;
+        }
+        let mut session = None;
+        while let Some(argument) = arguments.next() {
+            let argument = std::str::from_utf8(argument).ok()?;
+            let (name, inline_value) = argument
+                .split_once('=')
+                .map_or((argument, None), |(name, value)| (name, Some(value)));
+            if matches!(
+                name,
+                "--session"
+                    | "--provider"
+                    | "--model"
+                    | "--api-key"
+                    | "--thinking"
+                    | "--mode"
+                    | "--system-prompt"
+                    | "--append-system-prompt"
+                    | "--session-dir"
+                    | "--session-durability"
+                    | "--session-workdir"
+            ) {
+                let value = match inline_value {
+                    Some(value) => value,
+                    None => std::str::from_utf8(arguments.next()?).ok()?,
+                };
+                if value.is_empty() || (inline_value.is_none() && value.starts_with('-')) {
+                    return None;
+                }
+                if name == "--session" && session.replace(PathBuf::from(value)).is_some() {
+                    return None;
+                }
+            } else if inline_value.is_some()
+                || !matches!(
+                    name,
+                    "--print"
+                        | "-p"
+                        | "--continue"
+                        | "-c"
+                        | "--resume"
+                        | "-r"
+                        | "--classic"
+                        | "--classic-tui"
+                        | "--ftui"
+                        | "--no-tools"
+                )
+            {
+                // Includes --no-session, --, help/export/subcommands, and any
+                // prompt text containing words that merely resemble options.
+                return None;
+            }
+        }
+        let path = session?;
+        (path.is_absolute()
+            && path.extension().is_some_and(|extension| extension == "jsonl")
+            && path
+                .components()
+                .all(|part| matches!(part, Component::RootDir | Component::Normal(_))))
+        .then_some(path)
+    }
+
+    /// No fallback is permitted: even an O_PATH lookup can otherwise consult a
+    /// remote filesystem before we can classify the returned descriptor.
+    /// RESOLVE_CACHED refuses any lookup needing I/O or revalidation; the held
+    /// descriptor is classified separately before its metadata is requested.
+    fn open_cached_session_path(root: &File, path: &Path) -> Result<File, &'static str> {
+        #[repr(C)]
+        struct OpenHow {
+            flags: u64,
+            mode: u64,
+            resolve: u64,
+        }
+        const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+        const RESOLVE_IN_ROOT: u64 = 0x10;
+        const RESOLVE_CACHED: u64 = 0x20;
+        let path =
+            CString::new(path.as_os_str().as_bytes()).map_err(|_| "session_explicit_path_invalid")?;
+        let how = OpenHow {
+            flags: (libc::O_PATH | libc::O_CLOEXEC) as u64,
+            mode: 0,
+            resolve: RESOLVE_NO_SYMLINKS | RESOLVE_IN_ROOT | RESOLVE_CACHED,
+        };
+        // SAFETY: the live descriptor, NUL-terminated path and initialized
+        // Linux open_how layout remain valid for this synchronous syscall.
+        let descriptor = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                root.as_raw_fd(),
+                path.as_ptr(),
+                &how as *const OpenHow,
+                std::mem::size_of::<OpenHow>(),
+            )
+        };
+        if descriptor < 0 {
+            return Err("session_explicit_path_cached_lookup_unavailable");
+        }
+        // SAFETY: a successful openat2 returns a new owned file descriptor.
+        Ok(unsafe { File::from_raw_fd(descriptor as std::os::fd::RawFd) })
+    }
+
+    struct SessionProcessView {
+        root: File,
+        namespace: PathBuf,
+        identity: (u64, u64, u64),
+    }
+
+    fn pin_session_process_view(
+        root: &File,
+        context: &Context,
+    ) -> Result<SessionProcessView, &'static str> {
+        let namespace_path = directory_path(root, "ns/mnt");
+        let namespace = fs::read_link(&namespace_path)
+            .map_err(|_| "session_explicit_mount_namespace_unavailable")?;
+        if namespace
+            != fs::read_link("/proc/self/ns/mnt")
+                .map_err(|_| "session_explicit_mount_namespace_unavailable")?
+        {
+            return Err("session_explicit_mount_namespace_unsupported");
+        }
+        // This is the pinned proc directory's kernel-provided root link, not
+        // an arbitrary link from argv. It also handles a same-namespace chroot.
+        let view = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(directory_path(root, "root"))
+            .map_err(|_| "session_explicit_root_unavailable")?;
+        if !context.filesystems.permits(&view) {
+            return Err("session_explicit_root_filesystem_unavailable");
+        }
+        let root_metadata = view
+            .metadata()
+            .map_err(|_| "session_explicit_root_identity_unavailable")?;
+        let identity = (
+            root_metadata.dev(),
+            root_metadata.ino(),
+            mount_id(&view).ok_or("session_explicit_root_identity_unavailable")?,
+        );
+        Ok(SessionProcessView {
+            root: view,
+            namespace,
+            identity,
+        })
+    }
+
+    struct ExplicitSessionObservation {
+        command_line: Vec<u8>,
+        view: SessionProcessView,
+        transcript: Transcript,
+        // Pin both the process root and transcript across the second
+        // observation, preventing inode reuse from disguising replacement.
+        _transcript: File,
+    }
+
+    fn inspect_explicit_pi_session(
+        root: &File,
+        process: &ProcessRecord,
+        context: &Context,
+        deadline: Instant,
+    ) -> Result<ExplicitSessionObservation, &'static str> {
+        check_budget(deadline)?;
+        let command_path = directory_path(root, "cmdline");
+        let command_line = read_bounded(&command_path, MAX_FIELD_BYTES)?;
+        let path = native_pi_session_path(&command_line)
+            .ok_or("session_explicit_argument_unavailable_or_ambiguous")?;
+        let view = pin_session_process_view(root, context)?;
+        let held = open_cached_session_path(&view.root, &path)?;
+        if !context.filesystems.permits(&held) {
+            return Err("session_transcript_filesystem_unavailable");
+        }
+        let metadata = held
+            .metadata()
+            .map_err(|_| "session_transcript_metadata_unavailable")?;
+        if !metadata.is_file()
+            || metadata.uid() != process.uid
+            || metadata.nlink() != 1
+            || metadata.len() == 0
+        {
+            return Err("session_transcript_identity_unusable");
+        }
+        let transcript = (
+            (metadata.dev(), metadata.ino()),
+            metadata
+                .modified()
+                .map_err(|_| "session_transcript_mtime_unavailable")?,
+        );
+        if read_bounded(&command_path, MAX_FIELD_BYTES)? != command_line {
+            return Err("session_explicit_arguments_changed");
+        }
+        let after = pin_session_process_view(root, context)?;
+        if after.namespace != view.namespace || after.identity != view.identity {
+            return Err("session_explicit_process_view_changed");
+        }
+        check_budget(deadline)?;
+        Ok(ExplicitSessionObservation {
+            command_line,
+            view,
+            transcript,
+            _transcript: held,
+        })
+    }
+
     fn collect_one(
         process: &ProcessRecord,
         window_seconds: u64,
@@ -1724,6 +2008,41 @@ mod agent_session {
         context: &Context,
     ) -> AgentSessionActivity {
         collect_one_with(process, window_seconds, proc_root, context, || {})
+    }
+
+    fn record_transcripts(
+        result: &mut AgentSessionActivity,
+        birth: SystemTime,
+        transcripts: BTreeMap<(u64, u64), SystemTime>,
+    ) {
+        let observed_at = SystemTime::now();
+        let mut latest = None;
+        for modified in transcripts.into_values() {
+            if modified < birth || modified > observed_at {
+                result
+                    .unavailable
+                    .push("session_transcript_mtime_outside_process_lifetime".to_string());
+                continue;
+            }
+            result.transcript_count += 1;
+            latest = Some(latest.map_or(modified, |old: SystemTime| old.max(modified)));
+        }
+        result.identity_verified = true;
+        result.observed_at = observed_at.into();
+        result.latest_modified_at = latest.map(Into::into);
+        if result.transcript_count == 0 {
+            result.unavailable.push(
+                match result.source {
+                    Some(AgentSessionActivitySource::ExplicitSessionArgument) => {
+                        "no usable modification time for the explicitly selected session transcript was observed"
+                    }
+                    _ => {
+                        "no identity-bound open writable session transcript was observed; agents may close transcripts between writes"
+                    }
+                }
+                .to_string(),
+            );
+        }
     }
 
     fn collect_one_with(
@@ -1741,7 +2060,7 @@ mod agent_session {
             }
             check_budget(context.deadline)?;
             let kind = agent_kind(&process.cmd).ok_or("session_agent_unrecognized")?;
-            if !matches!(kind, "claude" | "codex") {
+            if !matches!(kind, "claude" | "codex" | "pi") {
                 return Err("session_transcript_layout_unsupported");
             }
             let deadline = context
@@ -1750,6 +2069,29 @@ mod agent_session {
             let root = pin_directory(&proc_root.join(process.pid.0.to_string()))?;
             let before = root_identity(&root, process, context)?;
             let birth = context.birth(before.birth_ticks)?;
+            if kind == "pi" {
+                result.source = Some(AgentSessionActivitySource::ExplicitSessionArgument);
+                let first = inspect_explicit_pi_session(&root, process, context, deadline)?;
+                before_recheck();
+                let second = inspect_explicit_pi_session(&root, process, context, deadline)?;
+                if first.command_line != second.command_line {
+                    return Err("session_explicit_arguments_changed");
+                }
+                if first.view.namespace != second.view.namespace
+                    || first.view.identity != second.view.identity
+                {
+                    return Err("session_explicit_process_view_changed");
+                }
+                if first.transcript.0 != second.transcript.0 {
+                    return Err("session_explicit_transcript_replaced");
+                }
+                if root_identity(&root, process, context)? != before {
+                    return Err("session_process_identity_changed");
+                }
+                record_transcripts(&mut result, birth, BTreeMap::from([second.transcript]));
+                return Ok(());
+            }
+            result.source = Some(AgentSessionActivitySource::HeldWritableDescriptor);
             let task_dir = directory_path(&root, "task");
             let mut tids = BTreeSet::from([process.pid.0]);
             match fs::read_dir(&task_dir) {
@@ -1838,27 +2180,7 @@ mod agent_session {
             if root_identity(&root, process, context)? != before {
                 return Err("session_process_identity_changed");
             }
-            let observed_at = SystemTime::now();
-            let mut latest = None;
-            for modified in transcripts.into_values() {
-                if modified < birth || modified > observed_at {
-                    result
-                        .unavailable
-                        .push("session_transcript_mtime_outside_process_lifetime".to_string());
-                    continue;
-                }
-                result.transcript_count += 1;
-                latest = Some(latest.map_or(modified, |old: SystemTime| old.max(modified)));
-            }
-            result.identity_verified = true;
-            result.observed_at = observed_at.into();
-            result.latest_modified_at = latest.map(Into::into);
-            if result.transcript_count == 0 {
-                result.unavailable.push(
-                    "no identity-bound open writable session transcript was observed; agents may close transcripts between writes"
-                        .to_string(),
-                );
-            }
+            record_transcripts(&mut result, birth, transcripts);
             Ok(())
         })();
         if let Err(reason) = observation {
@@ -1914,6 +2236,24 @@ mod agent_session {
 
         const BOOT: &str = "ebaf61d7-e8b6-4f06-a845-4376238330f0";
         const SESSION: &str = "019c017a-84b0-7710-8bba-47ea1175fee3";
+
+        fn raw_arguments(arguments: &[&str]) -> Vec<u8> {
+            arguments
+                .iter()
+                .flat_map(|argument| argument.bytes().chain(std::iter::once(0)))
+                .collect()
+        }
+
+        fn assert_cached_lookup_unavailable(observed: &AgentSessionActivity) {
+            assert_eq!(observed.recently_modified(), None, "{observed:?}");
+            assert!(!observed.identity_verified);
+            assert_eq!(observed.transcript_count, 0);
+            assert!(observed.latest_modified_at.is_none());
+            assert_eq!(
+                observed.unavailable,
+                ["session_explicit_path_cached_lookup_unavailable"]
+            );
+        }
 
         struct Fixture {
             _directory: tempfile::TempDir,
@@ -1979,6 +2319,40 @@ mod agent_session {
                 result
             }
 
+            fn explicit_pi() -> Self {
+                let mut fixture = Self::new();
+                fixture.process.comm = "pi".to_string();
+                let path = fixture.transcript.to_str().unwrap().to_string();
+                fixture.arguments(&["pi", "--session", &path]);
+                fixture.write_identity(&fixture.root(), 4242);
+                // The explicit source must work with no descriptor table to
+                // inspect: native Pi closes its transcript between saves.
+                fs::rename(
+                    fixture.root().join("task"),
+                    fixture.root().join("unused_descriptor_fixture"),
+                )
+                .unwrap();
+                fs::create_dir_all(fixture.root().join("ns")).unwrap();
+                std::os::unix::fs::symlink(
+                    fs::read_link("/proc/self/ns/mnt").unwrap(),
+                    fixture.root().join("ns/mnt"),
+                )
+                .unwrap();
+                std::os::unix::fs::symlink("/", fixture.root().join("root")).unwrap();
+                let root = pin_directory(Path::new("/")).unwrap();
+                fixture
+                    .context
+                    .filesystems
+                    .mounts
+                    .insert(mount_id(&root).unwrap(), true);
+                fixture
+            }
+
+            fn arguments(&mut self, arguments: &[&str]) {
+                self.process.cmd = arguments.join(" ");
+                fs::write(self.root().join("cmdline"), raw_arguments(arguments)).unwrap();
+            }
+
             fn root(&self) -> PathBuf {
                 self.proc_root.join("4242")
             }
@@ -1997,7 +2371,7 @@ mod agent_session {
                 fields[19] = "100";
                 fs::write(
                     path.join("stat"),
-                    format!("{tid} (codex) {}\n", fields.join(" ")),
+                    format!("{tid} ({}) {}\n", self.process.comm, fields.join(" ")),
                 )
                 .unwrap();
                 let uid = self.process.uid;
@@ -2049,6 +2423,241 @@ mod agent_session {
                     &self.proc_root,
                     &self.context,
                 )
+            }
+        }
+
+        #[test]
+        fn native_pi_session_arguments_reject_ambiguous_launches() {
+            for arguments in [
+                vec!["pi", "--session", "/custom/selected.jsonl"],
+                vec!["/home/u/bin/pi", "--session=/custom/selected.jsonl"],
+                vec![
+                    "pi",
+                    "--mode",
+                    "rpc",
+                    "--provider",
+                    "anthropic",
+                    "--session",
+                    "/custom/selected.jsonl",
+                    "--continue",
+                ],
+                vec![
+                    "pi",
+                    "--session",
+                    "/custom/selected.jsonl",
+                    "--system-prompt",
+                    "a prompt with spaces and --session in its text",
+                ],
+            ] {
+                assert_eq!(
+                    native_pi_session_path(&raw_arguments(&arguments)),
+                    Some(PathBuf::from("/custom/selected.jsonl")),
+                    "{arguments:?}"
+                );
+            }
+            assert_eq!(
+                native_pi_session_path(&raw_arguments(&[
+                    "pi",
+                    "--session",
+                    "/custom/会話 with spaces.jsonl",
+                ])),
+                Some(PathBuf::from("/custom/会話 with spaces.jsonl"))
+            );
+            for arguments in [
+                vec!["pi"],
+                vec!["pi", "--session"],
+                vec!["pi", "--session="],
+                vec!["pi", "--session", "selected.jsonl"],
+                vec!["pi", "--session", "a-session-id"],
+                vec!["pi", "--session", "/custom/session.sqlite"],
+                vec!["pi", "--session", "/custom/../selected.jsonl"],
+                vec!["pi", "--session", "/a.jsonl", "--session=/b.jsonl"],
+                vec!["pi", "--no-session", "--session", "/a.jsonl"],
+                vec!["pi", "--session", "/a.jsonl", "--no-session"],
+                vec!["pi", "--", "--session", "/a.jsonl"],
+                vec!["pi", "review", "--session", "/a.jsonl"],
+                vec!["pi", "--session", "/a.jsonl", "review this"],
+                vec!["pi", "--session", "/a.jsonl", "--unknown-option"],
+                vec!["pi", "--system-prompt", "--session", "/a.jsonl"],
+                vec!["pi", "--system-prompt=--session /a.jsonl"],
+                vec!["pi --session /a.jsonl"],
+                vec![
+                    "node",
+                    "/pkg/@mariozechner/pi-coding-agent/dist/cli.js",
+                    "--session",
+                    "/a.jsonl",
+                ],
+                vec!["bash", "-c", "pi --session /a.jsonl"],
+            ] {
+                assert_eq!(
+                    native_pi_session_path(&raw_arguments(&arguments)),
+                    None,
+                    "{arguments:?}"
+                );
+            }
+            assert_eq!(native_pi_session_path(b"pi\0--session\0/a.jsonl"), None);
+        }
+
+        #[test]
+        fn explicit_pi_transcript_is_observed_without_open_descriptors() {
+            let cached_lookup = super::super::cached_session_lookup_available_for_test();
+            let fixture = Fixture::explicit_pi();
+            assert!(!fixture.root().join("task").exists());
+            let observed = fixture.observe(1800);
+            if cached_lookup {
+                assert!(observed.matches_record(&fixture.process), "{observed:?}");
+                assert_eq!(observed.recently_modified(), Some(true));
+                assert_eq!(observed.transcript_count, 1);
+            } else {
+                assert_cached_lookup_unavailable(&observed);
+            }
+            assert_eq!(
+                observed.source,
+                Some(AgentSessionActivitySource::ExplicitSessionArgument)
+            );
+            let encoded = serde_json::to_string(&observed).unwrap();
+            assert!(!encoded.contains(fixture.transcript.to_str().unwrap()));
+            assert!(!encoded.contains(SESSION));
+            fixture.modified(SystemTime::now() - Duration::from_secs(3600));
+            let stale = fixture.observe(1800);
+            if cached_lookup {
+                assert_eq!(stale.recently_modified(), Some(false));
+            } else {
+                assert_cached_lookup_unavailable(&stale);
+            }
+            fixture.modified(SystemTime::now() + Duration::from_secs(1));
+            assert_eq!(fixture.observe(1800).recently_modified(), None);
+            fixture.modified(fixture.context.boot_time);
+            assert_eq!(fixture.observe(1800).recently_modified(), None);
+            assert_eq!(fixture.observe(0).recently_modified(), None);
+        }
+
+        #[test]
+        fn explicit_pi_arguments_and_path_replacement_are_rechecked() {
+            let cached_lookup = super::super::cached_session_lookup_available_for_test();
+            let mut fixture = Fixture::explicit_pi();
+            let path = fixture.transcript.to_str().unwrap().to_string();
+            fixture.arguments(&[
+                "pi",
+                "--session",
+                &path,
+                "--system-prompt=hello --model example",
+            ]);
+            let changed = raw_arguments(&[
+                "pi",
+                "--session",
+                &path,
+                "--system-prompt=hello",
+                "--model",
+                "example",
+            ]);
+            // Both argv arrays are supported and flatten to the same text.
+            // Only byte-exact argv comparison detects the changed boundaries.
+            assert_eq!(
+                native_pi_session_path(&changed),
+                Some(fixture.transcript.clone())
+            );
+            let observed = collect_one_with(
+                &fixture.process,
+                1800,
+                &fixture.proc_root,
+                &fixture.context,
+                || fs::write(fixture.root().join("cmdline"), &changed).unwrap(),
+            );
+            assert_eq!(observed.recently_modified(), None);
+            if cached_lookup {
+                assert!(observed
+                    .unavailable
+                    .iter()
+                    .any(|reason| reason == "session_explicit_arguments_changed"));
+            } else {
+                assert_cached_lookup_unavailable(&observed);
+            }
+
+            let fixture = Fixture::explicit_pi();
+            let observed = collect_one_with(
+                &fixture.process,
+                1800,
+                &fixture.proc_root,
+                &fixture.context,
+                || {
+                    fs::rename(
+                        &fixture.transcript,
+                        fixture.transcript.with_extension("previous"),
+                    )
+                    .unwrap();
+                    fs::write(&fixture.transcript, b"{\"replacement\":true}\n").unwrap();
+                },
+            );
+            assert_eq!(observed.recently_modified(), None);
+            if cached_lookup {
+                assert!(observed
+                    .unavailable
+                    .iter()
+                    .any(|reason| reason == "session_explicit_transcript_replaced"));
+            } else {
+                assert_cached_lookup_unavailable(&observed);
+            }
+        }
+
+        #[test]
+        fn explicit_pi_symlinks_wrong_owner_and_unsafe_filesystems_stay_unknown() {
+            let mut fixture = Fixture::explicit_pi();
+            let link = fixture.transcript.with_file_name("linked.jsonl");
+            std::os::unix::fs::symlink(&fixture.transcript, &link).unwrap();
+            fixture.arguments(&["pi", "--session", link.to_str().unwrap()]);
+            assert_eq!(fixture.observe(1800).recently_modified(), None);
+            let path = fixture.transcript.to_str().unwrap().to_string();
+            fixture.arguments(&["pi", "--session", &path]);
+            fixture.process.uid = fixture.process.uid.wrapping_add(1);
+            fixture.write_identity(&fixture.root(), 4242);
+            assert_eq!(fixture.observe(1800).recently_modified(), None);
+
+            let mut fixture = Fixture::explicit_pi();
+            for allowed in fixture.context.filesystems.mounts.values_mut() {
+                *allowed = false;
+            }
+            assert_eq!(fixture.observe(1800).recently_modified(), None);
+        }
+
+        #[test]
+        fn explicit_pi_root_and_namespace_changes_stay_unknown() {
+            let cached_lookup = super::super::cached_session_lookup_available_for_test();
+            for change_namespace in [false, true] {
+                let fixture = Fixture::explicit_pi();
+                let observed = collect_one_with(
+                    &fixture.process,
+                    1800,
+                    &fixture.proc_root,
+                    &fixture.context,
+                    || {
+                        if change_namespace {
+                            fs::rename(
+                                fixture.root().join("ns/mnt"),
+                                fixture.root().join("ns/previous"),
+                            )
+                            .unwrap();
+                            std::os::unix::fs::symlink("mnt:[0]", fixture.root().join("ns/mnt"))
+                                .unwrap();
+                        } else {
+                            fs::rename(
+                                fixture.root().join("root"),
+                                fixture.root().join("previous_root"),
+                            )
+                            .unwrap();
+                            std::os::unix::fs::symlink(
+                                fixture.proc_root.parent().unwrap(),
+                                fixture.root().join("root"),
+                            )
+                            .unwrap();
+                        }
+                    },
+                );
+                assert_eq!(observed.recently_modified(), None, "{observed:?}");
+                assert!(!observed.identity_verified);
+                if !cached_lookup {
+                    assert_cached_lookup_unavailable(&observed);
+                }
             }
         }
 
