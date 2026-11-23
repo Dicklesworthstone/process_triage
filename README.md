@@ -232,6 +232,14 @@ Available tools:
 
 AI agents can use these to query process state, run scans, and make triage decisions without CLI parsing.
 
+`pt_scan` and `pt_plan` accept `probe_budget_ms` (default 3,000; range 0–60,000).
+Zero disables optional deep probes, including when `deep: true`. Deep collection
+uses the same cancellable worker as the CLI and retains completed observations
+after a timeout. `pt_scan` reports `deep_scan.collection` coverage instead of
+presenting a partial scan as complete. Retained records must still match the
+original process identity. This budget covers deep collection; it is not an
+overall scan deadline.
+
 For a resource goal, pass the same `goal` text the CLI accepts, such as `free 4GB RAM`, `free port 3000`, `free 100 FDs`, `free-disk 4GB on /data`, or `relieve`:
 
 ```json

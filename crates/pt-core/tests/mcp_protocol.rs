@@ -1382,6 +1382,10 @@ fn actual_mcp_plan_validates_scope_and_goal_before_loading_config() {
         (serde_json::json!({"min_score": 1.2}), "min_score"),
         (serde_json::json!({"deep": "true"}), "deep"),
         (
+            serde_json::json!({"probe_budget_ms": 60_001}),
+            "probe_budget_ms",
+        ),
+        (
             serde_json::json!({"since": session.0, "since_time": "2h"}),
             "mutually exclusive",
         ),
@@ -2111,7 +2115,11 @@ fn actual_mcp_deep_scan_preserves_live_snapshot_and_default_age_candidates() {
     let requests = [
         serde_json::json!({"window_ms": 0}),
         serde_json::json!({"deep": true, "window_ms": 0}),
+        serde_json::json!({"deep": true, "probe_budget_ms": 0, "window_ms": 0}),
         serde_json::json!({"deep": true, "min_age": u64::MAX, "window_ms": 0}),
+        // The same long-lived server must still handle requests after either
+        // disabled collection or a worker that exhausted its optional budget.
+        serde_json::json!({"window_ms": 0}),
     ]
     .into_iter()
     .enumerate()
@@ -2144,7 +2152,7 @@ fn actual_mcp_deep_scan_preserves_live_snapshot_and_default_age_candidates() {
         .lines()
         .map(|line| serde_json::from_str(line).expect("JSON-RPC response"))
         .collect();
-    assert_eq!(responses.len(), 3, "{responses:?}");
+    assert_eq!(responses.len(), 5, "{responses:?}");
     for (index, response) in responses.iter().enumerate() {
         assert_eq!(response["id"], index + 1);
         assert!(response["error"].is_null(), "{response}");
@@ -2158,7 +2166,7 @@ fn actual_mcp_deep_scan_preserves_live_snapshot_and_default_age_candidates() {
         let processes = result["processes"].as_array().expect("processes");
         assert_eq!(result["returned"], processes.len(), "{result}");
         assert_eq!(result["window_ms"], 0, "{result}");
-        if index == 2 {
+        if index == 3 {
             assert_eq!(result["min_age_seconds"], u64::MAX);
             assert!(processes.is_empty());
             assert_eq!(result["deep_scan"]["status"], "no_eligible_processes");
@@ -2182,9 +2190,24 @@ fn actual_mcp_deep_scan_preserves_live_snapshot_and_default_age_candidates() {
         assert_eq!(process["start_time_unix"], baseline.start_time_unix);
         assert_eq!(process["tty"].as_str(), baseline.tty.as_deref());
         assert!(process["protected"].is_null(), "{process}");
-        if index == 0 {
+        if matches!(index, 0 | 2 | 4) {
             assert!(process["deep_evidence"].is_null());
+            if index == 2 {
+                assert_eq!(result["deep_scan"]["status"], "disabled_by_budget");
+                assert_eq!(result["deep_scan"]["budget_ms"], 0);
+                assert_eq!(result["deep_scan"]["matched_processes"], 0);
+                assert!(result["deep_scan"]["requested_processes"].as_u64().unwrap() > 0);
+            } else {
+                assert_eq!(result["deep_scan"]["status"], "not_requested");
+            }
         } else {
+            assert_eq!(result["deep_scan"]["budget_ms"], 3_000);
+            assert_eq!(result["deep_scan"]["collection"]["budget_ms"], 3_000);
+            assert!(result["deep_scan"]["collection"]["complete"].is_boolean());
+            assert!(result["deep_scan"]["collection"]["timed_out"].is_boolean());
+            if result["deep_scan"]["collection"]["timed_out"] == true {
+                assert_eq!(result["deep_scan"]["status"], "timed_out");
+            }
             let deep = &process["deep_evidence"];
             assert_eq!(deep["start_id"], baseline.start_id.0);
             assert_eq!(deep["has_network_sockets"], true, "{deep}");

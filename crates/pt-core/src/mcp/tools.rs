@@ -5,7 +5,7 @@
 use crate::collect::protected::{ProtectedFilter, ProtectedMatch};
 use crate::collect::tool_runner::{ToolConfig, ToolOutput, ToolRunner, ToolSpec};
 #[cfg(target_os = "linux")]
-use crate::collect::{deep_scan, DeepScanOptions, DeepScanRecord};
+use crate::collect::{deep_scan_with_budget, DeepScanOptions, DeepScanRecord, DeepScanResult};
 use crate::collect::{quick_scan, ProcessActivity, ProcessRecord, QuickScanOptions, ScanResult};
 use crate::mcp::protocol::{ToolContent, ToolDefinition};
 use crate::scoring::{AgentActivityReport, ProcessScore, Scorer};
@@ -18,8 +18,33 @@ use std::time::Duration;
 
 const DEFAULT_ACTIVITY_WINDOW_MS: u64 = 500;
 const MAX_ACTIVITY_WINDOW_MS: u64 = 60_000;
+const DEFAULT_PROBE_BUDGET_MS: u64 = 3_000;
+const MAX_PROBE_BUDGET_MS: u64 = 60_000;
 const DEFAULT_PLAN_TIMEOUT_SECS: u64 = 120;
 const MAX_PLAN_TIMEOUT_SECS: u64 = 600;
+
+fn probe_budget(params: &serde_json::Value) -> Result<Duration, String> {
+    let millis = match params.get("probe_budget_ms") {
+        None => DEFAULT_PROBE_BUDGET_MS,
+        Some(value) => value
+            .as_u64()
+            .filter(|millis| *millis <= MAX_PROBE_BUDGET_MS)
+            .ok_or_else(|| {
+                format!("probe_budget_ms must be an integer between 0 and {MAX_PROBE_BUDGET_MS}")
+            })?,
+    };
+    Ok(Duration::from_millis(millis))
+}
+
+fn probe_budget_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "integer",
+        "description": "Total deep-probe collection budget in milliseconds, including worker startup and output. Partial evidence and coverage are retained on timeout; 0 disables deep probes. This is not an overall scan deadline",
+        "default": DEFAULT_PROBE_BUDGET_MS,
+        "minimum": 0,
+        "maximum": MAX_PROBE_BUDGET_MS,
+    })
+}
 
 fn plan_timeout(params: &serde_json::Value) -> Result<Duration, String> {
     let seconds = match params.get("timeout_secs") {
@@ -163,65 +188,29 @@ impl Evaluator {
         output
     }
 
-    fn collect_deep_evidence(&mut self, scan: &ScanResult) -> serde_json::Value {
+    fn collect_deep_evidence(&mut self, scan: &ScanResult, budget: Duration) -> serde_json::Value {
         #[cfg(target_os = "linux")]
         {
-            self.deep_records.clear();
-            let eligible = self.eligible_processes(scan);
-            // An empty PID selection means "all processes" to deep_scan.
-            if eligible.is_empty() {
-                return serde_json::json!({
-                    "requested": true,
-                    "status": "no_eligible_processes",
-                    "requested_processes": 0,
-                    "matched_processes": 0,
-                    "duration_ms": 0,
-                });
-            }
-            let options = DeepScanOptions {
-                pids: eligible.iter().map(|process| process.pid.0).collect(),
-                ..Default::default()
-            };
-            let result = match deep_scan(&options) {
-                Ok(result) => result,
-                Err(error) => {
-                    return serde_json::json!({
-                        "requested": true,
-                        "status": "unavailable",
-                        "requested_processes": eligible.len(),
-                        "matched_processes": 0,
-                        "error": error.to_string(),
-                    });
-                }
-            };
-            let (mut records, identity_mismatches) =
-                match_deep_records(&eligible, result.processes);
-            // The deep collector reads stat before its optional probes. Recheck
-            // after those reads so PID reuse during collection cannot attach a
-            // replacement process's socket or I/O facts to the original row.
             use crate::action::{IdentityProvider, LiveIdentityProvider};
-            let identity_provider = LiveIdentityProvider::new();
-            let joined_count = records.len();
-            records.retain(|_, record| {
-                matches!(
-                    identity_provider.revalidate(&record.to_identity()),
-                    Ok(true)
-                )
-            });
-            let identity_revalidation_failed = joined_count - records.len();
-            self.deep_records = records;
-            serde_json::json!({
-                "requested": true,
-                "status": if self.deep_records.len() == eligible.len() { "collected" } else { "partial" },
-                "requested_processes": eligible.len(),
-                "matched_processes": self.deep_records.len(),
-                "identity_mismatches": identity_mismatches,
-                "identity_revalidation_failed": identity_revalidation_failed,
-                "skipped_processes": result.metadata.skipped_count,
-                "started_at": result.metadata.started_at,
-                "duration_ms": result.metadata.duration_ms,
-                "warnings": result.metadata.warnings,
-            })
+            let identity_provider = std::sync::OnceLock::new();
+            self.collect_deep_evidence_with(
+                scan,
+                budget,
+                |options, budget| {
+                    let executable = std::env::current_exe()
+                        .map_err(|error| format!("cannot locate deep-scan worker: {error}"))?;
+                    deep_scan_with_budget(options, budget, &executable)
+                        .map_err(|error| error.to_string())
+                },
+                |identity| {
+                    matches!(
+                        identity_provider
+                            .get_or_init(LiveIdentityProvider::new)
+                            .revalidate(identity),
+                        Ok(true)
+                    )
+                },
+            )
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -229,10 +218,77 @@ impl Evaluator {
             serde_json::json!({
                 "requested": true,
                 "status": "unsupported",
+                "budget_ms": budget.as_millis(),
                 "matched_processes": 0,
                 "reason": "Deep probes are only available on Linux; quick-scan evidence is retained",
             })
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn collect_deep_evidence_with(
+        &mut self,
+        scan: &ScanResult,
+        budget: Duration,
+        collect: impl FnOnce(&DeepScanOptions, Duration) -> Result<DeepScanResult, String>,
+        revalidate: impl Fn(&pt_common::ProcessIdentity) -> bool,
+    ) -> serde_json::Value {
+        self.deep_records.clear();
+        let eligible = self.eligible_processes(scan);
+        // The collector interprets an empty PID list as "scan all". Neither an
+        // empty eligible set nor an explicit zero budget may start a worker.
+        if eligible.is_empty() || budget.is_zero() {
+            return serde_json::json!({
+                "requested": true,
+                "status": if eligible.is_empty() { "no_eligible_processes" } else { "disabled_by_budget" },
+                "budget_ms": budget.as_millis(),
+                "requested_processes": eligible.len(),
+                "matched_processes": 0,
+                "duration_ms": 0,
+            });
+        }
+        let options = DeepScanOptions {
+            pids: eligible.iter().map(|process| process.pid.0).collect(),
+            // Losing one target must not discard independent completed probes.
+            skip_inaccessible: true,
+            ..Default::default()
+        };
+        let result = match collect(&options, budget) {
+            Ok(result) => result,
+            Err(error) => {
+                return serde_json::json!({
+                    "requested": true,
+                    "status": "unavailable",
+                    "budget_ms": budget.as_millis(),
+                    "requested_processes": eligible.len(),
+                    "matched_processes": 0,
+                    "error": error,
+                });
+            }
+        };
+        let (mut records, identity_mismatches) = match_deep_records(&eligible, result.processes);
+        // Partial worker output is useful only for the original incarnation.
+        // Recheck after all optional reads, including on timeout, so a new PID
+        // occupant never inherits a predecessor's network or I/O evidence.
+        let joined_count = records.len();
+        records.retain(|_, record| revalidate(&record.to_identity()));
+        let identity_revalidation_failed = joined_count - records.len();
+        let complete = result.metadata.collection.complete && records.len() == eligible.len();
+        self.deep_records = records;
+        serde_json::json!({
+            "requested": true,
+            "status": if result.metadata.collection.timed_out { "timed_out" } else if complete { "collected" } else { "partial" },
+            "budget_ms": budget.as_millis(),
+            "requested_processes": eligible.len(),
+            "matched_processes": self.deep_records.len(),
+            "identity_mismatches": identity_mismatches,
+            "identity_revalidation_failed": identity_revalidation_failed,
+            "skipped_processes": result.metadata.skipped_count,
+            "started_at": result.metadata.started_at,
+            "duration_ms": result.metadata.duration_ms,
+            "collection": result.metadata.collection,
+            "warnings": result.metadata.warnings,
+        })
     }
 
     fn evidence(&self, process: &ProcessRecord) -> crate::inference::Evidence {
@@ -387,6 +443,7 @@ fn plan_command_args(params: &serde_json::Value) -> Result<Vec<String>, String> 
         .as_object()
         .ok_or_else(|| "pt_plan arguments must be an object".to_string())?;
     let window_ms = activity_window_ms(params)?;
+    probe_budget(params)?;
     plan_timeout(params)?;
     for key in object.keys() {
         if !matches!(
@@ -395,6 +452,7 @@ fn plan_command_args(params: &serde_json::Value) -> Result<Vec<String>, String> 
                 | "min_score"
                 | "min_age"
                 | "window_ms"
+                | "probe_budget_ms"
                 | "timeout_secs"
                 | "goal"
                 | "pids"
@@ -421,6 +479,10 @@ fn plan_command_args(params: &serde_json::Value) -> Result<Vec<String>, String> 
     ];
     if crate::mcp::robot_mode() {
         args.push("--robot".to_string());
+    }
+    if object.contains_key("probe_budget_ms") {
+        args.push("--probe-budget-ms".to_string());
+        args.push(probe_budget(params)?.as_millis().to_string());
     }
     for (parameter, flag) in [
         ("deep", "--deep"),
@@ -620,7 +682,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {
                     "deep": {
                         "type": "boolean",
-                        "description": "Add Linux /proc probes for eligible unprotected processes, preserving quick-scan identity, age, CPU and TTY; reports missing evidence explicitly",
+                        "description": "Add bounded Linux /proc probes for eligible unprotected processes, preserving quick-scan identity, age, CPU and TTY; returns partial coverage explicitly when the probe budget expires",
                         "default": false
                     },
                     "min_score": {
@@ -635,7 +697,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "description": "Minimum process age in seconds (default: policy guardrail, 1 hour, as for pt_plan; 0 returns every process)",
                         "minimum": 0
                     },
-                    "window_ms": activity_window_schema()
+                    "window_ms": activity_window_schema(),
+                    "probe_budget_ms": probe_budget_schema()
                 },
                 "required": [],
                 "additionalProperties": false
@@ -706,6 +769,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "maximum": u64::MAX
                     },
                     "window_ms": activity_window_schema(),
+                    "probe_budget_ms": probe_budget_schema(),
                     "timeout_secs": {
                         "type": "integer",
                         "minimum": 1,
@@ -877,27 +941,50 @@ pub fn call_tool(name: &str, params: &serde_json::Value) -> Result<Vec<ToolConte
 }
 
 fn tool_scan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
+    let object = params
+        .as_object()
+        .ok_or("pt_scan arguments must be an object")?;
     let window_ms = activity_window_ms(params)?;
-    let deep = params
-        .get("deep")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let min_score = params
-        .get("min_score")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
+    let budget = probe_budget(params)?;
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "deep" | "min_score" | "min_age" | "window_ms" | "probe_budget_ms"
+        ) {
+            return Err(format!("unknown pt_scan argument: {key}"));
+        }
+    }
+    let deep = match params.get("deep") {
+        None => false,
+        Some(value) => value.as_bool().ok_or("deep must be a boolean")?,
+    };
+    let min_score = match params.get("min_score") {
+        None => 0.0,
+        Some(value) => value
+            .as_f64()
+            .filter(|score| score.is_finite() && (0.0..=1.0).contains(score))
+            .ok_or("min_score must be a number between 0 and 1")?,
+    };
+    let min_age = params
+        .get("min_age")
+        .map(|value| {
+            value
+                .as_u64()
+                .ok_or("min_age must be a nonnegative integer")
+        })
+        .transpose()?;
     let mut evaluator = Evaluator::load()?;
     let scan_started = std::time::Instant::now();
     let scan_result = quick_scan(&QuickScanOptions::default())
         .map_err(|error| format!("Scan failed: {error}"))?;
     // `agent plan`'s age floor: a process younger than this is never a candidate, so
     // scoring it would only invite acting on a busy new process.
-    if let Some(min_age) = params.get("min_age").and_then(|v| v.as_u64()) {
+    if let Some(min_age) = min_age {
         evaluator.min_age_seconds = min_age;
     }
     evaluator.collect_provenance(&scan_result, &[]);
     let deep_scan = if deep {
-        evaluator.collect_deep_evidence(&scan_result)
+        evaluator.collect_deep_evidence(&scan_result, budget)
     } else {
         serde_json::json!({"requested": false, "status": "not_requested"})
     };
@@ -1845,13 +1932,175 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn deep_test_result(records: Vec<DeepScanRecord>) -> DeepScanResult {
+        let count = records.len();
+        DeepScanResult {
+            processes: records,
+            metadata: crate::collect::DeepScanMetadata {
+                started_at: "2026-11-23T12:00:00Z".to_string(),
+                duration_ms: 20,
+                process_count: count,
+                skipped_count: 0,
+                collection: crate::collect::DeepScanCollection {
+                    complete: true,
+                    budget_ms: Some(20),
+                    requested_count: Some(count),
+                    processed_count: count,
+                    incomplete_count: Some(0),
+                    enriched_count: count,
+                    stage: crate::collect::DeepScanStage::Complete,
+                    ..Default::default()
+                },
+                warnings: Vec::new(),
+            },
+            gpu: Default::default(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn timed_out_deep_scan_retains_only_identity_bound_partial_evidence() {
+        let mut scan = protection_test_scan();
+        scan.processes.truncate(4);
+        let filter = ProtectedFilter::new(&[], &[], &[], &[]).unwrap();
+        let mut evaluator = protection_test_evaluator(filter);
+        evaluator.min_age_seconds = 0;
+        let retained = &scan.processes[0];
+        let mut changed_owner = deep_test_record(&scan.processes[1]);
+        changed_owner.uid += 1;
+        let changed_after_probe = deep_test_record(&scan.processes[2]);
+        let mut result = deep_test_result(vec![
+            deep_test_record(retained),
+            changed_owner,
+            changed_after_probe,
+        ]);
+        result.metadata.collection.complete = false;
+        result.metadata.collection.timed_out = true;
+        result.metadata.collection.requested_count = Some(4);
+        result.metadata.collection.incomplete_count = Some(1);
+        result.metadata.collection.enriched_count = 0;
+        result.metadata.collection.stage = crate::collect::DeepScanStage::Processes;
+        result
+            .metadata
+            .warnings
+            .push("probe deadline reached".into());
+        let metadata = evaluator.collect_deep_evidence_with(
+            &scan,
+            Duration::from_millis(20),
+            |options, budget| {
+                assert_eq!(budget, Duration::from_millis(20));
+                assert_eq!(
+                    options.pids,
+                    scan.processes
+                        .iter()
+                        .map(|process| process.pid.0)
+                        .collect::<Vec<_>>()
+                );
+                assert!(options.skip_inaccessible);
+                assert!(!options.include_environ);
+                Ok(result)
+            },
+            |identity| identity.pid == retained.pid,
+        );
+        assert_eq!(metadata["status"], "timed_out");
+        assert_eq!(metadata["budget_ms"], 20);
+        assert_eq!(metadata["requested_processes"], 4);
+        assert_eq!(metadata["matched_processes"], 1);
+        assert_eq!(metadata["identity_mismatches"], 1);
+        assert_eq!(metadata["identity_revalidation_failed"], 1);
+        assert_eq!(metadata["collection"]["complete"], false);
+        assert_eq!(metadata["collection"]["processed_count"], 3);
+        assert_eq!(metadata["collection"]["incomplete_count"], 1);
+        assert_eq!(metadata["warnings"][0], "probe deadline reached");
+        assert_eq!(evaluator.evidence(retained).net, Some(true));
+        for process in &scan.processes[1..] {
+            assert!(evaluator.deep_evidence(process).is_null());
+            assert_eq!(evaluator.evidence(process).net, None);
+        }
+
+        let unavailable = evaluator.collect_deep_evidence_with(
+            &scan,
+            Duration::from_millis(20),
+            |_, _| Err("worker could not start".into()),
+            |_| panic!("failed collection must not revalidate stale records"),
+        );
+        assert_eq!(unavailable["status"], "unavailable");
+        assert_eq!(unavailable["error"], "worker could not start");
+        assert!(evaluator.deep_records.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deep_scan_coverage_does_not_confuse_all_records_with_completed_enrichment() {
+        let mut scan = protection_test_scan();
+        scan.processes.truncate(1);
+        let filter = ProtectedFilter::new(&[], &[], &[], &[]).unwrap();
+        let mut evaluator = protection_test_evaluator(filter);
+        evaluator.min_age_seconds = 0;
+        for (complete, truncated, expected) in [
+            (true, false, "collected"),
+            (false, false, "partial"),
+            (false, true, "partial"),
+        ] {
+            let mut result = deep_test_result(vec![deep_test_record(&scan.processes[0])]);
+            result.metadata.collection.complete = complete;
+            result.metadata.collection.output_truncated = truncated;
+            if !complete {
+                result.metadata.collection.stage = crate::collect::DeepScanStage::Gpu;
+                result.metadata.collection.enriched_count = 0;
+            }
+            let metadata = evaluator.collect_deep_evidence_with(
+                &scan,
+                Duration::from_millis(20),
+                |_, _| Ok(result),
+                |_| true,
+            );
+            assert_eq!(metadata["status"], expected);
+            assert_eq!(metadata["matched_processes"], 1);
+            assert_eq!(metadata["collection"]["complete"], complete);
+            assert_eq!(metadata["collection"]["output_truncated"], truncated);
+            assert_eq!(metadata["collection"]["incomplete_count"], 0);
+            assert_eq!(evaluator.evidence(&scan.processes[0]).net, Some(true));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn zero_deep_budget_skips_worker_and_clears_previous_probe_evidence() {
+        let scan = protection_test_scan();
+        let filter = ProtectedFilter::new(&[], &[], &[], &[]).unwrap();
+        let mut evaluator = protection_test_evaluator(filter);
+        evaluator.min_age_seconds = 0;
+        evaluator.deep_records.insert(
+            scan.processes[0].pid.0,
+            deep_test_record(&scan.processes[0]),
+        );
+        let metadata = evaluator.collect_deep_evidence_with(
+            &scan,
+            Duration::ZERO,
+            |_, _| panic!("disabled probes must never resolve or start a worker"),
+            |_| panic!("disabled probes must never revalidate stale records"),
+        );
+        assert_eq!(metadata["status"], "disabled_by_budget");
+        assert_eq!(metadata["budget_ms"], 0);
+        assert_eq!(metadata["requested_processes"], scan.processes.len());
+        assert_eq!(metadata["matched_processes"], 0);
+        assert!(evaluator.deep_records.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn deep_scan_does_not_expand_an_empty_eligible_set_into_all_pids() {
         let scan = protection_test_scan();
         let filter = ProtectedFilter::new(&[], &[], &[], &[]).unwrap();
         let mut evaluator = protection_test_evaluator(filter);
         evaluator.collect_provenance(&scan, &[]);
-        let metadata = evaluator.collect_deep_evidence(&scan);
+        let metadata = evaluator.collect_deep_evidence_with(
+            &scan,
+            Duration::from_millis(DEFAULT_PROBE_BUDGET_MS),
+            |_, _| panic!("an empty eligible set must never invoke an all-PID scan"),
+            |_| panic!("no records to revalidate"),
+        );
         assert_eq!(metadata["status"], "no_eligible_processes");
         assert_eq!(metadata["requested_processes"], 0);
         assert_eq!(metadata["matched_processes"], 0);
@@ -1971,6 +2220,82 @@ mod tests {
         assert!(!result.is_empty());
         let parsed: serde_json::Value = serde_json::from_str(&result[0].text).unwrap();
         assert!(parsed.get("sessions").is_some());
+    }
+
+    #[test]
+    fn scan_rejects_invalid_probe_requests_before_collection() {
+        for (arguments, expected) in [
+            (serde_json::json!([]), "object"),
+            (serde_json::json!({"unknown": 1}), "unknown"),
+            (serde_json::json!({"deep": "true"}), "deep"),
+            (serde_json::json!({"min_score": -0.1}), "min_score"),
+            (serde_json::json!({"min_score": 1.1}), "min_score"),
+            (serde_json::json!({"min_score": "0.5"}), "min_score"),
+            (serde_json::json!({"min_age": -1}), "min_age"),
+            (serde_json::json!({"min_age": 1.5}), "min_age"),
+            (
+                serde_json::json!({"probe_budget_ms": -1}),
+                "probe_budget_ms",
+            ),
+            (
+                serde_json::json!({"probe_budget_ms": 1.5}),
+                "probe_budget_ms",
+            ),
+            (
+                serde_json::json!({"probe_budget_ms": "3"}),
+                "probe_budget_ms",
+            ),
+            (
+                serde_json::json!({"probe_budget_ms": 60_001}),
+                "probe_budget_ms",
+            ),
+        ] {
+            let error = tool_scan(&arguments).unwrap_err();
+            assert!(error.contains(expected), "{arguments}: {error}");
+        }
+    }
+
+    #[test]
+    fn scan_and_plan_share_bounded_probe_options() {
+        assert_eq!(
+            probe_budget(&serde_json::json!({})).unwrap(),
+            Duration::from_secs(3)
+        );
+        for millis in [0, 1, DEFAULT_PROBE_BUDGET_MS, MAX_PROBE_BUDGET_MS] {
+            let arguments = serde_json::json!({"deep": true, "probe_budget_ms": millis});
+            assert_eq!(
+                probe_budget(&arguments).unwrap(),
+                Duration::from_millis(millis)
+            );
+            let command = plan_command_args(&arguments).unwrap();
+            let flag = command
+                .iter()
+                .position(|part| part == "--probe-budget-ms")
+                .unwrap();
+            assert_eq!(command[flag + 1], millis.to_string());
+            assert!(command.iter().any(|part| part == "--deep"));
+        }
+        for invalid in [
+            serde_json::json!(null),
+            serde_json::json!(-1),
+            serde_json::json!(60_001),
+            serde_json::json!(0.5),
+            serde_json::json!("0"),
+        ] {
+            let arguments = serde_json::json!({"probe_budget_ms": invalid});
+            assert!(probe_budget(&arguments).is_err());
+            assert!(plan_command_args(&arguments).is_err());
+        }
+        for name in ["pt_scan", "pt_plan"] {
+            let definition = tool_definitions()
+                .into_iter()
+                .find(|tool| tool.name == name)
+                .unwrap();
+            assert_eq!(
+                definition.input_schema["properties"]["probe_budget_ms"],
+                probe_budget_schema()
+            );
+        }
     }
 
     #[test]
