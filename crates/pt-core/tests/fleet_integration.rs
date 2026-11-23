@@ -1221,7 +1221,7 @@ fn fdr_method_is_eby_only_with_real_evalues() {
     let session = create_fleet_session("fdr-method", None, &inputs, 0.05);
     assert_eq!(
         session.safety_budget.pooled_fdr.method,
-        "bayes_expected_fdr"
+        "subset_safe_bayes_expected_fdr"
     );
 
     let inputs = vec![host_input(

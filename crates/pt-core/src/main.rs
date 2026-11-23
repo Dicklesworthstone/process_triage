@@ -15003,9 +15003,12 @@ fn run_agent_fleet_apply(global: &GlobalOpts, args: &AgentFleetApplyArgs) -> Exi
             "completion_without_receipt": "unknown",
             "limits": config,
             "fdr_approval": {
-                "scope": "complete_planned_kill_set",
+                "method": "subset_safe_bayes_expected_fdr",
+                "scope": "any_subset_of_approved_direct_kill_targets",
                 "max_fdr": fleet.safety_budget.max_fdr,
-                "applies_to_partial_or_unknown_execution": false,
+                "applies_to_partial_or_unknown_execution": true,
+                "model_based": true,
+                "limitation": "Bound on recorded posterior risk, not a frequentist guarantee or confirmation of which remote actions completed.",
             },
             "hosts": prepared,
         });
@@ -15104,12 +15107,15 @@ fn run_agent_fleet_apply(global: &GlobalOpts, args: &AgentFleetApplyArgs) -> Exi
         "persistence_error": report.persistence_error,
         "safety_budget": fleet.safety_budget,
         "fdr_approval": {
-            "scope": "complete_planned_kill_set",
+            "method": "subset_safe_bayes_expected_fdr",
+            "scope": "any_subset_of_approved_direct_kill_targets",
             "max_fdr": fleet.safety_budget.max_fdr,
-            "applies_to_partial_or_unknown_execution": false,
+            "applies_to_partial_or_unknown_execution": true,
+            "model_based": true,
+            "limitation": "Bound on recorded posterior risk, not a frequentist guarantee or confirmation of which remote actions completed.",
         },
         "note": if executing {
-            "Remote outcomes are reported only from bound receipts. Missing or timed-out responses have unknown completion; inspect the remote session before retrying. Pooled expected-FDR approval covers the complete planned kill set; it does not establish that bound for a partial or unknown executed subset."
+            "Remote outcomes are reported only from bound receipts. Missing or timed-out responses have unknown completion; inspect the remote session before retrying. Every approved target independently meets the fleet posterior-risk limit, so any execution subset retains that recorded model-based ceiling; actual false discoveries are not measured by this estimate."
         } else {
             "Local preview only; no SSH command was started. Use --confirm to apply this exact selection."
         },

@@ -335,19 +335,33 @@ carry real e-values.
 ### 5.2b Bayesian expected FDR (fleet plans from posteriors)
 
 Fleet plans pool each host's kill recommendations, which carry posteriors
-`p_i = P(abandoned or zombie | x_i)`, not e-values. They are selected by Bayesian
-FDR: sort by `p_i` descending and take the largest `k` with
+`p_i = P(abandoned or zombie | x_i)`, not e-values. A target is approved only if
+its individual recorded null probability fits the fleet ceiling:
 
 ```
-(1/k) * sum_{i<=k} (1 - p_i) <= alpha
+q_i = 1 - p_i
+S = { i : q_i <= alpha }
+For every nonempty T contained in S: (1/|T|) * sum_{i in T} q_i <= alpha
 ```
 
-**Guarantee (model-based):** the left side is the posterior expected false
-discovery proportion of the selected set, `E[FDP | x] <= alpha`. If the posteriors
-are calibrated, `E[FDP] <= alpha`. This is a statement about the model, not a
-frequentist guarantee: pt's posterior is not yet calibrated against labeled
-outcomes, so neither is this bound. Implementation: `select_bayes_expected_fdr`
-in `session/fleet.rs`, checked by simulation with truth drawn from the posteriors.
+**Bound on recorded model risk:** averaging numbers individually bounded by
+`alpha` preserves that bound. For the fixed planned set this is the model's
+posterior expected FDP. The numerical ceiling also holds after a failed host,
+partial response, cancellation, or resume leaves a subset. A largest mean-risk
+prefix lacks this property: risks `.001` and `.099` average to `.05`, but executing
+only the latter does not retain that ceiling.
+
+Apply rechecks normalized class posteriors on the exact executable actions before
+dispatch, independently of remote FDR configuration, and requires candidate and
+action evidence to agree. Invalid probabilities or ambiguous targets are refused.
+Implementation: `select_bayes_expected_fdr` in `session/fleet.rs` and
+`request_from_document` in `fleet/apply.rs`, with subset, evidence-integrity and
+transport-failure regressions plus simulation under model-generated truth.
+
+This does not establish calibration, a frequentist/anytime-valid guarantee, or
+which actions completed. Runtime outcomes can carry additional information not
+represented in the original posterior; the subset statement bounds the original
+recorded estimates, not a newly conditioned or observed false-discovery rate.
 
 ### 5.3 p-value Derivation
 

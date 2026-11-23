@@ -130,6 +130,7 @@ fn request_from_document(
     host: &str,
     document: &Value,
     selected_pids: &[u32],
+    max_fdr: f64,
 ) -> Result<HostApplyRequest, String> {
     if document["command"].as_str() != Some("agent plan") {
         return Err("remote document is not a saved agent plan".into());
@@ -154,6 +155,7 @@ fn request_from_document(
         .as_array()
         .ok_or("remote candidate evidence is unavailable")?;
     let mut targets = Vec::new();
+    let mut posteriors = HashMap::new();
     for &pid in selected_pids {
         let matching: Vec<_> = candidates
             .iter()
@@ -196,6 +198,11 @@ fn request_from_document(
                 "approved PID {pid} has inconsistent or unusable identity evidence"
             ));
         }
+        let posterior: crate::inference::ClassScores =
+            serde_json::from_value(candidate["posterior"].clone()).map_err(|_| {
+                format!("approved PID {pid} has no complete recorded class posterior")
+            })?;
+        posteriors.insert(pid, posterior);
         targets.push(target);
     }
     let mut actions = Vec::new();
@@ -220,6 +227,12 @@ fn request_from_document(
                 target.pid.0
             ));
         }
+        if kills[0].rationale.posterior != posteriors.get(&target.pid.0).copied() {
+            return Err(format!(
+                "approved PID {} candidate and executable action disagree on posterior evidence",
+                target.pid.0
+            ));
+        }
         let kill_stage = kills[0].stage;
         for action in matching {
             if action.target != *target
@@ -239,6 +252,23 @@ fn request_from_document(
         }
     }
     actions.sort_by_key(|action| action.order);
+    // Independently enforce the coordinator's budget on the exact actions, even
+    // when a remote host disabled its local FDR policy. Evaluate a clone so the
+    // approved document and its hash remain unchanged. This also rejects legacy
+    // or malformed actions whose class evidence was omitted from the plan.
+    let mut selected_plan = plan.clone();
+    selected_plan.actions = actions.clone();
+    let mut risk_policy = crate::config::Policy::default();
+    risk_policy.fdr_control.enabled = true;
+    risk_policy.fdr_control.method = crate::config::policy::FdrMethod::Bayesian;
+    risk_policy.fdr_control.alpha = max_fdr;
+    let risk = crate::decision::apply_plan_fdr_gate(&mut selected_plan, &risk_policy);
+    if let Some(decision) = risk.decisions.iter().find(|decision| !decision.selected) {
+        return Err(format!(
+            "fleet posterior-risk limit refused PID {}: {}",
+            decision.target.pid.0, decision.reason
+        ));
+    }
     Ok(HostApplyRequest {
         host: host.to_string(),
         binding,
@@ -264,7 +294,12 @@ pub fn bind_fleet_execution(
                 .and_then(|result| result.plan.as_ref())
                 .and_then(|plan| plan.document.clone());
             let prepared = document.as_ref().map(|document| {
-                request_from_document(&host.host_id, document, &host.selected_kill_pids)
+                request_from_document(
+                    &host.host_id,
+                    document,
+                    &host.selected_kill_pids,
+                    fleet.safety_budget.max_fdr,
+                )
             });
             let request = prepared.as_ref().and_then(|result| result.as_ref().ok());
             FleetHostBinding {
@@ -387,7 +422,12 @@ pub fn prepare_fleet_apply(fleet: &FleetSession) -> Result<Vec<PreparedHostApply
             ));
         }
         let request = binding.document.as_ref().map(|document| {
-            request_from_document(&host.host_id, document, &host.selected_kill_pids)
+            request_from_document(
+                &host.host_id,
+                document,
+                &host.selected_kill_pids,
+                fleet.safety_budget.max_fdr,
+            )
         });
         match request {
             Some(Ok(request)) => {
@@ -414,7 +454,7 @@ pub fn prepare_fleet_apply(fleet: &FleetSession) -> Result<Vec<PreparedHostApply
             }
             Some(Err(error)) if !host.selected_kill_pids.is_empty() => {
                 return Err(format!(
-                    "{} cannot execute its pooled-approved selection: {error}; refusing the whole fleet because excluding it would change the approved FDR set",
+                    "{} cannot execute its pooled-approved selection: {error}; refusing the whole fleet because an approved execution request is invalid",
                     host.host_id
                 ));
             }
@@ -733,10 +773,11 @@ where
     R: FnMut(&HostApplyResult) -> Result<(), String>,
 {
     let execute = config.confirmed && !config.dry_run;
-    // Pooled approval covers the complete selected set. A known local exclusion
-    // can remove its most confident contributors and invalidate the remaining
-    // set's expected FDR. Refuse every dispatch before starting any worker;
-    // --continue-on-error cannot turn a known exclusion into partial approval.
+    // Validate the complete approved operation before starting any worker.
+    // Every approved target independently fits the posterior-risk ceiling, but
+    // a known invalid request or cap violation still requires review rather
+    // than silently changing what the user approved. Runtime failures retain
+    // the existing stop/continue policy and never cause automatic retries.
     let preflight_refusal = prepared.iter().find_map(|host| {
         let local_error = if let Some(error) = &host.error {
             Some(error.clone())
@@ -748,10 +789,10 @@ where
             }
         };
         local_error.map(|error| {
-                format!(
-                    "{}: {error}; no hosts started because a local refusal could change the approved FDR set",
-                    host.host
-                )
+            format!(
+                "{}: {error}; no hosts started because an approved execution request is invalid",
+                host.host
+            )
         })
     });
     let mut report = FleetApplyReport {
@@ -888,7 +929,12 @@ mod tests {
                 "stage": 0,
                 "timeouts": ActionTimeouts::default(),
                 "pre_checks": [],
-                "rationale": {},
+                "rationale": {"posterior": {
+                    "useful": 1.0 - probability,
+                    "useful_bad": 0.0,
+                    "abandoned": probability,
+                    "zombie": 0.0,
+                }},
                 "on_success": [],
                 "on_failure": [],
                 "blocked": false,
@@ -1029,6 +1075,79 @@ mod tests {
         assert!(prepare_fleet_apply(&legacy)
             .unwrap_err()
             .contains("summaries only"));
+    }
+
+    #[test]
+    fn fleet_risk_refusals_survive_transport_failure_and_disabled_remote_policy() {
+        let mut low = remote_document("low", &[(101, 0.999)]);
+        let mut high = remote_document("high", &[(201, 0.901)]);
+        let mut other = remote_document("other", &[(301, 0.96)]);
+        for document in [&mut low, &mut high, &mut other] {
+            document["policy_snapshot"]["fdr_control"] =
+                serde_json::json!({"enabled": false, "method": "none", "alpha": 1.0});
+        }
+        let fleet = retained_fleet(vec![("low", low), ("high", high), ("other", other)]);
+        assert!(fleet.hosts[1].selected_kill_pids.is_empty());
+        let before = serde_json::to_value(&fleet).unwrap();
+        let prepared = prepare_fleet_apply(&fleet).unwrap();
+        let attempted = Mutex::new(Vec::new());
+        let options = FleetApplyConfig {
+            continue_on_error: true,
+            ..config()
+        };
+        let report = execute_fleet_apply_with(
+            &prepared,
+            &fleet.execution.as_ref().unwrap().transport,
+            &options,
+            |request, _, _| {
+                attempted
+                    .lock()
+                    .unwrap()
+                    .extend(request.targets.iter().map(|target| target.pid.0));
+                if request.host == "low" {
+                    Err("connection lost after dispatch".into())
+                } else {
+                    Ok(result_output(request, "success", 2))
+                }
+            },
+            |_| Ok(()),
+        );
+        assert_eq!(*attempted.lock().unwrap(), [101, 301]);
+        assert_eq!(report.hosts[0].status, HostApplyStatus::Unknown);
+        assert_eq!(report.hosts[1].status, HostApplyStatus::NoActions);
+        assert_eq!(report.hosts[2].status, HostApplyStatus::Applied);
+        assert_eq!(serde_json::to_value(&fleet).unwrap(), before);
+
+        // A saved selection made by the older mean-risk rule is re-evaluated,
+        // not grandfathered into execution after upgrading the coordinator.
+        let mut legacy_selection = fleet;
+        legacy_selection.hosts[1].selected_kill_pids = vec![201];
+        legacy_selection.safety_budget.pooled_fdr.method = "bayes_expected_fdr".into();
+        assert!(prepare_fleet_apply(&legacy_selection)
+            .unwrap_err()
+            .contains("pooled-approved selection changed"));
+    }
+
+    #[test]
+    fn fleet_execution_requires_matching_normalized_action_posteriors() {
+        for variant in ["missing", "conflicting", "unnormalized"] {
+            let mut document = remote_document("alpha", &[(101, 0.999)]);
+            match variant {
+                "missing" => document["actions"][0]["rationale"]["posterior"] = Value::Null,
+                "conflicting" => {
+                    document["actions"][0]["rationale"]["posterior"] = serde_json::json!({
+                        "useful": 0.04, "useful_bad": 0.0, "abandoned": 0.96, "zombie": 0.0,
+                    });
+                }
+                _ => {
+                    document["candidates"][0]["posterior"]["useful"] = serde_json::json!(0.9);
+                    document["actions"][0]["rationale"]["posterior"] =
+                        document["candidates"][0]["posterior"].clone();
+                }
+            }
+            let fleet = retained_fleet(vec![("alpha", document)]);
+            assert!(prepare_fleet_apply(&fleet).is_err(), "{variant}");
+        }
     }
 
     #[test]
@@ -1189,9 +1308,9 @@ mod tests {
     }
 
     #[test]
-    fn known_host_exclusion_never_dispatches_an_unsafe_pooled_subset() {
-        // All three pass pooled alpha=.002: (.005 + .0001 + .0001) / 3.
-        // Omitting beta's two targets leaves alpha alone at .005, above budget.
+    fn known_host_refusals_are_checked_before_any_dispatch() {
+        // Alpha's target is independently too risky. Beta's two safe targets
+        // still exceed the explicit per-host cap, so no dispatch may begin.
         let fleet = retained_fleet_with_budget(
             vec![
                 ("alpha", remote_document("alpha", &[(101, 0.995)])),
@@ -1202,7 +1321,8 @@ mod tests {
             ],
             0.002,
         );
-        assert_eq!(fleet.safety_budget.pooled_fdr.selected_kills, 3);
+        assert_eq!(fleet.safety_budget.pooled_fdr.selected_kills, 2);
+        assert!(fleet.hosts[0].selected_kill_pids.is_empty());
         let prepared = prepare_fleet_apply(&fleet).unwrap();
         for continue_on_error in [false, true] {
             let calls = AtomicUsize::new(0);
@@ -1230,7 +1350,7 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap()
-                .contains("approved FDR set"));
+                .contains("approved execution request is invalid"));
         }
 
         let mut invalid_beta = remote_document("beta", &[(201, 0.9999), (202, 0.9999)]);

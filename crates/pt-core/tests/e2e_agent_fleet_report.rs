@@ -317,7 +317,12 @@ fn executable_document(host_id: &str, session_id: &str, pids: &[u32]) -> Value {
             "stage": 0,
             "timeouts": ActionTimeouts::default(),
             "pre_checks": [],
-            "rationale": {},
+            "rationale": {"posterior": {
+                "useful": if order == 0 {0.001} else {0.6},
+                "useful_bad": 0.0,
+                "abandoned": if order == 0 {0.999} else {0.4},
+                "zombie": 0.0,
+            }},
             "on_success": [],
             "on_failure": [],
             "blocked": false,
@@ -331,7 +336,12 @@ fn executable_document(host_id: &str, session_id: &str, pids: &[u32]) -> Value {
             "recommendation": "KILL",
             "command_short": "fixture-worker",
             "classification": "abandoned",
-            "posterior": {"abandoned": if order == 0 {0.999} else {0.4}, "zombie": 0.0},
+            "posterior": {
+                "useful": if order == 0 {0.001} else {0.6},
+                "useful_bad": 0.0,
+                "abandoned": if order == 0 {0.999} else {0.4},
+                "zombie": 0.0,
+            },
         })).collect::<Vec<_>>(),
     })
 }
@@ -478,12 +488,13 @@ fn fleet_confirmed_cap_refusal_persists_intent_and_zero_attempt_receipts() {
         assert_eq!(response["hosts"][0]["attempted"], false);
         assert_eq!(
             response["fdr_approval"]["scope"],
-            "complete_planned_kill_set"
+            "any_subset_of_approved_direct_kill_targets"
         );
         assert_eq!(
             response["fdr_approval"]["applies_to_partial_or_unknown_execution"],
-            false
+            true
         );
+        assert_eq!(response["fdr_approval"]["model_based"], true);
         let content = fs::read_to_string(response["receipt_path"].as_str().unwrap()).unwrap();
         let records: Vec<Value> = content
             .lines()
