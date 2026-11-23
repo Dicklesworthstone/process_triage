@@ -2898,8 +2898,20 @@ fn plan_identifies_agent_cli_kind() {
     assert_eq!(c["agent_kind"], "claude", "{c}");
     let rec = c["recommendation"].as_str().unwrap_or("");
     assert!(matches!(rec, "KEEP" | "REVIEW"), "agent got {rec}: {c}");
-    // No controlling terminal: no liveness evidence.
-    assert_eq!(c["agent_liveness"]["live"], false, "{c}");
+    // A headless sleeper has no positive activity. A complete zero window can
+    // report quiet; an incomplete census stays unknown instead of inventing idle.
+    assert!(
+        c["agent_liveness"]["live"].is_null() || c["agent_liveness"]["live"] == false,
+        "{c}"
+    );
+    assert!(
+        matches!(
+            c["agent_liveness"]["status"].as_str(),
+            Some("no_activity_observed_in_window") | Some("unknown")
+        ),
+        "{c}"
+    );
+    assert_eq!(c["agent_liveness"]["sources"], serde_json::json!([]), "{c}");
 }
 
 /// An agent CLI on a terminal with recent I/O is live: kept, not surfaced for review.

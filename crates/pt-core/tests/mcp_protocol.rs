@@ -1664,6 +1664,17 @@ fn actual_mcp_agent_activity_includes_young_children_before_candidate_filters() 
     let data = tempfile::tempdir().expect("MCP data");
     let mut policy = pt_core::config::Policy::default();
     policy.guardrails.min_process_age_seconds = u64::MAX;
+    // Make the planning counterfactual independent of host load and posterior
+    // rounding: absent positive liveness, this policy prefers an intervention,
+    // which the built-in agent guard must downgrade to review. No action runs.
+    for row in [
+        &mut policy.loss_matrix.useful,
+        &mut policy.loss_matrix.useful_bad,
+        &mut policy.loss_matrix.abandoned,
+        &mut policy.loss_matrix.zombie,
+    ] {
+        row.keep = 1_000.0;
+    }
     std::fs::write(
         config.path().join("policy.json"),
         serde_json::to_vec_pretty(&policy).unwrap(),
@@ -1689,6 +1700,26 @@ fn actual_mcp_agent_activity_includes_young_children_before_candidate_filters() 
             "params": {
                 "name": "pt_explain",
                 "arguments": {"pid": agent_pid, "window_ms": 0}
+            }
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {
+                "name": "pt_plan",
+                "arguments": {
+                    "pids": [agent_pid], "min_age": 0, "min_score": 0,
+                    "window_ms": 1000
+                }
+            }
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+            "params": {
+                "name": "pt_plan",
+                "arguments": {
+                    "pids": [agent_pid], "min_age": 0, "min_score": 0,
+                    "window_ms": 0
+                }
             }
         }),
     ];
@@ -1720,21 +1751,22 @@ fn actual_mcp_agent_activity_includes_young_children_before_candidate_filters() 
         assert_eq!(response["id"], index + 1, "{response}");
         assert!(response["error"].is_null(), "{response}");
         assert_eq!(response["result"]["isError"], false, "{response}");
-        let result: serde_json::Value = serde_json::from_str(
-            response["result"]["content"][0]["text"].as_str().unwrap(),
-        )
-        .expect("tool result JSON");
+        let result: serde_json::Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .expect("tool result JSON");
         if index == 0 {
             assert_eq!(result["returned"], 0, "{result}");
             assert!(result["processes"].as_array().unwrap().is_empty());
             assert_eq!(
-                result["agent_activity"]["input_processes"],
-                result["total_processes"],
+                result["agent_activity"]["input_processes"], result["total_processes"],
                 "{result}"
             );
-        } else {
+        } else if index < 3 {
             assert_eq!(result["pid"], agent_pid, "{result}");
-            assert!(result.get("tty").expect("terminal fact").is_null(), "{result}");
+            assert!(
+                result.get("tty").expect("terminal fact").is_null(),
+                "{result}"
+            );
         }
         let report = &result["agent_activity"];
         let unit = report["units"]
@@ -1749,7 +1781,7 @@ fn actual_mcp_agent_activity_includes_young_children_before_candidate_filters() 
             assert_eq!(&unit["root"], expected, "{unit}");
         }
         root_identity = Some(unit["root"].clone());
-        if index < 2 {
+        if index < 2 || index == 3 {
             assert_eq!(report["sampling_window_ms"], 1000, "{report}");
             assert_eq!(unit["activity"], "activity_observed", "{unit}");
             assert!(
@@ -1761,6 +1793,46 @@ fn actual_mcp_agent_activity_includes_young_children_before_candidate_filters() 
             assert_eq!(unit["activity"], "unknown", "{unit}");
             assert_eq!(unit["coverage"]["active_members"], 0, "{unit}");
             assert!(unit["usage"]["cpu_cores"]["observed"].is_null(), "{unit}");
+        }
+        if index > 0 {
+            let candidate = if index < 3 {
+                &result
+            } else {
+                let candidates = result["candidates"]
+                    .as_array()
+                    .expect("real plan candidates");
+                assert_eq!(candidates.len(), 1, "{result}");
+                assert_eq!(candidates[0]["pid"], agent_pid, "{result}");
+                &candidates[0]
+            };
+            let liveness = &candidate["agent_liveness"];
+            if index == 1 || index == 3 {
+                assert_eq!(liveness["live"], true, "{candidate}");
+                assert_eq!(liveness["status"], "live", "{candidate}");
+                assert!(
+                    liveness["sources"]
+                        .as_array()
+                        .expect("liveness evidence sources")
+                        .iter()
+                        .any(|source| source == "descendant_activity"),
+                    "a headless parent's liveness must use its child's measured work: {candidate}"
+                );
+            } else {
+                assert!(liveness["live"].is_null(), "{candidate}");
+                assert_eq!(liveness["status"], "unknown", "{candidate}");
+            }
+            if index == 3 {
+                assert_eq!(candidate["recommended_action"], "keep", "{candidate}");
+                assert!(
+                    candidate["action_rationale"]
+                        .as_str()
+                        .unwrap()
+                        .contains("progress"),
+                    "the recommendation must explain the measured liveness: {candidate}"
+                );
+            } else if index == 4 {
+                assert_eq!(candidate["recommended_action"], "review", "{candidate}");
+            }
         }
     }
     assert!(

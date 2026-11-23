@@ -850,6 +850,22 @@ events when activity, membership, child composition, or coverage changes, and
 does not repeat events merely because an age or resource counter moved. These
 reports do not relax agent protection or authorize group actions.
 
+The shared recommendation path also uses these observations in `agent_liveness`.
+An identified agent with recent terminal activity or measured CPU/I/O progress
+in its own process or an attributed child is retained with a `keep`
+recommendation and an explanation of the observed work. This includes headless
+agents whose work happens in child tools. The assessment is bound to the agent's
+process identity; it does not give descendants additional protection.
+
+`agent_liveness.live` is `true` for positive activity, `false` for a fully observed
+quiet sampling window, and `null` when evidence is incomplete. Its `status`,
+`sources`, `reason`, and `activity` fields explain the result in plan/explain and
+MCP output. `terminal_window_seconds` names the terminal recency threshold;
+`requested_activity_window_ms` names the separate CPU/I/O sampling interval.
+Disabling sampling with `--window-ms 0` leaves a headless agent's liveness unknown.
+A quiet window never establishes abandonment or authorizes an automatic kill.
+Session-transcript activity is not yet collected.
+
 #### Live memory-limit headroom
 
 Linux cgroup diagnostics also read the visible ancestor chain's `memory.high`,

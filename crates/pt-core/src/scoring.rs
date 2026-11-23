@@ -262,6 +262,9 @@ pub struct ProcessScore<'a> {
     /// Identity-bound windowed activity, including reasons for missing signals.
     /// None when no window was requested; then snapshot CPU remains the input.
     pub activity: Option<ProcessActivity>,
+    /// Recent work attributed to this recognized agent root, never to its children.
+    /// This supports conservative Keep advice without changing class probabilities.
+    pub agent_activity: Option<AgentActivityUnit>,
     /// Where the class prior came from (`global`, `signature`, or `user` for a learned
     /// verdict).
     pub prior_source: String,
@@ -314,6 +317,9 @@ pub struct ScoringObservations {
     pub desktop_app: Option<String>,
     #[serde(deserialize_with = "Option::deserialize")]
     pub activity: Option<ProcessActivity>,
+    /// Older recordings do not contain an agent census; absence stays unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_activity: Option<AgentActivityUnit>,
     #[serde(deserialize_with = "Option::deserialize")]
     pub respawn_history: Option<RespawnLoopSummary>,
     /// Older recordings contain no work census. Absence is unknown, not proof
@@ -342,6 +348,10 @@ impl ScoringObservations {
                 .as_ref()
                 .is_none_or(|activity| activity.matches_record(process))
             && self
+                .agent_activity
+                .as_ref()
+                .is_none_or(|activity| activity.matches_record(process))
+            && self
                 .work
                 .as_ref()
                 .is_none_or(|work| work.matches_record(process))
@@ -358,6 +368,7 @@ pub struct Scorer {
     evaluation_time: Option<chrono::DateTime<chrono::Utc>>,
     activity_window: Option<Duration>,
     activity: BTreeMap<u32, ProcessActivity>,
+    agent_activity: BTreeMap<u32, AgentActivityUnit>,
     respawn_history: BTreeMap<u32, (pt_common::StartId, u32, RespawnLoopSummary)>,
     work: Option<DuplicateWorkSnapshot>,
     supervisor_restarts: BTreeMap<u32, SupervisorRestartObservation>,
@@ -446,6 +457,9 @@ pub struct AgentActivityUnit {
     pub root: pt_common::ProcessIdentity,
     pub root_state: crate::collect::ProcessState,
     pub age_seconds: u64,
+    /// Requested CPU/I/O sampling window; never the terminal-idle threshold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling_window_ms: Option<u64>,
     pub activity: AgentActivityState,
     pub member_count: usize,
     pub composition: AgentChildComposition,
@@ -454,8 +468,169 @@ pub struct AgentActivityUnit {
     pub unavailable: Vec<String>,
 }
 
+impl AgentActivityUnit {
+    /// An activity report belongs only to its original recognized agent root.
+    /// Descendants, a reused PID, or a changed job/session cannot inherit it.
+    pub fn matches_record(&self, process: &ProcessRecord) -> bool {
+        self.root.pid == process.pid
+            && self.root.start_id == process.start_id
+            && self.root.uid == process.uid
+            && self.root.pgid == process.pgid
+            && self.root.sid == process.sid
+            && crate::collect::protected::agent_kind(&process.cmd) == Some(self.kind.as_str())
+    }
+}
+
+/// Positive activity is evidence for retaining an agent. A quiet short window
+/// cannot establish abandonment, and missing observations cannot establish quiet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentLivenessState {
+    Live,
+    NoActivityObservedInWindow,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentLivenessSource {
+    RecentTerminalActivity,
+    ProcessActivity,
+    DescendantActivity,
+}
+
+/// One assessment for CLI, TUI, watch and explanations. This is an observation,
+/// not a calibrated likelihood term or permission to act on a quiet agent.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentLiveness {
+    pub status: AgentLivenessState,
+    /// Null when evidence is unavailable; false means only that no activity was
+    /// observed during the reported window, never that the agent is abandoned.
+    pub live: Option<bool>,
+    pub tty: Option<String>,
+    pub tty_idle_seconds: Option<u64>,
+    /// Terminal-activity lookback only, separate from the short CPU/I/O sample.
+    pub terminal_window_seconds: u64,
+    pub requested_activity_window_ms: Option<u64>,
+    pub sources: Vec<AgentLivenessSource>,
+    pub reason: String,
+    pub activity: Option<AgentActivityUnit>,
+    pub unavailable: Vec<String>,
+}
+
+pub const AGENT_LIVE_TERMINAL_WINDOW_SECONDS: u64 = 30 * 60;
+
+/// Assess current terminal activity alongside an already sampled agent unit.
+/// Saved explanations retain the original assessment instead of calling this.
+pub fn agent_liveness(
+    process: &ProcessRecord,
+    activity: Option<&AgentActivityUnit>,
+) -> Option<AgentLiveness> {
+    crate::collect::protected::agent_kind(&process.cmd)?;
+    #[cfg(unix)]
+    let tty_idle_seconds = process
+        .tty
+        .as_deref()
+        .and_then(crate::collect::protected::tty_idle_seconds);
+    #[cfg(not(unix))]
+    let tty_idle_seconds = None;
+    assess_agent_liveness(
+        process,
+        activity,
+        tty_idle_seconds,
+        AGENT_LIVE_TERMINAL_WINDOW_SECONDS,
+    )
+}
+
+pub fn assess_agent_liveness(
+    process: &ProcessRecord,
+    activity: Option<&AgentActivityUnit>,
+    tty_idle_seconds: Option<u64>,
+    terminal_window_seconds: u64,
+) -> Option<AgentLiveness> {
+    crate::collect::protected::agent_kind(&process.cmd)?;
+    let activity = activity.filter(|unit| {
+        unit.matches_record(process)
+            && unit.root.quality == pt_common::IdentityQuality::Full
+            && unit.sampling_window_ms.is_some_and(|window| window > 0)
+            && agent_start_parts(process)
+                .is_some_and(|(boot, _)| !matches!(boot, "unknown" | "synthetic"))
+    });
+    let mut sources = Vec::new();
+    let mut reasons = Vec::new();
+    if !process.state.is_zombie() {
+        if process.tty.is_some()
+            && tty_idle_seconds.is_some_and(|idle| idle < terminal_window_seconds)
+        {
+            sources.push(AgentLivenessSource::RecentTerminalActivity);
+            reasons.push("terminal has recent activity".to_string());
+        }
+        if let Some(unit) = activity.filter(|unit| {
+            unit.activity == AgentActivityState::ActivityObserved
+                && unit.coverage.active_members > 0
+        }) {
+            if unit.coverage.active_members > unit.composition.active_descendants {
+                sources.push(AgentLivenessSource::ProcessActivity);
+                reasons.push("the agent made measurable CPU or I/O progress".to_string());
+            }
+            if unit.composition.active_descendants > 0 {
+                sources.push(AgentLivenessSource::DescendantActivity);
+                reasons.push(format!(
+                    "{} attributed child process(es) made measurable CPU or I/O progress",
+                    unit.composition.active_descendants
+                ));
+            }
+        }
+    }
+    let terminal_observed = process.tty.is_none() || tty_idle_seconds.is_some();
+    let status = if !sources.is_empty() {
+        AgentLivenessState::Live
+    } else if terminal_observed
+        && activity
+            .is_some_and(|unit| unit.activity == AgentActivityState::NoActivityObservedInWindow)
+    {
+        AgentLivenessState::NoActivityObservedInWindow
+    } else {
+        AgentLivenessState::Unknown
+    };
+    let live = match status {
+        AgentLivenessState::Live => Some(true),
+        AgentLivenessState::NoActivityObservedInWindow => Some(false),
+        AgentLivenessState::Unknown => None,
+    };
+    let reason = match status {
+        AgentLivenessState::Live => format!("Keep: AI agent CLI {}", reasons.join("; ")),
+        AgentLivenessState::NoActivityObservedInWindow => format!(
+            "No activity observed in the {}ms sampling window; a quiet sampling window does not establish abandonment",
+            activity.and_then(|unit| unit.sampling_window_ms).unwrap_or(0)
+        ),
+        AgentLivenessState::Unknown =>
+            "Agent liveness is unknown because recent activity evidence is incomplete".to_string(),
+    };
+    let mut unavailable = activity.map_or_else(
+        || vec!["identity-bound agent activity census is unavailable".to_string()],
+        |unit| unit.unavailable.clone(),
+    );
+    if !terminal_observed {
+        unavailable.push("terminal activity could not be read".to_string());
+    }
+    Some(AgentLiveness {
+        status,
+        live,
+        tty: process.tty.clone(),
+        tty_idle_seconds,
+        terminal_window_seconds,
+        requested_activity_window_ms: activity.and_then(|unit| unit.sampling_window_ms),
+        sources,
+        reason,
+        activity: activity.cloned(),
+        unavailable,
+    })
+}
+
 /// Read-only activity of recognized agent CLIs and their observed same-user trees.
-/// No field changes inference, inherited supervision, protection, or action gates.
+/// Positive observations support retaining the root, never inherited descendant
+/// protection. No field changes class probabilities or permits an action.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentActivityReport {
     pub units: Vec<AgentActivityUnit>,
@@ -599,6 +774,7 @@ impl Scorer {
             evaluation_time: None,
             activity_window: None,
             activity: BTreeMap::new(),
+            agent_activity: BTreeMap::new(),
             respawn_history: BTreeMap::new(),
             work: None,
             supervisor_restarts: BTreeMap::new(),
@@ -813,6 +989,7 @@ impl Scorer {
     /// A zero window clears previous measurements and selects snapshot behavior.
     pub fn collect_activity(&mut self, processes: &[&ProcessRecord], window: Duration) {
         self.activity.clear();
+        self.agent_activity.clear();
         self.activity_window = (!window.is_zero()).then_some(window);
         if window.is_zero() || processes.is_empty() {
             return;
@@ -860,6 +1037,28 @@ impl Scorer {
                 "process was not included in the activity sampling window",
             ),
         })
+    }
+
+    /// Retain root-only activity from the same full census as rate collection.
+    /// Refreshing rates clears this cache; callers must rebuild it before scoring.
+    pub fn prepare_agent_activity(
+        &mut self,
+        population: &[ProcessRecord],
+        census_complete: bool,
+    ) -> AgentActivityReport {
+        let report = self.agent_activity_report(population, census_complete);
+        self.agent_activity = report
+            .units
+            .iter()
+            .map(|unit| (unit.root.pid.0, unit.clone()))
+            .collect();
+        report
+    }
+
+    pub fn agent_activity_for(&self, process: &ProcessRecord) -> Option<&AgentActivityUnit> {
+        self.agent_activity
+            .get(&process.pid.0)
+            .filter(|unit| unit.matches_record(process))
     }
 
     /// Describe recognized agent trees using only this census and activity that
@@ -920,6 +1119,7 @@ impl Scorer {
                         ),
                         root_state: process.state,
                         age_seconds: process.elapsed_seconds(),
+                        sampling_window_ms,
                         activity: AgentActivityState::Unknown,
                         member_count: 0,
                         composition: AgentChildComposition::default(),
@@ -1140,6 +1340,7 @@ impl Scorer {
             sid: process.sid,
             desktop_app,
             activity: self.activity_for(process),
+            agent_activity: self.agent_activity_for(process).cloned(),
             respawn_history: self.respawn_history_for(process).cloned(),
             work: self.workload_diagnosis_for(process),
             supervisor_restart: self.supervisor_restart_for(process).cloned(),
@@ -1194,6 +1395,7 @@ impl Scorer {
         let pid = proc.pid.0;
         let desktop_app = observations.desktop_app;
         let activity = observations.activity;
+        let agent_activity = observations.agent_activity;
         let respawn_history = observations.respawn_history;
         let work = observations.work;
         if let Some(activity) = &activity {
@@ -1447,11 +1649,26 @@ impl Scorer {
             }
         }
 
+        if let Some(liveness) = assess_agent_liveness(
+            proc,
+            agent_activity.as_ref(),
+            None,
+            AGENT_LIVE_TERMINAL_WINDOW_SECONDS,
+        ) {
+            if liveness.live == Some(true) {
+                ledger.top_evidence.push(liveness.reason.clone());
+                ledger
+                    .why_summary
+                    .push_str(&format!(" {}", liveness.reason));
+            }
+        }
+
         Some(ProcessScore {
             posterior,
             ledger,
             orphaned,
             activity,
+            agent_activity,
             prior_source,
             signature,
             signature_age_weight,
@@ -2474,6 +2691,185 @@ mod tests {
             .map(|process| (process.pid.0, agent_activity_sample(process, 0.0, 0.0)))
             .collect();
         result
+    }
+
+    #[test]
+    fn agent_liveness_uses_child_progress_only_for_its_root_without_changing_posteriors() {
+        let processes = vec![
+            agent_record(100, 1, "claude --continue"),
+            agent_record(101, 100, "cargo build"),
+            agent_record(102, 100, "codex exec review"),
+            agent_record(103, 102, "rustc lib.rs"),
+        ];
+        let mut measured = agent_activity_scorer(&processes);
+        measured
+            .activity
+            .insert(101, agent_activity_sample(&processes[1], 100.0, 4096.0));
+        let before = measured
+            .score_with_desktop(&processes[0], Evidence::from_snapshot(&processes[0]), None)
+            .unwrap();
+        let before_posterior = before.posterior.posterior;
+        measured.prepare_agent_activity(&processes, true);
+        let score = measured
+            .score_with_desktop(&processes[0], Evidence::from_snapshot(&processes[0]), None)
+            .unwrap();
+        let live = assess_agent_liveness(
+            &processes[0],
+            score.agent_activity.as_ref(),
+            None,
+            AGENT_LIVE_TERMINAL_WINDOW_SECONDS,
+        )
+        .unwrap();
+        assert_eq!(live.status, AgentLivenessState::Live);
+        assert_eq!(live.live, Some(true));
+        assert_eq!(live.requested_activity_window_ms, Some(500));
+        assert_eq!(live.terminal_window_seconds, 1800);
+        assert_eq!(live.sources, vec![AgentLivenessSource::DescendantActivity]);
+        assert!(live.reason.contains("1 attributed child"));
+        assert!(score.ledger.why_summary.contains(&live.reason));
+        assert_eq!(
+            serde_json::to_value(score.posterior.posterior).unwrap(),
+            serde_json::to_value(before_posterior).unwrap(),
+            "observed work is a retention reason, not an invented likelihood"
+        );
+        assert!(measured.agent_activity_for(&processes[1]).is_none());
+        assert!(agent_liveness(&processes[1], score.agent_activity.as_ref()).is_none());
+        let nested = assess_agent_liveness(
+            &processes[2],
+            measured.agent_activity_for(&processes[2]),
+            None,
+            AGENT_LIVE_TERMINAL_WINDOW_SECONDS,
+        )
+        .unwrap();
+        assert_eq!(
+            nested.live,
+            Some(false),
+            "sibling work cannot make a nested agent live"
+        );
+        assert_eq!(
+            nested.status,
+            AgentLivenessState::NoActivityObservedInWindow
+        );
+
+        // Persisting/replaying the observation keeps the original attribution.
+        let recorded = measured.recorded_observations(&processes[0], None);
+        let roundtrip: ScoringObservations =
+            serde_json::from_value(serde_json::to_value(&recorded).unwrap()).unwrap();
+        let replayed = scorer(SignatureDatabase::with_defaults())
+            .score_recorded(
+                &processes[0],
+                Evidence::from_snapshot(&processes[0]),
+                roundtrip,
+            )
+            .unwrap()
+            .agent_activity
+            .unwrap();
+        assert_eq!(replayed.activity, AgentActivityState::ActivityObserved);
+        assert_eq!(replayed.composition.active_descendants, 1);
+    }
+
+    #[test]
+    fn agent_liveness_keeps_unknown_distinct_from_quiet_and_accepts_positive_partial_evidence() {
+        let mut process = agent_record(100, 1, "claude");
+        process.tty = Some("pts/7".to_string());
+        let processes = [process.clone()];
+        let mut measured = agent_activity_scorer(&processes);
+        measured.prepare_agent_activity(&processes, true);
+        let assess = |activity, idle| {
+            assess_agent_liveness(&process, activity, idle, AGENT_LIVE_TERMINAL_WINDOW_SECONDS)
+                .unwrap()
+        };
+        let missing_terminal = assess(measured.agent_activity_for(&process), None);
+        assert_eq!(missing_terminal.live, None);
+        assert_eq!(missing_terminal.status, AgentLivenessState::Unknown);
+        assert!(missing_terminal
+            .unavailable
+            .iter()
+            .any(|reason| reason.contains("terminal")));
+        let quiet = assess(measured.agent_activity_for(&process), Some(1800));
+        assert_eq!(quiet.live, Some(false));
+        assert!(quiet.reason.contains("does not establish abandonment"));
+        let terminal_only = assess(None, Some(1799));
+        assert_eq!(terminal_only.live, Some(true));
+        assert_eq!(
+            terminal_only.sources,
+            vec![AgentLivenessSource::RecentTerminalActivity]
+        );
+        assert_eq!(assess(None, Some(1800)).live, None);
+
+        let mut sample = agent_activity_sample(&process, 100.0, 0.0);
+        sample.io_error = Some("permission denied".to_string());
+        sample.io_active = None;
+        measured.activity.insert(process.pid.0, sample);
+        measured.prepare_agent_activity(&processes, false);
+        let positive = assess(measured.agent_activity_for(&process), None);
+        assert_eq!(positive.live, Some(true));
+        assert_eq!(positive.sources, vec![AgentLivenessSource::ProcessActivity]);
+        assert!(!positive.unavailable.is_empty());
+        measured.collect_activity(&[], Duration::ZERO);
+        assert!(measured.agent_activity_for(&process).is_none());
+        assert_eq!(
+            assess(measured.agent_activity_for(&process), None).live,
+            None
+        );
+    }
+
+    #[test]
+    fn agent_liveness_rejects_reused_moved_unknown_and_zombie_roots() {
+        let process = agent_record(100, 1, "codex");
+        let mut measured = agent_activity_scorer(std::slice::from_ref(&process));
+        measured
+            .activity
+            .insert(100, agent_activity_sample(&process, 100.0, 0.0));
+        measured.prepare_agent_activity(std::slice::from_ref(&process), true);
+        let unit = measured.agent_activity_for(&process).unwrap();
+        for variant in 0..5 {
+            let mut changed = process.clone();
+            match variant {
+                0 => changed.start_id = StartId::from_linux("test-boot-id", 999, 100),
+                1 => changed.uid += 1,
+                2 => changed.pgid = Some(999),
+                3 => changed.sid = Some(999),
+                _ => changed.cmd = "claude".to_string(),
+            }
+            assert!(
+                measured.agent_activity_for(&changed).is_none(),
+                "variant {variant}"
+            );
+            let assessment = assess_agent_liveness(&changed, Some(unit), None, 1800).unwrap();
+            assert_eq!(assessment.live, None, "variant {variant}");
+            assert!(assessment.activity.is_none());
+        }
+        let mut running = process.clone();
+        running.state = ProcessState::Running;
+        assert!(measured.agent_activity_for(&running).is_some());
+        assert_eq!(
+            assess_agent_liveness(&running, Some(unit), None, 1800)
+                .unwrap()
+                .live,
+            Some(true),
+            "ordinary scheduler-state changes do not change process identity"
+        );
+        let mut unknown = process.clone();
+        unknown.start_id = StartId::from_linux("unknown", 1_234_567_890, 100);
+        let mut unknown_unit = unit.clone();
+        unknown_unit.root.start_id = unknown.start_id.clone();
+        unknown_unit.root.quality = pt_common::IdentityQuality::NoBootId;
+        assert_eq!(
+            assess_agent_liveness(&unknown, Some(&unknown_unit), None, 1800)
+                .unwrap()
+                .live,
+            None
+        );
+        let mut zombie = process;
+        zombie.state = ProcessState::Zombie;
+        zombie.tty = Some("pts/7".to_string());
+        assert_ne!(
+            assess_agent_liveness(&zombie, Some(unit), Some(0), 1800)
+                .unwrap()
+                .live,
+            Some(true)
+        );
     }
 
     #[test]

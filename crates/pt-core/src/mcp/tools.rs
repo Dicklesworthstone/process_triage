@@ -148,7 +148,7 @@ impl Evaluator {
         self.scorer
             .collect_activity(&population, Duration::from_millis(window_ms));
         self.scorer
-            .agent_activity_report(&scan.processes, scan.metadata.warnings.is_empty())
+            .prepare_agent_activity(&scan.processes, scan.metadata.warnings.is_empty())
     }
 
     /// Collect across the full census, so age/protection filters cannot hide a
@@ -955,6 +955,10 @@ fn tool_scan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
                 "cpu_lifetime_pct": p.cpu_percent,
                 "io_activity": activity.as_ref().and_then(|sample| sample.io_active),
                 "activity": activity,
+                "agent_liveness": crate::scoring::agent_liveness(
+                    p,
+                    evaluator.scorer.agent_activity_for(p),
+                ),
                 "rss_bytes": p.rss_bytes,
                 "vsz_bytes": p.vsz_bytes,
                 "elapsed_sec": p.elapsed.as_secs(),
@@ -1056,6 +1060,10 @@ fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
                 "cpu_lifetime_pct": p.cpu_percent,
                 "io_activity": activity.as_ref().and_then(|sample| sample.io_active),
                 "activity": activity,
+                "agent_liveness": crate::scoring::agent_liveness(
+                    p,
+                    evaluator.scorer.agent_activity_for(p),
+                ),
                 "rss_bytes": p.rss_bytes,
                 "vsz_bytes": p.vsz_bytes,
                 "elapsed_sec": p.elapsed.as_secs(),

@@ -3226,6 +3226,7 @@ fn score_tui_rows(
     scorer.collect_provenance(&eligible, population, census_complete);
     let system_state =
         collect_planning_activity(&mut scorer, population, window_ms, census_complete);
+    scorer.prepare_agent_activity(population, census_complete);
     let pressure = PlanningPressure::from_system_state(&system_state);
     let probe_advice = if probe_budget.is_zero() {
         HashMap::new()
@@ -7547,6 +7548,7 @@ fn build_tui_rows(
                 "state": proc.state.to_string(),
                 "recommended_action": recommendation,
                 "action_rationale": rationale,
+                "agent_liveness": advice.agent_liveness,
                 "workspace_context": deep.and_then(|deep| deep.workspace_context),
                 "work": scorer.workload_diagnosis_for(proc),
                 "supervisor_restart": scorer.supervisor_restart_for(proc),
@@ -27556,7 +27558,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
         .as_ref()
         .map(|scan| collect_responsible_units(scan, &scorer, &pressure));
     let agent_activity = scan_result.as_ref().map(|scan| {
-        scorer.agent_activity_report(&scan.processes, scan.metadata.warnings.is_empty())
+        scorer.prepare_agent_activity(&scan.processes, scan.metadata.warnings.is_empty())
     });
     if args.minimal {
         let units = responsible_units.as_ref().map(|table| {
@@ -27785,6 +27787,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                 "pid": proc.pid.0,
                 "recommended_action": advice.action,
                 "action_rationale": advice.rationale,
+                "agent_liveness": advice.agent_liveness,
                 "respawn_history": score.respawn_history,
                 "work": score.work,
                 "supervisor_restart": score.supervisor_restart,
@@ -28169,34 +28172,13 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
     ExitCode::Clean
 }
 
-/// An agent CLI whose terminal had input/output within this window is live.
-const AGENT_LIVE_TTY_IDLE_SECS: u64 = 30 * 60;
-
-/// Seconds since the agent's terminal last saw I/O (agent CLIs with a tty only).
-fn agent_tty_idle_seconds(proc: &ProcessRecord) -> Option<u64> {
-    #[cfg(unix)]
-    {
-        pt_core::collect::protected::agent_kind(&proc.cmd)
-            .and(proc.tty.as_deref())
-            .and_then(pt_core::collect::protected::tty_idle_seconds)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = proc;
-        None
-    }
-}
-
 /// `agent_liveness` block for plan/explain output (`None` for non-agents).
-fn agent_liveness_json(proc: &ProcessRecord) -> Option<serde_json::Value> {
-    pt_core::collect::protected::agent_kind(&proc.cmd)?;
-    let idle = agent_tty_idle_seconds(proc);
-    Some(serde_json::json!({
-        "tty": proc.tty,
-        "tty_idle_seconds": idle,
-        "live": idle.is_some_and(|s| s < AGENT_LIVE_TTY_IDLE_SECS),
-        "window_seconds": AGENT_LIVE_TTY_IDLE_SECS,
-    }))
+fn agent_liveness_json(
+    proc: &ProcessRecord,
+    score: &pt_core::scoring::ProcessScore<'_>,
+) -> Option<serde_json::Value> {
+    pt_core::scoring::agent_liveness(proc, score.agent_activity.as_ref())
+        .map(|liveness| serde_json::json!(liveness))
 }
 
 /// The policy and live-infrastructure verdict for a scored process. Every
@@ -29989,14 +29971,19 @@ fn candidate_recommendation(
                      act only after manual review"
             .to_string();
     }
-    let agent_liveness = agent_liveness_json(proc);
-    if action == "review"
+    let agent_liveness = agent_liveness_json(proc, score);
+    if policy.guardrails.builtin_protection
+        && matches!(action, "keep" | "review")
         && agent_liveness
             .as_ref()
             .is_some_and(|liveness| liveness["live"].as_bool() == Some(true))
     {
         action = "keep";
-        rationale = "Keep: AI agent CLI terminal has recent activity".to_string();
+        rationale = agent_liveness
+            .as_ref()
+            .and_then(|liveness| liveness["reason"].as_str())
+            .unwrap_or("Keep: AI agent CLI has recent activity")
+            .to_string();
     }
     if let Some(reason) = fuse_refusal {
         // Keep is already safe. Preserve an earlier, independently sufficient
@@ -30807,7 +30794,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     });
     let pressure = PlanningPressure::from_system_state(&system_state);
     let responsible_units = collect_responsible_units(&scan_result, &scorer, &pressure);
-    let agent_activity = scorer.agent_activity_report(
+    let agent_activity = scorer.prepare_agent_activity(
         &scan_result.processes,
         scan_result.metadata.warnings.is_empty(),
     );
@@ -32534,10 +32521,7 @@ fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
             protected.as_ref(),
             min_age_seconds,
             &scan_result.processes,
-        );
-        scorer.collect_activity(
-            &scan_result.processes.iter().collect::<Vec<_>>(),
-            Duration::from_millis(args.window_ms),
+            args.window_ms,
         );
         for pid in &pids_to_explain {
             match scan_result
@@ -32745,6 +32729,7 @@ fn collect_explain_provenance(
     protected: Option<&ProtectedFilter>,
     min_age_seconds: u64,
     targets: &[ProcessRecord],
+    window_ms: u64,
 ) {
     let scan_options = QuickScanOptions {
         pids: vec![],
@@ -32756,6 +32741,11 @@ fn collect_explain_provenance(
         Ok(result) => result,
         Err(e) => {
             eprintln!("agent explain: warning: provenance scan failed: {e}");
+            scorer.collect_activity(
+                &targets.iter().collect::<Vec<_>>(),
+                Duration::from_millis(window_ms),
+            );
+            scorer.prepare_agent_activity(targets, false);
             scorer.collect_respawn_history(None, &[], chrono::Utc::now());
             collect_planning_workloads(scorer, &[], false);
             scorer.collect_supervisor_restarts(&[]);
@@ -32763,6 +32753,16 @@ fn collect_explain_provenance(
             return;
         }
     };
+    // Descendant work is meaningful even when only the root was requested.
+    // Sample the census once, as plan/TUI/watch do, and retain its identities.
+    scorer.collect_activity(
+        &population.processes.iter().collect::<Vec<_>>(),
+        Duration::from_millis(window_ms),
+    );
+    scorer.prepare_agent_activity(
+        &population.processes,
+        population.metadata.warnings.is_empty(),
+    );
     collect_planning_workloads(
         scorer,
         &population.processes,
@@ -32864,7 +32864,7 @@ fn build_process_explanation(
         "user": proc.user,
         "state": proc.state.to_string(),
         "agent_kind": pt_core::collect::protected::agent_kind(&proc.cmd),
-        "agent_liveness": agent_liveness_json(proc),
+        "agent_liveness": agent_liveness_json(proc, &score),
         "elapsed_seconds": proc.elapsed.as_secs(),
         "start_id": proc.start_id,
         "uid": proc.uid,
@@ -39670,7 +39670,7 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
         // Every event in this iteration shares the hook budget. A stalled
         // receiver cannot turn many candidates into many full timeout waits.
         let notification_runner = pt_core::collect::tool_runner::notification_runner();
-        let agent_activity = scorer.agent_activity_report(
+        let agent_activity = scorer.prepare_agent_activity(
             &scan_result.processes,
             scan_result.metadata.warnings.is_empty(),
         );
@@ -39919,6 +39919,7 @@ fn evaluate_watch_candidate(
             "pid": proc.pid.0,
             "recommended_action": advice.action,
             "action_rationale": advice.rationale,
+            "agent_liveness": advice.agent_liveness,
             "action_target": action_target,
             "activity": score.activity,
             "respawn_history": score.respawn_history,
@@ -40067,6 +40068,7 @@ mod agent_activity_output_tests {
                     ),
                     root_state: ProcessState::Sleeping,
                     age_seconds: 10,
+                    sampling_window_ms: Some(500),
                     activity: AgentActivityState::ActivityObserved,
                     member_count: 1,
                     composition: AgentChildComposition::default(),
