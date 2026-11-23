@@ -815,6 +815,9 @@ static BUILTIN_PROTECTED: std::sync::LazyLock<Vec<BuiltinRule>> = std::sync::Laz
     ]
 });
 
+const AGENT_CLI_REVIEW_NOTES: &str =
+    "AI agent CLI session: may be mid-task; kill only after manual review";
+
 /// Agent CLIs: shown for review, never killed by robot/agent mode, never pre-selected.
 static BUILTIN_FORCE_REVIEW: std::sync::LazyLock<Vec<BuiltinRule>> = std::sync::LazyLock::new(
     || {
@@ -826,7 +829,7 @@ static BUILTIN_FORCE_REVIEW: std::sync::LazyLock<Vec<BuiltinRule>> = std::sync::
             // `zsh -ic '...; cod --no-alt-screen ...'` (`cod` is an installer's codex
             // wrapper). Mentions as arguments (`rg codex src/`) do not count.
             r#"(^|/)(claude|codex|cod|agy|agy-real|gemini|cursor-agent|aider|opencode|goose|amp|crush|qwen|droid)(\s|$)|^(\S*/)?(ba|z|da|fi|k)?sh\s+-[A-Za-z]*c[A-Za-z]*\s+(['"]?|.*[;&|('"]\s*)(claude|codex|cod|agy|gemini|cursor-agent|aider|opencode)(\s|$)|/claude/versions/|/\.?claude-code/|@anthropic-ai/claude-code|@openai/codex|/codex-(linux|darwin)-|@google/gemini-cli"#,
-            "AI agent CLI session: may be mid-task; kill only after manual review",
+            AGENT_CLI_REVIEW_NOTES,
         )]
     },
 );
@@ -850,10 +853,39 @@ pub fn builtin_protection_match(comm: &str, cmd: &str) -> Option<(&'static str, 
     builtin_match(&BUILTIN_PROTECTED, comm, cmd)
 }
 
+/// Recognize Pi only in executable/script position. The native fleet binary is
+/// named `pi`; the JavaScript package exposes its `dist/cli.js` entrypoint.
+/// Package paths mentioned by search tools or unrelated scripts are not agents.
+fn pi_agent_command(cmd: &str) -> bool {
+    let mut arguments = cmd.split_whitespace();
+    let Some(executable) = arguments.next() else {
+        return false;
+    };
+    let executable = executable.rsplit('/').next().unwrap_or(executable);
+    if executable == "pi" {
+        return true;
+    }
+    if !matches!(executable, "node" | "nodejs" | "bun") {
+        return false;
+    }
+    let Some(script) = arguments.next() else {
+        return false;
+    };
+    const ENTRYPOINT: &str = "@mariozechner/pi-coding-agent/dist/cli.js";
+    script == ENTRYPOINT
+        || script
+            .strip_suffix(ENTRYPOINT)
+            .is_some_and(|prefix| prefix.ends_with('/'))
+}
+
 /// Built-in force-review match (agent CLIs), if any applies.
 pub fn builtin_force_review_match(cmd: &str) -> Option<(&'static str, &'static str)> {
     // Agent CLIs are identified by their command line; comm is too short/ambiguous.
-    builtin_match(&BUILTIN_FORCE_REVIEW, "", cmd)
+    if pi_agent_command(cmd) {
+        Some(("builtin.agent_cli", AGENT_CLI_REVIEW_NOTES))
+    } else {
+        builtin_match(&BUILTIN_FORCE_REVIEW, "", cmd)
+    }
 }
 
 /// Live FUSE servers are infrastructure for every process accessing their mounts.
@@ -1204,6 +1236,11 @@ pub fn agent_kind(cmd: &str) -> Option<&'static str> {
         )
         .expect("agent kind regex")
     });
+    // Pi's prompt/model arguments may mention other agents. Its verified command
+    // position takes precedence over the legacy name search through the command.
+    if pi_agent_command(cmd) {
+        return Some("pi");
+    }
     builtin_force_review_match(cmd)?;
     let caps = KIND.captures(cmd)?;
     let name = caps.get(1).or_else(|| caps.get(2))?.as_str();
@@ -2371,6 +2408,46 @@ mod tests {
         ];
         for (cmd, want) in cases {
             assert_eq!(agent_kind(cmd), want, "{cmd:?}");
+        }
+    }
+
+    #[test]
+    fn pi_agent_entrypoints_match_without_argument_or_package_collisions() {
+        for cmd in [
+            "pi",
+            "pi --continue",
+            "/home/ubuntu/.local/bin/pi --provider anthropic",
+            "/data/projects/pi_agent_rust/target/release/pi --mode rpc",
+            // Kind comes from the entrypoint, never a model or prompt argument.
+            "pi --model claude --print review-codex",
+            "node /usr/lib/node_modules/@mariozechner/pi-coding-agent/dist/cli.js",
+            "/usr/bin/nodejs /home/codex/node_modules/@mariozechner/pi-coding-agent/dist/cli.js --continue",
+            "/home/u/.bun/bin/bun /home/u/.bun/install/global/node_modules/@mariozechner/pi-coding-agent/dist/cli.js",
+            "node @mariozechner/pi-coding-agent/dist/cli.js --mode rpc",
+        ] {
+            assert_eq!(agent_kind(cmd), Some("pi"), "{cmd}");
+            let matched = builtin_force_review_match(cmd).expect("Pi requires review");
+            assert_eq!(matched.0, "builtin.agent_cli", "{cmd}");
+            assert!(builtin_protection_match("pi", cmd).is_none(), "{cmd}");
+        }
+        for cmd in [
+            "pip install numpy",
+            "pihole-FTL",
+            "piquant --continue",
+            "rg pi src/",
+            "cat /tmp/pi",
+            "python3 -c 'import math; print(math.pi)'",
+            "rsync source host:/data/pi",
+            "bash -c 'printf %s pi'",
+            "node /tmp/server.js",
+            "node /tmp/server.js /usr/lib/node_modules/@mariozechner/pi-coding-agent/dist/cli.js",
+            "node /usr/lib/node_modules/@mariozechner/pi-coding-agent-extra/dist/cli.js",
+            "node /usr/lib/node_modules/@mariozechner/pi-coding-agent/dist/cli.js.map",
+            "rg @mariozechner/pi-coding-agent/dist/cli.js src/",
+            "bun test @mariozechner/pi-coding-agent/dist/cli.js",
+        ] {
+            assert_eq!(agent_kind(cmd), None, "{cmd}");
+            assert!(builtin_force_review_match(cmd).is_none(), "{cmd}");
         }
     }
 
