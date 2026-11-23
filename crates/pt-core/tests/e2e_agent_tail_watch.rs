@@ -445,6 +445,145 @@ fn watch_reports_policy_review_instead_of_raw_kill_decision() {
 
 #[cfg(unix)]
 #[test]
+fn watch_enforces_posterior_risk_before_publishing_actionable_events() {
+    use pt_core::config::policy::FdrMethod;
+
+    let mut child = OwnedWatchChild(
+        std::process::Command::new("/bin/sleep")
+            .arg("900")
+            .env_clear()
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn owned process"),
+    );
+    let config = TempDir::new().expect("config directory");
+    let data = TempDir::new().expect("data directory");
+    write_watch_review_config(&config);
+    let policy_path = config.path().join("policy.json");
+    let mut policy: pt_core::config::Policy =
+        serde_json::from_slice(&fs::read(&policy_path).unwrap()).unwrap();
+    policy.guardrails.force_review_patterns.clear();
+    // The same owned child must reach this particular gate regardless of the
+    // number of unrelated processes on a build worker. No apply command runs.
+    policy.guardrails.max_kills_per_run = u32::MAX;
+    policy.robot_mode.max_kills = u32::MAX;
+
+    for (method, alpha, enabled, robot, expected_action, reason) in [
+        (
+            FdrMethod::Bayesian,
+            0.05,
+            true,
+            false,
+            "kill",
+            "within the per-target limit",
+        ),
+        (
+            FdrMethod::Bayesian,
+            0.0,
+            true,
+            true,
+            "review",
+            "exceeds alpha",
+        ),
+        (
+            FdrMethod::By,
+            1.0,
+            true,
+            true,
+            "review",
+            "requires valid p-values",
+        ),
+        (
+            FdrMethod::AlphaInvesting,
+            1.0,
+            true,
+            false,
+            "review",
+            "requires valid sequential evidence",
+        ),
+        (
+            FdrMethod::By,
+            1.0,
+            false,
+            true,
+            "kill",
+            "disabled by policy",
+        ),
+    ] {
+        policy.fdr_control.method = method;
+        policy.fdr_control.alpha = alpha;
+        policy.fdr_control.enabled = enabled;
+        fs::write(&policy_path, serde_json::to_vec(&policy).unwrap()).unwrap();
+        let mut command = pt_core_fast();
+        command
+            .env("PROCESS_TRIAGE_DATA", data.path())
+            .env("PROCESS_TRIAGE_RETENTION", "off")
+            .arg("--config")
+            .arg(config.path())
+            .args([
+                "--format",
+                "jsonl",
+                "agent",
+                "watch",
+                "--once",
+                "--threshold",
+                "low",
+                "--window-ms",
+                "1",
+            ]);
+        if robot {
+            command.arg("--robot");
+        }
+        let output = command.assert().success().get_output().stdout.clone();
+        let events: Vec<Value> = String::from_utf8_lossy(&output)
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str(line).expect("watch event JSON"))
+            .collect();
+        let event = events
+            .iter()
+            .find(|event| {
+                event["event"] == "candidate_detected"
+                    && event["pid"].as_u64() == Some(u64::from(child.0.id()))
+            })
+            .unwrap_or_else(|| panic!("owned process absent for {method:?}: {events:?}"));
+        assert_eq!(event["recommended_action"], expected_action, "{event}");
+        assert_eq!(event["classification"], expected_action, "{event}");
+        assert_eq!(
+            event["fdr_control"]["selected"],
+            expected_action == "kill",
+            "{event}"
+        );
+        assert!(
+            event["fdr_control"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains(reason),
+            "{event}"
+        );
+        let risk = event["fdr_control"]["posterior_null_probability"]
+            .as_f64()
+            .expect("real class posterior is retained even when the method is unavailable");
+        assert!(risk > 0.0 && risk < 0.05, "{event}");
+        assert_eq!(
+            event["action_target"].is_null(),
+            expected_action == "review",
+            "{event}"
+        );
+        if expected_action == "kill" {
+            assert_eq!(event["action_target"], event["source_identity"], "{event}");
+        }
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "watch must remain read-only"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn watch_hook_failure_is_jsonl_and_does_not_leak_child_output() {
     let child = OwnedWatchChild(
         std::process::Command::new("sleep")

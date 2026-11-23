@@ -835,6 +835,122 @@ mod snapshot_policy_safety {
         assert_eq!(candidate["recommended_action"], "keep", "{candidate}");
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn snapshot_persists_risk_gated_actions_and_reports_the_same_identity() {
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let mut child = OwnedChild(
+            std::process::Command::new("sleep")
+                .arg("300")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn owned snapshot target"),
+        );
+        let pid = child.0.id();
+        let mut ready = false;
+        for _ in 0..100 {
+            if fs::read(format!("/proc/{pid}/cmdline"))
+                .is_ok_and(|command| command.starts_with(b"sleep\0"))
+            {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready, "owned process must finish exec before observation");
+
+        let config = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let mut policy = Policy::default();
+        // Read-only snapshots propose a kill so the risk ceiling, rather than
+        // the loss matrix, decides what is written to the inference artifact.
+        policy.guardrails.builtin_protection = false;
+        policy.guardrails.protected_users.clear();
+        policy.guardrails.protected_categories.clear();
+        policy.guardrails.never_kill_ppid.clear();
+        policy.guardrails.min_process_age_seconds = 0;
+        policy.guardrails.max_kills_per_run = u32::MAX;
+        // Keep unrelated host processes out of the proposed action set.
+        policy.guardrails.never_kill_pid = fs::read_dir("/proc")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+            .filter(|&observed| observed != pid)
+            .collect();
+        for row in [
+            &mut policy.loss_matrix.useful,
+            &mut policy.loss_matrix.useful_bad,
+            &mut policy.loss_matrix.abandoned,
+            &mut policy.loss_matrix.zombie,
+        ] {
+            row.keep = 10.0;
+            row.kill = 0.0;
+            row.pause = Some(10.0);
+            row.throttle = Some(10.0);
+            row.cap_memory = Some(10.0);
+            row.restart = Some(10.0);
+            row.renice = Some(10.0);
+        }
+        // An explicit all-class null makes the expected risk one regardless of
+        // this host's activity or learned priors; both alpha values are valid.
+        policy.fdr_control.lfdr_null = ["useful", "useful_bad", "abandoned", "zombie"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        for (alpha, action, selected) in [(1.0, "kill", true), (0.0, "review", false)] {
+            policy.fdr_control.alpha = alpha;
+            fs::write(
+                config.path().join("policy.json"),
+                serde_json::to_vec(&policy).unwrap(),
+            )
+            .unwrap();
+            let bytes = snapshot_command(config.path(), data.path())
+                .args(["--window-ms", "0"])
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone();
+            let output: Value = serde_json::from_slice(&bytes).unwrap();
+            let report = &output["fdr_control"];
+            assert_eq!(report["status"], "enforced", "{report}");
+            let risk = report["decisions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|decision| decision["target"]["pid"].as_u64() == Some(u64::from(pid)))
+                .expect("the owned target must reach the risk gate");
+            assert_eq!(risk["selected"], selected, "{risk}");
+            assert!((risk["posterior_null_probability"].as_f64().unwrap() - 1.0).abs() < 1e-10);
+
+            let session = Path::new(output["session_dir"].as_str().unwrap());
+            let inference: Value =
+                serde_json::from_slice(&fs::read(session.join("inference/results.json")).unwrap())
+                    .unwrap();
+            let recorded = inference["payload"]["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|record| record["pid"].as_u64() == Some(u64::from(pid)))
+                .expect("owned target must be persisted");
+            assert_eq!(recorded["recommended_action"], action, "{recorded}");
+            assert_eq!(recorded["start_id"], risk["target"]["start_id"]);
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "snapshot must remain read-only"
+            );
+        }
+    }
+
     #[test]
     fn snapshot_rejects_malformed_policy_instead_of_skipping_inference() {
         let config = TempDir::new().expect("config directory");

@@ -7184,18 +7184,16 @@ fn finalize_tui_recommendations(
         .iter()
         .filter_map(|row| goal_candidates.remove(&row.pid))
         .collect();
-    let mut candidates: Vec<&mut serde_json::Value> = final_candidates.iter_mut().collect();
-    apply_planned_kill_budget(&mut candidates, population, policy, false);
     let action_inputs: HashMap<_, _> = plan_candidates
         .iter()
         .map(|(&pid, input)| (pid, input.decision_candidate()))
         .collect();
-    apply_candidate_fdr_gate(policy, &mut final_candidates, &action_inputs);
-    let mut candidates: Vec<_> = final_candidates.iter_mut().collect();
-    apply_process_tree_safety(
-        &mut candidates,
+    finalize_candidate_safety(
+        &mut final_candidates,
+        &action_inputs,
         population,
-        policy.guardrails.builtin_protection,
+        policy,
+        false,
     );
     for candidate in final_candidates {
         if let Some(pid) = candidate["pid"]
@@ -28317,6 +28315,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
         }
     }
     let mut pressure_decisions = Vec::new();
+    let mut fdr_control = None;
 
     // Persist compact artifacts when we have a scan result.
     if let Some(ref scan_result) = scan_result {
@@ -28354,6 +28353,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
             .collect();
         let mut persisted_inference_records: Vec<PersistedInference> = Vec::new();
         let mut recommendations = Vec::new();
+        let mut action_inputs = HashMap::new();
         let mut supervision = pt_core::supervision::SupervisionDetector::for_scan();
         for proc in plan_eligible {
             let Some(score) = scorer.score(proc, Evidence::from_snapshot(proc)) else {
@@ -28437,6 +28437,21 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                 "supervisor_restart_unavailable": score.supervisor_restart_unavailable,
                 "memory_cap": memory_cap,
             }));
+            action_inputs.insert(
+                proc.pid.0,
+                DecisionCandidate {
+                    identity: process_identity_from_record(proc),
+                    ppid: Some(proc.ppid.0),
+                    decision: decision_outcome,
+                    blocked_reasons: Vec::new(),
+                    stage_pause_before_kill: false,
+                    process_state: Some(proc.state),
+                    parent_identity: parent.map(process_identity_from_record),
+                    d_state_diagnostics: None,
+                    supervisor_restart: score.supervisor_restart.clone(),
+                    memory_cap,
+                },
+            );
             persisted_inference_records.push(PersistedInference {
                 pid: proc.pid.0,
                 start_id: proc.start_id.to_string(),
@@ -28455,15 +28470,13 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                 provenance_log_odds_shift: None,
             });
         }
-        {
-            let mut candidates: Vec<&mut serde_json::Value> = recommendations.iter_mut().collect();
-            apply_planned_kill_budget(
-                &mut candidates,
-                &scan_result.processes,
-                &decision_policy,
-                global.robot,
-            );
-        }
+        fdr_control = Some(finalize_candidate_safety(
+            &mut recommendations,
+            &action_inputs,
+            &scan_result.processes,
+            &decision_policy,
+            global.robot,
+        ));
         let final_actions: HashMap<u32, &str> = recommendations
             .iter()
             .filter_map(|candidate| {
@@ -28661,6 +28674,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                 "capabilities": capabilities_summary,
                 "activity_window_ms": args.window_ms,
                 "pressure_decisions": pressure_decisions,
+                "fdr_control": fdr_control,
                 "responsible_units": responsible_units,
                 "memory_limits": responsible_units.as_ref().map(memory_limit_report),
                 "agent_activity": agent_activity.as_ref().map(|report| agent_activity_output(report, None)),
@@ -30865,6 +30879,30 @@ fn apply_candidate_fdr_gate(
     report
 }
 
+/// Finalize the exact recommendation set consistently across plan, TUI, watch
+/// and snapshot. Risk exclusions can leave live children behind, so tree safety
+/// must run again after the FDR gate, not just inside the planned kill budget.
+fn finalize_candidate_safety(
+    candidates: &mut [serde_json::Value],
+    action_inputs: &HashMap<u32, DecisionCandidate>,
+    population: &[ProcessRecord],
+    policy: &pt_core::config::Policy,
+    robot: bool,
+) -> pt_core::decision::PlanFdrReport {
+    let mut values: Vec<_> = candidates.iter_mut().collect();
+    apply_planned_kill_budget(&mut values, population, policy, robot);
+    let report = apply_candidate_fdr_gate(policy, candidates, action_inputs);
+    // Each admitted target independently meets the risk ceiling. Further tree
+    // exclusions cannot increase the remaining set's modeled FDR above it.
+    let mut values: Vec<_> = candidates.iter_mut().collect();
+    apply_process_tree_safety(
+        &mut values,
+        population,
+        policy.guardrails.builtin_protection,
+    );
+    report
+}
+
 /// Recheck exactly the selected, unfinished actions without altering the saved
 /// plan or its execution binding. Both the recorded and current policy apply;
 /// changing a policy, selecting one PID or resuming cannot remove either gate.
@@ -32327,27 +32365,13 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
 
     // Planning does not record executions, so enforce the final kill count after
     // goal ranking and before both the displayed and executable plans are built.
-    {
-        let mut candidate_values: Vec<&mut serde_json::Value> = candidates.iter_mut().collect();
-        apply_planned_kill_budget(
-            &mut candidate_values,
-            &scan_result.processes,
-            &decision_policy,
-            global.robot,
-        );
-    }
-
-    let fdr_control = apply_candidate_fdr_gate(&decision_policy, &mut candidates, &action_inputs);
-    // A rejected child can make a previously safe parent unsafe. The FDR gate
-    // is subset-safe; tree exclusions therefore need no risk-budget recycling.
-    {
-        let mut candidate_values: Vec<_> = candidates.iter_mut().collect();
-        apply_process_tree_safety(
-            &mut candidate_values,
-            &scan_result.processes,
-            decision_policy.guardrails.builtin_protection,
-        );
-    }
+    let fdr_control = finalize_candidate_safety(
+        &mut candidates,
+        &action_inputs,
+        &scan_result.processes,
+        &decision_policy,
+        global.robot,
+    );
     candidates.retain(|candidate| candidate_matches_filter(candidate, &args.only));
 
     let generated_at = chrono::Utc::now().to_rfc3339();
@@ -40770,6 +40794,8 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
         }
 
         let mut evaluated = Vec::new();
+        let mut recommendations = Vec::new();
+        let mut action_inputs = HashMap::new();
         // A watch iteration is a new scan; do not retain negative IPC evidence
         // across refreshes.
         let mut supervision = pt_core::supervision::SupervisionDetector::for_scan();
@@ -40798,30 +40824,28 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
             }
             eval.recommendation["responsible_unit"] =
                 responsible_unit_summary(responsible_units.unit_for(proc));
-            evaluated.push((proc, eval));
+            action_inputs.insert(proc.pid.0, eval.decision_candidate);
+            recommendations.push(eval.recommendation);
+            evaluated.push((proc, eval.confidence));
         }
 
         // A child omitted by the watch threshold is not being recommended for
-        // action. Resolve tree safety and the shared kill budget on this final
-        // event set, while retaining all protected/young ancestors and children.
-        {
-            let mut recommendations: Vec<&mut serde_json::Value> = evaluated
-                .iter_mut()
-                .map(|(_, eval)| &mut eval.recommendation)
-                .collect();
-            apply_planned_kill_budget(
-                &mut recommendations,
-                &scan_result.processes,
-                &decision_policy,
-                global.robot,
-            );
-        }
-        for (proc, eval) in evaluated {
+        // action. Apply the same budget, posterior-risk gate and final tree
+        // safety as saved plans before any event or notification can advertise
+        // a kill. A risk-refused child must also withdraw its parent's advice.
+        finalize_candidate_safety(
+            &mut recommendations,
+            &action_inputs,
+            &scan_result.processes,
+            &decision_policy,
+            global.robot,
+        );
+        for ((proc, confidence), recommendation) in evaluated.into_iter().zip(recommendations) {
             if let Some(candidate) = WatchCandidate::new(
                 process_identity_from_record(proc),
                 proc.cmd.clone(),
-                eval.confidence,
-                eval.recommendation,
+                confidence,
+                recommendation,
             ) {
                 current.insert(proc.pid.0, candidate);
             }
@@ -40859,6 +40883,7 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
 struct WatchEval {
     confidence: f64,
     recommendation: serde_json::Value,
+    decision_candidate: DecisionCandidate,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -40937,6 +40962,18 @@ fn evaluate_watch_candidate(
 
     Some(WatchEval {
         confidence,
+        decision_candidate: DecisionCandidate {
+            identity: process_identity_from_record(proc),
+            ppid: Some(proc.ppid.0),
+            decision: decision_outcome,
+            blocked_reasons: Vec::new(),
+            stage_pause_before_kill: false,
+            process_state: Some(proc.state),
+            parent_identity: parent.map(process_identity_from_record),
+            d_state_diagnostics: None,
+            supervisor_restart: score.supervisor_restart.clone(),
+            memory_cap: memory_cap.clone(),
+        },
         recommendation: serde_json::json!({
             "pid": proc.pid.0,
             "recommended_action": advice.action,
@@ -42489,6 +42526,157 @@ mod watch_tests {
             Some(pid),
             IdentityQuality::Full,
         )
+    }
+
+    #[test]
+    fn watch_withdraws_risk_refused_kills_and_parent_advice_without_changing_evidence() {
+        use pt_core::decision::decide_action;
+        use pt_core::inference::ClassScores;
+
+        let mut policy = pt_core::config::Policy::default();
+        policy.guardrails.builtin_protection = false;
+        let mut processes = Vec::new();
+        let mut recommendations = Vec::new();
+        let mut action_inputs = HashMap::new();
+        let mut previous = HashMap::new();
+        for (pid, ppid, risk) in [(10, 1, 0.001), (20, 10, 0.1), (30, 1, 0.01)] {
+            let source = identity(pid, u64::from(pid));
+            let posterior = ClassScores {
+                useful: risk,
+                useful_bad: 0.0,
+                abandoned: 1.0 - risk,
+                zombie: 0.0,
+            };
+            let mut decision =
+                decide_action(&posterior, &policy, &ActionFeasibility::allow_all()).unwrap();
+            // An older or differently tuned loss matrix may recommend every
+            // target. The final risk policy must constrain that recommendation.
+            decision.optimal_action = Action::Kill;
+            decision.rationale.posterior = Some(posterior);
+            action_inputs.insert(
+                pid,
+                DecisionCandidate {
+                    identity: source.clone(),
+                    ppid: Some(ppid),
+                    decision,
+                    blocked_reasons: Vec::new(),
+                    stage_pause_before_kill: false,
+                    process_state: Some(ProcessState::Sleeping),
+                    parent_identity: None,
+                    d_state_diagnostics: None,
+                    supervisor_restart: None,
+                    memory_cap: None,
+                },
+            );
+            let recommendation = serde_json::json!({
+                "pid": pid,
+                "recommended_action": "kill",
+                "action_rationale": "recorded model advice",
+                "action_target": source,
+                "posterior": posterior,
+                "probability_basis": "abandonment_probability",
+            });
+            previous.insert(
+                pid,
+                WatchCandidate::new(
+                    source.clone(),
+                    "owned workload".into(),
+                    posterior.abandonment_probability(),
+                    recommendation.clone(),
+                )
+                .unwrap(),
+            );
+            recommendations.push(recommendation);
+            processes.push(ProcessRecord {
+                pid: source.pid,
+                ppid: pt_common::ProcessId(ppid),
+                uid: source.uid,
+                user: "test".into(),
+                pgid: source.pgid,
+                sid: source.sid,
+                start_id: source.start_id,
+                comm: "worker".into(),
+                cmd: "owned workload".into(),
+                state: ProcessState::Sleeping,
+                cpu_percent: 0.0,
+                rss_bytes: 0,
+                vsz_bytes: 0,
+                tty: None,
+                start_time_unix: 0,
+                elapsed: Duration::from_secs(7200),
+                source: "recorded watch fixture".into(),
+                container_info: None,
+            });
+        }
+        let original = recommendations.clone();
+        let report = finalize_candidate_safety(
+            &mut recommendations,
+            &action_inputs,
+            &processes,
+            &policy,
+            false,
+        );
+        assert_eq!(report.blocked_targets, 1);
+        assert_eq!(recommendations[0]["recommended_action"], "review");
+        assert_eq!(recommendations[0]["tree_safety"]["rule"], "live_child");
+        assert_eq!(recommendations[1]["recommended_action"], "review");
+        assert_eq!(recommendations[1]["fdr_control"]["selected"], false);
+        assert_eq!(recommendations[2]["recommended_action"], "kill");
+        assert_eq!(recommendations[2]["fdr_control"]["selected"], true);
+
+        let mut current = HashMap::new();
+        for recommendation in recommendations {
+            let pid = u32::try_from(recommendation["pid"].as_u64().unwrap()).unwrap();
+            assert_eq!(
+                recommendation["posterior"],
+                previous[&pid].recommendation["posterior"]
+            );
+            let prior = &previous[&pid];
+            current.insert(
+                pid,
+                WatchCandidate::new(
+                    prior.identity.clone(),
+                    prior.command.clone(),
+                    prior.confidence,
+                    recommendation,
+                )
+                .unwrap(),
+            );
+        }
+        let observed = previous
+            .iter()
+            .map(|(&pid, candidate)| (pid, candidate.identity.clone()))
+            .collect();
+        let events = watch_candidate_events(&previous, &current, &observed, "risk-gated-tick");
+        assert_eq!(
+            events.len(),
+            2,
+            "only the refused child and its parent change"
+        );
+        for (event, expected_pid) in events.iter().zip([10, 20]) {
+            assert_eq!(event["event"], "recommendation_changed");
+            assert_eq!(event["pid"], expected_pid);
+            assert_eq!(event["prior_recommended_action"], "kill");
+            assert_eq!(event["recommended_action"], "review");
+            assert!(event["action_target"].is_null());
+            assert!(event["prior_action_target"].is_object());
+        }
+        assert!(watch_candidate_events(&current, &current, &observed, "next-tick").is_empty());
+
+        // The event decisions agree with the executable plan from this exact
+        // snapshot and policy, including the parent affected by a child's gate.
+        let mut planned = original;
+        finalize_candidate_safety(&mut planned, &action_inputs, &processes, &policy, false);
+        let plan = build_agent_action_plan(
+            &SessionId::new(),
+            &policy,
+            &planned,
+            &action_inputs,
+            "2026-11-23T00:00:00Z".into(),
+        );
+        assert_eq!(plan.actions.len(), 1);
+        assert_eq!(plan.actions[0].target.pid.0, 30);
+        assert_eq!(current[&30].recommendation["recommended_action"], "kill");
     }
 
     fn candidate(
