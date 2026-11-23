@@ -3356,7 +3356,10 @@ int main(int argc, char **argv) {
         })
         .unwrap();
         let process = scan.processes.into_iter().next().unwrap();
-        assert_eq!(process.cmd, format!("pi --session {}", transcript.display()));
+        assert_eq!(
+            process.cmd,
+            format!("pi --session {}", transcript.display())
+        );
         for descriptor in std::fs::read_dir(format!("/proc/{}/fd", process.pid.0)).unwrap() {
             let target = std::fs::read_link(descriptor.unwrap().path()).unwrap();
             assert_ne!(
@@ -3407,7 +3410,8 @@ int main(int argc, char **argv) {
         );
         assert_eq!(session.identity_verified, cached_lookup);
         assert_eq!(session.transcript_count, usize::from(cached_lookup));
-        let captured = serde_json::to_string(&measured.recorded_observations(&process, None)).unwrap();
+        let captured =
+            serde_json::to_string(&measured.recorded_observations(&process, None)).unwrap();
         assert!(!captured.contains(transcript.to_str().unwrap()));
         // Releasing the owned input pipe lets the helper exit normally. Replay
         // must continue to use the captured observation after its PID is gone.

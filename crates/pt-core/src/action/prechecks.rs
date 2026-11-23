@@ -654,9 +654,14 @@ impl ConfirmedAgentChildAction {
             return Err("interactive agent-child consent does not match this action".to_string());
         }
         for original in [&self.review.child, &self.review.parent] {
-            let mut matches = population.iter().filter(|record| record.pid == original.pid);
+            let mut matches = population
+                .iter()
+                .filter(|record| record.pid == original.pid);
             let current = matches.next().ok_or_else(|| {
-                format!("reviewed agent-child process {} is unavailable", original.pid.0)
+                format!(
+                    "reviewed agent-child process {} is unavailable",
+                    original.pid.0
+                )
             })?;
             if matches.next().is_some()
                 || !same_reviewed_process(original, current)
@@ -3458,8 +3463,18 @@ mod tests {
         let (child, parent) = reviewed_agent_family();
         assert!(AgentChildReview::from_records(&child, &parent).is_some());
         for invalid in [
-            "agent_child", "ordinary_parent", "owner", "parent", "loop", "weak_birth",
-            "other_boot", "impossible_birth", "missing_job", "unknown", "zombie", "disk_sleep",
+            "agent_child",
+            "ordinary_parent",
+            "owner",
+            "parent",
+            "loop",
+            "weak_birth",
+            "other_boot",
+            "impossible_birth",
+            "missing_job",
+            "unknown",
+            "zombie",
+            "disk_sleep",
         ] {
             let mut child = child.clone();
             let mut parent = parent.clone();
@@ -3470,19 +3485,30 @@ mod tests {
                 "parent" => child.ppid.0 += 1,
                 "loop" => parent.ppid = child.pid,
                 "weak_birth" => child.start_id = pt_common::StartId::from_linux("unknown", 20, 71),
-                "other_boot" => parent.start_id = pt_common::StartId::from_linux(
-                    "aaaaaaaa-1234-4321-8765-123456789abc", 10, 70,
-                ),
-                "impossible_birth" => parent.start_id = pt_common::StartId::from_linux(
-                    "12345678-1234-4321-8765-123456789abc", 30, 70,
-                ),
+                "other_boot" => {
+                    parent.start_id = pt_common::StartId::from_linux(
+                        "aaaaaaaa-1234-4321-8765-123456789abc",
+                        10,
+                        70,
+                    )
+                }
+                "impossible_birth" => {
+                    parent.start_id = pt_common::StartId::from_linux(
+                        "12345678-1234-4321-8765-123456789abc",
+                        30,
+                        70,
+                    )
+                }
                 "missing_job" => child.pgid = None,
                 "unknown" => parent.state = ProcessState::Unknown,
                 "zombie" => parent.state = ProcessState::Zombie,
                 "disk_sleep" => child.state = ProcessState::DiskSleep,
                 _ => unreachable!(),
             }
-            assert!(AgentChildReview::from_records(&child, &parent).is_none(), "{invalid}");
+            assert!(
+                AgentChildReview::from_records(&child, &parent).is_none(),
+                "{invalid}"
+            );
         }
     }
 
@@ -3495,9 +3521,22 @@ mod tests {
         let consent = review.confirm_kill(&action).unwrap();
         assert!(consent.matches_action(&action));
         for changed in [
-            "id", "sibling", "parent", "birth", "owner", "group", "session", "quality",
-            "kind", "blocked", "zombie_route", "supervisor_route", "original_zombie",
-            "timeout", "prechecks", "order",
+            "id",
+            "sibling",
+            "parent",
+            "birth",
+            "owner",
+            "group",
+            "session",
+            "quality",
+            "kind",
+            "blocked",
+            "zombie_route",
+            "supervisor_route",
+            "original_zombie",
+            "timeout",
+            "prechecks",
+            "order",
         ] {
             let mut action = action.clone();
             match changed {
@@ -3519,7 +3558,10 @@ mod tests {
                 "order" => action.order += 1,
                 _ => unreachable!(),
             }
-            assert!(!consent.matches_action(&action), "reused consent after {changed}");
+            assert!(
+                !consent.matches_action(&action),
+                "reused consent after {changed}"
+            );
         }
     }
 
@@ -3539,15 +3581,29 @@ mod tests {
         assert!(consent.validate_population(&action, &scheduled).is_ok());
         for index in 0..2 {
             for changed in [
-                "birth", "parent", "owner", "group", "session", "comm", "command", "tty",
-                "zombie", "unknown", "missing", "duplicate",
+                "birth",
+                "parent",
+                "owner",
+                "group",
+                "session",
+                "comm",
+                "command",
+                "tty",
+                "zombie",
+                "unknown",
+                "missing",
+                "duplicate",
             ] {
                 let mut population = original.clone();
                 let process = &mut population[index];
                 match changed {
-                    "birth" => process.start_id = pt_common::StartId::from_linux(
-                        "12345678-1234-4321-8765-123456789abc", 100, process.pid.0,
-                    ),
+                    "birth" => {
+                        process.start_id = pt_common::StartId::from_linux(
+                            "12345678-1234-4321-8765-123456789abc",
+                            100,
+                            process.pid.0,
+                        )
+                    }
                     "parent" => process.ppid.0 += 1,
                     "owner" => process.uid += 1,
                     "group" => process.pgid = Some(99),
@@ -3557,7 +3613,9 @@ mod tests {
                     "tty" => process.tty = Some("pts/99".to_string()),
                     "zombie" => process.state = ProcessState::Zombie,
                     "unknown" => process.state = ProcessState::Unknown,
-                    "missing" => { population.remove(index); }
+                    "missing" => {
+                        population.remove(index);
+                    }
                     "duplicate" => population.push(original[index].clone()),
                     _ => unreachable!(),
                 }

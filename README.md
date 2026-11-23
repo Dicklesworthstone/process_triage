@@ -1315,6 +1315,20 @@ When a trigger fires, the daemon requests the normal pressure-conditioned `agent
 
 Pressure diagnoses retain their kind and severity in the inbox, including when no safe action candidates exist. A delivered warning can escalate to critical once; a deferred critical upgrade is sent only while fresh evidence still supports it. Three consecutive observed recovery readings end an episode. Missing sensors and daemon restarts interrupt confirmation and recovery streaks without declaring recovery. OOM counter increments remain known incidents until delivery, even if the next sensor read fails. Counter resets never become new OOM incidents or evidence of swap recovery.
 
+Confirmed critical pressure also opens a durable incident session before the planner runs. Its `incident.json` retains up to 12 preceding pressure observations, 24 recent observations during the episode, and 8 planner outcomes, including cooldown, lock contention, overhead-budget deferrals and failures. Simultaneous diagnoses share an incident. A completed review plan is linked by session ID and the canonical SHA-256 of its accepted document; this records planning, not action execution. Review and lock-contention inbox items include `incident_session_id` when that evidence has been saved.
+
+Inspect the saved incident through the existing session commands, even when planning was deferred and there is no plan:
+
+```bash
+pt agent sessions --session <incident-id>
+pt --format json agent sessions --session <incident-id> --detail
+pt bundle create --session <incident-id> --output incident.ptb
+```
+
+The session view includes an `incident` summary by default; `--detail` also includes `incident_detail` with the retained pressure readings and planner attempts. Incident sessions do not advertise action resumption. Safe and forensic bundles include `incident.json` using the selected profile's normal JSON redaction; the minimal profile remains summary-only. Missing, redirected, malformed, oversized, or mismatched incident evidence fails inspection/export explicitly instead of producing an apparently complete record.
+
+The daemon writes a bounded checkpoint before invoking the planner, so even its first incident survives a crash before the ordinary daemon-state save. Restarts restore that episode without scanning session history; missing sensors and restart gaps cannot establish recovery. `daemon status` exposes `active_incident`, `last_incident`, `incident_storage_error`, and `discarded_incident_archives`. Active incidents remain protected from retention until observed recovery marks them complete. Each incident is capped at 256 KiB, and at most two completed archives await a storage retry; omitted samples, attempts, and dropped retries are counted. Persistent disk failures can leave an earlier active archive conservatively preserved for manual review. This capture path does not enable automatic mitigation.
+
 The native `triggers.pressure_regimes` configuration controls `enabled`, `minimum_severity` (`warn` by default), `exit_after_ticks` (default `3`), and `thresholds` using the pressure classifier's warn/critical bands. `triggers.sustained_ticks` controls episode entry. CPU/I/O rates use live monotonic sampling intervals when valid counters are available; serialized ticks cannot manufacture a live interval. `daemon status` includes the confirmed episodes, pending diagnoses, latest assessment and unavailable-evidence reason. Swap paradox diagnosis is also supported; process-census-only diagnoses are not inferred from missing census data.
 
 Without usable CPU PSI, the load fallback uses load and CPU count observed in the same pressure reading. A load of 10 exceeds its default threshold on a 2-CPU machine but stays below it on a 64-CPU machine. With CPU PSI, high load alongside quiet CPU and high I/O pressure is diagnosed as I/O pressure. Missing or invalid load/capacity readings interrupt the sustained window and record an unavailable-evidence reason; they never substitute one CPU or a zero load. Load notifications include the observed CPU count and effective threshold.

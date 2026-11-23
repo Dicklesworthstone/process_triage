@@ -535,6 +535,7 @@ fn export_artifact_path(engine: &RedactionEngine, path: &str) -> String {
         path,
         "summary.json"
             | "plan.json"
+            | "incident.json"
             | "snapshot.json"
             | "data.json"
             | "test.json"
@@ -615,6 +616,12 @@ mod tests {
         writer
             .add_json("private-customer.json", &serde_json::json!({"score": 87}))
             .unwrap();
+        writer
+            .add_json("incident.json", &serde_json::json!({
+                "samples_observed": 4,
+                "after": [{ "unavailable_reason": "cannot read /home/private-customer/pressure" }]
+            }))
+            .unwrap();
         for path in [
             "private-customer/provenance.json",
             "private-customer/audit.json",
@@ -650,6 +657,9 @@ mod tests {
         let outcome: serde_json::Value = serde_json::from_slice(&log).unwrap();
         assert_eq!(outcome["cmd"], plan["candidates"][0]["cmd"]);
         assert_eq!(outcome["success"], true);
+        let incident: serde_json::Value = reader.read_json("incident.json").unwrap();
+        assert_eq!(incident["samples_observed"], 4);
+        assert_eq!(incident["after"].as_array().unwrap().len(), 1);
     }
 
     #[test]

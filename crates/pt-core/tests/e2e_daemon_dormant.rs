@@ -359,6 +359,244 @@ fn run_daemon_cli(
     output
 }
 
+fn incident_session_fixture(
+    data_dir: &Path,
+) -> (
+    pt_common::SessionId,
+    PathBuf,
+    pt_core::daemon::IncidentRecord,
+) {
+    use pt_core::daemon::{IncidentPlannerAttempt, IncidentRecord, IncidentSample};
+    use pt_core::decision::pressure_regime::{Regime, RegimeKind, Severity};
+    use pt_core::session::{SessionManifest, SessionMode, SessionState, SessionStore};
+
+    let id = pt_common::SessionId::new();
+    let store = SessionStore::at_data_dir(data_dir);
+    let mut manifest = SessionManifest::new(&id, None, SessionMode::DaemonAlert, None);
+    manifest.record_state(SessionState::Scanning);
+    let handle = store.create(&manifest).expect("create incident session");
+    let sample = IncidentSample {
+        timestamp: "2026-11-23T00:00:00Z".into(),
+        pressure: Some(
+            serde_json::from_value(json!({
+                "sampled_at_ms": 1795392000000_u64,
+                "cpus": 4,
+                "cpu": {"some": {"avg10": 40.0, "avg60": 40.0, "avg300": 20.0, "total_us": 50000}},
+                "load": {"one": 8.0, "five": 4.0, "fifteen": 2.0},
+                "unavailable": [{
+                    "source": "memory",
+                    "reason": "cannot read /home/incident-private-customer/pressure"
+                }]
+            }))
+            .unwrap(),
+        ),
+        process_census: None,
+        memory_mode: Some(pt_core::decision::mem_pressure::PressureMode::Emergency),
+        observed_live: true,
+        unavailable_reason: None,
+    };
+    let record = IncidentRecord {
+        schema_version: 1,
+        session_id: id.0.clone(),
+        revision: 2,
+        opened_at: sample.timestamp.clone(),
+        last_observed_at: sample.timestamp.clone(),
+        recovered_at: None,
+        causes: vec![Regime {
+            kind: RegimeKind::MemoryExhaustion,
+            severity: Severity::Crit,
+            sustained: true,
+            explanation: "Memory usage exceeds the critical threshold".into(),
+        }],
+        memory_emergency: true,
+        before: [sample.clone()].into(),
+        after: [sample].into(),
+        planner_attempts: [IncidentPlannerAttempt {
+            timestamp: "2026-11-23T00:00:00Z".into(),
+            status: pt_core::daemon::escalation::EscalationStatus::Deferred,
+            reason: "global action lock is held".into(),
+            session_id: None,
+            plan: None,
+        }]
+        .into(),
+        samples_observed: 2,
+        samples_dropped: 0,
+        planner_attempts_dropped: 0,
+    };
+    let path = handle.dir.join("incident.json");
+    fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    (id, path, record)
+}
+
+#[test]
+fn incident_evidence_is_visible_and_exportable_without_a_plan() {
+    let temp = TempDir::new().unwrap();
+    let config_dir = temp.path().join("config");
+    let data_dir = temp.path().join("data");
+    fs::create_dir_all(&config_dir).unwrap();
+    let (id, _, record) = incident_session_fixture(&data_dir);
+    let output = run_daemon_cli(
+        &config_dir,
+        &data_dir,
+        &["agent", "sessions", "--session", &id.0],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(summary["incident"]["session_id"], id.0);
+    assert_eq!(summary["incident"]["latest_planner_status"], "deferred");
+    assert_eq!(summary["incident"]["samples_observed"], 2);
+    assert_eq!(summary["resumable"], false);
+    assert_eq!(summary["phase"], "incident");
+    assert!(summary["resume_command"].is_null());
+    assert!(summary.get("incident_detail").is_none());
+    assert!(summary["incident_detail_command"]
+        .as_str()
+        .unwrap()
+        .contains("--detail"));
+
+    let output = run_daemon_cli(
+        &config_dir,
+        &data_dir,
+        &["agent", "sessions", "--session", &id.0, "--detail"],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let detail: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        detail["incident_detail"],
+        serde_json::to_value(&record).unwrap()
+    );
+    assert!(detail.get("plan").is_none());
+
+    for format in ["md", "jsonl"] {
+        let output = Command::new(assert_cmd::cargo::cargo_bin!("pt-core"))
+            .args(["--format", format, "agent", "sessions", "--session", &id.0])
+            .env("PROCESS_TRIAGE_DATA", &data_dir)
+            .env("PROCESS_TRIAGE_CONFIG", &config_dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        if format == "md" {
+            assert!(text.contains("Critical Pressure Incident"));
+            assert!(text.contains("--detail"));
+            assert!(!text.contains("Resume with:"));
+        } else {
+            assert_eq!(text.lines().count(), 1);
+            assert_eq!(
+                serde_json::from_str::<Value>(&text).unwrap()["incident"]["samples_observed"],
+                2
+            );
+        }
+    }
+
+    for profile in ["safe", "forensic", "minimal"] {
+        let path = temp.path().join(format!("incident-{profile}.ptb"));
+        let output = run_daemon_cli(
+            &config_dir,
+            &data_dir,
+            &[
+                "bundle",
+                "create",
+                "--session",
+                &id.0,
+                "--profile",
+                profile,
+                "--output",
+                path.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut reader = pt_bundle::BundleReader::open(&path).unwrap();
+        assert!(reader.verify_all().is_empty());
+        if profile == "minimal" {
+            assert!(reader.read_raw("incident.json").is_err());
+            assert!(reader.read_json::<Value>("summary.json").is_ok());
+        } else {
+            let exported: Value = reader.read_json("incident.json").unwrap();
+            assert_eq!(exported["samples_observed"], 2);
+            assert_eq!(exported["after"].as_array().unwrap().len(), 1);
+            assert_eq!(exported["planner_attempts"][0]["status"], "deferred");
+            assert_eq!(exported["opened_at"], record.opened_at);
+            assert_eq!(
+                exported["after"][0]["pressure"]["cpu"]["some"]["total_us"],
+                50000
+            );
+            assert_eq!(exported["after"][0]["pressure"]["load"]["one"], 8.0);
+            assert_eq!(exported["after"][0]["memory_mode"], "Emergency");
+            // Even forensic exports apply the normal free-text policy to
+            // diagnostic strings; structural fields and readings remain usable.
+            assert!(!exported.to_string().contains("incident-private-customer"));
+            assert!(serde_json::from_value::<pt_core::daemon::IncidentRecord>(exported).is_ok());
+        }
+    }
+}
+
+#[test]
+fn incident_evidence_inspection_and_export_refuse_invalid_artifacts() {
+    let temp = TempDir::new().unwrap();
+    let config_dir = temp.path().join("config");
+    fs::create_dir_all(&config_dir).unwrap();
+    for defect in ["missing", "mismatched", "symlink", "oversized", "malformed"] {
+        let data_dir = temp.path().join(defect);
+        let (id, path, mut record) = incident_session_fixture(&data_dir);
+        // Retain the valid evidence while installing each broken fixture.
+        let original = path.with_extension("original.json");
+        fs::rename(&path, &original).unwrap();
+        match defect {
+            "missing" => {}
+            "mismatched" => {
+                record.session_id = pt_common::SessionId::new().0;
+                fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+            }
+            "symlink" => std::os::unix::fs::symlink(&original, &path).unwrap(),
+            "oversized" => {
+                fs::write(&path, vec![b' '; pt_core::daemon::INCIDENT_MAX_BYTES + 1]).unwrap()
+            }
+            "malformed" => fs::write(&path, b"{not-json").unwrap(),
+            _ => unreachable!(),
+        }
+        let output = run_daemon_cli(
+            &config_dir,
+            &data_dir,
+            &["agent", "sessions", "--session", &id.0, "--detail"],
+        );
+        assert!(!output.status.success(), "{defect} inspection must fail");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("incident"));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("incident-private-customer"));
+        let bundle = temp.path().join(format!("{defect}.ptb"));
+        let output = run_daemon_cli(
+            &config_dir,
+            &data_dir,
+            &[
+                "bundle",
+                "create",
+                "--session",
+                &id.0,
+                "--output",
+                bundle.to_str().unwrap(),
+            ],
+        );
+        assert!(!output.status.success(), "{defect} export must fail");
+        assert!(!bundle.exists(), "{defect} must not publish a bundle");
+    }
+}
+
 fn send_signal(child: &mut OwnedDaemon, signal: i32) {
     assert!(
         child

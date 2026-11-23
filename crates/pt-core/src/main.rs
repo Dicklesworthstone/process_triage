@@ -12667,7 +12667,7 @@ fn run_bundle_create(
 
     // Find session to export
     let target_session = if let Some(raw) = session_arg {
-        match SessionId::parse(raw) {
+        match raw.is_ascii().then(|| SessionId::parse(raw)).flatten() {
             Some(sid) => sid,
             None => {
                 eprintln!("bundle create: invalid session ID '{}'", raw);
@@ -12702,6 +12702,37 @@ fn run_bundle_create(
         }
     };
 
+    let manifest = match handle.read_manifest() {
+        Ok(manifest) if manifest.session_id == target_session.0 => manifest,
+        Ok(_) => {
+            eprintln!("bundle create: manifest belongs to another session");
+            return ExitCode::IoError;
+        }
+        Err(error) => {
+            eprintln!("bundle create: cannot read session manifest: {error}");
+            return ExitCode::IoError;
+        }
+    };
+    #[cfg(feature = "daemon")]
+    let incident_record = match pt_core::daemon::load_incident_record(&store, &target_session) {
+        Ok(Some(record)) if manifest.mode == SessionMode::DaemonAlert => Some(record),
+        Ok(Some(_)) => {
+            eprintln!("bundle create: incident artifact requires a daemon alert session");
+            return ExitCode::IoError;
+        }
+        Ok(None) if manifest.mode == SessionMode::DaemonAlert => {
+            eprintln!(
+                "bundle create: incident evidence is missing; retry after daemon persistence"
+            );
+            return ExitCode::IoError;
+        }
+        Ok(None) => None,
+        Err(error) => {
+            eprintln!("bundle create: cannot read incident evidence: {error}");
+            return ExitCode::IoError;
+        }
+    };
+
     // Preserve the source session's host, including imported sessions; the
     // machine creating the archive is not necessarily the machine scanned.
     let source_host_id = match handle.read_context() {
@@ -12721,62 +12752,52 @@ fn run_bundle_create(
         .with_pt_version(env!("CARGO_PKG_VERSION"))
         .with_description(format!("Export of session {}", target_session.0));
 
+    // Export the manifest whose identity was checked, rather than reopening it.
+    if let Err(error) = writer.add_json("session/manifest.json", &manifest) {
+        eprintln!("bundle create: cannot serialize session manifest: {error}");
+        return ExitCode::IoError;
+    }
+    #[cfg(feature = "daemon")]
+    if let Some(record) = &incident_record {
+        // The validated bounded record still passes through ordinary JSON
+        // redaction: unavailable-sensor diagnostics can contain private paths.
+        if let Err(error) = writer.add_json("incident.json", record) {
+            eprintln!("bundle create: cannot serialize incident evidence: {error}");
+            return ExitCode::IoError;
+        }
+    }
+
     // Optional artifacts may be absent; existing unreadable artifacts must not
-    // silently disappear from a successful export. The session manifest is required.
-    for (source, destination, file_type, required) in [
-        (
-            "manifest.json",
-            "session/manifest.json",
-            FileType::Json,
-            true,
-        ),
-        (
-            "context.json",
-            "session/context.json",
-            FileType::Json,
-            false,
-        ),
-        ("decision/plan.json", "plan.json", FileType::Json, false),
-        (
-            "scan/inventory.json",
-            "scan/inventory.json",
-            FileType::Json,
-            false,
-        ),
+    // silently disappear from a successful export.
+    for (source, destination, file_type) in [
+        ("context.json", "session/context.json", FileType::Json),
+        ("decision/plan.json", "plan.json", FileType::Json),
+        ("scan/inventory.json", "scan/inventory.json", FileType::Json),
         (
             "inference/results.json",
             "inference/results.json",
             FileType::Json,
-            false,
         ),
         (
             "action/outcomes.jsonl",
             "logs/outcomes.jsonl",
             FileType::Log,
-            false,
         ),
-        (
-            "logs/session.jsonl",
-            "logs/session.jsonl",
-            FileType::Log,
-            false,
-        ),
+        ("logs/session.jsonl", "logs/session.jsonl", FileType::Log),
         (
             "scan/provenance.json",
             "scan/provenance.json",
             FileType::Json,
-            false,
         ),
         (
             "scan/provenance_audit.json",
             "scan/provenance_audit.json",
             FileType::Json,
-            false,
         ),
     ] {
         match std::fs::read(handle.dir.join(source)) {
             Ok(content) => writer.add_file(destination, content, Some(file_type)),
-            Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 eprintln!("bundle create: cannot read {source}: {error}");
                 return ExitCode::IoError;
@@ -17735,6 +17756,17 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
 
     let state_path = daemon_state_path();
     let mut state_bundle = load_daemon_state(&state_path, config);
+    let incident_store = pt_core::session::SessionStore::from_env();
+    match &incident_store {
+        Ok(store) => {
+            let _ = state_bundle.daemon.incidents.recover_persisted(store);
+        }
+        Err(error) => {
+            state_bundle.daemon.incidents.storage_error =
+                Some(format!("incident storage unavailable: {error}"));
+        }
+    }
+    let incident_store = incident_store.ok();
 
     let mut config = config.clone();
     let inbox = InboxStore::from_env().ok();
@@ -17755,6 +17787,8 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
                 // Observations under the old limits cannot establish recovery
                 // under newly loaded overhead budgets.
                 state_bundle.daemon.interrupt_overhead_recovery();
+                state_bundle.daemon.incidents.interrupt_observations();
+                state_bundle.triggers.pressure.interrupt_observations();
                 // Apply new ladder config while preserving persisted state.
                 notify_mgr = pt_core::decision::escalation::EscalationManager::from_persisted(
                     config.notification_ladder.clone(),
@@ -17857,17 +17891,27 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
             // Keep cheap pressure evidence and pending episodes while deferring
             // expensive planning under the daemon's own overhead budget.
             trigger_state.pressure.observe(&config.triggers, &metrics);
+            daemon_capture_budget_incident(&config, daemon_state, trigger_state, &metrics);
+            persist_daemon_incidents(&mut daemon_state.incidents, incident_store.as_ref());
             daemon_state.record_event(
                 pt_core::daemon::DaemonEventType::TickCompleted,
                 "tick (budget exceeded)",
             );
         } else {
             let mut escalation_inbox = inbox.clone();
-            let outcome = pt_core::daemon::process_tick(
+            let incident_session_id = std::cell::RefCell::new(None);
+            let mut incident_plan = None;
+            let outcome = pt_core::daemon::process_tick_with_incident_observer(
                 &config,
                 daemon_state,
                 trigger_state,
                 &metrics,
+                &mut |tracker| {
+                    // This checkpoint precedes the potentially expensive or
+                    // unsuccessful planner, including its lock/cooldown checks.
+                    *incident_session_id.borrow_mut() =
+                        persist_daemon_incidents(tracker, incident_store.as_ref());
+                },
                 &mut |esc_config, fired| {
                     let lock_path = global_lock_path().unwrap_or_else(daemon_lock_path);
                     let lock = match GlobalLock::try_acquire(&lock_path) {
@@ -17895,10 +17939,11 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
                     ) && outcome.reason.contains("LockContention")
                     {
                         if let Some(store) = escalation_inbox.as_mut() {
-                            let item = InboxItem::lock_contention(
+                            let mut item = InboxItem::lock_contention(
                                 "daemon escalation deferred: lock contention".to_string(),
                                 None,
                             );
+                            item.incident_session_id = incident_session_id.borrow().clone();
                             let _ = store.add(&item);
                         }
                     }
@@ -17910,10 +17955,15 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
                         match run_daemon_escalation(global, fired, esc_config) {
                             Ok(result) => {
                                 outcome.session_id = Some(result.session_id.clone());
+                                incident_plan = Some(pt_core::daemon::IncidentPlanRef {
+                                    session_id: result.session_id.clone(),
+                                    plan_sha256: result.plan_sha256.clone(),
+                                });
                                 match persist_daemon_review_request(
                                     escalation_inbox.as_ref(),
                                     &result,
                                     fired,
+                                    incident_session_id.borrow().as_deref(),
                                 ) {
                                     Ok(item) => {
                                         // Emit L1 notification immediately for new inbox item.
@@ -17956,6 +18006,10 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
                 },
             );
             let _ = outcome;
+            if let Some(plan) = incident_plan {
+                daemon_state.incidents.attach_plan_reference(plan);
+            }
+            persist_daemon_incidents(&mut daemon_state.incidents, incident_store.as_ref());
             state_bundle
                 .daemon
                 .record_event(pt_core::daemon::DaemonEventType::TickCompleted, "tick");
@@ -18025,10 +18079,48 @@ fn inbox_item_dedupe_key(item: &pt_core::inbox::InboxItem) -> String {
 }
 
 #[cfg(feature = "daemon")]
+fn persist_daemon_incidents(
+    tracker: &mut pt_core::daemon::IncidentTracker,
+    store: Option<&pt_core::session::SessionStore>,
+) -> Option<String> {
+    let Some(store) = store else {
+        tracker.storage_error = Some("incident storage directory is unavailable".into());
+        return None;
+    };
+    tracker.persist(store).ok()?;
+    tracker.active_summary().map(|incident| incident.session_id)
+}
+
+#[cfg(feature = "daemon")]
+fn daemon_capture_budget_incident(
+    config: &pt_core::daemon::DaemonConfig,
+    state: &mut pt_core::daemon::DaemonState,
+    triggers: &pt_core::daemon::triggers::TriggerState,
+    metrics: &pt_core::daemon::TickMetrics,
+) {
+    state.incidents.observe(
+        metrics,
+        &triggers.pressure,
+        state.last_memory_pressure.as_ref(),
+        config.triggers.pressure_regimes.exit_after_ticks,
+    );
+    state.incidents.record_planner(
+        &pt_core::daemon::escalation::EscalationOutcome {
+            status: pt_core::daemon::escalation::EscalationStatus::Deferred,
+            reason: "daemon overhead budget exceeded; planning deferred".into(),
+            session_id: None,
+            provenance_summary: None,
+        },
+        None,
+    );
+}
+
+#[cfg(feature = "daemon")]
 fn persist_daemon_review_request(
     store: Option<&pt_core::inbox::InboxStore>,
     result: &DaemonEscalationResult,
     fired: &[pt_core::daemon::triggers::FiredTrigger],
+    incident_session_id: Option<&str>,
 ) -> Result<pt_core::inbox::InboxItem, String> {
     let store = store.ok_or("review plan created but durable inbox is unavailable")?;
     // Preserve a corrupt ledger for diagnosis instead of appending an unreadable
@@ -18043,6 +18135,7 @@ fn persist_daemon_review_request(
         summary,
         result.candidates_found,
     );
+    item.incident_session_id = incident_session_id.map(str::to_owned);
     item.memory_pressure = fired
         .iter()
         .find_map(|trigger| trigger.memory_pressure.as_ref())
@@ -18060,6 +18153,7 @@ fn persist_daemon_review_request(
     if saved.iter().any(|saved| {
         saved.id == item.id
             && saved.session_id == item.session_id
+            && saved.incident_session_id == item.incident_session_id
             && saved.pressure_regimes == item.pressure_regimes
             && saved.memory_pressure == item.memory_pressure
             && saved.candidates == item.candidates
@@ -18640,15 +18734,34 @@ fn run_daemon_status(global: &GlobalOpts) -> ExitCode {
     let pid = record.map(|(pid, _)| pid);
     let running = record.is_some_and(|(pid, birth)| pid_file_running(pid, birth));
     let state_path = daemon_state_path();
-    let state = if state_path.exists() {
-        std::fs::read_to_string(&state_path)
-            .ok()
-            .and_then(|content| serde_json::from_str::<DaemonStateBundle>(&content).ok())
-    } else {
-        None
-    };
-
     let (config, _) = load_daemon_config(global);
+    let saved_state = pt_core::daemon::read_daemon_json_bounded::<DaemonStateBundle>(
+        &state_path,
+        DAEMON_STATE_MAX_BYTES,
+    );
+    let state_error = saved_state.as_ref().err().cloned();
+    let saved_state = saved_state.ok().flatten();
+    let had_state = saved_state.is_some();
+    let mut recovered = saved_state.unwrap_or_else(|| new_daemon_state(&config));
+    // A crash during the very first planner can leave only the incident
+    // checkpoint. Status must still expose that evidence without modifying it.
+    let last_storage_error = recovered.daemon.incidents.storage_error.clone();
+    if let Ok(store) = pt_core::session::SessionStore::from_env() {
+        if recovered.daemon.incidents.recover_persisted(&store).is_ok() {
+            // Reading an artifact does not prove the daemon's last write
+            // succeeded (for example on a full or read-only filesystem).
+            recovered.daemon.incidents.storage_error = last_storage_error;
+        }
+    }
+    let active_incident = recovered.daemon.incidents.active_summary();
+    let last_incident = recovered.daemon.incidents.last_summary();
+    let incident_storage_error = recovered.daemon.incidents.storage_error.clone();
+    let discarded_incident_archives = recovered.daemon.incidents.discarded_pending_archives;
+    let state = (had_state
+        || active_incident.is_some()
+        || last_incident.is_some()
+        || incident_storage_error.is_some())
+    .then_some(recovered);
     let next_tick_interval_secs = state
         .as_ref()
         .map(|state| state.daemon.next_tick_interval_secs(&config));
@@ -18658,6 +18771,11 @@ fn run_daemon_status(global: &GlobalOpts) -> ExitCode {
         "pid": pid,
         "base_dir": daemon_base_dir().display().to_string(),
         "next_tick_interval_secs": next_tick_interval_secs,
+        "active_incident": active_incident,
+        "last_incident": last_incident,
+        "incident_storage_error": incident_storage_error,
+        "discarded_incident_archives": discarded_incident_archives,
+        "state_error": state_error,
         "state": state
             .as_ref()
             .and_then(|s| serde_json::to_value(s).ok()),
@@ -18674,6 +18792,24 @@ fn run_daemon_status(global: &GlobalOpts) -> ExitCode {
                 println!("Daemon not running.");
             }
             if let Some(state) = &state {
+                if let Some(incident) = state.daemon.incidents.active_summary() {
+                    println!(
+                        "Active incident: {} ({} observations; {} omitted).",
+                        incident.session_id, incident.samples_observed, incident.samples_dropped
+                    );
+                }
+                if let Some(incident) = state.daemon.incidents.last_summary() {
+                    println!("Last recovered incident: {}.", incident.session_id);
+                }
+                if let Some(error) = &state.daemon.incidents.storage_error {
+                    println!("Incident storage: {error}.");
+                }
+                if state.daemon.incidents.discarded_pending_archives > 0 {
+                    println!(
+                        "Incident archives dropped from retry queue: {}.",
+                        state.daemon.incidents.discarded_pending_archives
+                    );
+                }
                 for (kind, severity) in &state.triggers.pressure.active {
                     println!("Confirmed pressure: {kind:?} ({severity:?}).");
                 }
@@ -18688,6 +18824,9 @@ fn run_daemon_status(global: &GlobalOpts) -> ExitCode {
                         config.overhead_backoff.healthy_ticks_before_recovery.max(1)
                     );
                 }
+            }
+            if let Some(error) = state_error {
+                println!("Daemon state unavailable: {error}.");
             }
         }
     }
@@ -20352,19 +20491,27 @@ struct DaemonStateBundle {
 }
 
 #[cfg(feature = "daemon")]
-fn load_daemon_state(path: &Path, config: &pt_core::daemon::DaemonConfig) -> DaemonStateBundle {
-    if let Ok(content) = std::fs::read_to_string(path) {
-        if let Ok(mut state) = serde_json::from_str::<DaemonStateBundle>(&content) {
-            // Retain the pressure mode across restarts, but samples separated by
-            // daemon downtime are not a consecutive live-observation sequence.
-            state.daemon.memory_pressure.observe(None);
-            state.daemon.last_memory_pressure = None;
-            state.daemon.interrupt_overhead_recovery();
-            state.triggers.pressure.interrupt_observations();
-            return state;
-        }
-    }
+const DAEMON_STATE_MAX_BYTES: usize = 2 * 1024 * 1024;
 
+#[cfg(feature = "daemon")]
+fn load_daemon_state(path: &Path, config: &pt_core::daemon::DaemonConfig) -> DaemonStateBundle {
+    if let Ok(Some(mut state)) =
+        pt_core::daemon::read_daemon_json_bounded::<DaemonStateBundle>(path, DAEMON_STATE_MAX_BYTES)
+    {
+        // Retain modes across restarts; daemon downtime cannot establish a
+        // consecutive live-observation sequence or incident recovery.
+        state.daemon.memory_pressure.observe(None);
+        state.daemon.last_memory_pressure = None;
+        state.daemon.interrupt_overhead_recovery();
+        state.daemon.incidents.interrupt_observations();
+        state.triggers.pressure.interrupt_observations();
+        return state;
+    }
+    new_daemon_state(config)
+}
+
+#[cfg(feature = "daemon")]
+fn new_daemon_state(config: &pt_core::daemon::DaemonConfig) -> DaemonStateBundle {
     DaemonStateBundle {
         daemon: pt_core::daemon::DaemonState::new(),
         triggers: pt_core::daemon::triggers::TriggerState::new(&config.triggers),
@@ -20377,15 +20524,15 @@ fn load_daemon_state(path: &Path, config: &pt_core::daemon::DaemonConfig) -> Dae
 
 #[cfg(feature = "daemon")]
 fn save_daemon_state(path: &Path, state: &DaemonStateBundle) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    let content = serde_json::to_vec_pretty(state)
+    let content = serde_json::to_vec(state)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(&tmp, content)?;
-    std::fs::rename(tmp, path)?;
-    Ok(())
+    if content.len() > DAEMON_STATE_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "daemon state exceeds its storage budget",
+        ));
+    }
+    pt_core::session::write_serialized_json(path, &content).map_err(std::io::Error::other)
 }
 
 #[cfg(all(feature = "daemon", target_os = "linux"))]
@@ -21129,11 +21276,17 @@ mod daemon_pressure_tests {
         let result = DaemonEscalationResult {
             session_id: "io-review-plan".into(),
             candidates_found: 0,
+            plan_sha256: "a".repeat(64),
         };
         let trigger = critical_io_trigger();
-        let item =
-            persist_daemon_review_request(Some(&store), &result, std::slice::from_ref(&trigger))
-                .unwrap();
+        let incident = pt_common::SessionId::new().0;
+        let item = persist_daemon_review_request(
+            Some(&store),
+            &result,
+            std::slice::from_ref(&trigger),
+            Some(&incident),
+        )
+        .unwrap();
         let persisted = store.list().unwrap();
         assert_eq!(persisted.len(), 1);
         assert_eq!(persisted[0].id, item.id);
@@ -21142,6 +21295,10 @@ mod daemon_pressure_tests {
             vec![trigger.pressure_regime.unwrap()]
         );
         assert_eq!(persisted[0].candidates, Some(0));
+        assert_eq!(
+            persisted[0].incident_session_id.as_deref(),
+            Some(incident.as_str())
+        );
         assert!(persisted[0]
             .review_command
             .as_ref()
@@ -21166,17 +21323,20 @@ mod daemon_pressure_tests {
         let result = DaemonEscalationResult {
             session_id: "io-review-plan".into(),
             candidates_found: 0,
+            plan_sha256: "a".repeat(64),
         };
         let triggers = [critical_io_trigger()];
-        assert!(persist_daemon_review_request(None, &result, &triggers)
-            .unwrap_err()
-            .contains("inbox is unavailable"));
+        assert!(
+            persist_daemon_review_request(None, &result, &triggers, None)
+                .unwrap_err()
+                .contains("inbox is unavailable")
+        );
         let directory = tempfile::tempdir().unwrap();
         let blocked_path = directory.path().join("not-a-directory");
         std::fs::write(&blocked_path, "owned test fixture").unwrap();
         let store = pt_core::inbox::InboxStore::from_data_dir(&blocked_path);
         assert!(
-            persist_daemon_review_request(Some(&store), &result, &triggers)
+            persist_daemon_review_request(Some(&store), &result, &triggers, None)
                 .unwrap_err()
                 .contains("delivery failed")
         );
@@ -21189,17 +21349,21 @@ mod daemon_pressure_tests {
         let result = DaemonEscalationResult {
             session_id: "io-review-plan".into(),
             candidates_found: 0,
+            plan_sha256: "a".repeat(64),
         };
         let inbox_directory = directory.path().join("inbox");
         std::fs::create_dir_all(&inbox_directory).unwrap();
         let ledger = inbox_directory.join("items.jsonl");
         let original = b"{\"id\":\"interrupted-record\"";
         std::fs::write(&ledger, original).unwrap();
-        assert!(
-            persist_daemon_review_request(Some(&store), &result, &[critical_io_trigger()])
-                .unwrap_err()
-                .contains("existing inbox is unreadable")
-        );
+        assert!(persist_daemon_review_request(
+            Some(&store),
+            &result,
+            &[critical_io_trigger()],
+            None
+        )
+        .unwrap_err()
+        .contains("existing inbox is unreadable"));
         assert_eq!(std::fs::read(&ledger).unwrap(), original);
     }
 
@@ -21258,6 +21422,186 @@ mod daemon_pressure_tests {
         assert_eq!(calls, 1);
         assert_eq!(metrics.memory_used_mb, 244);
         assert_eq!(metrics.swap_used_mb, 19);
+    }
+
+    fn budget_incident_metrics(
+        started: std::time::Instant,
+        tick: u64,
+        cpu_stall: Option<f64>,
+    ) -> pt_core::daemon::TickMetrics {
+        use pt_core::collect::pressure::{MemInfo, PressureSnapshot, PsiLine, PsiResource};
+        let pressure = PressureSnapshot {
+            sampled_at_ms: tick * 60_000,
+            cpus: 4,
+            cpu: cpu_stall.map(|stall| PsiResource {
+                some: Some(PsiLine {
+                    avg10: stall,
+                    avg60: stall,
+                    avg300: stall,
+                    total_us: 10_000,
+                }),
+                full: None,
+            }),
+            memory: None,
+            io: None,
+            irq: None,
+            load: None,
+            meminfo: Some(MemInfo {
+                total: Some(1_000_000),
+                available: Some(800_000),
+                ..Default::default()
+            }),
+            vmstat: None,
+            file_handles: None,
+            unavailable: Vec::new(),
+        };
+        let mut metrics = daemon_metrics_from_pressure(pressure, DaemonProcessCensus::default());
+        metrics.pressure_observed_at = Some(started + std::time::Duration::from_secs(tick * 60));
+        metrics.timestamp = format!("budget-sample-{tick}");
+        metrics
+    }
+
+    #[test]
+    fn budget_deferred_incident_is_durable_before_the_daemon_state_save() {
+        use pt_core::daemon::escalation::EscalationStatus;
+        let directory = tempfile::tempdir().unwrap();
+        let store = pt_core::session::SessionStore::at_data_dir(directory.path());
+        let path = directory.path().join("daemon-state.json");
+        let mut config = DaemonConfig::default();
+        config.triggers.sustained_ticks = 1;
+        let mut bundle = new_daemon_state(&config);
+        save_daemon_state(&path, &bundle).unwrap();
+        let metrics = budget_incident_metrics(std::time::Instant::now(), 1, Some(40.0));
+        bundle.daemon.observe_memory_pressure(&config, &metrics);
+        bundle.triggers.pressure.observe(&config.triggers, &metrics);
+        daemon_capture_budget_incident(&config, &mut bundle.daemon, &bundle.triggers, &metrics);
+        // A storage outage remains visible while the episode is still held in
+        // memory; resolving storage publishes exactly that same episode.
+        assert!(persist_daemon_incidents(&mut bundle.daemon.incidents, None).is_none());
+        assert!(bundle.daemon.incidents.storage_error.is_some());
+        let incident =
+            persist_daemon_incidents(&mut bundle.daemon.incidents, Some(&store)).unwrap();
+        assert!(bundle.daemon.incidents.storage_error.is_none());
+        let id = pt_common::SessionId::parse(&incident).unwrap();
+        let record: pt_core::daemon::IncidentRecord = pt_core::daemon::read_daemon_json_bounded(
+            &store.session_dir(&id).join("incident.json"),
+            pt_core::daemon::INCIDENT_MAX_BYTES,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(record.causes[0].kind, RegimeKind::CpuContention);
+        assert_eq!(record.planner_attempts.len(), 1);
+        assert_eq!(
+            record.planner_attempts[0].status,
+            EscalationStatus::Deferred
+        );
+        assert!(record.planner_attempts[0]
+            .reason
+            .contains("overhead budget"));
+        assert!(record.planner_attempts[0].plan.is_none());
+        assert!(record.recovered_at.is_none());
+        assert_eq!(bundle.daemon.escalation_count, 0);
+
+        // The normal daemon-state file deliberately still predates the incident.
+        let mut restarted = load_daemon_state(&path, &config);
+        assert!(restarted.daemon.incidents.active_summary().is_none());
+        restarted
+            .daemon
+            .incidents
+            .recover_persisted(&store)
+            .unwrap();
+        let recovered = restarted.daemon.incidents.active_summary().unwrap();
+        assert_eq!(recovered.session_id, incident);
+        assert_eq!(
+            recovered.latest_planner_status,
+            Some(EscalationStatus::Deferred)
+        );
+        assert_eq!(recovered.samples_observed, 1);
+    }
+
+    #[test]
+    fn budget_incident_restart_and_missing_sensor_cannot_supply_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = pt_core::session::SessionStore::at_data_dir(directory.path());
+        let path = directory.path().join("daemon-state.json");
+        let mut config = DaemonConfig::default();
+        config.triggers.sustained_ticks = 1;
+        config.triggers.pressure_regimes.exit_after_ticks = 2;
+        let mut bundle = new_daemon_state(&config);
+        let started = std::time::Instant::now();
+        for (tick, stall) in [(1, Some(40.0)), (2, Some(0.0))] {
+            let metrics = budget_incident_metrics(started, tick, stall);
+            bundle.daemon.observe_memory_pressure(&config, &metrics);
+            bundle.triggers.pressure.observe(&config.triggers, &metrics);
+            daemon_capture_budget_incident(&config, &mut bundle.daemon, &bundle.triggers, &metrics);
+        }
+        let incident =
+            persist_daemon_incidents(&mut bundle.daemon.incidents, Some(&store)).unwrap();
+        save_daemon_state(&path, &bundle).unwrap();
+        let mut restarted = load_daemon_state(&path, &config);
+        restarted
+            .daemon
+            .incidents
+            .recover_persisted(&store)
+            .unwrap();
+        for (tick, stall) in [(3, Some(0.0)), (4, None), (5, Some(0.0))] {
+            let metrics = budget_incident_metrics(started, tick, stall);
+            restarted.daemon.observe_memory_pressure(&config, &metrics);
+            restarted
+                .triggers
+                .pressure
+                .observe(&config.triggers, &metrics);
+            daemon_capture_budget_incident(
+                &config,
+                &mut restarted.daemon,
+                &restarted.triggers,
+                &metrics,
+            );
+            assert_eq!(
+                restarted
+                    .daemon
+                    .incidents
+                    .active_summary()
+                    .unwrap()
+                    .session_id,
+                incident
+            );
+        }
+        let metrics = budget_incident_metrics(started, 6, Some(0.0));
+        restarted.daemon.observe_memory_pressure(&config, &metrics);
+        restarted
+            .triggers
+            .pressure
+            .observe(&config.triggers, &metrics);
+        daemon_capture_budget_incident(
+            &config,
+            &mut restarted.daemon,
+            &restarted.triggers,
+            &metrics,
+        );
+        assert!(restarted.daemon.incidents.active_summary().is_none());
+        assert!(persist_daemon_incidents(&mut restarted.daemon.incidents, Some(&store)).is_none());
+        assert!(restarted.daemon.incidents.storage_error.is_none());
+        let id = pt_common::SessionId::parse(&incident).unwrap();
+        let record: pt_core::daemon::IncidentRecord = pt_core::daemon::read_daemon_json_bounded(
+            &store.session_dir(&id).join("incident.json"),
+            pt_core::daemon::INCIDENT_MAX_BYTES,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(record.recovered_at.as_deref(), Some("budget-sample-6"));
+        assert!(record.after.iter().any(|sample| sample
+            .pressure
+            .as_ref()
+            .is_some_and(|pressure| pressure.cpu.is_none())));
+        let manifest: pt_core::session::SessionManifest =
+            pt_core::daemon::read_daemon_json_bounded(
+                &store.session_dir(&id).join("manifest.json"),
+                32 * 1024,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(manifest.state, pt_core::session::SessionState::Completed);
     }
 
     #[test]
@@ -25125,7 +25469,7 @@ mod process_tree_safety_tests {
                     .collect();
                 assert_eq!(pids.len(), 2);
                 assert_ne!(pids[0], pids[1]);
-                let bind = |pid| {
+                let bind = |pid: u32| {
                     // SAFETY: bind only a process emitted by the owned launcher.
                     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
                     assert!(
@@ -43568,7 +43912,11 @@ fn run_agent_session_status(
     host_id: &str,
     include_detail: bool,
 ) -> ExitCode {
-    let session_id = match SessionId::parse(session_id_str) {
+    let session_id = match session_id_str
+        .is_ascii()
+        .then(|| SessionId::parse(session_id_str))
+        .flatten()
+    {
         Some(sid) => sid,
         None => {
             eprintln!("agent sessions: invalid session ID: {}", session_id_str);
@@ -43585,22 +43933,60 @@ fn run_agent_session_status(
     };
 
     let manifest = match handle.read_manifest() {
-        Ok(m) => m,
+        Ok(m) if m.session_id == session_id.0 => m,
+        Ok(_) => {
+            eprintln!("agent sessions: manifest belongs to another session");
+            return ExitCode::IoError;
+        }
         Err(e) => {
             eprintln!("agent sessions: failed to read manifest: {}", e);
             return ExitCode::InternalError;
         }
     };
 
-    // Determine if session is resumable
-    let resumable = matches!(
-        manifest.state,
-        SessionState::Created
-            | SessionState::Scanning
-            | SessionState::Planned
-            | SessionState::Executing
-            | SessionState::Cancelled
+    #[cfg(feature = "daemon")]
+    let (incident_summary, incident_detail) =
+        match pt_core::daemon::load_incident_record(store, &session_id) {
+            Ok(Some(record)) if manifest.mode == SessionMode::DaemonAlert => (
+                Some(serde_json::json!(record.summary())),
+                include_detail.then(|| serde_json::json!(record)),
+            ),
+            Ok(Some(_)) => {
+                eprintln!("agent sessions: incident artifact requires a daemon alert session");
+                return ExitCode::IoError;
+            }
+            Ok(None) if manifest.mode == SessionMode::DaemonAlert => {
+                eprintln!(
+                    "agent sessions: incident evidence is missing; retry after daemon persistence"
+                );
+                return ExitCode::IoError;
+            }
+            Ok(None) => (None, None),
+            Err(error) => {
+                eprintln!("agent sessions: cannot read incident evidence: {error}");
+                return ExitCode::IoError;
+            }
+        };
+    #[cfg(not(feature = "daemon"))]
+    let (incident_summary, incident_detail): (
+        Option<serde_json::Value>,
+        Option<serde_json::Value>,
+    ) = (None, None);
+    let incident_detail_command = format!(
+        "pt --format json agent sessions --session {} --detail",
+        session_id.0
     );
+
+    // Incident sessions capture observations; they are never executable plans.
+    let resumable = manifest.mode != SessionMode::DaemonAlert
+        && matches!(
+            manifest.state,
+            SessionState::Created
+                | SessionState::Scanning
+                | SessionState::Planned
+                | SessionState::Executing
+                | SessionState::Cancelled
+        );
 
     // Count progress from action outcomes and plan metadata.
     let outcomes_path = handle.dir.join("action").join("outcomes.jsonl");
@@ -43672,7 +44058,7 @@ fn run_agent_session_status(
     };
 
     match global.format {
-        OutputFormat::Json | OutputFormat::Toon => {
+        OutputFormat::Json | OutputFormat::Jsonl | OutputFormat::Toon => {
             let mut output = serde_json::json!({
                 "schema_version": SCHEMA_VERSION,
                 "session_id": manifest.session_id,
@@ -43682,7 +44068,7 @@ fn run_agent_session_status(
                 "mode": manifest.mode,
                 "label": manifest.label,
                 "timing": manifest.timing,
-                "phase": match manifest.state {
+                "phase": if manifest.mode == SessionMode::DaemonAlert { "incident" } else { match manifest.state {
                     SessionState::Created => "init",
                     SessionState::Scanning => "scan",
                     SessionState::Planned => "plan",
@@ -43691,7 +44077,7 @@ fn run_agent_session_status(
                     SessionState::Cancelled => "cancelled",
                     SessionState::Failed => "failed",
                     SessionState::Archived => "archived",
-                },
+                } },
                 "progress": {
                     "total_actions": total_actions,
                     "completed_actions": completed_actions,
@@ -43708,6 +44094,14 @@ fn run_agent_session_status(
                 "status": "ok",
                 "command": format!("pt agent sessions --session {}", manifest.session_id),
             });
+            if let Some(summary) = &incident_summary {
+                output["incident"] = summary.clone();
+                output["incident_artifact"] = serde_json::json!("incident.json");
+                output["incident_detail_command"] = serde_json::json!(incident_detail_command);
+            }
+            if let Some(record) = &incident_detail {
+                output["incident_detail"] = record.clone();
+            }
             // Add detail if requested
             if include_detail {
                 if let Some(plan) = &plan_detail {
@@ -43721,9 +44115,27 @@ fn run_agent_session_status(
                     }
                 }
             }
-            println!("{}", format_structured_output(global, output));
+            if global.format == OutputFormat::Jsonl {
+                println!("{}", global.process_output_value(output));
+            } else {
+                println!("{}", format_structured_output(global, output));
+            }
         }
         OutputFormat::Summary => {
+            if let Some(incident) = &incident_summary {
+                println!(
+                    "[{}] critical pressure incident: {}, {} observations; details: {}",
+                    manifest.session_id,
+                    if incident["recovered_at"].is_null() {
+                        "active"
+                    } else {
+                        "recovered"
+                    },
+                    incident["samples_observed"],
+                    incident_detail_command
+                );
+                return ExitCode::Clean;
+            }
             let status_char = if resumable { "⏸" } else { "✓" };
             println!(
                 "[{}] {} {:?} ({}/{} actions)",
@@ -43765,6 +44177,45 @@ fn run_agent_session_status(
                 println!();
                 println!("## Error");
                 println!("{}", error);
+            }
+
+            if let Some(incident) = &incident_summary {
+                println!();
+                println!("## Critical Pressure Incident");
+                println!(
+                    "Status: {}",
+                    incident["recovered_at"].as_str().map_or_else(
+                        || "active; recovery has not been confirmed".to_string(),
+                        |at| format!("recovered at {at}")
+                    )
+                );
+                println!("Causes: {}", incident["causes"]);
+                println!(
+                    "Emergency memory pressure: {}",
+                    incident["memory_emergency"]
+                );
+                println!(
+                    "Observations: {} ({} omitted); planner attempts omitted: {}",
+                    incident["samples_observed"],
+                    incident["samples_dropped"],
+                    incident["planner_attempts_dropped"]
+                );
+                println!(
+                    "Latest planner status: {}",
+                    incident["latest_planner_status"]
+                );
+                if !incident["latest_plan"].is_null() {
+                    println!("Latest review plan: {}", incident["latest_plan"]);
+                }
+                println!("Full evidence: {incident_detail_command}");
+                if let Some(record) = &incident_detail {
+                    println!();
+                    println!("## Incident Detail");
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(record).unwrap_or_default()
+                    );
+                }
             }
 
             // Print detail if requested

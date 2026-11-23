@@ -1915,6 +1915,12 @@ fn retention_requires_preservation(
         if manifest.state == SessionState::Executing {
             return Some(true);
         }
+        // A pressure incident can remain active longer than the ordinary
+        // retention window. Scanning here means ongoing observation, not action
+        // execution; only confirmed recovery moves the alert to Completed.
+        if manifest.mode == SessionMode::DaemonAlert && manifest.state == SessionState::Scanning {
+            return Some(true);
+        }
         let created = DateTime::parse_from_rfc3339(&manifest.timing.created_at)
             .map(|value| value.with_timezone(&Utc))
             .ok()
@@ -3148,6 +3154,54 @@ mod tests {
             Duration::days(7)
         ));
         assert_eq!(std::fs::read(&path).unwrap(), b"partial manifest");
+    }
+
+    #[test]
+    fn retention_keeps_active_incidents_until_confirmed_completion() {
+        let directory = retained_retention_fixture();
+        let id = SessionId("pt-20260101-000000-alrt".to_string());
+        let session = directory.join("sessions").join(&id.0);
+        std::fs::create_dir_all(session.join(ACTION_DIR)).unwrap();
+        let mut manifest = SessionManifest::new(&id, None, SessionMode::DaemonAlert, None);
+        manifest.state = SessionState::Scanning;
+        manifest.timing.created_at = (Utc::now() - Duration::days(30)).to_rfc3339();
+        let path = session.join(MANIFEST_FILE);
+        std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let store = SessionStore::at_data_dir(&directory);
+        assert!(retention_requires_preservation(
+            &session,
+            &id.0,
+            Duration::days(7)
+        ));
+        assert_eq!(
+            store
+                .cleanup_sessions(Duration::days(7))
+                .unwrap()
+                .removed_count,
+            0
+        );
+        assert!(path.is_file());
+
+        // Ordinary stale scans remain eligible, and a recovered incident returns
+        // to the same age-based retention lifecycle as completed sessions.
+        manifest.mode = SessionMode::ScanOnly;
+        std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(!retention_requires_preservation(
+            &session,
+            &id.0,
+            Duration::days(7)
+        ));
+        manifest.mode = SessionMode::DaemonAlert;
+        manifest.state = SessionState::Completed;
+        std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert_eq!(
+            store
+                .cleanup_sessions(Duration::days(7))
+                .unwrap()
+                .removed_count,
+            1
+        );
+        assert!(!session.exists());
     }
 
     #[test]

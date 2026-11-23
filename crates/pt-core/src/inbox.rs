@@ -83,6 +83,9 @@ pub struct InboxItem {
     /// Associated session ID (if any).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Host-pressure evidence captured independently of the review planner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incident_session_id: Option<String>,
     /// Trigger reason (for escalations).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger: Option<String>,
@@ -128,6 +131,7 @@ impl InboxItem {
             item_type,
             created_at: now.to_rfc3339(),
             session_id: None,
+            incident_session_id: None,
             trigger: None,
             summary,
             candidates: None,

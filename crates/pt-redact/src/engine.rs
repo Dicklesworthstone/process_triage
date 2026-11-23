@@ -482,6 +482,9 @@ fn is_export_field(key: &str) -> bool {
         once_cell::sync::Lazy::new(|| {
             "schema_version bundle_version pt_version policy_version session_id
             generated_at created_at updated_at started_at ended_at completed_at timestamp ts state_history
+            revision opened_at last_observed_at recovered_at causes memory_emergency before after
+            planner_attempts samples_observed samples_dropped planner_attempts_dropped
+            process_census memory_mode observed_live unavailable_reason plan plan_sha256
             host_id hostname host os_family os_arch cores memory_total_gb
             payload integrity_sha256 policy_hash priors_hash config_hash
             summary total count total_processes total_system_processes
@@ -504,7 +507,7 @@ fn is_export_field(key: &str) -> bool {
             parent_patterns min_matches typical_lifetime_seconds max_normal_lifetime_seconds
             cpu_during_run idle_cpu_normal expected_memory_bytes expects_network expects_disk_io
             signature_age_weight system_state pressure assessment sampled_at_ms cpus psi
-            some full avg10 avg60 avg300 one five fifteen runnable meminfo vmstat file_handles
+            some full avg10 avg60 avg300 total_us load one five fifteen runnable meminfo vmstat file_handles macos_pressure
             total_gb available_gb used_gb process_count unavailable source reason load_ratio
             free available buffers cached swap_cached anon shmem slab slab_reclaimable
             slab_unreclaimable dirty writeback swap_total swap_free committed_as commit_limit
@@ -553,6 +556,12 @@ fn is_signature_matcher_field(field: &str) -> bool {
 }
 
 fn is_public_export_string(field: &str, value: &str) -> bool {
+    if field == "memory_mode" {
+        return matches!(value, "Normal" | "Warning" | "Emergency");
+    }
+    if field == "macos_pressure" {
+        return matches!(value, "normal" | "warning" | "critical");
+    }
     if matches!(field, "worst" | "severity") {
         return matches!(value, "ok" | "warn" | "crit");
     }
@@ -587,6 +596,7 @@ fn is_public_export_string(field: &str, value: &str) -> bool {
             value,
             "summary.json"
                 | "plan.json"
+                | "incident.json"
                 | "scan/inventory.json"
                 | "scan/provenance.json"
                 | "scan/provenance_audit.json"
@@ -611,7 +621,7 @@ fn is_public_export_string(field: &str, value: &str) -> bool {
     }
     if matches!(
         field,
-        "integrity_sha256" | "policy_hash" | "priors_hash" | "config_hash"
+        "integrity_sha256" | "policy_hash" | "priors_hash" | "config_hash" | "plan_sha256"
     ) {
         return value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
     }
@@ -623,6 +633,9 @@ fn is_public_export_string(field: &str, value: &str) -> bool {
             | "started_at"
             | "ended_at"
             | "completed_at"
+            | "opened_at"
+            | "last_observed_at"
+            | "recovered_at"
             | "timestamp"
             | "ts"
     ) {
@@ -720,7 +733,7 @@ fn is_public_export_string(field: &str, value: &str) -> bool {
             very_high veryhigh usefulbad normal very_low report_failure zombie_reaped
             quickscan deep quick interactive robot agent dry_run planned completed applied running
             created scanning executing cancelled archived robot_plan robot_apply daemon_alert scan_only export
-            success succeeded failed blocked skipped ok error linux macos darwin x86_64 aarch64
+            success succeeded failed deferred blocked skipped ok error linux macos darwin x86_64 aarch64
             blocked_by_plan blocked_by_constraints precheck_blocked identity_mismatch identity_check_failed
             already_completed shadow unsupported_platform
             irreversible reversible reversal no_action safe minimal forensic r s d z t i"

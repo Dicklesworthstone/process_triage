@@ -1854,7 +1854,9 @@ mod agent_session {
         }
         let path = session?;
         (path.is_absolute()
-            && path.extension().is_some_and(|extension| extension == "jsonl")
+            && path
+                .extension()
+                .is_some_and(|extension| extension == "jsonl")
             && path
                 .components()
                 .all(|part| matches!(part, Component::RootDir | Component::Normal(_))))
@@ -1875,8 +1877,8 @@ mod agent_session {
         const RESOLVE_NO_SYMLINKS: u64 = 0x04;
         const RESOLVE_IN_ROOT: u64 = 0x10;
         const RESOLVE_CACHED: u64 = 0x20;
-        let path =
-            CString::new(path.as_os_str().as_bytes()).map_err(|_| "session_explicit_path_invalid")?;
+        let path = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| "session_explicit_path_invalid")?;
         let how = OpenHow {
             flags: (libc::O_PATH | libc::O_CLOEXEC) as u64,
             mode: 0,

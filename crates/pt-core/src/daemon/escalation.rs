@@ -27,6 +27,8 @@ pub const PLAN_TIMEOUT_SECS: u64 = 60;
 pub struct DaemonEscalationResult {
     pub session_id: String,
     pub candidates_found: u32,
+    /// Canonical digest of the complete accepted planner document.
+    pub plan_sha256: String,
 }
 
 /// Run the real planner without letting a stalled child stop daemon monitoring.
@@ -103,6 +105,7 @@ fn parse_planner_output(
     Ok(DaemonEscalationResult {
         session_id: plan.session_id,
         candidates_found,
+        plan_sha256: crate::fleet::apply::plan_document_sha256(&document)?,
     })
 }
 
@@ -367,6 +370,10 @@ mod tests {
                     .unwrap();
             assert_eq!(result.session_id, "pt-20261112-123456-abcd");
             assert_eq!(result.candidates_found, count as u32);
+            assert_eq!(
+                result.plan_sha256,
+                crate::fleet::apply::plan_document_sha256(&planner_document(count)).unwrap()
+            );
         }
     }
 
