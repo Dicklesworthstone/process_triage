@@ -832,6 +832,19 @@ impl Scorer {
         }
     }
 
+    /// Construct a scorer from already loaded models and the complete policy.
+    /// Interactive refreshes can replace learned verdicts without losing the
+    /// same policy-controlled observations used by plan, explain and replay.
+    pub fn from_policy(
+        priors: Priors,
+        decisions: DecisionStore,
+        signatures: SignatureDatabase,
+        policy: &Policy,
+    ) -> Self {
+        Self::new(priors, decisions, signatures, fast_path_config(policy))
+            .with_agent_session_window(policy.guardrails.agent_session_window_seconds)
+    }
+
     /// Configure transcript freshness independently of the CPU/I/O sample.
     /// A zero lookback disables transcript collection and its retention signal.
     pub fn with_agent_session_window(mut self, window_seconds: u64) -> Self {
@@ -862,13 +875,12 @@ impl Scorer {
         let (signatures, signature_warnings) = load_signature_database(&config.config_dir);
         warnings.extend(signature_warnings);
         (
-            Self::new(
+            Self::from_policy(
                 config.priors.clone(),
                 decisions,
                 signatures,
-                fast_path_config(&config.policy),
-            )
-            .with_agent_session_window(config.policy.guardrails.agent_session_window_seconds),
+                &config.policy,
+            ),
             warnings,
         )
     }
@@ -2810,6 +2822,80 @@ mod tests {
             transcript_count: 1,
             latest_modified_at: Some(observed_at - chrono::Duration::seconds(age_seconds)),
             unavailable: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn policy_construction_and_refresh_apply_session_retention_boundaries() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = crate::config::load_config(&crate::config::ConfigOptions {
+            config_dir: Some(directory.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap();
+        let process = agent_record(100, 1, "codex exec review");
+        let capture = scorer(SignatureDatabase::with_defaults());
+        let mut observations = capture.recorded_observations(&process, None);
+        let mut unit = capture
+            .agent_activity_report(std::slice::from_ref(&process), true)
+            .units
+            .remove(0);
+        unit.session_activity = Some(session_activity_sample(&process, 600, 1800));
+        observations.agent_activity = Some(unit);
+
+        for (window, expected_live) in [
+            (0, None),
+            (600, None),
+            (601, Some(true)),
+            (7200, Some(true)),
+        ] {
+            config.policy.guardrails.agent_session_window_seconds = window;
+            config.policy.signature_fast_path.enabled = false;
+            let interactive = Scorer::from_policy(
+                config.priors.clone(),
+                DecisionStore::default(),
+                SignatureDatabase::with_defaults(),
+                &config.policy,
+            );
+            let (configured, warnings) = Scorer::from_config(&config);
+            assert!(warnings.is_empty(), "{warnings:?}");
+
+            for candidate in [interactive, configured] {
+                // The TUI clones its configured scorer on refresh, then replaces
+                // only the latest explicitly learned verdicts.
+                let mut refreshed = candidate.clone();
+                refreshed.decisions = DecisionStore::default();
+                for current in [&candidate, &refreshed] {
+                    assert!(!current.fast_path.enabled);
+                    let score = current
+                        .score_recorded(
+                            &process,
+                            Evidence::from_snapshot(&process),
+                            observations.clone(),
+                        )
+                        .unwrap();
+                    let live = assess_agent_liveness(
+                        &process,
+                        score.agent_activity.as_ref(),
+                        None,
+                        1800,
+                    )
+                    .unwrap();
+                    assert_eq!(live.live, expected_live, "policy lookback {window}");
+                    assert_eq!(
+                        live.sources
+                            .contains(&AgentLivenessSource::RecentSessionTranscriptActivity),
+                        expected_live == Some(true),
+                    );
+                    assert_eq!(
+                        score
+                            .ledger
+                            .why_summary
+                            .contains("an open session transcript was recently modified"),
+                        expected_live == Some(true),
+                    );
+                }
+            }
         }
     }
 

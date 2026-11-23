@@ -2599,11 +2599,11 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
     for warning in signature_warnings {
         eprintln!("pt: warning: {warning}");
     }
-    let base_scorer = Scorer::new(
+    let base_scorer = Scorer::from_policy(
         priors.clone(),
         Default::default(),
         signatures,
-        pt_core::scoring::fast_path_config(&policy),
+        &policy,
     );
     let scorer_with = |decisions: Option<&pt_core::decision::decision_store::DecisionStore>| {
         let mut scorer = base_scorer.clone();
@@ -33019,11 +33019,11 @@ fn load_priors_for_explain(global: &GlobalOpts) -> Result<ExplainContext, Config
             let policy = pt_core::config::Policy::default();
             let (signatures, _) =
                 pt_core::scoring::load_signature_database(&resolved_config_dir(global));
-            let scorer = Scorer::new(
+            let scorer = Scorer::from_policy(
                 Priors::default(),
                 Default::default(),
                 signatures,
-                pt_core::scoring::fast_path_config(&policy),
+                &policy,
             );
             (scorer, policy.guardrails)
         }
