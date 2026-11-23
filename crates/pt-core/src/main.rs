@@ -40450,6 +40450,8 @@ mod agent_activity_output_tests {
                     root_state: ProcessState::Sleeping,
                     age_seconds: 10,
                     sampling_window_ms: Some(500),
+                    session_window_seconds: Some(1800),
+                    session_activity: None,
                     activity: AgentActivityState::ActivityObserved,
                     member_count: 1,
                     composition: AgentChildComposition::default(),
