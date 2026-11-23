@@ -295,10 +295,12 @@ fn snapshot_identity(process: &ProcessRecord) -> ProcessIdentity {
 
 /// Capture the inputs used by shared scoring without executing process actions.
 ///
-/// Placement is collected once per record. Expensive activity/provenance probes
-/// run only for the capture policy's eligible population, with one shared window.
-/// Identity checks bracket observation collection; failed and unprobed rows are
-/// retained explicitly. The resulting file is private and still needs redaction.
+/// Placement is collected once per record. Activity uses one shared window over
+/// the complete census, so young/protected children can establish an agent root's
+/// progress without becoming candidates. Provenance and stored scoring rows remain
+/// limited to the capture policy's eligible population. Identity checks bracket
+/// observation collection; failed and unprobed rows are retained explicitly. The
+/// resulting file is private and still needs redaction.
 pub fn capture_snapshot(
     scan: &ScanResult,
     name: Option<&str>,
@@ -384,7 +386,8 @@ pub fn capture_snapshot(
             })
             .collect();
 
-        scorer.collect_activity(&eligible, window);
+        scorer.collect_activity(&scan.processes.iter().collect::<Vec<_>>(), window);
+        scorer.prepare_agent_activity(&scan.processes, scan.metadata.warnings.is_empty());
         let mut workloads = crate::collect::duplicates::collect_duplicate_work(&scan.processes);
         if !scan.metadata.warnings.is_empty() {
             workloads.mark_census_incomplete();
@@ -930,6 +933,247 @@ mod tests {
             .cmd(format!("{comm} --job"))
             .elapsed_secs(age)
             .build()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn capture_preserves_agent_progress_from_excluded_children_for_offline_replay() {
+        use crate::collect::{quick_scan, QuickScanOptions};
+        use crate::scoring::{assess_agent_liveness, AgentActivityState, AgentLivenessSource};
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        struct OwnedAgent(std::process::Child);
+        impl Drop for OwnedAgent {
+            fn drop(&mut self) {
+                // This leader is kept unreaped until its dedicated session and
+                // worker are terminated. Never signal an unrelated process group.
+                unsafe {
+                    libc::kill(-(self.0.id() as i32), libc::SIGKILL);
+                }
+                let _ = self.0.wait();
+            }
+        }
+
+        let mut command = Command::new("/bin/bash");
+        command
+            .arg0("codex")
+            .args([
+                "-c",
+                "sleep 2; sh -c 'while :; do :; done' >/dev/null 2>&1 & worker=$!; printf '%s\\n' \"$worker\"; wait \"$worker\"",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let mut target = OwnedAgent(command.spawn().expect("owned agent fixture"));
+        let agent_pid = target.0.id();
+        let mut stdout = target.0.stdout.take().unwrap();
+        let fd = stdout.as_raw_fd();
+        // The owned pipe remains valid through both fcntl calls. Nonblocking
+        // reads keep fixture startup bounded even if the shell stops responding.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(flags >= 0, "read readiness pipe flags");
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0,
+            "set readiness pipe nonblocking"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut ready = Vec::new();
+        loop {
+            let mut buffer = [0_u8; 32];
+            match stdout.read(&mut buffer) {
+                Ok(0) => panic!("agent exited before reporting its worker"),
+                Ok(count) => {
+                    ready.extend_from_slice(&buffer[..count]);
+                    assert!(ready.len() <= 32, "invalid worker readiness record");
+                    if ready.contains(&b'\n') {
+                        break;
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => panic!("worker readiness failed: {error}"),
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker readiness timed out"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let worker_pid: u32 = std::str::from_utf8(&ready)
+            .unwrap()
+            .trim()
+            .parse()
+            .expect("worker PID");
+        let initial =
+            crate::collect::collect_tick_snapshot(worker_pid).expect("worker CPU baseline");
+        let progress_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let current =
+                crate::collect::collect_tick_snapshot(worker_pid).expect("live owned worker");
+            assert_eq!(
+                current.starttime, initial.starttime,
+                "worker identity changed"
+            );
+            if current.total_ticks > initial.total_ticks {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < progress_deadline,
+                "worker made no CPU progress"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut scan = quick_scan(&QuickScanOptions {
+            pids: vec![agent_pid, worker_pid],
+            ..Default::default()
+        })
+        .expect("real fixture census");
+        // This fixture intentionally observes only its owned process tree.
+        scan.metadata
+            .warnings
+            .push("owned test census only".to_string());
+        let agent = scan
+            .processes
+            .iter()
+            .find(|p| p.pid.0 == agent_pid)
+            .unwrap();
+        let worker = scan
+            .processes
+            .iter()
+            .find(|p| p.pid.0 == worker_pid)
+            .unwrap();
+        assert_eq!(worker.ppid.0, agent_pid);
+        assert_eq!(
+            crate::collect::protected::agent_kind(&agent.cmd),
+            Some("codex")
+        );
+
+        let mut policy = Policy::default();
+        // Capture is read-only. Use an explicit fixture policy so the runner's
+        // own container/service placement cannot hide these two owned records.
+        policy.guardrails.builtin_protection = false;
+        policy.guardrails.protected_users.clear();
+        policy.guardrails.min_process_age_seconds = worker.elapsed_seconds() + 1;
+        assert!(agent.elapsed_seconds() >= policy.guardrails.min_process_age_seconds);
+        let mut scorer = replay_scorer();
+        let measured = capture_snapshot(
+            &scan,
+            Some("agent-with-young-worker"),
+            &mut scorer,
+            &policy,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let context = measured.scoring_context.as_ref().unwrap();
+        let observations = context.processes[&agent_pid].observations.as_ref().unwrap();
+        let activity = observations
+            .agent_activity
+            .as_ref()
+            .expect("captured agent unit");
+        assert_eq!(activity.activity, AgentActivityState::ActivityObserved);
+        assert_eq!(activity.sampling_window_ms, Some(1000));
+        assert_eq!(activity.composition.descendants, 1);
+        assert_eq!(activity.composition.active_descendants, 1);
+        assert!(context.processes[&worker_pid].observations.is_none());
+
+        // Disabling collection must not reuse the previous capture's progress.
+        let unmeasured = capture_snapshot(
+            &scan,
+            Some("agent-without-window"),
+            &mut scorer,
+            &policy,
+            Duration::ZERO,
+        )
+        .unwrap();
+        let unmeasured_observations = unmeasured.scoring_context.as_ref().unwrap().processes
+            [&agent_pid]
+            .observations
+            .as_ref()
+            .unwrap();
+        assert!(unmeasured_observations.activity.is_none());
+        let unknown = unmeasured_observations.agent_activity.as_ref().unwrap();
+        assert_eq!(unknown.activity, AgentActivityState::Unknown);
+        assert_eq!(unknown.sampling_window_ms, None);
+        assert_eq!(unknown.composition.active_descendants, 0);
+
+        // Explicit protection also limits candidate rows, not observation of
+        // the worker's progress on behalf of its agent root.
+        let mut protected_policy = policy.clone();
+        protected_policy.guardrails.min_process_age_seconds = 0;
+        protected_policy.guardrails.never_kill_pid.push(worker_pid);
+        let protected = capture_snapshot(
+            &scan,
+            Some("agent-with-protected-worker"),
+            &mut scorer,
+            &protected_policy,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let protected_context = protected.scoring_context.as_ref().unwrap();
+        assert!(protected_context.processes[&worker_pid].observations.is_none());
+        assert_eq!(
+            protected_context.processes[&agent_pid]
+                .observations
+                .as_ref()
+                .unwrap()
+                .agent_activity
+                .as_ref()
+                .unwrap()
+                .composition
+                .active_descendants,
+            1
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent-capture.json");
+        measured.save_new_private(&path).unwrap();
+        drop(target);
+        let restored = load_snapshot(&path).unwrap();
+        let recorded = restored.scoring_context.as_ref().unwrap().processes[&agent_pid]
+            .observations
+            .as_ref()
+            .unwrap();
+        let liveness =
+            assess_agent_liveness(agent, recorded.agent_activity.as_ref(), None, 1800).unwrap();
+        assert_eq!(liveness.live, Some(true));
+        assert!(liveness
+            .sources
+            .contains(&AgentLivenessSource::DescendantActivity));
+        let report = replay_scores(&restored, &replay_scorer(), &policy).unwrap();
+        let root = report.processes.iter().find(|p| p.pid == agent_pid).unwrap();
+        assert_eq!(root.status, ReplayScoreStatus::Scored);
+        assert!(root
+            .ledger
+            .as_ref()
+            .unwrap()
+            .why_summary
+            .contains("attributed child"));
+        assert_eq!(report.too_young_count, 1);
+        let protected_report =
+            replay_scores(&protected, &replay_scorer(), &protected_policy).unwrap();
+        assert_eq!(protected_report.scored_count, 1);
+        assert_eq!(protected_report.protected_count, 1);
+
+        policy.guardrails.min_process_age_seconds = 0;
+        let broadened = replay_scores(&restored, &replay_scorer(), &policy).unwrap();
+        assert_eq!(broadened.scored_count, 1);
+        assert_eq!(broadened.unavailable_count, 1);
     }
 
     #[test]
