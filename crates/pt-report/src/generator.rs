@@ -50,6 +50,220 @@ pub struct ReportGenerator {
     config: ReportConfig,
 }
 
+/// Recorded session data after validation and the requested export redaction.
+/// Every output format uses the same unknown-aware overview and artifacts.
+#[derive(Debug)]
+pub struct PreparedReport {
+    data: ReportData,
+    recorded: serde_json::Value,
+}
+
+/// Plain-text report destination and markup conventions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextReportFormat {
+    /// Slack mrkdwn with escaped mentions and links.
+    Slack,
+    /// Plain prose suitable for a terminal or saved text file.
+    Prose,
+}
+
+/// Presentation style; every style uses the same recorded facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextReportStyle {
+    /// Compact counts and outcomes.
+    Terse,
+    /// A formal report with recorded timing and candidate details.
+    Formal,
+    /// Separate fact lines including saved host and mode metadata.
+    Technical,
+    /// A conversational introduction to the recorded facts.
+    Conversational,
+}
+
+impl PreparedReport {
+    /// Render the prepared artifacts with the configured HTML sections.
+    pub fn render_html(&self) -> Result<String> {
+        let generator = ReportGenerator::new(self.data.config.clone());
+        let sections = generator.generate_recorded_sections(&self.recorded)?;
+        generator.finish_html(
+            generator.generate_html(&self.data, &sections, Some(&self.recorded["overview"])),
+            &self.data,
+        )
+    }
+
+    /// Summarize recorded observations, never current host state or predictions
+    /// reconstructed under today's policy. Rendering cannot bypass redaction.
+    pub fn render_summary(&self, format: TextReportFormat, style: TextReportStyle) -> String {
+        recorded_text_summary(&self.recorded, format, style)
+    }
+}
+
+fn summary_text(value: &serde_json::Value) -> String {
+    let Some(value) = value.as_str().filter(|value| !value.trim().is_empty()) else {
+        return "unknown".to_string();
+    };
+    value
+        .chars()
+        .take(160)
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+fn summary_count(value: &serde_json::Value) -> String {
+    value
+        .as_u64()
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn summary_recommendation(candidate: &serde_json::Value) -> String {
+    summary_text(
+        candidate
+            .get("recommended_action")
+            .or_else(|| candidate.get("recommendation"))
+            .unwrap_or(&serde_json::Value::Null),
+    )
+}
+
+fn summary_counts(values: impl Iterator<Item = String>) -> String {
+    let mut counts = std::collections::BTreeMap::new();
+    for value in values {
+        *counts.entry(value).or_insert(0usize) += 1;
+    }
+    if counts.is_empty() {
+        return "none recorded".to_string();
+    }
+    counts
+        .into_iter()
+        .map(|(value, count)| format!("{value} {count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Text formats deliberately consume the already redacted, null-aware snapshot
+/// used by HTML. Recommendations and outcome records remain distinct facts.
+fn recorded_text_summary(
+    recorded: &serde_json::Value,
+    format: TextReportFormat,
+    style: TextReportStyle,
+) -> String {
+    let overview = &recorded["overview"];
+    let session = summary_text(&overview["session_id"]);
+    let state = summary_text(&overview["state"]);
+    let scanned = summary_count(&overview["processes_scanned"]);
+    let candidate_count = summary_count(&overview["candidates_found"]);
+    let minimal = overview["export_profile"] == "minimal";
+    let candidates = recorded
+        .pointer("/plan/candidates")
+        .and_then(|v| v.as_array());
+    let recommendations = if minimal {
+        "withheld by the minimal profile".to_string()
+    } else if let Some(candidates) = candidates {
+        summary_counts(candidates.iter().map(summary_recommendation))
+    } else {
+        "not recorded".to_string()
+    };
+    let outcomes = recorded["outcomes"].as_array();
+    let outcome_count = outcomes
+        .map(|outcomes| outcomes.len() as u64)
+        .or_else(|| recorded["outcome_count"].as_u64());
+    let outcome_summary = match outcome_count {
+        Some(count) if count > 0 && minimal => {
+            format!("{count} recorded entries; details withheld by the minimal profile")
+        }
+        Some(count) if count > 0 => {
+            let statuses = summary_counts(
+                outcomes
+                    .into_iter()
+                    .flatten()
+                    .map(|outcome| summary_text(&outcome["status"])),
+            );
+            format!("{count} recorded entries ({statuses})")
+        }
+        _ => "not recorded; execution is unknown".to_string(),
+    };
+    // The legacy aggregate counts success/failed entries, not proven signal
+    // deliveries. Timeouts and refusals remain visible in the status counts.
+    let kill_outcomes = format!(
+        "Kill outcome records: success/failure entries {}; successes {}.",
+        summary_count(&overview["kills_attempted"]),
+        summary_count(&overview["kills_successful"]),
+    );
+    let mut facts = vec![
+        format!(
+            "Recorded state: {state}; processes scanned: {scanned}; candidates: {candidate_count}."
+        ),
+        format!("Recommendations: {recommendations}."),
+        format!("Outcomes: {outcome_summary}."),
+        kill_outcomes,
+    ];
+    if style != TextReportStyle::Terse {
+        facts.push(format!(
+            "Recorded start: {}; terminal transition: {}.",
+            summary_text(&overview["started_at"]),
+            summary_text(&overview["ended_at"]),
+        ));
+        if let Some(candidates) = candidates.filter(|candidates| !candidates.is_empty()) {
+            let details = candidates
+                .iter()
+                .take(5)
+                .map(|candidate| {
+                    format!(
+                        "PID {}: {}",
+                        summary_count(&candidate["pid"]),
+                        summary_recommendation(candidate),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            facts.push(format!(
+                "Recorded candidates (first {} of {}): {details}.",
+                candidates.len().min(5),
+                candidates.len(),
+            ));
+        }
+        facts.push(format!(
+            "Export profile: {}. Recommendations do not establish execution.",
+            summary_text(&overview["export_profile"]),
+        ));
+    }
+    if style == TextReportStyle::Technical {
+        facts.push(format!(
+            "Recorded host: {}; mode: {}.",
+            summary_text(&overview["host_id"]),
+            summary_text(&overview["mode"]),
+        ));
+    }
+    let title = match style {
+        TextReportStyle::Terse | TextReportStyle::Technical => {
+            format!("Process Triage — session {session}")
+        }
+        TextReportStyle::Formal => format!("Process Triage report for session {session}"),
+        TextReportStyle::Conversational => {
+            format!("Here's the recorded triage summary for session {session}.")
+        }
+    };
+    match format {
+        TextReportFormat::Slack => {
+            // Prevent saved metadata from turning into Slack mentions or links.
+            let text = format!("*{title}*\n• {}", facts.join("\n• "));
+            text.replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+        }
+        TextReportFormat::Prose if style == TextReportStyle::Technical => {
+            format!("{title}\n{}", facts.join("\n"))
+        }
+        TextReportFormat::Prose => format!("{title}\n\n{}", facts.join(" ")),
+    }
+}
+
 /// A session ends at its recorded terminal transition, not at an update or
 /// export. Resumed sessions and incomplete or inconsistent history stay unknown.
 pub fn recorded_session_end(metadata: &serde_json::Value) -> Option<DateTime<Utc>> {
@@ -101,6 +315,14 @@ impl ReportGenerator {
         &self,
         reader: &mut pt_bundle::BundleReader<R>,
     ) -> Result<String> {
+        self.prepare_from_bundle(reader)?.render_html()
+    }
+
+    /// Read and redact verified bundle artifacts once for any report format.
+    pub fn prepare_from_bundle<R: Read + Seek>(
+        &self,
+        reader: &mut pt_bundle::BundleReader<R>,
+    ) -> Result<PreparedReport> {
         debug!("Generating report from bundle");
 
         let overview = self.build_overview_from_manifest(reader.manifest());
@@ -138,7 +360,7 @@ impl ReportGenerator {
         } else {
             Vec::new()
         };
-        self.generate_recorded_artifacts(overview, recorded_overview, &plan, &outcomes)
+        self.prepare_recorded_artifacts(overview, recorded_overview, &plan, &outcomes)
     }
 
     /// Render recorded plan evidence and outcomes without reconstructing missing
@@ -149,17 +371,28 @@ impl ReportGenerator {
         plan: &serde_json::Value,
         outcomes: &[serde_json::Value],
     ) -> Result<String> {
-        let recorded_overview = serde_json::to_value(&overview)?;
-        self.generate_recorded_artifacts(overview, recorded_overview, plan, outcomes)
+        self.prepare_from_session_artifacts(overview, plan, outcomes)?
+            .render_html()
     }
 
-    fn generate_recorded_artifacts(
+    /// Validate and redact saved session artifacts without choosing a format.
+    pub fn prepare_from_session_artifacts(
+        &self,
+        overview: OverviewSection,
+        plan: &serde_json::Value,
+        outcomes: &[serde_json::Value],
+    ) -> Result<PreparedReport> {
+        let recorded_overview = serde_json::to_value(&overview)?;
+        self.prepare_recorded_artifacts(overview, recorded_overview, plan, outcomes)
+    }
+
+    fn prepare_recorded_artifacts(
         &self,
         mut overview: OverviewSection,
         mut recorded_overview: serde_json::Value,
         plan: &serde_json::Value,
         outcomes: &[serde_json::Value],
-    ) -> Result<String> {
+    ) -> Result<PreparedReport> {
         if !plan.is_object()
             || plan
                 .get("candidates")
@@ -260,11 +493,7 @@ impl ReportGenerator {
             actions: None,
             galaxy_brain: None,
         };
-        let sections = self.generate_recorded_sections(&recorded)?;
-        self.finish_html(
-            self.generate_html(&data, &sections, Some(&recorded["overview"])),
-            &data,
-        )
+        Ok(PreparedReport { data, recorded })
     }
 
     /// Generate report from structured data.

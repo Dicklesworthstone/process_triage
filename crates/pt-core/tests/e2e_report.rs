@@ -1258,49 +1258,389 @@ mod security {
 
 mod output_formats {
     use super::*;
+    use pt_core::session::{
+        SessionContext, SessionHandle, SessionManifest, SessionMode, SessionStore,
+    };
+    use std::fs;
+    use std::path::Path;
 
-    #[test]
-    fn slack_format_produces_text() {
-        let tmp = tempdir().unwrap();
-        let (_, session_id) = create_session(tmp.path());
+    // Saved fixtures exercise the CLI adapters without rescanning the host or
+    // executing the recommendations. Outcome entries are historical input.
+    fn saved_session(data_dir: &Path, with_outcomes: bool) -> SessionHandle {
+        let session_id = pt_common::SessionId::new();
+        let mut manifest = SessionManifest::new(&session_id, None, SessionMode::RobotPlan, None);
+        // Creation runs retention; establish the fixture before backdating its
+        // saved metadata so that automatic cleanup cannot remove it mid-setup.
+        let handle = SessionStore::at_data_dir(data_dir)
+            .create(&manifest)
+            .unwrap();
+        manifest.timing.created_at = "2026-01-15T12:00:00Z".to_string();
+        manifest.state_history[0].ts = manifest.timing.created_at.clone();
+        handle.write_manifest(&manifest).unwrap();
+        handle
+            .write_context(&SessionContext::new(
+                &session_id,
+                "private-summary-host".to_string(),
+                "summary-test".to_string(),
+                None,
+            ))
+            .unwrap();
+        fs::create_dir_all(handle.dir.join("decision")).unwrap();
+        fs::create_dir_all(handle.dir.join("action")).unwrap();
+        let plan = serde_json::json!({
+            "scan": {"total_processes": 42},
+            "candidates": [
+                {"pid": 61001, "recommended_action": "kill", "score": 99,
+                 "command": "python /home/private-summary/work.py --token AKIAIOSFODNN7EXAMPLE"},
+                {"pid": 61002, "recommended_action": "review", "score": 81},
+                {"pid": 61003, "recommended_action": "renice", "score": 68}
+            ],
+            "actions": [{"action_id": "recorded-kill", "action": "kill"}]
+        });
+        fs::write(
+            handle.dir.join("decision/plan.json"),
+            serde_json::to_vec(&plan).unwrap(),
+        )
+        .unwrap();
+        if with_outcomes {
+            let outcomes = [
+                serde_json::json!({"pid": 61001, "action_id": "recorded-kill", "status": "success"}),
+                serde_json::json!({"pid": 61002, "action": "kill", "status": "blocked"}),
+                serde_json::json!({"pid": 61003, "action": "renice", "status": "success"}),
+            ];
+            fs::write(
+                handle.dir.join("action/outcomes.jsonl"),
+                outcomes
+                    .iter()
+                    .map(|outcome| format!("{outcome}\n"))
+                    .collect::<String>(),
+            )
+            .unwrap();
+        }
+        handle
+    }
 
-        pt_core()
-            .env("PROCESS_TRIAGE_DATA", tmp.path().display().to_string())
+    fn text_report(
+        data_dir: &Path,
+        source_flag: &str,
+        source: &str,
+        format: &str,
+        profile: &str,
+        style: &str,
+    ) -> String {
+        let output = pt_core_fast()
+            .env("PROCESS_TRIAGE_DATA", data_dir)
             .args([
                 "--format",
                 "json",
                 "agent",
                 "report",
+                source_flag,
+                source,
+                "--report-format",
+                format,
+                "--profile",
+                profile,
+                "--prose-style",
+                style,
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let response: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(response["format"], format);
+        assert_eq!(response["prose_style"], style);
+        response["content"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn text_summaries_follow_recorded_recommendations_and_outcomes() {
+        let tmp = tempdir().unwrap();
+        let handle = saved_session(tmp.path(), true);
+        let manifest_before = fs::read(handle.dir.join("manifest.json")).unwrap();
+        let outcomes_before = fs::read(handle.dir.join("action/outcomes.jsonl")).unwrap();
+        for format in ["slack", "prose"] {
+            for style in ["terse", "conversational", "formal", "technical"] {
+                let text = text_report(
+                    tmp.path(),
+                    "--session",
+                    &handle.id.0,
+                    format,
+                    "forensic",
+                    style,
+                );
+                for fact in [
+                    handle.id.0.as_str(),
+                    "Recorded state: created",
+                    "processes scanned: 42; candidates: 3",
+                    "Recommendations: kill 1, renice 1, review 1",
+                    "Outcomes: 3 recorded entries (blocked 1, success 2)",
+                    "Kill outcome records: success/failure entries 1; successes 1",
+                ] {
+                    assert!(
+                        text.contains(fact),
+                        "{format}/{style}: missing {fact}: {text}"
+                    );
+                }
+                assert!(
+                    !text.contains("completed"),
+                    "an outcome does not complete the session"
+                );
+                assert!(!text.contains("AKIAIOSFODNN7EXAMPLE"));
+            }
+        }
+        assert_eq!(
+            fs::read(handle.dir.join("manifest.json")).unwrap(),
+            manifest_before
+        );
+        assert_eq!(
+            fs::read(handle.dir.join("action/outcomes.jsonl")).unwrap(),
+            outcomes_before
+        );
+
+        // Changing the saved source changes the report; a now-unresolvable
+        // action identifier must not turn missing kill evidence into zero.
+        fs::write(
+            handle.dir.join("decision/plan.json"),
+            br#"{"scan":{"total_processes":7},"candidates":[]}"#,
+        )
+        .unwrap();
+        let changed = text_report(
+            tmp.path(),
+            "--session",
+            &handle.id.0,
+            "prose",
+            "forensic",
+            "terse",
+        );
+        assert!(changed.contains("processes scanned: 7; candidates: 0"));
+        assert!(changed.contains("Recommendations: none recorded"));
+        assert!(changed
+            .contains("Kill outcome records: success/failure entries unknown; successes unknown"));
+
+        let missing = saved_session(tmp.path(), false);
+        let unknown = text_report(
+            tmp.path(),
+            "--session",
+            &missing.id.0,
+            "slack",
+            "safe",
+            "technical",
+        );
+        assert!(unknown.contains("Outcomes: not recorded; execution is unknown"));
+        assert!(unknown
+            .contains("Kill outcome records: success/failure entries unknown; successes unknown"));
+        assert!(unknown.contains("terminal transition: unknown"));
+        assert!(!unknown.contains("private-summary-host"));
+        assert!(!missing.dir.join("action/outcomes.jsonl").exists());
+    }
+
+    #[test]
+    fn bundle_and_session_summaries_agree_and_respect_export_profiles() {
+        let tmp = tempdir().unwrap();
+        let handle = saved_session(tmp.path(), true);
+        let mut writer = pt_bundle::BundleWriter::new(
+            &handle.id.0,
+            "private-summary-host",
+            pt_bundle::ExportProfile::Forensic,
+        );
+        writer
+            .add_json("session/manifest.json", &handle.read_manifest().unwrap())
+            .unwrap();
+        writer
+            .add_json("session/context.json", &handle.read_context().unwrap())
+            .unwrap();
+        writer.add_file(
+            "plan.json",
+            fs::read(handle.dir.join("decision/plan.json")).unwrap(),
+            None,
+        );
+        writer.add_file(
+            "logs/outcomes.jsonl",
+            fs::read(handle.dir.join("action/outcomes.jsonl")).unwrap(),
+            None,
+        );
+        let bundle = tmp.path().join("recorded.ptb");
+        writer.write(&bundle).unwrap();
+        for profile in ["minimal", "safe", "forensic"] {
+            let session_text = text_report(
+                tmp.path(),
                 "--session",
-                &session_id,
+                &handle.id.0,
+                "prose",
+                profile,
+                "formal",
+            );
+            let bundle_text = text_report(
+                tmp.path(),
+                "--bundle",
+                bundle.to_str().unwrap(),
+                "prose",
+                profile,
+                "formal",
+            );
+            assert_eq!(session_text, bundle_text, "{profile}");
+            assert!(session_text.contains("processes scanned: 42; candidates: 3"));
+            assert!(!session_text.contains("AKIAIOSFODNN7EXAMPLE"));
+            assert!(!session_text.contains("/home/private-summary"));
+            if profile == "minimal" {
+                assert!(session_text.contains("Recommendations: withheld by the minimal profile"));
+                assert!(session_text.contains("Outcomes: 3 recorded entries; details withheld"));
+                assert!(!session_text.contains("61001"));
+                assert!(!session_text.contains("blocked 1"));
+            } else {
+                assert!(session_text.contains("PID 61001: kill"));
+                assert!(
+                    session_text.contains("Outcomes: 3 recorded entries (blocked 1, success 2)")
+                );
+            }
+        }
+        let forensic = text_report(
+            tmp.path(),
+            "--session",
+            &handle.id.0,
+            "prose",
+            "forensic",
+            "technical",
+        );
+        assert!(forensic.contains("Recorded host: private-summary-host"));
+
+        // Even forensic Slack output must not activate mentions from metadata.
+        let mut context = handle.read_context().unwrap();
+        context.host_id = "<!channel> & host\nforged line".to_string();
+        handle.write_context(&context).unwrap();
+        let slack = text_report(
+            tmp.path(),
+            "--session",
+            &handle.id.0,
+            "slack",
+            "forensic",
+            "technical",
+        );
+        assert!(slack.contains("&lt;!channel&gt; &amp; host forged line"));
+        assert!(!slack.contains("<!channel>"));
+        assert!(!slack.contains("\nforged line"));
+    }
+
+    #[test]
+    fn every_report_format_honors_output_files_and_jsonl_receipts() {
+        let tmp = tempdir().unwrap();
+        let handle = saved_session(tmp.path(), false);
+        for format in ["html", "slack", "prose"] {
+            let destination = tmp.path().join(format!("report.{format}"));
+            let output = pt_core_fast()
+                .env("PROCESS_TRIAGE_DATA", tmp.path())
+                .args([
+                    "--format",
+                    "jsonl",
+                    "agent",
+                    "report",
+                    "--session",
+                    &handle.id.0,
+                    "--report-format",
+                    format,
+                    "--out",
+                ])
+                .arg(&destination)
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone();
+            assert_eq!(String::from_utf8_lossy(&output).lines().count(), 1);
+            let receipt: Value = serde_json::from_slice(&output).unwrap();
+            let content = fs::read_to_string(&destination).unwrap();
+            assert_eq!(receipt["status"], "success");
+            assert_eq!(receipt["format"], format);
+            assert_eq!(receipt["output_path"], destination.to_str().unwrap());
+            assert_eq!(receipt["size_bytes"], content.len());
+            assert!(receipt.get("content").is_none());
+            if format == "html" {
+                assert!(content.contains("<!DOCTYPE html>"));
+            } else {
+                assert!(content.contains("processes scanned: 42; candidates: 3"));
+                assert!(content.contains("execution is unknown"));
+            }
+        }
+        let output = pt_core_fast()
+            .env("PROCESS_TRIAGE_DATA", tmp.path())
+            .args([
+                "--format",
+                "jsonl",
+                "agent",
+                "report",
+                "--session",
+                &handle.id.0,
                 "--report-format",
                 "slack",
             ])
             .assert()
             .success()
-            .stdout(predicate::str::contains("slack"));
-    }
-
-    #[test]
-    fn prose_format_produces_text() {
-        let tmp = tempdir().unwrap();
-        let (_, session_id) = create_session(tmp.path());
-
-        pt_core()
-            .env("PROCESS_TRIAGE_DATA", tmp.path().display().to_string())
+            .get_output()
+            .stdout
+            .clone();
+        assert_eq!(String::from_utf8_lossy(&output).lines().count(), 1);
+        let response: Value = serde_json::from_slice(&output).unwrap();
+        assert!(response["content"]
+            .as_str()
+            .unwrap()
+            .contains("execution is unknown"));
+        pt_core_fast()
+            .env("PROCESS_TRIAGE_DATA", tmp.path())
             .args([
                 "--format",
                 "json",
                 "agent",
                 "report",
                 "--session",
-                &session_id,
+                &handle.id.0,
                 "--report-format",
                 "prose",
+                "--out",
+            ])
+            .arg(tmp.path().join("missing-parent/report.txt"))
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("failed to write output"))
+            .stdout(predicate::str::is_empty());
+    }
+
+    #[test]
+    fn text_reports_reject_ambiguous_sources_and_invalid_styles() {
+        let tmp = tempdir().unwrap();
+        let handle = saved_session(tmp.path(), false);
+        pt_core_fast()
+            .env("PROCESS_TRIAGE_DATA", tmp.path())
+            .args([
+                "agent",
+                "report",
+                "--session",
+                &handle.id.0,
+                "--bundle",
+                "unused.ptb",
             ])
             .assert()
-            .success()
-            .stdout(predicate::str::contains("prose"));
+            .failure()
+            .stderr(predicate::str::contains(
+                "specify only one of --session or --bundle",
+            ));
+        pt_core_fast()
+            .env("PROCESS_TRIAGE_DATA", tmp.path())
+            .args([
+                "agent",
+                "report",
+                "--session",
+                &handle.id.0,
+                "--report-format",
+                "prose",
+                "--prose-style",
+                "unknown-style",
+            ])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("invalid prose style"));
     }
 }
 

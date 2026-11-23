@@ -1773,7 +1773,7 @@ struct AgentReportArgs {
     #[arg(long)]
     bundle: Option<String>,
 
-    /// Output path for the HTML report
+    /// Output path for the selected report format
     #[arg(short, long)]
     out: Option<String>,
 
@@ -3325,9 +3325,8 @@ fn build_plan_from_selection(
         let Some(candidate) = candidates.get(pid) else {
             continue;
         };
-        plan_candidates.push(
-            candidate.decision_candidate_for_selection(explicitly_selected.contains(pid)),
-        );
+        plan_candidates
+            .push(candidate.decision_candidate_for_selection(explicitly_selected.contains(pid)));
     }
 
     if plan_candidates.is_empty() {
@@ -4978,13 +4977,8 @@ fn execute_tui_plan_selection(
     let execution = (|| {
         // Persist every earlier binding, but execute only this new selection.
         write_plan_to_session(handle, selection)?;
-        let ((result, mut evidence), lock) = execute_plan_actions(
-            handle,
-            policy,
-            selection,
-            confirmed_agent_children,
-            state,
-        )?;
+        let ((result, mut evidence), lock) =
+            execute_plan_actions(handle, policy, selection, confirmed_agent_children, state)?;
         execution_lock = Some(lock);
         #[cfg(unix)]
         for outcome in &result.outcomes {
@@ -23822,7 +23816,8 @@ mod process_tree_safety_tests {
             .collect();
         let session = pt_common::SessionId::new();
         let permitted =
-            super::build_plan_from_selection(&session, &policy, &[100, 200], &[], &candidates).unwrap();
+            super::build_plan_from_selection(&session, &policy, &[100, 200], &[], &candidates)
+                .unwrap();
         assert_eq!(permitted.actions.len(), 2);
         assert!(permitted.actions.iter().all(|action| !action.blocked));
         let error =
@@ -23830,7 +23825,9 @@ mod process_tree_safety_tests {
                 .unwrap_err();
         assert!(error.contains("selected 3 kills/restarts exceed the per-run policy limit 2"));
         policy.guardrails.max_kills_per_run = 0;
-        assert!(super::build_plan_from_selection(&session, &policy, &[100], &[], &candidates).is_err());
+        assert!(
+            super::build_plan_from_selection(&session, &policy, &[100], &[], &candidates).is_err()
+        );
     }
 
     #[cfg(feature = "ui")]
@@ -25089,14 +25086,18 @@ mod process_tree_safety_tests {
                         Ok(())
                     });
                 }
-                let mut setup = WrapperSetup(Some(command.spawn().expect("spawn owned agent family")));
+                let mut setup =
+                    WrapperSetup(Some(command.spawn().expect("spawn owned agent family")));
                 let mut stdout = setup.0.as_mut().unwrap().stdout.take().unwrap();
                 // Bound setup even if the launcher never writes its readiness line.
                 let flags = unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_GETFL) };
                 assert!(flags >= 0);
-                assert_eq!(unsafe {
-                    libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)
-                }, 0);
+                assert_eq!(
+                    unsafe {
+                        libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)
+                    },
+                    0
+                );
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
                 let mut readiness = Vec::new();
                 loop {
@@ -25111,7 +25112,10 @@ mod process_tree_safety_tests {
                     if readiness.contains(&b'\n') {
                         break;
                     }
-                    assert!(std::time::Instant::now() < deadline, "agent readiness timed out");
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "agent readiness timed out"
+                    );
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
                 let pids: Vec<u32> = std::str::from_utf8(&readiness)
@@ -25124,7 +25128,11 @@ mod process_tree_safety_tests {
                 let bind = |pid| {
                     // SAFETY: bind only a process emitted by the owned launcher.
                     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-                    assert!(fd >= 0, "bind agent child: {}", std::io::Error::last_os_error());
+                    assert!(
+                        fd >= 0,
+                        "bind agent child: {}",
+                        std::io::Error::last_os_error()
+                    );
                     unsafe { OwnedFd::from_raw_fd(fd as i32) }
                 };
                 let child_pidfd = bind(pids[0]);
@@ -25141,7 +25149,10 @@ mod process_tree_safety_tests {
                         .map(|comm| comm.trim() != "sleep")
                         .unwrap_or(true)
                     {
-                        assert!(std::time::Instant::now() < deadline, "agent child never exec'd");
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "agent child never exec'd"
+                        );
                         std::thread::sleep(std::time::Duration::from_millis(10));
                     }
                 }
@@ -25278,9 +25289,14 @@ mod process_tree_safety_tests {
                     agent_child_review: None,
                 },
             )]);
-            let plan =
-                super::super::build_plan_from_selection(&handle.id, policy, &[pid], &[], &candidates)
-                    .expect("produce canonical selected action");
+            let plan = super::super::build_plan_from_selection(
+                &handle.id,
+                policy,
+                &[pid],
+                &[],
+                &candidates,
+            )
+            .expect("produce canonical selected action");
             assert_eq!(plan.actions.len(), 1);
             assert_eq!(plan.actions[0].action, Action::Kill);
             assert_eq!(
@@ -25653,16 +25669,30 @@ mod process_tree_safety_tests {
         let before = quick_scan(&options).expect("observe owned agent and both children");
         assert!(before.metadata.warnings.is_empty());
         assert_eq!(before.processes.len(), 3);
-        let parent = before.processes.iter().find(|p| p.pid.0 == family.agent.id()).unwrap();
-        let child = before.processes.iter().find(|p| p.pid.0 == family.child_pid).unwrap();
-        let sibling = before.processes.iter().find(|p| p.pid.0 == family.sibling_pid).unwrap();
+        let parent = before
+            .processes
+            .iter()
+            .find(|p| p.pid.0 == family.agent.id())
+            .unwrap();
+        let child = before
+            .processes
+            .iter()
+            .find(|p| p.pid.0 == family.child_pid)
+            .unwrap();
+        let sibling = before
+            .processes
+            .iter()
+            .find(|p| p.pid.0 == family.sibling_pid)
+            .unwrap();
         let parent_identity = process_identity_from_record(parent);
         let sibling_identity = process_identity_from_record(sibling);
         let review = AgentChildReview::from_records(child, parent)
             .expect("review the actual immediate non-agent child");
         assert_eq!(sibling.ppid, parent.pid);
         assert_ne!(child.sid, Some(child.pid.0));
-        assert!(fd_evidence(child.pid.0).iter().all(|fd| fd["writable_regular"] == false));
+        assert!(fd_evidence(child.pid.0)
+            .iter()
+            .all(|fd| fd["writable_regular"] == false));
         let posterior = ClassScores {
             useful: 0.001,
             useful_bad: 0.0,
@@ -25720,28 +25750,49 @@ mod process_tree_safety_tests {
             blast_radius_risk: None,
         }];
         super::finalize_tui_recommendations(
-            &mut rows, &mut candidates, &mut inputs, &before.processes, &policy,
+            &mut rows,
+            &mut candidates,
+            &mut inputs,
+            &before.processes,
+            &policy,
         );
         assert_eq!(rows[0].classification, "REVIEW");
         assert!(!rows[0].selected);
-        assert!(rows[0].top_evidence.iter().any(|reason| reason.contains("confirm to request its kill")));
+        assert!(rows[0]
+            .top_evidence
+            .iter()
+            .any(|reason| reason.contains("confirm to request its kill")));
         assert!(inputs[&child.pid.0].blocked_reasons.is_empty());
-        assert_eq!(candidates[&child.pid.0]["tree_safety"]["rule"], "agent_descendant");
+        assert_eq!(
+            candidates[&child.pid.0]["tree_safety"]["rule"],
+            "agent_descendant"
+        );
         // Goal finalization repeats synchronization. It must neither select the
         // child automatically nor lose the narrowly reviewable reason.
         let goal = super::parse_goal("free 1 process").unwrap();
         let goal_output = super::finalize_tui_goal_selection(
-            &handle.id, &goal, 0.0, &mut rows, &mut candidates, &mut inputs,
-            &policy, &before.processes, &super::GoalResourceSnapshot::default(),
-        ).unwrap();
+            &handle.id,
+            &goal,
+            0.0,
+            &mut rows,
+            &mut candidates,
+            &mut inputs,
+            &policy,
+            &before.processes,
+            &super::GoalResourceSnapshot::default(),
+        )
+        .unwrap();
         assert!(goal_output.selected_pids.is_empty());
         assert!(!rows[0].selected);
         assert!(inputs[&child.pid.0].blocked_reasons.is_empty());
         let selected = [child.pid.0];
-        let bulk = super::build_plan_from_selection(&handle.id, &policy, &selected, &[], &inputs).unwrap();
+        let bulk =
+            super::build_plan_from_selection(&handle.id, &policy, &selected, &[], &inputs).unwrap();
         assert!(bulk.actions.is_empty());
         assert!(super::confirmed_agent_child_actions(&bulk, &[], &inputs).is_empty());
-        let plan = super::build_plan_from_selection(&handle.id, &policy, &selected, &selected, &inputs).unwrap();
+        let plan =
+            super::build_plan_from_selection(&handle.id, &policy, &selected, &selected, &inputs)
+                .unwrap();
         assert_eq!(plan.actions.len(), 1);
         assert_eq!(plan.actions[0].action, Action::Kill);
         let confirmations = super::confirmed_agent_child_actions(&plan, &selected, &inputs);
@@ -25752,57 +25803,112 @@ mod process_tree_safety_tests {
             .unwrap()
             .blocked_reasons
             .push("independent policy refusal".to_string());
-        let still_blocked = super::build_plan_from_selection(
-            &handle.id, &policy, &selected, &selected, &inputs,
-        ).unwrap();
+        let still_blocked =
+            super::build_plan_from_selection(&handle.id, &policy, &selected, &selected, &inputs)
+                .unwrap();
         assert!(still_blocked.actions.is_empty());
         assert!(super::confirmed_agent_child_actions(&plan, &selected, &inputs).is_empty());
         assert_eq!(
-            inputs.get_mut(&child.pid.0).unwrap().blocked_reasons.pop().as_deref(),
+            inputs
+                .get_mut(&child.pid.0)
+                .unwrap()
+                .blocked_reasons
+                .pop()
+                .as_deref(),
             Some("independent policy refusal"),
         );
 
         let provider = LivePreCheckProvider::new(
-            Some(&policy.guardrails), LivePreCheckConfig::from(&policy.data_loss_gates),
-        ).unwrap().with_confirmed_agent_children(confirmations.clone());
+            Some(&policy.guardrails),
+            LivePreCheckConfig::from(&policy.data_loss_gates),
+        )
+        .unwrap()
+        .with_confirmed_agent_children(confirmations.clone());
         assert!(!provider.check_agent_supervision(child.pid.0).is_passed());
-        assert!(provider.run_checks_for_action(
-            &[pt_core::plan::PreCheck::CheckAgentSupervision], child.pid.0, child.sid, Action::Kill,
-        ).iter().any(|result| !result.is_passed()), "PID-only API cannot consume an action approval");
+        assert!(
+            provider
+                .run_checks_for_action(
+                    &[pt_core::plan::PreCheck::CheckAgentSupervision],
+                    child.pid.0,
+                    child.sid,
+                    Action::Kill,
+                )
+                .iter()
+                .any(|result| !result.is_passed()),
+            "PID-only API cannot consume an action approval"
+        );
         let mut changed = plan.actions[0].clone();
         changed.action_id.push_str("-another-action");
-        assert!(super::confirmed_tui_tree_refusal(&changed, &before.processes, true, &confirmations).is_some());
+        assert!(super::confirmed_tui_tree_refusal(
+            &changed,
+            &before.processes,
+            true,
+            &confirmations
+        )
+        .is_some());
         let mut reparented = before.processes.clone();
-        reparented.iter_mut().find(|p| p.pid == child.pid).unwrap().ppid = sibling.pid;
-        assert!(super::confirmed_tui_tree_refusal(&plan.actions[0], &reparented, true, &confirmations).is_some());
+        reparented
+            .iter_mut()
+            .find(|p| p.pid == child.pid)
+            .unwrap()
+            .ppid = sibling.pid;
+        assert!(super::confirmed_tui_tree_refusal(
+            &plan.actions[0],
+            &reparented,
+            true,
+            &confirmations
+        )
+        .is_some());
         let mut has_live_child = before.processes.clone();
-        has_live_child.iter_mut().find(|p| p.pid == sibling.pid).unwrap().ppid = child.pid;
-        assert!(super::confirmed_tui_tree_refusal(&plan.actions[0], &has_live_child, true, &confirmations)
-            .unwrap().contains("has live child"));
+        has_live_child
+            .iter_mut()
+            .find(|p| p.pid == sibling.pid)
+            .unwrap()
+            .ppid = child.pid;
+        assert!(super::confirmed_tui_tree_refusal(
+            &plan.actions[0],
+            &has_live_child,
+            true,
+            &confirmations
+        )
+        .unwrap()
+        .contains("has live child"));
 
         // Serialized evidence never carries the in-memory human approval.
         super::write_plan_to_session(&handle, &plan).unwrap();
         let saved_plan = pt_core::verify::parse_agent_plan(
             &std::fs::read_to_string(handle.dir.join("decision/plan.json")).unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
         let mut state = super::TuiExecutionState::default();
-        let (refused, refusal_evidence) = super::execute_tui_plan_selection(
-            &handle, &policy, &saved_plan, &[], &mut state,
-        ).expect("record refusal without fresh interactive consent");
+        let (refused, refusal_evidence) =
+            super::execute_tui_plan_selection(&handle, &policy, &saved_plan, &[], &mut state)
+                .expect("record refusal without fresh interactive consent");
         assert_eq!(refused.summary.actions_succeeded, 0);
-        assert!(matches!(&refused.outcomes[0].status, ActionStatus::PreCheckBlocked { reason, .. }
-            if reason.contains("agent session")));
+        assert!(
+            matches!(&refused.outcomes[0].status, ActionStatus::PreCheckBlocked { reason, .. }
+            if reason.contains("agent session"))
+        );
         assert!(refusal_evidence.is_empty());
         assert_eq!(state.enforcer.as_ref().unwrap().current_run_kill_count(), 0);
-        record(&log_dir, serde_json::json!({"step": "saved_plan_has_no_consent", "result": refused, "before": before.processes}));
+        record(
+            &log_dir,
+            serde_json::json!({"step": "saved_plan_has_no_consent", "result": refused, "before": before.processes}),
+        );
 
-        let (result, evidence) = super::execute_tui_plan_selection(
-            &handle, &policy, &plan, &confirmations, &mut state,
-        ).expect("execute actual individually confirmed child through TUI callback helper");
-        record(&log_dir, serde_json::json!({"step": "confirmed_child_execution", "result": result, "evidence": evidence}));
+        let (result, evidence) =
+            super::execute_tui_plan_selection(&handle, &policy, &plan, &confirmations, &mut state)
+                .expect("execute actual individually confirmed child through TUI callback helper");
+        record(
+            &log_dir,
+            serde_json::json!({"step": "confirmed_child_execution", "result": result, "evidence": evidence}),
+        );
         assert_eq!(result.summary.actions_succeeded, 1, "{result:?}");
         assert_eq!(result.outcomes[0].status, ActionStatus::Success);
-        assert_eq!(evidence[&plan.actions[0].action_id]["kill_signal_delivered"], true);
+        assert_eq!(
+            evidence[&plan.actions[0].action_id]["kill_signal_delivered"],
+            true
+        );
         assert_eq!(state.enforcer.as_ref().unwrap().current_run_kill_count(), 1);
         assert!(family.agent.try_wait().unwrap().is_none());
         // Signal success can precede the agent's waitpid. Bound that scheduling
@@ -25812,23 +25918,34 @@ mod process_tree_safety_tests {
             let after = quick_scan(&options).expect("observe surviving agent and sibling");
             assert!(after.metadata.warnings.is_empty());
             for identity in [&parent_identity, &sibling_identity] {
-                let survivor = after.processes.iter().find(|p| p.pid == identity.pid).unwrap();
+                let survivor = after
+                    .processes
+                    .iter()
+                    .find(|p| p.pid == identity.pid)
+                    .unwrap();
                 assert!(survivor.state.is_active());
                 assert_eq!(process_identity_from_record(survivor), *identity);
             }
             if after.processes.iter().all(|p| p.pid != child.pid) {
                 break after;
             }
-            assert!(std::time::Instant::now() < deadline, "agent did not reap selected child");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "agent did not reap selected child"
+            );
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
         let outcomes = pt_core::verify::parse_action_outcomes(
             &std::fs::read_to_string(handle.dir.join("action/outcomes.jsonl")).unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(outcomes.len(), 2);
         assert_eq!(outcomes[0].status, "precheck_blocked");
         assert_eq!(outcomes[1].status, "success");
-        record(&log_dir, serde_json::json!({"step": "parent_and_sibling_survived", "after": after.processes, "outcomes": outcomes}));
+        record(
+            &log_dir,
+            serde_json::json!({"step": "parent_and_sibling_survived", "after": after.processes, "outcomes": outcomes}),
+        );
     }
 
     /// An actual wrapper selection must preserve its unselected live child.
@@ -25999,9 +26116,14 @@ mod process_tree_safety_tests {
         // execution fixture: the wrong owner must refuse signaling this target.
         refused_selection.actions[0].target.uid ^= 1;
         let mut state = super::TuiExecutionState::default();
-        let (refusal, refusal_evidence) =
-            super::execute_tui_plan_selection(&handle, &policy, &refused_selection, &[], &mut state)
-                .expect("retain actual runtime identity refusal");
+        let (refusal, refusal_evidence) = super::execute_tui_plan_selection(
+            &handle,
+            &policy,
+            &refused_selection,
+            &[],
+            &mut state,
+        )
+        .expect("retain actual runtime identity refusal");
         record(
             &log_dir,
             serde_json::json!({"step": "wrong_uid_refusal", "plan": refused_selection, "result": refusal, "evidence": refusal_evidence}),
@@ -26173,8 +26295,9 @@ mod process_tree_safety_tests {
         };
         let mut state = super::TuiExecutionState::default();
         let (result, evidence) = std::thread::scope(|scope| {
-            let execution = scope
-                .spawn(|| super::execute_tui_plan_selection(&handle, &policy, &batch, &[], &mut state));
+            let execution = scope.spawn(|| {
+                super::execute_tui_plan_selection(&handle, &policy, &batch, &[], &mut state)
+            });
             wait_for_handler(0);
             wait_for_handler(1);
             // Both handlers are held open by owned input pipes. Their TERM
@@ -26278,8 +26401,9 @@ mod process_tree_safety_tests {
         batch.gates_summary.pre_toggled_actions = 2;
         let mut state = super::TuiExecutionState::default();
         let (result, evidence) = std::thread::scope(|scope| {
-            let execution = scope
-                .spawn(|| super::execute_tui_plan_selection(&handle, &policy, &batch, &[], &mut state));
+            let execution = scope.spawn(|| {
+                super::execute_tui_plan_selection(&handle, &policy, &batch, &[], &mut state)
+            });
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
             while !marker.exists() {
                 assert!(
@@ -30871,7 +30995,7 @@ fn apply_candidate_fdr_gate(
             candidate["recommendation"] = serde_json::json!("REVIEW");
             let previous = candidate["action_rationale"].as_str().unwrap_or("");
             candidate["action_rationale"] = serde_json::json!(format!(
-                "Kill downgraded to review by FDR policy: {}; {previous}",
+                "Action downgraded to review by FDR policy: {}; {previous}",
                 decision.reason,
             ));
         }
@@ -40276,6 +40400,7 @@ fn run_agent_tail(_global: &GlobalOpts, args: &AgentTailArgs) -> ExitCode {
 
 #[cfg(feature = "report")]
 fn run_agent_report(global: &GlobalOpts, args: &AgentReportArgs) -> ExitCode {
+    use pt_report::generator::{TextReportFormat, TextReportStyle};
     use pt_report::{ReportConfig, ReportGenerator, ReportTheme};
 
     // Validate inputs: need either session or bundle
@@ -40283,6 +40408,37 @@ fn run_agent_report(global: &GlobalOpts, args: &AgentReportArgs) -> ExitCode {
         eprintln!("agent report: must specify either --session or --bundle");
         return ExitCode::ArgsError;
     }
+    if args.session.is_some() && args.bundle.is_some() {
+        eprintln!("agent report: specify only one of --session or --bundle");
+        return ExitCode::ArgsError;
+    }
+    let report_format = args.report_format.to_lowercase();
+    let text_format = match report_format.as_str() {
+        "html" => None,
+        "slack" => Some(TextReportFormat::Slack),
+        "prose" => Some(TextReportFormat::Prose),
+        _ => {
+            eprintln!(
+                "agent report: invalid format '{}', use: html, slack, prose",
+                args.report_format
+            );
+            return ExitCode::ArgsError;
+        }
+    };
+    let prose_style = args.prose_style.to_lowercase();
+    let style = match prose_style.as_str() {
+        "terse" => TextReportStyle::Terse,
+        "formal" => TextReportStyle::Formal,
+        "technical" => TextReportStyle::Technical,
+        "conversational" => TextReportStyle::Conversational,
+        _ => {
+            eprintln!(
+                "agent report: invalid prose style '{}', use: terse, conversational, formal, technical",
+                args.prose_style
+            );
+            return ExitCode::ArgsError;
+        }
+    };
 
     // Parse theme
     let theme = match args.theme.to_lowercase().as_str() {
@@ -40311,8 +40467,8 @@ fn run_agent_report(global: &GlobalOpts, args: &AgentReportArgs) -> ExitCode {
 
     let generator = ReportGenerator::new(config);
 
-    // Generate report from bundle or session
-    let html_result = if let Some(ref bundle_path) = args.bundle {
+    // Validate and redact the recorded source once for every output format.
+    let prepared_result = if let Some(ref bundle_path) = args.bundle {
         // Generate from bundle file
         let path = std::path::Path::new(bundle_path);
         if !path.exists() {
@@ -40328,7 +40484,7 @@ fn run_agent_report(global: &GlobalOpts, args: &AgentReportArgs) -> ExitCode {
             }
         };
 
-        generator.generate_from_bundle(&mut reader)
+        generator.prepare_from_bundle(&mut reader)
     } else if let Some(ref session_id_str) = args.session {
         // Generate from session directory
         let store = match SessionStore::from_env() {
@@ -40356,90 +40512,65 @@ fn run_agent_report(global: &GlobalOpts, args: &AgentReportArgs) -> ExitCode {
         };
 
         // Read session data and build report
-        generate_report_from_session(&generator, &handle)
+        prepare_report_from_session(&generator, &handle)
     } else {
         unreachable!("already validated session or bundle is present");
     };
 
-    let html = match html_result {
-        Ok(h) => h,
+    let prepared = match prepared_result {
+        Ok(report) => report,
         Err(e) => {
             eprintln!("agent report: failed to generate report: {}", e);
             return ExitCode::InternalError;
         }
     };
 
-    // Handle different output formats
-    match args.report_format.to_lowercase().as_str() {
-        "html" => {
-            // Write HTML to file or stdout
-            if let Some(ref out_path) = args.out {
-                match std::fs::write(out_path, &html) {
-                    Ok(_) => match global.format {
-                        OutputFormat::Json | OutputFormat::Toon => {
-                            let response = serde_json::json!({
-                                "status": "success",
-                                "output_path": out_path,
-                                "size_bytes": html.len(),
-                                "format": "html",
-                            });
-                            println!("{}", format_structured_output(global, response));
-                        }
-                        _ => {
-                            println!("Report written to: {}", out_path);
-                        }
-                    },
-                    Err(e) => {
-                        eprintln!("agent report: failed to write output: {}", e);
-                        return ExitCode::InternalError;
-                    }
-                }
-            } else {
-                // Write to stdout
-                print!("{}", html);
+    let content = if let Some(format) = text_format {
+        prepared.render_summary(format, style)
+    } else {
+        match prepared.render_html() {
+            Ok(html) => html,
+            Err(error) => {
+                eprintln!("agent report: failed to generate report: {}", error);
+                return ExitCode::InternalError;
             }
         }
-        "slack" => {
-            // Generate Slack-friendly summary
-            let summary = generate_slack_summary(&args.prose_style);
-            match global.format {
-                OutputFormat::Json | OutputFormat::Toon => {
-                    let response = serde_json::json!({
-                        "format": "slack",
-                        "prose_style": args.prose_style,
-                        "content": summary,
-                    });
-                    println!("{}", format_structured_output(global, response));
-                }
-                _ => {
-                    println!("{}", summary);
-                }
+    };
+    if let Some(ref out_path) = args.out {
+        if let Err(error) = std::fs::write(out_path, &content) {
+            eprintln!("agent report: failed to write output: {}", error);
+            return ExitCode::IoError;
+        }
+        let response = serde_json::json!({
+            "status": "success",
+            "output_path": out_path,
+            "size_bytes": content.len(),
+            "format": report_format,
+        });
+        match global.format {
+            OutputFormat::Json | OutputFormat::Toon => {
+                println!("{}", format_structured_output(global, response));
             }
+            OutputFormat::Jsonl => println!("{}", global.process_output_value(response)),
+            OutputFormat::Exitcode => {}
+            _ => println!("Report written to: {}", out_path),
         }
-        "prose" => {
-            // Generate prose summary
-            let summary = generate_prose_summary(&args.prose_style);
-            match global.format {
-                OutputFormat::Json | OutputFormat::Toon => {
-                    let response = serde_json::json!({
-                        "format": "prose",
-                        "prose_style": args.prose_style,
-                        "content": summary,
-                    });
-                    println!("{}", format_structured_output(global, response));
-                }
-                _ => {
-                    println!("{}", summary);
-                }
+    } else if text_format.is_some() {
+        let response = serde_json::json!({
+            "format": report_format,
+            "prose_style": prose_style,
+            "content": content,
+        });
+        match global.format {
+            OutputFormat::Json | OutputFormat::Toon => {
+                println!("{}", format_structured_output(global, response));
             }
+            OutputFormat::Jsonl => println!("{}", global.process_output_value(response)),
+            OutputFormat::Exitcode => {}
+            _ => println!("{}", content),
         }
-        _ => {
-            eprintln!(
-                "agent report: invalid format '{}', use: html, slack, prose",
-                args.report_format
-            );
-            return ExitCode::ArgsError;
-        }
+    } else if !matches!(global.format, OutputFormat::Exitcode) {
+        print!("{}", content);
     }
 
     ExitCode::Clean
@@ -43077,10 +43208,10 @@ mod queue_metrics_tests {
 
 /// Generate a report from session directory data.
 #[cfg(feature = "report")]
-fn generate_report_from_session(
+fn prepare_report_from_session(
     generator: &pt_report::ReportGenerator,
     handle: &pt_core::session::SessionHandle,
-) -> pt_report::Result<String> {
+) -> pt_report::Result<pt_report::generator::PreparedReport> {
     use pt_report::sections::*;
 
     // Read manifest for session metadata
@@ -43146,7 +43277,7 @@ fn generate_report_from_session(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(error) => return Err(error.into()),
     };
-    generator.generate_from_session_artifacts(overview, &plan, &outcomes)
+    generator.prepare_from_session_artifacts(overview, &plan, &outcomes)
 }
 
 #[cfg(all(test, feature = "report"))]
@@ -43202,7 +43333,10 @@ mod report_generation_tests {
                 .with_theme(ReportTheme::Light)
                 .with_title("Session Report Test".to_string()),
         );
-        let html = generate_report_from_session(&generator, &handle).unwrap();
+        let html = prepare_report_from_session(&generator, &handle)
+            .unwrap()
+            .render_html()
+            .unwrap();
         let recorded_data = |html: &str| -> serde_json::Value {
             let data = html
                 .split("id=\"recorded-session-data\">")
@@ -43242,7 +43376,10 @@ mod report_generation_tests {
         let mut context = handle.read_context().unwrap();
         context.host_id = "different-context-host".to_string();
         handle.write_context(&context).unwrap();
-        let changed_html = generate_report_from_session(&generator, &handle).unwrap();
+        let changed_html = prepare_report_from_session(&generator, &handle)
+            .unwrap()
+            .render_html()
+            .unwrap();
         let changed = recorded_data(&changed_html);
         let changed_overview_host = changed["overview"]["host_id"].as_str().unwrap();
         let unchanged_plan_host = changed["plan"]["host_id"].as_str().unwrap();
@@ -43287,7 +43424,10 @@ mod report_generation_tests {
             // A later update is deliberately not the terminal transition.
             manifest.timing.updated_at = Some("2026-01-15T13:00:00Z".to_string());
             handle.write_manifest(&manifest).unwrap();
-            let html = generate_report_from_session(&forensic, &handle).unwrap();
+            let html = prepare_report_from_session(&forensic, &handle)
+                .unwrap()
+                .render_html()
+                .unwrap();
             let recorded = recorded_data(&html);
             assert_eq!(
                 recorded["overview"]["ended_at"],
@@ -43318,7 +43458,10 @@ mod report_generation_tests {
                 .with_theme(ReportTheme::Light)
                 .with_title("Session Report Test".to_string()),
         );
-        let html = generate_report_from_session(&generator, &handle).unwrap();
+        let html = prepare_report_from_session(&generator, &handle)
+            .unwrap()
+            .render_html()
+            .unwrap();
         let unknown_host_row = "Host ID</dt>\n                <dd class=\"font-mono\">unknown</dd>";
         let wrong_host_row = format!(
             "Host ID</dt>\n                <dd class=\"font-mono\">{}</dd>",
@@ -43342,7 +43485,7 @@ mod report_generation_tests {
                 .with_theme(ReportTheme::Light)
                 .with_title("Session Report Test".to_string()),
         );
-        let err = generate_report_from_session(&generator, &handle).unwrap_err();
+        let err = prepare_report_from_session(&generator, &handle).unwrap_err();
 
         assert!(err.to_string().contains("missing required data: context:"));
     }
@@ -43361,64 +43504,15 @@ mod report_generation_tests {
             .unwrap();
         let generator = ReportGenerator::default_config();
         assert!(matches!(
-            generate_report_from_session(&generator, &handle),
+            prepare_report_from_session(&generator, &handle),
             Err(pt_report::ReportError::IoError(error)) if error.kind() == std::io::ErrorKind::NotFound,
         ));
         fs::create_dir_all(handle.dir.join("decision")).unwrap();
         fs::write(handle.dir.join("decision/plan.json"), b"not-json").unwrap();
         assert!(matches!(
-            generate_report_from_session(&generator, &handle),
+            prepare_report_from_session(&generator, &handle),
             Err(pt_report::ReportError::JsonError(_)),
         ));
-    }
-}
-
-/// Generate Slack-friendly summary.
-#[cfg(feature = "report")]
-fn generate_slack_summary(prose_style: &str) -> String {
-    match prose_style {
-        "terse" => "*Process Triage Summary*\n• Report generated\n• Review the recorded evidence and outcomes".to_string(),
-        "formal" => "*Process Triage Report*\n\nA report has been generated from the saved session artifacts. \
-             Consult the HTML report for recorded recommendations and action outcomes.\n\n\
-             _Report generated by pt-core_"
-            .to_string(),
-        "technical" => "*Process Triage Technical Summary*\n\n\
-             ```\n\
-             Source: saved session artifacts\n\
-             Missing measurements: explicitly marked\n\
-             ```\n\n\
-             See the HTML report for recorded evidence, posteriors, and outcomes."
-            .to_string(),
-        _ => {
-            // conversational (default)
-            "*Process Triage Report*\n\n\
-             Your report is ready. Review the saved recommendations and action outcomes \
-             in the HTML report. Missing measurements are marked explicitly."
-                .to_string()
-        }
-    }
-}
-
-/// Generate prose summary for agent-to-user communication.
-#[cfg(feature = "report")]
-fn generate_prose_summary(prose_style: &str) -> String {
-    match prose_style {
-        "terse" => "Report ready. Review the recorded evidence and outcomes.".to_string(),
-        "formal" => "A process triage report has been generated from the saved session artifacts. \
-             The HTML report presents recorded recommendations and action outcomes, with \
-             missing measurements marked explicitly."
-            .to_string(),
-        "technical" => "The report reads saved plan evidence and action outcomes. Four-class \
-             posteriors and exact evidence ledgers are shown when recorded; missing ledgers \
-             and measurements are marked explicitly. Review the HTML report for details."
-            .to_string(),
-        _ => {
-            // conversational (default)
-            "Your report is ready. You can review the saved recommendations, evidence, \
-             and action outcomes in the HTML report. It marks missing information so \
-             you can see which details were actually recorded."
-                .to_string()
-        }
     }
 }
 
