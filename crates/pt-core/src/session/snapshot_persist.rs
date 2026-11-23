@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use super::{SessionError, SessionHandle, SnapshotProvenanceRef, SNAPSHOT_SCHEMA_VERSION};
+use super::{
+    SessionContext, SessionError, SessionHandle, SessionManifest, SnapshotProvenanceRef,
+    SNAPSHOT_SCHEMA_VERSION,
+};
 use pt_common::ProvenanceGraphSnapshot;
 
 /// Subdirectory names for artifact types.
@@ -373,11 +376,17 @@ fn load_artifact<T: serde::de::DeserializeOwned + Serialize>(
             path: path.clone(),
             source: e,
         })?;
+    validate_artifact(envelope, &path)
+}
 
+fn validate_artifact<T: Serialize>(
+    envelope: ArtifactEnvelope<T>,
+    path: &Path,
+) -> Result<ArtifactEnvelope<T>, SessionError> {
     // Validate schema version compatibility.
     if !pt_common::schema::is_compatible(&envelope.schema_version) {
         return Err(SessionError::Json {
-            path,
+            path: path.to_path_buf(),
             source: serde_json::Error::io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
@@ -389,11 +398,11 @@ fn load_artifact<T: serde::de::DeserializeOwned + Serialize>(
     }
 
     // Validate integrity hash.
-    let payload_json = canonical_payload_bytes(&envelope.payload, &path)?;
+    let payload_json = canonical_payload_bytes(&envelope.payload, path)?;
     let computed = sha256_hex(&payload_json);
     if computed != envelope.integrity_sha256 {
         return Err(SessionError::Json {
-            path,
+            path: path.to_path_buf(),
             source: serde_json::Error::io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "integrity check failed: payload SHA-256 mismatch",
@@ -566,6 +575,192 @@ pub fn load_inventory(
     handle: &SessionHandle,
 ) -> Result<ArtifactEnvelope<InventoryArtifact>, SessionError> {
     load_artifact(handle, INVENTORY_FILE)
+}
+
+/// The exact session evidence used to label a recorded process. These files
+/// are read from one pinned session directory, with bounded no-follow reads.
+pub struct RecordedLabelInventory {
+    pub manifest: SessionManifest,
+    pub context: SessionContext,
+    pub inventory: ArtifactEnvelope<InventoryArtifact>,
+}
+
+/// Load intact local evidence for retrospective human feedback. Unlike display
+/// readers, this refuses redirected or concurrently replaced evidence before
+/// any label or learned prior is written. Callers must also check session/host
+/// consistency and the target's command and birth identity.
+#[cfg(unix)]
+pub fn load_label_inventory(
+    handle: &SessionHandle,
+) -> Result<RecordedLabelInventory, SessionError> {
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    fn evidence_error(path: &Path, message: &str) -> SessionError {
+        SessionError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, message),
+        }
+    }
+
+    fn open_at(
+        parent: &std::fs::File,
+        name: &str,
+        directory: bool,
+        path: &Path,
+    ) -> Result<std::fs::File, SessionError> {
+        let name = std::ffi::CString::new(name)
+            .map_err(|_| evidence_error(path, "invalid recorded evidence filename"))?;
+        let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+        // SAFETY: parent is live, name is NUL-terminated, and the descriptor is
+        // transferred into File exactly once after a successful openat.
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                flags | if directory { libc::O_DIRECTORY } else { 0 },
+            )
+        };
+        if fd < 0 {
+            return Err(SessionError::Io {
+                path: path.to_path_buf(),
+                source: std::io::Error::last_os_error(),
+            });
+        }
+        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+    }
+
+    fn metadata(file: &std::fs::File, path: &Path) -> Result<std::fs::Metadata, SessionError> {
+        file.metadata().map_err(|source| SessionError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
+    fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+        a.dev() == b.dev()
+            && a.ino() == b.ino()
+            && a.len() == b.len()
+            && a.mtime() == b.mtime()
+            && a.mtime_nsec() == b.mtime_nsec()
+            && a.ctime() == b.ctime()
+            && a.ctime_nsec() == b.ctime_nsec()
+    }
+
+    fn read_file(
+        directory: &std::fs::File,
+        name: &str,
+        path: &Path,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, SessionError> {
+        let file = open_at(directory, name, false, path)?;
+        let before = metadata(&file, path)?;
+        if !before.is_file() || before.len() > max_bytes {
+            return Err(evidence_error(
+                path,
+                "label evidence must be a bounded regular file",
+            ));
+        }
+        let mut bytes = Vec::new();
+        (&file)
+            .take(max_bytes + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|source| SessionError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let after = metadata(&file, path)?;
+        let current = metadata(&open_at(directory, name, false, path)?, path)?;
+        if !same_file(&before, &after)
+            || !same_file(&after, &current)
+            || bytes.len() as u64 != before.len()
+            || !current.is_file()
+        {
+            return Err(evidence_error(
+                path,
+                "recorded label evidence changed while reading",
+            ));
+        }
+        Ok(bytes)
+    }
+
+    // Validate even handles assembled by callers rather than SessionStore.
+    if !handle.id.0.is_ascii()
+        || pt_common::SessionId::parse(&handle.id.0).is_none()
+        || handle.dir.file_name().and_then(|name| name.to_str()) != Some(handle.id.0.as_str())
+    {
+        return Err(evidence_error(
+            &handle.dir,
+            "invalid recorded session identity",
+        ));
+    }
+    let root_path = handle
+        .dir
+        .parent()
+        .ok_or_else(|| evidence_error(&handle.dir, "recorded session lacks a store directory"))?;
+    let root = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(root_path)
+        .map_err(|source| SessionError::Io {
+            path: root_path.to_path_buf(),
+            source,
+        })?;
+    let session = open_at(&root, &handle.id.0, true, &handle.dir)?;
+    let scan_path = handle.dir.join("scan");
+    let scan = open_at(&session, "scan", true, &scan_path)?;
+    let manifest_path = handle.manifest_path();
+    let context_path = handle.context_path();
+    let inventory_path = handle.dir.join(INVENTORY_FILE);
+    let manifest_bytes = read_file(&session, "manifest.json", &manifest_path, 1024 * 1024)?;
+    let context_bytes = read_file(&session, "context.json", &context_path, 1024 * 1024)?;
+    let inventory_bytes = read_file(&scan, "inventory.json", &inventory_path, 64 * 1024 * 1024)?;
+    for (parent, name, pinned, path) in [
+        (&root, handle.id.0.as_str(), &session, &handle.dir),
+        (&session, "scan", &scan, &scan_path),
+    ] {
+        let before = metadata(pinned, path)?;
+        let current = metadata(&open_at(parent, name, true, path)?, path)?;
+        if before.dev() != current.dev() || before.ino() != current.ino() {
+            return Err(evidence_error(
+                path,
+                "recorded session directory changed while reading",
+            ));
+        }
+    }
+    let manifest =
+        serde_json::from_slice(&manifest_bytes).map_err(|source| SessionError::Json {
+            path: manifest_path,
+            source,
+        })?;
+    let context = serde_json::from_slice(&context_bytes).map_err(|source| SessionError::Json {
+        path: context_path,
+        source,
+    })?;
+    let inventory =
+        serde_json::from_slice(&inventory_bytes).map_err(|source| SessionError::Json {
+            path: inventory_path.clone(),
+            source,
+        })?;
+    Ok(RecordedLabelInventory {
+        manifest,
+        context,
+        inventory: validate_artifact(inventory, &inventory_path)?,
+    })
+}
+
+#[cfg(not(unix))]
+pub fn load_label_inventory(
+    handle: &SessionHandle,
+) -> Result<RecordedLabelInventory, SessionError> {
+    Err(SessionError::Io {
+        path: handle.dir.clone(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "recorded labels require no-follow session reads on a supported Unix platform",
+        ),
+    })
 }
 
 /// Load the inventory artifact but skip integrity validation.

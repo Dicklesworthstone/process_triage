@@ -883,12 +883,7 @@ impl Scorer {
         let (signatures, signature_warnings) = load_signature_database(&config.config_dir);
         warnings.extend(signature_warnings);
         (
-            Self::from_policy(
-                config.priors.clone(),
-                decisions,
-                signatures,
-                &config.policy,
-            ),
+            Self::from_policy(config.priors.clone(), decisions, signatures, &config.policy),
             warnings,
         )
     }
@@ -2885,13 +2880,9 @@ mod tests {
                             observations.clone(),
                         )
                         .unwrap();
-                    let live = assess_agent_liveness(
-                        &process,
-                        score.agent_activity.as_ref(),
-                        None,
-                        1800,
-                    )
-                    .unwrap();
+                    let live =
+                        assess_agent_liveness(&process, score.agent_activity.as_ref(), None, 1800)
+                            .unwrap();
                     assert_eq!(live.live, expected_live, "policy lookback {window}");
                     assert_eq!(
                         live.sources
@@ -3592,7 +3583,7 @@ int main(int argc, char **argv) {
         let processes = [process.clone()];
         let mut measured = agent_activity_scorer(&processes);
         measured.prepare_agent_activity(&processes, true);
-        let assess = |activity, idle| {
+        let assess = |activity: Option<&AgentActivityUnit>, idle| {
             assess_agent_liveness(&process, activity, idle, AGENT_LIVE_TERMINAL_WINDOW_SECONDS)
                 .unwrap()
         };

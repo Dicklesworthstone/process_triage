@@ -248,7 +248,13 @@ For feedback, call `pt_label` with exactly one of `pid` or `cmd`, a `verdict` of
 {"name":"pt_label","arguments":{"cmd":"node /srv/my-app/server.js","verdict":"spare","confirmed_by_user":true}}
 ```
 
-The verdict updates future recommendations; a kill label does not terminate the process. Live PID labels also record an identity-bound shadow event, while command-only labels cannot supply a calibration outcome for a particular process. Model recommendations and defaults accepted in a batch are not human labels. Each successful call adds one observation, so do not retry a successful call.
+To review a process from a saved session after it exits, supply `session` alongside `pid`:
+
+```json
+{"name":"pt_label","arguments":{"session":"pt-20260115-143022-a7xq","pid":1234,"verdict":"spare","confirmed_by_user":true}}
+```
+
+The verdict updates future recommendations; a kill label does not terminate the process. With `session`, the tool uses the saved process incarnation and command without looking up the live PID. The session must belong to this host and retain its intact inventory, manifest and context; missing, ambiguous, corrupt or redacted evidence is refused. The response's `recorded_source` identifies the session, inventory checksum, observation time, host and recorded process identity. Omit `session` to label a live PID. Both forms record an identity-bound shadow event; command-only labels cannot supply a calibration outcome for a particular process. Model recommendations and defaults accepted in a batch are not human labels. Each successful call adds one learning observation, so do not retry a successful call; repeated judgments of one incarnation still count only once for shadow calibration.
 
 ### Learning Tutorials
 
@@ -1824,13 +1830,17 @@ The checked-in files under `completions/` are snapshots and may lag behind the C
 - **Kills you individually select and confirm in the TUI** are recorded once they succeed (dry-run, shadow, failed and blocked actions are not).
 - **Spare feedback in the TUI**: individually unselect a process, then press `e` and confirm. With no selected actions, the dialog becomes **Save Feedback** and saves only the reviewed spare judgments. Reselecting a row cancels its pending spare. Bulk selection changes do not create labels, refresh clears pending judgments, and dry-run/shadow previews save no labels.
 - **Explicit labels**: `pt agent label --pid 1234 --kill` or `pt agent label --cmd "python3 -m http.server 8000" --spare`.
+- **Retrospective labels**: `pt agent label --session pt-20260115-143022-a7xq --pid 1234 --spare` uses the original identity and command saved in that session, including after the process exits. A reused live PID cannot change what is labeled.
 - **Robot/agent applies are never recorded**, so the model cannot teach itself its own mistakes.
 
-Live-process labels (`agent label --pid`) and explicit per-row TUI spares/successful
-direct kills also supply positive/negative labels to `shadow report`, matched to
-an earlier observation of the same process incarnation. TUI feedback retains the
-reviewed identity and command even after exit; repeated CLI/TUI labels cannot count
-the same incarnation twice. Command-pattern labels (`--cmd`) update priors only. Shadow calibration
+Retrospective labels require an intact session from the current host and a unique recorded PID with its original birth identity and unredacted command. They do not accept arbitrary file paths, redacted sharing bundles, missing inventories or inconsistent artifacts, and never fall back to inspecting a live process. JSON output includes `recorded_source` with the session ID, inventory checksum and observation time, host ID, PID, start ID and UID. A saved inventory can teach a command pattern without an earlier shadow prediction, but it cannot invent a prediction to calibrate. Session retention still applies; feedback needs the saved artifacts to remain available.
+
+Live-process labels (`agent label --pid`), retrospective labels (`--session --pid`),
+and explicit per-row TUI spares/successful direct kills also supply positive/negative
+labels to `shadow report`, matched to an earlier observation of the same process
+incarnation. Recorded-session and TUI feedback retain the reviewed identity and
+command even after exit; repeated CLI/TUI labels cannot count the same incarnation
+twice. Command-pattern labels (`--cmd`) update priors only. Shadow calibration
 never treats disappearance, successful execution of an action, or a model's own
 recommendation as a human judgment. It requires at least five labels of each class
 before computing metrics; see [the shadow calibration tutorial](docs/tutorials/06-shadow-calibration.md).

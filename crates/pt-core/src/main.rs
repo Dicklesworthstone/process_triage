@@ -1679,9 +1679,13 @@ struct AgentListPriorsArgs {
 #[command(group(clap::ArgGroup::new("target").required(true).args(["pid", "cmd"])))]
 #[command(group(clap::ArgGroup::new("verdict").required(true).args(["kill", "spare"])))]
 struct AgentLabelArgs {
-    /// Live process whose command pattern to label
+    /// Process whose command pattern to label (live unless --session is supplied)
     #[arg(long)]
     pid: Option<u32>,
+
+    /// Label the recorded process incarnation in this session, even after it exits
+    #[arg(long, requires = "pid", conflicts_with_all = ["cmd", "comm"])]
+    session: Option<String>,
 
     /// Command line to label (instead of a live --pid)
     #[arg(long)]
@@ -2599,12 +2603,7 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
     for warning in signature_warnings {
         eprintln!("pt: warning: {warning}");
     }
-    let base_scorer = Scorer::from_policy(
-        priors.clone(),
-        Default::default(),
-        signatures,
-        &policy,
-    );
+    let base_scorer = Scorer::from_policy(priors.clone(), Default::default(), signatures, &policy);
     let scorer_with = |decisions: Option<&pt_core::decision::decision_store::DecisionStore>| {
         let mut scorer = base_scorer.clone();
         scorer.decisions = decisions.cloned().unwrap_or_default();
@@ -33453,12 +33452,8 @@ fn load_priors_for_explain(global: &GlobalOpts) -> Result<ExplainContext, Config
             let policy = pt_core::config::Policy::default();
             let (signatures, _) =
                 pt_core::scoring::load_signature_database(&resolved_config_dir(global));
-            let scorer = Scorer::from_policy(
-                Priors::default(),
-                Default::default(),
-                signatures,
-                &policy,
-            );
+            let scorer =
+                Scorer::from_policy(Priors::default(), Default::default(), signatures, &policy);
             (scorer, policy.guardrails)
         }
     };
@@ -39021,6 +39016,112 @@ fn run_agent_diff(global: &GlobalOpts, args: &AgentDiffArgs) -> ExitCode {
     ExitCode::Clean
 }
 
+struct SessionLabelTarget {
+    identity: ProcessIdentity,
+    comm: String,
+    cmd: String,
+    source: serde_json::Value,
+}
+
+/// Recover the command the human reviewed, without resolving a potentially
+/// reused live PID. Only intact, local session inventories can teach patterns;
+/// redacted sharing bundles cannot recover the original shadow identity.
+fn load_session_label_target(
+    sessions: &SessionStore,
+    session: &str,
+    pid: u32,
+    host_id: &str,
+) -> Result<SessionLabelTarget, String> {
+    let session_id = session
+        .is_ascii()
+        .then(|| SessionId::parse(session))
+        .flatten()
+        .ok_or("invalid --session: expected a session ID, not a path")?;
+    if pid == 0 {
+        return Err("recorded process ID must be positive".into());
+    }
+    let handle = sessions
+        .open(&session_id)
+        .map_err(|error| error.to_string())?;
+
+    let pt_core::session::snapshot_persist::RecordedLabelInventory {
+        manifest,
+        context,
+        inventory,
+    } = pt_core::session::snapshot_persist::load_label_inventory(&handle)
+        .map_err(|error| error.to_string())?;
+    if manifest.session_id != session_id.0
+        || context.session_id != session_id.0
+        || inventory.session_id != session_id.0
+    {
+        return Err("recorded label evidence session ID mismatch".into());
+    }
+    if host_id.is_empty() || context.host_id != host_id || inventory.host_id != host_id {
+        return Err("recorded labels require an intact session from this host".into());
+    }
+    if !pt_common::schema::is_compatible(&manifest.schema_version)
+        || !pt_common::schema::is_compatible(&context.schema_version)
+    {
+        return Err("recorded label evidence has an incompatible schema".into());
+    }
+    if inventory.payload.record_count != inventory.payload.records.len() {
+        return Err("recorded inventory count mismatch".into());
+    }
+    let mut pids = HashSet::new();
+    let mut identities = HashSet::new();
+    for process in &inventory.payload.records {
+        if !pids.insert(process.pid) || !identities.insert(process.start_id.as_str()) {
+            return Err("recorded inventory contains ambiguous duplicate processes".into());
+        }
+    }
+    let process = inventory
+        .payload
+        .records
+        .iter()
+        .find(|process| process.pid == pid)
+        .ok_or_else(|| format!("PID {pid} is not in the recorded session inventory"))?;
+    let (_, start_id) = parse_explain_target(&format!("{pid}:{}", process.start_id))
+        .map_err(|error| format!("invalid recorded process identity: {error}"))?;
+    if !matches!(
+        process.identity_quality.as_str(),
+        "QuickScan" | "Full" | "full"
+    ) || start_id
+        .0
+        .split(':')
+        .nth(1)
+        .and_then(|value| value.parse::<u64>().ok())
+        == Some(0)
+    {
+        return Err("recorded process lacks a complete birth identity".into());
+    }
+    for command in [&process.comm, &process.cmd] {
+        let uppercase = command.to_ascii_uppercase();
+        if command.trim().is_empty()
+            || command.contains('\0')
+            || uppercase.contains("[REDACTED]")
+            || uppercase.contains("<REDACTED>")
+            || uppercase.contains("[HASH:")
+        {
+            return Err("recorded label requires the original, unredacted command".into());
+        }
+    }
+    Ok(SessionLabelTarget {
+        identity: ProcessIdentity::new(pid, start_id, process.uid),
+        comm: process.comm.clone(),
+        cmd: process.cmd.clone(),
+        source: serde_json::json!({
+            "session_id": session_id.0,
+            "artifact": "scan/inventory.json",
+            "integrity_sha256": inventory.integrity_sha256,
+            "observed_at": inventory.generated_at,
+            "host_id": inventory.host_id,
+            "pid": process.pid,
+            "start_id": process.start_id,
+            "uid": process.uid,
+        }),
+    })
+}
+
 fn run_agent_label(global: &GlobalOpts, args: &AgentLabelArgs) -> ExitCode {
     use pt_core::decision::decision_store::{DecisionStore, Verdict};
 
@@ -39035,7 +39136,31 @@ fn run_agent_label(global: &GlobalOpts, args: &AgentLabelArgs) -> ExitCode {
     };
 
     let mut labeled_process = None;
-    let (comm, cmd) = if let Some(pid) = args.pid {
+    let mut recorded_target = None;
+    let (comm, cmd) = if let Some(session) = args.session.as_deref() {
+        let sessions = match SessionStore::from_env() {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                eprintln!("agent label: {error}");
+                return ExitCode::SessionError;
+            }
+        };
+        let target = match load_session_label_target(
+            &sessions,
+            session,
+            args.pid.unwrap_or(0),
+            &pt_core::logging::get_host_id(),
+        ) {
+            Ok(target) => target,
+            Err(error) => {
+                eprintln!("agent label: {error}; learned prior unchanged");
+                return ExitCode::SessionError;
+            }
+        };
+        let command = (target.comm.clone(), target.cmd.clone());
+        recorded_target = Some(target);
+        command
+    } else if let Some(pid) = args.pid {
         let scan = match quick_scan(&QuickScanOptions {
             pids: vec![pid],
             include_kernel_threads: false,
@@ -39084,8 +39209,25 @@ fn run_agent_label(global: &GlobalOpts, args: &AgentLabelArgs) -> ExitCode {
             return ExitCode::IoError;
         }
     };
-    let shadow_identity = if let Some(proc) = labeled_process.as_ref() {
-        match pt_core::shadow::record_human_verdict(proc, verdict) {
+    let shadow_result = if let Some(target) = recorded_target.as_ref() {
+        Some(pt_core::shadow::record_reviewed_verdict(
+            &ShadowStorageConfig {
+                base_dir: shadow_base_dir(),
+                ..Default::default()
+            },
+            &target.identity,
+            &target.comm,
+            &target.cmd,
+            verdict,
+            pt_core::shadow::HumanVerdictSource::AgentLabel,
+        ))
+    } else {
+        labeled_process
+            .as_ref()
+            .map(|proc| pt_core::shadow::record_human_verdict(proc, verdict))
+    };
+    let shadow_identity = match shadow_result {
+        Some(result) => match result {
             Ok(identity) => Some(identity),
             Err(error) => {
                 eprintln!(
@@ -39094,9 +39236,8 @@ fn run_agent_label(global: &GlobalOpts, args: &AgentLabelArgs) -> ExitCode {
                 );
                 return ExitCode::IoError;
             }
-        }
-    } else {
-        None
+        },
+        None => None,
     };
     store.record(&comm, &cmd, verdict);
     if let Err(e) = store.save() {
@@ -39117,10 +39258,13 @@ fn run_agent_label(global: &GlobalOpts, args: &AgentLabelArgs) -> ExitCode {
         "patterns": DecisionStore::pattern_keys(&comm, &cmd),
         "learned_prior": learned,
         "store": config.config_dir.join(pt_core::decision::decision_store::DECISIONS_FILE),
+        "recorded_source": recorded_target.as_ref().map(|target| &target.source),
         "shadow_label": {
             "recorded": shadow_identity.is_some(),
             "identity_hash": shadow_identity,
-            "reason": if labeled_process.is_some() {
+            "reason": if recorded_target.is_some() {
+                "explicit_session_process_verdict"
+            } else if labeled_process.is_some() {
                 "explicit_live_process_verdict"
             } else {
                 "command_pattern_has_no_process_identity"
@@ -39147,6 +39291,63 @@ fn run_agent_label(global: &GlobalOpts, args: &AgentLabelArgs) -> ExitCode {
         }
     }
     ExitCode::Clean
+}
+
+#[cfg(test)]
+mod recorded_label_argument_tests {
+    use super::*;
+
+    #[test]
+    fn a_recorded_label_requires_a_pid_and_an_explicit_verdict() {
+        let session = "pt-20260115-143022-a7xq";
+        assert!(Cli::try_parse_from([
+            "pt-core",
+            "agent",
+            "label",
+            "--session",
+            session,
+            "--pid",
+            "123",
+            "--spare",
+        ])
+        .is_ok());
+        for arguments in [
+            vec!["--session", session, "--spare"],
+            vec!["--session", session, "--cmd", "sleep 1", "--spare"],
+            vec!["--session", session, "--pid", "123"],
+            vec!["--session", session, "--pid", "123", "--kill", "--spare"],
+            vec![
+                "--session",
+                session,
+                "--pid",
+                "123",
+                "--comm",
+                "sleep",
+                "--kill",
+            ],
+        ] {
+            let mut command = vec!["pt-core", "agent", "label"];
+            command.extend(arguments);
+            assert!(Cli::try_parse_from(command.clone()).is_err(), "{command:?}");
+        }
+    }
+
+    #[test]
+    fn recorded_label_session_ids_cannot_be_paths_or_break_utf8_boundaries() {
+        let sessions = SessionStore::at_data_dir(Path::new("unused-recorded-label-test"));
+        for session in [
+            "../pt-20260115-143022-a7xq",
+            "/tmp/pt-20260115-143022-a7xq",
+            "pt-2026011é-143022-a7xq",
+            "pt-20260115-143022-💣",
+            "",
+        ] {
+            assert!(matches!(
+                load_session_label_target(&sessions, session, 123, "host"),
+                Err(error) if error.contains("invalid --session")
+            ));
+        }
+    }
 }
 
 fn run_agent_list_priors(global: &GlobalOpts, args: &AgentListPriorsArgs) -> ExitCode {
@@ -41022,13 +41223,11 @@ mod memory_limit_diagnostic_tests {
     };
 
     fn unit(inode: u64, current: u64) -> ResponsibleUnit {
-        let mut headroom = CgroupMemoryHeadroom {
-            hierarchy_complete: true,
-            high_complete: true,
-            max_complete: true,
-            swap_complete: true,
-            ..CgroupMemoryHeadroom::default()
-        };
+        let mut headroom = CgroupMemoryHeadroom::default();
+        headroom.hierarchy_complete = true;
+        headroom.high_complete = true;
+        headroom.max_complete = true;
+        headroom.swap_complete = true;
         headroom.scopes.push(CgroupMemoryScope {
             path: format!("/user.slice/limit-{inode}"),
             directory_device: 2,

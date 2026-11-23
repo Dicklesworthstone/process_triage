@@ -2399,3 +2399,108 @@ fn actual_mcp_live_labels_preserve_processes_and_record_shadow_identity() {
     );
     assert!(target.0.try_wait().unwrap().is_none());
 }
+
+#[cfg(unix)]
+#[test]
+fn actual_mcp_recorded_labels_calibrate_an_exited_process() {
+    use assert_cmd::cargo::cargo_bin_cmd;
+
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let config = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let fallback = tempfile::tempdir().unwrap();
+    let mut policy = pt_core::config::Policy::default();
+    policy.guardrails.builtin_protection = false;
+    policy.guardrails.protected_users.clear();
+    std::fs::write(
+        config.path().join("policy.json"),
+        serde_json::to_vec_pretty(&policy).unwrap(),
+    )
+    .unwrap();
+    let mut target = ChildGuard(
+        std::process::Command::new("sleep")
+            .arg("673")
+            .spawn()
+            .unwrap(),
+    );
+    let pid = target.0.id();
+    let output = cargo_bin_cmd!("pt-core")
+        .env_remove("PT_CONFIG_DIR")
+        .env("PROCESS_TRIAGE_CONFIG", config.path())
+        .env("PROCESS_TRIAGE_DATA", data.path())
+        .env("PROCESS_TRIAGE_RETENTION", "off")
+        .args([
+            "--shadow",
+            "--format",
+            "json",
+            "agent",
+            "plan",
+            "--pids",
+            &pid.to_string(),
+            "--min-age",
+            "0",
+            "--min-posterior",
+            "0",
+            "--window-ms",
+            "0",
+        ])
+        .timeout(std::time::Duration::from_secs(60))
+        .output()
+        .unwrap();
+    assert!(matches!(output.status.code(), Some(0 | 1)), "{output:?}");
+    let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(plan["summary"]["shadow_observations_recorded"], 1);
+    let session = plan["session_id"].as_str().unwrap();
+    target.0.kill().unwrap();
+    target.0.wait().unwrap();
+
+    let arguments = serde_json::json!({
+        "pid": pid, "session": session, "verdict": "spare", "confirmed_by_user": true,
+    });
+    for _ in 0..2 {
+        let result = call_actual_mcp_label(
+            config.path(),
+            data.path(),
+            fallback.path(),
+            arguments.clone(),
+        );
+        assert_eq!(result["isError"], false, "{result}");
+        let label: serde_json::Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            label["shadow_label"]["reason"],
+            "explicit_session_process_verdict"
+        );
+        assert_eq!(label["recorded_source"]["session_id"], session);
+        assert_eq!(
+            label["recorded_source"]["start_id"],
+            plan["candidates"][0]["start_id"]
+        );
+        assert_eq!(label["shadow_label"]["recorded"], true);
+        assert!(label["learned_prior"]["spare"].as_u64().unwrap() > 0);
+    }
+    assert!(!fallback.path().join("decisions.json").exists());
+    let output = cargo_bin_cmd!("pt-core")
+        .env_remove("PT_CONFIG_DIR")
+        .env("PROCESS_TRIAGE_CONFIG", config.path())
+        .env("PROCESS_TRIAGE_DATA", data.path())
+        .args(["--format", "json", "shadow", "report"])
+        .timeout(std::time::Duration::from_secs(60))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(report["resolved_predictions"], 1, "{report}");
+    assert_eq!(report["negative_labels"], 1, "{report}");
+    assert_eq!(report["positive_labels"], 0, "{report}");
+    assert!(report["metrics"].is_null());
+}

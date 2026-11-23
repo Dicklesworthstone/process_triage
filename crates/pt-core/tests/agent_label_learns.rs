@@ -420,6 +420,253 @@ fn pattern_labels_do_not_invent_shadow_process_identities() {
 }
 
 #[test]
+fn recorded_labels_resolve_exited_process_predictions_without_live_pid_lookup() {
+    let config = TempDir::new().unwrap();
+    let data = TempDir::new().unwrap();
+    let mut policy = pt_core::config::Policy::default();
+    policy.guardrails.builtin_protection = false;
+    policy.guardrails.protected_users.clear();
+    std::fs::write(
+        config.path().join("policy.json"),
+        serde_json::to_vec_pretty(&policy).unwrap(),
+    )
+    .unwrap();
+    let mut exited = ChildGuard(ProcessCommand::new("sleep").arg("653").spawn().unwrap());
+    let mut living = ChildGuard(ProcessCommand::new("sleep").arg("659").spawn().unwrap());
+    let pids = format!("{},{}", exited.0.id(), living.0.id());
+    let output = pt_core(config.path(), data.path())
+        .args([
+            "--shadow",
+            "--format",
+            "json",
+            "agent",
+            "plan",
+            "--pids",
+            &pids,
+            "--min-age",
+            "0",
+            "--min-posterior",
+            "0",
+            "--window-ms",
+            "0",
+        ])
+        .output()
+        .unwrap();
+    assert!(matches!(output.status.code(), Some(0 | 1)), "{output:?}");
+    let plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let session = plan["session_id"].as_str().unwrap();
+    assert_eq!(plan["summary"]["shadow_observations_recorded"], 2);
+    exited.0.kill().unwrap();
+    exited.0.wait().unwrap();
+
+    // Both verdicts refer to the immutable inventory, including the process
+    // that no longer exists. Repeated feedback cannot inflate calibration N.
+    for (pid, verdict) in [
+        (exited.0.id(), "--kill"),
+        (living.0.id(), "--spare"),
+        (exited.0.id(), "--kill"),
+    ] {
+        let output = pt_core(config.path(), data.path())
+            .args([
+                "--format",
+                "json",
+                "agent",
+                "label",
+                "--session",
+                session,
+                "--pid",
+            ])
+            .arg(pid.to_string())
+            .arg(verdict)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let label: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let candidate = plan["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| candidate["pid"].as_u64() == Some(u64::from(pid)))
+            .unwrap();
+        assert_eq!(label["recorded_source"]["session_id"], session);
+        assert_eq!(label["recorded_source"]["start_id"], candidate["start_id"]);
+        assert_eq!(label["recorded_source"]["pid"], pid);
+        assert_eq!(
+            label["recorded_source"]["integrity_sha256"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64
+        );
+        assert_eq!(
+            label["shadow_label"]["reason"],
+            "explicit_session_process_verdict"
+        );
+        assert_eq!(label["shadow_label"]["recorded"], true);
+        assert!(label["learned_prior"].is_object());
+        assert!(
+            living.0.try_wait().unwrap().is_none(),
+            "labels never execute actions"
+        );
+    }
+    let report = pt_core(config.path(), data.path())
+        .args(["--format", "json", "shadow", "report"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&report).unwrap();
+    assert_eq!(report["resolved_predictions"], 2, "{report}");
+    assert_eq!(report["positive_labels"], 1, "{report}");
+    assert_eq!(report["negative_labels"], 1, "{report}");
+    assert!(report["metrics"].is_null(), "{report}");
+}
+
+#[test]
+fn recorded_labels_reject_invalid_evidence_before_any_learning_or_live_fallback() {
+    use pt_core::session::snapshot_persist::{
+        persist_inventory, InventoryArtifact, PersistedProcess,
+    };
+    use pt_core::session::SessionContext;
+
+    let mut target = ChildGuard(ProcessCommand::new("sleep").arg("661").spawn().unwrap());
+    let pid = target.0.id();
+    let process = pt_core::collect::quick_scan(&pt_core::collect::QuickScanOptions {
+        pids: vec![pid],
+        ..Default::default()
+    })
+    .unwrap()
+    .processes
+    .into_iter()
+    .find(|process| process.pid.0 == pid)
+    .unwrap();
+
+    for defect in [
+        "checksum",
+        "count",
+        "duplicate",
+        "missing_pid",
+        "birth_pid",
+        "zero_birth",
+        "identity_quality",
+        "empty_command",
+        "redacted_command",
+        "hashed_command",
+        "foreign_host",
+        "session_mismatch",
+        "context_mismatch",
+        "missing_inventory",
+        "linked_inventory",
+        "linked_scan",
+        "linked_context",
+        "linked_session",
+    ] {
+        let config = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let sessions = SessionStore::at_data_dir(data.path());
+        let session = SessionId::new();
+        let handle = sessions
+            .create(&SessionManifest::new(
+                &session,
+                None,
+                SessionMode::RobotPlan,
+                None,
+            ))
+            .unwrap();
+        let host = pt_core::logging::get_host_id();
+        let mut context = SessionContext::new(&session, host.clone(), "label-test".into(), None);
+        if defect == "context_mismatch" {
+            context.session_id = SessionId::new().0;
+        }
+        handle.write_context(&context).unwrap();
+        let mut record = PersistedProcess {
+            pid,
+            ppid: process.ppid.0,
+            uid: process.uid,
+            start_id: process.start_id.0.clone(),
+            comm: process.comm.clone(),
+            cmd: process.cmd.clone(),
+            state: process.state.to_string(),
+            start_time_unix: process.start_time_unix,
+            elapsed_secs: process.elapsed.as_secs(),
+            identity_quality: "QuickScan".into(),
+        };
+        match defect {
+            "missing_pid" => record.pid = pid + 1,
+            "birth_pid" => record.start_id = format!("recorded-boot:100:{}", pid + 1),
+            "zero_birth" => record.start_id = format!("recorded-boot:0:{pid}"),
+            "identity_quality" => record.identity_quality = "PidOnly".into(),
+            "empty_command" => record.cmd.clear(),
+            "redacted_command" => record.cmd = "sleep [REDACTED]".into(),
+            "hashed_command" => record.cmd = "[HASH:test:123456]".into(),
+            _ => {}
+        }
+        let records = if defect == "duplicate" {
+            vec![record.clone(), record]
+        } else {
+            vec![record]
+        };
+        let inventory = InventoryArtifact {
+            total_system_processes: 1,
+            protected_filtered: 0,
+            record_count: if defect == "count" { 9 } else { records.len() },
+            records,
+        };
+        let path = persist_inventory(
+            &handle,
+            if defect == "session_mismatch" {
+                "pt-20000101-000000-aaaa"
+            } else {
+                &session.0
+            },
+            if defect == "foreign_host" {
+                "foreign-host"
+            } else {
+                &host
+            },
+            inventory,
+        )
+        .unwrap();
+        if defect == "checksum" {
+            let mut artifact: Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            artifact["payload"]["records"][0]["cmd"] = serde_json::json!("changed command");
+            std::fs::write(&path, serde_json::to_vec(&artifact).unwrap()).unwrap();
+        } else if defect == "missing_inventory" {
+            std::fs::rename(&path, path.with_extension("retained")).unwrap();
+        } else if defect.starts_with("linked_") {
+            let original = match defect {
+                "linked_scan" => handle.dir.join("scan"),
+                "linked_context" => handle.context_path(),
+                "linked_session" => handle.dir.clone(),
+                _ => path,
+            };
+            let retained = data.path().join(format!("retained-{defect}"));
+            std::fs::rename(&original, &retained).unwrap();
+            std::os::unix::fs::symlink(&retained, &original).unwrap();
+        }
+        let output = pt_core(config.path(), data.path())
+            .args(["agent", "label", "--session", &session.0, "--pid"])
+            .arg(pid.to_string())
+            .arg("--kill")
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "defect {defect} accepted: {output:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("learned prior unchanged"),
+            "{defect}: {output:?}"
+        );
+        assert!(!config.path().join("decisions.json").exists(), "{defect}");
+        assert!(!data.path().join("shadow").exists(), "{defect}");
+        assert!(target.0.try_wait().unwrap().is_none());
+    }
+}
+
+#[test]
 fn shadow_label_write_failure_does_not_train_the_prior() {
     let config_dir = TempDir::new().expect("config dir");
     let data_dir = TempDir::new().expect("data dir");

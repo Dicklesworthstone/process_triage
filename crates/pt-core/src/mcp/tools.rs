@@ -541,7 +541,7 @@ fn label_command_args(params: &serde_json::Value) -> Result<Vec<String>, String>
     for key in object.keys() {
         if !matches!(
             key.as_str(),
-            "pid" | "cmd" | "comm" | "verdict" | "confirmed_by_user"
+            "pid" | "session" | "cmd" | "comm" | "verdict" | "confirmed_by_user"
         ) {
             return Err(format!("unknown pt_label argument: {key}"));
         }
@@ -571,8 +571,19 @@ fn label_command_args(params: &serde_json::Value) -> Result<Vec<String>, String>
                 .filter(|pid| *pid > 0)
                 .ok_or_else(|| "pid must be an integer between 1 and 4294967295".to_string())?;
             args.extend(["--pid".to_string(), pid.to_string()]);
+            if let Some(value) = params.get("session") {
+                let session = value
+                    .as_str()
+                    .filter(|session| session.is_ascii())
+                    .and_then(pt_common::SessionId::parse)
+                    .ok_or_else(|| "session must be a valid session ID, not a path".to_string())?;
+                args.extend(["--session".to_string(), session.0]);
+            }
         }
         (None, Some(value)) => {
+            if params.get("session").is_some() {
+                return Err("session is only valid with pid".to_string());
+            }
             let cmd = value
                 .as_str()
                 .filter(|cmd| !cmd.trim().is_empty() && !cmd.contains('\0'))
@@ -763,6 +774,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             description: "Record an explicitly user-confirmed kill/spare verdict using \
                           the same durable learning and shadow-label path as pt agent label. \
                           Updates future recommendations; never signals a process. \
+                          Supply session with pid to label the recorded incarnation after it exits. \
                           Do not record model recommendations or accepted defaults as human verdicts. \
                           Each successful call adds one observation; do not retry a successful call."
                 .to_string(),
@@ -773,7 +785,12 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": u32::MAX,
-                        "description": "Live process to label; records an identity-bound shadow verdict"
+                        "description": "Process to label; live unless session is supplied. Records an identity-bound shadow verdict"
+                    },
+                    "session": {
+                        "type": "string",
+                        "pattern": "^pt-[0-9]{8}-[0-9]{6}-[a-z2-7]{4}$",
+                        "description": "Local session ID with intact saved command and identity; requires pid and never inspects that PID live"
                     },
                     "cmd": {
                         "type": "string",
@@ -804,7 +821,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     },
                     {
                         "required": ["cmd"],
-                        "not": {"required": ["pid"]}
+                        "not": {"anyOf": [{"required": ["pid"]}, {"required": ["session"]}]}
                     }
                 ],
                 "additionalProperties": false
@@ -922,24 +939,10 @@ fn tool_scan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
     let matching_processes = candidates.len();
     candidates.truncate(200);
 
-    let result = serde_json::json!({
-        "scanned_at": scan_result.metadata.started_at,
-        "duration_ms": scan_started.elapsed().as_millis(),
-        "quick_scan_duration_ms": scan_result.metadata.duration_ms,
-        "platform": scan_result.metadata.platform,
-        "warnings": scan_result.metadata.warnings,
-        "deep_scan": deep_scan,
-        "workloads": workloads,
-        "agent_activity": agent_activity,
-        "window_ms": window_ms,
-        "total_processes": scan_result.processes.len(),
-        "min_age_seconds": evaluator.min_age_seconds,
-        "younger_than_min_age": younger_than_min_age,
-        "returned": candidates.len(),
-        "matching_processes": matching_processes,
-        "truncated": matching_processes > candidates.len(),
-        "score_definition": "P(abandoned or zombie) from pt's posterior (0-1); suspicion_score = 100 x score",
-        "processes": candidates.iter().map(|(p, score, posterior, protected, top_signature)| {
+    let duration_ms = scan_started.elapsed().as_millis();
+    let process_snapshots = candidates
+        .iter()
+        .map(|(p, score, posterior, protected, top_signature)| {
             let activity = evaluator.scorer.activity_for(p);
             serde_json::json!({
                 "pid": p.pid.0,
@@ -971,7 +974,26 @@ fn tool_scan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
                 "protected": protected,
                 "top_signature": top_signature,
             })
-        }).collect::<Vec<_>>(),
+        })
+        .collect::<Vec<_>>();
+    let result = serde_json::json!({
+        "scanned_at": scan_result.metadata.started_at,
+        "duration_ms": duration_ms,
+        "quick_scan_duration_ms": scan_result.metadata.duration_ms,
+        "platform": scan_result.metadata.platform,
+        "warnings": scan_result.metadata.warnings,
+        "deep_scan": deep_scan,
+        "workloads": workloads,
+        "agent_activity": agent_activity,
+        "window_ms": window_ms,
+        "total_processes": scan_result.processes.len(),
+        "min_age_seconds": evaluator.min_age_seconds,
+        "younger_than_min_age": younger_than_min_age,
+        "returned": candidates.len(),
+        "matching_processes": matching_processes,
+        "truncated": matching_processes > candidates.len(),
+        "score_definition": "P(abandoned or zombie) from pt's posterior (0-1); suspicion_score = 100 x score",
+        "processes": process_snapshots,
     });
 
     Ok(vec![ToolContent {
@@ -2204,6 +2226,26 @@ mod tests {
             .unwrap(),
             ["agent", "label", "--format", "json", "--pid", "123", "--spare"]
         );
+        assert_eq!(
+            label_command_args(&serde_json::json!({
+                "pid": 123,
+                "session": "pt-20260115-143022-a7xq",
+                "verdict": "kill",
+                "confirmed_by_user": true,
+            }))
+            .unwrap(),
+            [
+                "agent",
+                "label",
+                "--format",
+                "json",
+                "--pid",
+                "123",
+                "--session",
+                "pt-20260115-143022-a7xq",
+                "--kill"
+            ]
+        );
         let command = "--keep; $(touch /tmp/pt-label-must-not-execute) 'two words'";
         assert_eq!(
             label_command_args(&serde_json::json!({
@@ -2244,6 +2286,8 @@ mod tests {
             serde_json::json!({"cmd": "sleep 1", "comm": "", "verdict": "spare", "confirmed_by_user": true}),
             serde_json::json!({"cmd": "sleep 1", "comm": null, "verdict": "spare", "confirmed_by_user": true}),
             serde_json::json!({"cmd": "sleep 1", "verdict": "spare", "confirmed_by_user": true, "apply": true}),
+            serde_json::json!({"cmd": "sleep 1", "session": "pt-20260115-143022-a7xq", "verdict": "spare", "confirmed_by_user": true}),
+            serde_json::json!({"session": "pt-20260115-143022-a7xq", "verdict": "spare", "confirmed_by_user": true}),
         ] {
             assert!(call_tool("pt_label", &arguments).is_err(), "{arguments}");
         }
@@ -2266,6 +2310,21 @@ mod tests {
             .unwrap_err();
             assert!(error.contains("pid"), "{error}");
         }
+        for session in [
+            serde_json::json!("../pt-20260115-143022-a7xq"),
+            serde_json::json!("/tmp/session"),
+            serde_json::json!("--help"),
+            serde_json::json!("pt-2026011é-143022-a7xq"),
+            serde_json::json!("pt-20260115-143022-💣"),
+            serde_json::json!(123),
+            serde_json::Value::Null,
+        ] {
+            let error = label_command_args(&serde_json::json!({
+                "pid": 123, "session": session, "verdict": "spare", "confirmed_by_user": true,
+            }))
+            .unwrap_err();
+            assert!(error.contains("session"), "{error}");
+        }
     }
 
     #[test]
@@ -2286,6 +2345,12 @@ mod tests {
             serde_json::json!(["kill", "spare"])
         );
         assert_eq!(schema["oneOf"].as_array().unwrap().len(), 2);
+        assert_eq!(schema["properties"]["session"]["type"], "string");
+        assert!(schema["oneOf"][1]["not"]["anyOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|exclusion| exclusion["required"] == serde_json::json!(["session"])));
         assert_eq!(schema["additionalProperties"], false);
         assert!(label.description.contains("never signals"));
     }
