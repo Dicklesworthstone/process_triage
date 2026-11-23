@@ -33,7 +33,7 @@
 //! ```
 
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use thiserror::Error;
 use tracing::{debug, trace};
@@ -1257,6 +1257,928 @@ pub fn agent_kind(cmd: &str) -> Option<&'static str> {
         "qwen" => "qwen",
         _ => "droid",
     })
+}
+
+/// Activity on a transcript that the recognized agent itself held writable.
+/// This does not identify a particular conversation or establish abandonment
+/// when no transcript was observed. Paths and transcript contents are omitted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSessionActivity {
+    pub identity: pt_common::ProcessIdentity,
+    pub ppid: u32,
+    pub command_sha256: String,
+    pub identity_verified: bool,
+    pub observed_at: chrono::DateTime<chrono::Utc>,
+    pub window_seconds: u64,
+    pub transcript_count: usize,
+    pub latest_modified_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub unavailable: Vec<String>,
+}
+
+impl AgentSessionActivity {
+    fn unavailable(process: &ProcessRecord, window_seconds: u64, reason: &str) -> Self {
+        Self {
+            identity: pt_common::ProcessIdentity::full(
+                process.pid.0,
+                process.start_id.clone(),
+                process.uid,
+                process.pgid,
+                process.sid,
+                pt_common::IdentityQuality::Full,
+            ),
+            ppid: process.ppid.0,
+            command_sha256: agent_command_digest(&process.cmd),
+            identity_verified: false,
+            observed_at: chrono::Utc::now(),
+            window_seconds,
+            transcript_count: 0,
+            latest_modified_at: None,
+            unavailable: vec![reason.to_string()],
+        }
+    }
+
+    /// Process replacement, observed command changes, reparenting and job changes
+    /// invalidate this observation. Ordinary scheduler-state changes do not.
+    pub fn matches_record(&self, process: &ProcessRecord) -> bool {
+        self.identity_verified
+            && self.identity.quality == pt_common::IdentityQuality::Full
+            && self.identity.pid == process.pid
+            && self.identity.start_id == process.start_id
+            && self.identity.uid == process.uid
+            && self.identity.pgid == process.pgid
+            && self.identity.sid == process.sid
+            && self.ppid == process.ppid.0
+            && self.command_sha256 == agent_command_digest(&process.cmd)
+            && agent_kind(&process.cmd).is_some()
+            && !matches!(
+                process.state,
+                crate::collect::ProcessState::Zombie
+                    | crate::collect::ProcessState::Dead
+                    | crate::collect::ProcessState::Unknown
+            )
+    }
+
+    /// Freshness is evaluated at the recorded observation time. Replay never
+    /// consults today's filesystem or clock, and future timestamps are unknown.
+    pub fn recently_modified(&self) -> Option<bool> {
+        self.recently_modified_within(self.window_seconds)
+    }
+
+    pub(crate) fn recently_modified_within(&self, window_seconds: u64) -> Option<bool> {
+        if !self.identity_verified || window_seconds == 0 || self.transcript_count == 0 {
+            return None;
+        }
+        let age = (self.observed_at - self.latest_modified_at?).to_std().ok()?;
+        let recent = age < std::time::Duration::from_secs(window_seconds);
+        // A positive observation survives partial collection. Stale evidence
+        // cannot establish quiet when another descriptor/task was unavailable.
+        (recent || self.unavailable.is_empty()).then_some(recent)
+    }
+}
+
+fn agent_command_digest(command: &str) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(command.as_bytes()))
+}
+
+/// Collect transcript metadata once for a scan's recognized agent roots.
+/// Only held writable descriptors are considered, never another session's
+/// newest file or a path supplied through an environment variable. Missing,
+/// closed, unsupported or unreadable transcript evidence remains unknown.
+pub fn collect_agent_session_activity(
+    processes: &[&ProcessRecord],
+    window_seconds: u64,
+) -> std::collections::BTreeMap<u32, AgentSessionActivity> {
+    #[cfg(target_os = "linux")]
+    {
+        agent_session::collect(processes, window_seconds)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        processes
+            .iter()
+            .filter(|process| agent_kind(&process.cmd).is_some())
+            .map(|process| {
+                (
+                    process.pid.0,
+                    AgentSessionActivity::unavailable(
+                        process,
+                        window_seconds,
+                        if window_seconds == 0 {
+                            "session transcript activity lookup is disabled by policy"
+                        } else {
+                            "session transcript descriptor inspection is unsupported on this platform"
+                        },
+                    ),
+                )
+            })
+            .collect()
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod agent_session {
+    use super::{agent_kind, AgentSessionActivity, ProcessRecord};
+    use crate::collect::proc_parsers::parse_required_proc_stat_content;
+    use crate::collect::procfs::{directory_path, mount_id, read_bounded, FilesystemGuard};
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::fs::{self, File, OpenOptions};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::path::{Component, Path};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    const MAX_FIELD_BYTES: usize = 65_536;
+    const MAX_TASKS: usize = 128;
+    const MAX_DESCRIPTORS: usize = 4096;
+    const SCAN_BUDGET: Duration = Duration::from_millis(250);
+    const PROCESS_BUDGET: Duration = Duration::from_millis(50);
+
+    struct Context {
+        boot: String,
+        boot_time: SystemTime,
+        ticks_per_second: u64,
+        filesystems: FilesystemGuard,
+        deadline: Instant,
+        process_budget: Duration,
+    }
+
+    impl Context {
+        fn load(deadline: Instant) -> Result<Self, &'static str> {
+            let boot = read_bounded(Path::new("/proc/sys/kernel/random/boot_id"), 128)?;
+            let boot = std::str::from_utf8(&boot)
+                .map_err(|_| "session_boot_identity_unavailable")?
+                .trim();
+            if uuid::Uuid::parse_str(boot).is_err() {
+                return Err("session_boot_identity_unavailable");
+            }
+            let stat = read_bounded(Path::new("/proc/stat"), 2_097_152)?;
+            let stat = std::str::from_utf8(&stat).map_err(|_| "session_boot_time_unavailable")?;
+            let mut boot_times = stat.lines().filter_map(|line| line.strip_prefix("btime "));
+            let seconds = boot_times
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|seconds| *seconds > 0)
+                .ok_or("session_boot_time_unavailable")?;
+            if boot_times.next().is_some() {
+                return Err("session_boot_time_unavailable");
+            }
+            Ok(Self {
+                boot: boot.to_string(),
+                boot_time: UNIX_EPOCH
+                    .checked_add(Duration::from_secs(seconds))
+                    .ok_or("session_boot_time_unavailable")?,
+                ticks_per_second: crate::collect::tick_delta::clk_tck(),
+                filesystems: FilesystemGuard::load()?,
+                deadline,
+                process_budget: PROCESS_BUDGET,
+            })
+        }
+
+        fn birth(&self, ticks: u64) -> Result<SystemTime, &'static str> {
+            if self.ticks_per_second == 0 {
+                return Err("session_process_birth_unavailable");
+            }
+            let nanos = (ticks % self.ticks_per_second)
+                .checked_mul(1_000_000_000)
+                .ok_or("session_process_birth_unavailable")?
+                / self.ticks_per_second;
+            self.boot_time
+                .checked_add(Duration::new(
+                    ticks / self.ticks_per_second,
+                    nanos as u32,
+                ))
+                .ok_or("session_process_birth_unavailable")
+        }
+    }
+
+    fn check_budget(deadline: Instant) -> Result<(), &'static str> {
+        if Instant::now() >= deadline {
+            Err("session_observation_budget_exhausted")
+        } else {
+            Ok(())
+        }
+    }
+
+    fn pin_directory(path: &Path) -> Result<File, &'static str> {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|_| "session_process_directory_unavailable")
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct TaskIdentity {
+        device: u64,
+        inode: u64,
+        birth_ticks: u64,
+    }
+
+    fn task_identity(
+        task: &File,
+        tid: u32,
+        process: &ProcessRecord,
+    ) -> Result<(TaskIdentity, crate::collect::ProcessStat), &'static str> {
+        let metadata = task
+            .metadata()
+            .map_err(|_| "session_task_identity_unavailable")?;
+        let stat = read_bounded(&directory_path(task, "stat"), MAX_FIELD_BYTES)?;
+        let stat = std::str::from_utf8(&stat).map_err(|_| "session_task_stat_unavailable")?;
+        let stat = parse_required_proc_stat_content(tid, stat)
+            .map_err(|_| "session_task_stat_unavailable")?;
+        let status = read_bounded(&directory_path(task, "status"), MAX_FIELD_BYTES)?;
+        let status = std::str::from_utf8(&status).map_err(|_| "session_task_status_unavailable")?;
+        let mut uid_lines = status.lines().filter_map(|line| line.strip_prefix("Uid:"));
+        let uids: Vec<_> = uid_lines
+            .next()
+            .ok_or("session_task_uid_unavailable")?
+            .split_whitespace()
+            .map(str::parse::<u32>)
+            .collect::<Result<_, _>>()
+            .map_err(|_| "session_task_uid_unavailable")?;
+        let mut tgid_lines = status.lines().filter_map(|line| line.strip_prefix("Tgid:"));
+        let tgid = tgid_lines
+            .next()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .ok_or("session_task_group_unavailable")?;
+        if uids.len() != 4
+            || uids.iter().any(|uid| *uid != process.uid)
+            || uid_lines.next().is_some()
+            || tgid != process.pid.0
+            || tgid_lines.next().is_some()
+            || !matches!(
+                stat.state,
+                'R' | 'S' | 'D' | 'T' | 't' | 'I' | 'P' | 'W' | 'K'
+            )
+        {
+            return Err("session_task_identity_changed_or_unusable");
+        }
+        Ok((
+            TaskIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                birth_ticks: stat.starttime,
+            },
+            stat,
+        ))
+    }
+
+    fn root_identity(
+        root: &File,
+        process: &ProcessRecord,
+        context: &Context,
+    ) -> Result<TaskIdentity, &'static str> {
+        let (identity, stat) = task_identity(root, process.pid.0, process)?;
+        if stat.ppid != process.ppid.0
+            || stat.comm != process.comm
+            || u32::try_from(stat.pgrp).ok() != process.pgid
+            || u32::try_from(stat.session).ok() != process.sid
+            || pt_common::StartId::from_linux(&context.boot, stat.starttime, stat.pid)
+                != process.start_id
+            || matches!(
+                process.state,
+                crate::collect::ProcessState::Zombie
+                    | crate::collect::ProcessState::Dead
+                    | crate::collect::ProcessState::Unknown
+            )
+        {
+            return Err("session_process_identity_changed_or_unusable");
+        }
+        let raw_command = read_bounded(&directory_path(root, "cmdline"), MAX_FIELD_BYTES)?;
+        if raw_command.last() != Some(&0) {
+            return Err("session_command_unavailable");
+        }
+        let command = std::str::from_utf8(&raw_command)
+            .map_err(|_| "session_command_unavailable")?
+            .replace('\0', " ");
+        if command.trim() != process.cmd.trim() || agent_kind(command.trim()).is_none() {
+            return Err("session_command_changed");
+        }
+        Ok(identity)
+    }
+
+    fn canonical_uuid(value: &str) -> bool {
+        uuid::Uuid::parse_str(value).is_ok_and(|id| id.hyphenated().to_string() == value)
+    }
+
+    /// Only established transcript layouts; no filesystem path is traversed.
+    /// Codex: openai/codex codex-rs/rollout/src/recorder.rs.
+    /// Claude: code.claude.com/docs/en/claude-directory (application data).
+    fn transcript_path(kind: &str, path: &Path) -> bool {
+        if !path.is_absolute()
+            || path
+                .components()
+                .any(|part| !matches!(part, Component::RootDir | Component::Normal(_)))
+        {
+            return false;
+        }
+        let Some(stem) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".jsonl"))
+        else {
+            return false;
+        };
+        let Some(parent) = path.parent() else {
+            return false;
+        };
+        match kind {
+            "claude" => {
+                canonical_uuid(stem)
+                    && parent.file_name().is_some()
+                    && parent
+                        .parent()
+                        .and_then(Path::file_name)
+                        .is_some_and(|name| name == "projects")
+            }
+            "codex" => {
+                let Some(name) = stem.strip_prefix("rollout-") else {
+                    return false;
+                };
+                let Some(timestamp) = name.get(..19) else {
+                    return false;
+                };
+                if chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H-%M-%S").is_err()
+                    || name.get(19..20) != Some("-")
+                {
+                    return false;
+                }
+                let mut ids = name[20..].split('_');
+                if !ids.next().is_some_and(canonical_uuid)
+                    || ids.next().is_some_and(|id| !canonical_uuid(id))
+                    || ids.next().is_some()
+                {
+                    return false;
+                }
+                if parent.file_name().is_some_and(|name| name == "sessions") {
+                    return true;
+                }
+                let parts: Vec<_> = parent.components().rev().take(4).collect();
+                parts.len() == 4
+                    && parts[0].as_os_str() == &timestamp[8..10]
+                    && parts[1].as_os_str() == &timestamp[5..7]
+                    && parts[2].as_os_str() == &timestamp[..4]
+                    && parts[3].as_os_str() == "sessions"
+            }
+            _ => false,
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct DescriptorIdentity {
+        flags: u64,
+        mount: u64,
+        inode: u64,
+    }
+
+    fn descriptor_identity(path: &Path) -> Result<DescriptorIdentity, &'static str> {
+        let bytes = read_bounded(path, MAX_FIELD_BYTES)?;
+        if bytes.last() != Some(&b'\n') {
+            return Err("session_descriptor_info_incomplete");
+        }
+        let content = std::str::from_utf8(&bytes)
+            .map_err(|_| "session_descriptor_info_unavailable")?;
+        let field = |name: &str, radix: u32| -> Result<u64, &'static str> {
+            let mut values = content.lines().filter_map(|line| line.strip_prefix(name));
+            let value = values
+                .next()
+                .ok_or("session_descriptor_info_incomplete")?
+                .trim();
+            if value.is_empty()
+                || !value.bytes().all(|b| b.is_ascii_digit())
+                || values.next().is_some()
+            {
+                return Err("session_descriptor_info_ambiguous");
+            }
+            u64::from_str_radix(value, radix).map_err(|_| "session_descriptor_info_invalid")
+        };
+        let identity = DescriptorIdentity {
+            flags: field("flags:", 8)?,
+            mount: field("mnt_id:", 10)?,
+            inode: field("ino:", 10)?,
+        };
+        if identity.mount == 0 || identity.inode == 0 {
+            return Err("session_descriptor_info_invalid");
+        }
+        Ok(identity)
+    }
+
+    type Transcript = ((u64, u64), SystemTime);
+
+    fn inspect_descriptor(
+        task: &File,
+        fd: u32,
+        kind: &str,
+        process: &ProcessRecord,
+        context: &Context,
+    ) -> Result<Option<Transcript>, &'static str> {
+        let path = directory_path(task, &format!("fd/{fd}"));
+        let target = fs::read_link(&path).map_err(|_| "session_descriptor_link_unavailable")?;
+        if !transcript_path(kind, &target) {
+            return Ok(None);
+        }
+        let info = directory_path(task, &format!("fdinfo/{fd}"));
+        let before = descriptor_identity(&info)?;
+        if !matches!(before.flags & libc::O_ACCMODE as u64, 1 | 2)
+            || before.flags & libc::O_PATH as u64 != 0
+        {
+            return Ok(None);
+        }
+        // Follow only the kernel's held-descriptor link with O_PATH. Determine
+        // its mount from procfs before asking the filesystem for metadata.
+        let held = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+            .open(&path)
+            .map_err(|_| "session_descriptor_unavailable")?;
+        if !context.filesystems.permits(&held) || mount_id(&held) != Some(before.mount) {
+            return Err("session_transcript_filesystem_unavailable");
+        }
+        let metadata = held
+            .metadata()
+            .map_err(|_| "session_transcript_metadata_unavailable")?;
+        if !metadata.is_file()
+            || metadata.uid() != process.uid
+            || metadata.nlink() != 1
+            || metadata.len() == 0
+            || metadata.ino() != before.inode
+        {
+            return Err("session_transcript_identity_unusable");
+        }
+        if descriptor_identity(&info)? != before
+            || fs::read_link(&path).map_err(|_| "session_descriptor_link_unavailable")? != target
+        {
+            return Err("session_descriptor_changed");
+        }
+        Ok(Some((
+            (metadata.dev(), metadata.ino()),
+            metadata
+                .modified()
+                .map_err(|_| "session_transcript_mtime_unavailable")?,
+        )))
+    }
+
+    fn collect_one(
+        process: &ProcessRecord,
+        window_seconds: u64,
+        proc_root: &Path,
+        context: &Context,
+    ) -> AgentSessionActivity {
+        collect_one_with(process, window_seconds, proc_root, context, || {})
+    }
+
+    fn collect_one_with(
+        process: &ProcessRecord,
+        window_seconds: u64,
+        proc_root: &Path,
+        context: &Context,
+        before_recheck: impl FnOnce(),
+    ) -> AgentSessionActivity {
+        let mut result = AgentSessionActivity::unavailable(process, window_seconds, "");
+        result.unavailable.clear();
+        let observation = (|| -> Result<(), &'static str> {
+            if window_seconds == 0 {
+                return Err("session transcript activity lookup is disabled by policy");
+            }
+            check_budget(context.deadline)?;
+            let kind = agent_kind(&process.cmd).ok_or("session_agent_unrecognized")?;
+            if !matches!(kind, "claude" | "codex") {
+                return Err("session_transcript_layout_unsupported");
+            }
+            let deadline = context.deadline.min(Instant::now() + context.process_budget);
+            let root = pin_directory(&proc_root.join(process.pid.0.to_string()))?;
+            let before = root_identity(&root, process, context)?;
+            let birth = context.birth(before.birth_ticks)?;
+            let task_dir = directory_path(&root, "task");
+            let mut tids = BTreeSet::from([process.pid.0]);
+            match fs::read_dir(&task_dir) {
+                Ok(entries) => {
+                    for entry in entries {
+                        if check_budget(deadline).is_err() || tids.len() >= MAX_TASKS {
+                            result
+                                .unavailable
+                                .push("session_task_budget_exhausted".to_string());
+                            break;
+                        }
+                        let tid = entry
+                            .ok()
+                            .and_then(|entry| entry.file_name().to_str()?.parse::<u32>().ok());
+                        match tid {
+                            Some(tid) if tid > 0 && tid <= i32::MAX as u32 => {
+                                tids.insert(tid);
+                            }
+                            _ => result
+                                .unavailable
+                                .push("session_task_entry_unavailable".to_string()),
+                        }
+                    }
+                }
+                Err(_) => result
+                    .unavailable
+                    .push("session_tasks_unavailable".to_string()),
+            }
+            let mut remaining = MAX_DESCRIPTORS;
+            let mut transcripts = BTreeMap::new();
+            // Inspect the leader first: most threads share this descriptor table.
+            let ordered = std::iter::once(process.pid.0)
+                .chain(tids.into_iter().filter(|tid| *tid != process.pid.0));
+            for tid in ordered {
+                if check_budget(deadline).is_err() || remaining == 0 {
+                    result
+                        .unavailable
+                        .push("session_descriptor_budget_exhausted".to_string());
+                    break;
+                }
+                let task_result =
+                    (|| -> Result<BTreeMap<(u64, u64), SystemTime>, &'static str> {
+                        let task = pin_directory(&task_dir.join(tid.to_string()))?;
+                        let (task_before, _) = task_identity(&task, tid, process)?;
+                        let entries = fs::read_dir(directory_path(&task, "fd"))
+                            .map_err(|_| "session_descriptor_table_unavailable")?;
+                        let mut found = BTreeMap::new();
+                        for entry in entries {
+                            if check_budget(deadline).is_err() || remaining == 0 {
+                                result
+                                    .unavailable
+                                    .push("session_descriptor_budget_exhausted".to_string());
+                                break;
+                            }
+                            remaining -= 1;
+                            let fd = entry.ok().and_then(|entry| {
+                                entry.file_name().to_str()?.parse::<u32>().ok()
+                            });
+                            let Some(fd) = fd.filter(|fd| *fd <= i32::MAX as u32) else {
+                                result
+                                    .unavailable
+                                    .push("session_descriptor_entry_unavailable".to_string());
+                                continue;
+                            };
+                            match inspect_descriptor(&task, fd, kind, process, context) {
+                                Ok(Some((identity, modified))) => {
+                                    found.insert(identity, modified);
+                                }
+                                Ok(None) => {}
+                                Err(reason) => result.unavailable.push(reason.to_string()),
+                            }
+                        }
+                        let (task_after, _) = task_identity(&task, tid, process)?;
+                        if task_before != task_after {
+                            return Err("session_task_identity_changed");
+                        }
+                        Ok(found)
+                    })();
+                match task_result {
+                    Ok(found) => transcripts.extend(found),
+                    Err(reason) => result.unavailable.push(reason.to_string()),
+                }
+            }
+            // A positive observation still needs a final bounded root check
+            // after a descriptor budget expires. Never reuse a replaced process.
+            before_recheck();
+            if root_identity(&root, process, context)? != before {
+                return Err("session_process_identity_changed");
+            }
+            let observed_at = SystemTime::now();
+            let mut latest = None;
+            for modified in transcripts.into_values() {
+                if modified < birth || modified > observed_at {
+                    result.unavailable.push(
+                        "session_transcript_mtime_outside_process_lifetime".to_string(),
+                    );
+                    continue;
+                }
+                result.transcript_count += 1;
+                latest = Some(latest.map_or(modified, |old: SystemTime| old.max(modified)));
+            }
+            result.identity_verified = true;
+            result.observed_at = observed_at.into();
+            result.latest_modified_at = latest.map(Into::into);
+            if result.transcript_count == 0 {
+                result.unavailable.push(
+                    "no identity-bound open writable session transcript was observed; agents may close transcripts between writes"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        })();
+        if let Err(reason) = observation {
+            result.identity_verified = false;
+            result.transcript_count = 0;
+            result.latest_modified_at = None;
+            result.unavailable.push(reason.to_string());
+        }
+        result.unavailable.sort();
+        result.unavailable.dedup();
+        result
+    }
+
+    pub(super) fn collect(
+        processes: &[&ProcessRecord],
+        window_seconds: u64,
+    ) -> BTreeMap<u32, AgentSessionActivity> {
+        let roots: Vec<_> = processes
+            .iter()
+            .copied()
+            .filter(|process| agent_kind(&process.cmd).is_some())
+            .collect();
+        if roots.is_empty() {
+            return BTreeMap::new();
+        }
+        let context = if window_seconds == 0 {
+            Err("session transcript activity lookup is disabled by policy")
+        } else {
+            Context::load(Instant::now() + SCAN_BUDGET)
+        };
+        roots
+            .into_iter()
+            .map(|process| {
+                let observation = match &context {
+                    Ok(context) => {
+                        collect_one(process, window_seconds, Path::new("/proc"), context)
+                    }
+                    Err(reason) => {
+                        AgentSessionActivity::unavailable(process, window_seconds, reason)
+                    }
+                };
+                (process.pid.0, observation)
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::collect::ProcessState;
+        use pt_common::{ProcessId, StartId};
+        use std::path::PathBuf;
+
+        const BOOT: &str = "ebaf61d7-e8b6-4f06-a845-4376238330f0";
+        const SESSION: &str = "019c017a-84b0-7710-8bba-47ea1175fee3";
+
+        struct Fixture {
+            _directory: tempfile::TempDir,
+            proc_root: PathBuf,
+            transcript: PathBuf,
+            process: ProcessRecord,
+            context: Context,
+        }
+
+        impl Fixture {
+            fn new() -> Self {
+                let directory = tempfile::tempdir().unwrap();
+                let proc_root = directory.path().join("proc");
+                let transcript = directory.path().join(format!(
+                    "sessions/2026/01/27/rollout-2026-01-27T12-30-00-{SESSION}.jsonl"
+                ));
+                fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+                fs::write(&transcript, b"{}\n").unwrap();
+                let held = File::open(&transcript).unwrap();
+                let uid = held.metadata().unwrap().uid();
+                let mount = mount_id(&held).unwrap();
+                let process = ProcessRecord {
+                    pid: ProcessId(4242),
+                    ppid: ProcessId(1),
+                    uid,
+                    user: "fixture".to_string(),
+                    pgid: Some(4242),
+                    sid: Some(4242),
+                    start_id: StartId::from_linux(BOOT, 100, 4242),
+                    comm: "codex".to_string(),
+                    cmd: "codex exec review".to_string(),
+                    state: ProcessState::Sleeping,
+                    cpu_percent: 0.0,
+                    rss_bytes: 4096,
+                    vsz_bytes: 8192,
+                    tty: None,
+                    start_time_unix: 1_600_000_001,
+                    elapsed: Duration::from_secs(3600),
+                    source: "fixture".to_string(),
+                    container_info: None,
+                };
+                let context = Context {
+                    boot: BOOT.to_string(),
+                    boot_time: UNIX_EPOCH + Duration::from_secs(1_600_000_000),
+                    ticks_per_second: 100,
+                    filesystems: FilesystemGuard {
+                        mounts: BTreeMap::from([(mount, true)]),
+                    },
+                    deadline: Instant::now() + Duration::from_secs(10),
+                    process_budget: Duration::from_secs(10),
+                };
+                let result = Self {
+                    _directory: directory,
+                    proc_root,
+                    transcript,
+                    process,
+                    context,
+                };
+                result.write_identity(&result.root(), 4242);
+                fs::write(result.root().join("cmdline"), b"codex\0exec\0review\0").unwrap();
+                result.add_task(4242);
+                result.add_descriptor(4242, 3, 2);
+                result
+            }
+
+            fn root(&self) -> PathBuf {
+                self.proc_root.join("4242")
+            }
+
+            fn task(&self, tid: u32) -> PathBuf {
+                self.root().join("task").join(tid.to_string())
+            }
+
+            fn write_identity(&self, path: &Path, tid: u32) {
+                fs::create_dir_all(path).unwrap();
+                let mut fields = ["0"; 24];
+                fields[0] = "S";
+                fields[1] = "1";
+                fields[2] = "4242";
+                fields[3] = "4242";
+                fields[19] = "100";
+                fs::write(
+                    path.join("stat"),
+                    format!("{tid} (codex) {}\n", fields.join(" ")),
+                )
+                .unwrap();
+                let uid = self.process.uid;
+                fs::write(
+                    path.join("status"),
+                    format!("Tgid:\t4242\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"),
+                )
+                .unwrap();
+            }
+
+            fn add_task(&self, tid: u32) {
+                let task = self.task(tid);
+                self.write_identity(&task, tid);
+                fs::create_dir_all(task.join("fd")).unwrap();
+                fs::create_dir_all(task.join("fdinfo")).unwrap();
+            }
+
+            fn add_descriptor(&self, tid: u32, fd: u32, flags: u64) {
+                let task = self.task(tid);
+                std::os::unix::fs::symlink(&self.transcript, task.join(format!("fd/{fd}")))
+                    .unwrap();
+                self.write_descriptor_info(tid, fd, flags);
+            }
+
+            fn write_descriptor_info(&self, tid: u32, fd: u32, flags: u64) {
+                let held = File::open(&self.transcript).unwrap();
+                let mount = mount_id(&held).unwrap();
+                let inode = held.metadata().unwrap().ino();
+                fs::write(
+                    self.task(tid).join(format!("fdinfo/{fd}")),
+                    format!("flags:\t{flags:o}\nmnt_id:\t{mount}\nino:\t{inode}\n"),
+                )
+                .unwrap();
+            }
+
+            fn modified(&self, when: SystemTime) {
+                File::options()
+                    .write(true)
+                    .open(&self.transcript)
+                    .unwrap()
+                    .set_modified(when)
+                    .unwrap();
+            }
+
+            fn observe(&self, window_seconds: u64) -> AgentSessionActivity {
+                collect_one(&self.process, window_seconds, &self.proc_root, &self.context)
+            }
+        }
+
+        #[test]
+        fn transcript_layouts_are_specific_and_support_custom_roots() {
+            for path in [
+                format!("/custom/sessions/2026/01/27/rollout-2026-01-27T12-30-00-{SESSION}.jsonl"),
+                format!("/custom/sessions/rollout-2026-01-27T12-30-00-{SESSION}_{BOOT}.jsonl"),
+            ] {
+                assert!(transcript_path("codex", Path::new(&path)), "{path}");
+            }
+            assert!(transcript_path(
+                "claude",
+                Path::new(&format!("/custom/projects/-workspace/{SESSION}.jsonl"))
+            ));
+            for path in [
+                "/tmp/history.jsonl".to_string(),
+                format!("projects/-workspace/{SESSION}.jsonl"),
+                format!("/custom/projects/-workspace/{SESSION}.jsonl (deleted)"),
+                format!("/custom/sessions/2026/01/28/rollout-2026-01-27T12-30-00-{SESSION}.jsonl"),
+                format!("/custom/sessions/rollout-2026-99-27T12-30-00-{SESSION}.jsonl"),
+                "/custom/sessions/rollout-2026-01-27T12-30-00-not-an-id.jsonl".to_string(),
+            ] {
+                assert!(!transcript_path("codex", Path::new(&path)), "{path}");
+                assert!(!transcript_path("claude", Path::new(&path)), "{path}");
+            }
+            assert!(!transcript_path(
+                "gemini",
+                Path::new(&format!("/custom/projects/-workspace/{SESSION}.jsonl"))
+            ));
+        }
+
+        #[test]
+        fn held_writable_transcript_is_bound_deduplicated_and_private() {
+            let fixture = Fixture::new();
+            fixture.add_task(4243);
+            fixture.add_descriptor(4243, 3, 2);
+            // Unreadable evidence on another descriptor must not erase a
+            // separately verified positive observation.
+            fs::write(fixture.task(4242).join("fd/9"), b"not a descriptor link").unwrap();
+            let observation = fixture.observe(1800);
+            assert!(observation.matches_record(&fixture.process));
+            assert_eq!(observation.transcript_count, 1);
+            assert_eq!(observation.recently_modified(), Some(true));
+            assert!(!observation.unavailable.is_empty());
+            let encoded = serde_json::to_string(&observation).unwrap();
+            assert!(!encoded.contains(SESSION));
+            assert!(!encoded.contains(fixture.transcript.to_str().unwrap()));
+            let decoded: AgentSessionActivity = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded.recently_modified(), Some(true));
+
+            fixture.modified(SystemTime::now() - Duration::from_secs(3600));
+            let stale_partial = fixture.observe(1800);
+            assert_eq!(stale_partial.transcript_count, 1);
+            assert!(!stale_partial.unavailable.is_empty());
+            assert_eq!(stale_partial.recently_modified(), None);
+        }
+
+        #[test]
+        fn stale_future_prebirth_disabled_and_unavailable_are_distinct() {
+            let fixture = Fixture::new();
+            fixture.modified(SystemTime::now() - Duration::from_secs(3600));
+            assert_eq!(fixture.observe(1800).recently_modified(), Some(false));
+            fixture.modified(SystemTime::now() + Duration::from_secs(3600));
+            assert_eq!(fixture.observe(1800).recently_modified(), None);
+            fixture.modified(fixture.context.boot_time);
+            assert_eq!(fixture.observe(1800).recently_modified(), None);
+            fixture.modified(SystemTime::now());
+            assert_eq!(fixture.observe(0).recently_modified(), None);
+            fixture.write_descriptor_info(4242, 3, 0);
+            assert_eq!(fixture.observe(1800).recently_modified(), None);
+            fixture.write_descriptor_info(4242, 3, 2);
+            fs::write(fixture.task(4242).join("fdinfo/3"), b"flags:\t2\n").unwrap();
+            assert_eq!(fixture.observe(1800).recently_modified(), None);
+        }
+
+        #[test]
+        fn filesystem_and_inode_ambiguity_fail_closed() {
+            let mut fixture = Fixture::new();
+            for allowed in fixture.context.filesystems.mounts.values_mut() {
+                *allowed = false;
+            }
+            assert_eq!(fixture.observe(1800).recently_modified(), None);
+            for allowed in fixture.context.filesystems.mounts.values_mut() {
+                *allowed = true;
+            }
+            fs::hard_link(
+                &fixture.transcript,
+                fixture.transcript.with_extension("linked"),
+            )
+            .unwrap();
+            assert_eq!(fixture.observe(1800).recently_modified(), None);
+        }
+
+        #[test]
+        fn transcript_owner_must_match_the_verified_process() {
+            let mut fixture = Fixture::new();
+            fixture.process.uid = fixture.process.uid.wrapping_add(1);
+            fixture.write_identity(&fixture.root(), 4242);
+            fixture.write_identity(&fixture.task(4242), 4242);
+            assert_eq!(fixture.observe(1800).recently_modified(), None);
+        }
+
+        #[test]
+        fn root_replacement_reparenting_exec_and_exhausted_budget_are_unknown() {
+            let fixture = Fixture::new();
+            let mut changed = fixture.process.clone();
+            changed.ppid = ProcessId(2);
+            assert_eq!(
+                collect_one(&changed, 1800, &fixture.proc_root, &fixture.context)
+                    .recently_modified(),
+                None
+            );
+            changed = fixture.process.clone();
+            changed.start_id = StartId::from_linux(BOOT, 101, 4242);
+            assert_eq!(
+                collect_one(&changed, 1800, &fixture.proc_root, &fixture.context)
+                    .recently_modified(),
+                None
+            );
+            let raced = collect_one_with(
+                &fixture.process,
+                1800,
+                &fixture.proc_root,
+                &fixture.context,
+                || fs::write(fixture.root().join("cmdline"), b"codex\0exec\0other\0").unwrap(),
+            );
+            assert!(!raced.identity_verified);
+            assert_eq!(raced.transcript_count, 0);
+            assert_eq!(raced.recently_modified(), None);
+            let mut fixture = Fixture::new();
+            fixture.context.deadline = Instant::now();
+            assert_eq!(fixture.observe(1800).recently_modified(), None);
+        }
+    }
 }
 
 /// Seconds since the terminal `tty` (as `ps` reports it: `pts/3`, `ttys003`) last

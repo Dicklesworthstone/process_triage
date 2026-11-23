@@ -9,7 +9,7 @@
 use crate::policy::{
     AlphaInvesting, ConfidenceLevel, DataLossGates, DecisionTimeBound, FdrControl, FdrMethod,
     Guardrails, LoadAwareDecision, LossMatrix, LossRow, PatternEntry, PatternKind, Policy,
-    RobotMode, SignalPolicy, SignatureFastPath,
+    RobotMode, SignalPolicy, SignatureFastPath, DEFAULT_AGENT_SESSION_WINDOW_SECONDS,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -223,6 +223,7 @@ fn developer_preset() -> Policy {
             min_process_age_seconds: 1800, // 30 minutes (shorter than default)
             require_confirmation: Some(true), // Still interactive by default
             builtin_protection: true,
+            agent_session_window_seconds: DEFAULT_AGENT_SESSION_WINDOW_SECONDS,
         },
 
         robot_mode: RobotMode {
@@ -427,6 +428,7 @@ fn server_preset() -> Policy {
             min_process_age_seconds: 14400, // 4 hours
             require_confirmation: Some(true),
             builtin_protection: true,
+            agent_session_window_seconds: DEFAULT_AGENT_SESSION_WINDOW_SECONDS,
         },
 
         robot_mode: RobotMode {
@@ -601,6 +603,7 @@ fn ci_preset() -> Policy {
             min_process_age_seconds: 3600, // 1 hour (long enough for most CI jobs)
             require_confirmation: Some(false), // NO interactive prompts
             builtin_protection: true,
+            agent_session_window_seconds: DEFAULT_AGENT_SESSION_WINDOW_SECONDS,
         },
 
         robot_mode: RobotMode {
@@ -862,6 +865,7 @@ fn paranoid_preset() -> Policy {
             min_process_age_seconds: 86400, // 24 hours
             require_confirmation: Some(true),
             builtin_protection: true,
+            agent_session_window_seconds: DEFAULT_AGENT_SESSION_WINDOW_SECONDS,
         },
 
         robot_mode: RobotMode {

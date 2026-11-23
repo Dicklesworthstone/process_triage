@@ -851,20 +851,38 @@ does not repeat events merely because an age or resource counter moved. These
 reports do not relax agent protection or authorize group actions.
 
 The shared recommendation path also uses these observations in `agent_liveness`.
-An identified agent with recent terminal activity or measured CPU/I/O progress
-in its own process or an attributed child is retained with a `keep`
-recommendation and an explanation of the observed work. This includes headless
-agents whose work happens in child tools. The assessment is bound to the agent's
-process identity; it does not give descendants additional protection.
+An identified agent with recent terminal activity, measured CPU/I/O progress
+in its own process or an attributed child, or a recently modified open session
+transcript is retained with a `keep` recommendation and an explanation of the
+observation. This includes headless agents whose work happens in child tools.
+The assessment is bound to the agent's process identity; it does not give
+descendants additional protection.
+
+On Linux, Codex and Claude can also contribute session-transcript evidence.
+Collection inspects recognized transcript files that the agent itself holds open
+for writing, checking process identity, descriptor ownership and safe filesystem
+placement around the metadata read. It does not search for the newest file in a
+session directory, read transcript contents, or persist transcript paths.
+A missing, closed, unreadable, replaced, future-dated, or unsupported transcript
+remains unknown; recent modification does not identify who wrote it or establish
+a particular conversation ID.
+
+Set `guardrails.agent_session_window_seconds` in `policy.json` to control the
+transcript recency window (default `1800`, or 30 minutes). A value of `0` disables
+this observation. It is independent of the CPU/I/O sampling window: a verified
+recent transcript can retain an otherwise idle headless agent even with
+`--window-ms 0`. The metadata summary is saved in
+`agent_liveness.activity.session_activity`; positive evidence appears in
+`sources` as `recent_session_transcript_activity`.
 
 `agent_liveness.live` is `true` for positive activity, `false` for a fully observed
 quiet sampling window, and `null` when evidence is incomplete. Its `status`,
-`sources`, `reason`, and `activity` fields explain the result in plan/explain and
-MCP output. `terminal_window_seconds` names the terminal recency threshold;
-`requested_activity_window_ms` names the separate CPU/I/O sampling interval.
-Disabling sampling with `--window-ms 0` leaves a headless agent's liveness unknown.
-A quiet window never establishes abandonment or authorizes an automatic kill.
-Session-transcript activity is not yet collected.
+`sources`, `reason`, `activity`, and `unavailable` fields explain the result in
+plan/explain and MCP output. `terminal_window_seconds` names the terminal recency
+threshold; `requested_activity_window_ms` names the separate CPU/I/O sampling
+interval. A quiet window never establishes abandonment or authorizes an
+automatic kill. Replay captures retain full-census child activity even when the
+capture policy excludes those children from independent scoring.
 
 #### Live memory-limit headroom
 

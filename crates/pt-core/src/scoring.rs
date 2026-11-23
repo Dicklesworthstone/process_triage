@@ -369,6 +369,7 @@ pub struct Scorer {
     activity_window: Option<Duration>,
     activity: BTreeMap<u32, ProcessActivity>,
     agent_activity: BTreeMap<u32, AgentActivityUnit>,
+    agent_session_window_seconds: u64,
     respawn_history: BTreeMap<u32, (pt_common::StartId, u32, RespawnLoopSummary)>,
     work: Option<DuplicateWorkSnapshot>,
     supervisor_restarts: BTreeMap<u32, SupervisorRestartObservation>,
@@ -460,6 +461,12 @@ pub struct AgentActivityUnit {
     /// Requested CPU/I/O sampling window; never the terminal-idle threshold.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sampling_window_ms: Option<u64>,
+    /// Effective transcript lookback, including when no transcript was captured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_window_seconds: Option<u64>,
+    /// Independently verified metadata, including with CPU sampling disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_activity: Option<crate::collect::protected::AgentSessionActivity>,
     pub activity: AgentActivityState,
     pub member_count: usize,
     pub composition: AgentChildComposition,
@@ -495,6 +502,7 @@ pub enum AgentLivenessState {
 #[serde(rename_all = "snake_case")]
 pub enum AgentLivenessSource {
     RecentTerminalActivity,
+    RecentSessionTranscriptActivity,
     ProcessActivity,
     DescendantActivity,
 }
@@ -552,20 +560,45 @@ pub fn assess_agent_liveness(
     let activity = activity.filter(|unit| {
         unit.matches_record(process)
             && unit.root.quality == pt_common::IdentityQuality::Full
-            && unit.sampling_window_ms.is_some_and(|window| window > 0)
             && agent_start_parts(process)
                 .is_some_and(|(boot, _)| !matches!(boot, "unknown" | "synthetic"))
     });
+    let sampled_activity =
+        activity.filter(|unit| unit.sampling_window_ms.is_some_and(|window| window > 0));
+    let session_activity = activity.and_then(|unit| unit.session_activity.as_ref());
+    let session_window_seconds = activity
+        .and_then(|unit| unit.session_window_seconds)
+        .or_else(|| session_activity.map(|session| session.window_seconds))
+        .unwrap_or(crate::config::policy::DEFAULT_AGENT_SESSION_WINDOW_SECONDS);
+    let session_observed = session_window_seconds == 0
+        || session_activity.is_some_and(|session| {
+            session.matches_record(process)
+                && session
+                    .recently_modified_within(session_window_seconds)
+                    .is_some()
+        });
     let mut sources = Vec::new();
     let mut reasons = Vec::new();
-    if !process.state.is_zombie() {
+    if !matches!(
+        process.state,
+        crate::collect::ProcessState::Zombie
+            | crate::collect::ProcessState::Dead
+            | crate::collect::ProcessState::Unknown
+    ) {
         if process.tty.is_some()
             && tty_idle_seconds.is_some_and(|idle| idle < terminal_window_seconds)
         {
             sources.push(AgentLivenessSource::RecentTerminalActivity);
             reasons.push("terminal has recent activity".to_string());
         }
-        if let Some(unit) = activity.filter(|unit| {
+        if session_activity.is_some_and(|session| {
+            session.matches_record(process)
+                && session.recently_modified_within(session_window_seconds) == Some(true)
+        }) {
+            sources.push(AgentLivenessSource::RecentSessionTranscriptActivity);
+            reasons.push("an open session transcript was recently modified".to_string());
+        }
+        if let Some(unit) = sampled_activity.filter(|unit| {
             unit.activity == AgentActivityState::ActivityObserved
                 && unit.coverage.active_members > 0
         }) {
@@ -586,7 +619,8 @@ pub fn assess_agent_liveness(
     let status = if !sources.is_empty() {
         AgentLivenessState::Live
     } else if terminal_observed
-        && activity
+        && session_observed
+        && sampled_activity
             .is_some_and(|unit| unit.activity == AgentActivityState::NoActivityObservedInWindow)
     {
         AgentLivenessState::NoActivityObservedInWindow
@@ -602,7 +636,7 @@ pub fn assess_agent_liveness(
         AgentLivenessState::Live => format!("Keep: AI agent CLI {}", reasons.join("; ")),
         AgentLivenessState::NoActivityObservedInWindow => format!(
             "No activity observed in the {}ms sampling window; a quiet sampling window does not establish abandonment",
-            activity.and_then(|unit| unit.sampling_window_ms).unwrap_or(0)
+            sampled_activity.and_then(|unit| unit.sampling_window_ms).unwrap_or(0)
         ),
         AgentLivenessState::Unknown =>
             "Agent liveness is unknown because recent activity evidence is incomplete".to_string(),
@@ -611,6 +645,19 @@ pub fn assess_agent_liveness(
         || vec!["identity-bound agent activity census is unavailable".to_string()],
         |unit| unit.unavailable.clone(),
     );
+    match session_activity {
+        Some(session) => {
+            unavailable.extend(session.unavailable.iter().cloned());
+            if session_window_seconds > 0 && !session.matches_record(process) {
+                unavailable
+                    .push("identity-bound session transcript evidence is unavailable".to_string());
+            }
+        }
+        None if session_window_seconds > 0 => {
+            unavailable.push("session transcript activity was not captured".to_string());
+        }
+        None => {}
+    }
     if !terminal_observed {
         unavailable.push("terminal activity could not be read".to_string());
     }
@@ -775,12 +822,21 @@ impl Scorer {
             activity_window: None,
             activity: BTreeMap::new(),
             agent_activity: BTreeMap::new(),
+            agent_session_window_seconds: crate::config::policy::DEFAULT_AGENT_SESSION_WINDOW_SECONDS,
             respawn_history: BTreeMap::new(),
             work: None,
             supervisor_restarts: BTreeMap::new(),
             #[cfg(target_os = "linux")]
             provenance: None,
         }
+    }
+
+    /// Configure transcript freshness independently of the CPU/I/O sample.
+    /// A zero lookback disables transcript collection and its retention signal.
+    pub fn with_agent_session_window(mut self, window_seconds: u64) -> Self {
+        self.agent_session_window_seconds = window_seconds;
+        self.agent_activity.clear();
+        self
     }
 
     /// Freeze learned-verdict decay for a paired evaluation. Live constructors
@@ -810,7 +866,8 @@ impl Scorer {
                 decisions,
                 signatures,
                 fast_path_config(&config.policy),
-            ),
+            )
+            .with_agent_session_window(config.policy.guardrails.agent_session_window_seconds),
             warnings,
         )
     }
@@ -1046,7 +1103,29 @@ impl Scorer {
         population: &[ProcessRecord],
         census_complete: bool,
     ) -> AgentActivityReport {
-        let report = self.agent_activity_report(population, census_complete);
+        let mut report = self.agent_activity_report(population, census_complete);
+        let by_pid: BTreeMap<_, _> = population
+            .iter()
+            .map(|process| (process.pid.0, process))
+            .collect();
+        // Duplicate PID records were already excluded by the pure report.
+        let roots: Vec<_> = report
+            .units
+            .iter()
+            .filter_map(|unit| {
+                by_pid
+                    .get(&unit.root.pid.0)
+                    .copied()
+                    .filter(|process| unit.matches_record(process))
+            })
+            .collect();
+        let mut sessions = crate::collect::protected::collect_agent_session_activity(
+            &roots,
+            self.agent_session_window_seconds,
+        );
+        for unit in &mut report.units {
+            unit.session_activity = sessions.remove(&unit.root.pid.0);
+        }
         self.agent_activity = report
             .units
             .iter()
@@ -1120,6 +1199,8 @@ impl Scorer {
                         root_state: process.state,
                         age_seconds: process.elapsed_seconds(),
                         sampling_window_ms,
+                        session_window_seconds: Some(self.agent_session_window_seconds),
+                        session_activity: None,
                         activity: AgentActivityState::Unknown,
                         member_count: 0,
                         composition: AgentChildComposition::default(),
@@ -1395,7 +1476,15 @@ impl Scorer {
         let pid = proc.pid.0;
         let desktop_app = observations.desktop_app;
         let activity = observations.activity;
-        let agent_activity = observations.agent_activity;
+        let mut agent_activity = observations.agent_activity;
+        if let Some(unit) = &mut agent_activity {
+            unit.session_window_seconds = Some(self.agent_session_window_seconds);
+            if let Some(session) = &mut unit.session_activity {
+                // Apply this policy to captured timestamps without consulting
+                // the live clock or filesystem during replay.
+                session.window_seconds = self.agent_session_window_seconds;
+            }
+        }
         let respawn_history = observations.respawn_history;
         let work = observations.work;
         if let Some(activity) = &activity {
@@ -2684,13 +2773,334 @@ mod tests {
     }
 
     fn agent_activity_scorer(processes: &[ProcessRecord]) -> Scorer {
-        let mut result = scorer(SignatureDatabase::with_defaults());
+        // These CPU/I/O fixtures have synthetic PIDs, not live transcripts.
+        let mut result = scorer(SignatureDatabase::with_defaults()).with_agent_session_window(0);
         result.activity_window = Some(Duration::from_millis(500));
         result.activity = processes
             .iter()
             .map(|process| (process.pid.0, agent_activity_sample(process, 0.0, 0.0)))
             .collect();
         result
+    }
+
+    fn session_activity_sample(
+        process: &ProcessRecord,
+        age_seconds: i64,
+        window_seconds: u64,
+    ) -> crate::collect::protected::AgentSessionActivity {
+        use sha2::Digest;
+        let observed_at = chrono::DateTime::parse_from_rfc3339("2026-01-27T12:30:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        crate::collect::protected::AgentSessionActivity {
+            identity: pt_common::ProcessIdentity::full(
+                process.pid.0,
+                process.start_id.clone(),
+                process.uid,
+                process.pgid,
+                process.sid,
+                pt_common::IdentityQuality::Full,
+            ),
+            ppid: process.ppid.0,
+            command_sha256: hex::encode(sha2::Sha256::digest(process.cmd.as_bytes())),
+            identity_verified: true,
+            observed_at,
+            window_seconds,
+            transcript_count: 1,
+            latest_modified_at: Some(observed_at - chrono::Duration::seconds(age_seconds)),
+            unavailable: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn session_liveness_survives_zero_cpu_window_and_frozen_replay_without_changing_posterior() {
+        let processes = [
+            agent_record(100, 1, "codex exec review"),
+            agent_record(101, 100, "cargo build"),
+        ];
+        let process = &processes[0];
+        let mut measured = scorer(SignatureDatabase::with_defaults());
+        assert_eq!(
+            measured.agent_session_window_seconds,
+            crate::config::policy::DEFAULT_AGENT_SESSION_WINDOW_SECONDS
+        );
+        measured.collect_activity(&[], Duration::ZERO);
+        let before = measured
+            .score_with_desktop(process, Evidence::from_snapshot(process), None)
+            .unwrap()
+            .posterior
+            .posterior;
+        let mut unit = measured.agent_activity_report(&processes, true).units.remove(0);
+        unit.session_activity = Some(session_activity_sample(process, 600, 1800));
+        measured.agent_activity.insert(process.pid.0, unit);
+        let score = measured
+            .score_with_desktop(process, Evidence::from_snapshot(process), None)
+            .unwrap();
+        let live =
+            assess_agent_liveness(process, score.agent_activity.as_ref(), None, 1800).unwrap();
+        assert_eq!(live.live, Some(true));
+        assert_eq!(live.requested_activity_window_ms, None);
+        assert_eq!(
+            live.sources,
+            vec![AgentLivenessSource::RecentSessionTranscriptActivity]
+        );
+        assert!(score.ledger.why_summary.contains(&live.reason));
+        assert_eq!(
+            serde_json::to_value(score.posterior.posterior).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+        assert!(measured.agent_activity_for(&processes[1]).is_none());
+        assert!(agent_liveness(&processes[1], score.agent_activity.as_ref()).is_none());
+
+        let encoded = serde_json::to_value(measured.recorded_observations(process, None)).unwrap();
+        for (window_seconds, expected_live) in [(1800, Some(true)), (600, None), (0, None)] {
+            let replay = scorer(SignatureDatabase::with_defaults())
+                .with_agent_session_window(window_seconds)
+                .with_evaluation_time(
+                    chrono::DateTime::parse_from_rfc3339("2040-01-01T00:00:00Z")
+                        .unwrap()
+                        .with_timezone(&chrono::Utc),
+                );
+            let score = replay
+                .score_recorded(
+                    process,
+                    Evidence::from_snapshot(process),
+                    serde_json::from_value(encoded.clone()).unwrap(),
+                )
+                .unwrap();
+            let live =
+                assess_agent_liveness(process, score.agent_activity.as_ref(), None, 1800).unwrap();
+            assert_eq!(live.live, expected_live, "session lookback {window_seconds}");
+            assert_eq!(
+                score
+                    .agent_activity
+                    .as_ref()
+                    .unwrap()
+                    .session_activity
+                    .as_ref()
+                    .unwrap()
+                    .window_seconds,
+                window_seconds
+            );
+        }
+        let mut legacy = encoded;
+        let legacy_unit = legacy["agent_activity"].as_object_mut().unwrap();
+        legacy_unit.remove("session_activity");
+        legacy_unit.remove("session_window_seconds");
+        let legacy: ScoringObservations = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.agent_activity.unwrap().session_activity.is_none());
+
+        measured.collect_activity(&[], Duration::ZERO);
+        assert!(measured.agent_activity_for(process).is_none());
+    }
+
+    #[test]
+    fn session_liveness_boundary_unavailable_and_wrong_identity_remain_unknown() {
+        let process = agent_record(100, 1, "claude --continue");
+        let measured = scorer(SignatureDatabase::with_defaults());
+        let mut unit = measured
+            .agent_activity_report(std::slice::from_ref(&process), true)
+            .units
+            .remove(0);
+        for (age, window, expected) in [
+            (1799, 1800, Some(true)),
+            (1800, 1800, None),
+            (3600, 1800, None),
+            (-1, 1800, None),
+            (0, 0, None),
+        ] {
+            unit.session_window_seconds = Some(window);
+            unit.session_activity = Some(session_activity_sample(&process, age, window));
+            assert_eq!(
+                assess_agent_liveness(&process, Some(&unit), None, 1800).unwrap().live,
+                expected,
+                "age {age}, lookback {window}"
+            );
+        }
+        unit.session_window_seconds = Some(1800);
+        unit.session_activity = Some(session_activity_sample(&process, 1, 1800));
+        for variant in 0..8 {
+            let mut changed = process.clone();
+            match variant {
+                0 => changed.start_id = StartId::from_linux("test-boot-id", 999, 100),
+                1 => changed.uid += 1,
+                2 => changed.pgid = Some(999),
+                3 => changed.sid = Some(999),
+                4 => changed.ppid = ProcessId(999),
+                5 => changed.cmd = "claude --resume another".to_string(),
+                6 => changed.state = ProcessState::Zombie,
+                _ => changed.state = ProcessState::Dead,
+            }
+            assert_eq!(
+                assess_agent_liveness(&changed, Some(&unit), None, 1800).unwrap().live,
+                None,
+                "identity variant {variant}"
+            );
+        }
+        for variant in 0..4 {
+            let mut unavailable = session_activity_sample(&process, 1, 1800);
+            match variant {
+                0 => unavailable.identity_verified = false,
+                1 => unavailable.transcript_count = 0,
+                2 => unavailable.latest_modified_at = None,
+                _ => unavailable.identity.quality = pt_common::IdentityQuality::PidOnly,
+            }
+            unit.session_activity = Some(unavailable);
+            assert_eq!(
+                assess_agent_liveness(&process, Some(&unit), None, 1800).unwrap().live,
+                None,
+                "unavailable variant {variant}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_liveness_never_negates_cpu_or_terminal_and_policy_zero_is_independent() {
+        let mut process = agent_record(100, 1, "codex");
+        process.tty = Some("pts/7".to_string());
+        let mut measured = agent_activity_scorer(std::slice::from_ref(&process));
+        measured.activity.insert(100, agent_activity_sample(&process, 100.0, 0.0));
+        let mut unit = measured
+            .agent_activity_report(std::slice::from_ref(&process), true)
+            .units
+            .remove(0);
+        for window in [0, 1800] {
+            unit.session_window_seconds = Some(window);
+            unit.session_activity = Some(session_activity_sample(&process, 3600, window));
+            let live = assess_agent_liveness(&process, Some(&unit), None, 1800).unwrap();
+            assert_eq!(live.live, Some(true));
+            assert_eq!(live.sources, vec![AgentLivenessSource::ProcessActivity]);
+        }
+        for state in [ProcessState::Zombie, ProcessState::Dead, ProcessState::Unknown] {
+            let mut invalid = process.clone();
+            invalid.state = state;
+            let live = assess_agent_liveness(&invalid, Some(&unit), Some(1), 1800).unwrap();
+            assert_ne!(live.live, Some(true));
+            assert!(live.sources.is_empty());
+        }
+        unit.sampling_window_ms = None;
+        let live = assess_agent_liveness(&process, Some(&unit), Some(1), 1800).unwrap();
+        assert_eq!(live.sources, vec![AgentLivenessSource::RecentTerminalActivity]);
+
+        let mut disabled = measured.with_agent_session_window(0);
+        let report = disabled.prepare_agent_activity(std::slice::from_ref(&process), true);
+        let session = report.units[0].session_activity.as_ref().unwrap();
+        assert_eq!(session.recently_modified(), None);
+        assert!(session.unavailable.iter().any(|reason| reason.contains("disabled")));
+        assert_eq!(
+            assess_agent_liveness(&process, Some(&report.units[0]), None, 1800)
+                .unwrap()
+                .sources,
+            vec![AgentLivenessSource::ProcessActivity]
+        );
+    }
+
+    #[test]
+    fn enabled_missing_transcript_keeps_overall_liveness_unknown_after_quiet_cpu_sample() {
+        let process = agent_record(100, 1, "claude");
+        let measured = agent_activity_scorer(std::slice::from_ref(&process));
+        let mut unit = measured
+            .agent_activity_report(std::slice::from_ref(&process), true)
+            .units
+            .remove(0);
+        assert_eq!(unit.activity, AgentActivityState::NoActivityObservedInWindow);
+        unit.session_window_seconds = Some(1800);
+        let assess = |unit: &AgentActivityUnit| {
+            assess_agent_liveness(&process, Some(unit), None, 1800).unwrap()
+        };
+        assert_eq!(assess(&unit).live, None);
+        let mut unavailable = session_activity_sample(&process, 0, 1800);
+        unavailable.identity_verified = false;
+        unavailable.unavailable = vec!["descriptor evidence could not be read".to_string()];
+        unit.session_activity = Some(unavailable);
+        assert_eq!(assess(&unit).status, AgentLivenessState::Unknown);
+        assert_eq!(unit.activity, AgentActivityState::NoActivityObservedInWindow);
+
+        unit.session_window_seconds = Some(0);
+        assert_eq!(assess(&unit).live, Some(false));
+        unit.session_window_seconds = Some(1800);
+        unit.session_activity = Some(session_activity_sample(&process, 1800, 1800));
+        assert_eq!(assess(&unit).live, Some(false));
+        unit.session_activity
+            .as_mut()
+            .unwrap()
+            .unavailable
+            .push("another task could not be inspected".to_string());
+        assert_eq!(assess(&unit).live, None);
+
+        // A disabled policy also applies to captures predating session metadata.
+        unit.session_activity = None;
+        unit.session_window_seconds = None;
+        let mut captured = measured.recorded_observations(&process, None);
+        captured.agent_activity = Some(unit);
+        let disabled = measured.with_agent_session_window(0);
+        let score = disabled
+            .score_recorded(&process, Evidence::from_snapshot(&process), captured)
+            .unwrap();
+        assert_eq!(assess(score.agent_activity.as_ref().unwrap()).live, Some(false));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_session_transcript_keeps_owned_agent_with_cpu_sampling_disabled() {
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let transcript = directory.path().join(
+            "sessions/2026/01/27/rollout-2026-01-27T12-30-00-019c017a-84b0-7710-8bba-47ea1175fee3.jsonl",
+        );
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        let child = OwnedChild(
+            std::process::Command::new("bash")
+                .arg("-c")
+                .arg("exec 3>>\"$1\"; printf '{}\\n' >&3; exec -a codex sleep 60")
+                .arg("session-transcript-test")
+                .arg(&transcript)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let process = loop {
+            assert!(std::time::Instant::now() < deadline, "owned agent did not become ready");
+            let scan = crate::collect::quick_scan(&crate::collect::QuickScanOptions {
+                pids: vec![child.0.id()],
+                timeout: Some(Duration::from_millis(500)),
+                ..Default::default()
+            })
+            .unwrap();
+            if let Some(process) = scan
+                .processes
+                .into_iter()
+                .find(|process| process.comm == "sleep" && process.cmd == "codex 60")
+            {
+                break process;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let mut measured = scorer(SignatureDatabase::with_defaults());
+        measured.collect_activity(&[&process], Duration::ZERO);
+        measured.prepare_agent_activity(std::slice::from_ref(&process), false);
+        let score = measured
+            .score_with_desktop(&process, Evidence::from_snapshot(&process), None)
+            .unwrap();
+        let live =
+            assess_agent_liveness(&process, score.agent_activity.as_ref(), None, 1800).unwrap();
+        assert_eq!(live.live, Some(true), "{live:?}");
+        assert_eq!(live.requested_activity_window_ms, None);
+        assert_eq!(
+            live.sources,
+            vec![AgentLivenessSource::RecentSessionTranscriptActivity]
+        );
+        assert!(score.ledger.why_summary.contains(&live.reason));
     }
 
     #[test]

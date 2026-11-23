@@ -81,7 +81,8 @@
     "max_kills_per_hour": 20,
     "max_kills_per_day": 100,
     "min_process_age_seconds": 3600,
-    "require_confirmation": true
+    "require_confirmation": true,
+    "agent_session_window_seconds": 1800
   },
   "robot_mode": {
     "enabled": false,

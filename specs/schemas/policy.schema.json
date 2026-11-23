@@ -177,6 +177,13 @@
         },
         "require_confirmation": {
           "type": "boolean"
+        },
+        "agent_session_window_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615,
+          "default": 1800,
+          "description": "Recency window for a recognized agent's own open transcript; zero disables this observation without implying inactivity."
         }
       }
     },

@@ -313,6 +313,18 @@ pub struct Guardrails {
     /// policy lists all of this explicitly.
     #[serde(default = "default_true")]
     pub builtin_protection: bool,
+
+    /// Lookback for recent modification of a transcript an agent holds writable.
+    /// Zero disables this observation; missing evidence never proves inactivity.
+    /// This is independent of the short CPU/I/O sampling window.
+    #[serde(default = "default_agent_session_window_seconds")]
+    pub agent_session_window_seconds: u64,
+}
+
+pub const DEFAULT_AGENT_SESSION_WINDOW_SECONDS: u64 = 30 * 60;
+
+fn default_agent_session_window_seconds() -> u64 {
+    DEFAULT_AGENT_SESSION_WINDOW_SECONDS
 }
 
 impl Default for Guardrails {
@@ -347,6 +359,7 @@ impl Default for Guardrails {
             min_process_age_seconds: 3600,
             require_confirmation: Some(true),
             builtin_protection: true,
+            agent_session_window_seconds: DEFAULT_AGENT_SESSION_WINDOW_SECONDS,
         }
     }
 }
@@ -1313,6 +1326,34 @@ mod tests {
         assert_eq!(g.max_kills_per_run, 10);
         assert_eq!(g.min_process_age_seconds, 3600);
         assert_eq!(g.never_kill_ppid, vec![1]);
+    }
+
+    #[test]
+    fn agent_session_window_defaults_and_explicit_disable_roundtrip() {
+        let mut policy = serde_json::to_value(Policy::default()).unwrap();
+        policy["guardrails"]
+            .as_object_mut()
+            .unwrap()
+            .remove("agent_session_window_seconds");
+        let omitted: Policy = serde_json::from_value(policy.clone()).unwrap();
+        assert_eq!(omitted.guardrails.agent_session_window_seconds, 1800);
+
+        for window in [0_u64, 60, 7200] {
+            policy["guardrails"]["agent_session_window_seconds"] = window.into();
+            let parsed: Policy = serde_json::from_value(policy.clone()).unwrap();
+            assert_eq!(parsed.guardrails.agent_session_window_seconds, window);
+            let saved = serde_json::to_value(&parsed).unwrap();
+            assert_eq!(saved["guardrails"]["agent_session_window_seconds"], window);
+        }
+
+        for invalid in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::Value::Null,
+        ] {
+            policy["guardrails"]["agent_session_window_seconds"] = invalid;
+            assert!(serde_json::from_value::<Policy>(policy.clone()).is_err());
+        }
     }
 
     #[test]

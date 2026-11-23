@@ -38,7 +38,8 @@
     "never_kill_ppid": [],
     "max_kills_per_run": 5,
     "min_process_age_seconds": 300,
-    "require_confirmation": true
+    "require_confirmation": true,
+    "agent_session_window_seconds": 1800
   },
   "robot_mode": {
     "enabled": false,
