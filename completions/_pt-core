@@ -928,7 +928,9 @@ esac
 ;;
 (report)
 _arguments "${_arguments_options[@]}" : \
-'--session=[Session ID to generate report for (default\: latest)]:SESSION:_default' \
+'(--bundle)--session=[Session ID to generate report for (default\: latest)]:SESSION:_default' \
+'--bundle=[Path to a .ptb bundle file (alternative to a local session)]:BUNDLE:_default' \
+'--passphrase=[Passphrase for encrypted bundles (or use PT_BUNDLE_PASSPHRASE)]:PASSPHRASE:_default' \
 '-o+[Output path for the HTML report]:OUTPUT:_default' \
 '--output=[Output path for the HTML report]:OUTPUT:_default' \
 '--capabilities=[Path to capabilities manifest (from pt wrapper)]:CAPABILITIES:_default' \
@@ -1924,7 +1926,8 @@ prose\:"Structured natural language for agent-to-user communication"))' \
 ;;
 (label)
 _arguments "${_arguments_options[@]}" : \
-'--pid=[Live process whose command pattern to label]:PID:_default' \
+'--pid=[Process whose command pattern to label (live unless --session is supplied)]:PID:_default' \
+'(--cmd --comm)--session=[Label the recorded process incarnation in this session, even after it exits]:SESSION:_default' \
 '--cmd=[Command line to label (instead of a live --pid)]:CMD:_default' \
 '--comm=[Process name for --cmd (default\: basename of its first word)]:COMM:_default' \
 '--capabilities=[Path to capabilities manifest (from pt wrapper)]:CAPABILITIES:_default' \
@@ -2206,10 +2209,11 @@ prose\:"Structured natural language for agent-to-user communication"))' \
 ;;
 (report)
 _arguments "${_arguments_options[@]}" : \
-'--session=[Session ID to generate report for (required unless using --bundle)]:SESSION:_default' \
+'(--bundle)--session=[Session ID to generate report for (required unless using --bundle)]:SESSION:_default' \
 '--bundle=[Path to a .ptb bundle file (alternative to --session)]:BUNDLE:_default' \
-'-o+[Output path for the HTML report]:OUT:_default' \
-'--out=[Output path for the HTML report]:OUT:_default' \
+'--passphrase=[Passphrase for encrypted bundles (or use PT_BUNDLE_PASSPHRASE)]:PASSPHRASE:_default' \
+'-o+[Output path for the selected report format]:OUT:_default' \
+'--out=[Output path for the selected report format]:OUT:_default' \
 '--profile=[Redaction profile\: minimal, safe (default), forensic]:PROFILE:_default' \
 '--report-format=[Report output format\: html (default), slack, prose]:REPORT_FORMAT:_default' \
 '--prose-style=[Prose style\: terse, conversational (default), formal, technical]:PROSE_STYLE:_default' \
@@ -3768,7 +3772,8 @@ prose\:"Structured natural language for agent-to-user communication"))' \
 ;;
 (label)
 _arguments "${_arguments_options[@]}" : \
-'--pid=[Live process whose command pattern to label]:PID:_default' \
+'--pid=[Process whose command pattern to label (live unless --session is supplied)]:PID:_default' \
+'(--cmd --comm)--session=[Label the recorded process incarnation in this session, even after it exits]:SESSION:_default' \
 '--cmd=[Command line to label (instead of a live --pid)]:CMD:_default' \
 '--comm=[Process name for --cmd (default\: basename of its first word)]:COMM:_default' \
 '--capabilities=[Path to capabilities manifest (from pt wrapper)]:CAPABILITIES:_default' \
@@ -4050,10 +4055,11 @@ prose\:"Structured natural language for agent-to-user communication"))' \
 ;;
 (report)
 _arguments "${_arguments_options[@]}" : \
-'--session=[Session ID to generate report for (required unless using --bundle)]:SESSION:_default' \
+'(--bundle)--session=[Session ID to generate report for (required unless using --bundle)]:SESSION:_default' \
 '--bundle=[Path to a .ptb bundle file (alternative to --session)]:BUNDLE:_default' \
-'-o+[Output path for the HTML report]:OUT:_default' \
-'--out=[Output path for the HTML report]:OUT:_default' \
+'--passphrase=[Passphrase for encrypted bundles (or use PT_BUNDLE_PASSPHRASE)]:PASSPHRASE:_default' \
+'-o+[Output path for the selected report format]:OUT:_default' \
+'--out=[Output path for the selected report format]:OUT:_default' \
 '--profile=[Redaction profile\: minimal, safe (default), forensic]:PROFILE:_default' \
 '--report-format=[Report output format\: html (default), slack, prose]:REPORT_FORMAT:_default' \
 '--prose-style=[Prose style\: terse, conversational (default), formal, technical]:PROSE_STYLE:_default' \

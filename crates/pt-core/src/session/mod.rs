@@ -1714,8 +1714,7 @@ impl ControlHistoryMirrors {
         };
         let mirrored = owner != session_id.0.as_str();
         if mirrored
-            && self.parents.get(owner).and_then(Option::as_deref)
-                != Some(session_id.0.as_str())
+            && self.parents.get(owner).and_then(Option::as_deref) != Some(session_id.0.as_str())
         {
             return Err(history_data_error(
                 path,
@@ -2949,8 +2948,14 @@ mod tests {
         let canonical = store.action_history(Some(&child_id), 10).unwrap();
         assert_eq!(canonical.total_count, 2);
         assert_eq!(canonical.actions.len(), 2);
-        assert_eq!(std::fs::read_to_string(parent_path).unwrap(), parent_journal);
-        assert_eq!(std::fs::read_to_string(child_path).unwrap(), control_journal);
+        assert_eq!(
+            std::fs::read_to_string(parent_path).unwrap(),
+            parent_journal
+        );
+        assert_eq!(
+            std::fs::read_to_string(child_path).unwrap(),
+            control_journal
+        );
     }
 
     #[test]
@@ -3053,12 +3058,18 @@ mod tests {
                 } else {
                     "control"
                 };
-                assert!(error.contains(expected), "{failure}, limit {limit}: {error}");
+                assert!(
+                    error.contains(expected),
+                    "{failure}, limit {limit}: {error}"
+                );
             }
             let parent_history = store.action_history(Some(&parent_id), 10).unwrap();
             assert_eq!(parent_history.total_count, 2, "{failure}");
             assert_eq!(parent_history.actions.len(), 2, "{failure}");
-            assert_eq!(std::fs::read_to_string(parent_path).unwrap(), parent_journal);
+            assert_eq!(
+                std::fs::read_to_string(parent_path).unwrap(),
+                parent_journal
+            );
         }
     }
 
@@ -3077,12 +3088,8 @@ mod tests {
                     None,
                 ))
                 .unwrap();
-            let mut child_manifest = SessionManifest::new(
-                &child_id,
-                Some(&parent_id),
-                SessionMode::Interactive,
-                None,
-            );
+            let mut child_manifest =
+                SessionManifest::new(&child_id, Some(&parent_id), SessionMode::Interactive, None);
             // Proof must work even if wall-clock ordering places the parent first.
             child_manifest.timing.created_at =
                 (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();

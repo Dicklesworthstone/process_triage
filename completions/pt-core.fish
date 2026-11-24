@@ -557,6 +557,8 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand bundle; and __fish_seen_
 complete -c pt-core -n "__fish_pt_core_using_subcommand bundle; and __fish_seen_subcommand_from help" -f -a "extract" -d 'Extract bundle contents'
 complete -c pt-core -n "__fish_pt_core_using_subcommand bundle; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand report" -l session -d 'Session ID to generate report for (default: latest)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand report" -l bundle -d 'Path to a .ptb bundle file (alternative to a local session)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand report" -l passphrase -d 'Passphrase for encrypted bundles (or use PT_BUNDLE_PASSPHRASE)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand report" -s o -l output -d 'Output path for the HTML report' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand report" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand report" -l config -d 'Override config directory' -r
@@ -1180,7 +1182,8 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_s
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from list-priors" -l estimate-tokens -d 'Estimate token count without full response'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from list-priors" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from list-priors" -s V -l version -d 'Print version'
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from label" -l pid -d 'Live process whose command pattern to label' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from label" -l pid -d 'Process whose command pattern to label (live unless --session is supplied)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from label" -l session -d 'Label the recorded process incarnation in this session, even after it exits' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from label" -l cmd -d 'Command line to label (instead of a live --pid)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from label" -l comm -d 'Process name for --cmd (default: basename of its first word)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from label" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
@@ -1360,7 +1363,8 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_s
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from import-priors" -s V -l version -d 'Print version'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from report" -l session -d 'Session ID to generate report for (required unless using --bundle)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from report" -l bundle -d 'Path to a .ptb bundle file (alternative to --session)' -r
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from report" -s o -l out -d 'Output path for the HTML report' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from report" -l passphrase -d 'Passphrase for encrypted bundles (or use PT_BUNDLE_PASSPHRASE)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from report" -s o -l out -d 'Output path for the selected report format' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from report" -l profile -d 'Redaction profile: minimal, safe (default), forensic' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from report" -l report-format -d 'Report output format: html (default), slack, prose' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from report" -l prose-style -d 'Prose style: terse, conversational (default), formal, technical' -r
@@ -1882,7 +1886,8 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_s
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from list-priors" -l estimate-tokens -d 'Estimate token count without full response'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from list-priors" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from list-priors" -s V -l version -d 'Print version'
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from label" -l pid -d 'Live process whose command pattern to label' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from label" -l pid -d 'Process whose command pattern to label (live unless --session is supplied)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from label" -l session -d 'Label the recorded process incarnation in this session, even after it exits' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from label" -l cmd -d 'Command line to label (instead of a live --pid)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from label" -l comm -d 'Process name for --cmd (default: basename of its first word)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from label" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
@@ -2062,7 +2067,8 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_s
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from import-priors" -s V -l version -d 'Print version'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from report" -l session -d 'Session ID to generate report for (required unless using --bundle)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from report" -l bundle -d 'Path to a .ptb bundle file (alternative to --session)' -r
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from report" -s o -l out -d 'Output path for the HTML report' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from report" -l passphrase -d 'Passphrase for encrypted bundles (or use PT_BUNDLE_PASSPHRASE)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from report" -s o -l out -d 'Output path for the selected report format' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from report" -l profile -d 'Redaction profile: minimal, safe (default), forensic' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from report" -l report-format -d 'Report output format: html (default), slack, prose' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from report" -l prose-style -d 'Prose style: terse, conversational (default), formal, technical' -r

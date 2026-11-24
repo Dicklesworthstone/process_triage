@@ -3099,13 +3099,17 @@ _pt__core() {
             return 0
             ;;
         pt__subcmd__core__subcmd__agent__subcmd__label)
-            opts="-f -v -q -h -V --pid --cmd --comm --kill --spare --capabilities --config --format --verbose --quiet --no-color --timeout --robot --shadow --dry-run --standalone --fields --compact --max-tokens --estimate-tokens --help --version"
+            opts="-f -v -q -h -V --pid --session --cmd --comm --kill --spare --capabilities --config --format --verbose --quiet --no-color --timeout --robot --shadow --dry-run --standalone --fields --compact --max-tokens --estimate-tokens --help --version"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
                 --pid)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --session)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -3301,7 +3305,7 @@ _pt__core() {
             return 0
             ;;
         pt__subcmd__core__subcmd__agent__subcmd__report)
-            opts="-o -f -v -q -h -V --session --bundle --out --profile --galaxy-brain --embed-assets --report-format --prose-style --title --theme --capabilities --config --format --verbose --quiet --no-color --timeout --robot --shadow --dry-run --standalone --fields --compact --max-tokens --estimate-tokens --help --version"
+            opts="-o -f -v -q -h -V --session --bundle --passphrase --out --profile --galaxy-brain --embed-assets --report-format --prose-style --title --theme --capabilities --config --format --verbose --quiet --no-color --timeout --robot --shadow --dry-run --standalone --fields --compact --max-tokens --estimate-tokens --help --version"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3312,6 +3316,10 @@ _pt__core() {
                     return 0
                     ;;
                 --bundle)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --passphrase)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -7499,13 +7507,21 @@ _pt__core() {
             return 0
             ;;
         pt__subcmd__core__subcmd__report)
-            opts="-o -f -v -q -h -V --session --output --include-ledger --embed-assets --capabilities --config --format --verbose --quiet --no-color --timeout --robot --shadow --dry-run --standalone --fields --compact --max-tokens --estimate-tokens --help --version"
+            opts="-o -f -v -q -h -V --session --bundle --passphrase --output --include-ledger --embed-assets --capabilities --config --format --verbose --quiet --no-color --timeout --robot --shadow --dry-run --standalone --fields --compact --max-tokens --estimate-tokens --help --version"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
                 --session)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --bundle)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --passphrase)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
