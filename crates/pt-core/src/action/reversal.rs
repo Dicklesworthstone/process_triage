@@ -524,6 +524,32 @@ pub struct ReversalRecord {
     pub restorations: Vec<ReversalOutcome>,
 }
 
+/// A read-only, canonically bound inventory for restoring a whole session.
+/// Pending attempts are ordered newest first so an older control never takes
+/// precedence over a later owner. Settled and unsupported receipts remain
+/// visible; missing receipts never become authority to reconstruct old state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReversalBatchInspection {
+    pub records: Vec<ReversalRecord>,
+    pub pending_attempt_ids: Vec<String>,
+    pub unsupported_attempt_ids: Vec<String>,
+    pub unrecorded_action_ids: Vec<String>,
+}
+
+/// Results from one bounded batch. A failed or incomplete restore stops the
+/// batch; remaining attempts retain their original order and durable authority.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReversalBatchResult {
+    pub inspection: ReversalBatchInspection,
+    pub restorations: Vec<ReversalOutcome>,
+    pub remaining_attempt_ids: Vec<String>,
+    pub error: Option<String>,
+}
+
+/// Bound one explicitly confirmed session-wide restoration. Larger sessions
+/// can still be inspected and restored through individual action selections.
+pub const MAX_BATCH_RESTORATIONS: usize = 64;
+
 #[cfg(target_os = "linux")]
 impl ReversalRecord {
     fn is_restored(&self) -> bool {
@@ -649,6 +675,121 @@ impl ReversalJournal {
     #[cfg(not(target_os = "linux"))]
     pub fn inspect(&self, _action: &PlanAction) -> Result<Vec<ReversalRecord>, ActionError> {
         Err(failed("durable undo receipts are supported only on Linux"))
+    }
+
+    /// Inspect every receipt once, requiring each to match an action in the
+    /// complete saved plan. Callers retain the execution-policy lock throughout
+    /// confirmed batch restoration and pass each exact pending attempt to
+    /// `restore`, which revalidates its current owner and live state again.
+    #[cfg(target_os = "linux")]
+    pub fn inspect_plan(
+        &self,
+        actions: &[PlanAction],
+    ) -> Result<ReversalBatchInspection, ActionError> {
+        let _lock = self
+            .lock
+            .lock()
+            .map_err(|_| failed("undo journal lock unavailable"))?;
+        let records = match JournalDirectory::open(&self.directory, false)? {
+            Some(directory) => self.read_records(&directory)?,
+            None => Vec::new(),
+        };
+        inspect_plan_records(actions, records)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn inspect_plan(
+        &self,
+        _actions: &[PlanAction],
+    ) -> Result<ReversalBatchInspection, ActionError> {
+        Err(failed("durable undo receipts are supported only on Linux"))
+    }
+
+    /// Restore all unresolved supported receipts from a canonically bound plan.
+    /// Callers must hold the normal execution-policy lock for the entire call.
+    /// Every write still goes through the single-attempt restoration protocol;
+    /// a failure stops the batch without pretending earlier writes were rolled back.
+    #[cfg(target_os = "linux")]
+    pub fn restore_plan(&self, actions: &[PlanAction]) -> Result<ReversalBatchResult, ActionError> {
+        self.restore_plan_with(actions, |action, attempt| {
+            self.restore(action, Some(attempt))
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn restore_plan_with(
+        &self,
+        actions: &[PlanAction],
+        mut restore: impl FnMut(&PlanAction, &str) -> Result<ReversalOutcome, ActionError>,
+    ) -> Result<ReversalBatchResult, ActionError> {
+        let inspection = self.inspect_plan(actions)?;
+        if inspection.pending_attempt_ids.len() > MAX_BATCH_RESTORATIONS {
+            return Err(failed(format!(
+                "session has more than {MAX_BATCH_RESTORATIONS} pending restorations; select individual actions"
+            )));
+        }
+        let canonical: std::collections::HashMap<_, _> = actions
+            .iter()
+            .map(|action| (action.action_id.as_str(), action))
+            .collect();
+        let pending: std::collections::HashSet<_> = inspection
+            .pending_attempt_ids
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let mut restorations = Vec::new();
+        let mut error = None;
+        let mut completed = 0;
+        for record in &inspection.records {
+            if !pending.contains(record.attempt_id.as_str()) {
+                continue;
+            }
+            // inspect_plan checked every receipt before the first mutation.
+            let action = canonical[record.action_id.as_str()];
+            match restore(action, &record.attempt_id) {
+                Ok(outcome) => {
+                    let restored = outcome.status == RestorationStatus::Restored;
+                    restorations.push(outcome);
+                    if !restored {
+                        break;
+                    }
+                    completed += 1;
+                }
+                Err(failure) => {
+                    error = Some(format!(
+                        "restoration of action {} attempt {} is incomplete: {failure}",
+                        record.action_id, record.attempt_id
+                    ));
+                    break;
+                }
+            }
+        }
+        let remaining_attempt_ids = inspection.pending_attempt_ids[completed..].to_vec();
+        let inspection = match self.inspect_plan(actions) {
+            Ok(current) => current,
+            Err(failure) => {
+                let detail = format!("cannot inspect final undo receipts: {failure}");
+                error = Some(match error {
+                    Some(previous) => format!("{previous}; {detail}"),
+                    None => detail,
+                });
+                inspection
+            }
+        };
+        Ok(ReversalBatchResult {
+            inspection,
+            restorations,
+            remaining_attempt_ids,
+            error,
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn restore_plan(
+        &self,
+        _actions: &[PlanAction],
+    ) -> Result<ReversalBatchResult, ActionError> {
+        Err(failed("durable undo is supported only on Linux"))
     }
 
     /// Observe intentional restoration without changing a controller or receipt.
@@ -1710,6 +1851,53 @@ fn validate_record(record: &ReversalRecord) -> Result<(), ActionError> {
         }
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_plan_records(
+    actions: &[PlanAction],
+    mut records: Vec<ReversalRecord>,
+) -> Result<ReversalBatchInspection, ActionError> {
+    let mut canonical = std::collections::HashMap::new();
+    for action in actions {
+        if canonical
+            .insert(action.action_id.as_str(), action)
+            .is_some()
+        {
+            return Err(failed("canonical undo plan contains duplicate action IDs"));
+        }
+    }
+    let mut recorded = std::collections::HashSet::new();
+    for record in &records {
+        let action = canonical.get(record.action_id.as_str()).ok_or_else(|| {
+            failed(format!(
+                "undo receipt {} has no action in the canonical saved plan",
+                record.attempt_id
+            ))
+        })?;
+        record.check_action(action)?;
+        recorded.insert(record.action_id.as_str());
+    }
+    let unrecorded_action_ids = actions
+        .iter()
+        .filter(|action| !recorded.contains(action.action_id.as_str()))
+        .map(|action| action.action_id.clone())
+        .collect();
+    records.sort_by_key(|record| std::cmp::Reverse(record.sequence));
+    Ok(ReversalBatchInspection {
+        pending_attempt_ids: records
+            .iter()
+            .filter(|record| record.has_unresolved_control())
+            .map(|record| record.attempt_id.clone())
+            .collect(),
+        unsupported_attempt_ids: records
+            .iter()
+            .filter(|record| matches!(record.operation, ReversalOperation::Unsupported { .. }))
+            .map(|record| record.attempt_id.clone())
+            .collect(),
+        unrecorded_action_ids,
+        records,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -4628,6 +4816,219 @@ mod tests {
             detail: None,
             timestamp: now(),
         }
+    }
+
+    #[test]
+    fn batch_inspection_binds_every_receipt_and_orders_actual_execution() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = journal(directory.path());
+        let (first, first_record) = leased_freeze(&journal, 123, ReversalStatus::Verified);
+        let (second, second_record) = leased_freeze(&journal, 124, ReversalStatus::Prepared);
+        let mut unrecorded = action(Action::Kill);
+        unrecorded.action_id = "irreversible-without-receipt".into();
+        let actions = vec![second.clone(), unrecorded.clone(), first.clone()];
+        let inspection = journal.inspect_plan(&actions).unwrap();
+        assert_eq!(
+            inspection.pending_attempt_ids,
+            vec![second_record.attempt_id, first_record.attempt_id]
+        );
+        assert_eq!(inspection.unrecorded_action_ids, vec![unrecorded.action_id]);
+        assert!(inspection.unsupported_attempt_ids.is_empty());
+        assert!(inspection
+            .records
+            .iter()
+            .all(|record| record.restorations.is_empty()));
+
+        let mut changed = first.clone();
+        changed.target.uid += 1;
+        for invalid in [
+            vec![first.clone()],
+            vec![changed, second.clone()],
+            vec![first.clone(), first, second],
+        ] {
+            assert!(journal
+                .restore_plan_with(&invalid, |_, _| panic!("invalid batch must not mutate"))
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn batch_restore_unwinds_newer_control_first_and_never_reuses_settled_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = journal(directory.path());
+        let first = action(Action::Freeze);
+        let first_record = journal
+            .insert(&first, freeze_operation(), ReversalStatus::Verified)
+            .unwrap();
+        let mut second = first.clone();
+        second.action_id = "later-unfreeze".into();
+        second.action = Action::Unfreeze;
+        let second_record = journal
+            .insert(
+                &second,
+                operation(
+                    ReversalValue::Freeze { requested: true },
+                    ReversalValue::Freeze { requested: false },
+                ),
+                ReversalStatus::Applied,
+            )
+            .unwrap();
+        let actions = [first, second];
+        let requested = Cell::new(false);
+        let result = journal
+            .restore_plan_with(&actions, |action, attempt| {
+                journal.restore_before_with(action, Some(attempt), None, |record, _| {
+                    let ReversalOperation::CgroupV2 {
+                        before, applied, ..
+                    } = &record.operation
+                    else {
+                        panic!("expected freezer receipt");
+                    };
+                    let current = ReversalValue::Freeze {
+                        requested: requested.get(),
+                    };
+                    let changed = needs_restore(before, applied, &current)?;
+                    let ReversalValue::Freeze {
+                        requested: original,
+                    } = before
+                    else {
+                        panic!("expected freezer state");
+                    };
+                    requested.set(*original);
+                    Ok(changed)
+                })
+            })
+            .unwrap();
+        assert_eq!(
+            result
+                .restorations
+                .iter()
+                .map(|outcome| outcome.attempt_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                second_record.attempt_id.as_str(),
+                first_record.attempt_id.as_str()
+            ]
+        );
+        assert!(result
+            .restorations
+            .iter()
+            .all(|outcome| outcome.status == RestorationStatus::Restored
+                && outcome.changed == Some(true)));
+        assert!(!requested.get());
+        assert!(result.remaining_attempt_ids.is_empty());
+        assert!(result.error.is_none());
+        assert!(result.inspection.pending_attempt_ids.is_empty());
+
+        requested.set(true); // A later external change is not ours to undo.
+        let repeated = journal
+            .restore_plan_with(&actions, |_, _| {
+                panic!("settled authority must not be reused")
+            })
+            .unwrap();
+        assert!(repeated.restorations.is_empty());
+        assert!(requested.get());
+    }
+
+    #[test]
+    fn batch_restore_stops_on_failure_and_retains_pending_attempts() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = journal(directory.path());
+        let (first, first_record) = leased_freeze(&journal, 123, ReversalStatus::Verified);
+        let (second, second_record) = leased_freeze(&journal, 124, ReversalStatus::Failed);
+        let actions = [first, second];
+        let calls = Cell::new(0);
+        let result = journal
+            .restore_plan_with(&actions, |action, attempt| {
+                calls.set(calls.get() + 1);
+                journal.restore_before_with(action, Some(attempt), None, |_, _| {
+                    Err(failed("target identity changed"))
+                })
+            })
+            .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(result.restorations.len(), 1);
+        assert_eq!(result.restorations[0].status, RestorationStatus::Failed);
+        assert_eq!(
+            result.remaining_attempt_ids,
+            vec![second_record.attempt_id, first_record.attempt_id]
+        );
+        assert_eq!(
+            journal.inspect(&actions[0]).unwrap()[0].restorations.len(),
+            0
+        );
+        assert_eq!(
+            journal.inspect(&actions[1]).unwrap()[0].restorations.len(),
+            1
+        );
+
+        let failed_write = journal
+            .restore_plan_with(&actions, |_, _| Err(failed("receipt persistence failed")))
+            .unwrap();
+        assert!(failed_write.restorations.is_empty());
+        assert_eq!(failed_write.remaining_attempt_ids.len(), 2);
+        assert!(failed_write
+            .error
+            .unwrap()
+            .contains("receipt persistence failed"));
+    }
+
+    #[test]
+    fn batch_inspection_retains_unsupported_and_missing_history_without_guessing() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = journal(directory.path());
+        let action = action(Action::Throttle);
+        let empty = journal.inspect_plan(std::slice::from_ref(&action)).unwrap();
+        assert!(empty.records.is_empty());
+        assert_eq!(empty.unrecorded_action_ids, vec![action.action_id.clone()]);
+        assert!(!journal.directory().exists());
+        let record = journal
+            .insert(
+                &action,
+                ReversalOperation::Unsupported {
+                    reason: "cgroup v1 receipt".into(),
+                },
+                ReversalStatus::Unsupported,
+            )
+            .unwrap();
+        let result = journal
+            .restore_plan_with(&[action], |_, _| {
+                panic!("unsupported control must not mutate")
+            })
+            .unwrap();
+        assert_eq!(
+            result.inspection.unsupported_attempt_ids,
+            vec![record.attempt_id]
+        );
+        assert!(result.restorations.is_empty());
+        assert!(result.remaining_attempt_ids.is_empty());
+    }
+
+    #[test]
+    fn batch_restore_limit_is_checked_before_any_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = journal(directory.path());
+        let actions: Vec<_> = (0..=MAX_BATCH_RESTORATIONS)
+            .map(|index| leased_freeze(&journal, 1000 + index as u32, ReversalStatus::Applied).0)
+            .collect();
+        assert_eq!(
+            journal
+                .inspect_plan(&actions)
+                .unwrap()
+                .pending_attempt_ids
+                .len(),
+            65
+        );
+        let error = journal
+            .restore_plan_with(&actions, |_, _| panic!("over-budget batch must not mutate"))
+            .unwrap_err();
+        assert!(error.to_string().contains("more than 64"));
+        assert!(journal
+            .inspect_plan(&actions)
+            .unwrap()
+            .records
+            .iter()
+            .all(|record| record.restorations.is_empty()));
     }
 
     #[test]

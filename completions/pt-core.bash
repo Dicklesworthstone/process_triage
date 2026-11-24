@@ -3537,7 +3537,7 @@ _pt__core() {
             return 0
             ;;
         pt__subcmd__core__subcmd__agent__subcmd__undo)
-            opts="-f -v -q -h -V --session --action-id --attempt-id --confirm --capabilities --config --format --verbose --quiet --no-color --timeout --robot --shadow --dry-run --standalone --fields --compact --max-tokens --estimate-tokens --help --version"
+            opts="-f -v -q -h -V --session --action-id --all --attempt-id --confirm --capabilities --config --format --verbose --quiet --no-color --timeout --robot --shadow --dry-run --standalone --fields --compact --max-tokens --estimate-tokens --help --version"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

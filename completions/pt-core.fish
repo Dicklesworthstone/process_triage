@@ -995,6 +995,7 @@ prose\t'Structured natural language for agent-to-user communication'"
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from undo" -l timeout -d 'Abort if operation exceeds time limit (seconds)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from undo" -l fields -d 'Select specific output fields (comma-separated or preset: minimal, standard, full)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from undo" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from undo" -l all -d 'Inspect or restore all pending durable receipts, newest execution first'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from undo" -l confirm -d 'Restore the recorded state (otherwise inspect receipts without mutation)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from undo" -s v -l verbose -d 'Increase verbosity (-v, -vv, -vvv)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from undo" -s q -l quiet -d 'Decrease verbosity (quiet mode)'
@@ -1696,6 +1697,7 @@ prose\t'Structured natural language for agent-to-user communication'"
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from undo" -l timeout -d 'Abort if operation exceeds time limit (seconds)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from undo" -l fields -d 'Select specific output fields (comma-separated or preset: minimal, standard, full)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from undo" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from undo" -l all -d 'Inspect or restore all pending durable receipts, newest execution first'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from undo" -l confirm -d 'Restore the recorded state (otherwise inspect receipts without mutation)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from undo" -s v -l verbose -d 'Increase verbosity (-v, -vv, -vvv)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from undo" -s q -l quiet -d 'Decrease verbosity (quiet mode)'

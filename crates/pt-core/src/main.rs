@@ -1496,11 +1496,15 @@ struct AgentUndoArgs {
     session: String,
 
     /// Canonical action ID from the saved plan
-    #[arg(long)]
-    action_id: String,
+    #[arg(long, required_unless_present = "all", conflicts_with = "all")]
+    action_id: Option<String>,
+
+    /// Inspect or restore all pending durable receipts, newest execution first
+    #[arg(long, conflicts_with_all = ["action_id", "attempt_id"])]
+    all: bool,
 
     /// Select an execution attempt when the action has more than one receipt
-    #[arg(long)]
+    #[arg(long, requires = "action_id")]
     attempt_id: Option<String>,
 
     /// Restore the recorded state (otherwise inspect receipts without mutation)
@@ -38701,17 +38705,6 @@ fn run_agent_undo(global: &GlobalOpts, args: &AgentUndoArgs) -> ExitCode {
             );
         }
     };
-    let action = match parse_undo_action(&content, &sid.0, &args.action_id) {
-        Ok(action) => action,
-        Err(error) => {
-            return refuse(
-                output,
-                "invalid_action_binding",
-                error,
-                ExitCode::PolicyBlocked,
-            );
-        }
-    };
     let document: serde_json::Value = match serde_json::from_str(&content) {
         Ok(document) => document,
         Err(error) => {
@@ -38730,8 +38723,6 @@ fn run_agent_undo(global: &GlobalOpts, args: &AgentUndoArgs) -> ExitCode {
     output["plan_sha256"] = serde_json::json!(&plan_sha256);
     output["recorded_host_id"] = serde_json::json!(recorded_host);
     output["current_host_id"] = serde_json::json!(&current_host);
-    output["action"] = serde_json::json!(action.action);
-    output["target"] = serde_json::json!(&action.target);
     output["receipt_directory"] = serde_json::json!(handle
         .dir
         .join("action")
@@ -38754,6 +38745,30 @@ fn run_agent_undo(global: &GlobalOpts, args: &AgentUndoArgs) -> ExitCode {
             );
         }
     };
+    if args.all {
+        return run_agent_undo_all(global, &handle, &journal, &content, output, execute);
+    }
+    let Some(action_id) = args.action_id.as_deref() else {
+        return refuse(
+            output,
+            "missing_action_selection",
+            "select --action-id or --all".to_string(),
+            ExitCode::ArgsError,
+        );
+    };
+    let action = match parse_undo_action(&content, &sid.0, action_id) {
+        Ok(action) => action,
+        Err(error) => {
+            return refuse(
+                output,
+                "invalid_action_binding",
+                error,
+                ExitCode::PolicyBlocked,
+            );
+        }
+    };
+    output["action"] = serde_json::json!(action.action);
+    output["target"] = serde_json::json!(&action.target);
     let records = match journal.inspect(&action) {
         Ok(records) => records,
         Err(error) => {
@@ -38919,6 +38934,193 @@ fn run_agent_undo(global: &GlobalOpts, args: &AgentUndoArgs) -> ExitCode {
     }
 }
 
+/// Restore only recorded reversible controls. The parent command holds its
+/// normal global lock; this path also serializes the entire batch with apply,
+/// TUI execution, plan replacement, and single-action undo.
+fn run_agent_undo_all(
+    global: &GlobalOpts,
+    handle: &SessionHandle,
+    journal: &pt_core::action::ReversalJournal,
+    content: &str,
+    mut output: serde_json::Value,
+    execute: bool,
+) -> ExitCode {
+    use pt_core::action::RestorationStatus;
+
+    output["all"] = serde_json::json!(true);
+    output["scope"] = serde_json::json!("recorded_reversible_controls");
+    let emit = |value: serde_json::Value| {
+        if !matches!(global.format, OutputFormat::Exitcode) {
+            println!("{}", format_structured_output(global, value));
+        }
+    };
+    let refuse = |mut value: serde_json::Value, error: &str, reason: String, code: ExitCode| {
+        value["status"] = serde_json::json!("refused");
+        value["error"] = serde_json::json!(error);
+        value["reason"] = serde_json::json!(reason);
+        emit(value);
+        code
+    };
+    let plan = match parse_agent_plan(content) {
+        Ok(plan) if Some(plan.session_id.as_str()) == output["session_id"].as_str() => plan,
+        Ok(_) => {
+            return refuse(
+                output,
+                "invalid_plan_binding",
+                "saved plan belongs to a different session".to_string(),
+                ExitCode::PolicyBlocked,
+            );
+        }
+        Err(error) => {
+            return refuse(
+                output,
+                "invalid_plan",
+                error.to_string(),
+                ExitCode::PolicyBlocked,
+            );
+        }
+    };
+    let inspection = match journal.inspect_plan(&plan.actions) {
+        Ok(inspection) => inspection,
+        Err(error) => {
+            return refuse(
+                output,
+                "invalid_reversal_receipt",
+                error.to_string(),
+                ExitCode::PolicyBlocked,
+            );
+        }
+    };
+    output["records"] = serde_json::json!(&inspection.records);
+    output["batch"] = serde_json::json!(&inspection);
+    output["restorations"] = serde_json::json!([]);
+    output["note"] = serde_json::json!(
+        "Only durable receipts authorize undo. Unrecorded actions and irreversible effects cannot be reconstructed. Pending receipts run newest first; the first failed restoration stops the batch."
+    );
+    if !execute {
+        output["status"] = serde_json::json!("preview");
+        output["live_eligibility_checked"] = serde_json::json!(false);
+        emit(output);
+        return ExitCode::Clean;
+    }
+    let document: serde_json::Value = match serde_json::from_str(content) {
+        Ok(document) => document,
+        Err(error) => {
+            return refuse(
+                output,
+                "invalid_plan",
+                error.to_string(),
+                ExitCode::PolicyBlocked,
+            );
+        }
+    };
+    if let Err(reason) = validate_undo_host_binding(&document, &pt_core::logging::get_host_id()) {
+        return refuse(
+            output,
+            "host_binding_mismatch",
+            reason,
+            ExitCode::PolicyBlocked,
+        );
+    }
+    let Some(data_dir) = handle.dir.parent().and_then(Path::parent) else {
+        return refuse(
+            output,
+            "execution_lock_unavailable",
+            "cannot resolve session execution data directory".to_string(),
+            ExitCode::IoError,
+        );
+    };
+    let _execution_lock = match GlobalLock::try_acquire(&data_dir.join(".execution-policy-lock")) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            return refuse(
+                output,
+                "execution_lock_held",
+                "another command is executing or restoring actions".to_string(),
+                ExitCode::LockError,
+            );
+        }
+        Err(error) => {
+            return refuse(
+                output,
+                "execution_lock_error",
+                error.to_string(),
+                ExitCode::IoError,
+            );
+        }
+    };
+    match fs::read(handle.dir.join("decision/plan.json")) {
+        Ok(current) if current.as_slice() == content.as_bytes() => {}
+        Ok(_) => {
+            return refuse(
+                output,
+                "plan_changed",
+                "saved plan changed during undo inspection; inspect the current session again"
+                    .to_string(),
+                ExitCode::PolicyBlocked,
+            );
+        }
+        Err(error) => {
+            return refuse(
+                output,
+                "plan_unavailable",
+                error.to_string(),
+                ExitCode::IoError,
+            );
+        }
+    }
+    // The journal rereads every receipt under the execution lock and validates
+    // the entire batch before its first write. Each actual restore then repeats
+    // the complete live identity, ownership and current-value checks.
+    let result = match journal.restore_plan(&plan.actions) {
+        Ok(result) => result,
+        Err(error) => {
+            return refuse(
+                output,
+                "invalid_restoration_batch",
+                error.to_string(),
+                ExitCode::PolicyBlocked,
+            );
+        }
+    };
+    let restored = result
+        .restorations
+        .iter()
+        .filter(|outcome| outcome.status == RestorationStatus::Restored)
+        .count();
+    let restoration_error = result.error.is_some();
+    let incomplete = restoration_error
+        || !result.remaining_attempt_ids.is_empty()
+        || !result.inspection.unsupported_attempt_ids.is_empty();
+    output["records"] = serde_json::json!(&result.inspection.records);
+    output["batch"] = serde_json::json!(&result.inspection);
+    output["restorations"] = serde_json::json!(&result.restorations);
+    output["remaining_attempt_ids"] = serde_json::json!(&result.remaining_attempt_ids);
+    output["restored_count"] = serde_json::json!(restored);
+    if let Some(error) = result.error {
+        output["error"] = serde_json::json!("restoration_incomplete");
+        output["reason"] = serde_json::json!(error);
+    }
+    let code = if incomplete {
+        output["status"] = serde_json::json!("failed");
+        if result.restorations.is_empty() && !restoration_error {
+            ExitCode::PolicyBlocked
+        } else {
+            ExitCode::PartialFail
+        }
+    } else if restored > 0 {
+        output["status"] = serde_json::json!("restored");
+        ExitCode::ActionsOk
+    } else {
+        // This makes no claim about current live state. A later external stop
+        // or priority change cannot revive an already settled receipt.
+        output["status"] = serde_json::json!("no_pending_restorations");
+        ExitCode::Clean
+    };
+    emit(output);
+    code
+}
+
 #[cfg(test)]
 mod agent_undo_tests {
     use super::*;
@@ -38965,6 +39167,53 @@ mod agent_undo_tests {
             };
             assert!(Cli::try_parse_from(["pt-core", "agent", "undo", flag, value]).is_err());
         }
+    }
+
+    #[test]
+    fn undo_all_is_an_explicit_exclusive_selection_and_preserves_read_only_modes() {
+        for (flags, expected) in [
+            (vec![], false),
+            (vec!["--robot"], false),
+            (vec!["--confirm"], true),
+            (vec!["--confirm", "--dry-run"], false),
+            (vec!["--confirm", "--shadow"], false),
+        ] {
+            let mut argv = vec![
+                "pt-core",
+                "agent",
+                "undo",
+                "--session",
+                "test-session",
+                "--all",
+            ];
+            argv.extend(flags);
+            let cli = Cli::try_parse_from(argv).unwrap();
+            let Some(Commands::Agent(agent)) = &cli.command else {
+                panic!("expected agent");
+            };
+            let AgentCommands::Undo(args) = &agent.command else {
+                panic!("expected undo");
+            };
+            assert!(args.all);
+            assert!(args.action_id.is_none());
+            assert_eq!(agent_undo_execution_requested(&cli.global, args), expected);
+        }
+        for conflict in [
+            vec!["--action-id", "freeze-42"],
+            vec!["--attempt-id", "attempt-1"],
+        ] {
+            let mut argv = vec![
+                "pt-core",
+                "agent",
+                "undo",
+                "--session",
+                "test-session",
+                "--all",
+            ];
+            argv.extend(conflict);
+            assert!(Cli::try_parse_from(argv).is_err());
+        }
+        assert!(Cli::try_parse_from(["pt-core", "agent", "undo", "--all"]).is_err());
     }
 
     fn saved_plan() -> serde_json::Value {

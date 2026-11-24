@@ -1604,7 +1604,7 @@ prose\:"Structured natural language for agent-to-user communication"))' \
 (undo)
 _arguments "${_arguments_options[@]}" : \
 '--session=[Session containing the original action and its durable reversal receipt]:SESSION:_default' \
-'--action-id=[Canonical action ID from the saved plan]:ACTION_ID:_default' \
+'(--all)--action-id=[Canonical action ID from the saved plan]:ACTION_ID:_default' \
 '--attempt-id=[Select an execution attempt when the action has more than one receipt]:ATTEMPT_ID:_default' \
 '--capabilities=[Path to capabilities manifest (from pt wrapper)]:CAPABILITIES:_default' \
 '--config=[Override config directory]:CONFIG:_default' \
@@ -1629,6 +1629,7 @@ prose\:"Structured natural language for agent-to-user communication"))' \
 '--timeout=[Abort if operation exceeds time limit (seconds)]:TIMEOUT:_default' \
 '--fields=[Select specific output fields (comma-separated or preset\: minimal, standard, full)]:FIELDS:_default' \
 '--max-tokens=[Maximum token budget for output (enables truncation with continuation)]:TOKENS:_default' \
+'(--action-id --attempt-id)--all[Inspect or restore all pending durable receipts, newest execution first]' \
 '--confirm[Restore the recorded state (otherwise inspect receipts without mutation)]' \
 '*-v[Increase verbosity (-v, -vv, -vvv)]' \
 '*--verbose[Increase verbosity (-v, -vv, -vvv)]' \
@@ -3447,7 +3448,7 @@ prose\:"Structured natural language for agent-to-user communication"))' \
 (undo)
 _arguments "${_arguments_options[@]}" : \
 '--session=[Session containing the original action and its durable reversal receipt]:SESSION:_default' \
-'--action-id=[Canonical action ID from the saved plan]:ACTION_ID:_default' \
+'(--all)--action-id=[Canonical action ID from the saved plan]:ACTION_ID:_default' \
 '--attempt-id=[Select an execution attempt when the action has more than one receipt]:ATTEMPT_ID:_default' \
 '--capabilities=[Path to capabilities manifest (from pt wrapper)]:CAPABILITIES:_default' \
 '--config=[Override config directory]:CONFIG:_default' \
@@ -3472,6 +3473,7 @@ prose\:"Structured natural language for agent-to-user communication"))' \
 '--timeout=[Abort if operation exceeds time limit (seconds)]:TIMEOUT:_default' \
 '--fields=[Select specific output fields (comma-separated or preset\: minimal, standard, full)]:FIELDS:_default' \
 '--max-tokens=[Maximum token budget for output (enables truncation with continuation)]:TOKENS:_default' \
+'(--action-id --attempt-id)--all[Inspect or restore all pending durable receipts, newest execution first]' \
 '--confirm[Restore the recorded state (otherwise inspect receipts without mutation)]' \
 '*-v[Increase verbosity (-v, -vv, -vvv)]' \
 '*--verbose[Increase verbosity (-v, -vv, -vvv)]' \

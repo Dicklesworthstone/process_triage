@@ -3935,6 +3935,141 @@ fn signal_verification_requires_original_identity_and_live_resume() {
 /// An existing stop belongs to its original operator and must never be resumed.
 #[cfg(target_os = "linux")]
 #[test]
+fn agent_undo_all_restores_a_live_batch_and_does_not_reclaim_settled_controls() {
+    use pt_core::action::{ActionRunner, SignalActionRunner};
+    use pt_core::exit_codes::ExitCode;
+
+    let data_dir = TempDir::new().unwrap().keep();
+    let config_dir = TempDir::new().unwrap().keep();
+    write_test_policy(&config_dir);
+    let first = ForeignTarget::spawn("sleep 367");
+    let second = ForeignTarget::spawn("sleep 368");
+    let first_identity = live_identity(first.pid);
+    let second_identity = live_identity(second.pid);
+    let mut first_action = plan_action(Action::Pause, &first_identity);
+    first_action.action_id = "pause-first".into();
+    let mut second_action = plan_action(Action::Pause, &second_identity);
+    second_action.action_id = "pause-second".into();
+    second_action.order = 1;
+
+    // The second process was already stopped by its owner. Undo must preserve
+    // that state while resuming the first process, which pt actually stopped.
+    let external = SignalActionRunner::with_defaults();
+    external.execute(&second_action).unwrap();
+    external.verify(&second_action).unwrap();
+    let session =
+        session_with_actions(&data_dir, vec![first_action.clone(), second_action.clone()]);
+    let targets = format!(
+        "{}:{},{}:{}",
+        first.pid, first_identity.start_id.0, second.pid, second_identity.start_id.0
+    );
+    let (status, applied) = apply(&data_dir, &config_dir, &session, &targets);
+    assert_eq!(status, "success", "{applied}");
+    assert_eq!(applied["outcomes"].as_array().unwrap().len(), 2);
+    assert!(applied["outcomes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|outcome| outcome["status"] == "success"));
+    assert_eq!(state_of(first.pid), Some('T'));
+    assert_eq!(state_of(second.pid), Some('T'));
+    let handle = SessionStore::at_data_dir(&data_dir)
+        .open(&SessionId::parse(&session).unwrap())
+        .unwrap();
+    let plan_bytes = fs::read(handle.dir.join("decision/plan.json")).unwrap();
+    let outcome_bytes = fs::read(handle.dir.join("action/outcomes.jsonl")).unwrap();
+    let args = [
+        "--format",
+        "json",
+        "agent",
+        "undo",
+        "--session",
+        &session,
+        "--all",
+    ];
+    for (step, flags) in [
+        ("batch-undo-preview", vec![]),
+        ("batch-undo-robot-preview", vec!["--robot"]),
+        ("batch-undo-dry-preview", vec!["--confirm", "--dry-run"]),
+        ("batch-undo-shadow-preview", vec!["--confirm", "--shadow"]),
+    ] {
+        let mut selected = args.to_vec();
+        selected.extend(flags);
+        let (code, preview) =
+            recorded_action_command(&data_dir, &config_dir, &session, step, &selected);
+        assert_eq!(code, Some(ExitCode::Clean.as_i32()), "{preview}");
+        assert_eq!(preview["status"], "preview");
+        assert_eq!(
+            preview["batch"]["pending_attempt_ids"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(preview["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|record| record["restorations"].as_array().unwrap().is_empty()));
+        assert_eq!(state_of(first.pid), Some('T'));
+        assert_eq!(state_of(second.pid), Some('T'));
+    }
+
+    let mut selected = args.to_vec();
+    selected.push("--confirm");
+    let (code, restored) = recorded_action_command(
+        &data_dir,
+        &config_dir,
+        &session,
+        "batch-undo-confirmed",
+        &selected,
+    );
+    assert_eq!(code, Some(ExitCode::ActionsOk.as_i32()), "{restored}");
+    assert_eq!(restored["restored_count"], 2);
+    assert_eq!(
+        restored["restorations"][0]["action_id"],
+        second_action.action_id
+    );
+    assert_eq!(restored["restorations"][0]["changed"], false);
+    assert_eq!(
+        restored["restorations"][1]["action_id"],
+        first_action.action_id
+    );
+    assert_eq!(restored["restorations"][1]["changed"], true);
+    assert!(restored["remaining_attempt_ids"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_ne!(state_of(first.pid), Some('T'));
+    assert_eq!(state_of(second.pid), Some('T'));
+    assert!(first.alive() && second.alive());
+
+    external.execute(&first_action).unwrap();
+    external.verify(&first_action).unwrap();
+    let (code, repeated) = recorded_action_command(
+        &data_dir,
+        &config_dir,
+        &session,
+        "batch-undo-after-owner-stop",
+        &selected,
+    );
+    assert_eq!(code, Some(ExitCode::Clean.as_i32()), "{repeated}");
+    assert_eq!(repeated["status"], "no_pending_restorations");
+    assert!(repeated["restorations"].as_array().unwrap().is_empty());
+    assert_eq!(state_of(first.pid), Some('T'));
+    assert_eq!(state_of(second.pid), Some('T'));
+    assert_eq!(
+        fs::read(handle.dir.join("decision/plan.json")).unwrap(),
+        plan_bytes
+    );
+    assert_eq!(
+        fs::read(handle.dir.join("action/outcomes.jsonl")).unwrap(),
+        outcome_bytes
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn agent_undo_pause_preserves_original_job_control_and_execution_history() {
     use pt_core::action::{ActionRunner, SignalActionRunner};
     use pt_core::exit_codes::ExitCode;

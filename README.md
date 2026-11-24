@@ -1982,7 +1982,22 @@ pt agent undo --session <id> --action-id <action-id> --confirm
 
 # Select a particular execution attempt when needed.
 pt agent undo --session <id> --action-id <action-id> --attempt-id <uuid> --confirm
+
+# Inspect all recorded controls, then restore pending attempts newest first.
+pt agent undo --session <id> --all
+pt agent undo --session <id> --all --confirm
 ```
+
+`--all` validates every receipt against the complete saved plan before the first
+write and restores pending attempts in reverse execution order. A batch with
+more than 64 pending attempts is refused; select individual actions instead. It
+stops at the first failed restoration, preserving earlier results and listing
+the remaining attempts; it does not claim to roll back a partially completed
+batch. Settled receipts are skipped, so a later external stop or control change
+cannot reuse old undo authority. Unsupported attempts and actions without
+receipts remain explicit in the output. This restores recorded controls only;
+it cannot undo termination or reconstruct unrecorded original state.
+`--all` cannot be combined with `--action-id` or `--attempt-id`.
 
 `--execute` is an alias for `--confirm`. Global `--dry-run` and `--shadow`
 always keep this command read-only. Preview reports saved facts; confirmed
