@@ -39,6 +39,45 @@ pub struct RefreshOutcome {
     pub goal_selection: Option<HashMap<u32, usize>>,
 }
 
+/// One immutable control batch and the durable receipt state reviewed by a user.
+/// The backend must revalidate both bindings under the execution lock before
+/// restoring anything; display text and counts never authorize a write.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UndoBatch {
+    pub session_id: String,
+    pub plan_sha256: String,
+    pub receipt_fingerprint: String,
+    pub created_at: String,
+    pub pending: usize,
+    pub settled: usize,
+    pub unsupported: usize,
+    pub unrecorded: usize,
+    pub details: Vec<String>,
+    pub blocked_reason: Option<String>,
+}
+
+/// Persisted controls belonging to this TUI session, including unavailable and
+/// already settled batches. Read-only modes may inspect without restoring.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UndoOverview {
+    pub batches: Vec<UndoBatch>,
+    pub read_only_reason: Option<String>,
+    pub notes: Vec<String>,
+}
+
+/// Actual restoration results together with a fresh persisted overview.
+/// Partial failures remain successful callback returns with `error` populated,
+/// so the UI can retain both completed restorations and pending controls.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UndoRestoreOutcome {
+    pub overview: UndoOverview,
+    pub session_id: String,
+    pub restored: usize,
+    pub remaining: usize,
+    pub summary: String,
+    pub error: Option<String>,
+}
+
 /// Single message type used by the ftui model update loop.
 #[derive(Debug, Clone)]
 pub enum Msg {
@@ -88,6 +127,8 @@ pub enum Msg {
     SetDetailView(DetailView),
     ToggleGoalView,
     ToggleHelp,
+    OpenUndo,
+    CloseUndo,
 
     // Action messages
     RequestExecute {
@@ -97,6 +138,13 @@ pub enum Msg {
     CancelExecute,
     RequestRefresh,
     ExportEvidenceLedger,
+    RequestUndoRefresh,
+    ShowUndoConfirmation,
+    ConfirmUndo,
+    CancelUndo,
+    RequestUndo {
+        ticket: u64,
+    },
 
     // Async result messages
     ProcessesScanned(Vec<ProcessRow>),
@@ -107,6 +155,14 @@ pub enum Msg {
     RefreshComplete {
         ticket: u64,
         result: Result<RefreshOutcome, String>,
+    },
+    UndoLoaded {
+        ticket: u64,
+        result: Result<UndoOverview, String>,
+    },
+    UndoComplete {
+        ticket: u64,
+        result: Result<UndoRestoreOutcome, String>,
     },
     LedgerExported(Result<PathBuf, String>),
 
@@ -186,6 +242,8 @@ mod tests {
         assert_send_static::<Vec<ProcessRow>>();
         assert_send_static::<Result<ExecutionOutcome, String>>();
         assert_send_static::<Result<RefreshOutcome, String>>();
+        assert_send_static::<Result<UndoOverview, String>>();
+        assert_send_static::<Result<UndoRestoreOutcome, String>>();
         assert_send_static::<Result<PathBuf, String>>();
     }
 }

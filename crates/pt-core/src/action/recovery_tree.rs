@@ -78,6 +78,7 @@ impl FailureCategory {
     /// work have no failure category, even when they carry diagnostic details.
     pub fn from_action_status(status: &super::executor::ActionStatus) -> Option<Self> {
         use super::executor::ActionStatus;
+        use crate::plan::PreCheck;
         match status {
             ActionStatus::Success | ActionStatus::Skipped => None,
             ActionStatus::IdentityMismatch => Some(Self::IdentityMismatch),
@@ -86,10 +87,18 @@ impl FailureCategory {
             ActionStatus::Timeout => Some(Self::Timeout),
             ActionStatus::Failed => Some(Self::UnexpectedError),
             ActionStatus::PreCheckBlocked { check, .. } => Some(match check {
-                crate::plan::PreCheck::CheckNotProtected
-                | crate::plan::PreCheck::CheckSessionSafety => Self::ProcessProtected,
-                crate::plan::PreCheck::VerifyIdentity => Self::EvidenceUnavailable,
-                _ => Self::PreCheckBlocked,
+                PreCheck::CheckNotProtected | PreCheck::CheckSessionSafety => {
+                    Self::ProcessProtected
+                }
+                // A failed identity precheck may mean unreadable evidence, not
+                // a proven identity mismatch. Preserve that distinction.
+                PreCheck::VerifyIdentity => Self::EvidenceUnavailable,
+                // A supervisor precheck is not evidence that a replacement
+                // spawned. The persisted check/reason retains its exact cause.
+                PreCheck::CheckDataLossGate
+                | PreCheck::CheckSupervisor
+                | PreCheck::CheckAgentSupervision
+                | PreCheck::VerifyProcessState => Self::PreCheckBlocked,
             }),
         }
     }
@@ -824,7 +833,7 @@ pub fn advisory_recovery(
             "The recorded process identity no longer matches the target; the saved action is invalid."
                 .to_string(),
             RecoveryAction::Replan,
-            "Discard this stale action and review a newly collected plan. A reused PID must not inherit the previous approval.",
+            "Identity verification can fail after an attempted change. Inspect the saved outcome and any reversal receipt, and verify the saved session before further action. Discard this stale action and review a newly collected plan; a reused PID must not inherit the previous approval.",
             replan.to_string(),
         ),
         FailureCategory::EvidenceUnavailable => (
@@ -837,7 +846,7 @@ pub fn advisory_recovery(
         FailureCategory::PermissionDenied => (
             format!("The caller lacked permission to complete {operation}."),
             RecoveryAction::EscalateToUser,
-            "Ask the process owner to review the required permissions and collect a new plan in an authorized context.",
+            "Permission can fail during verification after a partial change. Inspect the saved outcome and any reversal receipt, and verify the saved session before further action. Ask the owner to review required permissions or controller delegation, then collect a new plan in an authorized context.",
             inspect,
         ),
         FailureCategory::ProcessNotFound => (
@@ -850,13 +859,13 @@ pub fn advisory_recovery(
         FailureCategory::ProcessProtected => (
             format!("A process or session protection gate blocked {operation}."),
             RecoveryAction::EscalateToUser,
-            "Review the recorded protection with the owner. Preserve the protected process and select an eligible target in a new plan.",
+            "The target is protected or evidence needed to rule out protection is unavailable. This refusal is terminal for the current plan. Review the recorded protection with the owner and preserve the refusal until fresh evidence supports a newly reviewed plan.",
             inspect,
         ),
         FailureCategory::Timeout => (
             format!("The {operation} operation reached its time limit."),
             RecoveryAction::VerifyGoal,
-            "Inspect the saved execution and current postconditions before deciding on further work; a timeout does not establish that earlier effects were undone.",
+            "Inspect the saved execution, any reversal receipt and current postconditions before deciding on further work; a timeout does not establish that earlier effects were undone.",
             verify,
         ),
         FailureCategory::SupervisorConflict => (
@@ -875,7 +884,7 @@ pub fn advisory_recovery(
         FailureCategory::PreCheckBlocked => (
             format!("A safety precheck blocked {operation}."),
             RecoveryAction::Investigate,
-            "Inspect the recorded check and reason, resolve the underlying condition, and collect a fresh plan.",
+            "This refusal is terminal for the current plan. Inspect the recorded check and reason with the workload owner, resolve the underlying condition without bypassing the gate, and collect a fresh plan.",
             inspect,
         ),
         FailureCategory::PolicyBlocked => (
@@ -893,7 +902,7 @@ pub fn advisory_recovery(
         FailureCategory::UnexpectedError => (
             format!("Execution or verification of {operation} failed without a more specific typed cause."),
             RecoveryAction::Investigate,
-            "Inspect the original error and saved execution evidence before considering another action. Partial effects remain possible.",
+            "Inspect the original error, saved execution evidence and any reversal receipt before considering another action. Partial effects remain possible.",
             verify,
         ),
     };
@@ -1431,11 +1440,11 @@ impl<'a> RecoveryExecutor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::action::executor::{ActionError, ActionStatus};
+    use crate::plan::PreCheck;
 
     #[test]
     fn production_recovery_preserves_typed_errors_and_does_not_guess_from_text() {
-        use super::super::executor::{ActionError, ActionStatus};
-
         for (error, status, category) in [
             (
                 ActionError::IdentityMismatch,
@@ -1474,57 +1483,6 @@ mod tests {
             FailureCategory::from_action_status(&ActionStatus::Skipped),
             None
         );
-    }
-
-    #[test]
-    fn production_recovery_never_authorizes_a_new_mutation_for_any_action() {
-        let session = pt_common::SessionId::new();
-        for action in [
-            Action::Keep,
-            Action::Kill,
-            Action::Pause,
-            Action::Resume,
-            Action::Renice,
-            Action::Restart,
-            Action::Freeze,
-            Action::Unfreeze,
-            Action::Throttle,
-            Action::CapMemory,
-            Action::Quarantine,
-            Action::Unquarantine,
-        ] {
-            for category in [
-                FailureCategory::PermissionDenied,
-                FailureCategory::ProcessNotFound,
-                FailureCategory::ProcessProtected,
-                FailureCategory::Timeout,
-                FailureCategory::SupervisorConflict,
-                FailureCategory::ResourceConflict,
-                FailureCategory::IdentityMismatch,
-                FailureCategory::PreCheckBlocked,
-                FailureCategory::EvidenceUnavailable,
-                FailureCategory::PolicyBlocked,
-                FailureCategory::UnsupportedAction,
-                FailureCategory::UnexpectedError,
-            ] {
-                let report = advisory_recovery(category, Some(action), &session);
-                assert!(!report.automatic_retry);
-                assert!(matches!(
-                    report.recovery_hint.recommended_action,
-                    RecoveryAction::Replan
-                        | RecoveryAction::VerifyGoal
-                        | RecoveryAction::Investigate
-                        | RecoveryAction::EscalateToUser
-                ));
-                assert!(report.recovery_hint.reversibility.is_none());
-                let next = &report.recovery_hint.agent_next_step;
-                assert!(!next.contains("<pid>"));
-                assert!(!next.contains("sudo "));
-                assert!(!next.contains("kill "));
-                assert!(!next.contains("--force"));
-                assert!(!next.contains("agent apply"));
-            }
-        }
     }
 
     #[test]
@@ -1567,6 +1525,205 @@ mod tests {
         assert_eq!(
             blocked.recovery_hint.agent_next_step,
             "pt --format json agent sessions --session 'pt-test'\\''; touch /tmp/not-a-command; #' --detail"
+        );
+    }
+
+    fn production_recovery_failure_statuses() -> Vec<ActionStatus> {
+        let mut statuses = vec![
+            ActionStatus::IdentityMismatch,
+            ActionStatus::ProcessNotFound,
+            ActionStatus::PermissionDenied,
+            ActionStatus::Timeout,
+            ActionStatus::Failed,
+        ];
+        statuses.extend(
+            [
+                PreCheck::VerifyIdentity,
+                PreCheck::CheckNotProtected,
+                PreCheck::CheckSessionSafety,
+                PreCheck::CheckDataLossGate,
+                PreCheck::CheckSupervisor,
+                PreCheck::CheckAgentSupervision,
+                PreCheck::VerifyProcessState,
+            ]
+            .into_iter()
+            .map(|check| ActionStatus::PreCheckBlocked {
+                check,
+                reason: "untrusted diagnostic: sudo kill -9 123; retry immediately".to_string(),
+            }),
+        );
+        statuses
+    }
+
+    #[test]
+    fn production_recovery_never_authorizes_a_new_mutation_for_any_action() {
+        let session = pt_common::SessionId::new();
+        let actions = [
+            Action::Keep,
+            Action::Renice,
+            Action::Pause,
+            Action::Resume,
+            Action::Freeze,
+            Action::Unfreeze,
+            Action::Throttle,
+            Action::CapMemory,
+            Action::Quarantine,
+            Action::Unquarantine,
+            Action::Restart,
+            Action::Kill,
+        ];
+        for action in actions {
+            for category in [
+                FailureCategory::PermissionDenied,
+                FailureCategory::ProcessNotFound,
+                FailureCategory::ProcessProtected,
+                FailureCategory::Timeout,
+                FailureCategory::SupervisorConflict,
+                FailureCategory::ResourceConflict,
+                FailureCategory::IdentityMismatch,
+                FailureCategory::PreCheckBlocked,
+                FailureCategory::EvidenceUnavailable,
+                FailureCategory::PolicyBlocked,
+                FailureCategory::UnsupportedAction,
+                FailureCategory::UnexpectedError,
+            ] {
+                let guidance = advisory_recovery(category, Some(action), &session);
+                assert!(!guidance.automatic_retry);
+                assert!(guidance.recovery_hint.reversibility.is_none());
+                assert!(matches!(
+                    guidance.recovery_hint.recommended_action,
+                    RecoveryAction::Replan
+                        | RecoveryAction::VerifyGoal
+                        | RecoveryAction::Investigate
+                        | RecoveryAction::EscalateToUser
+                ));
+                let json = serde_json::to_string(&guidance).unwrap();
+                assert!(!json.contains("sudo"));
+                assert!(!json.contains("kill -"));
+                assert!(!json.contains("<pid>"));
+                assert!(!json.contains("--force"));
+                assert!(!json.contains("agent apply"));
+                assert!(!json.contains("untrusted diagnostic"));
+                assert!(!guidance.recovery_hint.agent_next_step.is_empty());
+                assert!(!guidance.recovery_hint.explanation.is_empty());
+            }
+            assert!(FailureCategory::from_action_status(&ActionStatus::Success).is_none());
+            assert!(FailureCategory::from_action_status(&ActionStatus::Skipped).is_none());
+        }
+    }
+
+    #[test]
+    fn production_recovery_uses_typed_failure_and_precheck_causes() {
+        let expected = [
+            FailureCategory::IdentityMismatch,
+            FailureCategory::ProcessNotFound,
+            FailureCategory::PermissionDenied,
+            FailureCategory::Timeout,
+            FailureCategory::UnexpectedError,
+            FailureCategory::EvidenceUnavailable,
+            FailureCategory::ProcessProtected,
+            FailureCategory::ProcessProtected,
+            FailureCategory::PreCheckBlocked,
+            FailureCategory::PreCheckBlocked,
+            FailureCategory::PreCheckBlocked,
+            FailureCategory::PreCheckBlocked,
+        ];
+        let statuses = production_recovery_failure_statuses();
+        assert_eq!(statuses.len(), expected.len());
+        for (status, expected) in statuses.into_iter().zip(expected) {
+            assert_eq!(
+                FailureCategory::from_action_status(&status),
+                Some(expected),
+                "{status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn production_recovery_keeps_protection_refusals_terminal() {
+        for check in [
+            PreCheck::CheckNotProtected,
+            PreCheck::CheckSessionSafety,
+            PreCheck::CheckDataLossGate,
+            PreCheck::CheckSupervisor,
+            PreCheck::CheckAgentSupervision,
+        ] {
+            let category = FailureCategory::from_action_status(&ActionStatus::PreCheckBlocked {
+                check,
+                reason: "evidence unavailable".to_string(),
+            })
+            .unwrap();
+            let guidance =
+                advisory_recovery(category, Some(Action::Kill), &pt_common::SessionId::new());
+            assert!(guidance
+                .recovery_hint
+                .explanation
+                .contains("terminal for the current plan"));
+            assert!(guidance.recovery_hint.reversibility.is_none());
+        }
+    }
+
+    #[test]
+    fn production_recovery_requires_verification_of_ambiguous_mutation() {
+        for status in [
+            ActionStatus::Timeout,
+            ActionStatus::Failed,
+            ActionStatus::PermissionDenied,
+            ActionStatus::IdentityMismatch,
+        ] {
+            let category = FailureCategory::from_action_status(&status).unwrap();
+            let guidance =
+                advisory_recovery(category, Some(Action::Freeze), &pt_common::SessionId::new());
+            assert!(
+                guidance
+                    .recovery_hint
+                    .agent_next_step
+                    .contains("agent verify")
+                    || guidance
+                        .recovery_hint
+                        .explanation
+                        .contains("verify the saved session")
+            );
+            assert!(guidance
+                .recovery_hint
+                .explanation
+                .contains("reversal receipt"));
+            assert!(guidance.recovery_hint.reversibility.is_none());
+            assert!(!guidance.automatic_retry);
+        }
+        let missing = advisory_recovery(
+            FailureCategory::ProcessNotFound,
+            Some(Action::Kill),
+            &pt_common::SessionId::new(),
+        );
+        assert_eq!(
+            missing.recovery_hint.recommended_action,
+            RecoveryAction::VerifyGoal
+        );
+        assert!(missing.recovery_hint.explanation.contains("does not prove"));
+    }
+
+    #[test]
+    fn production_recovery_serializes_a_stable_typed_hint_without_mutating_commands() {
+        let guidance = advisory_recovery(
+            FailureCategory::PermissionDenied,
+            Some(Action::CapMemory),
+            &pt_common::SessionId::new(),
+        );
+        let value = serde_json::to_value(&guidance).unwrap();
+        assert_eq!(value["failure_type"], "permission_denied");
+        assert_eq!(
+            value["recovery_hint"]["recommended_action"],
+            "escalate_to_user"
+        );
+        assert_eq!(value["automatic_retry"], false);
+        assert!(value["recovery_hint"].get("reversibility").is_none());
+        assert!(value["recovery_hint"].get("command_hint").is_none());
+        let restored: RecoveryHint =
+            serde_json::from_value(value["recovery_hint"].clone()).unwrap();
+        assert_eq!(
+            restored.agent_next_step,
+            guidance.recovery_hint.agent_next_step
         );
     }
 

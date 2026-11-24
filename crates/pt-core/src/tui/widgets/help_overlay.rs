@@ -100,6 +100,10 @@ const ACTIONS: &[Binding] = &[
         desc: "Refresh list",
     },
     Binding {
+        key: "U",
+        desc: "Undo recorded controls",
+    },
+    Binding {
         key: "Enter",
         desc: "Toggle detail pane",
     },
@@ -198,7 +202,7 @@ impl<'a> HelpOverlay<'a> {
             FtuiLine::raw("Navigation: j/k/Home/End"),
             FtuiLine::raw("Search: /"),
             FtuiLine::raw("Select: Space/a/A/u/x"),
-            FtuiLine::raw("Execute: e"),
+            FtuiLine::raw("Execute: e  Undo controls: U"),
             FtuiLine::raw("Detail: Enter"),
             FtuiLine::raw("Views: s/t/g  Mode: v"),
             FtuiLine::raw("Help: ?  Quit: q"),

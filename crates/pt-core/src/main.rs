@@ -97,7 +97,9 @@ use pt_core::supervision::{
 #[cfg(feature = "ui")]
 use pt_core::tui::widgets::ProcessRow;
 #[cfg(feature = "ui")]
-use pt_core::tui::{run_ftui, App, ExecutionOutcome, RefreshOutcome};
+use pt_core::tui::{
+    run_ftui, App, ExecutionOutcome, RefreshOutcome, UndoBatch, UndoOverview, UndoRestoreOutcome,
+};
 use pt_core::verify::relief::{capture_resource_observation, ResourceDelta, DEFAULT_SETTLE_MS};
 use pt_core::verify::relief_store::{
     begin_resource_run, finish_resource_run, load_resource_runs, ResourceRun, ResourceRunResult,
@@ -2986,6 +2988,25 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
         app.set_refresh_op(refresh_fn);
         app.set_execute_op(execute_fn);
 
+        let undo_read_only = if dry_run {
+            Some("Dry-run mode does not restore controls".to_string())
+        } else if shadow {
+            Some("Shadow mode does not restore controls".to_string())
+        } else {
+            None
+        };
+        let undo_inspect_handle = handle.clone();
+        let undo_restore_handle = handle.clone();
+        let undo_inspect_read_only = undo_read_only.clone();
+        app.set_undo_ops(
+            Arc::new(move || {
+                inspect_tui_undo(&undo_inspect_handle, undo_inspect_read_only.clone())
+            }),
+            Arc::new(move |reviewed| {
+                restore_tui_undo(&undo_restore_handle, reviewed, undo_read_only.clone())
+            }),
+        );
+
         let program_config = if args.inline {
             ftui::ProgramConfig::inline(compute_inline_ui_height())
         } else {
@@ -4966,6 +4987,705 @@ struct TuiControlSession {
     handle: SessionHandle,
     plan: Plan,
     plan_sha256: String,
+}
+
+#[cfg(feature = "ui")]
+fn inspect_tui_undo(
+    parent: &SessionHandle,
+    read_only_reason: Option<String>,
+) -> Result<UndoOverview, String> {
+    #[cfg(target_os = "linux")]
+    {
+        tui_undo_backend::inspect(parent, read_only_reason)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = parent;
+        Ok(UndoOverview {
+            read_only_reason: Some(read_only_reason.unwrap_or_else(|| {
+                "Durable interactive undo is supported only on Linux".to_string()
+            })),
+            ..UndoOverview::default()
+        })
+    }
+}
+
+#[cfg(feature = "ui")]
+fn restore_tui_undo(
+    parent: &SessionHandle,
+    reviewed: UndoBatch,
+    read_only_reason: Option<String>,
+) -> Result<UndoRestoreOutcome, String> {
+    #[cfg(target_os = "linux")]
+    {
+        tui_undo_backend::restore(parent, reviewed, read_only_reason)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (parent, reviewed);
+        Err(read_only_reason
+            .unwrap_or_else(|| "Durable interactive undo is supported only on Linux".to_string()))
+    }
+}
+
+/// The UI selects an immutable child, never a PID or a command from a history
+/// string. Every authority-bearing file is opened through pinned directories;
+/// restoration then uses the same durable journal as `agent undo --all`.
+#[cfg(all(feature = "ui", target_os = "linux"))]
+mod tui_undo_backend {
+    use super::{
+        parse_agent_plan, Plan, SessionContext, SessionHandle, SessionId, SessionManifest,
+        SessionMode, UndoBatch, UndoOverview, UndoRestoreOutcome,
+    };
+    use pt_core::action::reversal::{ReversalBatchInspection, MAX_BATCH_RESTORATIONS};
+    use pt_core::action::{RestorationStatus, ReversalJournal};
+    use serde::de::DeserializeOwned;
+    use sha2::{Digest, Sha256};
+    use std::fs::{self, File, Metadata, OpenOptions};
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::path::{Path, PathBuf};
+
+    const MAX_REFERENCES: usize = 256;
+    const MAX_METADATA_BYTES: u64 = 64 * 1024;
+    const MAX_PLAN_BYTES: u64 = 1024 * 1024;
+    const MAX_DETAIL_ROWS: usize = MAX_BATCH_RESTORATIONS;
+
+    fn check_owned(metadata: &Metadata, directory: bool) -> Result<(), String> {
+        // SAFETY: geteuid only reads the caller's effective credentials.
+        if (if directory {
+            !metadata.is_dir()
+        } else {
+            !metadata.is_file()
+        }) || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o022 != 0
+            || (!directory && metadata.nlink() != 1)
+        {
+            return Err("interactive undo requires owned storage that is not writable by others, with singly linked regular files".into());
+        }
+        Ok(())
+    }
+
+    fn same_file(left: &Metadata, right: &Metadata) -> bool {
+        left.dev() == right.dev() && left.ino() == right.ino()
+    }
+
+    struct Directory {
+        path: PathBuf,
+        handle: File,
+    }
+
+    impl Directory {
+        fn open(path: PathBuf) -> Result<Self, String> {
+            let handle = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&path)
+                .map_err(|error| format!("cannot open interactive undo directory: {error}"))?;
+            let directory = Self { path, handle };
+            directory.revalidate()?;
+            Ok(directory)
+        }
+
+        fn pinned(&self) -> PathBuf {
+            PathBuf::from(format!("/proc/self/fd/{}", self.handle.as_raw_fd()))
+        }
+
+        fn child(&self, name: &str) -> Result<Self, String> {
+            self.revalidate()?;
+            Self::open(self.pinned().join(name))
+        }
+
+        fn revalidate(&self) -> Result<(), String> {
+            let saved = self.handle.metadata().map_err(|error| error.to_string())?;
+            let current = fs::symlink_metadata(&self.path)
+                .map_err(|error| format!("interactive undo directory changed: {error}"))?;
+            check_owned(&saved, true)?;
+            check_owned(&current, true)?;
+            if !same_file(&saved, &current) {
+                return Err("interactive undo directory identity changed".into());
+            }
+            Ok(())
+        }
+
+        fn read(&self, name: &str, maximum: u64) -> Result<Vec<u8>, String> {
+            self.revalidate()?;
+            let path = self.pinned().join(name);
+            let mut file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+                .open(&path)
+                .map_err(|error| format!("cannot read interactive undo {name}: {error}"))?;
+            let before = file.metadata().map_err(|error| error.to_string())?;
+            check_owned(&before, false)?;
+            if before.len() > maximum {
+                return Err(format!("interactive undo {name} exceeds its size limit"));
+            }
+            let mut bytes = Vec::new();
+            (&mut file)
+                .take(maximum + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|error| format!("cannot read interactive undo {name}: {error}"))?;
+            if bytes.len() as u64 > maximum {
+                return Err(format!("interactive undo {name} exceeds its size limit"));
+            }
+            let after = file.metadata().map_err(|error| error.to_string())?;
+            let current = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+            check_owned(&after, false)?;
+            check_owned(&current, false)?;
+            if !same_file(&before, &after)
+                || !same_file(&after, &current)
+                || before.len() != after.len()
+                || before.mtime() != after.mtime()
+                || before.mtime_nsec() != after.mtime_nsec()
+                || before.ctime() != after.ctime()
+                || before.ctime_nsec() != after.ctime_nsec()
+            {
+                return Err(format!("interactive undo {name} changed while being read"));
+            }
+            self.revalidate()?;
+            Ok(bytes)
+        }
+
+        fn json<T: DeserializeOwned>(&self, name: &str) -> Result<T, String> {
+            serde_json::from_slice(&self.read(name, MAX_METADATA_BYTES)?)
+                .map_err(|error| format!("invalid interactive undo {name}: {error}"))
+        }
+    }
+
+    /// Same stable inode/flock protocol as apply, CLI undo and retention; never
+    /// truncate a lock or follow a caller-controlled symlink while acquiring it.
+    struct ExecutionLock {
+        path: PathBuf,
+        file: File,
+    }
+
+    impl ExecutionLock {
+        fn acquire(data: &Directory) -> Result<Self, String> {
+            data.revalidate()?;
+            let path = data.pinned().join(".execution-policy-lock");
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+                .open(&path)
+                .map_err(|error| format!("cannot open interactive restoration lock: {error}"))?;
+            check_owned(&file.metadata().map_err(|error| error.to_string())?, false)?;
+            // SAFETY: file owns a live descriptor; flock only acquires its lock.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                let error = std::io::Error::last_os_error();
+                return Err(format!(
+                    "cannot lock interactive restoration; another command may be executing or restoring actions: {error}"
+                ));
+            }
+            let lock = Self { path, file };
+            lock.revalidate()?;
+            data.revalidate()?;
+            Ok(lock)
+        }
+
+        fn revalidate(&self) -> Result<(), String> {
+            let saved = self.file.metadata().map_err(|error| error.to_string())?;
+            let current = fs::symlink_metadata(&self.path).map_err(|error| error.to_string())?;
+            check_owned(&saved, false)?;
+            check_owned(&current, false)?;
+            if !same_file(&saved, &current) {
+                return Err("interactive restoration lock was replaced".into());
+            }
+            Ok(())
+        }
+    }
+
+    // Closing the sole owned File releases its flock on every return path.
+
+    struct Store {
+        parent_id: String,
+        host_id: String,
+        data: Directory,
+        sessions: Directory,
+        parent: Directory,
+        action: Directory,
+        references: Option<Directory>,
+    }
+
+    fn session_id(value: &str) -> Result<SessionId, String> {
+        SessionId::parse(value)
+            .filter(|id| {
+                id.0 == value
+                    && value.len() <= 128
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            })
+            .ok_or_else(|| "invalid interactive control session ID".to_string())
+    }
+
+    fn require_host(value: &str, current: &str) -> Result<(), String> {
+        if value.trim().is_empty() || value.eq_ignore_ascii_case("unknown") || value != current {
+            return Err("interactive control host does not match the known current host".into());
+        }
+        Ok(())
+    }
+
+    impl Store {
+        fn open(handle: &SessionHandle) -> Result<Self, String> {
+            session_id(&handle.id.0)?;
+            let data_path = handle
+                .dir
+                .parent()
+                .and_then(Path::parent)
+                .ok_or("cannot resolve interactive undo session storage")?;
+            if handle.dir != data_path.join("sessions").join(&handle.id.0) {
+                return Err("interactive parent path differs from its canonical session ID".into());
+            }
+            let data = Directory::open(data_path.to_path_buf())?;
+            let sessions = data.child("sessions")?;
+            let parent = sessions.child(&handle.id.0)?;
+            let manifest: SessionManifest = parent.json("manifest.json")?;
+            let context: SessionContext = parent.json("context.json")?;
+            if manifest.session_id != handle.id.0
+                || context.session_id != handle.id.0
+                || manifest.mode != SessionMode::Interactive
+            {
+                return Err(
+                    "interactive parent manifest or context has a different identity".into(),
+                );
+            }
+            let host_id = pt_core::logging::get_host_id();
+            require_host(&context.host_id, &host_id)?;
+            let action = parent.child("action")?;
+            let references = match fs::symlink_metadata(action.pinned().join("control_sessions")) {
+                Ok(_) => Some(action.child("control_sessions")?),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(format!("cannot inspect control references: {error}")),
+            };
+            let store = Self {
+                parent_id: handle.id.0.clone(),
+                host_id,
+                data,
+                sessions,
+                parent,
+                action,
+                references,
+            };
+            store.revalidate()?;
+            Ok(store)
+        }
+
+        fn revalidate(&self) -> Result<(), String> {
+            for directory in [&self.data, &self.sessions, &self.parent, &self.action] {
+                directory.revalidate()?;
+            }
+            if let Some(references) = &self.references {
+                references.revalidate()?;
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Reference {
+        session_id: String,
+        parent_session_id: String,
+        plan_sha256: String,
+        action_ids: Vec<String>,
+        #[serde(rename = "undo_preview")]
+        _undo_preview: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct PlanOrigin {
+        session_id: String,
+        parent_session_id: String,
+        host_id: String,
+    }
+
+    struct BoundBatch {
+        session: Directory,
+        decision: Directory,
+        action: Directory,
+        plan: Plan,
+        journal: ReversalJournal,
+        view: UndoBatch,
+    }
+
+    impl BoundBatch {
+        fn revalidate(&self, store: &Store) -> Result<(), String> {
+            store.revalidate()?;
+            self.session.revalidate()?;
+            self.decision.revalidate()?;
+            self.action.revalidate()
+        }
+    }
+
+    fn load_batch(store: &Store, id: &str) -> Result<BoundBatch, String> {
+        session_id(id)?;
+        if id == store.parent_id {
+            return Err("a review session cannot reference itself as a control child".into());
+        }
+        let references = store
+            .references
+            .as_ref()
+            .ok_or("no saved control references")?;
+        let reference: Reference = references.json(&format!("{id}.json"))?;
+        if reference.session_id != id
+            || reference.parent_session_id != store.parent_id
+            || reference.plan_sha256.len() != 64
+            || !reference
+                .plan_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("control reference does not bind this parent, child and exact plan".into());
+        }
+        let session = store.sessions.child(id)?;
+        let manifest: SessionManifest = session.json("manifest.json")?;
+        let context: SessionContext = session.json("context.json")?;
+        if manifest.session_id != id
+            || manifest.parent_session_id.as_deref() != Some(store.parent_id.as_str())
+            || manifest.mode != SessionMode::Interactive
+            || context.session_id != id
+        {
+            return Err(
+                "control child manifest or context no longer belongs to this review".into(),
+            );
+        }
+        require_host(&context.host_id, &store.host_id)?;
+        chrono::DateTime::parse_from_rfc3339(&manifest.timing.created_at)
+            .map_err(|_| "control child has an invalid creation timestamp".to_string())?;
+        let decision = session.child("decision")?;
+        let bytes = decision.read("plan.json", MAX_PLAN_BYTES)?;
+        let plan_sha256 = format!("{:x}", Sha256::digest(&bytes));
+        if plan_sha256 != reference.plan_sha256 {
+            return Err("immutable control plan bytes differ from the parent reference".into());
+        }
+        let origin: PlanOrigin = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("invalid control plan origin: {error}"))?;
+        if origin.session_id != id || origin.parent_session_id != store.parent_id {
+            return Err("control plan belongs to a different parent or child session".into());
+        }
+        require_host(&origin.host_id, &store.host_id)?;
+        let content = std::str::from_utf8(&bytes).map_err(|error| error.to_string())?;
+        let plan =
+            parse_agent_plan(content).map_err(|error| format!("invalid control plan: {error}"))?;
+        if plan.session_id != id
+            || reference.action_ids
+                != plan
+                    .actions
+                    .iter()
+                    .map(|action| action.action_id.clone())
+                    .collect::<Vec<_>>()
+        {
+            return Err(
+                "control reference action selection differs from its saved child plan".into(),
+            );
+        }
+        let action = session.child("action")?;
+        // This canonical root is reached through the pinned data directory;
+        // retain every intervening directory handle until restoration finishes.
+        let journal = ReversalJournal::new(
+            store.sessions.path.join(id).join("action"),
+            id,
+            &plan_sha256,
+            &store.sessions.path,
+        )
+        .map_err(|error| format!("cannot bind control receipts: {error}"))?;
+        let inspection = journal
+            .inspect_plan(&plan.actions)
+            .map_err(|error| format!("cannot inspect control receipts: {error}"))?;
+        let view = batch_view(id, plan_sha256, manifest.timing.created_at, &inspection)?;
+        let batch = BoundBatch {
+            session,
+            decision,
+            action,
+            plan,
+            journal,
+            view,
+        };
+        batch.revalidate(store)?;
+        Ok(batch)
+    }
+
+    fn batch_view(
+        id: &str,
+        plan_sha256: String,
+        created_at: String,
+        inspection: &ReversalBatchInspection,
+    ) -> Result<UndoBatch, String> {
+        let fingerprint = serde_json::to_vec(inspection)
+            .map_err(|error| format!("cannot bind reviewed control receipts: {error}"))?;
+        let pending = inspection.pending_attempt_ids.len();
+        let unsupported = inspection.unsupported_attempt_ids.len();
+        let settled = inspection
+            .records
+            .len()
+            .saturating_sub(pending + unsupported);
+        let pending_ids: std::collections::HashSet<_> = inspection
+            .pending_attempt_ids
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let unsupported_ids: std::collections::HashSet<_> = inspection
+            .unsupported_attempt_ids
+            .iter()
+            .map(String::as_str)
+            .collect();
+        // Every control in an allowed confirmation must be visible. Older
+        // settled attempts cannot push pending targets out of the detail list.
+        let visible = inspection
+            .records
+            .iter()
+            .filter(|record| pending_ids.contains(record.attempt_id.as_str()))
+            .chain(
+                inspection
+                    .records
+                    .iter()
+                    .filter(|record| !pending_ids.contains(record.attempt_id.as_str())),
+            )
+            .take(MAX_DETAIL_ROWS);
+        let mut details = visible
+            .map(|record| {
+                let restored = record
+                    .restorations
+                    .iter()
+                    .any(|outcome| outcome.status == RestorationStatus::Restored);
+                format!(
+                    "{} PID {}: {} (execution {:?})",
+                    record.action.as_str(),
+                    record.target.pid.0,
+                    if restored {
+                        "restored"
+                    } else if pending_ids.contains(record.attempt_id.as_str()) {
+                        "pending"
+                    } else if unsupported_ids.contains(record.attempt_id.as_str()) {
+                        "unsupported"
+                    } else {
+                        "no pending control"
+                    },
+                    record.status,
+                )
+            })
+            .collect::<Vec<_>>();
+        if inspection.records.len() > MAX_DETAIL_ROWS {
+            details.push(format!("{} additional recorded attempts are not shown; batches with more than {MAX_BATCH_RESTORATIONS} pending controls cannot be restored here", inspection.records.len() - MAX_DETAIL_ROWS));
+        }
+        if !inspection.unrecorded_action_ids.is_empty() {
+            details.push(format!(
+                "{} action(s) have no durable receipt; their original state cannot be reconstructed",
+                inspection.unrecorded_action_ids.len(),
+            ));
+        }
+        let blocked_reason = if pending > MAX_BATCH_RESTORATIONS {
+            Some(format!("More than {MAX_BATCH_RESTORATIONS} pending controls; inspect individual actions with agent undo"))
+        } else if pending == 0 {
+            Some(if unsupported > 0 {
+                "No pending supported controls; unsupported receipts remain visible".to_string()
+            } else {
+                "No pending durable controls to restore".to_string()
+            })
+        } else {
+            None
+        };
+        Ok(UndoBatch {
+            session_id: id.to_string(),
+            plan_sha256,
+            receipt_fingerprint: format!("{:x}", Sha256::digest(fingerprint)),
+            created_at,
+            pending,
+            settled,
+            unsupported,
+            unrecorded: inspection.unrecorded_action_ids.len(),
+            details,
+            blocked_reason,
+        })
+    }
+
+    fn inventory(store: &Store, read_only_reason: Option<String>) -> Result<UndoOverview, String> {
+        store.revalidate()?;
+        let mut overview = UndoOverview {
+            read_only_reason,
+            ..UndoOverview::default()
+        };
+        let Some(references) = &store.references else {
+            return Ok(overview);
+        };
+        let mut ids = Vec::new();
+        for (index, entry) in fs::read_dir(references.pinned())
+            .map_err(|error| format!("cannot enumerate control references: {error}"))?
+            .enumerate()
+        {
+            // Count all entries before filtering or allocating an unbounded list.
+            if index >= MAX_REFERENCES {
+                return Err(format!("interactive undo exceeds {MAX_REFERENCES} reference entries; inspect an individual saved control session with agent undo"));
+            }
+            let entry = entry.map_err(|error| format!("cannot read control reference: {error}"))?;
+            let name = entry.file_name();
+            let Some(id) = name.to_str().and_then(|name| name.strip_suffix(".json")) else {
+                overview.notes.push(
+                    "An unfinished or unrecognized control reference was not selected".into(),
+                );
+                continue;
+            };
+            if session_id(id).is_err() {
+                overview
+                    .notes
+                    .push("An invalid control reference filename was not selected".into());
+                continue;
+            }
+            ids.push(id.to_string());
+        }
+        ids.sort();
+        for id in ids {
+            let view = match load_batch(store, &id) {
+                Ok(batch) => batch.view,
+                Err(error) => UndoBatch {
+                    session_id: id,
+                    blocked_reason: Some(error),
+                    ..UndoBatch::default()
+                },
+            };
+            overview.batches.push(view);
+        }
+        overview.batches.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.session_id.cmp(&left.session_id))
+        });
+        store.revalidate()?;
+        Ok(overview)
+    }
+
+    pub(super) fn inspect(
+        parent: &SessionHandle,
+        read_only_reason: Option<String>,
+    ) -> Result<UndoOverview, String> {
+        let before_lock = Store::open(parent)?;
+        let lock = ExecutionLock::acquire(&before_lock.data)?;
+        // Parent metadata and newly published reference directories are read
+        // again under the same lock used by apply, restoration and retention.
+        let store = Store::open(parent)?;
+        before_lock.revalidate()?;
+        lock.revalidate()?;
+        let overview = inventory(&store, read_only_reason)?;
+        before_lock.revalidate()?;
+        lock.revalidate()?;
+        Ok(overview)
+    }
+
+    fn append_error(error: &mut Option<String>, detail: String) {
+        *error = Some(match error.take() {
+            Some(previous) => format!("{previous}; {detail}"),
+            None => detail,
+        });
+    }
+
+    pub(super) fn restore(
+        parent: &SessionHandle,
+        reviewed: UndoBatch,
+        read_only_reason: Option<String>,
+    ) -> Result<UndoRestoreOutcome, String> {
+        if let Some(reason) = read_only_reason {
+            return Err(reason);
+        }
+        let before_lock = Store::open(parent)?;
+        let lock = ExecutionLock::acquire(&before_lock.data)?;
+        let store = Store::open(parent)?;
+        before_lock.revalidate()?;
+        // Reopen all authority after taking the shared lock. Never let display
+        // counts, a child ID alone, or an earlier receipt inspection authorize
+        // a new attempt that was not present in the confirmation dialog.
+        let batch = load_batch(&store, &reviewed.session_id)?;
+        if reviewed.plan_sha256 != batch.view.plan_sha256
+            || reviewed.receipt_fingerprint != batch.view.receipt_fingerprint
+        {
+            return Err("control plan or receipts changed since review; reload undo and confirm the current batch".into());
+        }
+        if let Some(reason) = &batch.view.blocked_reason {
+            return Err(reason.clone());
+        }
+        batch.revalidate(&store)?;
+        lock.revalidate()?;
+        let (restored, remaining, mut error) = match batch.journal.restore_plan(&batch.plan.actions)
+        {
+            Ok(result) => {
+                let restored = result
+                    .restorations
+                    .iter()
+                    .filter(|outcome| outcome.status == RestorationStatus::Restored)
+                    .count();
+                let remaining = result.remaining_attempt_ids.len();
+                let mut error = result.error;
+                if remaining > 0 && error.is_none() {
+                    let detail = result
+                        .restorations
+                        .last()
+                        .and_then(|outcome| outcome.detail.as_deref())
+                        .unwrap_or(
+                            "a control could not be restored; later attempts were not changed",
+                        );
+                    error = Some(detail.to_string());
+                }
+                if !result.inspection.unsupported_attempt_ids.is_empty() {
+                    append_error(
+                        &mut error,
+                        "unsupported receipts could not be restored".into(),
+                    );
+                }
+                (restored, remaining, error)
+            }
+            Err(error) => (
+                0,
+                batch.view.pending,
+                Some(format!(
+                    "restoration did not complete; inspect the retained receipts: {error}"
+                )),
+            ),
+        };
+        if let Err(detail) = lock
+            .revalidate()
+            .and_then(|_| before_lock.revalidate())
+            .and_then(|_| batch.revalidate(&store))
+        {
+            append_error(&mut error, detail);
+        }
+        // Refresh directly while retaining the lock; calling the public
+        // restoration callback or acquiring another lock here would deadlock.
+        let overview = match inventory(&store, None) {
+            Ok(overview) => overview,
+            Err(detail) => {
+                append_error(
+                    &mut error,
+                    format!("cannot refresh undo inventory: {detail}"),
+                );
+                UndoOverview {
+                    notes: vec!["Restoration was attempted, but the current saved controls could not be reloaded. Reload undo before any further restoration.".into()],
+                    ..UndoOverview::default()
+                }
+            }
+        };
+        let summary = format!(
+            "Restored {restored} control(s); {remaining} pending in the selected batch{}",
+            if error.is_some() {
+                "; inspection is required"
+            } else {
+                ""
+            },
+        );
+        Ok(UndoRestoreOutcome {
+            overview,
+            session_id: reviewed.session_id,
+            restored,
+            remaining,
+            summary,
+            error,
+        })
+    }
 }
 
 #[cfg(feature = "ui")]
@@ -26038,13 +26758,23 @@ mod process_tree_safety_tests {
     #[cfg(all(feature = "ui", target_os = "linux"))]
     #[test]
     fn tui_control_batches_keep_durable_undo_after_later_selections() {
-        use pt_core::action::{RestorationStatus, ReversalJournal};
+        use pt_core::action::{ActionRunner, ReversalJournal, SignalActionRunner};
         use pt_core::collect::{quick_scan, QuickScanOptions};
-        use pt_core::session::{SessionState, SessionStore};
+        use pt_core::decision::Action;
+        use pt_core::session::{SessionContext, SessionState, SessionStore};
         use sha2::{Digest, Sha256};
+        use std::sync::Arc;
         use tui_live_fixtures::{case, pause_selection, policy, record, DetachedTarget};
 
         let (parent, log_dir) = case("interactive-durable-controls");
+        parent
+            .write_context(&SessionContext::new(
+                &parent.id,
+                pt_core::logging::get_host_id(),
+                pt_core::logging::generate_run_id(),
+                None,
+            ))
+            .unwrap();
         let policy = policy(2);
         let first = DetachedTarget::spawn();
         let second = DetachedTarget::spawn();
@@ -26130,39 +26860,189 @@ mod process_tree_safety_tests {
             .processes
             .iter()
             .all(|process| process.state == ProcessState::Stopped));
-        for (child, original_content, child_plan) in &batches {
+        let original_history = std::fs::read(parent.dir.join("action/outcomes.jsonl")).unwrap();
+        let original_parent_plan = std::fs::read(parent.dir.join("decision/plan.json")).unwrap();
+        for (child, original_content, _) in &batches {
             assert_eq!(
                 std::fs::read_to_string(child.dir.join("decision/plan.json")).unwrap(),
                 *original_content,
                 "later selections must not change a previous undo binding",
             );
             assert!(super::update_canonical_session_plan(child, |_| Ok("{}".into())).is_err());
+        }
+        let overview = super::inspect_tui_undo(&parent, None).unwrap();
+        assert_eq!(overview.batches.len(), 2);
+        assert!(
+            overview.batches.iter().all(|batch| {
+                batch.pending == 1
+                    && batch.settled == 0
+                    && batch.unrecorded == 0
+                    && batch.blocked_reason.is_none()
+            }),
+            "{overview:?}"
+        );
+        let select = |overview: &pt_core::tui::UndoOverview, index: usize| {
+            overview
+                .batches
+                .iter()
+                .find(|batch| batch.session_id == batches[index].0.id.0)
+                .unwrap()
+                .clone()
+        };
+        let reviewed_second = select(&overview, 1);
+        let second_journal = Arc::new(
+            ReversalJournal::new(
+                batches[1].0.dir.join("action"),
+                batches[1].0.id.0.as_str(),
+                reviewed_second.plan_sha256.as_str(),
+                store.sessions_root(),
+            )
+            .unwrap(),
+        );
+        let original_receipts =
+            serde_json::to_value(second_journal.inspect_plan(&batches[1].2.actions).unwrap())
+                .unwrap();
+        for mode in ["Dry-run mode", "Shadow mode"] {
+            assert!(
+                super::restore_tui_undo(&parent, reviewed_second.clone(), Some(mode.into()))
+                    .is_err()
+            );
+        }
+        {
             let _lock = super::GlobalLock::try_acquire(&data_dir.join(".execution-policy-lock"))
                 .unwrap()
                 .unwrap();
-            // Reopen from persisted bytes, as a later undo command does. No
-            // in-memory runner state from the original selection is retained.
-            let journal = ReversalJournal::new(
-                child.dir.join("action"),
-                child.id.0.as_str(),
-                format!("{:x}", Sha256::digest(original_content.as_bytes())),
-                store.sessions_root(),
-            )
-            .unwrap();
-            let restored = journal.restore(&child_plan.actions[0], None).unwrap();
-            record(
-                &log_dir,
-                serde_json::json!({"step": "undo", "session": child.id.0, "restoration": restored}),
-            );
-            assert_eq!(restored.status, RestorationStatus::Restored);
-            assert_eq!(restored.changed, Some(true));
+            assert!(super::restore_tui_undo(&parent, reviewed_second.clone(), None).is_err());
         }
+        let mut stale = reviewed_second.clone();
+        stale.receipt_fingerprint = "0".repeat(64);
+        assert!(super::restore_tui_undo(&parent, stale, None).is_err());
+        assert_eq!(
+            serde_json::to_value(second_journal.inspect_plan(&batches[1].2.actions).unwrap())
+                .unwrap(),
+            original_receipts
+        );
+        assert!(observe()
+            .processes
+            .iter()
+            .all(|process| process.state == ProcessState::Stopped));
+
+        let restored_second = super::restore_tui_undo(&parent, reviewed_second.clone(), None)
+            .expect("restore the exact reviewed second batch through the TUI backend");
+        record(
+            &log_dir,
+            serde_json::json!({
+                "step": "tui_undo_second", "restored": restored_second.restored,
+                "remaining": restored_second.remaining, "error": restored_second.error,
+            }),
+        );
+        assert_eq!(restored_second.restored, 1);
+        assert_eq!(restored_second.remaining, 0);
+        assert!(restored_second.error.is_none(), "{restored_second:?}");
+        assert_eq!(select(&restored_second.overview, 1).settled, 1);
+        assert_eq!(select(&restored_second.overview, 0).pending, 1);
+        let after_second = observe();
+        assert_eq!(
+            after_second
+                .processes
+                .iter()
+                .find(|p| p.pid.0 == first.pid)
+                .unwrap()
+                .state,
+            ProcessState::Stopped
+        );
+        assert!(after_second
+            .processes
+            .iter()
+            .find(|p| p.pid.0 == second.pid)
+            .unwrap()
+            .state
+            .is_active());
+
+        // A new real receipt under the same immutable plan must not expand a
+        // confirmation made for an older receipt set. The runner targets only
+        // this test's owned detached process and retains all identity checks.
+        let reviewed_settled = select(&restored_second.overview, 1);
+        let pause_runner =
+            SignalActionRunner::with_defaults().with_reversal_journal(Arc::clone(&second_journal));
+        {
+            let _lock = super::GlobalLock::try_acquire(&data_dir.join(".execution-policy-lock"))
+                .unwrap()
+                .unwrap();
+            pause_runner.execute(&batches[1].2.actions[0]).unwrap();
+            pause_runner.verify(&batches[1].2.actions[0]).unwrap();
+        }
+        let new_receipts =
+            serde_json::to_value(second_journal.inspect_plan(&batches[1].2.actions).unwrap())
+                .unwrap();
+        assert!(super::restore_tui_undo(&parent, reviewed_second, None).is_err());
+        assert!(super::restore_tui_undo(&parent, reviewed_settled, None).is_err());
+        assert_eq!(
+            serde_json::to_value(second_journal.inspect_plan(&batches[1].2.actions).unwrap())
+                .unwrap(),
+            new_receipts
+        );
+        assert!(observe()
+            .processes
+            .iter()
+            .all(|process| process.state == ProcessState::Stopped));
+        let fresh = super::inspect_tui_undo(&parent, None).unwrap();
+        assert_eq!(select(&fresh, 1).pending, 1);
+        assert_eq!(select(&fresh, 1).settled, 1);
+        let restored_again = super::restore_tui_undo(&parent, select(&fresh, 1), None).unwrap();
+        assert_eq!(restored_again.restored, 1);
+        assert!(restored_again.error.is_none(), "{restored_again:?}");
+
+        // Settled receipts cannot release a later independent job-control stop.
+        let external_stop = SignalActionRunner::with_defaults();
+        external_stop.execute(&batches[1].2.actions[0]).unwrap();
+        external_stop.verify(&batches[1].2.actions[0]).unwrap();
+        let settled = select(&restored_again.overview, 1);
+        assert!(super::restore_tui_undo(&parent, settled, None).is_err());
+        assert_eq!(
+            observe()
+                .processes
+                .iter()
+                .find(|p| p.pid.0 == second.pid)
+                .unwrap()
+                .state,
+            ProcessState::Stopped
+        );
+        let mut resume = batches[1].2.actions[0].clone();
+        resume.action = Action::Resume;
+        external_stop.execute(&resume).unwrap();
+        external_stop.verify(&resume).unwrap();
+
+        let restored_first =
+            super::restore_tui_undo(&parent, select(&restored_again.overview, 0), None).unwrap();
+        assert_eq!(restored_first.restored, 1);
+        assert_eq!(restored_first.remaining, 0);
+        assert!(restored_first.error.is_none(), "{restored_first:?}");
+        assert!(restored_first
+            .overview
+            .batches
+            .iter()
+            .all(|batch| batch.pending == 0));
         let restored = observe();
         assert_eq!(restored.processes.len(), 2);
         assert!(restored
             .processes
             .iter()
             .all(|process| process.state.is_active()));
+        for (child, original_content, _) in &batches {
+            assert_eq!(
+                std::fs::read_to_string(child.dir.join("decision/plan.json")).unwrap(),
+                *original_content
+            );
+        }
+        assert_eq!(
+            std::fs::read(parent.dir.join("decision/plan.json")).unwrap(),
+            original_parent_plan
+        );
+        assert_eq!(
+            std::fs::read(parent.dir.join("action/outcomes.jsonl")).unwrap(),
+            original_history
+        );
         let history = std::fs::read_to_string(parent.dir.join("action/outcomes.jsonl")).unwrap();
         assert_eq!(history.lines().count(), 2);
         assert!(history.lines().all(|line| {
@@ -26251,6 +27131,261 @@ mod process_tree_safety_tests {
                 control.handle.read_manifest().unwrap().state,
                 SessionState::Executing
             );
+        }
+    }
+
+    #[cfg(all(feature = "ui", target_os = "linux"))]
+    fn tui_undo_discovery_fixture(
+        label: &str,
+    ) -> (
+        std::path::PathBuf,
+        pt_core::session::SessionHandle,
+        super::TuiControlSession,
+    ) {
+        let (directory, parent, mut selection, _, _) = tui_respawn_fixture(label);
+        let context = pt_core::session::SessionContext::new(
+            &parent.id,
+            pt_core::logging::get_host_id(),
+            pt_core::logging::generate_run_id(),
+            None,
+        );
+        parent.write_context(&context).unwrap();
+        selection.actions[0].action = pt_core::decision::Action::Pause;
+        // The original fixture already saved its Kill ID. A new action must
+        // never reuse that canonical ID with a different operation.
+        selection.actions[0].action_id = format!("tui-undo-{label}");
+        super::write_plan_to_session(&parent, &selection).unwrap();
+        let control = super::prepare_tui_control_session(
+            &parent,
+            &pt_core::config::Policy::default(),
+            &selection,
+        )
+        .unwrap()
+        .unwrap();
+        (directory, parent, control)
+    }
+
+    #[cfg(all(feature = "ui", target_os = "linux"))]
+    #[test]
+    fn tui_undo_discovery_preserves_unexecuted_and_incomplete_children() {
+        use pt_core::session::SessionState;
+
+        let (_, parent, control) = tui_undo_discovery_fixture("undo-discovery-states");
+        let original_plan = std::fs::read(control.handle.dir.join("decision/plan.json")).unwrap();
+        for state in [
+            SessionState::Planned,
+            SessionState::Executing,
+            SessionState::Failed,
+            SessionState::Completed,
+        ] {
+            control.handle.update_state(state).unwrap();
+            let overview = super::inspect_tui_undo(&parent, None).unwrap();
+            assert_eq!(overview.batches.len(), 1, "{state:?}: {overview:?}");
+            let batch = &overview.batches[0];
+            assert_eq!(batch.session_id, control.handle.id.0);
+            assert_eq!(batch.plan_sha256, control.plan_sha256);
+            assert_eq!(batch.receipt_fingerprint.len(), 64);
+            assert_eq!(batch.pending, 0);
+            assert_eq!(batch.settled, 0);
+            assert_eq!(batch.unsupported, 0);
+            assert_eq!(batch.unrecorded, 1);
+            assert_eq!(
+                std::fs::read(control.handle.dir.join("decision/plan.json")).unwrap(),
+                original_plan,
+            );
+            assert!(!control.handle.dir.join("action/reversals").exists());
+        }
+        let reason = "This interactive session is read-only".to_string();
+        let overview = super::inspect_tui_undo(&parent, Some(reason.clone())).unwrap();
+        assert_eq!(overview.read_only_reason, Some(reason.clone()));
+        assert!(
+            super::restore_tui_undo(&parent, overview.batches[0].clone(), Some(reason)).is_err()
+        );
+        assert!(!control.handle.dir.join("action/reversals").exists());
+        assert!(!control.handle.dir.join("action/outcomes.jsonl").exists());
+    }
+
+    #[cfg(all(feature = "ui", target_os = "linux"))]
+    #[test]
+    fn tui_undo_discovery_refuses_forged_links_changed_children_and_unsafe_paths() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        for case in [
+            "reference_session",
+            "reference_parent",
+            "reference_hash",
+            "reference_actions",
+            "reference_duplicate_actions",
+            "reference_shape",
+            "reference_size",
+            "child_bytes",
+            "child_plan_session",
+            "child_plan_parent",
+            "child_plan_host",
+            "child_plan_missing_host",
+            "child_plan_unknown_host",
+            "child_manifest_identity",
+            "child_manifest_parent",
+            "child_context_identity",
+            "child_context_host",
+            "reference_symlink",
+            "child_plan_symlink",
+            "child_directory_symlink",
+            "child_plan_writable",
+        ] {
+            let (directory, parent, control) = tui_undo_discovery_fixture(case);
+            let overview = super::inspect_tui_undo(&parent, None).unwrap();
+            assert_eq!(overview.batches.len(), 1, "{case}: {overview:?}");
+            let reviewed = overview.batches[0].clone();
+            assert_eq!(reviewed.plan_sha256, control.plan_sha256);
+            assert_eq!(reviewed.receipt_fingerprint.len(), 64);
+            assert_eq!(reviewed.unrecorded, 1);
+            let reference_path = parent
+                .dir
+                .join("action/control_sessions")
+                .join(format!("{}.json", control.handle.id.0));
+            let plan_path = control.handle.dir.join("decision/plan.json");
+            let mut reference: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&reference_path).unwrap()).unwrap();
+            let parent_manifest = std::fs::read(parent.manifest_path()).unwrap();
+
+            match case {
+                "reference_session"
+                | "reference_parent"
+                | "reference_hash"
+                | "reference_actions"
+                | "reference_duplicate_actions"
+                | "reference_shape"
+                | "reference_size" => {
+                    match case {
+                        "reference_session" => {
+                            reference["session_id"] = serde_json::json!(parent.id.0)
+                        }
+                        "reference_parent" => {
+                            reference["parent_session_id"] = serde_json::json!(control.handle.id.0)
+                        }
+                        "reference_hash" => {
+                            reference["plan_sha256"] = serde_json::json!("0".repeat(64))
+                        }
+                        "reference_actions" => {
+                            reference["action_ids"] = serde_json::json!(["foreign-action"])
+                        }
+                        "reference_duplicate_actions" => {
+                            reference["action_ids"] = serde_json::json!([
+                                control.plan.actions[0].action_id,
+                                control.plan.actions[0].action_id,
+                            ])
+                        }
+                        "reference_shape" => reference["action_ids"] = serde_json::json!(42),
+                        "reference_size" => {
+                            reference["undo_preview"] = serde_json::json!("x".repeat(65 * 1024))
+                        }
+                        _ => unreachable!(),
+                    }
+                    pt_core::session::write_json_pretty(&reference_path, &reference).unwrap();
+                }
+                "child_bytes" => {
+                    let content = std::fs::read_to_string(&plan_path).unwrap();
+                    std::fs::write(&plan_path, format!("{content}\n")).unwrap();
+                }
+                "child_plan_session"
+                | "child_plan_parent"
+                | "child_plan_host"
+                | "child_plan_missing_host"
+                | "child_plan_unknown_host" => {
+                    let mut document: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(&plan_path).unwrap()).unwrap();
+                    match case {
+                        "child_plan_session" => {
+                            document["session_id"] = serde_json::json!(parent.id.0)
+                        }
+                        "child_plan_parent" => {
+                            document["parent_session_id"] = serde_json::json!(control.handle.id.0)
+                        }
+                        "child_plan_host" => {
+                            document["host_id"] = serde_json::json!(format!(
+                                "foreign-{}",
+                                pt_core::logging::get_host_id()
+                            ))
+                        }
+                        "child_plan_missing_host" => {
+                            document.as_object_mut().unwrap().remove("host_id");
+                        }
+                        "child_plan_unknown_host" => {
+                            document["host_id"] = serde_json::json!("unknown")
+                        }
+                        _ => unreachable!(),
+                    }
+                    let content = serde_json::to_vec_pretty(&document).unwrap();
+                    // Keep the reference hash coherent: semantic ownership and
+                    // host checks must reject these after the byte check passes.
+                    reference["plan_sha256"] =
+                        serde_json::json!(format!("{:x}", Sha256::digest(&content)));
+                    pt_core::session::write_serialized_json(&plan_path, &content).unwrap();
+                    pt_core::session::write_json_pretty(&reference_path, &reference).unwrap();
+                }
+                "child_manifest_identity" | "child_manifest_parent" => {
+                    let mut manifest = control.handle.read_manifest().unwrap();
+                    if case == "child_manifest_identity" {
+                        manifest.session_id = parent.id.0.clone();
+                    } else {
+                        manifest.parent_session_id = None;
+                    }
+                    control.handle.write_manifest(&manifest).unwrap();
+                }
+                "child_context_identity" | "child_context_host" => {
+                    let mut context = control.handle.read_context().unwrap();
+                    if case == "child_context_identity" {
+                        context.session_id = parent.id.0.clone();
+                    } else {
+                        context.host_id = format!("foreign-{}", context.host_id);
+                    }
+                    control.handle.write_context(&context).unwrap();
+                }
+                "reference_symlink" | "child_plan_symlink" | "child_directory_symlink" => {
+                    let path = match case {
+                        "reference_symlink" => &reference_path,
+                        "child_plan_symlink" => &plan_path,
+                        "child_directory_symlink" => &control.handle.dir,
+                        _ => unreachable!(),
+                    };
+                    let retained = directory.join(format!("retained-{case}"));
+                    std::fs::rename(path, &retained).unwrap();
+                    symlink(&retained, path).unwrap();
+                }
+                "child_plan_writable" => {
+                    std::fs::set_permissions(&plan_path, std::fs::Permissions::from_mode(0o666))
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            let unavailable = super::inspect_tui_undo(&parent, None).unwrap_or_else(|error| {
+                panic!("{case}: broken child must remain visible: {error}")
+            });
+            assert_eq!(unavailable.batches.len(), 1, "{case}: {unavailable:?}");
+            let batch = &unavailable.batches[0];
+            assert_eq!(batch.session_id, control.handle.id.0, "{case}");
+            assert!(batch.blocked_reason.is_some(), "{case}: {batch:?}");
+            assert!(
+                super::restore_tui_undo(&parent, reviewed, None).is_err(),
+                "{case}: a prior review cannot authorize a changed child",
+            );
+            assert_eq!(
+                std::fs::read(parent.manifest_path()).unwrap(),
+                parent_manifest,
+                "{case}"
+            );
+            assert!(
+                !control.handle.dir.join("action/reversals").exists(),
+                "{case}"
+            );
+            assert!(
+                !control.handle.dir.join("action/outcomes.jsonl").exists(),
+                "{case}"
+            );
+            assert!(!parent.dir.join("action/outcomes.jsonl").exists(), "{case}");
         }
     }
 

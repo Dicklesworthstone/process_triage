@@ -24,8 +24,10 @@ use std::time::{Duration, Instant};
 
 use ftui::layout::Rect;
 use ftui::runtime::{Every, Subscription};
+use ftui::text::{Line as FtuiLine, Span as FtuiSpan, Text as FtuiText, WrapMode};
 use ftui::widgets::command_palette::{ActionItem, CommandPalette, PaletteAction};
 use ftui::widgets::notification_queue::{NotificationQueue, NotificationStack, QueueConfig};
+use ftui::widgets::paragraph::Paragraph as FtuiParagraph;
 use ftui::widgets::toast::{Toast, ToastIcon, ToastPosition, ToastStyle};
 use ftui::widgets::Widget;
 use ftui::{
@@ -36,7 +38,9 @@ use ftui::{
 
 use super::events::KeyBindings;
 use super::layout::{Breakpoint, LayoutState, ResponsiveLayout};
-use super::msg::{ExecutionOutcome, Msg, RefreshOutcome};
+use super::msg::{
+    ExecutionOutcome, Msg, RefreshOutcome, UndoBatch, UndoOverview, UndoRestoreOutcome,
+};
 use super::theme::Theme;
 use super::widgets::{
     AuxPanel, ConfirmChoice, ConfirmDialog, ConfirmDialogState, DetailView, HelpOverlay,
@@ -69,6 +73,10 @@ pub enum AppState {
     Confirming,
     /// Help overlay is visible.
     Help,
+    /// Durable control batches are visible for inspection and restoration.
+    Undo,
+    /// A specific immutable control batch is awaiting explicit confirmation.
+    ConfirmingUndo,
     /// Application is quitting.
     Quitting,
 }
@@ -76,6 +84,8 @@ pub enum AppState {
 type RefreshOp = Arc<dyn Fn() -> Result<RefreshOutcome, String> + Send + Sync>;
 type ExecuteOp =
     Arc<dyn Fn(Vec<u32>, Vec<u32>, Vec<u32>) -> Result<ExecutionOutcome, String> + Send + Sync>;
+type UndoInspectOp = Arc<dyn Fn() -> Result<UndoOverview, String> + Send + Sync>;
+type UndoRestoreOp = Arc<dyn Fn(UndoBatch) -> Result<UndoRestoreOutcome, String> + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum PendingOperation {
@@ -83,6 +93,8 @@ enum PendingOperation {
     Idle,
     Refreshing(u64),
     Executing(u64),
+    LoadingUndo(u64),
+    RestoringUndo(u64),
 }
 
 struct SelectionSnapshot {
@@ -94,6 +106,11 @@ struct SelectionSnapshot {
 struct ConfirmedSelection {
     ticket: u64,
     selection: SelectionSnapshot,
+}
+
+struct ConfirmedUndo {
+    ticket: u64,
+    batch: UndoBatch,
 }
 
 /// Main TUI application.
@@ -135,6 +152,15 @@ pub struct App {
     /// Takes selected PIDs, explicit positive selections, and explicit spares.
     /// An empty action selection with spares saves feedback without acting.
     execute_op: Option<ExecuteOp>,
+    undo_inspect_op: Option<UndoInspectOp>,
+    undo_restore_op: Option<UndoRestoreOp>,
+    undo_overview: Option<UndoOverview>,
+    undo_cursor: usize,
+    undo_detail_offset: usize,
+    undo_error: Option<String>,
+    undo_result: Option<UndoRestoreOutcome>,
+    undo_confirmation: Option<UndoBatch>,
+    confirmed_undo: Option<ConfirmedUndo>,
     /// Toast notification queue for async operation feedback.
     notifications: NotificationQueue,
     /// Command palette for fuzzy action discovery and execution.
@@ -190,6 +216,15 @@ impl App {
             goal_summary: None,
             refresh_op: None,
             execute_op: None,
+            undo_inspect_op: None,
+            undo_restore_op: None,
+            undo_overview: None,
+            undo_cursor: 0,
+            undo_detail_offset: 0,
+            undo_error: None,
+            undo_result: None,
+            undo_confirmation: None,
+            confirmed_undo: None,
             notifications: NotificationQueue::new(QueueConfig {
                 max_visible: 3,
                 max_queued: 10,
@@ -215,6 +250,10 @@ impl App {
             ActionItem::new("action.refresh", "Refresh processes  [r]")
                 .with_description("Rescan processes and refresh recommendations")
                 .with_tags(&["refresh", "rescan"])
+                .with_category("Actions"),
+            ActionItem::new("action.undo", "Undo recorded controls  [U]")
+                .with_description("Inspect saved control batches and confirm restoration")
+                .with_tags(&["undo", "restore", "resume", "thaw", "controls"])
                 .with_category("Actions"),
             ActionItem::new("navigation.first", "Go to first process  [Home]")
                 .with_description("Move cursor to the first process row")
@@ -374,6 +413,237 @@ impl App {
         self.execute_op = Some(op);
     }
 
+    /// Install persisted inspection and guarded restoration callbacks. These run
+    /// only as asynchronous operations, never from a render or a direct key.
+    pub fn set_undo_ops(&mut self, inspect: UndoInspectOp, restore: UndoRestoreOp) {
+        self.undo_inspect_op = Some(inspect);
+        self.undo_restore_op = Some(restore);
+        self.invalidate_undo_confirmation();
+        self.undo_overview = None;
+    }
+
+    /// Last completed persisted overview, absent until inspection succeeds.
+    pub fn undo_overview(&self) -> Option<&UndoOverview> {
+        self.undo_overview.as_ref()
+    }
+
+    /// Batch currently highlighted in the undo panel. Selection alone never
+    /// authorizes restoration.
+    pub fn selected_undo_batch(&self) -> Option<&UndoBatch> {
+        self.undo_overview
+            .as_ref()
+            .and_then(|overview| overview.batches.get(self.undo_cursor))
+    }
+
+    fn invalidate_undo_confirmation(&mut self) {
+        self.undo_confirmation = None;
+        self.confirmed_undo = None;
+        if self.state == AppState::ConfirmingUndo {
+            self.confirm_dialog.cancel();
+            self.state = AppState::Undo;
+        }
+    }
+
+    fn replace_undo_overview(&mut self, overview: UndoOverview, selected: Option<&str>) {
+        let previous = selected.map(str::to_owned).or_else(|| {
+            self.selected_undo_batch()
+                .map(|batch| batch.session_id.clone())
+        });
+        self.invalidate_undo_confirmation();
+        self.undo_cursor = previous
+            .as_ref()
+            .and_then(|session| {
+                overview
+                    .batches
+                    .iter()
+                    .position(|batch| &batch.session_id == session)
+            })
+            .unwrap_or(0);
+        self.undo_overview = Some(overview);
+        self.undo_detail_offset = 0;
+        self.undo_error = None;
+        self.needs_redraw = true;
+    }
+
+    fn undo_block_reason(&self, batch: &UndoBatch) -> Option<String> {
+        if self.undo_error.is_some() {
+            return Some("Reload saved controls before confirming restoration".to_string());
+        }
+        if let Some(reason) = self
+            .undo_overview
+            .as_ref()
+            .and_then(|overview| overview.read_only_reason.as_ref())
+        {
+            return Some(reason.clone());
+        }
+        if let Some(reason) = &batch.blocked_reason {
+            return Some(reason.clone());
+        }
+        if batch.pending == 0 {
+            return Some("No pending restorations in this batch".to_string());
+        }
+        if batch.session_id.is_empty()
+            || batch.plan_sha256.is_empty()
+            || batch.receipt_fingerprint.is_empty()
+        {
+            return Some("Saved control binding is unavailable; reload the panel".to_string());
+        }
+        None
+    }
+
+    fn move_undo_cursor(&mut self, target: usize) {
+        if self.state != AppState::Undo || !self.operation_is_idle() {
+            return;
+        }
+        self.invalidate_undo_confirmation();
+        let count = self
+            .undo_overview
+            .as_ref()
+            .map_or(0, |overview| overview.batches.len());
+        self.undo_cursor = target.min(count.saturating_sub(1));
+        self.undo_detail_offset = 0;
+        self.needs_redraw = true;
+    }
+
+    fn scroll_undo_details(&mut self, forward: bool) {
+        if self.state != AppState::Undo || !self.operation_is_idle() {
+            return;
+        }
+        let width = self.layout_state.size().0.saturating_sub(2);
+        let last = self.undo_detail_lines(width).len().saturating_sub(1);
+        self.undo_detail_offset = if forward {
+            self.undo_detail_offset.saturating_add(4).min(last)
+        } else {
+            self.undo_detail_offset.saturating_sub(4)
+        };
+        self.needs_redraw = true;
+    }
+
+    fn request_undo_refresh(&mut self) -> FtuiCmd<Msg> {
+        if !self.operation_is_idle() {
+            return FtuiCmd::none();
+        }
+        self.invalidate_selection();
+        self.state = AppState::Undo;
+        self.undo_result = None;
+        let Some(inspect) = self.undo_inspect_op.clone() else {
+            self.undo_error =
+                Some("Saved control inspection is unavailable in this build".to_string());
+            self.set_status("Undo is unavailable: no inspection backend");
+            return FtuiCmd::none();
+        };
+        let Some(ticket) = self.issue_operation_ticket() else {
+            return FtuiCmd::none();
+        };
+        self.operation = PendingOperation::LoadingUndo(ticket);
+        self.set_status("Loading recorded control batches...");
+        FtuiCmd::sequence(vec![
+            FtuiCmd::log("undo: inspecting saved control batches"),
+            FtuiCmd::task_named("inspect-controls", move || Msg::UndoLoaded {
+                ticket,
+                result: inspect(),
+            }),
+        ])
+    }
+
+    fn show_undo_confirmation(&mut self) {
+        if self.state != AppState::Undo || !self.operation_is_idle() {
+            return;
+        }
+        self.invalidate_undo_confirmation();
+        let Some(batch) = self.selected_undo_batch().cloned() else {
+            self.set_status("No saved control batch selected");
+            return;
+        };
+        if let Some(reason) = self.undo_block_reason(&batch) {
+            self.set_status(format!("Restoration unavailable: {reason}"));
+            return;
+        }
+        if self.undo_restore_op.is_none() {
+            self.set_status("Restoration unavailable: no execution backend");
+            return;
+        }
+        self.set_status(format!(
+            "Confirm restoration of {} pending control(s) in {}?",
+            batch.pending, batch.session_id
+        ));
+        self.undo_confirmation = Some(batch);
+        self.confirm_dialog.show();
+        self.state = AppState::ConfirmingUndo;
+    }
+
+    fn handle_undo_confirmation(&mut self, choice: ConfirmChoice) -> FtuiCmd<Msg> {
+        if !self.operation_is_idle() {
+            return FtuiCmd::none();
+        }
+        if self.state != AppState::ConfirmingUndo {
+            self.invalidate_undo_confirmation();
+            self.set_status("Undo confirmation expired; review the batch again");
+            return FtuiCmd::none();
+        }
+        let batch = self.undo_confirmation.take();
+        self.confirm_dialog.hide();
+        self.state = AppState::Undo;
+        self.confirmed_undo = None;
+        if choice == ConfirmChoice::No {
+            self.set_status("Restoration cancelled; controls unchanged");
+            return FtuiCmd::none();
+        }
+        let Some(batch) = batch.filter(|batch| self.selected_undo_batch() == Some(batch)) else {
+            self.set_status("Undo selection changed; reload and confirm the batch again");
+            return FtuiCmd::none();
+        };
+        if let Some(reason) = self.undo_block_reason(&batch) {
+            self.set_status(format!("Restoration unavailable: {reason}"));
+            return FtuiCmd::none();
+        }
+        let Some(ticket) = self.issue_operation_ticket() else {
+            return FtuiCmd::none();
+        };
+        self.set_status(format!("Preparing restoration for {}...", batch.session_id));
+        self.confirmed_undo = Some(ConfirmedUndo { ticket, batch });
+        FtuiCmd::msg(Msg::RequestUndo { ticket })
+    }
+
+    fn request_undo(&mut self, ticket: u64) -> FtuiCmd<Msg> {
+        if !self.operation_is_idle() {
+            return FtuiCmd::none();
+        }
+        if self.state != AppState::Undo
+            || !self.confirmed_undo.as_ref().is_some_and(|confirmed| {
+                confirmed.ticket == ticket
+                    && self.selected_undo_batch() == Some(&confirmed.batch)
+                    && self.undo_block_reason(&confirmed.batch).is_none()
+            })
+        {
+            self.set_status("Stale restoration request rejected; review and confirm the batch");
+            return FtuiCmd::none();
+        }
+        let Some(confirmed) = self.confirmed_undo.take() else {
+            return FtuiCmd::none();
+        };
+        let Some(restore) = self.undo_restore_op.clone() else {
+            self.set_status("Restoration unavailable: no execution backend");
+            return FtuiCmd::none();
+        };
+        self.operation = PendingOperation::RestoringUndo(ticket);
+        self.undo_result = None;
+        self.set_status(format!(
+            "Restoring recorded controls in {}...",
+            confirmed.batch.session_id
+        ));
+        FtuiCmd::sequence(vec![
+            FtuiCmd::log(format!(
+                "undo: restoring child batch {}",
+                confirmed.batch.session_id
+            )),
+            FtuiCmd::task_named("restore-controls", move || Msg::UndoComplete {
+                ticket,
+                result: restore(confirmed.batch),
+            }),
+        ])
+    }
+
     /// Set a status message.
     pub fn set_status(&mut self, message: impl Into<String>) {
         self.status_message = Some(message.into());
@@ -422,6 +692,14 @@ impl App {
                 self.set_status("Execution in progress; wait before refreshing or executing");
                 false
             }
+            PendingOperation::LoadingUndo(_) => {
+                self.set_status("Loading saved controls; wait before another operation");
+                false
+            }
+            PendingOperation::RestoringUndo(_) => {
+                self.set_status("Restoration in progress; wait before another operation");
+                false
+            }
         }
     }
 
@@ -429,8 +707,12 @@ impl App {
         if !self.operation_is_idle() {
             return false;
         }
-        if self.state == AppState::Confirming {
+        if matches!(self.state, AppState::Confirming | AppState::ConfirmingUndo) {
             self.set_status("Finish or cancel the current confirmation before changing selection");
+            return false;
+        }
+        if self.state == AppState::Undo {
+            self.set_status("Close the undo panel before selecting process actions");
             return false;
         }
         true
@@ -450,6 +732,7 @@ impl App {
     }
 
     fn invalidate_selection(&mut self) {
+        self.invalidate_undo_confirmation();
         self.confirmation_selection = None;
         self.confirmed_selection = None;
         self.confirm_dialog.cancel();
@@ -508,6 +791,7 @@ impl App {
         match action_id {
             "action.execute" => "Execute selected",
             "action.refresh" => "Refresh processes",
+            "action.undo" => "Undo recorded controls",
             "navigation.first" => "Go to first process",
             "navigation.last" => "Go to last process",
             "navigation.page_down" => "Page down",
@@ -532,33 +816,31 @@ impl App {
     }
 
     fn execute_palette_action(&mut self, action_id: &str) -> FtuiCmd<Msg> {
+        if self.state == AppState::ConfirmingUndo {
+            self.set_status("Finish or cancel restoration confirmation first");
+            return FtuiCmd::none();
+        }
         let mut known = true;
         let cmd = match action_id {
             "action.execute" => {
-                self.show_execute_confirmation();
+                if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo) {
+                    self.show_undo_confirmation();
+                } else {
+                    self.show_execute_confirmation();
+                }
                 FtuiCmd::none()
             }
             "action.refresh" => self.handle_msg(Msg::RequestRefresh),
+            "action.undo" => self.handle_msg(Msg::OpenUndo),
 
-            "navigation.first" => {
-                self.process_table.cursor_home();
-                FtuiCmd::none()
-            }
-            "navigation.last" => {
-                self.process_table.cursor_end();
-                FtuiCmd::none()
-            }
-            "navigation.page_down" => {
-                self.process_table
-                    .page_down(self.process_table.last_visible_height);
-                FtuiCmd::none()
-            }
-            "navigation.page_up" => {
-                self.process_table
-                    .page_up(self.process_table.last_visible_height);
-                FtuiCmd::none()
-            }
+            "navigation.first" => self.handle_msg(Msg::CursorHome),
+            "navigation.last" => self.handle_msg(Msg::CursorEnd),
+            "navigation.page_down" => self.handle_msg(Msg::PageDown),
+            "navigation.page_up" => self.handle_msg(Msg::PageUp),
             "search.open" => {
+                if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo) {
+                    return FtuiCmd::none();
+                }
                 self.state = AppState::Searching;
                 self.focus = FocusTarget::Search;
                 self.update_focus();
@@ -708,7 +990,9 @@ impl App {
 
     /// Show confirmation dialog for executing actions.
     fn show_execute_confirmation(&mut self) {
-        if !self.operation_is_idle() {
+        if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo)
+            || !self.operation_is_idle()
+        {
             return;
         }
         self.confirmed_selection = None;
@@ -742,6 +1026,9 @@ impl App {
 
     /// Handle confirmation dialog result.
     fn handle_confirmation(&mut self, choice: ConfirmChoice) -> FtuiCmd<Msg> {
+        if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo) {
+            return FtuiCmd::none();
+        }
         if !self.operation_is_idle() {
             return FtuiCmd::none();
         }
@@ -789,6 +1076,19 @@ impl App {
     /// Handle a message from the ftui runtime while preserving existing state
     /// transitions from the legacy event handlers.
     fn handle_msg(&mut self, msg: Msg) -> FtuiCmd<Msg> {
+        if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo)
+            && matches!(
+                &msg,
+                Msg::SearchInput(_)
+                    | Msg::SearchBackspace
+                    | Msg::SearchCommit
+                    | Msg::SearchCancel
+                    | Msg::SearchHistoryUp
+                    | Msg::SearchHistoryDown
+            )
+        {
+            return FtuiCmd::none();
+        }
         match msg {
             Msg::KeyPressed(key) => self.handle_ftui_key_event(key),
             Msg::Resized { width, height } => {
@@ -820,6 +1120,9 @@ impl App {
                 FtuiCmd::none()
             }
             Msg::PasteReceived { text, .. } => {
+                if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo) {
+                    return FtuiCmd::none();
+                }
                 self.search.set_value(&text);
                 self.state = AppState::Searching;
                 self.focus = FocusTarget::Search;
@@ -833,29 +1136,53 @@ impl App {
             Msg::Noop => FtuiCmd::none(),
 
             Msg::CursorUp => {
-                self.process_table.cursor_up();
+                if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo) {
+                    self.move_undo_cursor(self.undo_cursor.saturating_sub(1));
+                } else {
+                    self.process_table.cursor_up();
+                }
                 FtuiCmd::none()
             }
             Msg::CursorDown => {
-                self.process_table.cursor_down();
+                if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo) {
+                    self.move_undo_cursor(self.undo_cursor.saturating_add(1));
+                } else {
+                    self.process_table.cursor_down();
+                }
                 FtuiCmd::none()
             }
             Msg::CursorHome => {
-                self.process_table.cursor_home();
+                if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo) {
+                    self.move_undo_cursor(0);
+                } else {
+                    self.process_table.cursor_home();
+                }
                 FtuiCmd::none()
             }
             Msg::CursorEnd => {
-                self.process_table.cursor_end();
+                if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo) {
+                    self.move_undo_cursor(usize::MAX);
+                } else {
+                    self.process_table.cursor_end();
+                }
                 FtuiCmd::none()
             }
             Msg::PageUp | Msg::HalfPageUp => {
-                self.process_table
-                    .page_up(self.process_table.last_visible_height);
+                if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo) {
+                    self.move_undo_cursor(self.undo_cursor.saturating_sub(5));
+                } else {
+                    self.process_table
+                        .page_up(self.process_table.last_visible_height);
+                }
                 FtuiCmd::none()
             }
             Msg::PageDown | Msg::HalfPageDown => {
-                self.process_table
-                    .page_down(self.process_table.last_visible_height);
+                if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo) {
+                    self.move_undo_cursor(self.undo_cursor.saturating_add(5));
+                } else {
+                    self.process_table
+                        .page_down(self.process_table.last_visible_height);
+                }
                 FtuiCmd::none()
             }
 
@@ -896,6 +1223,9 @@ impl App {
             }
 
             Msg::EnterSearchMode => {
+                if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo) {
+                    return FtuiCmd::none();
+                }
                 self.state = AppState::Searching;
                 self.focus = FocusTarget::Search;
                 self.update_focus();
@@ -953,6 +1283,9 @@ impl App {
                 FtuiCmd::none()
             }
             Msg::ToggleHelp => {
+                if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo) {
+                    return FtuiCmd::none();
+                }
                 self.state = if self.state == AppState::Help {
                     AppState::Normal
                 } else {
@@ -960,6 +1293,25 @@ impl App {
                 };
                 FtuiCmd::none()
             }
+
+            Msg::OpenUndo | Msg::RequestUndoRefresh => self.request_undo_refresh(),
+            Msg::CloseUndo => {
+                if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo)
+                    && self.operation_is_idle()
+                {
+                    self.invalidate_undo_confirmation();
+                    self.state = AppState::Normal;
+                    self.set_status("Undo panel closed");
+                }
+                FtuiCmd::none()
+            }
+            Msg::ShowUndoConfirmation => {
+                self.show_undo_confirmation();
+                FtuiCmd::none()
+            }
+            Msg::ConfirmUndo => self.handle_undo_confirmation(ConfirmChoice::Yes),
+            Msg::CancelUndo => self.handle_undo_confirmation(ConfirmChoice::No),
+            Msg::RequestUndo { ticket } => self.request_undo(ticket),
 
             Msg::RequestExecute { ticket } => {
                 if !self.operation_is_idle() {
@@ -1032,6 +1384,9 @@ impl App {
             Msg::ConfirmExecute => self.handle_confirmation(ConfirmChoice::Yes),
             Msg::CancelExecute => self.handle_confirmation(ConfirmChoice::No),
             Msg::RequestRefresh => {
+                if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo) {
+                    return self.request_undo_refresh();
+                }
                 if !self.operation_is_idle() {
                     return FtuiCmd::none();
                 }
@@ -1127,6 +1482,7 @@ impl App {
                 }
                 self.operation = PendingOperation::Idle;
                 self.invalidate_selection();
+                self.undo_overview = None;
                 let status = if let Some(mode) = outcome.mode.as_deref() {
                     match mode {
                         "dry_run" => format!(
@@ -1171,6 +1527,7 @@ impl App {
                 }
                 self.operation = PendingOperation::Idle;
                 self.invalidate_selection();
+                self.undo_overview = None;
                 tracing::error!(target: "tui.async_complete", error = %error, "Execution failed");
                 self.set_status(format!("Execution failed: {}", error));
                 self.push_toast(
@@ -1179,6 +1536,67 @@ impl App {
                     ToastStyle::Error,
                 );
                 FtuiCmd::log(format!("execute: failed ({})", error))
+            }
+            Msg::UndoLoaded { ticket, result } => {
+                if self.operation != PendingOperation::LoadingUndo(ticket) {
+                    return FtuiCmd::none();
+                }
+                self.operation = PendingOperation::Idle;
+                match result {
+                    Ok(overview) => {
+                        let count = overview.batches.len();
+                        self.replace_undo_overview(overview, None);
+                        self.set_status(format!(
+                            "{} saved control batch(es); select one to inspect",
+                            count
+                        ));
+                        FtuiCmd::log(format!("undo: inspected {} saved batches", count))
+                    }
+                    Err(error) => {
+                        self.invalidate_undo_confirmation();
+                        self.undo_error = Some(error.clone());
+                        self.set_status(format!("Cannot inspect saved controls: {error}"));
+                        FtuiCmd::log(format!("undo: inspection failed ({error})"))
+                    }
+                }
+            }
+            Msg::UndoComplete { ticket, result } => {
+                if self.operation != PendingOperation::RestoringUndo(ticket) {
+                    return FtuiCmd::none();
+                }
+                self.operation = PendingOperation::Idle;
+                self.invalidate_selection();
+                match result {
+                    Ok(outcome) => {
+                        self.replace_undo_overview(
+                            outcome.overview.clone(),
+                            Some(&outcome.session_id),
+                        );
+                        let status = if let Some(error) = &outcome.error {
+                            format!(
+                                "{} restored; {} pending. {}: {}",
+                                outcome.restored, outcome.remaining, outcome.summary, error
+                            )
+                        } else {
+                            format!(
+                                "{} restored; {} pending. {}",
+                                outcome.restored, outcome.remaining, outcome.summary
+                            )
+                        };
+                        self.set_status(status.clone());
+                        self.undo_result = Some(outcome);
+                        FtuiCmd::log(format!("undo: {status}"))
+                    }
+                    Err(error) => {
+                        // A callback error may follow a partial write. Never
+                        // reuse the reviewed inventory or imply a rollback.
+                        self.undo_error = Some(error.clone());
+                        self.set_status(format!(
+                            "Restoration stopped: {error}. Reload saved controls."
+                        ));
+                        FtuiCmd::log(format!("undo: restoration error ({error})"))
+                    }
+                }
             }
             Msg::LedgerExported(Ok(path)) => {
                 self.set_status(format!("Evidence ledger exported to {}", path.display()));
@@ -1215,6 +1633,10 @@ impl App {
             }
 
             Msg::Quit => {
+                if matches!(self.operation, PendingOperation::RestoringUndo(_)) {
+                    self.set_status("Restoration is still finishing; wait before quitting");
+                    return FtuiCmd::none();
+                }
                 self.state = AppState::Quitting;
                 FtuiCmd::quit()
             }
@@ -1226,8 +1648,10 @@ impl App {
             return FtuiCmd::none();
         }
 
-        if let Some(cmd) = self.handle_command_palette_key(key) {
-            return cmd;
+        if self.state != AppState::ConfirmingUndo {
+            if let Some(cmd) = self.handle_command_palette_key(key) {
+                return cmd;
+            }
         }
 
         tracing::debug!(
@@ -1244,6 +1668,8 @@ impl App {
             AppState::Searching => self.handle_ftui_search_key(key),
             AppState::Confirming => self.handle_ftui_confirm_key(key),
             AppState::Help => self.handle_ftui_help_key(key),
+            AppState::Undo => self.handle_ftui_undo_key(key),
+            AppState::ConfirmingUndo => self.handle_ftui_confirm_key(key),
             AppState::Quitting => FtuiCmd::quit(),
         }
     }
@@ -1311,6 +1737,7 @@ impl App {
             FtuiKeyCode::Char('x') => return self.handle_msg(Msg::InvertSelection),
             FtuiKeyCode::Enter => self.toggle_detail_visibility(),
             FtuiKeyCode::Char('r') => return self.handle_msg(Msg::RequestRefresh),
+            FtuiKeyCode::Char('U') => return self.handle_msg(Msg::OpenUndo),
             FtuiKeyCode::Char('s') => self.set_detail_view(DetailView::Summary),
             FtuiKeyCode::Char('t') => self.set_detail_view(DetailView::Genealogy),
             FtuiKeyCode::Char('g') => {
@@ -1366,14 +1793,55 @@ impl App {
             FtuiKeyCode::Tab => self.confirm_dialog.toggle(),
             FtuiKeyCode::Enter => {
                 let choice = self.confirm_dialog.confirm();
-                return self.handle_confirmation(choice);
+                return if self.state == AppState::ConfirmingUndo {
+                    self.handle_undo_confirmation(choice)
+                } else {
+                    self.handle_confirmation(choice)
+                };
             }
             FtuiKeyCode::Escape => {
-                return self.handle_confirmation(ConfirmChoice::No);
+                return if self.state == AppState::ConfirmingUndo {
+                    self.handle_undo_confirmation(ConfirmChoice::No)
+                } else {
+                    self.handle_confirmation(ConfirmChoice::No)
+                };
             }
             _ => {}
         }
         FtuiCmd::none()
+    }
+
+    fn handle_ftui_undo_key(&mut self, key: FtuiKeyEvent) -> FtuiCmd<Msg> {
+        if matches!(key.code, FtuiKeyCode::Escape | FtuiKeyCode::Char('U'))
+            || self.key_bindings.is_quit(&key)
+        {
+            return self.handle_msg(Msg::CloseUndo);
+        }
+        if self.key_bindings.is_next(&key) {
+            return self.handle_msg(Msg::CursorDown);
+        }
+        if self.key_bindings.is_prev(&key) {
+            return self.handle_msg(Msg::CursorUp);
+        }
+        match key.code {
+            FtuiKeyCode::Home => self.handle_msg(Msg::CursorHome),
+            FtuiKeyCode::End => self.handle_msg(Msg::CursorEnd),
+            FtuiKeyCode::PageUp => self.handle_msg(Msg::PageUp),
+            FtuiKeyCode::PageDown => self.handle_msg(Msg::PageDown),
+            FtuiKeyCode::Char('r') => self.handle_msg(Msg::RequestUndoRefresh),
+            FtuiKeyCode::Char('[') => {
+                self.scroll_undo_details(false);
+                FtuiCmd::none()
+            }
+            FtuiKeyCode::Char(']') => {
+                self.scroll_undo_details(true);
+                FtuiCmd::none()
+            }
+            FtuiKeyCode::Enter | FtuiKeyCode::Char('e') => {
+                self.handle_msg(Msg::ShowUndoConfirmation)
+            }
+            _ => FtuiCmd::none(),
+        }
     }
 
     fn handle_ftui_help_key(&mut self, key: FtuiKeyEvent) -> FtuiCmd<Msg> {
@@ -1389,6 +1857,209 @@ impl App {
             );
         }
         FtuiCmd::none()
+    }
+
+    fn undo_detail_lines(&self, width: u16) -> Vec<FtuiLine> {
+        let normal = self.theme.stylesheet().get_or_default("border.normal");
+        let warning = self.theme.class("status.warning");
+        let mut details = Vec::new();
+        if let Some(batch) = self.selected_undo_batch() {
+            if let Some(reason) = self.undo_block_reason(batch) {
+                details.push((format!("Restoration unavailable: {reason}"), warning));
+            }
+            details.extend(batch.details.iter().cloned().map(|detail| (detail, normal)));
+        }
+        if let Some(error) = &self.undo_error {
+            details.push((format!("Inspection/restoration error: {error}"), warning));
+        }
+        if let Some(overview) = &self.undo_overview {
+            details.extend(overview.notes.iter().cloned().map(|note| (note, warning)));
+        }
+        details
+            .into_iter()
+            .flat_map(|(detail, style)| {
+                let text: String = detail
+                    .chars()
+                    .map(|ch| if ch.is_control() { ' ' } else { ch })
+                    .collect();
+                FtuiLine::from_spans([FtuiSpan::styled(text, style)])
+                    .wrap(width as usize, WrapMode::WordChar)
+            })
+            .collect()
+    }
+
+    fn render_undo_panel(&self, area: Rect, frame: &mut FtuiFrame) {
+        let sheet = self.theme.stylesheet();
+        let block = super::widgets::panel_block()
+            .title(" Undo recorded controls ")
+            .border_style(sheet.get_or_default("border.normal"));
+        let inner = block.inner(area);
+        block.render(area, frame);
+        if inner.height == 0 || inner.width == 0 {
+            return;
+        }
+        let normal = sheet.get_or_default("border.normal");
+        let heading = sheet.get_or_default("table.header");
+        let selected = sheet.get_or_default("table.selected");
+        let warning = self.theme.class("status.warning");
+        let clean = |text: &str| -> String {
+            text.chars()
+                .map(|ch| if ch.is_control() { ' ' } else { ch })
+                .collect()
+        };
+        let line = |text: String, style| FtuiLine::from_spans([FtuiSpan::styled(text, style)]);
+        let mut lines = vec![line(
+            if inner.width >= 76 {
+                "j/k batch  [/] details  Enter/e restore  r reload  U/Esc/q close".to_string()
+            } else {
+                "j/k batch | [/] details | Enter restore | Esc close".to_string()
+            },
+            heading,
+        )];
+        if let Some(reason) = self
+            .undo_overview
+            .as_ref()
+            .and_then(|overview| overview.read_only_reason.as_ref())
+        {
+            lines.push(line(format!("Read only: {}", clean(reason)), warning));
+        }
+        if let Some(error) = &self.undo_error {
+            lines.push(line(
+                format!("Cannot use saved controls: {}", clean(error)),
+                warning,
+            ));
+        }
+        if let Some(outcome) = &self.undo_result {
+            lines.push(line(
+                format!(
+                    "{} restored; {} pending. {}",
+                    outcome.restored,
+                    outcome.remaining,
+                    clean(&outcome.summary)
+                ),
+                if outcome.error.is_some() {
+                    warning
+                } else {
+                    heading
+                },
+            ));
+            if let Some(error) = &outcome.error {
+                lines.push(line(
+                    format!("Restoration stopped: {}", clean(error)),
+                    warning,
+                ));
+            }
+        }
+        match self.operation {
+            PendingOperation::LoadingUndo(_) => lines.push(line(
+                "Loading persisted control batches...".to_string(),
+                heading,
+            )),
+            PendingOperation::RestoringUndo(_) => lines.push(line(
+                "Restoring the confirmed batch; waiting for persisted results...".to_string(),
+                heading,
+            )),
+            _ => {}
+        }
+        let batches = self
+            .undo_overview
+            .as_ref()
+            .map_or(&[][..], |overview| overview.batches.as_slice());
+        if batches.is_empty() {
+            lines.push(FtuiLine::default());
+            lines.push(line(
+                if self.undo_overview.is_some() {
+                    "No durable control batches recorded in this TUI session.".to_string()
+                } else {
+                    "Saved controls will appear after inspection completes.".to_string()
+                },
+                normal,
+            ));
+            lines.push(line(
+                "Only recorded reversible controls can be restored here.".to_string(),
+                normal,
+            ));
+        } else {
+            let available = (inner.height as usize).saturating_sub(lines.len());
+            let visible = (available / 3).clamp(1, 8).min(batches.len());
+            let start = self.undo_cursor.saturating_sub(visible.saturating_sub(1));
+            let end = (start + visible).min(batches.len());
+            lines.push(line(
+                format!("Saved batches {}-{} of {}", start + 1, end, batches.len()),
+                heading,
+            ));
+            for (index, batch) in batches.iter().enumerate().take(end).skip(start) {
+                let state = if batch.blocked_reason.is_some() {
+                    "unavailable".to_string()
+                } else if batch.pending > 0 {
+                    format!("{} pending", batch.pending)
+                } else if batch.settled > 0 {
+                    "settled".to_string()
+                } else if batch.unsupported > 0 {
+                    "unsupported".to_string()
+                } else {
+                    "no receipts".to_string()
+                };
+                lines.push(line(
+                    format!(
+                        "{} {}  {}",
+                        if index == self.undo_cursor { ">" } else { " " },
+                        clean(&batch.session_id),
+                        state
+                    ),
+                    if index == self.undo_cursor {
+                        selected
+                    } else {
+                        normal
+                    },
+                ));
+            }
+            if let Some(batch) = self.selected_undo_batch() {
+                lines.push(FtuiLine::default());
+                lines.push(line(
+                    format!("Selected: {}", clean(&batch.session_id)),
+                    heading,
+                ));
+                lines.push(line(
+                    format!(
+                        "Pending {} | Settled {} | Unsupported {} | Unrecorded {}",
+                        batch.pending, batch.settled, batch.unsupported, batch.unrecorded
+                    ),
+                    normal,
+                ));
+                if !batch.created_at.is_empty() {
+                    lines.push(line(
+                        format!("Created: {}", clean(&batch.created_at)),
+                        normal,
+                    ));
+                }
+                let details = self.undo_detail_lines(inner.width);
+                if !details.is_empty() {
+                    let offset = self.undo_detail_offset.min(details.len().saturating_sub(1));
+                    let shown = (inner.height as usize).saturating_sub(lines.len() + 1);
+                    let end = offset.saturating_add(shown).min(details.len());
+                    lines.push(line(
+                        format!(
+                            "Details {}-{} of {}  ([/] scroll)",
+                            offset + 1,
+                            end,
+                            details.len()
+                        ),
+                        heading,
+                    ));
+                    lines.extend(details.into_iter().skip(offset).take(shown));
+                }
+            }
+        }
+        if batches.is_empty() {
+            if let Some(overview) = &self.undo_overview {
+                for note in &overview.notes {
+                    lines.push(line(clean(note), warning));
+                }
+            }
+        }
+        let text: FtuiText = lines.into_iter().collect();
+        FtuiParagraph::new(text).render(inner, frame);
     }
 }
 
@@ -1416,6 +2087,41 @@ impl FtuiModel for App {
         // Degrade gracefully for tiny terminals
         if layout.is_too_small() {
             draw_ftui_text(frame, 0, 0, "Terminal too small (min 40x10)");
+            return;
+        }
+
+        if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo) {
+            self.render_undo_panel(
+                Rect::new(
+                    full_area.x,
+                    full_area.y,
+                    full_area.width,
+                    full_area.height.saturating_sub(1),
+                ),
+                frame,
+            );
+            let mut status = StatusBar::new().theme(&self.theme);
+            if let Some(message) = &self.status_message {
+                status = status.message(message);
+            }
+            status.render_ftui(
+                Rect::new(0, full_area.height.saturating_sub(1), full_area.width, 1),
+                frame,
+            );
+            if self.state == AppState::ConfirmingUndo {
+                if let Some(batch) = &self.undo_confirmation {
+                    let message = format!(
+                        "Restore original values for {} pending control(s) in {}?\n\nAlready settled and unsupported records will not be replayed. Restoration stops on the first refusal or failure.",
+                        batch.pending, batch.session_id
+                    );
+                    ConfirmDialog::new()
+                        .title("Restore Recorded Controls")
+                        .message(&message)
+                        .labels("Restore controls", "Cancel")
+                        .theme(&self.theme)
+                        .render_view(layout.popup_area(80, 55), frame, &self.confirm_dialog);
+                }
+            }
             return;
         }
 
@@ -1475,9 +2181,9 @@ impl FtuiModel for App {
 
         // ── Status bar ─────────────────────────────────────────────────
         let status_mode = match self.state {
-            AppState::Normal | AppState::Quitting => StatusMode::Normal,
+            AppState::Normal | AppState::Quitting | AppState::Undo => StatusMode::Normal,
             AppState::Searching => StatusMode::Searching,
-            AppState::Confirming => StatusMode::Confirming,
+            AppState::Confirming | AppState::ConfirmingUndo => StatusMode::Confirming,
             AppState::Help => StatusMode::Help,
         };
         let mut status_bar = StatusBar::new()

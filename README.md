@@ -192,9 +192,18 @@ The interactive TUI is built on **ftui** (an Elm-style Model-View-Update framewo
 - **Detail panel**: expanded evidence view for the selected process including Bayes factors, evidence term glyphs, and decision rationale
 - **Plan preview**: the canonical staged remedy, actual target PID, confidence, routing and live prechecks; parent-directed zombie remedies stay attached to the zombie's row
 - **Command palette**: fuzzy-searchable action palette for power users
+- **Undo controls** (`U`): inspect saved control batches and restore a selected batch after explicit confirmation
 - **Inline mode** (`pt run --inline`): confines the UI to a bottom region, preserving terminal scrollback above
 
 From source: `cargo run -p pt-core -- run` (the `ui` feature is on by default).
+
+In the undo panel, use `j`/`k` to select a batch, `[`/`]` to scroll its action/PID/state
+details, and `r` to reload saved records. `Enter` or `e` opens a confirmation that
+defaults to **Cancel**; `U`, `Esc`, or `q` closes the panel. Dry-run and shadow modes
+allow inspection only. Restoration rechecks the saved batch and live control ownership,
+stops on the first refusal or failure, and shows completed restorations alongside
+remaining pending controls. Already settled, unsupported, and unrecorded actions stay
+visible; irreversible actions cannot be undone.
 
 ### Session Diffing
 

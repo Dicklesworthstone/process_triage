@@ -8,7 +8,7 @@ use ftui::{
     Modifiers as FtuiModifiers,
 };
 use pt_core::tui::widgets::{DetailView, ProcessRow};
-use pt_core::tui::{App, AppState, Msg};
+use pt_core::tui::{App, AppState, Msg, UndoBatch, UndoOverview, UndoRestoreOutcome};
 
 // ===========================================================================
 // Helpers
@@ -46,6 +46,540 @@ fn confirmed_request(app: &mut App) -> Msg {
         panic!("a fresh confirmation must create a bound request");
     };
     request
+}
+
+fn undo_batch(suffix: &str, pending: usize) -> UndoBatch {
+    UndoBatch {
+        session_id: format!("pt-20261124-010000-{suffix}"),
+        plan_sha256: "a".repeat(64),
+        receipt_fingerprint: format!("reviewed-{suffix}"),
+        created_at: "2026-11-24T01:00:00Z".into(),
+        pending,
+        details: vec![format!("pause PID 42: {pending} pending receipt(s)")],
+        ..UndoBatch::default()
+    }
+}
+
+fn load_undo(app: &mut App) {
+    let inspect = deferred_task(<App as FtuiModel>::update(app, Msg::OpenUndo));
+    assert_eq!(app.state, AppState::Undo);
+    let completed = inspect();
+    send_msg(app, completed);
+}
+
+fn confirmed_undo_request(app: &mut App) -> Msg {
+    send_msg(app, Msg::ShowUndoConfirmation);
+    assert_eq!(app.state, AppState::ConfirmingUndo);
+    assert_eq!(
+        app.confirm_dialog.selected,
+        pt_core::tui::widgets::ConfirmChoice::No
+    );
+    send_msg(app, ftui_key(FtuiKeyCode::Left));
+    let FtuiCmd::Msg(request @ Msg::RequestUndo { .. }) =
+        <App as FtuiModel>::update(app, ftui_key(FtuiKeyCode::Enter))
+    else {
+        panic!("explicit undo confirmation must create a bound request");
+    };
+    request
+}
+
+#[test]
+fn undo_panel_selects_one_saved_batch_and_never_replays_settled_authority() {
+    use std::sync::{Arc, Mutex};
+
+    let first = undo_batch("aaaa", 1);
+    let second = undo_batch("aaab", 2);
+    let saved = Arc::new(Mutex::new(UndoOverview {
+        batches: vec![first.clone(), second.clone()],
+        ..UndoOverview::default()
+    }));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut app = app_with_rows();
+    let inspected = Arc::clone(&saved);
+    let restored = Arc::clone(&saved);
+    let observed = Arc::clone(&calls);
+    app.set_undo_ops(
+        Arc::new(move || Ok(inspected.lock().unwrap().clone())),
+        Arc::new(move |selection| {
+            let mut saved = restored.lock().unwrap();
+            let batch = saved
+                .batches
+                .iter_mut()
+                .find(|batch| batch.session_id == selection.session_id)
+                .unwrap();
+            assert_eq!(
+                *batch, selection,
+                "restore must receive exactly the displayed batch"
+            );
+            observed.lock().unwrap().push(selection.clone());
+            batch.settled += batch.pending;
+            batch.pending = 0;
+            batch.receipt_fingerprint = "settled".to_string();
+            Ok(UndoRestoreOutcome {
+                overview: saved.clone(),
+                session_id: selection.session_id,
+                restored: selection.pending,
+                remaining: 0,
+                summary: "Recorded original values restored".into(),
+                error: None,
+            })
+        }),
+    );
+    load_undo(&mut app);
+    assert_eq!(app.selected_undo_batch(), Some(&first));
+    send_msg(&mut app, ftui_char('j'));
+    assert_eq!(app.selected_undo_batch(), Some(&second));
+    send_msg(&mut app, ftui_key(FtuiKeyCode::Enter));
+    assert_eq!(app.state, AppState::ConfirmingUndo);
+    send_msg(&mut app, ftui_key(FtuiKeyCode::Enter));
+    assert_eq!(app.state, AppState::Undo);
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "Enter defaults to cancellation"
+    );
+
+    let request = confirmed_undo_request(&mut app);
+    let restore = deferred_task(<App as FtuiModel>::update(&mut app, request.clone()));
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "model update must defer the callback"
+    );
+    assert!(matches!(
+        <App as FtuiModel>::update(&mut app, request.clone()),
+        FtuiCmd::None
+    ));
+    let completed = restore();
+    assert_eq!(
+        app.selected_undo_batch().unwrap().pending,
+        2,
+        "display waits for its own completion"
+    );
+    send_msg(&mut app, completed.clone());
+    assert_eq!(
+        app.selected_undo_batch().unwrap().session_id,
+        second.session_id
+    );
+    assert_eq!(app.selected_undo_batch().unwrap().pending, 0);
+    assert_eq!(app.selected_undo_batch().unwrap().settled, 2);
+    assert_eq!(app.undo_overview().unwrap().batches[0].pending, 1);
+    assert_eq!(*calls.lock().unwrap(), vec![second]);
+    assert!(matches!(
+        <App as FtuiModel>::update(&mut app, request),
+        FtuiCmd::None
+    ));
+    assert!(matches!(
+        <App as FtuiModel>::update(&mut app, completed),
+        FtuiCmd::None
+    ));
+    send_msg(&mut app, Msg::ShowUndoConfirmation);
+    assert_eq!(
+        app.state,
+        AppState::Undo,
+        "settled batch cannot be confirmed again"
+    );
+    send_msg(&mut app, ftui_key(FtuiKeyCode::Escape));
+    assert_eq!(app.state, AppState::Normal);
+}
+
+#[test]
+fn undo_refresh_consumes_old_confirmation_and_serializes_all_mutating_operations() {
+    use std::sync::{Arc, Mutex};
+
+    let saved = Arc::new(Mutex::new(UndoOverview {
+        batches: vec![undo_batch("aaaa", 1)],
+        ..UndoOverview::default()
+    }));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut app = app_with_rows();
+    let inspected = Arc::clone(&saved);
+    let observed = Arc::clone(&calls);
+    app.set_undo_ops(
+        Arc::new(move || Ok(inspected.lock().unwrap().clone())),
+        Arc::new(move |batch| {
+            observed.lock().unwrap().push(batch);
+            Err("receipt changed before restoration".into())
+        }),
+    );
+    load_undo(&mut app);
+    let stale = confirmed_undo_request(&mut app);
+    saved.lock().unwrap().batches[0].receipt_fingerprint = "a later reviewed receipt".into();
+    let inspect = deferred_task(<App as FtuiModel>::update(
+        &mut app,
+        Msg::RequestUndoRefresh,
+    ));
+    let completed = inspect();
+    assert_eq!(
+        app.selected_undo_batch().unwrap().receipt_fingerprint,
+        "reviewed-aaaa"
+    );
+    for message in [
+        stale.clone(),
+        Msg::ConfirmUndo,
+        Msg::ShowUndoConfirmation,
+        Msg::RequestRefresh,
+        Msg::RequestUndoRefresh,
+        Msg::SelectAll,
+        Msg::ConfirmExecute,
+        Msg::CursorDown,
+        Msg::ProcessesScanned(vec![]),
+        Msg::UndoLoaded {
+            ticket: 0,
+            result: Ok(UndoOverview::default()),
+        },
+    ] {
+        assert!(matches!(
+            <App as FtuiModel>::update(&mut app, message),
+            FtuiCmd::None
+        ));
+    }
+    assert!(calls.lock().unwrap().is_empty());
+    send_msg(&mut app, completed);
+    assert_eq!(
+        app.selected_undo_batch().unwrap().receipt_fingerprint,
+        "a later reviewed receipt"
+    );
+    let fresh = confirmed_undo_request(&mut app);
+    assert!(matches!(
+        <App as FtuiModel>::update(&mut app, stale.clone()),
+        FtuiCmd::None
+    ));
+    let restore = deferred_task(<App as FtuiModel>::update(&mut app, fresh.clone()));
+    for message in [
+        stale,
+        fresh,
+        Msg::OpenUndo,
+        Msg::CloseUndo,
+        Msg::RequestRefresh,
+        Msg::RequestUndoRefresh,
+        Msg::ShowUndoConfirmation,
+        Msg::ConfirmUndo,
+        Msg::ConfirmExecute,
+        Msg::SelectAll,
+        Msg::ProcessesScanned(vec![]),
+        Msg::Quit,
+        Msg::UndoComplete {
+            ticket: 0,
+            result: Ok(UndoRestoreOutcome::default()),
+        },
+    ] {
+        assert!(matches!(
+            <App as FtuiModel>::update(&mut app, message),
+            FtuiCmd::None
+        ));
+    }
+    assert!(!app.should_quit());
+    send_msg(&mut app, restore());
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    send_msg(&mut app, Msg::ShowUndoConfirmation);
+    assert_eq!(
+        app.state,
+        AppState::Undo,
+        "callback failure requires a fresh inspection"
+    );
+    let inspect = deferred_task(<App as FtuiModel>::update(
+        &mut app,
+        Msg::RequestUndoRefresh,
+    ));
+    send_msg(&mut app, inspect());
+    send_msg(&mut app, Msg::ShowUndoConfirmation);
+    assert_eq!(app.state, AppState::ConfirmingUndo);
+    send_msg(&mut app, Msg::CancelUndo);
+}
+
+#[test]
+fn undo_read_only_blocked_missing_and_unsupported_batches_remain_inspectable() {
+    use std::sync::Arc;
+
+    for variant in [
+        "read_only",
+        "blocked",
+        "settled",
+        "unsupported",
+        "unrecorded",
+        "missing_binding",
+    ] {
+        let mut batch = undo_batch("aaaa", 1);
+        let mut overview = UndoOverview::default();
+        match variant {
+            "read_only" => overview.read_only_reason = Some("shadow mode".into()),
+            "blocked" => batch.blocked_reason = Some("saved child plan changed".into()),
+            "settled" => {
+                batch.pending = 0;
+                batch.settled = 1;
+            }
+            "unsupported" => {
+                batch.pending = 0;
+                batch.unsupported = 1;
+            }
+            "unrecorded" => {
+                batch.pending = 0;
+                batch.unrecorded = 1;
+            }
+            "missing_binding" => batch.receipt_fingerprint.clear(),
+            _ => unreachable!(),
+        }
+        overview.batches.push(batch.clone());
+        let mut app = app_with_rows();
+        app.set_undo_ops(
+            Arc::new(move || Ok(overview.clone())),
+            Arc::new(|_| panic!("non-restorable batch must not reach the backend")),
+        );
+        load_undo(&mut app);
+        assert_eq!(app.selected_undo_batch(), Some(&batch), "{variant}");
+        send_msg(&mut app, Msg::ShowUndoConfirmation);
+        assert_eq!(app.state, AppState::Undo, "{variant}");
+        assert!(matches!(
+            <App as FtuiModel>::update(&mut app, Msg::ConfirmUndo),
+            FtuiCmd::None
+        ));
+        assert!(matches!(
+            <App as FtuiModel>::update(&mut app, Msg::RequestUndo { ticket: 1 }),
+            FtuiCmd::None
+        ));
+    }
+}
+
+#[test]
+fn undo_partial_results_keep_completed_and_pending_controls_visible() {
+    use std::sync::Arc;
+
+    let original = UndoOverview {
+        batches: vec![undo_batch("aaaa", 2)],
+        ..UndoOverview::default()
+    };
+    let mut after = original.clone();
+    after.batches[0].pending = 1;
+    after.batches[0].settled = 1;
+    after.batches[0].receipt_fingerprint = "partial-result".into();
+    after.batches[0].details = vec![
+        "pause PID 42: restored".into(),
+        "pause PID 43: refused; still pending".into(),
+    ];
+    let displayed = after.clone();
+    let mut app = app_with_rows();
+    app.set_undo_ops(
+        Arc::new(move || Ok(original.clone())),
+        Arc::new(move |selection| {
+            Ok(UndoRestoreOutcome {
+                overview: after.clone(),
+                session_id: selection.session_id,
+                restored: 1,
+                remaining: 1,
+                summary: "Stopped after a refusal".into(),
+                error: Some("PID 43 identity changed".into()),
+            })
+        }),
+    );
+    load_undo(&mut app);
+    let request = confirmed_undo_request(&mut app);
+    let restore = deferred_task(<App as FtuiModel>::update(&mut app, request));
+    send_msg(&mut app, restore());
+    assert_eq!(app.undo_overview(), Some(&displayed));
+    assert_eq!(app.state, AppState::Undo);
+    for (width, height) in [(80, 24), (120, 30), (200, 40)] {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(width, height, &mut pool);
+        <App as FtuiModel>::view(&app, &mut frame);
+        let text = ftui_harness::buffer_to_text(&frame.buffer);
+        for expected in [
+            "Undo recorded controls",
+            "1 restored; 1 pending",
+            "PID 43 identity changed",
+            "pause PID 42: restored",
+            "pause PID 43: refused; still pending",
+        ] {
+            assert!(
+                text.contains(expected),
+                "{width}x{height} is missing {expected}:\n{text}"
+            );
+        }
+        assert!(
+            !text.contains("partial-result"),
+            "receipt bindings are not user-facing text"
+        );
+    }
+}
+
+#[test]
+fn undo_confirmation_expires_on_selection_close_and_process_replacement() {
+    use std::sync::Arc;
+
+    for invalidation in ["cursor", "close", "processes"] {
+        let overview = UndoOverview {
+            batches: vec![undo_batch("aaaa", 1), undo_batch("aaab", 1)],
+            ..UndoOverview::default()
+        };
+        let mut app = app_with_rows();
+        app.set_undo_ops(
+            Arc::new(move || Ok(overview.clone())),
+            Arc::new(|_| panic!("expired selection cannot restore")),
+        );
+        load_undo(&mut app);
+        let request = confirmed_undo_request(&mut app);
+        send_msg(
+            &mut app,
+            match invalidation {
+                "cursor" => Msg::CursorDown,
+                "close" => Msg::CloseUndo,
+                "processes" => Msg::ProcessesScanned(vec![]),
+                _ => unreachable!(),
+            },
+        );
+        assert!(
+            matches!(<App as FtuiModel>::update(&mut app, request), FtuiCmd::None),
+            "{invalidation}"
+        );
+    }
+}
+
+#[test]
+fn undo_details_scroll_without_changing_the_reviewed_batch() {
+    use std::sync::Arc;
+
+    let mut batch = undo_batch("aaaa", 40);
+    batch.details = (1..=40)
+        .map(|pid| format!("pause PID {pid}: pending recorded original job-control state"))
+        .collect();
+    let expected = batch.clone();
+    let overview = UndoOverview {
+        batches: vec![batch],
+        ..UndoOverview::default()
+    };
+    let mut app = app_with_rows();
+    app.set_undo_ops(
+        Arc::new(move || Ok(overview.clone())),
+        Arc::new(|_| panic!("detail navigation must not restore a control")),
+    );
+    load_undo(&mut app);
+    for (width, height) in [(80, 24), (120, 30), (200, 40)] {
+        send_msg(&mut app, Msg::Resized { width, height });
+        for _ in 0..12 {
+            send_msg(&mut app, ftui_char(']'));
+        }
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(width, height, &mut pool);
+        <App as FtuiModel>::view(&app, &mut frame);
+        let text = ftui_harness::buffer_to_text(&frame.buffer);
+        assert!(
+            text.contains("pause PID 40: pending"),
+            "last receipt must be reachable at {width}x{height}:\n{text}"
+        );
+        assert_eq!(app.selected_undo_batch(), Some(&expected));
+        for _ in 0..12 {
+            send_msg(&mut app, ftui_char('['));
+        }
+        let mut frame = ftui::Frame::new(width, height, &mut pool);
+        <App as FtuiModel>::view(&app, &mut frame);
+        let text = ftui_harness::buffer_to_text(&frame.buffer);
+        assert!(
+            text.contains("pause PID 1: pending"),
+            "first receipt must remain reachable:\n{text}"
+        );
+    }
+}
+
+#[test]
+fn undo_failed_inspection_cannot_reuse_an_old_review_token() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let inspected = Arc::clone(&calls);
+    let overview = UndoOverview {
+        batches: vec![undo_batch("aaaa", 1)],
+        ..UndoOverview::default()
+    };
+    let mut app = app_with_rows();
+    app.set_undo_ops(
+        Arc::new(move || match inspected.fetch_add(1, Ordering::SeqCst) {
+            1 => Err("child control reference unavailable".into()),
+            _ => Ok(overview.clone()),
+        }),
+        Arc::new(|_| panic!("failed inspection must not authorize restoration")),
+    );
+    let first = deferred_task(<App as FtuiModel>::update(&mut app, Msg::OpenUndo));
+    let old_completed = first();
+    send_msg(&mut app, old_completed.clone());
+    let stale_request = confirmed_undo_request(&mut app);
+    let reload = deferred_task(<App as FtuiModel>::update(
+        &mut app,
+        Msg::RequestUndoRefresh,
+    ));
+    send_msg(&mut app, reload());
+    assert!(
+        app.selected_undo_batch().is_some(),
+        "last observed records stay visible"
+    );
+    assert!(matches!(
+        <App as FtuiModel>::update(&mut app, old_completed),
+        FtuiCmd::None
+    ));
+    assert!(matches!(
+        <App as FtuiModel>::update(&mut app, stale_request),
+        FtuiCmd::None
+    ));
+    send_msg(&mut app, Msg::ShowUndoConfirmation);
+    assert_eq!(app.state, AppState::Undo);
+    let reload = deferred_task(<App as FtuiModel>::update(
+        &mut app,
+        Msg::RequestUndoRefresh,
+    ));
+    send_msg(&mut app, reload());
+    send_msg(&mut app, Msg::ShowUndoConfirmation);
+    assert_eq!(app.state, AppState::ConfirmingUndo);
+    send_msg(&mut app, Msg::CancelUndo);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn undo_open_expires_an_already_confirmed_process_execution() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&calls);
+    let mut app = app_with_rows();
+    app.set_execute_op(Arc::new(move |_, _, _| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        Ok(pt_core::tui::ExecutionOutcome::default())
+    }));
+    app.set_undo_ops(
+        Arc::new(|| {
+            Ok(UndoOverview {
+                batches: vec![undo_batch("aaaa", 1)],
+                ..UndoOverview::default()
+            })
+        }),
+        Arc::new(|_| panic!("opening a panel never restores controls")),
+    );
+    send_msg(&mut app, Msg::SelectAll);
+    let stale = confirmed_request(&mut app);
+    let inspect = deferred_task(<App as FtuiModel>::update(&mut app, Msg::OpenUndo));
+    assert!(matches!(
+        <App as FtuiModel>::update(&mut app, stale.clone()),
+        FtuiCmd::None
+    ));
+    send_msg(&mut app, inspect());
+    assert!(matches!(
+        <App as FtuiModel>::update(&mut app, stale.clone()),
+        FtuiCmd::None
+    ));
+    send_msg(&mut app, Msg::ConfirmExecute);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    send_msg(&mut app, Msg::CloseUndo);
+    send_msg(&mut app, Msg::SelectAll);
+    let fresh = confirmed_request(&mut app);
+    assert!(matches!(
+        <App as FtuiModel>::update(&mut app, stale),
+        FtuiCmd::None
+    ));
+    let execute = deferred_task(<App as FtuiModel>::update(&mut app, fresh));
+    send_msg(&mut app, execute());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 /// Send multiple Msgs sequentially.
