@@ -420,7 +420,7 @@ fn terminate_owned_group(child: &Child) {
 /// Cancel only an unreaped child whose ownership can still be established.
 /// Reaping can wait for uninterruptible kernel I/O, so it runs off the collection
 /// path. Successful commands do not create a reaper thread.
-pub(super) fn terminate_owned_child(mut child: Child) {
+pub fn terminate_owned_child(mut child: Child) {
     match child.try_wait() {
         Ok(Some(_)) => return,
         Ok(None) => {}
@@ -445,6 +445,49 @@ pub(super) fn terminate_owned_child(mut child: Child) {
         })
     {
         warn!(pid, %error, "cannot start tool reaper; cleanup remains unverified");
+    }
+}
+
+/// Supervise a trusted worker with its original arguments, environment and stdio.
+/// Unlike captured probe output, foreground planner output is streamed directly
+/// to the operator. The same ownership guard cancels the group before reaping.
+pub fn run_owned_worker(
+    command: &mut Command,
+    timeout: Duration,
+    should_cancel: impl Fn() -> bool,
+) -> std::io::Result<std::process::ExitStatus> {
+    let started = Instant::now();
+    let check_deadline = || {
+        if should_cancel() {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "worker cancelled",
+            ))
+        } else if started.elapsed() >= timeout {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("worker timed out after {timeout:?}"),
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    check_deadline()?;
+    configure_owned_worker(command, true)?;
+    let mut guard = ToolChildGuard(Some(command.spawn()?), true);
+    let child = guard.0.as_mut().expect("owned worker");
+    loop {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let result = peek_child_exit(child);
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let result = child.try_wait();
+        match result {
+            Ok(Some(status)) => return Ok(status),
+            Err(error) if error.kind() != std::io::ErrorKind::Interrupted => return Err(error),
+            _ => {}
+        }
+        check_deadline()?;
+        thread::sleep(Duration::from_millis(20).min(timeout.saturating_sub(started.elapsed())));
     }
 }
 
@@ -794,58 +837,67 @@ impl ToolRunner {
         command.env("LANG", "C");
         command.envs(&spec.env);
 
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::process::CommandExt;
-
-            // A scanner can itself run under a deadline in another process.
-            // Killing that scanner also removes its timeout/reaper threads, so
-            // its owned helpers need kernel-enforced cancellation as well.
-            // This covers this direct child across ordinary execs, including
-            // nice/ionice wrappers. Linux clears the setting in forked children
-            // and on credential-changing execs; it is not a process-tree kill.
-            // SAFETY: getpid only reads the current process identity.
-            let parent_pid = unsafe { libc::getpid() };
-            // SAFETY: after fork, use only allocation-free libc operations and
-            // raw OS errors. Checking getppid after prctl closes the race where
-            // the parent died before the death signal was installed.
-            unsafe {
-                command.pre_exec(move || {
-                    if libc::prctl(
-                        libc::PR_SET_PDEATHSIG,
-                        libc::SIGKILL as libc::c_ulong,
-                        0 as libc::c_ulong,
-                        0 as libc::c_ulong,
-                        0 as libc::c_ulong,
-                    ) == -1
-                    {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    if libc::getppid() != parent_pid {
-                        return Err(std::io::Error::from_raw_os_error(libc::ECHILD));
-                    }
-                    Ok(())
-                });
-            }
-        }
-
-        if spec.isolate_process_group {
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            {
-                use std::os::unix::process::CommandExt;
-                command.process_group(0);
-            }
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "owned worker process groups require Linux or macOS WNOWAIT",
-            )
-            .into());
-        }
-
+        configure_owned_worker(&mut command, spec.isolate_process_group)?;
         Ok(command)
     }
+}
 
+fn configure_owned_worker(
+    command: &mut Command,
+    isolate_process_group: bool,
+) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+
+        // A scanner can itself run under a deadline in another process.
+        // Killing that scanner also removes its timeout/reaper threads, so
+        // its owned helpers need kernel-enforced cancellation as well.
+        // This covers this direct child across ordinary execs, including
+        // nice/ionice wrappers. Linux clears the setting in forked children
+        // and on credential-changing execs; it is not a process-tree kill.
+        // SAFETY: getpid only reads the current process identity.
+        let parent_pid = unsafe { libc::getpid() };
+        // SAFETY: after fork, use only allocation-free libc operations and
+        // raw OS errors. Checking getppid after prctl closes the race where
+        // the parent died before the death signal was installed.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(
+                    libc::PR_SET_PDEATHSIG,
+                    libc::SIGKILL as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                ) == -1
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != parent_pid {
+                    return Err(std::io::Error::from_raw_os_error(libc::ECHILD));
+                }
+                Ok(())
+            });
+        }
+    }
+
+    if isolate_process_group {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "owned worker process groups require Linux or macOS WNOWAIT",
+        ));
+    }
+
+    Ok(())
+}
+
+impl ToolRunner {
     /// Read/write each nonblocking pipe once per iteration. EOF and process exit
     /// are separate conditions: descendants can retain output pipes after the
     /// tool exits, and a tool can close its pipes before becoming stuck.
@@ -1611,6 +1663,71 @@ mod tests {
                 unrelated.0.as_mut().unwrap().try_wait().unwrap().is_none(),
                 "group cancellation must leave the caller's other children alive"
             );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn foreground_worker_preserves_stdio_and_exit_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let stdout = dir.path().join("stdout");
+        let stderr = dir.path().join("stderr");
+        for expected in [0, 1, 21] {
+            let mut command = Command::new("sh");
+            command
+                .args(["-c", "echo out; echo err >&2; exit \"$1\"", "worker"])
+                .arg(expected.to_string())
+                .stdout(std::fs::File::create(&stdout).unwrap())
+                .stderr(std::fs::File::create(&stderr).unwrap());
+            let status = run_owned_worker(&mut command, Duration::from_secs(5), || false).unwrap();
+            assert_eq!(status.code(), Some(expected));
+            assert_eq!(std::fs::read(&stdout).unwrap(), b"out\n");
+            assert_eq!(std::fs::read(&stderr).unwrap(), b"err\n");
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn foreground_worker_deadline_and_cancellation_stop_owned_descendants() {
+        for cancel in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("descendant");
+            let mut command = Command::new("sh");
+            command
+                .args(["-c", "sleep 60 & echo $! > \"$1\"; wait", "worker"])
+                .arg(&marker);
+            let timeout = Duration::from_secs(if cancel { 30 } else { 1 });
+            let started = Instant::now();
+            let error = run_owned_worker(&mut command, timeout, || cancel && marker.exists())
+                .expect_err("worker must be interrupted");
+            assert_eq!(
+                error.kind(),
+                if cancel {
+                    std::io::ErrorKind::Interrupted
+                } else {
+                    std::io::ErrorKind::TimedOut
+                }
+            );
+            assert!(started.elapsed() < Duration::from_secs(5));
+            let pid = std::fs::read_to_string(marker)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            loop {
+                #[cfg(target_os = "linux")]
+                let stat = crate::collect::proc_parsers::read_required_proc_stat(pid).ok();
+                #[cfg(target_os = "macos")]
+                let stat = crate::collect::macos::read_session_stat(pid);
+                if stat.is_none_or(|stat| matches!(stat.state, 'Z' | 'X' | 'x')) {
+                    break;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "living worker descendant {pid}"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
         }
     }
 

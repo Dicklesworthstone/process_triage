@@ -351,10 +351,66 @@ fn test_shadow_stop_does_not_signal_a_reused_pid() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn test_shadow_stop_signals_the_recorded_observer() {
-    let (survived, json, _) = stop_with_pid_file(|pid| Some(birth_of(pid)));
+    let (survived, json, pid_file_left) = stop_with_pid_file(|pid| Some(birth_of(pid)));
     assert!(
         !survived,
         "stop did not signal the recorded process: {json}"
+    );
+    assert_eq!(json["stopped"], true);
+    assert_eq!(json["running"], false);
+    assert!(!pid_file_left, "confirmed stop should clear the pid file");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn test_shadow_stop_retains_identity_when_exit_is_unconfirmed() {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+
+    let dir = tempdir().unwrap();
+    let shadow_dir = dir.path().join("shadow");
+    fs::create_dir_all(&shadow_dir).unwrap();
+    let mut child = Command::new("sh")
+        .args(["-c", "trap '' TERM; echo ready; exec sleep 30"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut ready = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut ready)
+        .unwrap();
+    assert_eq!(ready.trim(), "ready");
+    let pid = child.id();
+    let birth = birth_of(pid);
+    fs::write(shadow_dir.join("shadow.pid"), pid.to_string()).unwrap();
+    fs::write(
+        shadow_dir.join("shadow.pid.birth"),
+        format!("{pid} {birth}"),
+    )
+    .unwrap();
+    let result = pt_core()
+        .env("PROCESS_TRIAGE_DATA", dir.path())
+        .args(["--format", "json", "--timeout", "0", "shadow", "stop"])
+        .output();
+    let alive = child.try_wait().unwrap().is_none();
+    if alive {
+        child.kill().unwrap();
+    }
+    child.wait().unwrap();
+    let result = result.unwrap();
+    assert!(alive);
+    assert_eq!(result.status.code(), Some(3));
+    let response: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(response["signaled"], true);
+    assert_eq!(response["stopped"], false);
+    assert_eq!(response["running"], true);
+    assert_eq!(
+        fs::read_to_string(shadow_dir.join("shadow.pid")).unwrap(),
+        pid.to_string()
+    );
+    assert_eq!(
+        fs::read_to_string(shadow_dir.join("shadow.pid.birth")).unwrap(),
+        format!("{pid} {birth}")
     );
 }
 
@@ -910,6 +966,37 @@ fn test_shadow_start_foreground_one_iteration() {
     assert_eq!(json["command"], "shadow run");
     assert_eq!(json["iterations"], 1, "should have completed 1 iteration");
     assert!(json.get("base_dir").is_some(), "should have base_dir");
+}
+
+#[test]
+fn shadow_iteration_deadline_allows_the_next_observation_to_run() {
+    let dir = tempdir().unwrap();
+    let result = pt_core()
+        .env("PROCESS_TRIAGE_DATA", dir.path())
+        .args([
+            "--format",
+            "json",
+            "--timeout",
+            "0",
+            "shadow",
+            "start",
+            "--iterations",
+            "2",
+            "--interval",
+            "0",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(3));
+    let summary = parse_last_json_object_with_command(&result.stdout, "shadow run");
+    assert_eq!(summary["iterations"], 2);
+    assert_eq!(summary["iterations_failed"], 2);
+    assert_eq!(summary["iterations_cancelled"], 0);
+    assert!(summary["last_iteration_exit_code"].is_null());
+    assert!(summary["last_error"]
+        .as_str()
+        .unwrap()
+        .contains("timed out"));
 }
 
 // ============================================================================

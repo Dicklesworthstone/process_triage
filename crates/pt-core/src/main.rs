@@ -20688,15 +20688,29 @@ fn run_shadow_start(global: &GlobalOpts, args: &ShadowStartArgs) -> ExitCode {
 }
 
 fn run_shadow_background(global: &GlobalOpts, args: &ShadowStartArgs) -> ExitCode {
-    if let Ok(Some((pid, birth))) = read_pid_file_record(&shadow_pid_path()) {
-        if pid_file_running(pid, birth) {
+    let _pid_lock = match lock_shadow_pid_file() {
+        Ok(lock) => lock,
+        Err(code) => return code,
+    };
+    match read_pid_file_record(&shadow_pid_path()) {
+        Ok(Some((pid, birth))) if pid_file_running(pid, birth) => {
             eprintln!(
                 "shadow start: existing shadow observer running (pid {})",
                 pid
             );
             return ExitCode::LockError;
         }
-        let _ = remove_shadow_pid();
+        Ok(Some(_)) => {
+            if let Err(error) = remove_shadow_pid() {
+                eprintln!("shadow start: cannot clear stale observer identity: {error}");
+                return ExitCode::IoError;
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("shadow start: cannot read observer identity: {error}");
+            return ExitCode::IoError;
+        }
     }
 
     let exe = match std::env::current_exe() {
@@ -20731,6 +20745,8 @@ fn run_shadow_background(global: &GlobalOpts, args: &ShadowStartArgs) -> ExitCod
 
     if let Err(err) = write_shadow_pid(child.id()) {
         eprintln!("shadow start: failed to write pid file: {}", err);
+        // This is still our unreaped child. Do not leave an untracked observer.
+        pt_core::collect::tool_runner::terminate_owned_child(child);
         return ExitCode::IoError;
     }
 
@@ -20761,6 +20777,7 @@ fn run_shadow_run(global: &GlobalOpts, args: &ShadowStartArgs) -> ExitCode {
     let mut run_count: u32 = 0;
     let mut successful_iterations: u32 = 0;
     let mut failed_iterations: u32 = 0;
+    let mut cancelled_iterations: u32 = 0;
     let mut last_iteration_exit_code = None;
     let mut last_error = None;
     let mut next_deep_at = if args.deep || args.deep_interval == 0 {
@@ -20804,6 +20821,14 @@ fn run_shadow_run(global: &GlobalOpts, args: &ShadowStartArgs) -> ExitCode {
                     last_error = Some(error);
                 }
             }
+            Err(err)
+                if err.kind() == std::io::ErrorKind::Interrupted
+                    && SHADOW_SIGNALS.should_stop() =>
+            {
+                cancelled_iterations += 1;
+                last_iteration_exit_code = None;
+                break;
+            }
             Err(err) => {
                 failed_iterations = failed_iterations.saturating_add(1);
                 last_iteration_exit_code = None;
@@ -20832,13 +20857,12 @@ fn run_shadow_run(global: &GlobalOpts, args: &ShadowStartArgs) -> ExitCode {
         }
     }
 
-    cleanup_shadow_pid_if_owned(own_pid);
-
     let response = serde_json::json!({
         "command": "shadow run",
         "iterations": run_count,
         "iterations_succeeded": successful_iterations,
         "iterations_failed": failed_iterations,
+        "iterations_cancelled": cancelled_iterations,
         "last_iteration_exit_code": last_iteration_exit_code,
         "last_error": last_error,
         "interval_seconds": args.interval,
@@ -20851,12 +20875,13 @@ fn run_shadow_run(global: &GlobalOpts, args: &ShadowStartArgs) -> ExitCode {
         }
         _ => {
             println!(
-                "Shadow run complete ({} iterations: {} succeeded, {} failed).",
-                run_count, successful_iterations, failed_iterations
+                "Shadow run complete ({} iterations: {} succeeded, {} failed, {} cancelled).",
+                run_count, successful_iterations, failed_iterations, cancelled_iterations
             );
         }
     }
 
+    cleanup_shadow_pid_if_owned(own_pid);
     if failed_iterations == 0 {
         ExitCode::Clean
     } else {
@@ -20880,7 +20905,12 @@ fn run_shadow_iteration(
         .arg("plan");
     apply_shadow_plan_args(&mut cmd, args, force_deep);
 
-    cmd.status()
+    // Match the daemon planner's default. A global override bounds the whole
+    // iteration, including phases outside the planner's internal scan budget.
+    let deadline = std::time::Duration::from_secs(global.timeout.unwrap_or(60));
+    pt_core::collect::tool_runner::run_owned_worker(&mut cmd, deadline, || {
+        SHADOW_SIGNALS.should_stop()
+    })
 }
 
 /// Both observer subprocess hops must retain the configuration and collection
@@ -20942,6 +20972,10 @@ mod shadow_observer_tests {
 }
 
 fn run_shadow_stop(global: &GlobalOpts) -> ExitCode {
+    let _pid_lock = match lock_shadow_pid_file() {
+        Ok(lock) => lock,
+        Err(code) => return code,
+    };
     let (pid, birth) = match read_pid_file_record(&shadow_pid_path()) {
         Ok(Some(record)) => record,
         Ok(None) => {
@@ -21008,25 +21042,48 @@ fn run_shadow_stop(global: &GlobalOpts) -> ExitCode {
         return ExitCode::IoError;
     }
 
-    if let Err(err) = remove_shadow_pid() {
-        eprintln!("shadow stop: failed to remove pid file: {}", err);
+    let started = std::time::Instant::now();
+    let wait = std::time::Duration::from_secs(global.timeout.unwrap_or(5));
+    let mut target = pid_file_target(pid, birth);
+    while target != PidFileTarget::Stale && started.elapsed() < wait {
+        std::thread::sleep(
+            std::time::Duration::from_millis(25).min(wait.saturating_sub(started.elapsed())),
+        );
+        target = pid_file_target(pid, birth);
     }
-
+    let stopped = target == PidFileTarget::Stale;
+    if stopped {
+        if let Err(err) = remove_shadow_pid() {
+            eprintln!("shadow stop: failed to remove pid file: {}", err);
+            return ExitCode::IoError;
+        }
+    }
     let response = serde_json::json!({
         "command": "shadow stop",
         "pid": pid,
         "signaled": true,
+        "stopped": stopped,
+        "running": match target {
+            PidFileTarget::Verified => Some(true),
+            PidFileTarget::Stale => Some(false),
+            PidFileTarget::Unverified => None,
+        },
     });
     match global.format {
         OutputFormat::Json | OutputFormat::Toon | OutputFormat::Jsonl => {
             println!("{}", format_structured_output(global, response));
         }
-        _ => {
+        _ if stopped => {
             println!("Shadow observer stopped (pid {}).", pid);
         }
+        _ => eprintln!("Shadow observer {pid} was signalled; its exit is unconfirmed."),
     }
 
-    ExitCode::Clean
+    if stopped {
+        ExitCode::Clean
+    } else {
+        ExitCode::PartialFail
+    }
 }
 
 fn run_shadow_status(global: &GlobalOpts) -> ExitCode {
@@ -21351,9 +21408,32 @@ fn shadow_sleep_with_interrupt(seconds: u64) -> bool {
 }
 
 fn cleanup_shadow_pid_if_owned(pid: u32) {
+    if !matches!(read_shadow_pid(), Ok(Some(current)) if current == pid) {
+        return;
+    }
+    // Stop holds this lock until it observes exit. A concurrent start may
+    // already have published a new identity by the time cleanup runs.
+    let Ok(Some(_lock)) = GlobalLock::try_acquire(&shadow_base_dir().join("shadow.pid.lock"))
+    else {
+        return;
+    };
     if let Ok(Some(current)) = read_shadow_pid() {
         if current == pid {
             let _ = remove_shadow_pid();
+        }
+    }
+}
+
+fn lock_shadow_pid_file() -> Result<GlobalLock, ExitCode> {
+    match GlobalLock::try_acquire(&shadow_base_dir().join("shadow.pid.lock")) {
+        Ok(Some(lock)) => Ok(lock),
+        Ok(None) => {
+            eprintln!("shadow: another start or stop is in progress");
+            Err(ExitCode::LockError)
+        }
+        Err(error) => {
+            eprintln!("shadow: cannot lock observer identity: {error}");
+            Err(ExitCode::IoError)
         }
     }
 }
@@ -21384,15 +21464,17 @@ fn read_shadow_pid() -> std::io::Result<Option<u32>> {
 /// pid file records next to the pid so a later `stop` can tell that process from
 /// an unrelated one that reused the pid.
 fn process_birth_for_pid_file(pid: u32) -> Option<u64> {
+    pid_file_process_stat(pid).map(|stat| stat.starttime)
+}
+
+fn pid_file_process_stat(pid: u32) -> Option<pt_core::collect::proc_parsers::ProcessStat> {
     #[cfg(target_os = "linux")]
     {
-        pt_core::collect::proc_parsers::read_required_proc_stat(pid)
-            .ok()
-            .map(|stat| stat.starttime)
+        pt_core::collect::proc_parsers::read_required_proc_stat(pid).ok()
     }
     #[cfg(target_os = "macos")]
     {
-        pt_core::collect::read_bsd_info(pid).map(|info| info.start_us)
+        pt_core::collect::macos::read_session_stat(pid)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -21463,8 +21545,10 @@ fn pid_file_target(pid: u32, birth: Option<u64>) -> PidFileTarget {
             PidFileTarget::Stale
         };
     };
-    match process_birth_for_pid_file(pid) {
-        Some(live) if live == birth => PidFileTarget::Verified,
+    match pid_file_process_stat(pid) {
+        Some(stat) if stat.starttime == birth && !matches!(stat.state, 'Z' | 'X' | 'x') => {
+            PidFileTarget::Verified
+        }
         Some(_) => PidFileTarget::Stale,
         None if is_process_running(pid) => PidFileTarget::Unverified,
         None => PidFileTarget::Stale,
