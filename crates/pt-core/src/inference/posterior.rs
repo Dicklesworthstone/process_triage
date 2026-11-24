@@ -312,6 +312,16 @@ pub fn compute_posterior(
     priors: &Priors,
     evidence: &Evidence,
 ) -> Result<PosteriorResult, PosteriorError> {
+    compute_posterior_with_cpu_expectation(priors, evidence, false)
+}
+
+/// Apply the ordinary CPU model with an optional directional bound for signatures
+/// whose useful processes routinely wait for work.
+pub(crate) fn compute_posterior_with_cpu_expectation(
+    priors: &Priors,
+    evidence: &Evidence,
+    idle_cpu_normal: bool,
+) -> Result<PosteriorResult, PosteriorError> {
     let cache = hot_path_cache(priors);
     let prior_scores = ClassScores {
         useful: ln_checked(priors.classes.useful.prior_prob, "priors.useful")?,
@@ -360,7 +370,7 @@ pub fn compute_posterior(
             priors,
             cache.abandoned.cpu_beta.as_ref(),
         )?;
-        let term = ClassScores {
+        let mut term = ClassScores {
             useful: log_lik_cpu(
                 cpu,
                 &priors.classes.useful,
@@ -381,6 +391,15 @@ pub fn compute_posterior(
             // Share the idle likelihood before clipping for both CPU formats.
             zombie: idle_likelihood,
         };
+        if idle_cpu_normal {
+            // A healthy event-driven process can wait through the entire
+            // measurement. Bound the CPU Bayes factor for abandonment against
+            // either useful class at one. Busy samples can still favor useful
+            // work. Apply the bound before clipping so the ledger and the
+            // posterior use the same term throughout the occupancy range.
+            term.useful = term.useful.max(idle_likelihood);
+            term.useful_bad = term.useful_bad.max(idle_likelihood);
+        }
         evidence_terms.push(EvidenceTerm {
             feature: "cpu".to_string(),
             log_likelihood: term,

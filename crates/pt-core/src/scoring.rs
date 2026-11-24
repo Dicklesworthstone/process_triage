@@ -32,10 +32,11 @@ use crate::collect::{ProcessActivity, ProcessRecord};
 use crate::config::{Policy, Priors, ResolvedConfig};
 use crate::decision::decision_store::{DecisionStore, LearnedPrior};
 use crate::decision::respawn_loop::{RespawnHistorySnapshot, RespawnLoopSummary};
+use crate::inference::posterior::compute_posterior_with_cpu_expectation;
 use crate::inference::{
-    apply_evidence_terms, compute_posterior_with_overrides, try_signature_fast_path, ClassScores,
-    Classification, CpuEvidence, Evidence, EvidenceLedger, EvidenceTerm, FastPathConfig,
-    FastPathResult, FastPathSkipReason, PosteriorResult, PriorContext,
+    apply_evidence_terms, resolve_priors, try_signature_fast_path, ClassScores, Classification,
+    CpuEvidence, Evidence, EvidenceLedger, EvidenceTerm, FastPathConfig, FastPathResult,
+    FastPathSkipReason, PosteriorResult, PriorContext,
 };
 use crate::supervision::signature::{
     BetaParams, MatchLevel, ProcessExpectations, ProcessMatchContext, SignatureDatabase,
@@ -1636,10 +1637,22 @@ impl Scorer {
         // Even an unchanged winning class can hide a probability change that
         // crosses an action threshold; retain the computed probabilities and
         // complete ledger rather than returning the prior-only shortcut.
-        let (mut posterior, source_info) =
-            compute_posterior_with_overrides(&prior_context, &evidence).ok()?;
+        // The expectation concerns measured recent activity. A native ps
+        // average covers the process lifetime and cannot establish a quiet
+        // window. Match the workload by command or arguments, including
+        // interpreted servers such as node running the Vite executable.
+        let idle_cpu_normal = activity.as_ref().is_some_and(|sample| {
+            sample.source == "procfs_window" && sample.cpu_ticks.is_some() && evidence.cpu.is_some()
+        }) && signature.as_ref().is_some_and(|matched| {
+            (matched.details.process_name_matched || matched.details.args_matched)
+                && matched.signature.expectations.idle_cpu_normal
+        });
+        let resolved = resolve_priors(&prior_context);
+        let mut posterior =
+            compute_posterior_with_cpu_expectation(&resolved.priors, &evidence, idle_cpu_normal)
+                .ok()?;
         let mut ledger = EvidenceLedger::from_posterior_result(&posterior, Some(pid), None);
-        let prior_source = source_info.source.to_string();
+        let prior_source = resolved.source_info.source.to_string();
         let signature_verification = signature_candidate
             .as_ref()
             .map(|candidate| signature_verification_reason(candidate, &posterior));
@@ -1702,6 +1715,12 @@ impl Scorer {
                 match_level_label(sig_match.level),
                 prior_source,
                 ledger.why_summary
+            );
+        }
+        if idle_cpu_normal {
+            ledger.top_evidence.push(
+                "The matched signature expects idle CPU. Windowed CPU can support active work, but a quiet window contributes no evidence for abandonment."
+                    .to_string(),
             );
         }
         if let Some((_, explanation)) = signature_verification {
@@ -4850,6 +4869,101 @@ int main(int argc, char **argv) {
             .top_evidence
             .iter()
             .any(|line| line.contains("CPU occupancy 100.00%") && line.contains("0.100")));
+    }
+
+    #[test]
+    fn windowed_cpu_does_not_support_abandonment_of_an_idle_normal_server() {
+        let scorer = scorer_for_defaults();
+        let server = record(1234, "postgres", "postgres", FOUR_DAYS);
+        let build = record(2345, "cargo", "cargo build", FOUR_DAYS);
+        let vite = record(3456, "node", "node /app/node_modules/.bin/vite", FOUR_DAYS);
+        for process in [&server, &vite, &build] {
+            for percent in [0.0, 2.0, 10.0, 40.0, 80.0] {
+                let mut sample = sampled_idle(process);
+                sample.cpu_percent = Some(percent);
+                sample.cpu_ticks = Some((percent / 2.0) as u64);
+                if let Some(crate::collect::CpuOccupancy::Observed { occupancy, .. }) =
+                    &mut sample.cpu_occupancy
+                {
+                    *occupancy = percent / 100.0;
+                }
+                let mut observations = scorer.recorded_observations(process, None);
+                observations.activity = Some(sample);
+                let score = scorer
+                    .score_recorded(process, Evidence::from_snapshot(process), observations)
+                    .unwrap();
+                let cpu = score
+                    .posterior
+                    .evidence_terms
+                    .iter()
+                    .find(|term| term.feature == "cpu")
+                    .unwrap()
+                    .log_likelihood;
+                if process.pid != build.pid {
+                    assert!(cpu.abandoned <= cpu.useful && cpu.abandoned <= cpu.useful_bad);
+                    assert_eq!(cpu.zombie, cpu.abandoned);
+                    if percent == 0.0 {
+                        assert_eq!(cpu.abandoned, cpu.useful);
+                        assert_eq!(cpu.abandoned, cpu.useful_bad);
+                    } else if percent == 80.0 {
+                        assert!(cpu.useful > cpu.abandoned);
+                    }
+                } else if percent == 0.0 {
+                    assert!(
+                        cpu.abandoned > cpu.useful,
+                        "idle build still carries evidence"
+                    );
+                }
+                assert_eq!(
+                    score
+                        .ledger
+                        .top_evidence
+                        .iter()
+                        .any(|line| line.contains("expects idle CPU")),
+                    process.pid != build.pid
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn idle_normal_rule_requires_a_window_and_preserves_non_cpu_evidence() {
+        let scorer = scorer_for_defaults();
+        let mut process = record(1234, "postgres", "postgres", FOUR_DAYS);
+        process.state = crate::collect::ProcessState::Zombie;
+        let mut evidence = Evidence::from_snapshot(&process);
+        evidence.cpu = Some(CpuEvidence::Fraction { occupancy: 0.0 });
+        let baseline = scorer
+            .score_with_desktop(&process, evidence.clone(), None)
+            .unwrap();
+        let raw_cpu = baseline
+            .posterior
+            .evidence_terms
+            .iter()
+            .find(|term| term.feature == "cpu")
+            .unwrap();
+        assert!(raw_cpu.log_likelihood.abandoned > raw_cpu.log_likelihood.useful);
+
+        let mut observations = scorer.recorded_observations(&process, None);
+        observations.activity = Some(sampled_idle(&process));
+        let score = scorer
+            .score_recorded(&process, evidence, observations)
+            .unwrap();
+        for feature in ["runtime", "state_flag"] {
+            let before = baseline
+                .posterior
+                .evidence_terms
+                .iter()
+                .find(|term| term.feature == feature)
+                .unwrap();
+            let after = score
+                .posterior
+                .evidence_terms
+                .iter()
+                .find(|term| term.feature == feature)
+                .unwrap();
+            assert_eq!(before.log_likelihood, after.log_likelihood);
+        }
     }
 
     #[test]
