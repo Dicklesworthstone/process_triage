@@ -1065,3 +1065,130 @@ fn snapshot_exposes_sampled_activity_and_explicit_single_snapshot_mode() {
         }
     }
 }
+
+#[cfg(unix)]
+mod snapshot_completion {
+    use super::*;
+    use pt_core::config::Policy;
+    use pt_core::exit_codes::ExitCode;
+    use std::path::Path;
+
+    fn command(directory: &Path, minimal: bool) -> Command {
+        let config = directory.join("config");
+        std::fs::create_dir(&config).unwrap();
+        let mut policy = Policy::default();
+        // This protocol test needs no per-process inference or action advice.
+        policy.guardrails.min_process_age_seconds = u64::MAX;
+        std::fs::write(
+            config.join("policy.json"),
+            serde_json::to_vec(&policy).unwrap(),
+        )
+        .unwrap();
+        let mut cmd = pt_core();
+        cmd.env("PROCESS_TRIAGE_DATA", directory.join("data"))
+            .env("PROCESS_TRIAGE_RETENTION", "off")
+            .env("PT_SKIP_GLOBAL_LOCK", "1")
+            .env_remove("PT_CAPABILITIES_MANIFEST")
+            .arg("--config")
+            .arg(config)
+            .args(["--format", "jsonl", "agent", "snapshot", "--window-ms", "0"]);
+        if minimal {
+            cmd.arg("--minimal");
+        } else {
+            cmd.args(["--top", "1"]);
+        }
+        cmd
+    }
+
+    fn single_json_line(output: &std::process::Output) -> Value {
+        let stdout = std::str::from_utf8(&output.stdout).unwrap();
+        let lines: Vec<_> = stdout.lines().collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "snapshot must emit exactly one JSONL record: {stdout}"
+        );
+        let report: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(report["command"], "agent snapshot");
+        assert_eq!(
+            report["exit_code"].as_i64(),
+            output.status.code().map(i64::from)
+        );
+        report
+    }
+
+    #[test]
+    fn complete_snapshot_jsonl_matches_durable_artifacts() {
+        for minimal in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let output = command(directory.path(), minimal)
+                .assert()
+                .success()
+                .get_output()
+                .clone();
+            let report = single_json_line(&output);
+            assert_eq!(report["status"], "ok");
+            assert_eq!(report["complete"], true);
+            assert_eq!(report["scan"]["complete"], true);
+            assert!(report["errors"].as_array().unwrap().is_empty());
+            let session = Path::new(report["session_dir"].as_str().unwrap());
+            let saved_system: Value = serde_json::from_slice(
+                &std::fs::read(session.join("scan/system_state.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(saved_system, report["system_state"]);
+            let saved_health: Value =
+                serde_json::from_slice(&std::fs::read(session.join("scan/health.json")).unwrap())
+                    .unwrap();
+            assert_eq!(saved_health, report);
+            if !minimal {
+                assert!(session.join("scan/inventory.json").is_file());
+                assert!(session.join("inference/results.json").is_file());
+                let saved: Value = serde_json::from_slice(
+                    &std::fs::read(session.join("scan/process_snapshot.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(saved, report["process_snapshot"]);
+            }
+        }
+    }
+
+    #[test]
+    fn unavailable_or_timed_out_scan_keeps_diagnostics_and_refuses_diff_artifacts() {
+        for minimal in [true, false] {
+            for timed_out in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let mut cmd = command(directory.path(), minimal);
+                let expected = if timed_out {
+                    cmd.args(["--timeout", "0"]);
+                    ExitCode::TimeoutError
+                } else {
+                    let empty_path = directory.path().join("empty_path");
+                    std::fs::create_dir(&empty_path).unwrap();
+                    // Fail the real collector spawn without replacing any executable.
+                    cmd.env("PATH", &empty_path);
+                    ExitCode::InternalError
+                };
+                let output = cmd.assert().code(expected.as_i32()).get_output().clone();
+                let report = single_json_line(&output);
+                assert_ne!(report["status"], "ok");
+                assert_eq!(report["complete"], false);
+                assert_eq!(report["scan"]["complete"], false);
+                assert!(report["scan"]["processes_observed"].is_null());
+                assert!(!report["errors"].as_array().unwrap().is_empty());
+                assert!(report["system_state"].is_object());
+                assert!(report["system_state"]["census"].is_null());
+                let session = Path::new(report["session_dir"].as_str().unwrap());
+                assert!(session.join("scan/system_state.json").is_file());
+                for path in ["scan/inventory.json", "inference/results.json"] {
+                    assert!(!session.join(path).exists(), "failed scan published {path}");
+                }
+                let saved_health: Value = serde_json::from_slice(
+                    &std::fs::read(session.join("scan/health.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(saved_health, report);
+            }
+        }
+    }
+}

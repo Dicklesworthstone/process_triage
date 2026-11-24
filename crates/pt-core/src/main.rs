@@ -331,10 +331,11 @@ impl GlobalOpts {
     }
 }
 
-/// Format structured output for JSON/TOON modes, preserving token-efficient options.
+/// Format structured output for JSON/JSONL/TOON modes, preserving token-efficient options.
 fn format_structured_output(global: &GlobalOpts, value: serde_json::Value) -> String {
     match global.format {
         OutputFormat::Json => global.process_output(value),
+        OutputFormat::Jsonl => global.process_output_value(value).to_string(),
         OutputFormat::Toon => {
             let processed = global.process_output_value(value);
             encode_toon_value(&processed)
@@ -2491,8 +2492,37 @@ mod cli_definition_tests {
 
 #[cfg(test)]
 mod output_format_tests {
-    use super::parse_output_format;
+    use super::{format_structured_output, parse_output_format, Cli};
+    use clap::Parser;
     use pt_common::OutputFormat;
+
+    #[test]
+    fn structured_jsonl_is_one_record_and_preserves_field_selection() {
+        let selected = serde_json::json!({
+            "message": "first line\nsecond line",
+            "values": [1, 2, 3],
+        });
+        let payload = serde_json::json!({
+            "selected": selected,
+            "omitted": {"nested": true},
+        });
+        for select_fields in [false, true] {
+            let mut arguments = vec!["pt-core", "--format", "jsonl"];
+            if select_fields {
+                arguments.extend(["--fields", "selected"]);
+            }
+            let global = Cli::try_parse_from(arguments).unwrap().global;
+            let rendered = format_structured_output(&global, payload.clone());
+            assert_eq!(rendered.lines().count(), 1);
+            let decoded: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+            let expected = if select_fields {
+                serde_json::json!({"selected": selected})
+            } else {
+                payload.clone()
+            };
+            assert_eq!(decoded, expected);
+        }
+    }
 
     #[test]
     fn parse_output_format_supports_all_canonical_variants() {
@@ -30944,6 +30974,293 @@ mod snapshot_network_tests {
     }
 }
 
+/// Completion of requested snapshot collection and publication. Useful partial
+/// observations remain available, but are never advertised as a complete census
+/// or a successfully saved diff baseline.
+struct SnapshotCompletion {
+    scan: serde_json::Value,
+    census_complete: bool,
+    errors: Vec<serde_json::Value>,
+    inference_skipped_pids: Vec<u32>,
+    exit_code: ExitCode,
+}
+
+impl SnapshotCompletion {
+    fn from_scan(result: &Result<ScanResult, pt_core::collect::QuickScanError>) -> Self {
+        match result {
+            Ok(scan) => {
+                let complete = scan.metadata.warnings.is_empty();
+                Self {
+                    scan: serde_json::json!({
+                        "complete": complete,
+                        "processes_observed": scan.processes.len(),
+                        "warnings": scan.metadata.warnings,
+                        "error": null,
+                    }),
+                    census_complete: complete,
+                    errors: if complete {
+                        Vec::new()
+                    } else {
+                        vec![serde_json::json!({
+                            "stage": "scan",
+                            "message": "Process census is incomplete; compact diff artifacts were not published",
+                        })]
+                    },
+                    inference_skipped_pids: Vec::new(),
+                    exit_code: if complete {
+                        ExitCode::Clean
+                    } else {
+                        ExitCode::PartialFail
+                    },
+                }
+            }
+            Err(error) => {
+                use pt_core::collect::QuickScanError;
+                let exit_code = match error {
+                    QuickScanError::Timeout(_) => ExitCode::TimeoutError,
+                    QuickScanError::IoError(_) => ExitCode::IoError,
+                    QuickScanError::UnsupportedPlatform(_) => ExitCode::CapabilityError,
+                    _ => ExitCode::InternalError,
+                };
+                let message = error.to_string();
+                Self {
+                    scan: serde_json::json!({
+                        "complete": false,
+                        "processes_observed": null,
+                        "warnings": [],
+                        "error": message,
+                    }),
+                    census_complete: false,
+                    errors: vec![serde_json::json!({
+                        "stage": "scan",
+                        "message": message,
+                    })],
+                    inference_skipped_pids: Vec::new(),
+                    exit_code,
+                }
+            }
+        }
+    }
+
+    fn record_inference_error(&mut self, pid: u32, message: impl std::fmt::Display) {
+        self.inference_skipped_pids.push(pid);
+        self.errors.push(serde_json::json!({
+            "stage": "inference",
+            "pid": pid,
+            "message": message.to_string(),
+        }));
+        if self.exit_code == ExitCode::Clean {
+            self.exit_code = ExitCode::PartialFail;
+        }
+    }
+
+    fn record_artifact_error(&mut self, artifact: &str, error: impl std::fmt::Display) {
+        eprintln!("agent snapshot: failed to persist {artifact}: {error}");
+        self.errors.push(serde_json::json!({
+            "stage": "persistence",
+            "artifact": artifact,
+            "message": error.to_string(),
+        }));
+        // A failed required write means the requested saved snapshot is unusable,
+        // even when collection already reported a timeout or partial census.
+        self.exit_code = ExitCode::IoError;
+    }
+
+    fn status(&self) -> &'static str {
+        match self.exit_code {
+            ExitCode::Clean => "ok",
+            ExitCode::PartialFail => "partial",
+            _ => "error",
+        }
+    }
+
+    fn annotate(&self, output: &mut serde_json::Value) {
+        output["status"] = serde_json::json!(self.status());
+        output["complete"] = serde_json::json!(self.exit_code == ExitCode::Clean);
+        output["exit_code"] = serde_json::json!(self.exit_code.as_i32());
+        output["scan"] = self.scan.clone();
+        output["errors"] = serde_json::json!(self.errors);
+        output["inference_skipped_pids"] = serde_json::json!(self.inference_skipped_pids);
+    }
+}
+
+#[cfg(test)]
+mod snapshot_completion_tests {
+    use super::*;
+    use pt_core::collect::{QuickScanError, ScanMetadata};
+
+    fn scan(warnings: &[&str]) -> Result<ScanResult, QuickScanError> {
+        Ok(ScanResult {
+            processes: Vec::new(),
+            metadata: ScanMetadata {
+                scan_type: "quick".to_string(),
+                platform: "fixture".to_string(),
+                boot_id: None,
+                started_at: "2026-01-01T00:00:00Z".to_string(),
+                duration_ms: 1,
+                process_count: 0,
+                warnings: warnings
+                    .iter()
+                    .map(|warning| (*warning).to_string())
+                    .collect(),
+            },
+        })
+    }
+
+    #[test]
+    fn omitted_scan_rows_never_claim_a_complete_census() {
+        for (warnings, expected) in [
+            (Vec::new(), ExitCode::Clean),
+            (vec!["Line 2: invalid RSS"], ExitCode::PartialFail),
+        ] {
+            let completion = SnapshotCompletion::from_scan(&scan(&warnings));
+            let complete = expected == ExitCode::Clean;
+            assert_eq!(completion.exit_code, expected);
+            assert_eq!(completion.census_complete, complete);
+            assert_eq!(completion.scan["complete"], complete);
+            assert_eq!(completion.scan["processes_observed"], 0);
+            assert_eq!(completion.scan["warnings"], serde_json::json!(warnings));
+            let mut output = serde_json::json!({"system_state": {"host_observation": true}});
+            completion.annotate(&mut output);
+            assert_eq!(output["complete"], complete);
+            assert_eq!(output["exit_code"], expected.as_i32());
+            assert_eq!(output["scan"], completion.scan);
+            assert_eq!(output["system_state"]["host_observation"], true);
+        }
+    }
+
+    #[test]
+    fn scan_errors_retain_diagnostics_and_specific_exit_codes() {
+        for (error, expected) in [
+            (
+                QuickScanError::Timeout(Duration::from_secs(3)),
+                ExitCode::TimeoutError,
+            ),
+            (
+                QuickScanError::IoError(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "owned scan pipe unavailable",
+                )),
+                ExitCode::IoError,
+            ),
+            (
+                QuickScanError::UnsupportedPlatform("fixture-os".to_string()),
+                ExitCode::CapabilityError,
+            ),
+            (
+                QuickScanError::CommandFailed("owned collector unavailable".to_string()),
+                ExitCode::InternalError,
+            ),
+            (
+                QuickScanError::ParseError {
+                    message: "invalid collector header".to_string(),
+                    line_num: 1,
+                },
+                ExitCode::InternalError,
+            ),
+        ] {
+            let message = error.to_string();
+            let completion = SnapshotCompletion::from_scan(&Err(error));
+            assert_eq!(completion.exit_code, expected);
+            assert_eq!(completion.status(), "error");
+            assert!(!completion.census_complete);
+            assert_eq!(completion.scan["complete"], false);
+            assert!(completion.scan["processes_observed"].is_null());
+            assert!(completion
+                .errors
+                .iter()
+                .any(|error| error["message"].as_str() == Some(message.as_str())));
+            let mut output = serde_json::json!({});
+            completion.annotate(&mut output);
+            assert_eq!(output["complete"], false);
+            assert_eq!(output["exit_code"], expected.as_i32());
+        }
+    }
+
+    #[test]
+    fn inference_failure_preserves_valid_census_but_marks_snapshot_partial() {
+        let mut completion = SnapshotCompletion::from_scan(&scan(&[]));
+        completion.record_inference_error(71, "posterior unavailable");
+        completion.record_inference_error(72, "no feasible decision");
+        assert!(completion.census_complete);
+        assert_eq!(completion.scan["complete"], true);
+        assert_eq!(completion.exit_code, ExitCode::PartialFail);
+        assert_eq!(completion.status(), "partial");
+        assert_eq!(completion.inference_skipped_pids, vec![71, 72]);
+        let mut output = serde_json::json!({});
+        completion.annotate(&mut output);
+        assert_eq!(output["complete"], false);
+        assert_eq!(
+            output["inference_skipped_pids"],
+            serde_json::json!([71, 72])
+        );
+        assert_eq!(output["errors"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn actual_artifact_publication_errors_invalidate_completion_and_preserve_scan_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let id = SessionId::new();
+        let handle = SessionStore::at_data_dir(directory.path())
+            .create(&SessionManifest::new(
+                &id,
+                None,
+                SessionMode::RobotPlan,
+                None,
+            ))
+            .unwrap();
+        // A directory at the destination fails even when tests run as root.
+        let inventory_path = handle.dir.join("scan/inventory.json");
+        std::fs::create_dir(&inventory_path).unwrap();
+        let error = persist_inventory(
+            &handle,
+            &id.0,
+            "fixture-host",
+            InventoryArtifact {
+                total_system_processes: 0,
+                protected_filtered: 0,
+                record_count: 0,
+                records: Vec::new(),
+            },
+        )
+        .unwrap_err();
+        let mut complete_scan = SnapshotCompletion::from_scan(&scan(&[]));
+        complete_scan.record_artifact_error("scan/inventory.json", &error);
+        assert!(complete_scan.census_complete);
+        assert_eq!(complete_scan.exit_code, ExitCode::IoError);
+        let mut output = serde_json::json!({});
+        complete_scan.annotate(&mut output);
+        assert_eq!(output["complete"], false);
+        assert_eq!(output["scan"]["complete"], true);
+        assert_eq!(output["errors"][0]["stage"], "persistence");
+        assert_eq!(output["errors"][0]["artifact"], "scan/inventory.json");
+        assert_eq!(output["errors"][0]["message"], error.to_string());
+        assert!(inventory_path.is_dir());
+
+        let inference_path = handle.dir.join("inference/results.json");
+        std::fs::create_dir(&inference_path).unwrap();
+        let error = persist_inference(
+            &handle,
+            &id.0,
+            "fixture-host",
+            InferenceArtifact {
+                candidate_count: 0,
+                candidates: Vec::new(),
+            },
+        )
+        .unwrap_err();
+        let mut failed_scan =
+            SnapshotCompletion::from_scan(&Err(QuickScanError::Timeout(Duration::from_secs(3))));
+        let scan_error = failed_scan.errors[0].clone();
+        failed_scan.record_artifact_error("inference/results.json", &error);
+        assert_eq!(failed_scan.exit_code, ExitCode::IoError);
+        assert_eq!(failed_scan.errors.len(), 2);
+        assert_eq!(failed_scan.errors[0], scan_error);
+        assert_eq!(failed_scan.errors[1]["artifact"], "inference/results.json");
+        assert!(inference_path.is_dir());
+    }
+}
+
 fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode {
     let config_options = ConfigOptions {
         config_dir: global.config.as_ref().map(PathBuf::from),
@@ -31027,13 +31344,12 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
         progress: None,
     };
 
-    let scan_result = match quick_scan(&scan_options) {
-        Ok(result) => Some(result),
-        Err(e) => {
-            eprintln!("agent snapshot: warning: process scan failed: {}", e);
-            None
-        }
-    };
+    let scanned = quick_scan(&scan_options);
+    let mut completion = SnapshotCompletion::from_scan(&scanned);
+    if let Err(error) = &scanned {
+        eprintln!("agent snapshot: process scan failed: {error}");
+    }
+    let scan_result = scanned.ok();
 
     let (mut system_state, cgroup_cpu) = match &scan_result {
         Some(scan) if args.minimal => collect_observational_activity(
@@ -31052,19 +31368,11 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
         ),
         None => (collect_system_state(None), CgroupCpuWindow::default()),
     };
-    if args.minimal {
-        if let Some(system) = system_state.as_object_mut() {
-            if scan_result
-                .as_ref()
-                .is_none_or(|scan| !scan.metadata.warnings.is_empty())
-            {
-                system.insert("census".into(), serde_json::Value::Null);
-            }
-        }
+    if !completion.census_complete {
+        system_state["census"] = serde_json::Value::Null;
     }
     if let Err(error) = write_system_state_to_session(&handle, &system_state) {
-        eprintln!("agent snapshot: {error}");
-        return ExitCode::InternalError;
+        completion.record_artifact_error("scan/system_state.json", error);
     }
     let pressure = PlanningPressure::from_system_state(&system_state);
     let responsible_units = scan_result
@@ -31100,10 +31408,10 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                 serde_json::json!("scan/system_state.json"),
             );
         }
-        let output = serde_json::json!({
+        let mut output = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
             "command": "agent snapshot",
-            "status": "ok",
+            "status": completion.status(),
             "pt_version": env!("CARGO_PKG_VERSION"),
             "session_id": session_id.0,
             "host_id": host_id,
@@ -31118,26 +31426,25 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
             "responsible_units": units,
             "memory_limits": responsible_units.as_ref().map(memory_limit_report),
             "agent_activity": agent_activity.as_ref().map(|report| agent_activity_output(report, Some(10))),
-            "scan": {
-                "complete": scan_result.as_ref().is_some_and(|scan| scan.metadata.warnings.is_empty()),
-                "processes_observed": scan_result.as_ref().map(|scan| scan.processes.len()),
-                "warnings": scan_result.as_ref().map(|scan| &scan.metadata.warnings),
-            },
         });
+        completion.annotate(&mut output);
         if let Err(error) =
             pt_core::session::write_json_pretty(&handle.dir.join("scan/health.json"), &output)
         {
-            eprintln!("agent snapshot: persist minimal health observation: {error}");
-            return ExitCode::IoError;
+            completion.record_artifact_error("scan/health.json", error);
+            completion.annotate(&mut output);
         }
         match global.format {
-            OutputFormat::Json | OutputFormat::Toon => {
+            OutputFormat::Json | OutputFormat::Jsonl | OutputFormat::Toon => {
                 println!("{}", format_structured_output(global, output))
             }
-            OutputFormat::Jsonl => println!("{output}"),
             OutputFormat::Exitcode => {}
             _ => {
-                println!("agent snapshot {}: host observations only", session_id);
+                println!(
+                    "agent snapshot {}: {} (host observations only)",
+                    session_id,
+                    completion.status()
+                );
                 println!("Session: {}", handle.dir.display());
                 if let Some(assessment) = system_state.get("assessment") {
                     println!("Pressure: {}", assessment["worst"]);
@@ -31150,7 +31457,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                 }
             }
         }
-        return ExitCode::Clean;
+        return completion.exit_code;
     }
 
     let caps = get_capabilities();
@@ -31179,18 +31486,22 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
             "responsible_units": table,
             "agent_activity": agent_activity.as_ref().map(|report| agent_activity_output(report, None)),
         });
-        if let Err(error) = std::fs::write(
-            handle.dir.join("scan/responsible_units.json"),
-            serde_json::to_vec_pretty(&artifact).unwrap(),
+        if let Err(error) = pt_core::session::write_json_pretty(
+            &handle.dir.join("scan/responsible_units.json"),
+            &artifact,
         ) {
-            eprintln!("agent snapshot: warning: failed to persist workload attribution: {error}");
+            completion.record_artifact_error("scan/responsible_units.json", error);
         }
     }
     let mut pressure_decisions = Vec::new();
     let mut fdr_control = None;
 
-    // Persist compact artifacts when we have a scan result.
-    if let Some(ref scan_result) = scan_result {
+    // A partial census must not become a diff baseline: missing processes
+    // would otherwise look like verified departures in the next comparison.
+    if let Some(scan_result) = scan_result
+        .as_ref()
+        .filter(|scan| scan.metadata.warnings.is_empty())
+    {
         let filter_result = filter_planning_scan(&protected_filter, scan_result, &mut scorer);
         let min_age = policy.guardrails.min_process_age_seconds;
         let plan_eligible: Vec<&ProcessRecord> = filter_result
@@ -31229,6 +31540,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
         let mut supervision = pt_core::supervision::SupervisionDetector::for_scan();
         for proc in plan_eligible {
             let Some(score) = scorer.score(proc, Evidence::from_snapshot(proc)) else {
+                completion.record_inference_error(proc.pid.0, "Process scoring unavailable");
                 continue;
             };
             let posterior = &score.posterior.posterior;
@@ -31240,7 +31552,10 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                 &pressure.for_process(proc, score.activity.as_ref()),
             ) {
                 Ok(inputs) => inputs,
-                Err(_) => continue,
+                Err(error) => {
+                    completion.record_inference_error(proc.pid.0, error);
+                    continue;
+                }
             };
             if inputs.report.enabled {
                 pressure_decisions.push(serde_json::json!({
@@ -31380,14 +31695,18 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
             records: persisted_inventory_records,
         };
         if let Err(error) = persist_inventory(&handle, &session_id.0, &host_id, inv_artifact) {
-            eprintln!("agent snapshot: warning: failed to persist inventory artifact: {error}");
+            completion.record_artifact_error("scan/inventory.json", error);
         }
-        let inf_artifact = InferenceArtifact {
-            candidate_count: persisted_inference_records.len(),
-            candidates: persisted_inference_records,
-        };
-        if let Err(error) = persist_inference(&handle, &session_id.0, &host_id, inf_artifact) {
-            eprintln!("agent snapshot: warning: failed to persist inference artifact: {error}");
+        // A complete inventory can remain useful even when scoring failed, but
+        // omitted inference rows must not appear to be absent candidates.
+        if completion.inference_skipped_pids.is_empty() {
+            let inf_artifact = InferenceArtifact {
+                candidate_count: persisted_inference_records.len(),
+                candidates: persisted_inference_records,
+            };
+            if let Err(error) = persist_inference(&handle, &session_id.0, &host_id, inf_artifact) {
+                completion.record_artifact_error("inference/results.json", error);
+            }
         }
     }
 
@@ -31501,13 +31820,14 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
         None
     };
 
+    let mut process_snapshot_saved = false;
     if let Some(snapshot) = &process_snapshot {
-        if let Err(error) = pt_core::session::write_json_pretty(
+        match pt_core::session::write_json_pretty(
             &handle.dir.join("scan/process_snapshot.json"),
             snapshot,
         ) {
-            eprintln!("agent snapshot: failed to persist process observation: {error}");
-            return ExitCode::InternalError;
+            Ok(()) => process_snapshot_saved = true,
+            Err(error) => completion.record_artifact_error("scan/process_snapshot.json", error),
         }
     }
 
@@ -31528,38 +31848,43 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
         },
     });
 
+    let mut output = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "command": "agent snapshot",
+        "pt_version": env!("CARGO_PKG_VERSION"),
+        "session_id": session_id.0,
+        "host_id": host_id,
+        "timestamp": timestamp.to_rfc3339(),
+        "generated_at": timestamp.to_rfc3339(),
+        "label": args.label,
+        "session_dir": handle.dir.display().to_string(),
+        "context_path": handle.context_path().display().to_string(),
+        "system_state": system_state,
+        "capabilities": capabilities_summary,
+        "activity_window_ms": args.window_ms,
+        "pressure_decisions": pressure_decisions,
+        "fdr_control": fdr_control,
+        "responsible_units": responsible_units,
+        "memory_limits": responsible_units.as_ref().map(memory_limit_report),
+        "agent_activity": agent_activity.as_ref().map(|report| agent_activity_output(report, None)),
+    });
+    if let Some(procs) = &process_snapshot {
+        output["process_snapshot"] = procs.clone();
+        if process_snapshot_saved {
+            output["process_snapshot_path"] =
+                serde_json::json!(handle.dir.join("scan/process_snapshot.json"));
+        }
+    }
+    completion.annotate(&mut output);
+    if let Err(error) =
+        pt_core::session::write_json_pretty(&handle.dir.join("scan/health.json"), &output)
+    {
+        completion.record_artifact_error("scan/health.json", error);
+        completion.annotate(&mut output);
+    }
+
     match global.format {
-        OutputFormat::Json | OutputFormat::Toon => {
-            let mut output = serde_json::json!({
-                "schema_version": SCHEMA_VERSION,
-                "command": "agent snapshot",
-                "status": "ok",
-                "pt_version": env!("CARGO_PKG_VERSION"),
-                "session_id": session_id.0,
-                "host_id": host_id,
-                "timestamp": timestamp.to_rfc3339(),
-                "generated_at": timestamp.to_rfc3339(),
-                "label": args.label,
-                "session_dir": handle.dir.display().to_string(),
-                "context_path": handle.context_path().display().to_string(),
-                "system_state": system_state,
-                "capabilities": capabilities_summary,
-                "activity_window_ms": args.window_ms,
-                "pressure_decisions": pressure_decisions,
-                "fdr_control": fdr_control,
-                "responsible_units": responsible_units,
-                "memory_limits": responsible_units.as_ref().map(memory_limit_report),
-                "agent_activity": agent_activity.as_ref().map(|report| agent_activity_output(report, None)),
-            });
-            if let Some(procs) = &process_snapshot {
-                if let Some(out_mut) = output.as_object_mut() {
-                    out_mut.insert("process_snapshot".to_string(), procs.clone());
-                    out_mut.insert(
-                        "process_snapshot_path".to_string(),
-                        serde_json::json!(handle.dir.join("scan/process_snapshot.json")),
-                    );
-                }
-            }
+        OutputFormat::Json | OutputFormat::Jsonl | OutputFormat::Toon => {
             println!("{}", format_structured_output(global, output));
         }
         OutputFormat::Summary => {
@@ -31578,8 +31903,12 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
             println!(
-                "[{}] agent snapshot: created ({} procs, {:.0}/{:.0}GB mem)",
-                session_id, procs, mem, total
+                "[{}] agent snapshot: {} ({} procs, {:.0}/{:.0}GB mem)",
+                session_id,
+                completion.status(),
+                procs,
+                mem,
+                total
             );
             for line in workload_summary_lines(&system_state["workloads"]) {
                 println!("{line}");
@@ -31589,6 +31918,10 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
         _ => {
             println!("# pt-core agent snapshot");
             println!();
+            println!("Status: {}", completion.status());
+            for error in &completion.errors {
+                println!("  {}: {}", error["stage"], error["message"]);
+            }
             println!("Session: {}", session_id);
             println!("Host: {}", host_id);
             println!("Dir: {}", handle.dir.display());
@@ -31681,7 +32014,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                             }
                         }
                     }
-                    if args.include_network {
+                    if args.include_network && process_snapshot_saved {
                         println!(
                             "  Network details: {}",
                             handle.dir.join("scan/process_snapshot.json").display()
@@ -31698,7 +32031,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
         }
     }
 
-    ExitCode::Clean
+    completion.exit_code
 }
 
 /// `agent_liveness` block for plan/explain output (`None` for non-agents).
@@ -33062,7 +33395,10 @@ fn collect_observational_activity(
         .as_ref()
         .map(|(before, started, _, _)| (before, started.elapsed()));
     let window = planning_pressure_window(&mut snapshot, baseline, requested);
-    let mut system = system_state_from_pressure(snapshot, window, Some(population));
+    // An incomplete population cannot establish zombie/D-state counts or the
+    // pressure regimes derived from that census.
+    let mut system =
+        system_state_from_pressure(snapshot, window, census_complete.then_some(population));
     system["cpu_usage"] = serde_json::json!(cpu_usage.ok());
     system["io_accounting"] = serde_json::json!(io_accounting.ok());
     let cgroup_cpu = cgroup_sampler
@@ -45542,8 +45878,7 @@ impl WatchMetricBaseline {
                 if self.active {
                     if metric.recovered(current, reference) {
                         self.active = false;
-                        self.value =
-                            Some(reference + Self::SAMPLE_WEIGHT * (current - reference));
+                        self.value = Some(reference + Self::SAMPLE_WEIGHT * (current - reference));
                         "baseline_recovered"
                     } else if resumed {
                         "baseline_observation_resumed"
@@ -46712,8 +47047,7 @@ mod watch_tests {
         assert!(baseline
             .observe(&baseline_state(Some(3.0), Some(8.0)), "improving")
             .is_empty());
-        let recovered =
-            baseline.observe(&baseline_state(Some(2.5), Some(8.5)), "recovered");
+        let recovered = baseline.observe(&baseline_state(Some(2.5), Some(8.5)), "recovered");
         assert_eq!(recovered.len(), 2);
         for event in &recovered {
             assert_eq!(event["event"], "baseline_recovered");
@@ -46850,8 +47184,9 @@ mod watch_tests {
             .is_empty());
         let prior = baseline.load1.value;
         for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
-            let event =
-                baseline.load1.observe(WatchBaselineMetric::Load, Some(invalid), "invalid");
+            let event = baseline
+                .load1
+                .observe(WatchBaselineMetric::Load, Some(invalid), "invalid");
             if let Some(event) = event {
                 assert_eq!(event["event"], "baseline_observation_unavailable");
                 assert!(event["current"].is_null());

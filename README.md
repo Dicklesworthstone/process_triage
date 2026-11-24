@@ -854,6 +854,28 @@ decisions. Use `load_aware.pressure` to tune the new model; set
 `load_aware.enabled` to `false` to use evidence-only losses. The default policy
 continues to leave load-aware decisions disabled.
 
+#### Snapshot completeness
+
+Both full and minimal `agent snapshot` reports expose `status`, `complete`,
+`exit_code`, `scan`, and `errors`. A successful snapshot returns exit code 0;
+an incomplete process census or skipped inference returns 3, a collection timeout
+returns 22, and an I/O or required artifact-write failure returns 21. The report
+retains the original diagnostics and any usable observations. Both modes support
+one compact record per invocation with `--format jsonl`, and save their completion
+report to `scan/health.json`; a failure to save that report is itself reported
+in structured output and through the exit code.
+
+An incomplete census is never published as `scan/inventory.json` or
+`inference/results.json`, preventing missing observations from becoming false
+process departures in a later diff. A complete census can still produce a valid
+inventory when inference fails, but the incomplete inference artifact is withheld
+and `inference_skipped_pids` identifies the affected processes. Incomplete
+population data also cannot establish zombie/D-state census pressure.
+
+Here, `complete` describes the requested census, inference, and required artifact
+writes. Optional probe availability is reported separately, and completion does
+not imply that the host is healthy or that every sensor is available.
+
 #### Watch baselines
 
 `agent watch --format jsonl` tracks load and available-memory changes independently. It emits `baseline_anomaly` when load rises above 150% of its reference or available memory falls below 70%; both findings can appear in one tick. Ordinary readings update the reference with a 20% weight per observation. An active anomaly freezes its reference until observed load returns to at most 125%, or available memory to at least 85%, when `baseline_recovered` is emitted. Repeated unchanged incidents do not repeatedly notify.
