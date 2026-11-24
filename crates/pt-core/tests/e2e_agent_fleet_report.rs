@@ -584,6 +584,15 @@ fn remote_apply_checks_host_and_document_before_resume_or_no_actions() {
         ] {
             let response = run(expected_host, expected_digest, 4);
             assert_eq!(response["error"], "fleet_binding_mismatch");
+            assert_eq!(response["failure_type"], "policy_blocked");
+            assert_eq!(response["automatic_retry"], false);
+            assert_eq!(
+                response["recovery_hint"]["agent_next_step"],
+                format!(
+                    "pt --format json agent sessions --session '{}' --detail",
+                    session_id.0
+                )
+            );
             assert_eq!(
                 response["expected_execution_binding"]["host_id"],
                 expected_host

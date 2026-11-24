@@ -745,7 +745,51 @@ fn apply_with_args(
     (status, json)
 }
 
-#[cfg(target_os = "linux")]
+fn assert_recovery_is_persisted(
+    data_dir: &Path,
+    session: &str,
+    result: &Value,
+    expected_category: &str,
+) {
+    let outcome = &result["outcomes"][0];
+    assert_eq!(outcome["failure_type"], expected_category, "{result}");
+    assert_eq!(outcome["automatic_retry"], false, "{result}");
+    assert!(
+        !outcome["diagnosis"].as_str().unwrap().is_empty(),
+        "{result}"
+    );
+    assert!(
+        !outcome["recovery_hint"]["agent_next_step"]
+            .as_str()
+            .unwrap()
+            .is_empty(),
+        "{result}"
+    );
+    let handle = SessionStore::at_data_dir(data_dir)
+        .open(&SessionId::parse(session).unwrap())
+        .unwrap();
+    let saved = fs::read_to_string(handle.dir.join("action/outcomes.jsonl")).unwrap();
+    let persisted: Value = saved
+        .lines()
+        .rev()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|saved| saved["action_id"] == outcome["action_id"])
+        .expect("the actual failure was durably checkpointed");
+    for key in [
+        "failure_type",
+        "diagnosis",
+        "recovery_hint",
+        "automatic_retry",
+        "error",
+        "reason",
+    ] {
+        assert_eq!(
+            persisted[key], outcome[key],
+            "saved {key} differs from CLI output: {result}"
+        );
+    }
+}
+
 fn recorded_action_command(
     data_dir: &Path,
     config_dir: &Path,
@@ -921,6 +965,56 @@ fn agent_apply_rejects_unbound_memory_caps_before_prechecks_or_actions() {
 }
 
 #[test]
+fn agent_apply_recovery_replans_stale_identities_and_leaves_success_unmodified() {
+    let data_dir = TempDir::new().expect("data dir");
+    let config_dir = TempDir::new().expect("config dir");
+    write_test_policy(config_dir.path());
+    let victim = ForeignTarget::spawn("sleep 386");
+    let identity = live_identity(victim.pid);
+    let original_nice = nice_of(victim.pid).unwrap();
+    let target = format!("{}:{}", victim.pid, identity.start_id.0);
+    let mut stale = identity.clone();
+    stale.uid = stale.uid.wrapping_add(1);
+    let session = session_with_plan(data_dir.path(), plan_action(Action::Renice, &stale));
+
+    // Preview and execution use different admission paths. Both must retain the
+    // original identity refusal and persist the same safe, actionable response.
+    for extra in [&["--dry-run"][..], &[][..]] {
+        let (_, result) =
+            apply_with_args(data_dir.path(), config_dir.path(), &session, &target, extra);
+        assert_recovery_is_persisted(data_dir.path(), &session, &result, "identity_mismatch");
+        let outcome = &result["outcomes"][0];
+        assert_eq!(outcome["recovery_hint"]["recommended_action"], "replan");
+        assert_eq!(
+            outcome["recovery_hint"]["agent_next_step"],
+            "pt --format json agent plan"
+        );
+        assert!(
+            outcome.get("action").is_none(),
+            "refusal is not execution: {result}"
+        );
+        assert!(outcome.get("executed_at").is_none(), "{result}");
+        assert!(victim.alive());
+        assert_eq!(live_identity(victim.pid), identity);
+        assert_eq!(nice_of(victim.pid), Ok(original_nice));
+        assert!(!data_dir.path().join("rate_limit.json").exists());
+    }
+
+    let fresh = session_with_plan(data_dir.path(), plan_action(Action::Renice, &identity));
+    let (status, result) = apply(data_dir.path(), config_dir.path(), &fresh, &target);
+    assert_eq!(status, "success", "{result}");
+    assert!(
+        result["outcomes"][0].get("failure_type").is_none(),
+        "{result}"
+    );
+    assert!(
+        result["outcomes"][0].get("recovery_hint").is_none(),
+        "{result}"
+    );
+    assert!(victim.alive());
+}
+
+#[test]
 fn agent_apply_refuses_the_live_protected_group_without_spending_budget() {
     let data_dir = TempDir::new().expect("data dir");
     let config_dir = TempDir::new().expect("config dir");
@@ -951,6 +1045,43 @@ fn agent_apply_refuses_the_live_protected_group_without_spending_budget() {
     assert_eq!(
         json["outcomes"][0]["violation"]["rule"], "guardrails.protected_groups",
         "{json}"
+    );
+    assert_recovery_is_persisted(
+        data_dir.path(),
+        &blocked_session,
+        &json,
+        "process_protected",
+    );
+    assert_eq!(
+        json["outcomes"][0]["recovery_hint"]["agent_next_step"],
+        format!(
+            "pt --format json agent sessions --session '{}' --detail",
+            blocked_session
+        )
+    );
+    // Exercise the suggested command through the real CLI. Session inspection
+    // needs no target selector and reads the saved failure without resolving a
+    // possibly reused numeric PID.
+    let (inspection_code, inspection) = recorded_action_command(
+        data_dir.path(),
+        config_dir.path(),
+        &blocked_session,
+        "inspect-protected-recovery",
+        &[
+            "--format",
+            "json",
+            "agent",
+            "sessions",
+            "--session",
+            &blocked_session,
+            "--detail",
+        ],
+    );
+    assert_eq!(inspection_code, Some(0), "{inspection}");
+    assert_eq!(inspection["session_id"], blocked_session);
+    assert_eq!(
+        inspection["outcomes"][0]["recovery_hint"], json["outcomes"][0]["recovery_hint"],
+        "the suggested inspection command must expose the saved failure"
     );
     assert!(victim.alive(), "the protected exact target must survive");
     assert_eq!(live_identity(victim.pid), identity);
@@ -4993,6 +5124,11 @@ fn agent_apply_zombie_route_reports_non_reaping_parent() {
     let (status, json) = apply(data_dir.path(), config_dir.path(), &s, &target);
     assert_ne!(status, "success", "non-reaping parent: {json}");
     assert!(json.to_string().contains("persists"), "{json}");
+    assert_recovery_is_persisted(data_dir.path(), &s, &json, "unexpected_error");
+    assert_eq!(
+        json["outcomes"][0]["recovery_hint"]["recommended_action"],
+        "investigate"
+    );
     assert!(parent.alive(), "the parent must not be harmed");
     assert_eq!(state_of(zombie_pid), Some('Z'), "zombie still there");
 }
@@ -5078,6 +5214,9 @@ fn agent_apply_zero_timeout_refuses_before_mutation_or_budget_charge() {
         );
         assert_eq!(code, Some(22), "{result}");
         assert_eq!(result["status"], "timeout", "{result}");
+        assert_eq!(result["failure_type"], "timeout", "{result}");
+        assert_eq!(result["automatic_retry"], false);
+        assert_eq!(result["recovery_hint"]["recommended_action"], "verify_goal");
         assert_eq!(result["operation_timed_out"], true);
         assert_eq!(result["summary"]["attempted"], 0);
         assert!(result["outcomes"].as_array().unwrap().is_empty());
@@ -5169,6 +5308,7 @@ fn agent_apply_timeout_cannot_shorten_required_recent_io_observation() {
     assert_eq!(code, Some(4), "{result}");
     assert_eq!(result["operation_timed_out"], false);
     assert_eq!(result["outcomes"][0]["status"], "precheck_blocked");
+    assert_recovery_is_persisted(data_dir.path(), &session, &result, "pre_check_blocked");
     assert!(
         result["outcomes"][0]["reason"]
             .as_str()

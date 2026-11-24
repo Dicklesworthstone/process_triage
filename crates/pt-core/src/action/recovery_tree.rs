@@ -31,6 +31,12 @@ pub enum FailureCategory {
     IdentityMismatch,
     /// Action blocked by pre-check (data loss risk, session safety).
     PreCheckBlocked,
+    /// Required identity or safety evidence could not be collected.
+    EvidenceUnavailable,
+    /// The plan or active policy did not admit the requested action.
+    PolicyBlocked,
+    /// This platform cannot execute the requested action.
+    UnsupportedAction,
     /// Unknown or unanticipated failure.
     UnexpectedError,
 }
@@ -46,7 +52,45 @@ impl std::fmt::Display for FailureCategory {
             FailureCategory::ResourceConflict => write!(f, "resource_conflict"),
             FailureCategory::IdentityMismatch => write!(f, "identity_mismatch"),
             FailureCategory::PreCheckBlocked => write!(f, "pre_check_blocked"),
+            FailureCategory::EvidenceUnavailable => write!(f, "evidence_unavailable"),
+            FailureCategory::PolicyBlocked => write!(f, "policy_blocked"),
+            FailureCategory::UnsupportedAction => write!(f, "unsupported_action"),
             FailureCategory::UnexpectedError => write!(f, "unexpected_error"),
+        }
+    }
+}
+
+impl FailureCategory {
+    /// Preserve a runner's typed error without guessing from diagnostic text or
+    /// looking up a numeric PID that may already belong to a different process.
+    pub fn from_action_error(error: &super::executor::ActionError) -> Self {
+        use super::executor::ActionError;
+        match error {
+            ActionError::IdentityMismatch => Self::IdentityMismatch,
+            ActionError::ProcessNotFound => Self::ProcessNotFound,
+            ActionError::PermissionDenied => Self::PermissionDenied,
+            ActionError::Timeout => Self::Timeout,
+            ActionError::Failed(_) => Self::UnexpectedError,
+        }
+    }
+
+    /// The same mapping for completed asynchronous actions. Success and skipped
+    /// work have no failure category, even when they carry diagnostic details.
+    pub fn from_action_status(status: &super::executor::ActionStatus) -> Option<Self> {
+        use super::executor::ActionStatus;
+        match status {
+            ActionStatus::Success | ActionStatus::Skipped => None,
+            ActionStatus::IdentityMismatch => Some(Self::IdentityMismatch),
+            ActionStatus::ProcessNotFound => Some(Self::ProcessNotFound),
+            ActionStatus::PermissionDenied => Some(Self::PermissionDenied),
+            ActionStatus::Timeout => Some(Self::Timeout),
+            ActionStatus::Failed => Some(Self::UnexpectedError),
+            ActionStatus::PreCheckBlocked { check, .. } => Some(match check {
+                crate::plan::PreCheck::CheckNotProtected
+                | crate::plan::PreCheck::CheckSessionSafety => Self::ProcessProtected,
+                crate::plan::PreCheck::VerifyIdentity => Self::EvidenceUnavailable,
+                _ => Self::PreCheckBlocked,
+            }),
         }
     }
 }
@@ -96,6 +140,8 @@ pub enum RecoveryAction {
     WaitAndRetry { delay_ms: u64 },
     /// Skip this action (goal may be unachievable).
     Skip,
+    /// Collect a new plan, without carrying a stale numeric PID into an action.
+    Replan,
     /// Custom action with command.
     Custom { command: String },
 }
@@ -745,6 +791,126 @@ pub struct RecoveryHint {
     pub agent_next_step: String,
 }
 
+/// Recovery information emitted with an actual execution failure or refusal.
+/// These instructions are advisory: they never authorize another mutation or
+/// claim that a partially completed action was rolled back.
+#[derive(Debug, Clone, Serialize)]
+pub struct FailureRecovery {
+    pub failure_type: FailureCategory,
+    pub diagnosis: String,
+    pub recovery_hint: RecoveryHint,
+    pub automatic_retry: bool,
+}
+
+/// Safe production projection of the recovery model. The older tree templates
+/// include privileged signals and supervisor operations whose prerequisites are
+/// not established by an action error. Execution output instead offers a fresh
+/// plan, saved-evidence inspection, or owner review; it never probes or acts on a
+/// possibly recycled PID merely to produce a hint.
+pub fn advisory_recovery(
+    category: FailureCategory,
+    action: Option<Action>,
+    session: &pt_common::SessionId,
+) -> FailureRecovery {
+    // SessionId is a public tuple type. Quote it even though the CLI validates
+    // IDs, so library callers cannot turn a copyable hint into shell syntax.
+    let session_arg = format!("'{}'", session.0.replace('\'', "'\\''"));
+    let verify = format!("pt --format json agent verify --session {session_arg}");
+    let inspect = format!("pt --format json agent sessions --session {session_arg} --detail");
+    let replan = "pt --format json agent plan";
+    let operation = action.map_or("apply", Action::as_str);
+    let (diagnosis, recommended_action, explanation, next_step) = match category {
+        FailureCategory::IdentityMismatch => (
+            "The recorded process identity no longer matches the target; the saved action is invalid."
+                .to_string(),
+            RecoveryAction::Replan,
+            "Discard this stale action and review a newly collected plan. A reused PID must not inherit the previous approval.",
+            replan.to_string(),
+        ),
+        FailureCategory::EvidenceUnavailable => (
+            "Required identity or safety evidence is unavailable; action eligibility is unconfirmed."
+                .to_string(),
+            RecoveryAction::Replan,
+            "Review the reported failure and saved session evidence, then resolve the cause before collecting a fresh plan.",
+            inspect,
+        ),
+        FailureCategory::PermissionDenied => (
+            format!("The caller lacked permission to complete {operation}."),
+            RecoveryAction::EscalateToUser,
+            "Ask the process owner to review the required permissions and collect a new plan in an authorized context.",
+            inspect,
+        ),
+        FailureCategory::ProcessNotFound => (
+            "The target was no longer present when the action or its verification checked it."
+                .to_string(),
+            RecoveryAction::VerifyGoal,
+            "Inspect the saved execution evidence and goal state. Absence alone does not prove that this action succeeded.",
+            verify,
+        ),
+        FailureCategory::ProcessProtected => (
+            format!("A process or session protection gate blocked {operation}."),
+            RecoveryAction::EscalateToUser,
+            "Review the recorded protection with the owner. Preserve the protected process and select an eligible target in a new plan.",
+            inspect,
+        ),
+        FailureCategory::Timeout => (
+            format!("The {operation} operation reached its time limit."),
+            RecoveryAction::VerifyGoal,
+            "Inspect the saved execution and current postconditions before deciding on further work; a timeout does not establish that earlier effects were undone.",
+            verify,
+        ),
+        FailureCategory::SupervisorConflict => (
+            "Observed replacement-process evidence conflicts with the intended outcome."
+                .to_string(),
+            RecoveryAction::Investigate,
+            "Review the observed replacement and its supervisor. A supervisor action requires its own fresh, reviewed plan.",
+            verify,
+        ),
+        FailureCategory::ResourceConflict => (
+            format!("The resource required for {operation} is occupied or controlled elsewhere."),
+            RecoveryAction::Investigate,
+            "Inspect existing controller ownership and undo records before selecting another action.",
+            verify,
+        ),
+        FailureCategory::PreCheckBlocked => (
+            format!("A safety precheck blocked {operation}."),
+            RecoveryAction::Investigate,
+            "Inspect the recorded check and reason, resolve the underlying condition, and collect a fresh plan.",
+            inspect,
+        ),
+        FailureCategory::PolicyBlocked => (
+            format!("The saved plan or active policy did not admit {operation}."),
+            RecoveryAction::EscalateToUser,
+            "Review the recorded constraint or budget with the owner and select work that the active policy permits.",
+            inspect,
+        ),
+        FailureCategory::UnsupportedAction => (
+            format!("This platform does not support {operation}."),
+            RecoveryAction::EscalateToUser,
+            "Inspect available capabilities and choose a supported action in a fresh plan.",
+            "pt --format json agent capabilities".to_string(),
+        ),
+        FailureCategory::UnexpectedError => (
+            format!("Execution or verification of {operation} failed without a more specific typed cause."),
+            RecoveryAction::Investigate,
+            "Inspect the original error and saved execution evidence before considering another action. Partial effects remain possible.",
+            verify,
+        ),
+    };
+    FailureRecovery {
+        failure_type: category,
+        diagnosis,
+        recovery_hint: RecoveryHint {
+            recommended_action,
+            explanation: explanation.to_string(),
+            // Diagnostic next steps do not reverse or certify the prior action.
+            reversibility: None,
+            agent_next_step: next_step,
+        },
+        automatic_retry: false,
+    }
+}
+
 /// Action attempt record for audit trail.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionAttempt {
@@ -1267,6 +1433,144 @@ mod tests {
     use super::*;
 
     #[test]
+    fn production_recovery_preserves_typed_errors_and_does_not_guess_from_text() {
+        use super::super::executor::{ActionError, ActionStatus};
+
+        for (error, status, category) in [
+            (
+                ActionError::IdentityMismatch,
+                ActionStatus::IdentityMismatch,
+                FailureCategory::IdentityMismatch,
+            ),
+            (
+                ActionError::ProcessNotFound,
+                ActionStatus::ProcessNotFound,
+                FailureCategory::ProcessNotFound,
+            ),
+            (
+                ActionError::PermissionDenied,
+                ActionStatus::PermissionDenied,
+                FailureCategory::PermissionDenied,
+            ),
+            (
+                ActionError::Timeout,
+                ActionStatus::Timeout,
+                FailureCategory::Timeout,
+            ),
+            (
+                ActionError::Failed("permission denied; timeout; possible PID reuse".to_string()),
+                ActionStatus::Failed,
+                FailureCategory::UnexpectedError,
+            ),
+        ] {
+            assert_eq!(FailureCategory::from_action_error(&error), category);
+            assert_eq!(FailureCategory::from_action_status(&status), Some(category));
+        }
+        assert_eq!(
+            FailureCategory::from_action_status(&ActionStatus::Success),
+            None
+        );
+        assert_eq!(
+            FailureCategory::from_action_status(&ActionStatus::Skipped),
+            None
+        );
+    }
+
+    #[test]
+    fn production_recovery_never_authorizes_a_new_mutation_for_any_action() {
+        let session = pt_common::SessionId::new();
+        for action in [
+            Action::Keep,
+            Action::Kill,
+            Action::Pause,
+            Action::Resume,
+            Action::Renice,
+            Action::Restart,
+            Action::Freeze,
+            Action::Unfreeze,
+            Action::Throttle,
+            Action::CapMemory,
+            Action::Quarantine,
+            Action::Unquarantine,
+        ] {
+            for category in [
+                FailureCategory::PermissionDenied,
+                FailureCategory::ProcessNotFound,
+                FailureCategory::ProcessProtected,
+                FailureCategory::Timeout,
+                FailureCategory::SupervisorConflict,
+                FailureCategory::ResourceConflict,
+                FailureCategory::IdentityMismatch,
+                FailureCategory::PreCheckBlocked,
+                FailureCategory::EvidenceUnavailable,
+                FailureCategory::PolicyBlocked,
+                FailureCategory::UnsupportedAction,
+                FailureCategory::UnexpectedError,
+            ] {
+                let report = advisory_recovery(category, Some(action), &session);
+                assert!(!report.automatic_retry);
+                assert!(matches!(
+                    report.recovery_hint.recommended_action,
+                    RecoveryAction::Replan
+                        | RecoveryAction::VerifyGoal
+                        | RecoveryAction::Investigate
+                        | RecoveryAction::EscalateToUser
+                ));
+                assert!(report.recovery_hint.reversibility.is_none());
+                let next = &report.recovery_hint.agent_next_step;
+                assert!(!next.contains("<pid>"));
+                assert!(!next.contains("sudo "));
+                assert!(!next.contains("kill "));
+                assert!(!next.contains("--force"));
+                assert!(!next.contains("agent apply"));
+            }
+        }
+    }
+
+    #[test]
+    fn production_recovery_replans_without_reusing_identity_and_quotes_session_data() {
+        let session = pt_common::SessionId("pt-test'; touch /tmp/not-a-command; #".to_string());
+        let stale = advisory_recovery(
+            FailureCategory::IdentityMismatch,
+            Some(Action::Kill),
+            &session,
+        );
+        assert_eq!(
+            stale.recovery_hint.recommended_action,
+            RecoveryAction::Replan
+        );
+        assert_eq!(
+            stale.recovery_hint.agent_next_step,
+            "pt --format json agent plan"
+        );
+
+        let missing = advisory_recovery(
+            FailureCategory::ProcessNotFound,
+            Some(Action::Kill),
+            &session,
+        );
+        assert_eq!(
+            missing.recovery_hint.agent_next_step,
+            "pt --format json agent verify --session 'pt-test'\\''; touch /tmp/not-a-command; #'"
+        );
+        assert!(missing
+            .recovery_hint
+            .explanation
+            .contains("Absence alone does not prove"));
+        let timeout = advisory_recovery(FailureCategory::Timeout, None, &session);
+        assert!(timeout
+            .recovery_hint
+            .explanation
+            .contains("does not establish"));
+
+        let blocked = advisory_recovery(FailureCategory::PolicyBlocked, None, &session);
+        assert_eq!(
+            blocked.recovery_hint.agent_next_step,
+            "pt --format json agent sessions --session 'pt-test'\\''; touch /tmp/not-a-command; #' --detail"
+        );
+    }
+
+    #[test]
     fn test_kill_tree_has_permission_denied_branch() {
         let tree = RecoveryTree::kill_tree();
         let branch = tree.get_branch(FailureCategory::PermissionDenied);
@@ -1721,6 +2025,7 @@ mod tests {
             RecoveryAction::Investigate,
             RecoveryAction::EscalateToUser,
             RecoveryAction::Skip,
+            RecoveryAction::Replan,
             RecoveryAction::Escalate(Action::Kill),
             RecoveryAction::WaitAndRetry { delay_ms: 500 },
             RecoveryAction::Custom {

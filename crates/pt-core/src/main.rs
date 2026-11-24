@@ -35681,25 +35681,26 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         Ok(binding) => binding,
         Err(error) => {
             eprintln!("agent apply: {error}");
-            println!(
-                "{}",
-                format_structured_output(
-                    global,
-                    serde_json::json!({
-                        "session_id": sid.0,
-                        "mode": "robot_apply",
-                        "status": "blocked",
-                        "error": "fleet_binding_mismatch",
-                        "reason": error,
-                        "expected_execution_binding": {
-                            "host_id": args.expected_host_id,
-                            "session_id": sid.0,
-                            "plan_sha256": args.expected_plan_sha256,
-                        },
-                        "outcomes": [],
-                    })
-                )
+            let mut result = serde_json::json!({
+                "session_id": sid.0,
+                "mode": "robot_apply",
+                "status": "blocked",
+                "error": "fleet_binding_mismatch",
+                "reason": error,
+                "expected_execution_binding": {
+                    "host_id": args.expected_host_id,
+                    "session_id": sid.0,
+                    "plan_sha256": args.expected_plan_sha256,
+                },
+                "outcomes": [],
+            });
+            insert_apply_failure_recovery(
+                &sid,
+                None,
+                pt_core::action::FailureCategory::PolicyBlocked,
+                &mut result,
             );
+            println!("{}", format_structured_output(global, result));
             return ExitCode::PolicyBlocked;
         }
     };
@@ -36199,6 +36200,11 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         });
     }
 
+    let recovery_actions: HashMap<&str, &PlanAction> = plan
+        .actions
+        .iter()
+        .map(|action| (action.action_id.as_str(), action))
+        .collect();
     let mut outcomes: Vec<serde_json::Value> = Vec::new();
     let action_dir = handle.dir.join("action");
     let mut persistence_error = None;
@@ -36209,7 +36215,8 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     // outcome is recorded still cannot provide exactly-once execution on resume.
     macro_rules! checkpoint_outcome {
         ($outcome:expr) => {{
-            let outcome = $outcome;
+            let mut outcome = $outcome;
+            attach_apply_failure_recovery(&sid, &recovery_actions, &mut outcome);
             let persisted = append_action_outcomes(&action_dir, std::slice::from_ref(&outcome));
             outcomes.push(outcome);
             if let Err(error) = persisted {
@@ -36828,6 +36835,11 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                             "status": status,
                             "time_ms": elapsed_ms,
                         });
+                        if let Some(category) = pt_core::action::FailureCategory::from_action_status(
+                            &finished.result.status,
+                        ) {
+                            outcome["failure_type"] = serde_json::json!(category);
+                        }
                         if let Some(error) = finished.result.details {
                             outcome["error"] = serde_json::json!(error);
                         }
@@ -36836,6 +36848,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                         {
                             fields.extend(evidence.clone());
                         }
+                        attach_apply_failure_recovery(&sid, &recovery_actions, &mut outcome);
                         record_adaptive_term_outcome(
                             &config.config_dir,
                             &config.policy,
@@ -36876,6 +36889,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             macro_rules! checkpoint_outcome {
                 ($outcome:expr) => {{
                     let mut outcome = $outcome;
+                    attach_apply_failure_recovery(&sid, &recovery_actions, &mut outcome);
                     if finish_pending!(usize::MAX) {
                         // The current refusal is already observed. Preserve it
                         // in the response even if an earlier worker's durable
@@ -37120,11 +37134,11 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                         }
                         continue;
                     }
-                    Err(_) => {
+                    Err(error) => {
                         failed += 1;
                         let elapsed_ms = start.elapsed().as_millis() as u64;
                         checkpoint_outcome!(
-                            serde_json::json!({"action_id": action.action_id, "pid": action.target.pid.0, "status": "identity_check_failed", "time_ms": elapsed_ms})
+                            serde_json::json!({"action_id": action.action_id, "pid": action.target.pid.0, "status": "identity_check_failed", "error": error.to_string(), "time_ms": elapsed_ms})
                         );
                         emit_action_event(
                             pt_core::events::event_names::ACTION_FAILED,
@@ -37359,6 +37373,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                                 "action_id": action.action_id,
                                 "pid": action.target.pid.0,
                                 "status": "failed",
+                                "failure_type": pt_core::action::FailureCategory::from_action_error(&error),
                                 "error": error.to_string(),
                                 "kill_signal_delivered": false,
                                 "time_ms": start.elapsed().as_millis(),
@@ -37478,7 +37493,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     Err(e) => {
                         failed += 1;
                         let elapsed_ms = start.elapsed().as_millis() as u64;
-                        let mut outcome = serde_json::json!({"action_id": action.action_id, "pid": action.target.pid.0, "status": "failed", "error": format!("{:?}", e), "time_ms": elapsed_ms, "signal_path": signal_path, "kill_signal_delivered": kill_signal_delivered, "accounting_error": accounting_error});
+                        let mut outcome = serde_json::json!({"action_id": action.action_id, "pid": action.target.pid.0, "status": "failed", "failure_type": pt_core::action::FailureCategory::from_action_error(&e), "error": format!("{:?}", e), "time_ms": elapsed_ms, "signal_path": signal_path, "kill_signal_delivered": kill_signal_delivered, "accounting_error": accounting_error});
                         if let (Some(fields), Some(evidence)) =
                             (outcome.as_object_mut(), execution_evidence.as_object())
                         {
@@ -38050,6 +38065,99 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     }
 }
 
+/// Attach recovery before checkpointing so durable outcomes and CLI output carry
+/// the same diagnosis. Only exact statuses/check identifiers or a typed runner
+/// category establish the cause; free-form error strings are never classified.
+fn attach_apply_failure_recovery(
+    sid: &SessionId,
+    actions: &HashMap<&str, &PlanAction>,
+    outcome: &mut serde_json::Value,
+) {
+    use pt_core::action::FailureCategory;
+
+    let Some(action) = outcome
+        .get("action_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|id| actions.get(id))
+        .filter(|action| outcome["pid"].as_u64() == Some(u64::from(action.target.pid.0)))
+    else {
+        return;
+    };
+    let category = match outcome["status"].as_str() {
+        Some("identity_mismatch") => FailureCategory::IdentityMismatch,
+        Some("identity_check_failed") => FailureCategory::EvidenceUnavailable,
+        Some("timeout") => FailureCategory::Timeout,
+        Some("failed") => outcome
+            .get("failure_type")
+            .and_then(|value| serde_json::from_value::<FailureCategory>(value.clone()).ok())
+            .unwrap_or(FailureCategory::UnexpectedError),
+        Some("precheck_blocked") => match outcome["check"].as_str() {
+            Some("check_not_protected" | "check_session_safety") => {
+                FailureCategory::ProcessProtected
+            }
+            Some("revalidate_identity")
+                if outcome["reason"].as_str() == Some("identity_mismatch") =>
+            {
+                FailureCategory::IdentityMismatch
+            }
+            Some("revalidate_identity" | "verify_identity") => FailureCategory::EvidenceUnavailable,
+            _ => FailureCategory::PreCheckBlocked,
+        },
+        Some("blocked_by_policy") => {
+            if matches!(
+                outcome["reason"].as_str(),
+                Some("policy_evidence_unavailable" | "preview_budget_unavailable")
+            ) {
+                FailureCategory::EvidenceUnavailable
+            } else if matches!(
+                outcome["violation"]["kind"].as_str(),
+                Some(
+                    "protected_pattern"
+                        | "protected_pid"
+                        | "protected_ppid"
+                        | "protected_user"
+                        | "protected_group"
+                        | "protected_category"
+                )
+            ) {
+                FailureCategory::ProcessProtected
+            } else {
+                FailureCategory::PolicyBlocked
+            }
+        }
+        Some("blocked_by_constraints" | "blocked_by_plan") => FailureCategory::PolicyBlocked,
+        Some("unsupported_platform") => FailureCategory::UnsupportedAction,
+        // Success, previews and already-completed actions must never acquire a
+        // failure diagnosis from an unrelated informational/error field.
+        _ => return,
+    };
+    insert_apply_failure_recovery(sid, Some(action.action), category, outcome);
+}
+
+fn insert_apply_failure_recovery(
+    sid: &SessionId,
+    action: Option<Action>,
+    category: pt_core::action::FailureCategory,
+    outcome: &mut serde_json::Value,
+) {
+    let report = pt_core::action::recovery_tree::advisory_recovery(category, action, sid);
+    if let Some(fields) = outcome.as_object_mut() {
+        fields.insert(
+            "failure_type".to_string(),
+            serde_json::json!(report.failure_type),
+        );
+        fields.insert("diagnosis".to_string(), serde_json::json!(report.diagnosis));
+        fields.insert(
+            "recovery_hint".to_string(),
+            serde_json::json!(report.recovery_hint),
+        );
+        fields.insert(
+            "automatic_retry".to_string(),
+            serde_json::json!(report.automatic_retry),
+        );
+    }
+}
+
 fn apply_timeout_outcome(action: &PlanAction, elapsed: Duration) -> serde_json::Value {
     // Requested work must not masquerade as execution evidence. In particular,
     // do not attach `action` or `executed_at` until a runner has been admitted.
@@ -38099,7 +38207,18 @@ fn apply_refusal_document(
     message: &str,
     binding: Option<&ApplyBindingReceipt>,
 ) -> serde_json::Value {
+    use pt_core::action::FailureCategory;
+
     let mut result = serde_json::json!({"session_id": sid.0, "error": error, "message": message});
+    let category = match error {
+        "operation_timeout" => FailureCategory::Timeout,
+        "invalid_policy_snapshot" | "preview_budget_unavailable" => {
+            FailureCategory::EvidenceUnavailable
+        }
+        "confirmation_required" | "robot_mode_disabled" => FailureCategory::PolicyBlocked,
+        _ => FailureCategory::UnexpectedError,
+    };
+    insert_apply_failure_recovery(sid, None, category, &mut result);
     if let Some(binding) = binding {
         result["execution_binding"] = serde_json::json!(binding);
         result["mode"] = serde_json::json!("robot_apply");
