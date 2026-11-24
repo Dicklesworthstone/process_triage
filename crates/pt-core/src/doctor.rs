@@ -1844,7 +1844,14 @@ pub fn fix_script(report: &DoctorReport) -> String {
         if f.commands.is_empty() {
             continue;
         }
-        s.push_str(&format!("\n# [{:?}] {}: {}\n", f.level, f.id, f.summary));
+        // Summaries contain observed paths and process names. Keep controls,
+        // including newlines, printable inside this single shell comment.
+        s.push_str(&format!(
+            "\n# [{:?}] {}: {}\n",
+            f.level,
+            f.id,
+            f.summary.escape_debug()
+        ));
         for c in &f.commands {
             s.push_str(c);
             s.push('\n');
@@ -2943,5 +2950,25 @@ mod tests {
         assert!(script.contains("never runs"));
         assert!(script.contains("vm.vfs_cache_pressure=200"));
         assert!(script.starts_with("#!/bin/sh"));
+    }
+
+    #[test]
+    fn fix_script_keeps_multiline_host_labels_inside_comments() {
+        let mut report = healthy().report();
+        report.facts.pt_sessions = Some(SessionUsage {
+            root: "/archive/nightly\nsecond line\rlabel".into(),
+            sessions: 1001,
+            bytes: 0,
+            retention: None,
+        });
+        report.findings.clear();
+        check_pt(&report.facts, &mut report.findings);
+        let script = fix_script(&report);
+        assert!(script.contains(r"/archive/nightly\nsecond line\rlabel"));
+        let commands: Vec<_> = script
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect();
+        assert_eq!(commands, ["pt agent sessions --cleanup --older-than 7d"]);
     }
 }
