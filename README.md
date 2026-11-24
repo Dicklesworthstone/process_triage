@@ -854,6 +854,12 @@ decisions. Use `load_aware.pressure` to tune the new model; set
 `load_aware.enabled` to `false` to use evidence-only losses. The default policy
 continues to leave load-aware decisions disabled.
 
+#### Watch baselines
+
+`agent watch --format jsonl` tracks load and available-memory changes independently. It emits `baseline_anomaly` when load rises above 150% of its reference or available memory falls below 70%; both findings can appear in one tick. Ordinary readings update the reference with a 20% weight per observation. An active anomaly freezes its reference until observed load returns to at most 125%, or available memory to at least 85%, when `baseline_recovered` is emitted. Repeated unchanged incidents do not repeatedly notify.
+
+Missing or invalid readings emit `baseline_observation_unavailable` once and preserve any active incident. Returning observations emit `baseline_observation_resumed`, or the onset/recovery they establish. A first positive observation establishes a reference after an initial missing or zero reading. Zero available memory remains a real observation. Events include numeric or null `baseline` and `current` fields and a boolean `anomaly_active` field. These relative changes do not certify host health; the separate pressure-regime stream continues to report absolute pressure.
+
 #### Responsible workloads
 
 Full `agent plan` and `agent snapshot` reports include a `responsible_units`

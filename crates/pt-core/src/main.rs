@@ -44219,7 +44219,7 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
         progress: None,
     };
 
-    let mut baseline: Option<WatchBaseline> = None;
+    let mut baseline = WatchBaseline::default();
     let mut pressure_watch = WatchPressureState::new();
     let mut workload_watch = WatchWorkloadState::default();
     let mut memory_limit_watch = WatchMemoryLimitState::default();
@@ -44360,9 +44360,6 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
                 notify_args,
             );
         }
-        if baseline.is_none() {
-            baseline = Some(WatchBaseline::from_state(&system_state));
-        }
         if let Some(event) = check_goal_violation(&system_state, args) {
             emit_watch_event(
                 &event,
@@ -44372,7 +44369,7 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
                 notify_args,
             );
         }
-        if let Some(event) = check_baseline_anomaly(&system_state, baseline.as_ref()) {
+        for event in baseline.observe(&system_state, &timestamp) {
             emit_watch_event(
                 &event,
                 &notification_runner,
@@ -44631,9 +44628,50 @@ fn severity_label(severity: WatchSeverity) -> &'static str {
     }
 }
 
+#[derive(Default)]
 struct WatchBaseline {
-    load1: f64,
-    available_gb: f64,
+    load1: WatchMetricBaseline,
+    available_gb: WatchMetricBaseline,
+}
+
+/// Relative anomalies retain their pre-incident reference until an observed
+/// recovery. An unavailable sample cannot move that reference or clear a warning.
+#[derive(Default)]
+struct WatchMetricBaseline {
+    value: Option<f64>,
+    active: bool,
+    available: Option<bool>,
+}
+
+#[derive(Clone, Copy)]
+enum WatchBaselineMetric {
+    Load,
+    AvailableMemory,
+}
+
+impl WatchBaselineMetric {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Load => "load1",
+            Self::AvailableMemory => "memory_available_gb",
+        }
+    }
+
+    fn anomalous(self, current: f64, baseline: f64) -> bool {
+        let ratio = current / baseline;
+        match self {
+            Self::Load => ratio > 1.5,
+            Self::AvailableMemory => ratio < 0.7,
+        }
+    }
+
+    fn recovered(self, current: f64, baseline: f64) -> bool {
+        let ratio = current / baseline;
+        match self {
+            Self::Load => ratio <= 1.25,
+            Self::AvailableMemory => ratio >= 0.85,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -45459,11 +45497,104 @@ impl WatchPressureState {
 }
 
 impl WatchBaseline {
-    fn from_state(state: &serde_json::Value) -> Self {
-        Self {
-            load1: read_load1(state).unwrap_or(0.0),
-            available_gb: read_available_gb(state).unwrap_or(0.0),
+    /// Both metrics are independent: a load incident cannot hide memory loss.
+    fn observe(&mut self, state: &serde_json::Value, timestamp: &str) -> Vec<serde_json::Value> {
+        let mut events = Vec::with_capacity(2);
+        for (metric, current, baseline) in [
+            (
+                WatchBaselineMetric::Load,
+                read_load1(state),
+                &mut self.load1,
+            ),
+            (
+                WatchBaselineMetric::AvailableMemory,
+                read_available_gb(state),
+                &mut self.available_gb,
+            ),
+        ] {
+            if let Some(event) = baseline.observe(metric, current, timestamp) {
+                events.push(event);
+            }
         }
+        events
+    }
+}
+
+impl WatchMetricBaseline {
+    /// Twenty percent of each non-anomalous observed sample enters the reference.
+    /// Missing samples and active incidents never enter it. This is a relative
+    /// change detector; the independent pressure regimes diagnose absolute load.
+    const SAMPLE_WEIGHT: f64 = 0.2;
+
+    fn observe(
+        &mut self,
+        metric: WatchBaselineMetric,
+        current: Option<f64>,
+        timestamp: &str,
+    ) -> Option<serde_json::Value> {
+        let current = current.filter(|value| value.is_finite() && *value >= 0.0);
+        // Event values describe the comparison, before any reference update.
+        let reference = self.value;
+        let resumed = self.available == Some(false);
+        let event = if let Some(current) = current {
+            self.available = Some(true);
+            if let Some(reference) = reference.filter(|value| *value > 0.0) {
+                if self.active {
+                    if metric.recovered(current, reference) {
+                        self.active = false;
+                        self.value =
+                            Some(reference + Self::SAMPLE_WEIGHT * (current - reference));
+                        "baseline_recovered"
+                    } else if resumed {
+                        "baseline_observation_resumed"
+                    } else {
+                        return None;
+                    }
+                } else if metric.anomalous(current, reference) {
+                    // Freeze the pre-incident reference. Repeated abnormal
+                    // samples must not quietly redefine the problem as normal.
+                    self.active = true;
+                    "baseline_anomaly"
+                } else {
+                    self.value = Some(reference + Self::SAMPLE_WEIGHT * (current - reference));
+                    if resumed {
+                        "baseline_observation_resumed"
+                    } else {
+                        return None;
+                    }
+                }
+            } else {
+                // Zero is an observation, but not a usable ratio denominator.
+                // The first positive reading seeds the relative reference;
+                // absolute pressure monitoring remains independent throughout.
+                self.value = Some(current);
+                if resumed {
+                    "baseline_observation_resumed"
+                } else {
+                    return None;
+                }
+            }
+        } else {
+            if self.available == Some(false) {
+                return None;
+            }
+            self.available = Some(false);
+            "baseline_observation_unavailable"
+        };
+        Some(serde_json::json!({
+            "event": event,
+            "timestamp": timestamp,
+            "metric": metric.name(),
+            "baseline": reference,
+            "current": current,
+            "anomaly_active": self.active,
+            "baseline_method": "ewma_observed_non_anomalous_samples",
+            "sample_weight": Self::SAMPLE_WEIGHT,
+            "reason": current.is_none().then_some(
+                "Reading missing or invalid; the prior reference and any active anomaly are retained"
+            ),
+            "automatic_action_authorized": false,
+        }))
     }
 }
 
@@ -45512,40 +45643,6 @@ fn check_goal_violation(
         }
     }
 
-    None
-}
-
-fn check_baseline_anomaly(
-    state: &serde_json::Value,
-    baseline: Option<&WatchBaseline>,
-) -> Option<serde_json::Value> {
-    let baseline = baseline?;
-    if baseline.load1 > 0.0 {
-        if let Some(load1) = read_load1(state) {
-            if load1 > baseline.load1 * 1.5 {
-                return Some(serde_json::json!({
-                    "event": "baseline_anomaly",
-                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                    "metric": "load1",
-                    "baseline": format!("{:.2}", baseline.load1),
-                    "current": format!("{:.2}", load1),
-                }));
-            }
-        }
-    }
-    if baseline.available_gb > 0.0 {
-        if let Some(available) = read_available_gb(state) {
-            if available < baseline.available_gb * 0.7 {
-                return Some(serde_json::json!({
-                    "event": "baseline_anomaly",
-                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                    "metric": "memory_available_gb",
-                    "baseline": format!("{:.2}", baseline.available_gb),
-                    "current": format!("{:.2}", available),
-                }));
-            }
-        }
-    }
     None
 }
 
@@ -46572,23 +46669,196 @@ mod watch_tests {
         );
     }
 
+    fn baseline_state(load: Option<f64>, available_gb: Option<f64>) -> serde_json::Value {
+        serde_json::json!({
+            "load": [load, null, null],
+            "memory": {"available_gb": available_gb},
+        })
+    }
+
     #[test]
-    fn test_baseline_anomaly_load() {
-        let baseline_state = serde_json::json!({
-            "load": [1.0, 0.5, 0.2],
-            "memory": {"available_gb": 4.0}
-        });
-        let baseline = WatchBaseline::from_state(&baseline_state);
-        let current_state = serde_json::json!({
-            "load": [2.0, 1.0, 0.5],
-            "memory": {"available_gb": 4.0}
-        });
-        let event =
-            check_baseline_anomaly(&current_state, Some(&baseline)).expect("baseline anomaly");
-        assert_eq!(
-            event.get("event").and_then(|v| v.as_str()),
-            Some("baseline_anomaly")
+    fn watch_baseline_reports_both_incidents_without_normalizing_or_flooding() {
+        let mut baseline = WatchBaseline::default();
+        assert!(baseline
+            .observe(&baseline_state(Some(2.0), Some(10.0)), "initial")
+            .is_empty());
+        let incident = baseline_state(Some(4.0), Some(5.0));
+        let events = baseline.observe(&incident, "onset");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["metric"], "load1");
+        assert_eq!(events[1]["metric"], "memory_available_gb");
+        assert_eq!(events[0]["baseline"], 2.0);
+        assert_eq!(events[1]["baseline"], 10.0);
+        for event in &events {
+            assert_eq!(event["event"], "baseline_anomaly");
+            assert_eq!(event["timestamp"], "onset");
+            assert_eq!(event["anomaly_active"], true);
+            assert_eq!(event["automatic_action_authorized"], false);
+        }
+        for _ in 0..100 {
+            assert!(baseline.observe(&incident, "persistent").is_empty());
+        }
+        assert_eq!(baseline.load1.value, Some(2.0));
+        assert_eq!(baseline.available_gb.value, Some(10.0));
+        assert!(baseline.load1.active && baseline.available_gb.active);
+    }
+
+    #[test]
+    fn watch_baseline_recovery_uses_hysteresis_and_rearms() {
+        let mut baseline = WatchBaseline::default();
+        baseline.observe(&baseline_state(Some(2.0), Some(10.0)), "initial");
+        baseline.observe(&baseline_state(Some(4.0), Some(5.0)), "onset");
+        // Leaving the onset band alone does not establish recovery.
+        assert!(baseline
+            .observe(&baseline_state(Some(3.0), Some(8.0)), "improving")
+            .is_empty());
+        let recovered =
+            baseline.observe(&baseline_state(Some(2.5), Some(8.5)), "recovered");
+        assert_eq!(recovered.len(), 2);
+        for event in &recovered {
+            assert_eq!(event["event"], "baseline_recovered");
+            assert_eq!(event["anomaly_active"], false);
+        }
+        // The event exposes the incident's comparison anchor, not the EWMA
+        // that now incorporates the observed recovery.
+        assert_eq!(recovered[0]["baseline"], 2.0);
+        assert_eq!(recovered[1]["baseline"], 10.0);
+        assert!(baseline
+            .observe(&baseline_state(Some(2.5), Some(8.5)), "stable")
+            .is_empty());
+        let renewed = baseline.observe(&baseline_state(Some(5.0), Some(4.0)), "renewed");
+        assert_eq!(renewed.len(), 2);
+        assert!(renewed
+            .iter()
+            .all(|event| event["event"] == "baseline_anomaly"));
+    }
+
+    #[test]
+    fn watch_baseline_gaps_preserve_incidents_until_observed_recovery() {
+        let mut baseline = WatchBaseline::default();
+        baseline.observe(&baseline_state(Some(2.0), Some(10.0)), "initial");
+        let incident = baseline_state(Some(4.0), Some(5.0));
+        baseline.observe(&incident, "onset");
+        let missing = baseline_state(Some(-1.0), None);
+        let unavailable = baseline.observe(&missing, "missing");
+        assert_eq!(unavailable.len(), 2);
+        for event in &unavailable {
+            assert_eq!(event["event"], "baseline_observation_unavailable");
+            assert!(event["current"].is_null());
+            assert_eq!(event["anomaly_active"], true);
+        }
+        assert!(baseline.observe(&missing, "still-missing").is_empty());
+        let resumed = baseline.observe(&incident, "resumed");
+        assert_eq!(resumed.len(), 2);
+        for event in &resumed {
+            assert_eq!(event["event"], "baseline_observation_resumed");
+            assert_eq!(event["anomaly_active"], true);
+        }
+        assert_eq!(resumed[0]["baseline"], 2.0);
+        assert_eq!(resumed[1]["baseline"], 10.0);
+        assert!(baseline.observe(&incident, "still-active").is_empty());
+        baseline.observe(&missing, "missing-again");
+        let recovered = baseline.observe(
+            &baseline_state(Some(2.0), Some(10.0)),
+            "recovered-after-gap",
         );
+        assert_eq!(recovered.len(), 2);
+        assert!(recovered
+            .iter()
+            .all(|event| event["event"] == "baseline_recovered"));
+    }
+
+    #[test]
+    fn watch_baseline_initial_missing_sources_can_be_observed_later() {
+        let mut baseline = WatchBaseline::default();
+        let missing = baseline_state(None, Some(10.0));
+        let unavailable = baseline.observe(&missing, "initial");
+        assert_eq!(unavailable.len(), 1);
+        assert_eq!(unavailable[0]["metric"], "load1");
+        assert_eq!(unavailable[0]["event"], "baseline_observation_unavailable");
+        assert!(unavailable[0]["baseline"].is_null());
+        assert!(baseline.observe(&missing, "still-missing").is_empty());
+        let resumed = baseline.observe(&baseline_state(Some(1.0), Some(10.0)), "available");
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(resumed[0]["event"], "baseline_observation_resumed");
+        assert_eq!(resumed[0]["anomaly_active"], false);
+        assert!(resumed[0]["baseline"].is_null());
+        let incident = baseline.observe(&baseline_state(Some(2.0), Some(10.0)), "load-rise");
+        assert_eq!(incident.len(), 1);
+        assert_eq!(incident[0]["event"], "baseline_anomaly");
+        assert_eq!(incident[0]["baseline"], 1.0);
+    }
+
+    #[test]
+    fn watch_baseline_observed_zero_is_not_missing_or_permanent_blindness() {
+        let mut baseline = WatchBaseline::default();
+        assert!(baseline
+            .observe(&baseline_state(Some(0.0), Some(0.0)), "initial")
+            .is_empty());
+        assert!(baseline
+            .observe(&baseline_state(Some(0.0), Some(0.0)), "zero")
+            .is_empty());
+        assert!(baseline
+            .observe(&baseline_state(Some(1.0), Some(10.0)), "positive-reference")
+            .is_empty());
+        let memory = baseline.observe(&baseline_state(Some(1.0), Some(0.0)), "no-memory");
+        assert_eq!(memory.len(), 1);
+        assert_eq!(memory[0]["event"], "baseline_anomaly");
+        assert_eq!(memory[0]["metric"], "memory_available_gb");
+        assert_eq!(memory[0]["current"], 0.0);
+        let load = baseline.observe(&baseline_state(Some(2.0), Some(0.0)), "load-rise");
+        assert_eq!(load.len(), 1);
+        assert_eq!(load[0]["metric"], "load1");
+        assert_eq!(load[0]["event"], "baseline_anomaly");
+    }
+
+    #[test]
+    fn watch_baseline_adapts_to_gradual_drift_but_detects_a_new_shock() {
+        let mut baseline = WatchBaseline::default();
+        baseline.observe(&baseline_state(Some(1.0), Some(10.0)), "initial");
+        // Over 100 observations the ordinary workload triples and available
+        // memory halves. Neither metric remains anchored to the first sample.
+        for step in 1..=100 {
+            let state = baseline_state(
+                Some(1.0 + f64::from(step) * 0.02),
+                Some(10.0 - f64::from(step) * 0.05),
+            );
+            assert!(baseline.observe(&state, "gradual-change").is_empty());
+        }
+        assert!(baseline.load1.value.unwrap() > 2.5);
+        assert!(baseline.available_gb.value.unwrap() < 6.0);
+        let load_reference = baseline.load1.value;
+        let memory_reference = baseline.available_gb.value;
+        let shock = baseline.observe(&baseline_state(Some(10.0), Some(1.0)), "new-shock");
+        assert_eq!(shock.len(), 2);
+        assert!(shock
+            .iter()
+            .all(|event| event["event"] == "baseline_anomaly"));
+        assert_eq!(baseline.load1.value, load_reference);
+        assert_eq!(baseline.available_gb.value, memory_reference);
+    }
+
+    #[test]
+    fn watch_baseline_onset_boundaries_and_invalid_values_remain_distinct() {
+        let mut baseline = WatchBaseline::default();
+        baseline.observe(&baseline_state(Some(2.0), Some(10.0)), "initial");
+        assert!(baseline
+            .observe(
+                &baseline_state(Some(3.0), Some(7.0)),
+                "exact-onset-boundaries",
+            )
+            .is_empty());
+        let prior = baseline.load1.value;
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+            let event =
+                baseline.load1.observe(WatchBaselineMetric::Load, Some(invalid), "invalid");
+            if let Some(event) = event {
+                assert_eq!(event["event"], "baseline_observation_unavailable");
+                assert!(event["current"].is_null());
+            }
+            assert_eq!(baseline.load1.value, prior);
+            assert!(!baseline.load1.active);
+        }
     }
 }
 
