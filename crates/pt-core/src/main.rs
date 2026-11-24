@@ -3752,20 +3752,59 @@ fn session_has_control_receipts(handle: &SessionHandle) -> Result<bool, String> 
         .map_err(|error| format!("cannot read saved control receipt entry: {error}"))
 }
 
+/// A new scan may produce different targets and reuse action IDs. Keep the
+/// original plan alongside any journal that verification or resume will read.
+fn session_replan_block_reason(handle: &SessionHandle) -> Result<Option<&'static str>, String> {
+    if session_has_control_receipts(handle)? {
+        return Ok(Some("this session has durable control receipts; omit --session to create a new plan and retain the original undo binding"));
+    }
+    let manifest = handle.read_manifest().map_err(|error| error.to_string())?;
+    if manifest.state == SessionState::Executing
+        || manifest
+            .state_history
+            .iter()
+            .any(|entry| entry.state == SessionState::Executing)
+    {
+        return Ok(Some("execution started in this session; omit --session to retain the original plan for verification and recovery"));
+    }
+    let journal = handle.dir.join("action/outcomes.jsonl");
+    match fs::symlink_metadata(&journal) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("cannot inspect the saved execution journal: {error}")),
+        Ok(metadata) if metadata.is_file() && metadata.len() == 0 => Ok(None),
+        Ok(_) => Ok(Some("this session has an execution journal; omit --session to create a new plan and preserve the recorded action bindings")),
+    }
+}
+
 /// Once controls depend on exact plan bytes, keep those bytes available for
 /// undo and replay. Serialize this check with all journaled controller writers.
-fn update_canonical_session_plan(
-    handle: &SessionHandle,
-    update: impl FnOnce(Option<&str>) -> Result<String, String>,
-) -> Result<PathBuf, String> {
+fn lock_canonical_session_plan(handle: &SessionHandle) -> Result<GlobalLock, String> {
     let data_dir = handle
         .dir
         .parent()
         .and_then(Path::parent)
         .ok_or("cannot resolve session execution data directory")?;
-    let _lock = GlobalLock::try_acquire(&data_dir.join(".execution-policy-lock"))
+    GlobalLock::try_acquire(&data_dir.join(".execution-policy-lock"))
         .map_err(|error| format!("cannot lock canonical plan write: {error}"))?
-        .ok_or("cannot replace a plan while another command is executing or restoring actions")?;
+        .ok_or_else(|| {
+            "cannot replace a plan while another command is executing or restoring actions".into()
+        })
+}
+
+#[cfg(any(feature = "ui", test))]
+fn update_canonical_session_plan(
+    handle: &SessionHandle,
+    update: impl FnOnce(Option<&str>) -> Result<String, String>,
+) -> Result<PathBuf, String> {
+    let lock = lock_canonical_session_plan(handle)?;
+    update_locked_session_plan(handle, &lock, update)
+}
+
+fn update_locked_session_plan(
+    handle: &SessionHandle,
+    _lock: &GlobalLock,
+    update: impl FnOnce(Option<&str>) -> Result<String, String>,
+) -> Result<PathBuf, String> {
     let plan_path = handle.dir.join("decision/plan.json");
     let previous = match fs::read_to_string(&plan_path) {
         Ok(content) => Some(content),
@@ -3781,7 +3820,8 @@ fn update_canonical_session_plan(
         }
         return Err("this session has durable control receipts; create a new plan session to preserve its original undo and verification binding".into());
     }
-    fs::write(&plan_path, content).map_err(|error| format!("write plan: {error}"))?;
+    pt_core::session::write_serialized_json(&plan_path, content.as_bytes())
+        .map_err(|error| format!("write plan: {error}"))?;
     Ok(plan_path)
 }
 
@@ -3841,31 +3881,69 @@ mod canonical_plan_write_tests {
         assert_eq!(fs::read(&path).unwrap(), original.as_bytes());
         drop(execution_lock);
         assert!(!session_has_control_receipts(&handle).unwrap());
-        update_canonical_session_plan(&handle, |_| Ok("replacement".into())).unwrap();
-        assert_eq!(fs::read(&path).unwrap(), b"replacement");
+        update_canonical_session_plan(&handle, |_| Ok("42".into())).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"42");
     }
 
     #[test]
     fn canonical_merge_reads_latest_bytes_while_execution_lock_is_held() {
         let directory = tempfile::tempdir().unwrap();
         let handle = session(directory.path());
-        let path = update_canonical_session_plan(&handle, |_| Ok("first".into())).unwrap();
+        let path = update_canonical_session_plan(&handle, |_| Ok("1".into())).unwrap();
         update_canonical_session_plan(&handle, |previous| {
-            assert_eq!(previous, Some("first"));
+            assert_eq!(previous, Some("1"));
             assert!(
                 GlobalLock::try_acquire(&directory.path().join(".execution-policy-lock"))
                     .unwrap()
                     .is_none()
             );
-            Ok(format!("{} second", previous.unwrap()))
+            Ok(format!("{}2", previous.unwrap()))
         })
         .unwrap();
         update_canonical_session_plan(&handle, |previous| {
-            assert_eq!(previous, Some("first second"));
-            Ok(format!("{} third", previous.unwrap()))
+            assert_eq!(previous, Some("12"));
+            Ok(format!("{}3", previous.unwrap()))
         })
         .unwrap();
-        assert_eq!(fs::read_to_string(path).unwrap(), "first second third");
+        assert_eq!(fs::read_to_string(path).unwrap(), "123");
+    }
+
+    #[test]
+    fn interrupted_and_completed_execution_journals_keep_their_plan_binding() {
+        let directory = tempfile::tempdir().unwrap();
+        let handle = session(directory.path());
+        let action = handle.dir.join("action");
+        fs::create_dir_all(&action).unwrap();
+        let journal = action.join("outcomes.jsonl");
+        fs::write(&journal, b"").unwrap();
+        assert_eq!(session_replan_block_reason(&handle).unwrap(), None);
+        for outcome in [r#"{"status":"success"}"#, r#"{"status":"dry_run"}"#, "{"] {
+            fs::write(&journal, outcome).unwrap();
+            assert!(session_replan_block_reason(&handle).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn invalid_plan_replacement_leaves_published_bytes_and_open_reader_intact() {
+        let directory = tempfile::tempdir().unwrap();
+        let handle = session(directory.path());
+        let path = update_canonical_session_plan(&handle, |_| Ok("1".into())).unwrap();
+        let reader = fs::File::open(&path).unwrap();
+        assert!(update_canonical_session_plan(&handle, |_| Ok("{".into())).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"1");
+        update_canonical_session_plan(&handle, |_| Ok("2".into())).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"2");
+        assert_eq!(std::io::read_to_string(reader).unwrap(), "1");
+    }
+
+    #[test]
+    fn interrupted_execution_keeps_its_plan_even_before_the_first_outcome() {
+        let directory = tempfile::tempdir().unwrap();
+        let handle = session(directory.path());
+        handle.update_state(SessionState::Executing).unwrap();
+        assert!(session_replan_block_reason(&handle).unwrap().is_some());
+        handle.update_state(SessionState::Failed).unwrap();
+        assert!(session_replan_block_reason(&handle).unwrap().is_some());
     }
 }
 
@@ -34305,10 +34383,10 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     };
 
     if !created {
-        match session_has_control_receipts(&handle) {
-            Ok(false) => {}
-            Ok(true) => {
-                eprintln!("agent plan: this session has durable control receipts; omit --session to create a new plan and retain the original undo binding");
+        match session_replan_block_reason(&handle) {
+            Ok(None) => {}
+            Ok(Some(reason)) => {
+                eprintln!("agent plan: {reason}");
                 return ExitCode::PolicyBlocked;
             }
             Err(error) => {
@@ -34511,10 +34589,6 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         scan_result.metadata.warnings.is_empty(),
     );
     let activity_observed_at_ms = chrono::Utc::now().timestamp_millis();
-    if let Err(error) = write_system_state_to_session(&handle, &system_state) {
-        eprintln!("agent plan: {error}");
-        return ExitCode::InternalError;
-    }
     let prediction_history = args.include_predictions.then(|| {
         let wanted = processes_to_infer
             .iter()
@@ -35809,7 +35883,31 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         );
         return ExitCode::InternalError;
     }
-    let plan_path = match update_canonical_session_plan(&handle, |_| {
+    // Apply may have started during the scan. Serialize publication of the
+    // plan, observations and Planned state with execution and its journal.
+    let publication_lock = match lock_canonical_session_plan(&handle) {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("agent plan: {error}");
+            return ExitCode::PolicyBlocked;
+        }
+    };
+    match session_replan_block_reason(&handle) {
+        Ok(None) => {}
+        Ok(Some(reason)) => {
+            eprintln!("agent plan: {reason}");
+            return ExitCode::PolicyBlocked;
+        }
+        Err(error) => {
+            eprintln!("agent plan: {error}");
+            return ExitCode::IoError;
+        }
+    }
+    if let Err(error) = write_system_state_to_session(&handle, &system_state) {
+        eprintln!("agent plan: {error}");
+        return ExitCode::IoError;
+    }
+    let plan_path = match update_locked_session_plan(&handle, &publication_lock, |_| {
         serde_json::to_string_pretty(&plan_output).map_err(|error| error.to_string())
     }) {
         Ok(path) => path,
@@ -35846,8 +35944,11 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         );
     }
 
-    // Update manifest state
-    let _ = handle.update_state(SessionState::Planned);
+    if let Err(error) = handle.update_state(SessionState::Planned) {
+        eprintln!("agent plan: failed to persist planned state: {error}");
+        return ExitCode::IoError;
+    }
+    drop(publication_lock);
 
     if let Some(ref e) = emitter {
         e.emit(

@@ -52,6 +52,40 @@ fn pt_core_fast() -> Command {
 /// Default sample size for tests that need inference coverage
 const TEST_SAMPLE_SIZE: &str = "10";
 
+#[test]
+fn replanning_a_session_with_recorded_attempts_preserves_its_original_plan() {
+    use pt_common::SessionId;
+    use pt_core::session::{SessionManifest, SessionMode, SessionStore};
+
+    let data = tempdir().unwrap();
+    let id = SessionId::new();
+    let session = SessionStore::at_data_dir(data.path())
+        .create(&SessionManifest::new(
+            &id,
+            None,
+            SessionMode::RobotPlan,
+            None,
+        ))
+        .unwrap();
+    let plan_path = session.dir.join("decision/plan.json");
+    let journal_path = session.dir.join("action/outcomes.jsonl");
+    let plan = br#"{"session_id":"original","actions":[]}"#;
+    let journal = br#"{"action_id":"a1","status":"dry_run"}"#;
+    std::fs::create_dir_all(plan_path.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(journal_path.parent().unwrap()).unwrap();
+    std::fs::write(&plan_path, plan).unwrap();
+    std::fs::write(&journal_path, journal).unwrap();
+
+    pt_core()
+        .env("PROCESS_TRIAGE_DATA", data.path())
+        .args(["agent", "plan", "--session", &id.0])
+        .assert()
+        .code(pt_core::exit_codes::ExitCode::PolicyBlocked.as_i32())
+        .stderr(predicate::str::contains("execution journal"));
+    assert_eq!(std::fs::read(plan_path).unwrap(), plan);
+    assert_eq!(std::fs::read(journal_path).unwrap(), journal);
+}
+
 #[cfg(target_os = "linux")]
 mod plan_differential {
     use super::*;
