@@ -114,6 +114,219 @@ fn config_snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
     files
 }
 
+#[test]
+fn fleet_transfer_transaction_preview_is_read_only_and_import_publishes_every_artifact() {
+    let root = retained_dir();
+    let source = root.join("source");
+    let target = root.join("missing-target");
+    let artifacts = root.join("artifacts");
+    let bundle = root.join("transfer.json");
+    let priors = priors_with_useful_prob(0.62, 0.11, 0.19, 0.08);
+    write_priors(&source, &priors);
+    let mut library = PatternLibrary::new(&source);
+    library
+        .add_custom(
+            SupervisorSignature::new("transaction-worker", SupervisorCategory::Other)
+                .with_process_patterns(vec!["^transaction-worker$"])
+                .with_confidence(0.9),
+        )
+        .unwrap();
+    library.save().unwrap();
+    let mut export = transfer_command(&source);
+    export.args(["export", "--out"]).arg(&bundle);
+    assert!(run_retained(export, &artifacts, "export").status.success());
+    for mode in ["local-dry-run", "global-dry-run", "shadow"] {
+        let mut preview = pt_core_fast();
+        preview.args(["--format", "json", "--config"]).arg(&target);
+        if mode == "global-dry-run" {
+            preview.arg("--dry-run");
+        } else if mode == "shadow" {
+            preview.arg("--shadow");
+        }
+        preview
+            .args(["agent", "fleet", "transfer", "import", "--from"])
+            .arg(&bundle);
+        if mode == "local-dry-run" {
+            preview.arg("--dry-run");
+        }
+        assert!(run_retained(preview, &artifacts, mode).status.success());
+        assert!(
+            !target.exists(),
+            "{mode} created the configuration directory"
+        );
+    }
+    let mut import = transfer_command(&target);
+    import
+        .args([
+            "import",
+            "--merge-strategy",
+            "replace",
+            "--no-backup",
+            "--from",
+        ])
+        .arg(&bundle);
+    let output = run_retained(import, &artifacts, "import");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(response["publication"]["id"].as_str().is_some());
+    let recovery = Path::new(
+        response["publication"]["recovery_journal"]
+            .as_str()
+            .unwrap(),
+    );
+    assert!(recovery.starts_with(&target));
+    assert!(recovery.is_file());
+    assert!(response["recovered_import"].is_null());
+    let reloaded: Priors =
+        serde_json::from_slice(&fs::read(target.join("priors.json")).unwrap()).unwrap();
+    assert_prob(reloaded.classes.useful.prior_prob, 0.62);
+    for path in [
+        "patterns/learned.json",
+        "patterns/custom.json",
+        "patterns/disabled.json",
+        "pattern_stats.json",
+    ] {
+        assert!(target.join(path).is_file(), "missing published {path}");
+    }
+    let mut library = PatternLibrary::new(&target);
+    library.load().unwrap();
+    assert!(library.get_pattern("transaction-worker").is_some());
+    assert!(!target.join("priors.json.bak").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn fleet_transfer_transaction_refuses_unsafe_later_destination_before_changing_priors() {
+    use std::os::unix::fs::symlink;
+    let root = retained_dir();
+    let source = root.join("source");
+    let target = root.join("target");
+    let artifacts = root.join("artifacts");
+    let bundle = root.join("transfer.json");
+    write_priors(&source, &priors_with_useful_prob(0.62, 0.11, 0.19, 0.08));
+    write_priors(&target, &Priors::default());
+    for (dir, name) in [(&source, "incoming-worker"), (&target, "existing-worker")] {
+        let mut library = PatternLibrary::new(dir);
+        library
+            .add_custom(
+                SupervisorSignature::new(name, SupervisorCategory::Other)
+                    .with_process_patterns(vec!["^worker$"])
+                    .with_confidence(0.9),
+            )
+            .unwrap();
+        library.save().unwrap();
+    }
+    let outside = root.join("preserved-stats.json");
+    fs::rename(target.join("pattern_stats.json"), &outside).unwrap();
+    symlink(&outside, target.join("pattern_stats.json")).unwrap();
+    let priors_before = fs::read(target.join("priors.json")).unwrap();
+    let custom_before = fs::read(target.join("patterns/custom.json")).unwrap();
+    let stats_before = fs::read(&outside).unwrap();
+    let state_before = fs::read(target.join(".fleet-transfer-state.json")).unwrap();
+    let mut export = transfer_command(&source);
+    export.args(["export", "--out"]).arg(&bundle);
+    assert!(run_retained(export, &artifacts, "export").status.success());
+    let mut import = transfer_command(&target);
+    import
+        .args(["import", "--merge-strategy", "replace", "--from"])
+        .arg(&bundle);
+    let output = run_retained(import, &artifacts, "refuse-unsafe-destination");
+    assert!(!output.status.success());
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(response["error"].as_str().unwrap().contains("regular file"));
+    assert_eq!(fs::read(target.join("priors.json")).unwrap(), priors_before);
+    assert_eq!(
+        fs::read(target.join("patterns/custom.json")).unwrap(),
+        custom_before
+    );
+    assert_eq!(fs::read(&outside).unwrap(), stats_before);
+    assert_eq!(
+        fs::read_link(target.join("pattern_stats.json")).unwrap(),
+        outside
+    );
+    assert!(!target.join("priors.json.bak").exists());
+    assert_eq!(
+        fs::read(target.join(".fleet-transfer-state.json")).unwrap(),
+        state_before
+    );
+}
+
+#[test]
+fn fleet_transfer_transaction_recovers_interruption_before_loading_local_merge_inputs() {
+    let root = retained_dir();
+    let source = root.join("source");
+    let target = root.join("target");
+    let artifacts = root.join("artifacts");
+    let bundle = root.join("transfer.json");
+    write_priors(&source, &priors_with_useful_prob(0.62, 0.11, 0.19, 0.08));
+    write_priors(&target, &Priors::default());
+    let mut export = transfer_command(&source);
+    export.args(["export", "--out"]).arg(&bundle);
+    assert!(run_retained(export, &artifacts, "export").status.success());
+    let original = fs::read_to_string(target.join("priors.json")).unwrap();
+    let interrupted =
+        serde_json::to_string_pretty(&priors_with_useful_prob(0.2, 0.2, 0.4, 0.2)).unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    // Plant an interrupted transaction boundary: the durable journal/marker
+    // preceded a complete first-file publication, but the writer then exited.
+    let journal = serde_json::to_vec_pretty(&serde_json::json!({
+        "version": 1,
+        "id": id,
+        "files": [{"path": "priors.json", "before": original, "after": interrupted}],
+    }))
+    .unwrap();
+    fs::write(target.join(format!(".fleet-transfer-{id}.json")), &journal).unwrap();
+    fs::write(
+        target.join(".fleet-transfer-state.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "id": id,
+            "journal_sha256": FileEntry::compute_checksum(&journal),
+            "phase": "pending",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(target.join("priors.json"), &interrupted).unwrap();
+    let before_preview = config_snapshot(&target);
+    let mut preview = transfer_command(&target);
+    preview.args(["import", "--dry-run", "--from"]).arg(&bundle);
+    let refused = run_retained(preview, &artifacts, "pending-preview");
+    assert!(!refused.status.success());
+    assert_eq!(config_snapshot(&target), before_preview);
+    let mut import = transfer_command(&target);
+    import
+        .args([
+            "import",
+            "--merge-strategy",
+            "keep-local",
+            "--no-backup",
+            "--from",
+        ])
+        .arg(&bundle);
+    let output = run_retained(import, &artifacts, "recover-and-import");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["recovered_import"], id);
+    assert_ne!(response["publication"]["id"], id);
+    let restored: Priors =
+        serde_json::from_slice(&fs::read(target.join("priors.json")).unwrap()).unwrap();
+    assert_prob(
+        restored.classes.useful.prior_prob,
+        Priors::default().classes.useful.prior_prob,
+    );
+    assert!(!target.join("priors.json.bak").exists());
+    assert!(target.join(format!(".fleet-transfer-{id}.json")).is_file());
+}
+
 // Construct valid checksums only for planted rejection/normalization fixtures.
 // Positive CLI exports are validated with their supplied checksum unchanged.
 fn checksum_planted_fixture(bundle: &mut TransferBundle) {

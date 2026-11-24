@@ -135,6 +135,15 @@ pub struct ConfigOptions {
 /// 4. Built-in defaults
 pub fn load_config(options: &ConfigOptions) -> Result<ResolvedConfig, ConfigError> {
     let config_dir = resolve_config_dir(options)?;
+    let transfer_generation = || {
+        crate::fleet::transfer::configuration_generation(&config_dir).map_err(|error| {
+            ConfigError::SchemaError {
+                path: config_dir.clone(),
+                message: error.to_string(),
+            }
+        })
+    };
+    let generation = transfer_generation()?;
 
     // Load priors
     let (priors, priors_path, priors_hash) = load_priors(&config_dir, &options.priors_path)?;
@@ -145,6 +154,14 @@ pub fn load_config(options: &ConfigOptions) -> Result<ResolvedConfig, ConfigErro
     // Validate the configuration semantically
     validate_priors(&priors)?;
     validate_policy(&policy)?;
+
+    if transfer_generation()? != generation {
+        return Err(ConfigError::SchemaError {
+            path: config_dir,
+            message: "configuration changed during loading; retry after the fleet import completes"
+                .to_string(),
+        });
+    }
 
     Ok(ResolvedConfig {
         priors,

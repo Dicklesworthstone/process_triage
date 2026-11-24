@@ -1159,7 +1159,7 @@ struct AgentFleetTransferImportArgs {
     #[arg(long)]
     dry_run: bool,
 
-    /// Skip backup of existing priors
+    /// Skip priors.json.bak (private transaction recovery journals are always retained)
     #[arg(long)]
     no_backup: bool,
 
@@ -16278,7 +16278,7 @@ fn run_agent_fleet_transfer_import(
 ) -> ExitCode {
     use pt_core::fleet::transfer::{
         compute_diff, merge_priors, validate_bundle, MergeStrategy, SignatureChangeType,
-        TransferBundle,
+        TransferBundle, TransferImport,
     };
     use pt_core::supervision::pattern_persistence::{
         ConflictResolution, PatternLibrary, PatternSource,
@@ -16370,6 +16370,25 @@ fn run_agent_fleet_transfer_import(
         priors_path: None,
         policy_path: None,
     };
+    let preview = args.dry_run || global.dry_run || global.shadow;
+    // Hold the fleet writer lock across recovery, local reads, merge and
+    // publication. A concurrent import must never merge a stale local snapshot.
+    // Preview remains read-only and refuses any pending transaction via the
+    // configuration loaders rather than performing recovery as a side effect.
+    let import = if preview {
+        None
+    } else {
+        let config_dir = match pt_core::config::resolve_config_dir(&options) {
+            Ok(dir) => dir,
+            Err(error) => return output_config_error(global, &error),
+        };
+        match TransferImport::begin(&config_dir) {
+            Ok(import) => Some(import),
+            Err(error) => {
+                return output_agent_error(global, "fleet transfer import", &error.to_string());
+            }
+        }
+    };
     let config = match load_config(&options) {
         Ok(c) => c,
         Err(e) => return output_config_error(global, &e),
@@ -16446,7 +16465,7 @@ fn run_agent_fleet_transfer_import(
         }
     };
 
-    if args.dry_run {
+    if preview {
         let applied_priors = diff
             .priors_changes
             .iter()
@@ -16511,62 +16530,38 @@ fn run_agent_fleet_transfer_import(
         return ExitCode::Clean;
     }
 
+    let mut artifacts = Vec::new();
     if let Some(ref final_priors) = merged_priors {
-        let priors_path = config
-            .snapshot()
-            .priors_path
-            .unwrap_or_else(|| resolved_config_dir(global).join("priors.json"));
-
-        if !args.no_backup && priors_path.exists() {
-            let backup = priors_path.with_extension("json.bak");
-            if let Err(e) = std::fs::copy(&priors_path, &backup) {
-                eprintln!("warning: failed to create backup: {}", e);
-            }
-        }
-
-        if let Some(parent) = priors_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-
-        let tmp = priors_path.with_extension("json.tmp");
         match serde_json::to_vec_pretty(final_priors) {
-            Ok(bytes) => {
-                if let Err(e) = std::fs::write(&tmp, &bytes) {
-                    eprintln!("fleet transfer import: write failed: {}", e);
-                    return ExitCode::IoError;
-                }
-                if let Err(e) = std::fs::rename(&tmp, &priors_path) {
-                    eprintln!("fleet transfer import: rename failed: {}", e);
-                    return ExitCode::IoError;
-                }
-            }
+            Ok(bytes) => artifacts.push((PathBuf::from("priors.json"), bytes)),
             Err(e) => {
                 return output_agent_error(global, "fleet transfer import", &e.to_string());
             }
         }
     }
+    if let Some((lib, _)) = &pending_signatures {
+        match lib.pending_files() {
+            Ok(files) => artifacts.extend(files),
+            Err(error) => {
+                return output_agent_error(global, "fleet transfer import", &error.to_string());
+            }
+        }
+    }
+    let import = import.expect("non-preview imports hold the writer lock");
+    let publication = match import.publish(artifacts, !args.no_backup) {
+        Ok(publication) => publication,
+        Err(error) => {
+            return output_agent_error(global, "fleet transfer import", &error.to_string());
+        }
+    };
 
     let sig_result = match pending_signatures {
-        Some((mut lib, result)) => {
-            if let Err(e) = lib.save() {
-                eprintln!(
-                    "fleet transfer import: saving signatures failed{}: {}",
-                    if merged_priors.is_some() {
-                        " (priors were already merged)"
-                    } else {
-                        ""
-                    },
-                    e
-                );
-                return ExitCode::IoError;
-            }
-            Some(serde_json::json!({
-                "imported": result.imported,
-                "updated": result.updated,
-                "skipped": result.skipped,
-                "conflicts": result.conflicts.len(),
-            }))
-        }
+        Some((_, result)) => Some(serde_json::json!({
+            "imported": result.imported,
+            "updated": result.updated,
+            "skipped": result.skipped,
+            "conflicts": result.conflicts.len(),
+        })),
         None => None,
     };
 
@@ -16579,6 +16574,8 @@ fn run_agent_fleet_transfer_import(
         "strategy": format!("{:?}", strategy),
         "priors_merged": merged_priors.is_some(),
         "signatures": sig_result,
+        "publication": publication,
+        "recovered_import": import.recovered_import(),
         "warnings": warnings,
     });
     match global.format {
@@ -41035,7 +41032,7 @@ fn run_agent_export_priors(global: &GlobalOpts, args: &AgentExportPriorsArgs) ->
 
 fn run_agent_import_priors(global: &GlobalOpts, args: &AgentImportPriorsArgs) -> ExitCode {
     use pt_core::config::priors::Priors;
-    use pt_core::fleet::transfer::{merge_priors, MergeStrategy};
+    use pt_core::fleet::transfer::{merge_priors, MergeStrategy, TransferImport};
 
     // Default to merge if neither --merge nor --replace specified
     let (mode, strategy) = if args.replace {
@@ -41119,13 +41116,30 @@ fn run_agent_import_priors(global: &GlobalOpts, args: &AgentImportPriorsArgs) ->
         }
     }
 
-    // Load current config
+    // Lock before reading the local merge input so a concurrent fleet import
+    // cannot be overwritten by a result based on the previous configuration.
+    // Preview never creates a writer guard or recovers pending publication.
     let options = ConfigOptions {
         config_dir: global.config.as_ref().map(PathBuf::from),
         priors_path: None,
         policy_path: None,
     };
-
+    let preview = args.dry_run || global.dry_run || global.shadow;
+    let writer = if preview {
+        None
+    } else {
+        let config_dir = match pt_core::config::resolve_config_dir(&options) {
+            Ok(directory) => directory,
+            Err(error) => return output_config_error(global, &error),
+        };
+        match TransferImport::begin_writer(&config_dir) {
+            Ok(writer) => Some(writer),
+            Err(error) => {
+                eprintln!("agent import-priors: cannot update configuration: {error}");
+                return ExitCode::IoError;
+            }
+        }
+    };
     let config = match load_config(&options) {
         Ok(c) => c,
         Err(e) => {
@@ -41154,7 +41168,7 @@ fn run_agent_import_priors(global: &GlobalOpts, args: &AgentImportPriorsArgs) ->
     }
 
     // Dry run: just show what would happen
-    if args.dry_run || global.dry_run || global.shadow {
+    if preview {
         let response = serde_json::json!({
             "dry_run": true,
             "mode": mode,
@@ -41182,15 +41196,18 @@ fn run_agent_import_priors(global: &GlobalOpts, args: &AgentImportPriorsArgs) ->
         return ExitCode::Clean;
     }
 
+    let writer = writer.expect("non-preview priors import holds the writer lock");
+
     // Create backup unless --no-backup
     if !args.no_backup && priors_path.exists() {
         let backup_path = priors_path.with_extension("json.bak");
         let backup = std::fs::read(&priors_path)
-            .map_err(|source| pt_core::session::SessionError::Io {
-                path: priors_path.clone(),
-                source,
-            })
-            .and_then(|original| pt_core::session::write_serialized_json(&backup_path, &original));
+            .map_err(|error| error.to_string())
+            .and_then(|original| {
+                writer
+                    .write_json(Path::new("priors.json.bak"), &original)
+                    .map_err(|error| error.to_string())
+            });
         if let Err(err) = backup {
             eprintln!(
                 "agent import-priors: failed to create backup at {}: {}; priors unchanged",
@@ -41201,7 +41218,14 @@ fn run_agent_import_priors(global: &GlobalOpts, args: &AgentImportPriorsArgs) ->
         }
     }
 
-    if let Err(err) = pt_core::session::write_json_pretty(&priors_path, &final_priors) {
+    let publication = serde_json::to_vec_pretty(&final_priors)
+        .map_err(|error| error.to_string())
+        .and_then(|bytes| {
+            writer
+                .write_json(Path::new("priors.json"), &bytes)
+                .map_err(|error| error.to_string())
+        });
+    if let Err(err) = publication {
         eprintln!(
             "agent import-priors: failed to publish {}: {}",
             priors_path.display(),

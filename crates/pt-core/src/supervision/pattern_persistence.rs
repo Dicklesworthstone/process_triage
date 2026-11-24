@@ -36,7 +36,7 @@
 
 use super::signature::{SignatureError, SignatureSchema, SupervisorSignature, SCHEMA_VERSION};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -667,12 +667,23 @@ pub struct PatternLibrary {
 
     /// Whether any changes need saving.
     dirty: bool,
+
+    /// The actual files and import generation read by this instance. A later
+    /// save refuses stale in-memory data rather than undoing another writer.
+    baseline: Result<PatternBaseline, String>,
+    loaded: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PatternBaseline {
+    generations: BTreeMap<PathBuf, Option<crate::fleet::transfer::ConfigurationGeneration>>,
+    files: BTreeMap<PathBuf, Option<Vec<u8>>>,
 }
 
 impl PatternLibrary {
     /// Create a new library manager with the given config directory.
     pub fn new(config_dir: impl Into<PathBuf>) -> Self {
-        Self {
+        let mut library = Self {
             config_dir: config_dir.into(),
             legacy_dir: None,
             built_in: PersistedSchema::new(),
@@ -681,7 +692,16 @@ impl PatternLibrary {
             disabled: DisabledPatterns::default(),
             stats: AllPatternStats::default(),
             dirty: false,
-        }
+            baseline: Ok(PatternBaseline {
+                generations: BTreeMap::new(),
+                files: BTreeMap::new(),
+            }),
+            loaded: false,
+        };
+        library.baseline = library
+            .capture_baseline()
+            .map_err(|error| error.to_string());
+        library
     }
 
     /// Read each file that `config_dir` lacks from `legacy_dir` instead (see
@@ -690,7 +710,36 @@ impl PatternLibrary {
     /// shadowing them with a file that holds only the new entries.
     pub fn with_legacy_dir(mut self, legacy_dir: Option<PathBuf>) -> Self {
         self.legacy_dir = legacy_dir;
+        self.baseline = self.capture_baseline().map_err(|error| error.to_string());
         self
+    }
+
+    fn capture_baseline(&self) -> Result<PatternBaseline, PersistenceError> {
+        let generation = crate::fleet::transfer::configuration_generation(&self.config_dir)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let mut generations = BTreeMap::from([(self.config_dir.clone(), generation)]);
+        let mut files = BTreeMap::new();
+        for relative in [
+            Path::new(PATTERNS_DIR_NAME).join(LEARNED_FILE),
+            Path::new(PATTERNS_DIR_NAME).join(CUSTOM_FILE),
+            Path::new(PATTERNS_DIR_NAME).join(DISABLED_FILE),
+            PathBuf::from(STATS_FILE),
+        ] {
+            let target = self.config_dir.join(&relative);
+            let bytes = read_pattern_preimage(&target)?;
+            if bytes.is_none() {
+                if let Some(legacy) = &self.legacy_dir {
+                    let path = legacy.join(&relative);
+                    // An interrupted migration source is not a readable model.
+                    let generation = crate::fleet::transfer::configuration_generation(legacy)
+                        .map_err(|error| std::io::Error::other(error.to_string()))?;
+                    generations.insert(legacy.clone(), generation);
+                    files.insert(path.clone(), read_pattern_preimage(&path)?);
+                }
+            }
+            files.insert(target, bytes);
+        }
+        Ok(PatternBaseline { generations, files })
     }
 
     /// `relative` under `config_dir`, or under the legacy dir when only that has it.
@@ -739,7 +788,13 @@ impl PatternLibrary {
 
     /// Load all patterns from storage.
     pub fn load(&mut self) -> Result<(), PersistenceError> {
-        self.ensure_directories()?;
+        self.loaded = false;
+        let baseline = self.capture_baseline()?;
+        self.built_in = PersistedSchema::new();
+        self.learned = PersistedSchema::new();
+        self.custom = PersistedSchema::new();
+        self.disabled = DisabledPatterns::default();
+        self.stats = AllPatternStats::default();
 
         let patterns_dir = Path::new(PATTERNS_DIR_NAME);
 
@@ -773,8 +828,45 @@ impl PatternLibrary {
             self.stats = AllPatternStats::from_file(&stats_path)?;
         }
 
+        if self.capture_baseline()? != baseline {
+            return Err(std::io::Error::other(
+                "pattern configuration changed during loading; retry after the fleet import completes",
+            )
+            .into());
+        }
+        self.baseline = Ok(baseline);
+        self.loaded = true;
         self.dirty = false;
         Ok(())
+    }
+
+    /// Serialize every file a save would publish, without modifying storage.
+    /// Relative paths let fleet import stage priors and patterns together.
+    pub fn pending_files(&self) -> Result<Vec<(PathBuf, Vec<u8>)>, PersistenceError> {
+        if !self.dirty {
+            return Ok(Vec::new());
+        }
+        self.learned.validate()?;
+        self.custom.validate()?;
+        let patterns = Path::new(PATTERNS_DIR_NAME);
+        Ok(vec![
+            (
+                patterns.join(LEARNED_FILE),
+                self.learned.to_json()?.into_bytes(),
+            ),
+            (
+                patterns.join(CUSTOM_FILE),
+                self.custom.to_json()?.into_bytes(),
+            ),
+            (
+                patterns.join(DISABLED_FILE),
+                serde_json::to_vec_pretty(&self.disabled)?,
+            ),
+            (
+                PathBuf::from(STATS_FILE),
+                serde_json::to_vec_pretty(&self.stats)?,
+            ),
+        ])
     }
 
     /// Save all modified patterns to storage.
@@ -783,21 +875,25 @@ impl PatternLibrary {
             return Ok(());
         }
 
-        self.ensure_directories()?;
-        let patterns_dir = self.patterns_dir();
-
-        // Save learned patterns
-        self.learned.save_to_file(patterns_dir.join(LEARNED_FILE))?;
-
-        // Save custom patterns
-        self.custom.save_to_file(patterns_dir.join(CUSTOM_FILE))?;
-
-        // Save disabled patterns
-        self.disabled
-            .save_to_file(patterns_dir.join(DISABLED_FILE))?;
-
-        // Save statistics
-        self.stats.save_to_file(self.config_dir.join(STATS_FILE))?;
+        let writer = crate::fleet::transfer::TransferImport::begin_writer(&self.config_dir)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let baseline = self
+            .baseline
+            .as_ref()
+            .map_err(|error| std::io::Error::other(error.clone()))?;
+        if (!self.loaded && baseline.files.values().any(Option::is_some))
+            || self.capture_baseline()? != *baseline
+        {
+            return Err(std::io::Error::other(
+                "pattern library changed or was not loaded; reload it before saving",
+            )
+            .into());
+        }
+        writer
+            .publish(self.pending_files()?, false)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        self.baseline = Ok(self.capture_baseline()?);
+        self.loaded = true;
 
         self.dirty = false;
         Ok(())
@@ -1122,6 +1218,19 @@ impl PatternLibrary {
         }
 
         transitions
+    }
+}
+
+fn read_pattern_preimage(path: &Path) -> Result<Option<Vec<u8>>, std::io::Error> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match fs::symlink_metadata(path) {
+                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                _ => Err(error),
+            }
+        }
+        Err(error) => Err(error),
     }
 }
 

@@ -4,6 +4,7 @@
 //! for managing user-defined process signatures.
 
 use crate::exit_codes::ExitCode;
+use crate::fleet::transfer::TransferImport;
 use crate::output::encode_toon_value;
 use crate::supervision::pattern_persistence::{AllPatternStats, DisabledPatterns};
 use crate::supervision::signature::{ProcessMatchContext, SignaturePriors};
@@ -311,18 +312,30 @@ pub fn load_user_signatures(config_dir: &Path) -> Option<SignatureSchema> {
     }
 }
 
-/// Save user signatures to a config directory
+fn begin_signature_update(config_dir: &Path) -> Result<TransferImport, std::io::Error> {
+    TransferImport::begin_writer(config_dir)
+        .map_err(|error| std::io::Error::other(error.to_string()))
+}
+
+/// Replace user signatures while holding the same directory lock as fleet
+/// import. Read/modify/write callers must acquire the guard before their read.
 pub fn save_user_signatures(
     config_dir: &Path,
     schema: &SignatureSchema,
 ) -> Result<(), std::io::Error> {
-    let path = user_signatures_path(config_dir);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let content = serde_json::to_string_pretty(schema)
+    let writer = begin_signature_update(config_dir)?;
+    save_user_signatures_with_writer(&writer, schema)
+}
+
+fn save_user_signatures_with_writer(
+    writer: &TransferImport,
+    schema: &SignatureSchema,
+) -> Result<(), std::io::Error> {
+    let content = serde_json::to_vec_pretty(schema)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(&path, content)
+    writer
+        .write_json(Path::new("signatures.json"), &content)
+        .map_err(|error| std::io::Error::other(error.to_string()))
 }
 
 /// Get the path to disabled signatures file
@@ -335,19 +348,55 @@ fn pattern_stats_path(config_dir: &Path) -> PathBuf {
     config_dir.join("pattern_stats.json")
 }
 
-/// Save disabled patterns to a config directory
+/// Replace disabled patterns under the shared configuration writer lock.
 pub fn save_disabled_patterns(
     config_dir: &Path,
     disabled: &DisabledPatterns,
 ) -> Result<(), std::io::Error> {
-    let path = disabled_signatures_path(config_dir);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    let writer = begin_signature_update(config_dir)?;
+    save_disabled_patterns_with_writer(&writer, disabled)
+}
+
+fn save_disabled_patterns_with_writer(
+    writer: &TransferImport,
+    disabled: &DisabledPatterns,
+) -> Result<(), std::io::Error> {
+    let content = serde_json::to_vec_pretty(disabled)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    writer
+        .write_json(Path::new("patterns/disabled.json"), &content)
+        .map_err(|error| std::io::Error::other(error.to_string()))
+}
+
+/// An unreadable or malformed disabled set must never become an empty set on
+/// save. Only a genuinely absent primary file may use the legacy location.
+fn load_disabled_patterns_for_update(
+    config_dir: &Path,
+) -> Result<DisabledPatterns, std::io::Error> {
+    let primary = disabled_signatures_path(config_dir);
+    let path = match std::fs::symlink_metadata(&primary) {
+        Ok(_) => primary,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match legacy_read_dir(config_dir) {
+                Some(legacy) => disabled_signatures_path(&legacy),
+                None => return Ok(DisabledPatterns::default()),
+            }
+        }
+        Err(error) => return Err(error),
+    };
+    match std::fs::read(&path) {
+        Ok(content) => serde_json::from_slice(&content)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(&path) {
+                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(DisabledPatterns::default())
+                }
+                _ => Err(error),
+            }
+        }
+        Err(error) => Err(error),
     }
-    // Convert PersistenceError to io::Error for compatibility
-    disabled
-        .save_to_file(&path)
-        .map_err(|e| std::io::Error::other(e.to_string()))
 }
 
 /// Parse a category string into SupervisorCategory
@@ -647,6 +696,16 @@ fn run_signature_add(
         expectations: Default::default(),
     };
 
+    // Serialize the entire read/modify/write against fleet publication and
+    // other signature commands, not just the final rename.
+    let writer = match begin_signature_update(config_dir) {
+        Ok(writer) => writer,
+        Err(error) => {
+            eprintln!("Cannot update user signatures: {error}");
+            return ExitCode::IoError;
+        }
+    };
+
     // Load or create user schema
     let mut schema = match try_load_user_signatures(config_dir) {
         Ok(Some(schema)) => schema,
@@ -670,7 +729,7 @@ fn run_signature_add(
     schema.signatures.push(new_sig);
 
     // Save
-    if let Err(e) = save_user_signatures(config_dir, &schema) {
+    if let Err(e) = save_user_signatures_with_writer(&writer, &schema) {
         eprintln!("Failed to save signature: {}", e);
         return ExitCode::ArgsError;
     }
@@ -716,6 +775,14 @@ fn run_signature_remove(
 ) -> ExitCode {
     let session_id = SessionId::new();
 
+    let writer = match begin_signature_update(config_dir) {
+        Ok(writer) => writer,
+        Err(error) => {
+            eprintln!("Cannot update user signatures: {error}");
+            return ExitCode::IoError;
+        }
+    };
+
     // Load user signatures
     let mut schema = match try_load_user_signatures(config_dir) {
         Ok(Some(schema)) => schema,
@@ -744,7 +811,7 @@ fn run_signature_remove(
     }
 
     // Save
-    if let Err(e) = save_user_signatures(config_dir, &schema) {
+    if let Err(e) = save_user_signatures_with_writer(&writer, &schema) {
         eprintln!("Failed to save: {}", e);
         return ExitCode::ArgsError;
     }
@@ -1085,6 +1152,20 @@ fn run_signature_import(
         return ExitCode::Clean;
     }
 
+    // Preview stays read-only. A real merge acquires the shared writer guard
+    // before reading the existing signatures and holds it through publication.
+    let writer = if dry_run {
+        None
+    } else {
+        match begin_signature_update(config_dir) {
+            Ok(writer) => Some(writer),
+            Err(error) => {
+                eprintln!("Cannot update user signatures: {error}");
+                return ExitCode::IoError;
+            }
+        }
+    };
+
     // Load existing user signatures for merge
     let existing = match try_load_user_signatures(config_dir) {
         Ok(Some(schema)) => schema,
@@ -1154,7 +1235,12 @@ fn run_signature_import(
         }
     }
 
-    if let Err(e) = save_user_signatures(config_dir, &merged) {
+    if let Err(e) = save_user_signatures_with_writer(
+        writer
+            .as_ref()
+            .expect("non-preview signature import holds the writer lock"),
+        &merged,
+    ) {
         eprintln!("Failed to save: {}", e);
         return ExitCode::IoError;
     }
@@ -1228,6 +1314,14 @@ fn run_signature_disable(
 ) -> ExitCode {
     let session_id = SessionId::new();
 
+    let writer = match begin_signature_update(config_dir) {
+        Ok(writer) => writer,
+        Err(error) => {
+            eprintln!("Cannot update disabled patterns: {error}");
+            return ExitCode::IoError;
+        }
+    };
+
     // First check if the signature exists (in either built-in or user signatures)
     let mut db = SignatureDatabase::new();
     db.add_default_signatures();
@@ -1236,8 +1330,15 @@ fn run_signature_disable(
 
     // Also check user signatures
     if !found {
-        if let Some(user_schema) = load_user_signatures(config_dir) {
-            found = user_schema.signatures.iter().any(|s| s.name == name);
+        match try_load_user_signatures(config_dir) {
+            Ok(Some(user_schema)) => {
+                found = user_schema.signatures.iter().any(|s| s.name == name);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("Cannot inspect user signatures: {error}");
+                return ExitCode::ArgsError;
+            }
         }
     }
 
@@ -1260,17 +1361,12 @@ fn run_signature_disable(
     }
 
     // Load or create disabled patterns
-    let disabled_path = readable_config_file(config_dir, disabled_signatures_path);
-    let mut disabled = if disabled_path.exists() {
-        match DisabledPatterns::from_file(&disabled_path) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("Warning: Failed to load disabled patterns: {}", e);
-                DisabledPatterns::default()
-            }
+    let mut disabled = match load_disabled_patterns_for_update(config_dir) {
+        Ok(disabled) => disabled,
+        Err(error) => {
+            eprintln!("Cannot update disabled patterns: {error}");
+            return ExitCode::ArgsError;
         }
-    } else {
-        DisabledPatterns::default()
     };
 
     // Check if already disabled
@@ -1296,7 +1392,7 @@ fn run_signature_disable(
     disabled.disable(name, reason);
 
     // Save
-    if let Err(e) = save_disabled_patterns(config_dir, &disabled) {
+    if let Err(e) = save_disabled_patterns_with_writer(&writer, &disabled) {
         eprintln!("Failed to save disabled patterns: {}", e);
         return ExitCode::ArgsError;
     }
@@ -1328,18 +1424,21 @@ fn run_signature_disable(
 fn run_signature_enable(format: &OutputFormat, config_dir: &Path, name: &str) -> ExitCode {
     let session_id = SessionId::new();
 
-    // Load disabled patterns
-    let disabled_path = readable_config_file(config_dir, disabled_signatures_path);
-    let mut disabled = if disabled_path.exists() {
-        match DisabledPatterns::from_file(&disabled_path) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("Warning: Failed to load disabled patterns: {}", e);
-                DisabledPatterns::default()
-            }
+    let writer = match begin_signature_update(config_dir) {
+        Ok(writer) => writer,
+        Err(error) => {
+            eprintln!("Cannot update disabled patterns: {error}");
+            return ExitCode::IoError;
         }
-    } else {
-        DisabledPatterns::default()
+    };
+
+    // Load disabled patterns
+    let mut disabled = match load_disabled_patterns_for_update(config_dir) {
+        Ok(disabled) => disabled,
+        Err(error) => {
+            eprintln!("Cannot update disabled patterns: {error}");
+            return ExitCode::ArgsError;
+        }
     };
 
     // Check if it's actually disabled
@@ -1366,7 +1465,7 @@ fn run_signature_enable(format: &OutputFormat, config_dir: &Path, name: &str) ->
     disabled.enable(name);
 
     // Save
-    if let Err(e) = save_disabled_patterns(config_dir, &disabled) {
+    if let Err(e) = save_disabled_patterns_with_writer(&writer, &disabled) {
         eprintln!("Failed to save disabled patterns: {}", e);
         return ExitCode::ArgsError;
     }
@@ -1768,6 +1867,147 @@ mod tests {
             ExitCode::ArgsError
         );
         assert_eq!(std::fs::read(&destination).unwrap(), original.as_slice());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signature_updates_share_the_fleet_writer_lock() {
+        let root = signature_test_evidence_dir();
+        save_user_signatures(&root, &test_schema(&["existing"])).unwrap();
+        let mut disabled = DisabledPatterns::default();
+        disabled.disable("existing", Some("recorded choice"));
+        save_disabled_patterns(&root, &disabled).unwrap();
+        let signatures_before = std::fs::read(user_signatures_path(&root)).unwrap();
+        let disabled_before = std::fs::read(disabled_signatures_path(&root)).unwrap();
+        let source = root.join("incoming.json");
+        let mut incoming = test_schema(&["imported"]);
+        incoming.signatures[0].patterns.process_names = vec!["^imported$".to_string()];
+        std::fs::write(&source, serde_json::to_vec(&incoming).unwrap()).unwrap();
+
+        // This is the real directory flock held by fleet publication. Other
+        // configuration writers must refuse before loading a stale merge base.
+        let fleet = TransferImport::begin(&root).unwrap();
+        for (operation, result) in [
+            (
+                "add",
+                run_signature_add(
+                    &OutputFormat::Json,
+                    &root,
+                    "new",
+                    SupervisorCategory::Agent,
+                    &["^new$".to_string()],
+                    &[],
+                    &[],
+                    0.8,
+                    None,
+                    100,
+                    None,
+                ),
+            ),
+            (
+                "remove",
+                run_signature_remove(&OutputFormat::Json, &root, "existing", true),
+            ),
+            (
+                "import",
+                run_signature_import(
+                    &OutputFormat::Json,
+                    &root,
+                    source.to_str().unwrap(),
+                    false,
+                    None,
+                ),
+            ),
+            (
+                "disable",
+                run_signature_disable(&OutputFormat::Json, &root, "existing", None),
+            ),
+            (
+                "enable",
+                run_signature_enable(&OutputFormat::Json, &root, "existing"),
+            ),
+        ] {
+            assert_eq!(
+                result,
+                ExitCode::IoError,
+                "{operation} bypassed fleet writer lock"
+            );
+        }
+        assert!(save_user_signatures(&root, &incoming).is_err());
+        assert!(save_disabled_patterns(&root, &DisabledPatterns::default()).is_err());
+        assert_eq!(
+            run_signature_import(
+                &OutputFormat::Json,
+                &root,
+                source.to_str().unwrap(),
+                true,
+                None
+            ),
+            ExitCode::Clean,
+            "read-only preview must not require the writer lock"
+        );
+        assert_eq!(
+            std::fs::read(user_signatures_path(&root)).unwrap(),
+            signatures_before
+        );
+        assert_eq!(
+            std::fs::read(disabled_signatures_path(&root)).unwrap(),
+            disabled_before
+        );
+        drop(fleet);
+
+        // Each successful command keeps one guard across its read and save;
+        // a nested self-locking save would fail these ordinary update paths.
+        assert_eq!(
+            run_signature_import(
+                &OutputFormat::Json,
+                &root,
+                source.to_str().unwrap(),
+                false,
+                None
+            ),
+            ExitCode::Clean
+        );
+        assert_eq!(
+            run_signature_disable(&OutputFormat::Json, &root, "imported", Some("new choice")),
+            ExitCode::Clean
+        );
+        assert_eq!(
+            run_signature_enable(&OutputFormat::Json, &root, "existing"),
+            ExitCode::Clean
+        );
+        let disabled = load_disabled_patterns_for_update(&root).unwrap();
+        assert!(!disabled.is_disabled("existing"));
+        assert!(disabled.is_disabled("imported"));
+        let schema = try_load_user_signatures(&root).unwrap().unwrap();
+        assert!(schema
+            .signatures
+            .iter()
+            .any(|signature| signature.name == "existing"));
+        assert!(schema
+            .signatures
+            .iter()
+            .any(|signature| signature.name == "imported"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signature_enable_and_disable_preserve_invalid_existing_choices() {
+        let root = signature_test_evidence_dir();
+        save_user_signatures(&root, &test_schema(&["existing"])).unwrap();
+        let destination = disabled_signatures_path(&root);
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        let original = b"{ interrupted disabled-pattern save";
+        std::fs::write(&destination, original).unwrap();
+        assert_eq!(
+            run_signature_disable(&OutputFormat::Json, &root, "existing", Some("new choice")),
+            ExitCode::ArgsError
+        );
+        assert_eq!(
+            run_signature_enable(&OutputFormat::Json, &root, "existing"),
+            ExitCode::ArgsError
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), original);
     }
 
     /// Before GH #18, macOS kept user signatures in `~/Library/Application Support`;

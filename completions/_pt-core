@@ -2871,7 +2871,7 @@ prose\:"Structured natural language for agent-to-user communication"))' \
 '--fields=[Select specific output fields (comma-separated or preset\: minimal, standard, full)]:FIELDS:_default' \
 '--max-tokens=[Maximum token budget for output (enables truncation with continuation)]:TOKENS:_default' \
 '--dry-run[Show what would change without modifying]' \
-'--no-backup[Skip backup of existing priors]' \
+'--no-backup[Skip priors.json.bak (private transaction recovery journals are always retained)]' \
 '--normalize-baseline[Request normalization (refused until comparable measured learning baselines exist)]' \
 '*-v[Increase verbosity (-v, -vv, -vvv)]' \
 '*--verbose[Increase verbosity (-v, -vv, -vvv)]' \
@@ -4717,7 +4717,7 @@ prose\:"Structured natural language for agent-to-user communication"))' \
 '--fields=[Select specific output fields (comma-separated or preset\: minimal, standard, full)]:FIELDS:_default' \
 '--max-tokens=[Maximum token budget for output (enables truncation with continuation)]:TOKENS:_default' \
 '--dry-run[Show what would change without modifying]' \
-'--no-backup[Skip backup of existing priors]' \
+'--no-backup[Skip priors.json.bak (private transaction recovery journals are always retained)]' \
 '--normalize-baseline[Request normalization (refused until comparable measured learning baselines exist)]' \
 '*-v[Increase verbosity (-v, -vv, -vvv)]' \
 '*--verbose[Increase verbosity (-v, -vv, -vvv)]' \

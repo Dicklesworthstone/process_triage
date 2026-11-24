@@ -193,6 +193,96 @@ fn distinct_transfer_priors() -> (pt_core::config::Priors, pt_core::config::Prio
     (local, incoming)
 }
 
+#[cfg(unix)]
+#[test]
+fn import_priors_refuses_a_fleet_writer_and_reloads_its_published_merge_base() {
+    use pt_core::config::priors::{BetaParams, GammaParams};
+    use pt_core::fleet::transfer::TransferImport;
+
+    let data_dir = TempDir::new().unwrap();
+    let config_dir = TempDir::new().unwrap();
+    let (local, incoming) = distinct_transfer_priors();
+    let priors_path = config_dir.path().join("priors.json");
+    let backup_path = config_dir.path().join("priors.json.bak");
+    let input_path = data_dir.path().join("incoming.json");
+    let original = serde_json::to_vec_pretty(&local).unwrap();
+    let source = serde_json::to_vec_pretty(&incoming).unwrap();
+    fs::write(&priors_path, &original).unwrap();
+    fs::write(&input_path, &source).unwrap();
+
+    // Hold the actual fleet writer lock in this process, then invoke the real
+    // priors CLI in another process. Refusal must precede its read/merge/save.
+    let fleet = TransferImport::begin(config_dir.path()).unwrap();
+    prior_transfer_command(&data_dir, &config_dir)
+        .args(["--format", "json", "agent", "import-priors", "--from"])
+        .arg(&input_path)
+        .assert()
+        .code(ExitCode::IoError.as_i32())
+        .stderr(predicates::str::contains(
+            "cannot lock configuration directory",
+        ));
+    assert_eq!(fs::read(&priors_path).unwrap(), original);
+    assert!(!backup_path.exists());
+
+    // Publish a materially different fleet model while retaining the lock.
+    // Retrying the ordinary import must merge this state, not its former base.
+    let mut fleet_priors = local;
+    fleet_priors.classes.useful.prior_prob = 0.1;
+    fleet_priors.classes.useful_bad.prior_prob = 0.1;
+    fleet_priors.classes.abandoned.prior_prob = 0.6;
+    fleet_priors.classes.zombie.prior_prob = 0.2;
+    fleet_priors.classes.useful.cpu_beta = BetaParams::new(20.0, 30.0);
+    fleet_priors.classes.useful.runtime_gamma = Some(GammaParams::new(5.0, 9.0));
+    let fleet_bytes = serde_json::to_vec_pretty(&fleet_priors).unwrap();
+    fleet
+        .publish(vec![("priors.json".into(), fleet_bytes.clone())], false)
+        .unwrap();
+    assert_eq!(fs::read(&priors_path).unwrap(), fleet_bytes);
+    assert!(!backup_path.exists());
+
+    let preview = prior_transfer_command(&data_dir, &config_dir)
+        .args([
+            "--format",
+            "json",
+            "agent",
+            "import-priors",
+            "--dry-run",
+            "--from",
+        ])
+        .arg(&input_path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let preview: Value = serde_json::from_slice(&preview).unwrap();
+    assert_eq!(preview["dry_run"], true);
+    assert_eq!(fs::read(&priors_path).unwrap(), fleet_bytes);
+    assert!(!backup_path.exists());
+    drop(fleet);
+
+    prior_transfer_command(&data_dir, &config_dir)
+        .args(["--format", "json", "agent", "import-priors", "--from"])
+        .arg(&input_path)
+        .assert()
+        .success();
+    let saved: pt_core::config::Priors =
+        serde_json::from_slice(&fs::read(&priors_path).unwrap()).unwrap();
+    assert!((saved.classes.useful.prior_prob - 0.15).abs() < 1e-12);
+    assert!((saved.classes.abandoned.prior_prob - 0.5).abs() < 1e-12);
+    assert_eq!(saved.classes.useful.cpu_beta.alpha, 15.0);
+    assert_eq!(saved.classes.useful.cpu_beta.beta, 22.0);
+    let runtime = saved.classes.useful.runtime_gamma.as_ref().unwrap();
+    assert_eq!(runtime.shape, 5.0);
+    assert_eq!(runtime.rate, 9.0);
+    assert_eq!(
+        serde_json::to_value(saved).unwrap(),
+        preview["resulting_priors"]
+    );
+    assert_eq!(fs::read(&backup_path).unwrap(), fleet_bytes);
+    assert_eq!(fs::read(&input_path).unwrap(), source);
+}
+
 #[test]
 fn import_priors_weighted_merge_matches_preview_and_retains_local_settings() {
     for explicit_merge in [false, true] {

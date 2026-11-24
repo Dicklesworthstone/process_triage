@@ -2249,6 +2249,95 @@ pub fn write_serialized_json(path: &Path, content: &[u8]) -> Result<(), SessionE
     publish_json_bytes(path, content)
 }
 
+/// Publish JSON relative to a caller-held parent directory, preserving its identity.
+///
+/// The parent must already exist and still be the directory containing `path`.
+/// It is never reopened or recreated. A substituted parent is rejected before
+/// creating a temporary file; all publication operations use the supplied inode.
+/// As with [`write_serialized_json`], an error after rename can leave the complete
+/// replacement visible, so callers must retain their recovery evidence.
+pub fn write_serialized_json_at(
+    path: &Path,
+    parent: &std::fs::File,
+    content: &[u8],
+) -> Result<(), SessionError> {
+    serde_json::from_slice::<serde::de::IgnoredAny>(content).map_err(|source| {
+        SessionError::Json {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    #[cfg(unix)]
+    {
+        let directory = JsonDirectory::from_file(artifact_parent(path), parent)?;
+        directory.sync_parent_entry(&std::fs::File::sync_all)?;
+        let temporary = format!(".pt-json-{}.tmp", uuid::Uuid::new_v4());
+        write_json_bytes_in_directory(
+            path,
+            &directory,
+            content,
+            temporary.as_ref(),
+            std::fs::File::sync_all,
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+        Err(session_io(
+            path,
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "durable session publication requires Unix directory synchronization",
+            ),
+        ))
+    }
+}
+
+/// Retain an exact JSON artifact outside its active name without deleting it.
+///
+/// Both parents are caller-held descriptors whose current path identities must
+/// still match. The source must be a regular, singly linked file containing
+/// `expected` bytes, and an existing destination is never replaced. Callers must
+/// serialize writers while checking the source and retiring it. A rename can
+/// succeed before a later sync error. Failures trigger no cleanup or retry;
+/// callers must inspect both names when recovering an uncertain result.
+pub fn retire_serialized_json_at(
+    source: &Path,
+    source_parent: &std::fs::File,
+    destination: &Path,
+    destination_parent: &std::fs::File,
+    expected: &[u8],
+) -> Result<(), SessionError> {
+    serde_json::from_slice::<serde::de::IgnoredAny>(expected).map_err(|error| {
+        SessionError::Json {
+            path: source.to_path_buf(),
+            source: error,
+        }
+    })?;
+    #[cfg(unix)]
+    {
+        retire_json_bytes(
+            source,
+            source_parent,
+            destination,
+            destination_parent,
+            expected,
+            std::fs::File::sync_all,
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (source_parent, destination, destination_parent);
+        Err(session_io(
+            source,
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "durable artifact retirement requires Unix directory synchronization",
+            ),
+        ))
+    }
+}
+
 fn publish_json_bytes(path: &Path, content: &[u8]) -> Result<(), SessionError> {
     // Randomness prevents same-process writers from sharing a temporary path;
     // exclusive creation, rather than randomness, enforces collision safety.
@@ -2294,6 +2383,17 @@ struct JsonDirectory {
 
 #[cfg(unix)]
 impl JsonDirectory {
+    fn from_file(path: &Path, handle: &std::fs::File) -> Result<Self, SessionError> {
+        let directory = Self {
+            path: path.to_path_buf(),
+            handle: handle
+                .try_clone()
+                .map_err(|error| session_io(path, error))?,
+        };
+        directory.revalidate()?;
+        Ok(directory)
+    }
+
     fn open(path: &Path) -> Result<Self, SessionError> {
         use std::os::unix::fs::OpenOptionsExt;
         let handle = std::fs::OpenOptions::new()
@@ -2425,6 +2525,80 @@ impl JsonDirectory {
         Ok(unsafe { std::fs::File::from_raw_fd(fd) })
     }
 
+    fn open_artifact(&self, name: &std::ffi::OsStr) -> Result<std::fs::File, SessionError> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        self.revalidate()?;
+        let path = self.path.join(name);
+        let name = artifact_name(name).map_err(|error| session_io(&path, error))?;
+        // SAFETY: the descriptor stays live and the validated name is one
+        // NUL-terminated component. Neither symlinks nor blocking FIFOs are read.
+        let fd = unsafe {
+            libc::openat(
+                self.handle.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(session_io(&path, std::io::Error::last_os_error()));
+        }
+        // SAFETY: this new descriptor is transferred to File exactly once.
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        if !file
+            .metadata()
+            .map_err(|error| session_io(&path, error))?
+            .is_file()
+        {
+            return Err(session_io(
+                &path,
+                std::io::Error::other("artifact must be a regular file"),
+            ));
+        }
+        Ok(file)
+    }
+
+    fn retire(
+        &self,
+        source_name: &std::ffi::OsStr,
+        source_file: &std::fs::File,
+        destination: &Self,
+        destination_name: &std::ffi::OsStr,
+        expected: &[u8],
+    ) -> Result<(), SessionError> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        self.revalidate()?;
+        destination.revalidate()?;
+        let source_path = self.path.join(source_name);
+        let destination_path = destination.path.join(destination_name);
+        let source = artifact_name(source_name).map_err(|error| session_io(&source_path, error))?;
+        let target = artifact_name(destination_name)
+            .map_err(|error| session_io(&destination_path, error))?;
+        let saved = source_file
+            .metadata()
+            .map_err(|error| session_io(&source_path, error))?;
+        let current_file = self.open_artifact(source_name)?;
+        let current = current_file
+            .metadata()
+            .map_err(|error| session_io(&source_path, error))?;
+        if saved.dev() != current.dev() || saved.ino() != current.ino() || current.nlink() != 1 {
+            return Err(session_io(
+                &source_path,
+                std::io::Error::other("artifact retirement source identity changed"),
+            ));
+        }
+        verify_retirement_source(&source_path, &current_file, expected)?;
+        self.revalidate()?;
+        destination.revalidate()?;
+        renameat_no_replace(
+            self.handle.as_raw_fd(),
+            &source,
+            destination.handle.as_raw_fd(),
+            &target,
+        )
+        .map_err(|error| session_io(&destination_path, error))
+    }
+
     fn rename(
         &self,
         temporary: &std::ffi::OsStr,
@@ -2496,6 +2670,135 @@ impl JsonDirectory {
 }
 
 #[cfg(unix)]
+fn renameat_no_replace(
+    source_parent: std::os::fd::RawFd,
+    source: &std::ffi::CStr,
+    destination_parent: std::os::fd::RawFd,
+    destination: &std::ffi::CStr,
+) -> Result<(), std::io::Error> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        // SAFETY: both borrowed descriptors remain live and both names are
+        // validated single components. The exclusive flag refuses any existing
+        // recovery destination, including a symlink, in the rename itself.
+        #[cfg(target_os = "linux")]
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                source_parent,
+                source.as_ptr(),
+                destination_parent,
+                destination.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        #[cfg(target_os = "macos")]
+        let result = unsafe {
+            libc::renameatx_np(
+                source_parent,
+                source.as_ptr(),
+                destination_parent,
+                destination.as_ptr(),
+                libc::RENAME_EXCL,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (source_parent, source, destination_parent, destination);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "exclusive artifact retirement requires Linux or macOS",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn verify_retirement_source(
+    path: &Path,
+    file: &std::fs::File,
+    expected: &[u8],
+) -> Result<(), SessionError> {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata().map_err(|error| session_io(path, error))?;
+    if metadata.len() != expected.len() as u64 || metadata.nlink() != 1 {
+        return Err(session_io(
+            path,
+            std::io::Error::other("artifact retirement source does not match expected bytes"),
+        ));
+    }
+    let mut observed = Vec::with_capacity(expected.len().min(65536));
+    file.take((expected.len() as u64).saturating_add(1))
+        .read_to_end(&mut observed)
+        .map_err(|error| session_io(path, error))?;
+    if observed != expected {
+        return Err(session_io(
+            path,
+            std::io::Error::other("artifact retirement source does not match expected bytes"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn retire_json_bytes(
+    source: &Path,
+    source_parent: &std::fs::File,
+    destination: &Path,
+    destination_parent: &std::fs::File,
+    expected: &[u8],
+    synchronize: impl Fn(&std::fs::File) -> std::io::Result<()>,
+) -> Result<(), SessionError> {
+    let source_name = source
+        .file_name()
+        .ok_or_else(|| session_io(source, std::io::Error::other("artifact has no filename")))?;
+    let destination_name = destination.file_name().ok_or_else(|| {
+        session_io(
+            destination,
+            std::io::Error::other("artifact has no filename"),
+        )
+    })?;
+    artifact_name(source_name).map_err(|error| session_io(source, error))?;
+    artifact_name(destination_name).map_err(|error| session_io(destination, error))?;
+    let source_directory = JsonDirectory::from_file(artifact_parent(source), source_parent)?;
+    let destination_directory =
+        JsonDirectory::from_file(artifact_parent(destination), destination_parent)?;
+    let file = source_directory.open_artifact(source_name)?;
+    verify_retirement_source(source, &file, expected)?;
+    destination_directory.sync_parent_entry(&std::fs::File::sync_all)?;
+    synchronize(&file).map_err(|error| session_io(source, error))?;
+    source_directory.retire(
+        source_name,
+        &file,
+        &destination_directory,
+        destination_name,
+        expected,
+    )?;
+    for directory in [&destination_directory, &source_directory] {
+        synchronize(&directory.handle).map_err(|error| {
+            session_io(
+                &directory.path,
+                std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "artifact {} was retired to {}, but directory synchronization failed: {error}",
+                        source.display(),
+                        destination.display()
+                    ),
+                ),
+            )
+        })?;
+    }
+    source_directory.revalidate()?;
+    destination_directory.revalidate()
+}
+
+#[cfg(unix)]
 fn create_session_directory(path: &Path) -> Result<(), SessionError> {
     JsonDirectory::create(path).map(|_| ())
 }
@@ -2520,7 +2823,6 @@ fn write_json_bytes(
     temporary: &std::ffi::OsStr,
     synchronize: impl Fn(&std::fs::File) -> std::io::Result<()>,
 ) -> Result<(), SessionError> {
-    use std::io::Write;
     let destination = path.file_name().ok_or_else(|| {
         session_io(
             path,
@@ -2529,6 +2831,25 @@ fn write_json_bytes(
     })?;
     artifact_name(destination).map_err(|error| session_io(path, error))?;
     let directory = JsonDirectory::create(artifact_parent(path))?;
+    write_json_bytes_in_directory(path, &directory, content, temporary, synchronize)
+}
+
+#[cfg(unix)]
+fn write_json_bytes_in_directory(
+    path: &Path,
+    directory: &JsonDirectory,
+    content: &[u8],
+    temporary: &std::ffi::OsStr,
+    synchronize: impl Fn(&std::fs::File) -> std::io::Result<()>,
+) -> Result<(), SessionError> {
+    use std::io::Write;
+    let destination = path.file_name().ok_or_else(|| {
+        session_io(
+            path,
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "artifact has no filename"),
+        )
+    })?;
+    artifact_name(destination).map_err(|error| session_io(path, error))?;
     let temporary_path = directory.path.join(temporary);
     let mut file = directory.create_temporary(temporary)?;
     file.write_all(content)
@@ -3835,6 +4156,257 @@ mod tests {
             assert!(!missing_parent.exists());
         }
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_serialized_json_at_uses_the_held_parent_and_refuses_late_replacement() {
+        use std::os::unix::fs::symlink;
+        for substitute_symlink in [false, true] {
+            let root = tempfile::tempdir().unwrap().keep();
+            let directory = root.join("config");
+            let retained = root.join("original-config");
+            let replacement = root.join("replacement");
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::create_dir(&replacement).unwrap();
+            let parent = std::fs::File::open(&directory).unwrap();
+            let path = directory.join("priors.json");
+            let original = b" {\"generation\":1, \"preserve\":[1,  2]}\n";
+            write_serialized_json_at(&path, &parent, original).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert!(matches!(
+                write_serialized_json_at(&path, &parent, b"{invalid"),
+                Err(SessionError::Json { .. })
+            ));
+            assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+
+            // Substitute before the helper is called: reopening a parent here
+            // would accept a replacement real directory as well as a redirect.
+            std::fs::rename(&directory, &retained).unwrap();
+            if substitute_symlink {
+                symlink(&replacement, &directory).unwrap();
+            } else {
+                std::fs::rename(&replacement, &directory).unwrap();
+            }
+            let error =
+                write_serialized_json_at(&path, &parent, b"{\"generation\":2}").unwrap_err();
+            assert!(error.to_string().contains("directory identity changed"));
+            assert_eq!(
+                std::fs::read(retained.join("priors.json")).unwrap(),
+                original
+            );
+            assert_eq!(std::fs::read_dir(&retained).unwrap().count(), 1);
+            assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn retire_serialized_json_at_preserves_exact_bytes_and_never_overwrites_a_name() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let active = root.join("active");
+        let retained = root.join("retained");
+        std::fs::create_dir(&active).unwrap();
+        std::fs::create_dir(&retained).unwrap();
+        let active_parent = std::fs::File::open(&active).unwrap();
+        let retained_parent = std::fs::File::open(&retained).unwrap();
+        let source = active.join("new.json");
+        let destination = retained.join("0.json");
+        let original = b" {\"generation\":2, \"unrecognized\":[1,  2]}\n";
+        let preexisting = b"{\"preserve\":\"recovery evidence\"}";
+        std::fs::write(&source, original).unwrap();
+        std::fs::write(&destination, preexisting).unwrap();
+        let error = retire_serialized_json_at(
+            &source,
+            &active_parent,
+            &destination,
+            &retained_parent,
+            original,
+        )
+        .unwrap_err();
+        assert!(matches!(error, SessionError::Io { source, .. }
+            if source.kind() == std::io::ErrorKind::AlreadyExists));
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+        assert_eq!(std::fs::read(&destination).unwrap(), preexisting);
+
+        let destination = retained.join("1.json");
+        assert!(retire_serialized_json_at(
+            &source,
+            &active_parent,
+            &destination,
+            &retained_parent,
+            b"{\"wrong\":true}",
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("expected bytes"));
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+        retire_serialized_json_at(
+            &source,
+            &active_parent,
+            &destination,
+            &retained_parent,
+            original,
+        )
+        .unwrap();
+        assert!(!source.exists());
+        assert_eq!(std::fs::read(&destination).unwrap(), original);
+        assert_eq!(std::fs::read(retained.join("0.json")).unwrap(), preexisting);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retire_serialized_json_at_refuses_either_replaced_parent_before_mutation() {
+        for replace_source in [false, true] {
+            let root = tempfile::tempdir().unwrap().keep();
+            let active = root.join("active");
+            let retained = root.join("retained");
+            std::fs::create_dir(&active).unwrap();
+            std::fs::create_dir(&retained).unwrap();
+            let active_parent = std::fs::File::open(&active).unwrap();
+            let retained_parent = std::fs::File::open(&retained).unwrap();
+            let source = active.join("new.json");
+            let destination = retained.join("0.json");
+            let expected = b"{\"generation\":2}";
+            std::fs::write(&source, expected).unwrap();
+            let replaced = if replace_source { &active } else { &retained };
+            let old_parent = root.join("old-parent");
+            std::fs::rename(replaced, &old_parent).unwrap();
+            std::fs::create_dir(replaced).unwrap();
+            // Even identical contents in a new source directory cannot make
+            // that directory inherit the original descriptor's authority.
+            if replace_source {
+                std::fs::write(&source, expected).unwrap();
+            }
+            let error = retire_serialized_json_at(
+                &source,
+                &active_parent,
+                &destination,
+                &retained_parent,
+                expected,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("directory identity changed"));
+            assert_eq!(std::fs::read(&source).unwrap(), expected);
+            assert!(!destination.exists());
+            if replace_source {
+                assert_eq!(
+                    std::fs::read(old_parent.join("new.json")).unwrap(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retire_serialized_json_at_revalidates_parents_and_source_after_sync() {
+        for substitution in [
+            "source_parent",
+            "destination_parent",
+            "source_inode",
+            "source_bytes",
+        ] {
+            let root = tempfile::tempdir().unwrap().keep();
+            let active = root.join("active");
+            let retained = root.join("retained");
+            std::fs::create_dir(&active).unwrap();
+            std::fs::create_dir(&retained).unwrap();
+            let active_parent = std::fs::File::open(&active).unwrap();
+            let retained_parent = std::fs::File::open(&retained).unwrap();
+            let source = active.join("new.json");
+            let destination = retained.join("0.json");
+            let expected = b"{\"generation\":2}";
+            let changed = b"{\"generation\":3}";
+            std::fs::write(&source, expected).unwrap();
+            let error = retire_json_bytes(
+                &source,
+                &active_parent,
+                &destination,
+                &retained_parent,
+                expected,
+                |file| {
+                    assert!(file.metadata()?.is_file());
+                    file.sync_all()?;
+                    match substitution {
+                        "source_parent" | "destination_parent" => {
+                            let parent = if substitution == "source_parent" {
+                                &active
+                            } else {
+                                &retained
+                            };
+                            std::fs::rename(parent, root.join("old-parent"))?;
+                            std::fs::create_dir(parent)
+                        }
+                        "source_inode" => {
+                            std::fs::rename(&source, active.join("original.json"))?;
+                            std::fs::write(&source, changed)
+                        }
+                        "source_bytes" => std::fs::write(&source, changed),
+                        _ => unreachable!(),
+                    }
+                },
+            )
+            .unwrap_err();
+            assert!(!destination.exists(), "{substitution}: {error}");
+            match substitution {
+                "source_parent" => {
+                    assert_eq!(
+                        std::fs::read(root.join("old-parent/new.json")).unwrap(),
+                        expected
+                    );
+                    assert_eq!(std::fs::read_dir(&active).unwrap().count(), 0);
+                }
+                "destination_parent" => assert_eq!(std::fs::read(&source).unwrap(), expected),
+                "source_inode" | "source_bytes" => {
+                    assert_eq!(std::fs::read(&source).unwrap(), changed)
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn retire_serialized_json_at_reports_sync_failure_without_retry_or_cleanup() {
+        for fail_after_rename in [false, true] {
+            let root = tempfile::tempdir().unwrap().keep();
+            let active = root.join("active");
+            let retained = root.join("retained");
+            std::fs::create_dir(&active).unwrap();
+            std::fs::create_dir(&retained).unwrap();
+            let source = active.join("new.json");
+            let destination = retained.join("0.json");
+            let expected = b"{\"generation\":2}";
+            std::fs::write(&source, expected).unwrap();
+            let error = retire_json_bytes(
+                &source,
+                &std::fs::File::open(&active).unwrap(),
+                &destination,
+                &std::fs::File::open(&retained).unwrap(),
+                expected,
+                |file| {
+                    if file.metadata()?.is_dir() == fail_after_rename {
+                        Err(std::io::Error::other("injected synchronization failure"))
+                    } else {
+                        file.sync_all()
+                    }
+                },
+            )
+            .unwrap_err();
+            if fail_after_rename {
+                assert!(error.to_string().contains("was retired to"));
+                assert!(error
+                    .to_string()
+                    .contains("directory synchronization failed"));
+                assert!(!source.exists());
+                assert_eq!(std::fs::read(&destination).unwrap(), expected);
+            } else {
+                assert_eq!(std::fs::read(&source).unwrap(), expected);
+                assert!(!destination.exists());
+            }
+        }
     }
 
     #[test]

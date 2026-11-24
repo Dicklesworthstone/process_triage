@@ -6,14 +6,19 @@
 //! diff preview before applying changes.
 
 use crate::supervision::pattern_persistence::{
-    ConflictResolution, ImportConflict, PatternLifecycle, PersistedPattern, PersistedSchema,
+    AllPatternStats, ConflictResolution, DisabledPatterns, ImportConflict, PatternLifecycle,
+    PersistedPattern, PersistedSchema,
 };
 use crate::supervision::signature::SupervisorSignature;
 use pt_config::priors::{BetaParams, ClassParams, Priors};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs::{self, File, OpenOptions};
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 // ── Constants ─────────────────────────────────────────────────────────────
@@ -48,6 +53,1445 @@ pub enum TransferError {
 
     #[error("transfer contains detected sensitive content; intact configuration transfer refused")]
     SensitiveContent,
+
+    #[error("fleet import publication failed: {0}")]
+    Publication(String),
+}
+
+// A small state file blocks readers during publication. Exact old and new bytes
+// are retained in a separate private journal, including after success: an error
+// synchronizing the final state must never discard the only copy of a preimage.
+const IMPORT_STATE_FILE: &str = ".fleet-transfer-state.json";
+const IMPORT_JOURNAL_VERSION: u32 = 1;
+const MAX_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_JOURNAL_BYTES: u64 = 256 * 1024 * 1024;
+const IMPORT_ARTIFACTS: [&str; 6] = [
+    "priors.json",
+    "priors.json.bak",
+    "patterns/learned.json",
+    "patterns/custom.json",
+    "patterns/disabled.json",
+    "pattern_stats.json",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ImportPhase {
+    Pending,
+    Committed,
+    RolledBack,
+}
+
+/// Opaque comparison token for one completed publication or rollback. The
+/// terminal phase matters: a visible commit marker can precede a failed fsync
+/// and subsequent rollback of the same transaction UUID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigurationGeneration {
+    id: uuid::Uuid,
+    phase: ImportPhase,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportState {
+    version: u32,
+    id: uuid::Uuid,
+    journal_sha256: String,
+    phase: ImportPhase,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportFile {
+    path: String,
+    before: Option<String>,
+    after: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportJournal {
+    version: u32,
+    id: uuid::Uuid,
+    files: Vec<ImportFile>,
+}
+
+/// Durable recovery evidence for one completed import. The private journal
+/// contains exact preimages even when the optional priors.json.bak is disabled.
+#[derive(Debug, Serialize)]
+pub struct ImportPublication {
+    pub id: uuid::Uuid,
+    pub recovery_journal: PathBuf,
+}
+
+/// Serialize fleet writers from before the local configuration is read until
+/// every destination is published or recovered. Locking the directory avoids
+/// predictable temporary names and does not add a lock file to dry-run output.
+pub struct TransferImport {
+    config_dir: PathBuf,
+    directory: File,
+    patterns_directory: RefCell<Option<File>>,
+    baseline: BTreeMap<String, Result<Option<String>, String>>,
+    recovered_import: Option<uuid::Uuid>,
+}
+
+impl TransferImport {
+    /// Acquire the writer lock and recover an interrupted import before merging.
+    pub fn begin(config_dir: &Path) -> Result<Self, TransferError> {
+        Self::begin_locked(config_dir, true)
+    }
+
+    /// Hold the configuration writer lock without recovering a pending import.
+    /// Ordinary writers acquire this BEFORE reading the values they will edit.
+    pub fn begin_writer(config_dir: &Path) -> Result<Self, TransferError> {
+        Self::begin_locked(config_dir, false)
+    }
+
+    fn begin_locked(config_dir: &Path, recover: bool) -> Result<Self, TransferError> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(config_dir)?;
+            let directory = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(config_dir)?;
+            // SAFETY: the directory descriptor remains owned by this guard.
+            if unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                return Err(TransferError::Publication(format!(
+                    "cannot lock configuration directory (another import may be running): {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            let mut import = Self {
+                config_dir: config_dir.to_path_buf(),
+                directory,
+                patterns_directory: RefCell::new(None),
+                baseline: BTreeMap::new(),
+                recovered_import: None,
+            };
+            import.check_directory()?;
+            if let Some(state) = read_import_state(config_dir)? {
+                if state.phase == ImportPhase::Pending {
+                    if !recover {
+                        return Err(TransferError::Publication(
+                            "configuration has a pending fleet import; run fleet transfer import to recover before changing configuration".into(),
+                        ));
+                    }
+                    let journal = import.load_journal(&state)?;
+                    import.rollback(&state, &journal)?;
+                    import.recovered_import = Some(state.id);
+                }
+            }
+            // Capture preimages before the caller reads and merges anything.
+            // Errors for unrelated artifacts remain deferred until requested.
+            for path in IMPORT_ARTIFACTS {
+                let before = import
+                    .read_artifact(path)
+                    .map_err(|error| error.to_string());
+                import.baseline.insert(path.to_string(), before);
+            }
+            Ok(import)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (config_dir, recover);
+            Err(TransferError::Publication(
+                "durable fleet import requires Unix directory locking and synchronization".into(),
+            ))
+        }
+    }
+
+    pub fn recovered_import(&self) -> Option<uuid::Uuid> {
+        self.recovered_import
+    }
+
+    /// Publish one JSON document while retaining this guard's writer lock and
+    /// pinned destination directory. Callers must hold the guard across reads.
+    pub fn write_json(&self, relative: &Path, bytes: &[u8]) -> Result<(), TransferError> {
+        serde_json::from_slice::<serde::de::IgnoredAny>(bytes)?;
+        self.check_directory()?;
+        let name = relative
+            .to_str()
+            .ok_or_else(|| TransferError::Publication("non-UTF-8 artifact path".into()))?;
+        let allowed = relative
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+            && (relative.components().count() == 1 || IMPORT_ARTIFACTS.contains(&name));
+        if !allowed {
+            return Err(TransferError::Publication(
+                "unsupported configuration write path".into(),
+            ));
+        }
+        let parent = self
+            .parent_directory(relative, true)?
+            .ok_or_else(|| TransferError::Publication("missing artifact directory".into()))?;
+        let path = self.config_dir.join(relative);
+        // The ordinary priors importer historically replaces a backup symlink
+        // without following it. The pinned-parent writer preserves that safe
+        // behavior. Transactional imports still validate/snapshot the backup
+        // via baseline_for/read_artifact before reaching this publication step.
+        if name != "priors.json.bak" {
+            read_import_json(&path, MAX_JOURNAL_BYTES)?;
+        }
+        crate::session::write_serialized_json_at(&path, &parent, bytes)
+            .map_err(|error| TransferError::Publication(error.to_string()))
+    }
+
+    fn baseline_for(&self, relative: &str) -> Result<Option<String>, TransferError> {
+        let before = self
+            .baseline
+            .get(relative)
+            .ok_or_else(|| TransferError::Publication("missing artifact baseline".into()))?
+            .as_ref()
+            .map_err(|error| TransferError::Publication(error.clone()))?
+            .clone();
+        if self.read_artifact(relative)? != before {
+            return Err(TransferError::Publication(format!(
+                "{relative} changed since the import began; reload before merging"
+            )));
+        }
+        Ok(before)
+    }
+
+    /// Validate and stage every artifact before touching any destination. A
+    /// durable pending state precedes publication; failures restore exact old
+    /// bytes, and interruption is recovered by the next non-preview import.
+    pub fn publish(
+        &self,
+        files: Vec<(PathBuf, Vec<u8>)>,
+        backup_priors: bool,
+    ) -> Result<Option<ImportPublication>, TransferError> {
+        self.publish_with(files, backup_priors, |path, bytes| {
+            let relative = path.strip_prefix(&self.config_dir).map_err(|_| {
+                TransferError::Publication("artifact escaped configuration directory".into())
+            })?;
+            self.write_json(relative, bytes)
+        })
+    }
+
+    fn publish_with(
+        &self,
+        files: Vec<(PathBuf, Vec<u8>)>,
+        backup_priors: bool,
+        mut publish: impl FnMut(&Path, &[u8]) -> Result<(), TransferError>,
+    ) -> Result<Option<ImportPublication>, TransferError> {
+        self.check_directory()?;
+        configuration_generation(&self.config_dir)?;
+        if files.is_empty() {
+            return Ok(None);
+        }
+        let mut journal = ImportJournal {
+            version: IMPORT_JOURNAL_VERSION,
+            id: uuid::Uuid::new_v4(),
+            files: Vec::new(),
+        };
+        for (relative, bytes) in files {
+            let path = relative
+                .to_str()
+                .ok_or_else(|| TransferError::Publication("non-UTF-8 artifact path".into()))?
+                .to_string();
+            validate_import_path(&path)?;
+            let after = String::from_utf8(bytes)
+                .map_err(|_| TransferError::Publication("non-UTF-8 configuration".into()))?;
+            validate_import_payload(&path, &after)?;
+            let before = self.baseline_for(&path)?;
+            journal.files.push(ImportFile {
+                path,
+                before,
+                after,
+            });
+        }
+        if backup_priors {
+            if let Some(before) = journal
+                .files
+                .iter()
+                .find(|file| file.path == "priors.json")
+                .and_then(|file| file.before.clone())
+            {
+                journal.files.push(ImportFile {
+                    path: "priors.json.bak".into(),
+                    before: self.baseline_for("priors.json.bak")?,
+                    after: before,
+                });
+            }
+        }
+        validate_import_journal(&journal)?;
+        let bytes = serde_json::to_vec_pretty(&journal)?;
+        if bytes.len() as u64 > MAX_JOURNAL_BYTES {
+            return Err(TransferError::Publication(
+                "import journal is too large".into(),
+            ));
+        }
+        let path = self.journal_path(journal.id);
+        if fs::symlink_metadata(&path).is_ok() {
+            return Err(TransferError::Publication(
+                "import journal already exists".into(),
+            ));
+        }
+        self.write_json(
+            Path::new(path.file_name().expect("journal has a filename")),
+            &bytes,
+        )?;
+        let mut state = ImportState {
+            version: IMPORT_JOURNAL_VERSION,
+            id: journal.id,
+            journal_sha256: hex::encode(Sha256::digest(&bytes)),
+            phase: ImportPhase::Pending,
+        };
+        // Validate the persisted staging, not only the values in memory.
+        self.load_journal(&state)?;
+        self.write_state(&state)?;
+        for file in &journal.files {
+            let result = (|| {
+                self.check_directory()?;
+                if self.read_artifact(&file.path)? != file.before {
+                    return Err(TransferError::Publication(format!(
+                        "{} changed after staging; refusing to overwrite it",
+                        file.path
+                    )));
+                }
+                publish(&self.config_dir.join(&file.path), file.after.as_bytes())
+            })();
+            if let Err(error) = result {
+                return Err(self.publication_failure(error, &state, &journal));
+            }
+        }
+        state.phase = ImportPhase::Committed;
+        if let Err(error) = self.write_state(&state) {
+            // A state rename may have succeeded before its fsync failed. Make
+            // Pending durable again BEFORE changing any published artifact.
+            state.phase = ImportPhase::Pending;
+            if let Err(pending_error) = self.write_state(&state) {
+                return Err(TransferError::Publication(format!(
+                    "all artifacts published, but commit durability could not be confirmed: {error}; \
+                     could not persist recovery state: {pending_error}; exact originals retained at {}",
+                    path.display()
+                )));
+            }
+            return Err(self.publication_failure(error, &state, &journal));
+        }
+        Ok(Some(ImportPublication {
+            id: state.id,
+            recovery_journal: path,
+        }))
+    }
+
+    fn publication_failure(
+        &self,
+        error: TransferError,
+        state: &ImportState,
+        journal: &ImportJournal,
+    ) -> TransferError {
+        let recovery = match self.rollback(state, journal) {
+            Ok(()) => "all original artifacts restored".to_string(),
+            Err(rollback) => format!(
+                "recovery remains pending: {rollback}; exact originals retained at {}",
+                self.journal_path(state.id).display()
+            ),
+        };
+        TransferError::Publication(format!("{error}; {recovery}"))
+    }
+
+    fn journal_path(&self, id: uuid::Uuid) -> PathBuf {
+        self.config_dir.join(format!(".fleet-transfer-{id}.json"))
+    }
+
+    fn write_state(&self, state: &ImportState) -> Result<(), TransferError> {
+        self.check_directory()?;
+        let path = self.config_dir.join(IMPORT_STATE_FILE);
+        // Never replace a substituted symlink or non-regular journal marker.
+        read_import_json(&path, MAX_CONFIG_BYTES)?;
+        self.write_json(
+            Path::new(IMPORT_STATE_FILE),
+            &serde_json::to_vec_pretty(state)?,
+        )
+    }
+
+    fn load_journal(&self, state: &ImportState) -> Result<ImportJournal, TransferError> {
+        self.check_directory()?;
+        let bytes = read_import_json(&self.journal_path(state.id), MAX_JOURNAL_BYTES)?
+            .ok_or_else(|| TransferError::Publication("missing import recovery journal".into()))?;
+        if hex::encode(Sha256::digest(bytes.as_bytes())) != state.journal_sha256 {
+            return Err(TransferError::Publication(
+                "import recovery checksum mismatch".into(),
+            ));
+        }
+        let journal: ImportJournal = serde_json::from_str(&bytes)?;
+        if journal.id != state.id {
+            return Err(TransferError::Publication(
+                "import recovery identity mismatch".into(),
+            ));
+        }
+        validate_import_journal(&journal)?;
+        Ok(journal)
+    }
+
+    fn read_artifact(&self, relative: &str) -> Result<Option<String>, TransferError> {
+        validate_import_path(relative)?;
+        self.check_directory()?;
+        if self.parent_directory(Path::new(relative), false)?.is_none() {
+            return Ok(None);
+        }
+        read_import_json(&self.config_dir.join(relative), MAX_CONFIG_BYTES)
+    }
+
+    fn parent_directory(
+        &self,
+        relative: &Path,
+        create: bool,
+    ) -> Result<Option<File>, TransferError> {
+        self.check_directory()?;
+        if relative
+            .parent()
+            .is_none_or(|parent| parent.as_os_str().is_empty())
+        {
+            return Ok(Some(self.directory.try_clone()?));
+        }
+        if relative.parent() != Some(Path::new("patterns")) {
+            return Err(TransferError::Publication(
+                "unsupported artifact parent".into(),
+            ));
+        }
+        let path = self.config_dir.join("patterns");
+        let mut pinned = self.patterns_directory.borrow_mut();
+        if pinned.is_none() {
+            *pinned = open_import_subdirectory(&self.directory, "patterns", create, false)?;
+        }
+        if let Some(directory) = pinned.as_ref() {
+            validate_import_directory(&path, directory)?;
+            Ok(Some(directory.try_clone()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn check_directory(&self) -> Result<(), TransferError> {
+        validate_import_directory(&self.config_dir, &self.directory)
+    }
+
+    fn rollback(&self, state: &ImportState, journal: &ImportJournal) -> Result<(), TransferError> {
+        self.rollback_with_sync(state, journal, File::sync_all)
+    }
+
+    fn rollback_with_sync(
+        &self,
+        state: &ImportState,
+        journal: &ImportJournal,
+        synchronize: impl Fn(&File) -> std::io::Result<()>,
+    ) -> Result<(), TransferError> {
+        validate_import_journal(journal)?;
+        // Validate every destination before making recovery changes. An unrelated
+        // writer's bytes are preserved; a pending marker keeps readers out.
+        for file in &journal.files {
+            let current = self.read_artifact(&file.path)?;
+            if current != file.before && current.as_deref() != Some(file.after.as_str()) {
+                return Err(TransferError::Publication(format!(
+                    "{} changed independently; refusing recovery overwrite",
+                    file.path
+                )));
+            }
+        }
+        let mut retained = None;
+        for (index, file) in journal.files.iter().enumerate().rev() {
+            let current = self.read_artifact(&file.path)?;
+            if current == file.before {
+                // A previous recovery may have renamed the original into place
+                // (or retired a new file) before its parent fsync failed. Visible
+                // bytes/absence are not yet proof of durable recovery.
+                if let Some(parent) = self.parent_directory(Path::new(&file.path), false)? {
+                    synchronize(&parent)?;
+                    self.check_directory()?;
+                    let path = self.config_dir.join(&file.path);
+                    validate_import_directory(
+                        path.parent().expect("artifact has a parent"),
+                        &parent,
+                    )?;
+                }
+                continue;
+            }
+            if current.as_deref() != Some(file.after.as_str()) {
+                return Err(TransferError::Publication(
+                    "artifact changed during recovery".into(),
+                ));
+            }
+            let path = self.config_dir.join(&file.path);
+            if let Some(before) = &file.before {
+                self.write_json(Path::new(&file.path), before.as_bytes())?;
+            } else {
+                // A newly created artifact has no original to restore. Retain
+                // it outside the active names instead of deleting any file.
+                if retained.is_none() {
+                    let name = format!(".fleet-transfer-recovered-{}", uuid::Uuid::new_v4());
+                    let directory = open_import_subdirectory(&self.directory, &name, true, true)?
+                        .ok_or_else(|| {
+                        TransferError::Publication("missing recovery directory".into())
+                    })?;
+                    retained = Some((self.config_dir.join(name), directory));
+                }
+                let (directory_path, directory) =
+                    retained.as_ref().expect("recovery directory was created");
+                self.check_directory()?;
+                let source_parent = self
+                    .parent_directory(Path::new(&file.path), false)?
+                    .ok_or_else(|| TransferError::Publication("missing source parent".into()))?;
+                crate::session::retire_serialized_json_at(
+                    &path,
+                    &source_parent,
+                    &directory_path.join(format!("{index}.json")),
+                    directory,
+                    file.after.as_bytes(),
+                )
+                .map_err(|error| TransferError::Publication(error.to_string()))?;
+            }
+        }
+        self.write_state(&ImportState {
+            version: state.version,
+            id: state.id,
+            journal_sha256: state.journal_sha256.clone(),
+            phase: ImportPhase::RolledBack,
+        })
+    }
+}
+
+fn validate_import_directory(path: &Path, directory: &File) -> Result<(), TransferError> {
+    let current = fs::symlink_metadata(path)?;
+    let saved = directory.metadata()?;
+    #[cfg(unix)]
+    let same_identity = {
+        use std::os::unix::fs::MetadataExt;
+        current.dev() == saved.dev() && current.ino() == saved.ino()
+    };
+    #[cfg(not(unix))]
+    let same_identity = saved.is_dir();
+    if !current.is_dir() || !same_identity {
+        return Err(TransferError::Publication(
+            "configuration directory identity changed or became a symlink".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Open one child relative to the already locked root. A replaced path cannot
+/// redirect directory creation outside that inode; the caller also checks the
+/// public path against this descriptor before publishing through it.
+fn open_import_subdirectory(
+    root: &File,
+    name: &str,
+    create: bool,
+    exclusive: bool,
+) -> Result<Option<File>, TransferError> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        if Path::new(name).components().count() != 1
+            || !matches!(
+                Path::new(name).components().next(),
+                Some(std::path::Component::Normal(_))
+            )
+        {
+            return Err(TransferError::Publication(
+                "invalid import directory name".into(),
+            ));
+        }
+        let name = std::ffi::CString::new(name)
+            .map_err(|_| TransferError::Publication("invalid import directory name".into()))?;
+        if create {
+            // SAFETY: the descriptor and single-component C string stay live.
+            if unsafe { libc::mkdirat(root.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+                let error = std::io::Error::last_os_error();
+                if exclusive || error.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(error.into());
+                }
+            }
+        }
+        // SAFETY: openat resolves one child of the held inode and refuses links.
+        let fd = unsafe {
+            libc::openat(
+                root.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            return if !create && error.kind() == std::io::ErrorKind::NotFound {
+                Ok(None)
+            } else {
+                Err(error.into())
+            };
+        }
+        // SAFETY: ownership of the new descriptor is transferred exactly once.
+        let directory = unsafe { File::from_raw_fd(fd) };
+        if create {
+            directory.sync_all()?;
+            root.sync_all()?;
+        }
+        Ok(Some(directory))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, name, create, exclusive);
+        Err(TransferError::Publication(
+            "durable import requires Unix directories".into(),
+        ))
+    }
+}
+
+/// Read guards compare this generation before and after loading related files.
+/// Pending or malformed state fails closed; generation changes detect imports
+/// that complete between reads. This is not a cross-command snapshot lock.
+pub fn configuration_generation(
+    config_dir: &Path,
+) -> Result<Option<ConfigurationGeneration>, TransferError> {
+    match read_import_state(config_dir)? {
+        Some(state) if state.phase == ImportPhase::Pending => Err(TransferError::Publication(
+            "configuration has an interrupted or active fleet import; retry a non-dry-run fleet transfer import to recover it".into(),
+        )),
+        state => Ok(state.map(|state| ConfigurationGeneration {
+            id: state.id,
+            phase: state.phase,
+        })),
+    }
+}
+
+fn read_import_state(config_dir: &Path) -> Result<Option<ImportState>, TransferError> {
+    let Some(bytes) = read_import_json(&config_dir.join(IMPORT_STATE_FILE), MAX_CONFIG_BYTES)?
+    else {
+        return Ok(None);
+    };
+    let state: ImportState = serde_json::from_str(&bytes)?;
+    if state.version != IMPORT_JOURNAL_VERSION
+        || state.id.is_nil()
+        || state.journal_sha256.len() != 64
+        || !state
+            .journal_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(TransferError::Publication(
+            "invalid import recovery state".into(),
+        ));
+    }
+    Ok(Some(state))
+}
+
+fn validate_import_path(path: &str) -> Result<(), TransferError> {
+    if !matches!(
+        path,
+        "priors.json"
+            | "priors.json.bak"
+            | "patterns/learned.json"
+            | "patterns/custom.json"
+            | "patterns/disabled.json"
+            | "pattern_stats.json"
+    ) {
+        return Err(TransferError::Publication(
+            "unsupported import artifact path".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_import_payload(path: &str, bytes: &str) -> Result<(), TransferError> {
+    if bytes.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(TransferError::Publication(
+            "configuration artifact is too large".into(),
+        ));
+    }
+    match path {
+        "priors.json" => {
+            let priors: Priors = serde_json::from_str(bytes)?;
+            pt_config::validate::validate_priors(&priors)
+                .map_err(|error| TransferError::InvalidConfiguration(error.to_string()))?;
+        }
+        "patterns/learned.json" | "patterns/custom.json" => {
+            let schema = PersistedSchema::from_json(bytes)
+                .map_err(|error| TransferError::InvalidConfiguration(error.to_string()))?;
+            for pattern in &schema.patterns {
+                pattern
+                    .signature
+                    .validate_for_activation()
+                    .map_err(|error| TransferError::InvalidConfiguration(error.to_string()))?;
+            }
+        }
+        "patterns/disabled.json" => {
+            serde_json::from_str::<DisabledPatterns>(bytes)?;
+        }
+        "pattern_stats.json" => {
+            serde_json::from_str::<AllPatternStats>(bytes)?;
+        }
+        "priors.json.bak" => {
+            serde_json::from_str::<serde::de::IgnoredAny>(bytes)?;
+        }
+        _ => {
+            return Err(TransferError::Publication(
+                "unsupported import artifact path".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_import_journal(journal: &ImportJournal) -> Result<(), TransferError> {
+    if journal.version != IMPORT_JOURNAL_VERSION
+        || journal.id.is_nil()
+        || journal.files.is_empty()
+        || journal.files.len() > 6
+    {
+        return Err(TransferError::Publication(
+            "invalid import recovery journal".into(),
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for file in &journal.files {
+        validate_import_path(&file.path)?;
+        if !seen.insert(&file.path) {
+            return Err(TransferError::Publication(
+                "duplicate import artifact".into(),
+            ));
+        }
+        validate_import_payload(&file.path, &file.after)?;
+        if let Some(before) = &file.before {
+            if before.len() as u64 > MAX_CONFIG_BYTES {
+                return Err(TransferError::Publication(
+                    "configuration preimage is too large".into(),
+                ));
+            }
+            serde_json::from_str::<serde::de::IgnoredAny>(before)?;
+        }
+    }
+    Ok(())
+}
+
+fn read_import_json(path: &Path, limit: u64) -> Result<Option<String>, TransferError> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(TransferError::Publication(format!(
+                "{} must be a regular file, not a symlink or special file",
+                path.display()
+            )));
+        }
+        _ => {}
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() || file.metadata()?.len() > limit {
+        return Err(TransferError::Publication(
+            "invalid or oversized configuration file".into(),
+        ));
+    }
+    let mut bytes = String::new();
+    file.take(limit + 1).read_to_string(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(TransferError::Publication(
+            "configuration file exceeds size limit".into(),
+        ));
+    }
+    serde_json::from_str::<serde::de::IgnoredAny>(&bytes)?;
+    Ok(Some(bytes))
+}
+
+#[cfg(test)]
+fn publish_import_json(path: &Path, bytes: &[u8]) -> Result<(), TransferError> {
+    crate::session::write_serialized_json(path, bytes)
+        .map_err(|error| TransferError::Publication(error.to_string()))
+}
+
+#[cfg(all(test, unix))]
+mod publication_tests {
+    use super::*;
+    use crate::config::{load_config, ConfigOptions};
+    use crate::supervision::pattern_persistence::PatternLibrary;
+    use crate::supervision::SupervisorCategory;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    fn fixture() -> (PathBuf, String) {
+        let root = tempfile::Builder::new()
+            .prefix("pt-fleet-import-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        let original = format!(
+            "{}\n  \n",
+            serde_json::to_string(&Priors::default()).unwrap()
+        );
+        fs::write(root.join("priors.json"), &original).unwrap();
+        eprintln!(
+            "Fleet import recovery artifacts retained at {}",
+            root.display()
+        );
+        (root, original)
+    }
+
+    fn incoming_priors() -> Vec<u8> {
+        let mut priors = Priors::default();
+        priors.classes.useful.prior_prob = 0.4;
+        priors.classes.useful_bad.prior_prob = 0.2;
+        priors.classes.abandoned.prior_prob = 0.3;
+        priors.classes.zombie.prior_prob = 0.1;
+        serde_json::to_vec_pretty(&priors).unwrap()
+    }
+
+    fn incoming_patterns() -> Vec<(PathBuf, Vec<u8>)> {
+        let mut library = PatternLibrary::new(Path::new("unused-import-source"));
+        library
+            .add_custom(
+                SupervisorSignature::new("imported-worker", SupervisorCategory::Other)
+                    .with_process_patterns(vec!["^imported-worker$"])
+                    .with_confidence(0.9),
+            )
+            .unwrap();
+        library.pending_files().unwrap()
+    }
+
+    fn config_options(root: &Path) -> ConfigOptions {
+        ConfigOptions {
+            config_dir: Some(root.into()),
+            ..ConfigOptions::default()
+        }
+    }
+
+    #[test]
+    fn publication_commits_all_artifacts_with_exact_private_recovery_and_backup() {
+        let (root, original) = fixture();
+        let import = TransferImport::begin(&root).unwrap();
+        let mut files = vec![(PathBuf::from("priors.json"), incoming_priors())];
+        files.extend(incoming_patterns());
+        let publication = import.publish(files.clone(), true).unwrap().unwrap();
+        for (path, expected) in files {
+            assert_eq!(fs::read(root.join(path)).unwrap(), expected);
+        }
+        assert_eq!(
+            fs::read_to_string(root.join("priors.json.bak")).unwrap(),
+            original
+        );
+        assert_eq!(
+            fs::metadata(&publication.recovery_journal)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(root.join(IMPORT_STATE_FILE))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let state = read_import_state(&root).unwrap().unwrap();
+        assert_eq!(state.phase, ImportPhase::Committed);
+        let journal = import.load_journal(&state).unwrap();
+        assert_eq!(journal.files.len(), 6);
+        assert_eq!(journal.files[0].before.as_deref(), Some(original.as_str()));
+        assert_eq!(
+            configuration_generation(&root).unwrap(),
+            Some(ConfigurationGeneration {
+                id: publication.id,
+                phase: ImportPhase::Committed,
+            })
+        );
+        assert_eq!(
+            load_config(&config_options(&root))
+                .unwrap()
+                .priors
+                .classes
+                .useful
+                .prior_prob,
+            0.4
+        );
+        let mut library = PatternLibrary::new(&root);
+        library.load().unwrap();
+        assert!(library.get_pattern("imported-worker").is_some());
+        drop(import);
+        let import = TransferImport::begin(&root).unwrap();
+        let next = import
+            .publish(vec![("priors.json".into(), incoming_priors())], false)
+            .unwrap()
+            .unwrap();
+        assert_ne!(publication.id, next.id);
+        assert!(publication.recovery_journal.is_file());
+        assert!(next.recovery_journal.is_file());
+    }
+
+    #[test]
+    fn publication_later_write_failure_restores_originals_and_retires_new_artifacts() {
+        let (root, original) = fixture();
+        fs::create_dir(root.join("patterns")).unwrap();
+        let original_custom = format!("{}\n  ", PersistedSchema::new().to_json().unwrap());
+        fs::write(root.join("patterns/custom.json"), &original_custom).unwrap();
+        let pattern_files = incoming_patterns();
+        let custom = pattern_files
+            .iter()
+            .find(|(path, _)| path == Path::new("patterns/custom.json"))
+            .unwrap()
+            .1
+            .clone();
+        let learned = pattern_files
+            .iter()
+            .find(|(path, _)| path == Path::new("patterns/learned.json"))
+            .unwrap()
+            .1
+            .clone();
+        let import = TransferImport::begin(&root).unwrap();
+        let mut writes = 0;
+        let result = import.publish_with(
+            vec![
+                ("priors.json".into(), incoming_priors()),
+                ("patterns/learned.json".into(), learned.clone()),
+                ("patterns/custom.json".into(), custom),
+            ],
+            true,
+            |path, bytes| {
+                // Exercise failure AFTER a real later-file atomic rename, as can
+                // happen when synchronizing its parent directory fails.
+                import.write_json(path.strip_prefix(&root).unwrap(), bytes)?;
+                writes += 1;
+                if writes == 3 {
+                    return Err(
+                        std::io::Error::other("later artifact synchronization failed").into(),
+                    );
+                }
+                Ok(())
+            },
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("all original artifacts restored"));
+        assert_eq!(
+            fs::read_to_string(root.join("priors.json")).unwrap(),
+            original
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("patterns/custom.json")).unwrap(),
+            original_custom
+        );
+        assert!(!root.join("patterns/learned.json").exists());
+        assert!(!root.join("priors.json.bak").exists());
+        let recovered = fs::read_dir(&root)
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".fleet-transfer-recovered-")
+            })
+            .unwrap()
+            .path();
+        assert_eq!(fs::read(recovered.join("1.json")).unwrap(), learned);
+        assert_eq!(
+            read_import_state(&root).unwrap().unwrap().phase,
+            ImportPhase::RolledBack
+        );
+        load_config(&config_options(&root)).unwrap();
+    }
+
+    #[test]
+    fn publication_same_transaction_rollback_changes_the_reader_generation() {
+        let (root, original) = fixture();
+        let import = TransferImport::begin(&root).unwrap();
+        import
+            .publish(vec![("priors.json".into(), incoming_priors())], false)
+            .unwrap();
+        let committed = configuration_generation(&root).unwrap();
+        let mut state = read_import_state(&root).unwrap().unwrap();
+        let journal = import.load_journal(&state).unwrap();
+        // A successful rename followed by a failed directory fsync can expose
+        // Committed before publication has to restore Pending and roll back.
+        state.phase = ImportPhase::Pending;
+        import.write_state(&state).unwrap();
+        assert!(configuration_generation(&root).is_err());
+        import.rollback(&state, &journal).unwrap();
+        let rolled_back = configuration_generation(&root).unwrap();
+        assert_ne!(committed, rolled_back);
+        assert_eq!(committed.unwrap().id, rolled_back.unwrap().id);
+        assert_eq!(
+            fs::read_to_string(root.join("priors.json")).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn publication_recovery_retry_syncs_already_restored_or_retired_pattern_entries() {
+        use std::os::unix::fs::MetadataExt;
+        for existed in [false, true] {
+            let (root, _) = fixture();
+            fs::create_dir(root.join("patterns")).unwrap();
+            let artifact = root.join("patterns/custom.json");
+            let original = PersistedSchema::new().to_json().unwrap();
+            if existed {
+                fs::write(&artifact, &original).unwrap();
+            }
+            let import = TransferImport::begin(&root).unwrap();
+            let custom = incoming_patterns()
+                .into_iter()
+                .find(|(path, _)| path == Path::new("patterns/custom.json"))
+                .unwrap();
+            import.publish(vec![custom], false).unwrap();
+            let mut state = read_import_state(&root).unwrap().unwrap();
+            let journal = import.load_journal(&state).unwrap();
+            state.phase = ImportPhase::Pending;
+            import.write_state(&state).unwrap();
+            // Leave the real filesystem at the exact rename-before-parent-sync
+            // boundary of an interrupted recovery, for either kind of preimage.
+            if existed {
+                let restore = root.join("patterns/restore.json");
+                fs::write(&restore, &original).unwrap();
+                File::open(&restore).unwrap().sync_all().unwrap();
+                fs::rename(restore, &artifact).unwrap();
+            } else {
+                fs::rename(&artifact, root.join("retained-new-pattern.json")).unwrap();
+            }
+            let metadata = fs::metadata(root.join("patterns")).unwrap();
+            let attempts = std::cell::Cell::new(0);
+            let error = import
+                .rollback_with_sync(&state, &journal, |directory| {
+                    let current = directory.metadata()?;
+                    if (current.dev(), current.ino()) == (metadata.dev(), metadata.ino()) {
+                        attempts.set(attempts.get() + 1);
+                        Err(std::io::Error::other("forced retry parent sync failure"))
+                    } else {
+                        directory.sync_all()
+                    }
+                })
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("forced retry parent sync failure"));
+            assert_eq!(attempts.get(), 1);
+            assert_eq!(
+                read_import_state(&root).unwrap().unwrap().phase,
+                ImportPhase::Pending
+            );
+            assert!(configuration_generation(&root).is_err());
+            drop(import);
+            let recovered = TransferImport::begin(&root).unwrap();
+            assert_eq!(recovered.recovered_import(), Some(state.id));
+            assert_eq!(
+                read_import_state(&root).unwrap().unwrap().phase,
+                ImportPhase::RolledBack
+            );
+            if existed {
+                assert_eq!(fs::read_to_string(&artifact).unwrap(), original);
+            } else {
+                assert!(!artifact.exists());
+                assert!(root.join("retained-new-pattern.json").is_file());
+            }
+        }
+    }
+
+    #[test]
+    fn publication_validates_every_staged_artifact_before_creating_a_journal() {
+        for (path, payload) in [
+            ("patterns/custom.json", b"{not-json".to_vec()),
+            ("../outside.json", incoming_priors()),
+            ("patterns/../priors.json", incoming_priors()),
+            ("priors.json", incoming_priors()),
+        ] {
+            let (root, original) = fixture();
+            let import = TransferImport::begin(&root).unwrap();
+            assert!(import
+                .publish(
+                    vec![
+                        ("priors.json".into(), incoming_priors()),
+                        (path.into(), payload),
+                    ],
+                    false
+                )
+                .is_err());
+            assert_eq!(
+                fs::read_to_string(root.join("priors.json")).unwrap(),
+                original
+            );
+            assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        }
+    }
+
+    fn interrupt_after_first_publication(root: &Path) -> ImportState {
+        let import = TransferImport::begin(root).unwrap();
+        assert!(catch_unwind(AssertUnwindSafe(|| {
+            let mut files = vec![("priors.json".into(), incoming_priors())];
+            files.extend(incoming_patterns());
+            let _ = import.publish_with(files, false, |path, bytes| {
+                import.write_json(path.strip_prefix(root).unwrap(), bytes)?;
+                panic!("interrupt after the first durable publication");
+            });
+        }))
+        .is_err());
+        let state = read_import_state(root).unwrap().unwrap();
+        assert_eq!(state.phase, ImportPhase::Pending);
+        // Dropping the actual directory lock models the writer exiting. Its
+        // files remain untouched for the next independent import to recover.
+        drop(import);
+        state
+    }
+
+    #[test]
+    fn publication_interruption_blocks_readers_and_next_import_recovers_before_merging() {
+        let (root, original) = fixture();
+        let pending = interrupt_after_first_publication(&root);
+        assert_eq!(
+            fs::read(root.join("priors.json")).unwrap(),
+            incoming_priors()
+        );
+        assert!(load_config(&config_options(&root))
+            .unwrap_err()
+            .to_string()
+            .contains("interrupted or active fleet import"));
+        assert!(PatternLibrary::new(&root)
+            .load()
+            .unwrap_err()
+            .to_string()
+            .contains("interrupted or active fleet import"));
+        let import = TransferImport::begin(&root).unwrap();
+        assert_eq!(import.recovered_import(), Some(pending.id));
+        assert_eq!(
+            fs::read_to_string(root.join("priors.json")).unwrap(),
+            original
+        );
+        assert_eq!(
+            read_import_state(&root).unwrap().unwrap().phase,
+            ImportPhase::RolledBack
+        );
+        load_config(&config_options(&root)).unwrap();
+        let publication = import
+            .publish(vec![("priors.json".into(), incoming_priors())], false)
+            .unwrap()
+            .unwrap();
+        assert_ne!(publication.id, pending.id);
+        assert!(!root.join("priors.json.bak").exists());
+    }
+
+    #[test]
+    fn publication_recovery_preserves_independent_edits_and_keeps_exact_preimages() {
+        let (root, original) = fixture();
+        let state = interrupt_after_first_publication(&root);
+        let external = format!("{}\n", String::from_utf8(incoming_priors()).unwrap());
+        fs::write(root.join("priors.json"), &external).unwrap();
+        let error = match TransferImport::begin(&root) {
+            Ok(_) => panic!("independently changed file must refuse recovery"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("changed independently"));
+        assert_eq!(
+            fs::read_to_string(root.join("priors.json")).unwrap(),
+            external
+        );
+        let journal: ImportJournal = serde_json::from_slice(
+            &fs::read(root.join(format!(".fleet-transfer-{}.json", state.id))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(journal.files[0].before.as_deref(), Some(original.as_str()));
+        assert!(configuration_generation(&root).is_err());
+    }
+
+    #[test]
+    fn publication_writer_lock_excludes_concurrent_imports_without_a_lock_file() {
+        let (root, original) = fixture();
+        let import = TransferImport::begin(&root).unwrap();
+        let other_root = root.clone();
+        assert!(
+            std::thread::spawn(move || TransferImport::begin(&other_root).is_err())
+                .join()
+                .unwrap()
+        );
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        assert_eq!(
+            fs::read_to_string(root.join("priors.json")).unwrap(),
+            original
+        );
+        drop(import);
+        TransferImport::begin(&root).unwrap();
+    }
+
+    #[test]
+    fn publication_rejects_edits_since_begin_before_capturing_stale_merge_preimages() {
+        let (root, original) = fixture();
+        let import = TransferImport::begin(&root).unwrap();
+        let independently_edited = format!("{original}\n");
+        fs::write(root.join("priors.json"), &independently_edited).unwrap();
+        let error = import
+            .publish(vec![("priors.json".into(), incoming_priors())], false)
+            .unwrap_err();
+        assert!(error.to_string().contains("changed since the import began"));
+        assert_eq!(
+            fs::read_to_string(root.join("priors.json")).unwrap(),
+            independently_edited
+        );
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn publication_existing_writers_cannot_race_and_loaded_libraries_cannot_undo_imports() {
+        let (root, _) = fixture();
+        let mut library = PatternLibrary::new(&root);
+        library
+            .add_custom(
+                SupervisorSignature::new("local-worker", SupervisorCategory::Other)
+                    .with_process_patterns(vec!["^local-worker$"]),
+            )
+            .unwrap();
+        library.save().unwrap();
+        let mut stale = PatternLibrary::new(&root);
+        stale.load().unwrap();
+        stale
+            .add_custom(
+                SupervisorSignature::new("stale-worker", SupervisorCategory::Other)
+                    .with_process_patterns(vec!["^stale-worker$"]),
+            )
+            .unwrap();
+        let import = TransferImport::begin(&root).unwrap();
+        let disabled_before = fs::read(root.join("patterns/disabled.json")).unwrap();
+        let mut disabled = DisabledPatterns::default();
+        disabled.disable("imported-worker", Some("concurrent edit"));
+        assert!(crate::signature_cli::save_disabled_patterns(&root, &disabled).is_err());
+        assert!(stale.save().is_err());
+        assert_eq!(
+            fs::read(root.join("patterns/disabled.json")).unwrap(),
+            disabled_before
+        );
+        import.publish(incoming_patterns(), false).unwrap();
+        drop(import);
+        let imported_bytes = fs::read(root.join("patterns/custom.json")).unwrap();
+        assert!(stale.save().unwrap_err().to_string().contains("reload"));
+        assert_eq!(
+            fs::read(root.join("patterns/custom.json")).unwrap(),
+            imported_bytes
+        );
+        let mut current = PatternLibrary::new(&root);
+        current.load().unwrap();
+        assert!(current.get_pattern("imported-worker").is_some());
+        assert!(current.get_pattern("stale-worker").is_none());
+
+        // Ordinary disabled-pattern edits don't publish a fleet generation;
+        // exact file preimages still detect them before an old library saves.
+        current
+            .add_custom(
+                SupervisorSignature::new("another-worker", SupervisorCategory::Other)
+                    .with_process_patterns(vec!["^another-worker$"]),
+            )
+            .unwrap();
+        crate::signature_cli::save_disabled_patterns(&root, &disabled).unwrap();
+        let edited_bytes = fs::read(root.join("patterns/disabled.json")).unwrap();
+        assert!(current.save().unwrap_err().to_string().contains("reload"));
+        assert_eq!(
+            fs::read(root.join("patterns/disabled.json")).unwrap(),
+            edited_bytes
+        );
+    }
+
+    #[test]
+    fn publication_refuses_replaced_root_and_pattern_directories() {
+        for replace_root in [false, true] {
+            let (root, original) = fixture();
+            fs::create_dir(root.join("patterns")).unwrap();
+            let custom = PersistedSchema::new().to_json().unwrap();
+            fs::write(root.join("patterns/custom.json"), &custom).unwrap();
+            let import = TransferImport::begin(&root).unwrap();
+            let (path, moved) = if replace_root {
+                (
+                    root.clone(),
+                    root.with_extension(format!("retained-{}", uuid::Uuid::new_v4())),
+                )
+            } else {
+                (root.join("patterns"), root.join("retained-patterns"))
+            };
+            fs::rename(&path, &moved).unwrap();
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join("canary.json"), b"{\"keep\":true}").unwrap();
+            assert!(import.publish(incoming_patterns(), false).is_err());
+            assert_eq!(
+                fs::read(path.join("canary.json")).unwrap(),
+                b"{\"keep\":true}"
+            );
+            assert_eq!(fs::read_dir(&path).unwrap().count(), 1);
+            let original_root = if replace_root { &moved } else { &root };
+            assert_eq!(
+                fs::read_to_string(original_root.join("priors.json")).unwrap(),
+                original
+            );
+            let original_custom = if replace_root {
+                moved.join("patterns/custom.json")
+            } else {
+                moved.join("custom.json")
+            };
+            assert_eq!(fs::read_to_string(original_custom).unwrap(), custom);
+        }
+    }
+
+    #[test]
+    fn publication_library_requires_loading_existing_files_before_save() {
+        let (root, _) = fixture();
+        let import = TransferImport::begin(&root).unwrap();
+        import.publish(incoming_patterns(), false).unwrap();
+        drop(import);
+        let original = fs::read(root.join("patterns/custom.json")).unwrap();
+        let mut unloaded = PatternLibrary::new(&root);
+        unloaded
+            .add_custom(
+                SupervisorSignature::new("new-worker", SupervisorCategory::Other)
+                    .with_process_patterns(vec!["^new-worker$"]),
+            )
+            .unwrap();
+        assert!(unloaded.save().unwrap_err().to_string().contains("reload"));
+        assert_eq!(
+            fs::read(root.join("patterns/custom.json")).unwrap(),
+            original
+        );
+        unloaded.load().unwrap();
+        unloaded
+            .add_custom(
+                SupervisorSignature::new("new-worker", SupervisorCategory::Other)
+                    .with_process_patterns(vec!["^new-worker$"]),
+            )
+            .unwrap();
+        unloaded.save().unwrap();
+        let mut checked = PatternLibrary::new(&root);
+        checked.load().unwrap();
+        assert!(checked.get_pattern("new-worker").is_some());
+        assert!(checked.get_pattern("imported-worker").is_some());
+    }
+
+    #[test]
+    fn publication_readers_do_not_create_missing_configuration_directories() {
+        let (root, _) = fixture();
+        let missing = root.join("missing-config");
+        load_config(&config_options(&missing)).unwrap();
+        let mut library = PatternLibrary::new(&missing);
+        library.load().unwrap();
+        assert!(library.all_active_patterns().is_empty());
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn publication_rejects_symlink_destinations_and_recovery_markers() {
+        for kind in ["artifact", "parent", "state", "journal"] {
+            let (root, original) = fixture();
+            let outside = root.join("outside");
+            fs::create_dir(&outside).unwrap();
+            fs::write(
+                outside.join("custom.json"),
+                PersistedSchema::new().to_json().unwrap(),
+            )
+            .unwrap();
+            fs::write(outside.join("state.json"), "{}").unwrap();
+            match kind {
+                "parent" => symlink(&outside, root.join("patterns")).unwrap(),
+                "artifact" => {
+                    fs::create_dir(root.join("patterns")).unwrap();
+                    symlink(
+                        outside.join("custom.json"),
+                        root.join("patterns/custom.json"),
+                    )
+                    .unwrap();
+                }
+                "state" => {
+                    symlink(outside.join("state.json"), root.join(IMPORT_STATE_FILE)).unwrap()
+                }
+                "journal" => {
+                    let id = uuid::Uuid::new_v4();
+                    symlink(
+                        outside.join("state.json"),
+                        root.join(format!(".fleet-transfer-{id}.json")),
+                    )
+                    .unwrap();
+                    publish_import_json(
+                        &root.join(IMPORT_STATE_FILE),
+                        &serde_json::to_vec(&ImportState {
+                            version: IMPORT_JOURNAL_VERSION,
+                            id,
+                            phase: ImportPhase::Pending,
+                            journal_sha256: hex::encode(Sha256::digest(b"{}")),
+                        })
+                        .unwrap(),
+                    )
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let before = fs::read(outside.join("custom.json")).unwrap();
+            let result = TransferImport::begin(&root)
+                .and_then(|import| import.publish(incoming_patterns(), false));
+            assert!(result.is_err(), "{kind}");
+            assert_eq!(
+                fs::read_to_string(root.join("priors.json")).unwrap(),
+                original
+            );
+            assert_eq!(fs::read(outside.join("custom.json")).unwrap(), before);
+            assert_eq!(fs::read(outside.join("state.json")).unwrap(), b"{}");
+        }
+    }
+
+    #[test]
+    fn publication_recovery_rejects_forged_paths_versions_and_checksums_before_writes() {
+        for corruption in ["path", "version", "checksum", "state"] {
+            let (root, original) = fixture();
+            let id = uuid::Uuid::new_v4();
+            let journal = ImportJournal {
+                version: if corruption == "version" {
+                    99
+                } else {
+                    IMPORT_JOURNAL_VERSION
+                },
+                id,
+                files: vec![ImportFile {
+                    path: if corruption == "path" {
+                        "../outside.json"
+                    } else {
+                        "priors.json"
+                    }
+                    .into(),
+                    before: Some(original.clone()),
+                    after: String::from_utf8(incoming_priors()).unwrap(),
+                }],
+            };
+            let bytes = serde_json::to_vec(&journal).unwrap();
+            publish_import_json(&root.join(format!(".fleet-transfer-{id}.json")), &bytes).unwrap();
+            let mut state = serde_json::to_value(ImportState {
+                version: IMPORT_JOURNAL_VERSION,
+                id,
+                phase: ImportPhase::Pending,
+                journal_sha256: if corruption == "checksum" {
+                    "0".repeat(64)
+                } else {
+                    hex::encode(Sha256::digest(&bytes))
+                },
+            })
+            .unwrap();
+            if corruption == "state" {
+                state["phase"] = serde_json::json!("trust-me");
+            }
+            publish_import_json(
+                &root.join(IMPORT_STATE_FILE),
+                &serde_json::to_vec(&state).unwrap(),
+            )
+            .unwrap();
+            assert!(TransferImport::begin(&root).is_err(), "{corruption}");
+            assert_eq!(
+                fs::read_to_string(root.join("priors.json")).unwrap(),
+                original
+            );
+            assert!(load_config(&config_options(&root)).is_err());
+        }
+    }
 }
 
 /// Non-fatal warning from bundle validation.
