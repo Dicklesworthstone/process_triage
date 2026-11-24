@@ -25,6 +25,321 @@ use std::time::Instant;
 use tempfile::tempdir;
 
 // ============================================================================
+// Integration Tests: Configured CLI Catalog
+// ============================================================================
+
+mod configured_cli_tests {
+    use super::*;
+    use assert_cmd::cargo::cargo_bin_cmd;
+    use assert_cmd::Command;
+    use pt_core::scoring::load_signature_database;
+    use serde_json::Value;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    fn retained_fixture() -> PathBuf {
+        let root = tempdir().expect("create signature CLI fixture").keep();
+        eprintln!("Retained signature CLI fixture: {}", root.display());
+        root
+    }
+
+    fn command(config: &Path, args: &[&str]) -> Command {
+        let mut command = cargo_bin_cmd!("pt-core");
+        command
+            .timeout(Duration::from_secs(120))
+            .env("PT_SKIP_GLOBAL_LOCK", "1")
+            .args(["--format", "json", "--config"])
+            .arg(config)
+            .arg("signature")
+            .args(args);
+        command
+    }
+
+    fn json(config: &Path, args: &[&str]) -> Value {
+        let output = command(config, args).output().expect("run signature CLI");
+        assert!(
+            output.status.success(),
+            "signature {args:?} failed: {output:?}"
+        );
+        serde_json::from_slice(&output.stdout).expect("signature command JSON")
+    }
+
+    fn exported(path: &Path) -> SignatureSchema {
+        serde_json::from_slice(&fs::read(path).expect("read exported signatures"))
+            .expect("parse exported signatures")
+    }
+
+    fn assert_shared_match(config: &Path, process: &str, name: Option<&str>) {
+        let (database, warnings) = load_signature_database(config);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            database
+                .best_match(&ProcessMatchContext::with_comm(process))
+                .map(|matched| matched.signature.name.as_str()),
+            name
+        );
+    }
+
+    #[test]
+    fn persisted_catalog_is_inspectable_and_cli_toggle_controls_matching_and_export() {
+        let root = retained_fixture();
+        let config = root.join("config");
+        let output = root.join("active-signatures.json");
+        let imported_signature =
+            SupervisorSignature::new("fleet-imported", SupervisorCategory::Other)
+                .with_process_patterns(vec!["^pt-imported-probe$"])
+                .with_priors(SignaturePriors::likely_useful())
+                .with_expectations(ProcessExpectations {
+                    max_normal_lifetime_seconds: Some(7200),
+                    ..Default::default()
+                })
+                .with_confidence(0.87);
+        let mut incoming = PersistedSchema::new();
+        incoming.patterns.push(PersistedPattern::new(
+            imported_signature.clone(),
+            PatternSource::Imported,
+        ));
+        let mut library = PatternLibrary::new(&config);
+        library
+            .import(incoming, ConflictResolution::ReplaceWithImported)
+            .expect("import persisted signature");
+        library
+            .add_learned(
+                SupervisorSignature::new("local-learned", SupervisorCategory::Other)
+                    .with_process_patterns(vec!["^pt-learned-probe$"]),
+            )
+            .expect("add learned signature");
+        library
+            .add_custom(
+                SupervisorSignature::new("retired-custom", SupervisorCategory::Other)
+                    .with_process_patterns(vec!["^pt-retired-probe$"]),
+            )
+            .expect("add retired signature");
+        library
+            .get_pattern_mut("retired-custom")
+            .expect("custom signature")
+            .transition_lifecycle(PatternLifecycle::Deprecated)
+            .expect("deprecate custom signature");
+        library.save().expect("persist configured catalog");
+
+        let listed = json(&config, &["list", "--user-only"]);
+        let entries = listed["signatures"].as_array().expect("catalog entries");
+        assert_eq!(entries.len(), 3);
+        let imported = entries
+            .iter()
+            .find(|entry| entry["name"] == "fleet-imported")
+            .expect("imported entry is visible");
+        assert_eq!(imported["source"], "custom");
+        assert_eq!(imported["provenance"], "imported");
+        assert_eq!(imported["active"], true);
+        assert_eq!(imported["disabled"], false);
+        let learned = entries
+            .iter()
+            .find(|entry| entry["name"] == "local-learned")
+            .expect("learned entry is visible");
+        assert_eq!(learned["source"], "learned");
+        assert_eq!(learned["provenance"], "learned");
+        assert_eq!(learned["active"], true);
+        let retired = entries
+            .iter()
+            .find(|entry| entry["name"] == "retired-custom")
+            .expect("retired entry stays inspectable");
+        assert_eq!(retired["active"], false);
+        assert_eq!(retired["lifecycle"], "deprecated");
+
+        let shown = json(&config, &["show", "fleet-imported"]);
+        assert_eq!(shown["source"], "custom");
+        assert_eq!(shown["provenance"], "imported");
+        assert_eq!(shown["active"], true);
+        assert_eq!(
+            shown["signature"]["priors"],
+            serde_json::to_value(&imported_signature.priors).unwrap()
+        );
+        assert_eq!(
+            shown["signature"]["expectations"],
+            serde_json::to_value(&imported_signature.expectations).unwrap()
+        );
+        assert_eq!(json(&config, &["validate"])["status"], "valid");
+        let matched = json(&config, &["test", "pt-imported-probe", "--all"]);
+        assert_eq!(matched["count"], 1);
+        assert_eq!(matched["matches"][0]["name"], "fleet-imported");
+        assert_shared_match(&config, "pt-imported-probe", Some("fleet-imported"));
+        assert_eq!(json(&config, &["test", "pt-retired-probe"])["count"], 0);
+
+        json(
+            &config,
+            &["export", output.to_str().unwrap(), "--user-only"],
+        );
+        let active = exported(&output);
+        assert_eq!(active.signatures.len(), 2);
+        assert!(active
+            .signatures
+            .iter()
+            .any(|signature| signature.name == "fleet-imported"));
+        assert!(active
+            .signatures
+            .iter()
+            .any(|signature| signature.name == "local-learned"));
+        assert!(!active
+            .signatures
+            .iter()
+            .any(|signature| signature.name == "retired-custom"));
+
+        json(
+            &config,
+            &["disable", "fleet-imported", "--reason", "operator decision"],
+        );
+        let shown = json(&config, &["show", "fleet-imported"]);
+        assert_eq!(shown["active"], false);
+        assert_eq!(shown["disabled"], true);
+        assert_eq!(json(&config, &["test", "pt-imported-probe"])["count"], 0);
+        assert_shared_match(&config, "pt-imported-probe", None);
+        json(
+            &config,
+            &["export", output.to_str().unwrap(), "--user-only"],
+        );
+        let active = exported(&output);
+        assert_eq!(active.signatures.len(), 1);
+        assert_eq!(active.signatures[0].name, "local-learned");
+
+        json(&config, &["enable", "fleet-imported"]);
+        assert_eq!(json(&config, &["show", "fleet-imported"])["active"], true);
+        assert_eq!(json(&config, &["test", "pt-imported-probe"])["count"], 1);
+        assert_shared_match(&config, "pt-imported-probe", Some("fleet-imported"));
+        let mut reloaded = PatternLibrary::new(&config);
+        reloaded.load().expect("reload toggled imported library");
+        assert_eq!(
+            reloaded.get_pattern("fleet-imported").unwrap().signature,
+            imported_signature,
+            "toggling must preserve imported matching and inference data"
+        );
+    }
+
+    #[test]
+    fn same_name_user_override_is_the_only_cli_and_scoring_winner() {
+        let root = retained_fixture();
+        let config = root.join("config");
+        let signature = SupervisorSignature::new("pytest", SupervisorCategory::Other)
+            .with_process_patterns(vec!["^pt-override-probe$"])
+            .with_priors(SignaturePriors::likely_useful());
+        let mut schema = SignatureSchema::new();
+        schema.add(signature.clone());
+        pt_core::signature_cli::save_user_signatures(&config, &schema)
+            .expect("persist explicit override");
+
+        let shown = json(&config, &["show", "pytest"]);
+        assert_eq!(shown["source"], "user");
+        assert_eq!(
+            shown["signature"]["patterns"],
+            serde_json::to_value(&signature.patterns).unwrap()
+        );
+        assert_eq!(
+            shown["signature"]["priors"],
+            serde_json::to_value(&signature.priors).unwrap()
+        );
+        let listed = json(&config, &["list"]);
+        let winners: Vec<_> = listed["signatures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["name"] == "pytest")
+            .collect();
+        assert_eq!(winners.len(), 1);
+        assert_eq!(winners[0]["source"], "user");
+        let builtins = json(&config, &["list", "--builtin-only"]);
+        assert!(!builtins["signatures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["name"] == "pytest"));
+        let matched = json(&config, &["test", "pt-override-probe", "--all"]);
+        assert_eq!(matched["count"], 1);
+        assert_eq!(matched["matches"][0]["name"], "pytest");
+        assert_shared_match(&config, "pt-override-probe", Some("pytest"));
+        let superseded = json(&config, &["test", "pytest", "--all"]);
+        assert!(!superseded["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["name"] == "pytest"));
+    }
+
+    #[test]
+    fn invalid_inactive_catalog_refuses_matching_validation_and_export_without_writes() {
+        let root = retained_fixture();
+        for case in [
+            "json",
+            "inactive-regex",
+            "inactive-redacted",
+            "disabled-redacted",
+        ] {
+            let config = root.join(case);
+            fs::create_dir_all(config.join("patterns")).expect("create invalid catalog fixture");
+            let mut schema = PersistedSchema::new();
+            let matcher = if case == "inactive-regex" {
+                "[invalid"
+            } else {
+                "[REDACTED]"
+            };
+            let mut pattern = PersistedPattern::new(
+                SupervisorSignature::new("invalid-configured", SupervisorCategory::Other)
+                    .with_process_patterns(vec![matcher]),
+                PatternSource::Custom,
+            );
+            if case != "disabled-redacted" {
+                pattern.lifecycle = PatternLifecycle::Deprecated;
+            }
+            schema.patterns.push(pattern);
+            let content = if case == "json" {
+                b"{broken-json".to_vec()
+            } else {
+                serde_json::to_vec_pretty(&schema).expect("serialize invalid catalog fixture")
+            };
+            let input = config.join("patterns/custom.json");
+            fs::write(&input, &content).expect("write invalid catalog fixture");
+            if case == "disabled-redacted" {
+                let mut disabled = DisabledPatterns::default();
+                disabled.disable("invalid-configured", Some("disabled before validation"));
+                disabled
+                    .save_to_file(config.join("patterns/disabled.json"))
+                    .expect("write disabled marker");
+            }
+            for args in [vec!["validate"], vec!["test", "unrelated"]] {
+                let result = command(&config, &args)
+                    .output()
+                    .expect("run invalid catalog command");
+                assert!(
+                    !result.status.success(),
+                    "{case} accepted by {args:?}: {result:?}"
+                );
+            }
+            let preserved = root.join(format!("{case}-preserved.json"));
+            let absent = root.join(format!("{case}-absent.json"));
+            fs::write(&preserved, b"preserve-this-existing-output").expect("write output sentinel");
+            for output in [&preserved, &absent] {
+                let result = command(
+                    &config,
+                    &["export", output.to_str().unwrap(), "--user-only"],
+                )
+                .output()
+                .expect("run refused export");
+                assert!(
+                    !result.status.success(),
+                    "{case} exported an invalid catalog: {result:?}"
+                );
+            }
+            assert_eq!(fs::read(&input).unwrap(), content);
+            assert_eq!(
+                fs::read(&preserved).unwrap(),
+                b"preserve-this-existing-output"
+            );
+            assert!(!absent.exists());
+        }
+    }
+}
+
+// ============================================================================
 // Unit Tests: Pattern Compilation
 // ============================================================================
 

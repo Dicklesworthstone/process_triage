@@ -6,10 +6,14 @@
 use crate::exit_codes::ExitCode;
 use crate::fleet::transfer::TransferImport;
 use crate::output::encode_toon_value;
-use crate::supervision::pattern_persistence::{AllPatternStats, DisabledPatterns};
+use crate::supervision::pattern_persistence::{
+    AllPatternStats, DisabledPatterns, SignatureCatalog, SignatureOrigin,
+};
 use crate::supervision::signature::{ProcessMatchContext, SignaturePriors};
+#[cfg(test)]
+use crate::supervision::SignatureDatabase;
 use crate::supervision::{
-    SignatureDatabase, SignaturePatterns, SignatureSchema, SupervisorCategory, SupervisorSignature,
+    SignaturePatterns, SignatureSchema, SupervisorCategory, SupervisorSignature,
     SCHEMA_VERSION as SIG_SCHEMA_VERSION,
 };
 use clap::{Args, Subcommand};
@@ -37,9 +41,9 @@ pub struct SignatureArgs {
 /// Signature subcommands
 #[derive(Subcommand, Debug)]
 pub enum SignatureCommands {
-    /// List all signatures (built-in and user-defined)
+    /// List effective built-in, learned, custom, and user signatures
     List {
-        /// Only show user-defined signatures
+        /// Only show user-managed signatures (including learned and imported)
         #[arg(long)]
         user_only: bool,
         /// Only show built-in signatures
@@ -105,13 +109,13 @@ pub enum SignatureCommands {
         #[arg(long)]
         all: bool,
     },
-    /// Validate user signatures file
+    /// Validate all configured signature sources and disabled-pattern state
     Validate,
-    /// Export signatures to a file
+    /// Export active effective signatures to a file
     Export {
         /// Output file path
         output: String,
-        /// Only export user signatures
+        /// Only export user-managed signatures (including learned and imported)
         #[arg(long)]
         user_only: bool,
     },
@@ -481,45 +485,33 @@ fn run_signature_list(
 ) -> ExitCode {
     let session_id = SessionId::new();
     let mut all_sigs: Vec<serde_json::Value> = Vec::new();
-
-    // Load built-in signatures
-    if !user_only {
-        let mut db = SignatureDatabase::new();
-        db.add_default_signatures();
-        for sig in db.signatures() {
-            if let Some(cat) = category_filter {
-                if sig.category != cat {
-                    continue;
-                }
-            }
-            all_sigs.push(serde_json::json!({
-                "name": sig.name,
-                "category": format!("{:?}", sig.category),
-                "source": "builtin",
-                "priority": sig.priority,
-                "confidence": sig.confidence_weight,
-            }));
+    let catalog = match SignatureCatalog::load(config_dir) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            eprintln!("Cannot load signature catalog: {error}");
+            return ExitCode::ArgsError;
         }
-    }
-
-    // Load user signatures
-    if !builtin_only {
-        if let Some(user_schema) = load_user_signatures(config_dir) {
-            for sig in &user_schema.signatures {
-                if let Some(cat) = category_filter {
-                    if sig.category != cat {
-                        continue;
-                    }
-                }
-                all_sigs.push(serde_json::json!({
-                    "name": sig.name,
-                    "category": format!("{:?}", sig.category),
-                    "source": "user",
-                    "priority": sig.priority,
-                    "confidence": sig.confidence_weight,
-                }));
-            }
+    };
+    for entry in &catalog.entries {
+        let builtin = entry.origin == SignatureOrigin::BuiltIn;
+        if (user_only && builtin) || (builtin_only && !builtin) {
+            continue;
         }
+        let sig = &entry.signature;
+        if category_filter.is_some_and(|category| sig.category != category) {
+            continue;
+        }
+        all_sigs.push(serde_json::json!({
+            "name": sig.name,
+            "category": format!("{:?}", sig.category),
+            "source": entry.origin.as_str(),
+            "provenance": entry.source,
+            "lifecycle": entry.lifecycle,
+            "active": entry.is_active(),
+            "disabled": entry.disabled,
+            "priority": sig.priority,
+            "confidence": sig.confidence_weight,
+        }));
     }
 
     // Sort by priority (higher first)
@@ -546,12 +538,14 @@ fn run_signature_list(
             println!();
             for sig in &all_sigs {
                 println!(
-                    "  {} ({}) [{}] priority={} confidence={}",
+                    "  {} ({}) [{}] priority={} confidence={} active={} disabled={}",
                     sig["name"].as_str().unwrap_or("?"),
                     sig["category"].as_str().unwrap_or("?"),
                     sig["source"].as_str().unwrap_or("?"),
                     sig["priority"],
-                    sig["confidence"]
+                    sig["confidence"],
+                    sig["active"],
+                    sig["disabled"]
                 );
             }
         }
@@ -562,90 +556,68 @@ fn run_signature_list(
 
 fn run_signature_show(format: &OutputFormat, config_dir: &Path, name: &str) -> ExitCode {
     let session_id = SessionId::new();
-
-    // Check built-in first
-    let mut db = SignatureDatabase::new();
-    db.add_default_signatures();
-
-    for sig in db.signatures() {
-        if sig.name == name {
-            let output = serde_json::json!({
-                "schema_version": SCHEMA_VERSION,
-                "session_id": session_id.0,
-                "generated_at": chrono::Utc::now().to_rfc3339(),
-                "command": "signature show",
-                "source": "builtin",
-                "signature": {
-                    "name": sig.name,
-                    "category": format!("{:?}", sig.category),
-                    "patterns": sig.patterns,
-                    "priority": sig.priority,
-                    "confidence": sig.confidence_weight,
-                    "notes": sig.notes,
-                }
-            });
-            match format {
-                OutputFormat::Json | OutputFormat::Toon => {
-                    println!("{}", format_signature_output(format, output));
-                }
-                _ => {
-                    println!("# Signature: {} (builtin)", name);
-                    println!();
-                    println!("  Category: {:?}", sig.category);
-                    println!("  Priority: {}", sig.priority);
-                    println!("  Confidence: {}", sig.confidence_weight);
-                    if let Some(ref notes) = sig.notes {
-                        println!("  Notes: {}", notes);
-                    }
-                    println!("  Patterns: {:?}", sig.patterns);
-                }
+    let catalog = match SignatureCatalog::load(config_dir) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            eprintln!("Cannot load signature catalog: {error}");
+            return ExitCode::ArgsError;
+        }
+    };
+    let Some(entry) = catalog
+        .entries
+        .iter()
+        .find(|entry| entry.signature.name == name)
+    else {
+        eprintln!("Signature '{}' not found", name);
+        return ExitCode::ArgsError;
+    };
+    let sig = &entry.signature;
+    let output = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "session_id": session_id.0,
+        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "command": "signature show",
+        "source": entry.origin.as_str(),
+        "provenance": entry.source,
+        "lifecycle": entry.lifecycle,
+        "active": entry.is_active(),
+        "disabled": entry.disabled,
+        "signature": {
+            "name": sig.name,
+            "category": format!("{:?}", sig.category),
+            "patterns": sig.patterns,
+            "priority": sig.priority,
+            "confidence": sig.confidence_weight,
+            "notes": sig.notes,
+            "priors": sig.priors,
+            "expectations": sig.expectations,
+            "builtin": sig.builtin,
+        }
+    });
+    match format {
+        OutputFormat::Json | OutputFormat::Toon => {
+            println!("{}", format_signature_output(format, output));
+        }
+        _ => {
+            println!("# Signature: {} ({})", name, entry.origin.as_str());
+            println!();
+            println!("  Category: {:?}", sig.category);
+            println!("  Priority: {}", sig.priority);
+            println!("  Confidence: {}", sig.confidence_weight);
+            println!("  Active: {}", entry.is_active());
+            println!("  Disabled: {}", entry.disabled);
+            if let Some(lifecycle) = entry.lifecycle {
+                println!("  Lifecycle: {:?}", lifecycle);
             }
-            return ExitCode::Clean;
+            if let Some(ref notes) = sig.notes {
+                println!("  Notes: {}", notes);
+            }
+            println!("  Patterns: {:?}", sig.patterns);
+            println!("  Priors: {:?}", sig.priors);
+            println!("  Expectations: {:?}", sig.expectations);
         }
     }
-
-    // Check user signatures
-    if let Some(user_schema) = load_user_signatures(config_dir) {
-        for sig in &user_schema.signatures {
-            if sig.name == name {
-                let output = serde_json::json!({
-                    "schema_version": SCHEMA_VERSION,
-                    "session_id": session_id.0,
-                    "generated_at": chrono::Utc::now().to_rfc3339(),
-                    "command": "signature show",
-                    "source": "user",
-                    "signature": {
-                        "name": sig.name,
-                        "category": format!("{:?}", sig.category),
-                        "patterns": sig.patterns,
-                        "priority": sig.priority,
-                        "confidence": sig.confidence_weight,
-                        "notes": sig.notes,
-                    }
-                });
-                match format {
-                    OutputFormat::Json | OutputFormat::Toon => {
-                        println!("{}", format_signature_output(format, output));
-                    }
-                    _ => {
-                        println!("# Signature: {} (user)", name);
-                        println!();
-                        println!("  Category: {:?}", sig.category);
-                        println!("  Priority: {}", sig.priority);
-                        println!("  Confidence: {}", sig.confidence_weight);
-                        if let Some(ref notes) = sig.notes {
-                            println!("  Notes: {}", notes);
-                        }
-                        println!("  Patterns: {:?}", sig.patterns);
-                    }
-                }
-                return ExitCode::Clean;
-            }
-        }
-    }
-
-    eprintln!("Signature '{}' not found", name);
-    ExitCode::ArgsError
+    ExitCode::Clean
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -845,16 +817,14 @@ fn run_signature_test(
 ) -> ExitCode {
     let session_id = SessionId::new();
 
-    // Build a database with both built-in and user signatures
-    let mut db = SignatureDatabase::new();
-    db.add_default_signatures();
-
-    // Add user signatures
-    if let Some(user_schema) = load_user_signatures(config_dir) {
-        for sig in user_schema.signatures {
-            let _ = db.add(sig);
+    // Use exactly the active, precedence-resolved signatures used for scoring.
+    let db = match crate::scoring::try_load_signature_database(config_dir) {
+        Ok(database) => database,
+        Err(error) => {
+            eprintln!("Cannot load signature catalog: {error}");
+            return ExitCode::ArgsError;
         }
-    }
+    };
 
     // Build match context
     let ctx = ProcessMatchContext {
@@ -921,74 +891,61 @@ fn run_signature_test(
 
 fn run_signature_validate(format: &OutputFormat, config_dir: &Path) -> ExitCode {
     let session_id = SessionId::new();
-    let path = readable_config_file(config_dir, user_signatures_path);
-
-    if !path.exists() {
-        match format {
-            OutputFormat::Json | OutputFormat::Toon => {
-                let output = serde_json::json!({
-                    "schema_version": SCHEMA_VERSION,
-                    "session_id": session_id.0,
-                    "generated_at": chrono::Utc::now().to_rfc3339(),
-                    "command": "signature validate",
-                    "status": "no_file",
-                    "message": "No user signatures file found",
-                });
-                println!("{}", format_signature_output(format, output));
+    match SignatureCatalog::load(config_dir) {
+        Ok(catalog) => {
+            let active_count = catalog
+                .entries
+                .iter()
+                .filter(|entry| entry.is_active())
+                .count();
+            let disabled_count = catalog
+                .entries
+                .iter()
+                .filter(|entry| entry.disabled)
+                .count();
+            match format {
+                OutputFormat::Json | OutputFormat::Toon => {
+                    let output = serde_json::json!({
+                        "schema_version": SCHEMA_VERSION,
+                        "session_id": session_id.0,
+                        "generated_at": chrono::Utc::now().to_rfc3339(),
+                        "command": "signature validate",
+                        "status": "valid",
+                        "path": config_dir.display().to_string(),
+                        "signature_count": catalog.entries.len(),
+                        "active_count": active_count,
+                        "disabled_count": disabled_count,
+                    });
+                    println!("{}", format_signature_output(format, output));
+                }
+                _ => {
+                    println!("Signature configuration is valid");
+                    println!("  Config: {}", config_dir.display());
+                    println!(
+                        "  Signatures: {} ({} active, {} disabled)",
+                        catalog.entries.len(),
+                        active_count,
+                        disabled_count
+                    );
+                }
             }
-            _ => {
-                println!("No user signatures file found at: {}", path.display());
-            }
+            ExitCode::Clean
         }
-        return ExitCode::Clean;
-    }
-
-    match std::fs::read_to_string(&path) {
-        Ok(content) => match serde_json::from_str::<SignatureSchema>(&content) {
-            Ok(schema) => {
-                match format {
-                    OutputFormat::Json | OutputFormat::Toon => {
-                        let output = serde_json::json!({
-                            "schema_version": SCHEMA_VERSION,
-                            "session_id": session_id.0,
-                            "generated_at": chrono::Utc::now().to_rfc3339(),
-                            "command": "signature validate",
-                            "status": "valid",
-                            "path": path.display().to_string(),
-                            "signature_count": schema.signatures.len(),
-                        });
-                        println!("{}", format_signature_output(format, output));
-                    }
-                    _ => {
-                        println!("User signatures file is valid");
-                        println!("  Path: {}", path.display());
-                        println!("  Signatures: {}", schema.signatures.len());
-                    }
+        Err(error) => {
+            match format {
+                OutputFormat::Json | OutputFormat::Toon => {
+                    let output = serde_json::json!({
+                        "schema_version": SCHEMA_VERSION,
+                        "session_id": session_id.0,
+                        "generated_at": chrono::Utc::now().to_rfc3339(),
+                        "command": "signature validate",
+                        "status": "invalid",
+                        "error": error.to_string(),
+                    });
+                    println!("{}", format_signature_output(format, output));
                 }
-                ExitCode::Clean
+                _ => eprintln!("Invalid signature configuration: {error}"),
             }
-            Err(e) => {
-                match format {
-                    OutputFormat::Json | OutputFormat::Toon => {
-                        let output = serde_json::json!({
-                            "schema_version": SCHEMA_VERSION,
-                            "session_id": session_id.0,
-                            "generated_at": chrono::Utc::now().to_rfc3339(),
-                            "command": "signature validate",
-                            "status": "invalid",
-                            "error": e.to_string(),
-                        });
-                        println!("{}", format_signature_output(format, output));
-                    }
-                    _ => {
-                        eprintln!("Invalid user signatures file: {}", e);
-                    }
-                }
-                ExitCode::ArgsError
-            }
-        },
-        Err(e) => {
-            eprintln!("Failed to read signatures file: {}", e);
             ExitCode::ArgsError
         }
     }
@@ -1002,23 +959,24 @@ fn run_signature_export(
 ) -> ExitCode {
     let session_id = SessionId::new();
 
-    let mut all_sigs = Vec::new();
-
-    // Load built-in signatures
-    if !user_only {
-        let mut db = SignatureDatabase::new();
-        db.add_default_signatures();
-        for sig in db.signatures() {
-            all_sigs.push(sig.clone());
+    let catalog = match SignatureCatalog::load(config_dir) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            eprintln!("Cannot export signature catalog: {error}");
+            return ExitCode::ArgsError;
         }
-    }
-
-    // Load user signatures
-    if let Some(user_schema) = load_user_signatures(config_dir) {
-        for sig in user_schema.signatures {
-            all_sigs.push(sig);
-        }
-    }
+    };
+    // A plain SignatureSchema has no disabled/lifecycle state. Only active
+    // winners may be flattened into it; otherwise importing this export would
+    // resurrect signatures the user explicitly excluded from inference.
+    let all_sigs = catalog
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.is_active() && (!user_only || entry.origin != SignatureOrigin::BuiltIn)
+        })
+        .map(|entry| entry.signature.clone())
+        .collect();
 
     let export_schema = SignatureSchema {
         schema_version: SIG_SCHEMA_VERSION,
@@ -1322,25 +1280,19 @@ fn run_signature_disable(
         }
     };
 
-    // First check if the signature exists (in either built-in or user signatures)
-    let mut db = SignatureDatabase::new();
-    db.add_default_signatures();
-
-    let mut found = db.signatures().iter().any(|s| s.name == name);
-
-    // Also check user signatures
-    if !found {
-        match try_load_user_signatures(config_dir) {
-            Ok(Some(user_schema)) => {
-                found = user_schema.signatures.iter().any(|s| s.name == name);
-            }
-            Ok(None) => {}
-            Err(error) => {
-                eprintln!("Cannot inspect user signatures: {error}");
-                return ExitCode::ArgsError;
-            }
+    // Resolve every stored source, including already disabled entries, while
+    // holding the writer guard through publication of the disabled set.
+    let catalog = match SignatureCatalog::load(config_dir) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            eprintln!("Cannot inspect signature catalog: {error}");
+            return ExitCode::ArgsError;
         }
-    }
+    };
+    let found = catalog
+        .entries
+        .iter()
+        .any(|entry| entry.signature.name == name);
 
     if !found {
         match format {

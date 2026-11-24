@@ -1415,6 +1415,25 @@ pt-core signature import sigs.json  # Import from file
 
 Categories: `agent`, `ide`, `ci`, `orchestrator`, `terminal`, `other`. `--pattern` matches the process name, `--arg-pattern` the command line (repeat either; all arg patterns must match). User signatures live in `signatures.json` in the config directory.
 
+Scoring and signature commands also load learned and imported patterns from
+`patterns/learned.json` and `patterns/custom.json`. A name has one effective
+definition: `signatures.json` overrides custom patterns, then learned patterns,
+then the shipped defaults. `patterns/disabled.json` suppresses that name across
+all sources; deprecated and removed patterns remain inactive. Stored statistics
+do not replace a signature's declared confidence or automatically calibrate it.
+
+`signature list`, `signature show NAME`, and MCP `pt_signatures` expose the
+effective source, original provenance, lifecycle, and active/disabled state.
+`signature disable NAME` and `signature enable NAME` work for imported patterns
+as well as shipped and user signatures. `signature test` uses the same active
+matchers as scoring, and `signature validate` checks every configured source.
+`signature export` includes only active effective definitions, so a plain JSON
+export cannot reactivate disabled or deprecated patterns when imported.
+`--user-only` includes learned and imported patterns as well as explicit user
+definitions. Live plan, explain, snapshot, watch, TUI, MCP, and replay scoring
+refuse unreadable or invalid model inputs instead of silently using a partial
+model; recorded session explanations remain independent of current configuration.
+
 Signatures are matched against the process name and command line. A matched signature with priors sets the class prior: `--prior useful` (about 90% useful) or `--prior abandoned` (about 80% abandoned). Built-in test-runner and build-tool signatures (jest, pytest, webpack, ...) lean toward "likely abandoned if old", dev-server signatures toward "likely useful"; their argument patterns match the tool as a command word (`node_modules/.bin/jest`, `python -m pytest`), not any path that contains the name. A signature added without `--prior` only labels its matches. Signature and learned priors apply the same way in `pt agent plan`, the TUI, `pt agent explain`, `snapshot`, `watch` and the MCP tools.
 
 Signature shortcut candidates also pass through ordinary inference, which retains
