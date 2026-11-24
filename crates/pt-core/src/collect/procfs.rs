@@ -413,6 +413,16 @@ impl FilesystemGuard {
         Self::parse(&bytes)
     }
 
+    /// Restrict allocation observations to disk-backed local filesystems. A
+    /// tmpfs mount is safe for metadata queries but consumes memory, wherever
+    /// the host chose to mount it.
+    pub(crate) fn local_disks(mountinfo: &Path) -> Result<Self, &'static str> {
+        let bytes = read_bounded(mountinfo, MAX_MOUNTINFO_BYTES)?;
+        let mut mounts = parse_mountinfo(&bytes)?;
+        mounts.retain(|_, mount| mount.filesystem_type != "tmpfs");
+        Ok(Self::from_mounts(&mounts))
+    }
+
     pub(crate) fn parse(bytes: &[u8]) -> Result<Self, &'static str> {
         Ok(Self::from_mounts(&parse_mountinfo(bytes)?))
     }

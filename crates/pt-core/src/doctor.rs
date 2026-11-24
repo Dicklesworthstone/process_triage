@@ -149,16 +149,17 @@ pub struct ProcTable {
     pub deleted_open_bytes: u64,
     /// Logical file lengths; sparse files may have much less allocated storage.
     pub deleted_open_logical_bytes: u64,
-    /// The largest of those files, with a process holding each.
+    /// The largest of those files, with their observed descriptor holders.
     pub deleted_open: Vec<DeletedOpenFile>,
 }
 
-/// A file deleted while a process still holds it open: its space is not freed until
-/// the process closes it or exits.
+/// An unlinked inode still held through observed process descriptors.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DeletedOpenFile {
     pub pid: u32,
     pub comm: String,
+    /// Observed process IDs in ascending order. A PID with several FDs appears once.
+    pub holder_pids: Vec<u32>,
     pub path: String,
     /// Allocated storage observed through the open descriptor, not measured relief.
     pub bytes: u64,
@@ -174,10 +175,10 @@ fn deleted_open_files(
 ) -> Vec<(String, u64, u64, (u64, u64))> {
     let mut out = Vec::new();
     for fd in fd_dir {
-        let Ok(target) = std::fs::read_link(fd.path()) else {
+        let Ok(target_path) = std::fs::read_link(fd.path()) else {
             continue;
         };
-        let target = target.to_string_lossy();
+        let target = target_path.to_string_lossy();
         let Some(path) = target.strip_suffix(" (deleted)") else {
             continue;
         };
@@ -188,6 +189,7 @@ fn deleted_open_files(
         // to be local. A direct stat can itself wait on a stalled FUSE server.
         #[cfg(target_os = "linux")]
         let meta = {
+            use std::os::fd::AsRawFd;
             use std::os::unix::fs::OpenOptionsExt;
             let Some(filesystems) = filesystems else {
                 continue;
@@ -200,6 +202,15 @@ fn deleted_open_files(
                 continue;
             };
             if !filesystems.permits(&file) {
+                continue;
+            }
+            // The process could reuse this FD between readlink and open. Bind
+            // the name reported to the same held handle used for accounting.
+            if std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+                .ok()
+                .as_ref()
+                != Some(&target_path)
+            {
                 continue;
             }
             let Ok(metadata) = file.metadata() else {
@@ -217,6 +228,11 @@ fn deleted_open_files(
         #[cfg(unix)]
         let (bytes, key) = {
             use std::os::unix::fs::MetadataExt;
+            // A literal " (deleted)" filename looks identical in readlink.
+            // Removing one hard link also leaves the inode reachable by name.
+            if meta.nlink() != 0 {
+                continue;
+            }
             (meta.blocks().saturating_mul(512), (meta.dev(), meta.ino()))
         };
         #[cfg(not(unix))]
@@ -872,10 +888,11 @@ fn read_proc_table(root: &Path, clk_tck: u64) -> ProcTable {
     let mut comms: BTreeMap<u32, (String, u64)> = BTreeMap::new();
     let mut zombies: BTreeMap<u32, u32> = BTreeMap::new();
     let mut fd_counts: Vec<FdHolder> = Vec::new();
-    let mut deleted: Vec<DeletedOpenFile> = Vec::new();
-    let mut seen_deleted: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+    let mut by_inode: BTreeMap<(u64, u64), DeletedOpenFile> = BTreeMap::new();
     #[cfg(target_os = "linux")]
-    let filesystems = crate::collect::procfs::FilesystemGuard::load().ok();
+    let filesystems =
+        crate::collect::procfs::FilesystemGuard::local_disks(&root.join("proc/self/mountinfo"))
+            .ok();
     let Ok(entries) = std::fs::read_dir(root.join("proc")) else {
         return table;
     };
@@ -922,14 +939,16 @@ fn read_proc_table(root: &Path, clk_tck: u64) -> ProcTable {
             #[cfg(not(target_os = "linux"))]
             let held_files = deleted_open_files(&fds);
             for (path, bytes, logical_bytes, key) in held_files {
-                if seen_deleted.insert(key) {
-                    deleted.push(DeletedOpenFile {
-                        pid,
-                        comm: comm.clone(),
-                        path,
-                        bytes,
-                        logical_bytes,
-                    });
+                let file = by_inode.entry(key).or_insert_with(|| DeletedOpenFile {
+                    pid,
+                    comm: comm.clone(),
+                    holder_pids: Vec::new(),
+                    path,
+                    bytes,
+                    logical_bytes,
+                });
+                if file.holder_pids.last() != Some(&pid) {
+                    file.holder_pids.push(pid);
                 }
             }
             fd_counts.push(FdHolder {
@@ -940,6 +959,7 @@ fn read_proc_table(root: &Path, clk_tck: u64) -> ProcTable {
         }
         comms.insert(pid, (comm, start));
     }
+    let mut deleted: Vec<_> = by_inode.into_values().collect();
     table.deleted_open_bytes = deleted.iter().map(|d| d.bytes).sum();
     table.deleted_open_logical_bytes = deleted.iter().map(|d| d.logical_bytes).sum();
     deleted.sort_by(|a, b| b.bytes.cmp(&a.bytes).then(a.pid.cmp(&b.pid)));
@@ -1571,18 +1591,19 @@ fn check_deleted_open(f: &HostFacts, out: &mut Vec<Finding>) {
             "disk.deleted_open_files",
             level,
             format!(
-                "{} allocated to deleted files that are still open ({} logical); largest: {} ({}) held by {} (pid {})",
+                "{} allocated to deleted files that are still open ({} logical); largest: {} ({}), {} observed holder(s) including {} (pid {})",
                 gib(p.deleted_open_bytes),
                 gib(p.deleted_open_logical_bytes),
                 largest.path,
                 gib(largest.bytes),
+                largest.holder_pids.len(),
                 largest.comm,
                 largest.pid
             ),
         )
         .observed(json!({"bytes": p.deleted_open_bytes, "logical_bytes": p.deleted_open_logical_bytes, "largest": p.deleted_open}))
         .recommended("inspect all holders before restarting or stopping processes")
-        .rationale("Deleted regular files remain open until every holder closes its descriptors. Allocated blocks can be much smaller than logical length for sparse files; the reported allocation is potential reclaim, not measured freed space. The named process is one representative and other processes may hold the same inode.")
+        .rationale("Unlinked regular files can remain allocated through open descriptors or memory mappings. Sparse files can have far fewer allocated bytes than their length. The totals are observed allocation, not measured freed space. The listed PIDs held readable descriptors during the scan. Additional references may exist.")
         .commands(&[&format!("ls -l /proc/{}/fd | grep deleted", largest.pid)]),
     );
 }
@@ -2758,49 +2779,68 @@ mod tests {
 
     /// Space held by deleted-but-open files: each file once, memfd skipped, the holder
     /// named. A large sparse fixture must not fabricate disk pressure.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn deleted_open_files_are_found_and_counted_once() {
-        use std::os::unix::fs::symlink;
+        use std::io::Write;
+        use std::os::unix::fs::{symlink, MetadataExt};
+        use std::process::{Command, Stdio};
         let root = healthy();
         root.proc(500, "logger", 'S', 1)
-            .proc(501, "logger-child", 'S', 500);
-        let held = root.path().join("var/log/app.log (deleted)");
-        std::fs::create_dir_all(held.parent().unwrap()).unwrap();
-        std::fs::File::create(&held)
-            .unwrap()
-            .set_len(2 * GIB)
-            .unwrap();
-        let kept = root.path().join("var/log/current.log");
-        std::fs::write(&kept, "live").unwrap();
-        for (pid, fd, target) in [
-            (500, 3, held.clone()),
-            (501, 4, held.clone()),
-            (500, 5, PathBuf::from("/memfd:shm (deleted)")),
-            (500, 6, kept.clone()),
+            .proc(501, "logger-child", 'S', 500)
+            .proc(502, "other", 'S', 1);
+        let path = root.path().join("app.log");
+        let mut held = std::fs::File::create(&path).unwrap();
+        held.set_len(2 * GIB).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let literal = std::fs::File::create(root.path().join("literal (deleted)")).unwrap();
+        let link = root.path().join("rotated");
+        let linked = std::fs::File::create(&link).unwrap();
+        std::fs::hard_link(&link, root.path().join("still-linked")).unwrap();
+        std::fs::remove_file(&link).unwrap();
+        // Use a real kernel FD table per fixture process, including a duplicate
+        // descriptor in one table and a descriptor inherited by another PID.
+        let mut children = Vec::new();
+        for (pid, stdout, stderr) in [
+            (500, &held, &held),
+            (501, &held, &literal),
+            (502, &linked, &literal),
         ] {
-            let dir = root.path().join(format!("proc/{pid}/fd"));
-            std::fs::create_dir_all(&dir).unwrap();
-            symlink(&target, dir.join(fd.to_string())).unwrap();
+            let child = Command::new("cat")
+                .stdin(Stdio::piped())
+                .stdout(stdout.try_clone().unwrap())
+                .stderr(stderr.try_clone().unwrap())
+                .spawn()
+                .unwrap();
+            symlink(
+                format!("/proc/{}/fd", child.id()),
+                root.path().join(format!("proc/{pid}/fd")),
+            )
+            .unwrap();
+            children.push(child);
         }
 
+        // Exercise disk classification independently of the test runner's
+        // temporary filesystem. The ID is from the same held descriptor.
+        let mount = crate::collect::procfs::mount_id(&held).unwrap();
+        let mount_table = |kind| format!("{mount} 1 0:1 / / rw - {kind} test rw\n");
+        root.write("proc/self/mountinfo", &mount_table("ext4"));
         let r = root.report();
-        use std::os::unix::fs::MetadataExt;
-        let allocated = std::fs::metadata(&held).unwrap().blocks() * 512;
+        let allocated = held.metadata().unwrap().blocks() * 512;
         assert!(allocated < GIB, "the sparse fixture allocated {allocated}");
         assert_eq!(r.facts.procs.deleted_open_bytes, allocated);
         assert_eq!(r.facts.procs.deleted_open_logical_bytes, 2 * GIB);
         assert_eq!(r.facts.procs.deleted_open.len(), 1);
+        assert_eq!(r.facts.procs.deleted_open[0].holder_pids, [500, 501]);
         let f = find(&r, "disk.deleted_open_files").unwrap();
         assert_eq!(f.level, Level::Info);
         assert!(f.summary.contains("app.log"), "{}", f.summary);
         assert!(f.summary.contains("(pid 500)"), "{}", f.summary);
         assert_eq!(f.commands, vec!["ls -l /proc/500/fd | grep deleted"]);
 
-        // Real allocated blocks retain a positive reader/deduplication oracle.
-        // This is a controlled proc-tree fixture, not live unlinked-file relief.
-        std::fs::write(&held, vec![b'x'; 8192]).unwrap();
-        let allocated = std::fs::metadata(&held).unwrap().blocks() * 512;
+        held.set_len(0).unwrap();
+        held.write_all(&[b'x'; 8192]).unwrap();
+        let allocated = held.metadata().unwrap().blocks() * 512;
         assert!(allocated > 0);
         let r = root.report();
         assert_eq!(r.facts.procs.deleted_open_bytes, allocated);
@@ -2830,6 +2870,13 @@ mod tests {
                 findings[0].commands,
                 vec!["ls -l /proc/500/fd | grep deleted"]
             );
+        }
+
+        root.write("proc/self/mountinfo", &mount_table("tmpfs"));
+        assert!(root.report().facts.procs.deleted_open.is_empty());
+        for mut child in children {
+            drop(child.stdin.take());
+            assert!(child.wait().unwrap().success());
         }
     }
 
