@@ -1208,6 +1208,317 @@ fn actual_mcp_sampling_windows_are_advertised_and_rejected_before_process_work()
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn actual_mcp_recorded_explanation_preserves_the_plan_after_exit_and_config_changes() {
+    use assert_cmd::cargo::cargo_bin_cmd;
+
+    struct OwnedChild(std::process::Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let root =
+        std::env::temp_dir().join(format!("pt-mcp-recorded-explain-{}", uuid::Uuid::new_v4()));
+    let config = root.join("config");
+    let data = root.join("data");
+    std::fs::create_dir_all(&config).unwrap();
+    // Observe only this fixture's owned child, including on root-owned build
+    // workers. This test never applies the generated plan.
+    let mut policy = pt_core::config::Policy::default();
+    policy.guardrails.builtin_protection = false;
+    policy.guardrails.protected_users.clear();
+    policy.guardrails.protected_groups.clear();
+    policy.guardrails.protected_patterns.clear();
+    policy.guardrails.protected_categories.clear();
+    std::fs::write(
+        config.join("policy.json"),
+        serde_json::to_vec(&policy).unwrap(),
+    )
+    .unwrap();
+    let target = OwnedChild(
+        std::process::Command::new("sleep")
+            .arg("61")
+            .spawn()
+            .unwrap(),
+    );
+    let pid = target.0.id();
+    eprintln!(
+        "retained MCP recorded-explanation evidence: {}",
+        root.display()
+    );
+    let call = |label: &str, tool: &str, arguments: serde_json::Value| {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": tool, "arguments": arguments},
+        });
+        std::fs::write(
+            root.join(format!("{label}.request.json")),
+            request.to_string(),
+        )
+        .unwrap();
+        let output = cargo_bin_cmd!("pt-core")
+            .arg("--config")
+            .arg(&config)
+            .arg("mcp")
+            .env_remove("PT_CONFIG_DIR")
+            .env_remove("PT_SKIP_GLOBAL_LOCK")
+            .env("PROCESS_TRIAGE_DATA", &data)
+            .env("PROCESS_TRIAGE_RETENTION", "off")
+            .write_stdin(format!("{request}\n"))
+            .timeout(std::time::Duration::from_secs(45))
+            .output()
+            .expect("run actual MCP server and CLI worker");
+        std::fs::write(root.join(format!("{label}.stdout")), &output.stdout).unwrap();
+        std::fs::write(root.join(format!("{label}.stderr")), &output.stderr).unwrap();
+        assert!(output.status.success(), "{label}: {output:?}");
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["id"], 1);
+        assert!(response["error"].is_null(), "{label}: {response}");
+        response["result"].clone()
+    };
+    let planned = call(
+        "plan",
+        "pt_plan",
+        serde_json::json!({
+            "pids": [pid], "min_age": 0, "min_score": 0,
+            "window_ms": 25, "timeout_secs": 30,
+        }),
+    );
+    assert_eq!(planned["isError"], false, "{planned}");
+    let plan: serde_json::Value =
+        serde_json::from_str(planned["content"][0]["text"].as_str().unwrap()).unwrap();
+    let candidate = plan["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|candidate| candidate["pid"] == pid)
+        .expect("owned process in recorded plan");
+    let session = plan["session_id"].as_str().unwrap();
+    let start_id = candidate["start_id"].as_str().unwrap();
+    let plan_path = data
+        .join("sessions")
+        .join(session)
+        .join("decision/plan.json");
+    let original_plan = std::fs::read(&plan_path).unwrap();
+    drop(target);
+    // Both a dead target and unreadable current priors must be irrelevant to a
+    // recorded explanation. A fallback to the live evaluator would fail here.
+    std::fs::write(config.join("priors.json"), b"{invalid-current-priors").unwrap();
+    let result = call(
+        "recorded",
+        "pt_explain",
+        serde_json::json!({
+            "session": session, "pid": pid, "start_id": start_id,
+            "include": ["evidence", "ledger", "bayes_factors"], "timeout_secs": 10,
+        }),
+    );
+    assert_eq!(result["isError"], false, "{result}");
+    let explained: serde_json::Value =
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(explained["command"], "agent explain");
+    assert_eq!(explained["mode"], "recorded");
+    assert_eq!(explained["session_id"], session);
+    assert_eq!(explained["source"]["artifact"], "decision/plan.json");
+    assert_eq!(explained["source"]["observed_at"], plan["generated_at"]);
+    assert_eq!(explained["activity_window_ms"], 25);
+    assert_eq!(explained["explanations"].as_array().unwrap().len(), 1);
+    let actual = &explained["explanations"][0];
+    for (field, expected) in candidate.as_object().unwrap() {
+        assert_eq!(&actual[field], expected, "recorded {field} changed");
+    }
+    assert_eq!(actual["ledger_status"], "recorded");
+    assert_eq!(
+        actual["learned_prior"],
+        candidate["inference"]["learned_prior"]
+    );
+    assert_eq!(
+        actual["bayes_factors"],
+        candidate["evidence_ledger"]["bayes_factors"]
+    );
+    assert_eq!(std::fs::read(&plan_path).unwrap(), original_plan);
+
+    let by_pid = call(
+        "recorded_by_pid",
+        "pt_explain",
+        serde_json::json!({"session": session, "pid": pid}),
+    );
+    assert_eq!(by_pid["isError"], false, "{by_pid}");
+    let by_pid: serde_json::Value =
+        serde_json::from_str(by_pid["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        by_pid["explanations"][0]["posterior"],
+        candidate["posterior"]
+    );
+    assert_eq!(by_pid["explanations"][0]["start_id"], start_id);
+    assert!(by_pid["explanations"][0].get("evidence_ledger").is_none());
+    for (label, arguments, expected_error) in [
+        (
+            "missing_pid",
+            serde_json::json!({"session": session, "pid": u32::MAX}),
+            "not found in recorded session",
+        ),
+        (
+            "wrong_birth",
+            serde_json::json!({
+                "session": session, "pid": pid,
+                "start_id": format!("different-boot:1:{pid}"),
+            }),
+            "does not match the recorded session",
+        ),
+        (
+            "missing_session",
+            serde_json::json!({"session": pt_common::SessionId::new().0, "pid": pid}),
+            "agent explain failed",
+        ),
+    ] {
+        let refused = call(label, "pt_explain", arguments);
+        assert_eq!(refused["isError"], true, "{label}: {refused}");
+        assert!(
+            refused["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains(expected_error),
+            "{label}: {refused}"
+        );
+    }
+    assert_eq!(std::fs::read(&plan_path).unwrap(), original_plan);
+}
+
+#[test]
+fn actual_mcp_explain_validates_session_identity_and_modes_before_loading_config() {
+    use assert_cmd::cargo::cargo_bin_cmd;
+
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("config");
+    let data = root.path().join("data");
+    std::fs::create_dir(&config).unwrap();
+    std::fs::write(config.join("policy.json"), b"{invalid-policy").unwrap();
+    let session = pt_common::SessionId::new().0;
+    let invalid = [
+        (serde_json::json!({"pid": 0}), "pid"),
+        (serde_json::json!({"pid": -1}), "pid"),
+        (serde_json::json!({"pid": 4_294_967_296_u64}), "pid"),
+        (serde_json::json!({"pid": "42"}), "pid"),
+        (serde_json::json!({"pid": null}), "pid"),
+        (
+            serde_json::json!({"pid": 42, "comm": "sleep"}),
+            "mutually exclusive",
+        ),
+        (serde_json::json!({"comm": ""}), "comm"),
+        (
+            serde_json::json!({"pid": 42, "session": "../elsewhere"}),
+            "session",
+        ),
+        (serde_json::json!({"session": session}), "requires pid"),
+        (
+            serde_json::json!({"session": session, "pid": 42, "comm": "sleep"}),
+            "cannot be combined",
+        ),
+        (
+            serde_json::json!({"session": session, "pid": 42, "window_ms": 0}),
+            "cannot be combined",
+        ),
+        (
+            serde_json::json!({"session": session, "pid": 42, "start_id": "bad"}),
+            "start_id",
+        ),
+        (
+            serde_json::json!({"session": session, "pid": 42, "start_id": "boot:1:43"}),
+            "requested pid",
+        ),
+        (
+            serde_json::json!({"pid": 42, "start_id": "boot:1:42"}),
+            "requires session",
+        ),
+        (
+            serde_json::json!({"session": session, "pid": 42, "include": []}),
+            "include",
+        ),
+        (
+            serde_json::json!({"session": session, "pid": 42, "include": ["unknown"]}),
+            "include",
+        ),
+        (
+            serde_json::json!({"session": session, "pid": 42, "include": ["ledger", "ledger"]}),
+            "duplicate",
+        ),
+        (
+            serde_json::json!({"pid": 42, "include": ["ledger"]}),
+            "requires session",
+        ),
+        (
+            serde_json::json!({"session": session, "pid": 42, "timeout_secs": 0}),
+            "timeout_secs",
+        ),
+        (
+            serde_json::json!({"session": session, "pid": 42, "timeout_secs": 601}),
+            "timeout_secs",
+        ),
+        (
+            serde_json::json!({"session": session, "pid": 42, "timeout_secs": "10"}),
+            "timeout_secs",
+        ),
+        (
+            serde_json::json!({"pid": 42, "timeout_secs": 10}),
+            "requires session",
+        ),
+        (
+            serde_json::json!({"session": session, "pid": 42, "live": true}),
+            "unknown pt_explain argument",
+        ),
+    ];
+    let input: String = invalid
+        .iter()
+        .enumerate()
+        .map(|(index, (arguments, _))| {
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": index, "method": "tools/call",
+                    "params": {"name": "pt_explain", "arguments": arguments},
+                })
+            )
+        })
+        .collect();
+    let output = cargo_bin_cmd!("pt-core")
+        .arg("--config")
+        .arg(&config)
+        .arg("mcp")
+        .env_remove("PT_CONFIG_DIR")
+        .env_remove("PT_SKIP_GLOBAL_LOCK")
+        .env("PROCESS_TRIAGE_DATA", &data)
+        .env("PROCESS_TRIAGE_RETENTION", "off")
+        .write_stdin(input)
+        .timeout(std::time::Duration::from_secs(10))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let responses: Vec<serde_json::Value> = std::str::from_utf8(&output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(responses.len(), invalid.len());
+    for ((_, expected_error), response) in invalid.iter().zip(responses) {
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        assert!(
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains(expected_error),
+            "{response}"
+        );
+    }
+    assert!(
+        !data.join("sessions").exists(),
+        "validation must not create a session"
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn actual_mcp_plan_deadline_releases_the_server_for_the_next_request() {

@@ -437,6 +437,145 @@ fn top_signature(process: &ProcessRecord, db: &SignatureDatabase) -> Option<Stri
         .map(|m| m.signature.name.clone())
 }
 
+#[derive(Debug)]
+enum ExplainRequest {
+    Live {
+        pid: Option<u32>,
+        comm: Option<String>,
+        window_ms: u64,
+    },
+    Recorded {
+        session: String,
+        pid: u32,
+        start_id: Option<String>,
+        args: Vec<String>,
+        timeout: Duration,
+    },
+}
+
+/// A saved explanation must select an existing observation explicitly. Never
+/// turn an invalid session or process identity into a fresh live observation.
+fn explain_request(params: &serde_json::Value) -> Result<ExplainRequest, String> {
+    let object = params
+        .as_object()
+        .ok_or_else(|| "pt_explain arguments must be an object".to_string())?;
+    let window_ms = activity_window_ms(params)?;
+    let timeout = plan_timeout(params)?;
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "pid" | "comm" | "window_ms" | "session" | "start_id" | "include" | "timeout_secs"
+        ) {
+            return Err(format!("unknown pt_explain argument: {key}"));
+        }
+    }
+    let pid = object
+        .get("pid")
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|pid| u32::try_from(pid).ok())
+                .filter(|pid| *pid > 0)
+                .ok_or("pid must be an integer between 1 and 4294967295")
+        })
+        .transpose()?;
+
+    if let Some(value) = object.get("session") {
+        let session = value
+            .as_str()
+            .filter(|session| pt_common::SessionId::parse(session).is_some())
+            .ok_or("session must be a valid pt session ID")?;
+        let pid = pid.ok_or("session requires pid to select a recorded process")?;
+        if object.contains_key("comm") || object.contains_key("window_ms") {
+            return Err("session cannot be combined with live comm or window_ms arguments".into());
+        }
+        let start_id = object
+            .get("start_id")
+            .map(|value| {
+                let start_id = value
+                    .as_str()
+                    .filter(|value| !value.contains('\0'))
+                    .and_then(pt_common::StartId::parse)
+                    .ok_or("start_id must be a valid process birth identity")?;
+                if start_id
+                    .0
+                    .rsplit(':')
+                    .next()
+                    .and_then(|value| value.parse::<u32>().ok())
+                    != Some(pid)
+                {
+                    return Err("start_id must identify the requested pid");
+                }
+                Ok(start_id.0)
+            })
+            .transpose()?;
+        let mut args = vec![
+            "agent".to_string(),
+            "explain".to_string(),
+            "--format=json".to_string(),
+            format!("--session={session}"),
+        ];
+        if let Some(start_id) = &start_id {
+            args.push(format!("--target={pid}:{start_id}"));
+        } else {
+            args.push(format!("--pids={pid}"));
+        }
+        if let Some(value) = object.get("include") {
+            let sections = value
+                .as_array()
+                .filter(|sections| !sections.is_empty())
+                .ok_or("include must be a nonempty array of evidence, ledger or bayes_factors")?;
+            let mut seen = std::collections::HashSet::new();
+            for section in sections {
+                let section = section
+                    .as_str()
+                    .filter(|section| matches!(*section, "evidence" | "ledger" | "bayes_factors"))
+                    .ok_or("include must contain evidence, ledger or bayes_factors")?;
+                if !seen.insert(section) {
+                    return Err("include must not contain duplicate sections".into());
+                }
+                args.push(format!("--include={section}"));
+            }
+        }
+        return Ok(ExplainRequest::Recorded {
+            session: session.to_string(),
+            pid,
+            start_id,
+            args,
+            timeout,
+        });
+    }
+
+    for parameter in ["start_id", "include", "timeout_secs"] {
+        if object.contains_key(parameter) {
+            return Err(format!(
+                "{parameter} requires session for a recorded explanation"
+            ));
+        }
+    }
+    let comm = object
+        .get("comm")
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.trim().is_empty() && !value.contains('\0'))
+                .map(str::to_string)
+                .ok_or("comm must be a nonempty process name without NUL bytes")
+        })
+        .transpose()?;
+    if pid.is_some() && comm.is_some() {
+        return Err("pid and comm are mutually exclusive".into());
+    }
+    if pid.is_none() && comm.is_none() {
+        return Err("Either 'pid' or 'comm' must be provided".into());
+    }
+    Ok(ExplainRequest::Live {
+        pid,
+        comm,
+        window_ms,
+    })
+}
+
 /// Arguments for `pt-core agent plan` derived from `pt_plan` tool params.
 fn plan_command_args(params: &serde_json::Value) -> Result<Vec<String>, String> {
     let object = params
@@ -706,21 +845,47 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "pt_explain".to_string(),
-            description: "Explain a specific process — why it was flagged and its evidence chain. \
-                          Includes measured agent-tree activity without treating missing observations as inactivity."
+            description: "Explain a specific process and its evidence chain. With session and pid, \
+                          returns the exact recorded CLI explanation, even after process exit or \
+                          configuration changes. Without session, observes the current process by pid or comm."
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "pid": {
                         "type": "integer",
-                        "description": "Process ID to explain"
+                        "minimum": 1,
+                        "maximum": u32::MAX,
+                        "description": "Process ID to explain; required with session"
                     },
                     "comm": {
                         "type": "string",
-                        "description": "Process name (comm) to explain (alternative to pid)"
+                        "minLength": 1,
+                        "description": "Live process name (comm), an alternative to pid; incompatible with session"
                     },
-                    "window_ms": activity_window_schema()
+                    "window_ms": activity_window_schema(),
+                    "session": {
+                        "type": "string",
+                        "description": "Saved pt session ID from pt_plan or pt_history. Uses recorded evidence without rescanning; incompatible with comm and window_ms"
+                    },
+                    "start_id": {
+                        "type": "string",
+                        "description": "Optional recorded process birth identity (boot_id:start_time:pid); requires session and must match the recorded process"
+                    },
+                    "include": {
+                        "type": "array",
+                        "description": "Additional recorded explanation sections; requires session",
+                        "items": {"type": "string", "enum": ["evidence", "ledger", "bayes_factors"]},
+                        "minItems": 1,
+                        "uniqueItems": true
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "description": "Total recorded-explanation deadline, including worker startup and output; requires session",
+                        "minimum": 1,
+                        "maximum": MAX_PLAN_TIMEOUT_SECS,
+                        "default": DEFAULT_PLAN_TIMEOUT_SECS
+                    }
                 },
                 "required": [],
                 "additionalProperties": false
@@ -1091,13 +1256,32 @@ fn tool_scan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
 }
 
 fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
-    let window_ms = activity_window_ms(params)?;
-    let pid = params.get("pid").and_then(|v| v.as_u64()).map(|v| v as u32);
-    let comm = params.get("comm").and_then(|v| v.as_str());
-
-    if pid.is_none() && comm.is_none() {
-        return Err("Either 'pid' or 'comm' must be provided".to_string());
-    }
+    let (pid, comm, window_ms) = match explain_request(params)? {
+        ExplainRequest::Recorded {
+            session,
+            pid,
+            start_id,
+            args,
+            timeout,
+        } => {
+            let config = crate::config::resolve_config_dir(&crate::mcp::config_options())
+                .map_err(|error| format!("cannot resolve explanation config directory: {error}"))?;
+            let exe = std::env::current_exe()
+                .map_err(|error| format!("cannot locate pt-core: {error}"))?;
+            let spec = agent_worker_spec(&exe, &config, args, timeout)?;
+            let output = run_agent_worker(&spec, "agent explain")?;
+            let text = parse_explain_worker_output(&output, &session, pid, start_id.as_deref())?;
+            return Ok(vec![ToolContent {
+                content_type: "text".to_string(),
+                text,
+            }]);
+        }
+        ExplainRequest::Live {
+            pid,
+            comm,
+            window_ms,
+        } => (pid, comm, window_ms),
+    };
 
     let mut evaluator = Evaluator::load()?;
     // Run a quick scan to find the process
@@ -1107,7 +1291,7 @@ fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
     let process = scan.processes.iter().find(|p| {
         if let Some(target_pid) = pid {
             p.pid.0 == target_pid
-        } else if let Some(target_comm) = comm {
+        } else if let Some(target_comm) = comm.as_deref() {
             p.comm == target_comm
         } else {
             false
@@ -1208,7 +1392,7 @@ fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
             let target = if let Some(p) = pid {
                 format!("PID {}", p)
             } else {
-                format!("comm '{}'", comm.unwrap_or("?"))
+                format!("comm '{}'", comm.as_deref().unwrap_or("?"))
             };
             Ok(vec![ToolContent {
                 content_type: "text".to_string(),
@@ -1227,7 +1411,7 @@ fn tool_plan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
     let config = crate::config::resolve_config_dir(&crate::mcp::config_options())
         .map_err(|error| format!("cannot resolve plan config directory: {error}"))?;
     let exe = std::env::current_exe().map_err(|e| format!("cannot locate pt-core: {e}"))?;
-    let spec = plan_worker_spec(&exe, &config, args, timeout)?;
+    let spec = agent_worker_spec(&exe, &config, args, timeout)?;
     let stdout = run_plan_worker(&spec)?;
     Ok(vec![ToolContent {
         content_type: "text".to_string(),
@@ -1235,9 +1419,9 @@ fn tool_plan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
     }])
 }
 
-/// Keep the planner's configured policy and storage location while preventing
+/// Keep the CLI worker's configured policy and storage location while preventing
 /// inherited output overrides or lock-bypass variables from changing its contract.
-fn plan_worker_spec(
+fn agent_worker_spec(
     executable: &Path,
     config: &Path,
     args: Vec<String>,
@@ -1245,10 +1429,10 @@ fn plan_worker_spec(
 ) -> Result<ToolSpec, String> {
     let executable = executable
         .to_str()
-        .ok_or("MCP planner executable path is not UTF-8")?;
+        .ok_or("MCP worker executable path is not UTF-8")?;
     let config = config
         .to_str()
-        .ok_or("MCP planner config path is not UTF-8")?;
+        .ok_or("MCP worker config path is not UTF-8")?;
     let mut command_args = vec![
         "--config".to_string(),
         config.to_string(),
@@ -1285,7 +1469,7 @@ fn plan_worker_spec(
             }
             Err(std::env::VarError::NotPresent) => {}
             Err(std::env::VarError::NotUnicode(_)) => {
-                return Err(format!("MCP planner environment {key} is not UTF-8"));
+                return Err(format!("MCP worker environment {key} is not UTF-8"));
             }
         }
     }
@@ -1293,22 +1477,90 @@ fn plan_worker_spec(
 }
 
 fn run_plan_worker(spec: &ToolSpec) -> Result<String, String> {
+    let output = run_agent_worker(spec, "agent plan")?;
+    parse_plan_worker_output(&output)
+}
+
+fn run_agent_worker(spec: &ToolSpec, operation: &str) -> Result<ToolOutput, String> {
     let timeout = spec
         .timeout
         .unwrap_or(Duration::from_secs(DEFAULT_PLAN_TIMEOUT_SECS));
     let runner = ToolRunner::new(ToolConfig {
         default_timeout: timeout,
-        // The generic collector's five-second budget is not a planning budget.
+        // A collector's five-second budget is not the caller's CLI deadline.
         budget_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
         use_nice: false,
         #[cfg(target_os = "linux")]
         use_ionice: false,
         ..ToolConfig::default()
     });
-    let output = runner
+    runner
         .run(spec)
-        .map_err(|error| format!("agent plan could not complete: {error}"))?;
-    parse_plan_worker_output(&output)
+        .map_err(|error| format!("{operation} could not complete: {error}"))
+}
+
+fn parse_explain_worker_output(
+    output: &ToolOutput,
+    session: &str,
+    pid: u32,
+    start_id: Option<&str>,
+) -> Result<String, String> {
+    if output.timed_out {
+        return Err("agent explain timed out; no complete explanation was returned".into());
+    }
+    if output.truncated {
+        return Err(
+            "agent explain output was truncated; no complete explanation was returned".into(),
+        );
+    }
+    let stdout = std::str::from_utf8(&output.stdout)
+        .map_err(|_| "agent explain returned invalid UTF-8".to_string())?;
+    if output.exit_code != Some(0) {
+        let document = serde_json::from_str::<serde_json::Value>(stdout).ok();
+        let detail = document
+            .as_ref()
+            .and_then(|value| value["explanations"][0]["error"].as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                output
+                    .stderr_str()
+                    .lines()
+                    .rev()
+                    .take(5)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            });
+        return Err(format!(
+            "agent explain failed (exit {:?}): {detail}",
+            output.exit_code
+        ));
+    }
+    let document: serde_json::Value = serde_json::from_str(stdout)
+        .map_err(|error| format!("agent explain returned invalid JSON: {error}"))?;
+    if document["command"] != "agent explain"
+        || document["mode"] != "recorded"
+        || document["session_id"] != session
+    {
+        return Err("agent explain returned an invalid recorded session identity".into());
+    }
+    let explanations = document["explanations"]
+        .as_array()
+        .filter(|explanations| explanations.len() == 1)
+        .ok_or("agent explain returned an incomplete explanation inventory")?;
+    let explanation = &explanations[0];
+    if explanation["pid"].as_u64() != Some(u64::from(pid)) {
+        return Err("agent explain returned a different process identity".into());
+    }
+    if let Some(error) = explanation["error"].as_str() {
+        return Err(format!("agent explain: {error}"));
+    }
+    if start_id.is_some_and(|expected| explanation["start_id"].as_str() != Some(expected)) {
+        return Err("agent explain returned a different process birth identity".into());
+    }
+    Ok(stdout.to_string())
 }
 
 fn parse_plan_worker_output(output: &ToolOutput) -> Result<String, String> {
@@ -1592,7 +1844,7 @@ mod tests {
         assert_eq!(schema["maximum"], MAX_PLAN_TIMEOUT_SECS);
         assert_eq!(schema["default"], DEFAULT_PLAN_TIMEOUT_SECS);
 
-        let spec = plan_worker_spec(
+        let spec = agent_worker_spec(
             Path::new("/tmp/pt core"),
             Path::new("/tmp/config with spaces"),
             plan_command_args(&serde_json::json!({"timeout_secs": 7})).unwrap(),
@@ -1667,6 +1919,137 @@ mod tests {
         assert!(parse_plan_worker_output(&output)
             .unwrap_err()
             .contains("truncated"));
+    }
+
+    #[test]
+    fn recorded_explanations_select_an_exact_session_and_optional_birth_identity() {
+        let session = pt_common::SessionId::new().0;
+        let params = serde_json::json!({
+            "session": session,
+            "pid": 42,
+            "start_id": "test-boot:123:42",
+            "include": ["evidence", "ledger", "bayes_factors"],
+            "timeout_secs": 7,
+        });
+        let ExplainRequest::Recorded {
+            session: actual_session,
+            pid,
+            start_id,
+            args,
+            timeout,
+        } = explain_request(&params).unwrap()
+        else {
+            panic!("session must select recorded explanation");
+        };
+        assert_eq!(actual_session, session);
+        assert_eq!(pid, 42);
+        assert_eq!(start_id.as_deref(), Some("test-boot:123:42"));
+        assert_eq!(timeout, Duration::from_secs(7));
+        assert_eq!(
+            args,
+            [
+                "agent",
+                "explain",
+                "--format=json",
+                &format!("--session={session}"),
+                "--target=42:test-boot:123:42",
+                "--include=evidence",
+                "--include=ledger",
+                "--include=bayes_factors",
+            ]
+        );
+        let ExplainRequest::Recorded { args, .. } =
+            explain_request(&serde_json::json!({"session": session, "pid": 42})).unwrap()
+        else {
+            panic!("session must not fall back to live observation");
+        };
+        assert!(args.contains(&"--pids=42".to_string()));
+        assert!(!args.iter().any(|arg| arg == "--live"));
+        assert!(matches!(
+            explain_request(&serde_json::json!({"pid": 42, "window_ms": 0})).unwrap(),
+            ExplainRequest::Live {
+                pid: Some(42),
+                comm: None,
+                window_ms: 0,
+            }
+        ));
+        assert!(matches!(
+            explain_request(&serde_json::json!({"comm": "sleep"})).unwrap(),
+            ExplainRequest::Live { pid: None, .. }
+        ));
+    }
+
+    #[test]
+    fn recorded_explanation_worker_rejects_unrelated_and_partial_outputs() {
+        let session = pt_common::SessionId::new().0;
+        let document = serde_json::json!({
+            "command": "agent explain",
+            "mode": "recorded",
+            "session_id": session,
+            "explanations": [{
+                "pid": 42,
+                "start_id": "test-boot:123:42",
+                "score": 0.8123456789,
+                "ledger_status": "not_recorded",
+            }],
+        });
+        let original = ToolOutput {
+            command: "pt-core".into(),
+            args: Vec::new(),
+            stdout: document.to_string().into_bytes(),
+            stderr: Vec::new(),
+            exit_code: Some(0),
+            truncated: false,
+            duration: Duration::ZERO,
+            timed_out: false,
+        };
+        let parse = |output: &ToolOutput| {
+            parse_explain_worker_output(output, &session, 42, Some("test-boot:123:42"))
+        };
+        assert_eq!(parse(&original).unwrap(), document.to_string());
+        for (path, value) in [
+            ("/command", serde_json::json!("agent plan")),
+            ("/mode", serde_json::json!("live")),
+            (
+                "/session_id",
+                serde_json::json!(pt_common::SessionId::new().0),
+            ),
+            ("/explanations", serde_json::json!([])),
+            ("/explanations", serde_json::json!([{}, {}])),
+            ("/explanations/0/pid", serde_json::json!(43)),
+            (
+                "/explanations/0/start_id",
+                serde_json::json!("test-boot:124:42"),
+            ),
+        ] {
+            let mut invalid = document.clone();
+            *invalid.pointer_mut(path).unwrap() = value;
+            let mut output = original.clone();
+            output.stdout = invalid.to_string().into_bytes();
+            assert!(parse(&output).is_err(), "accepted {path}");
+        }
+        for bytes in [b"{}".to_vec(), b"{\"command\":".to_vec(), vec![0xff]] {
+            let mut output = original.clone();
+            output.stdout = bytes;
+            assert!(parse(&output).is_err());
+        }
+        for status in [None, Some(1), Some(20)] {
+            let mut output = original.clone();
+            output.exit_code = status;
+            assert!(parse(&output).is_err());
+        }
+        let mut output = original.clone();
+        output.timed_out = true;
+        assert!(parse(&output).unwrap_err().contains("timed out"));
+        output = original.clone();
+        output.truncated = true;
+        assert!(parse(&output).unwrap_err().contains("truncated"));
+        let mut missing = document;
+        missing["explanations"][0]["error"] =
+            serde_json::json!("process not found in recorded session inference");
+        output = original;
+        output.stdout = missing.to_string().into_bytes();
+        assert!(parse(&output).unwrap_err().contains("process not found"));
     }
 
     #[cfg(unix)]
