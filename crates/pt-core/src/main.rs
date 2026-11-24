@@ -2935,13 +2935,26 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
                         .then(|| evidence["adaptive_term_grace_learning"]["error"].as_str())
                         .flatten()
                     });
-                    Ok(ExecutionOutcome {
-                        mode: learning_warning.map(|error| {
-                            format!(
-                            "{} succeeded, {} failed; cleanup timing learning unavailable: {error}",
+                    let undo_preview = execution_evidence
+                        .values()
+                        .find_map(|evidence| evidence["undo_preview"].as_str());
+                    let mode = (learning_warning.is_some() || undo_preview.is_some()).then(|| {
+                        let mut message = format!(
+                            "{} succeeded, {} failed",
                             result.summary.actions_succeeded, result.summary.actions_failed,
-                        )
-                        }),
+                        );
+                        if let Some(preview) = undo_preview {
+                            message.push_str(&format!("; undo preview: {preview}"));
+                        }
+                        if let Some(error) = learning_warning {
+                            message.push_str(&format!(
+                                "; cleanup timing learning unavailable: {error}"
+                            ));
+                        }
+                        message
+                    });
+                    Ok(ExecutionOutcome {
+                        mode,
                         attempted: result.summary.actions_attempted,
                         succeeded: result.summary.actions_succeeded,
                         failed: result.summary.actions_failed,
@@ -3269,7 +3282,7 @@ fn score_tui_rows(
     let probe_advice = if probe_budget.is_zero() {
         HashMap::new()
     } else {
-        compute_probe_advice(&eligible, &scorer, policy, &pressure, false)
+        compute_probe_advice(&eligible, &scorer, policy, &pressure, true)
     };
     let targeted = select_deep_probe_targets(&eligible, &probe_advice, deep);
     let selected: HashSet<_> = targeted.iter().map(|process| process.pid.0).collect();
@@ -4933,6 +4946,120 @@ struct TuiExecutionState {
     failure: Option<String>,
 }
 
+/// Each interactive control batch keeps its own immutable plan. The parent
+/// session remains the cumulative review/history surface and can accept later
+/// selections without invalidating earlier restoration receipts.
+#[cfg(feature = "ui")]
+struct TuiControlSession {
+    handle: SessionHandle,
+    plan: Plan,
+    plan_sha256: String,
+}
+
+#[cfg(feature = "ui")]
+fn prepare_tui_control_session(
+    parent: &SessionHandle,
+    policy: &pt_core::config::Policy,
+    selection: &Plan,
+) -> Result<Option<TuiControlSession>, String> {
+    // Durable control writers currently exist only on Linux. Pure termination
+    // batches do not need a second session because they have no state to undo.
+    if !cfg!(target_os = "linux")
+        || !selection.actions.iter().any(|action| {
+            !action.blocked
+                && matches!(
+                    action.action,
+                    Action::Pause
+                        | Action::Renice
+                        | Action::Freeze
+                        | Action::Unfreeze
+                        | Action::Throttle
+                        | Action::CapMemory
+                        | Action::Quarantine
+                )
+        })
+    {
+        return Ok(None);
+    }
+    if selection.session_id != parent.id.0 {
+        return Err("interactive control selection belongs to a different session".into());
+    }
+    let data_dir = parent
+        .dir
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("cannot resolve interactive control storage")?;
+    let store = SessionStore::at_data_dir(data_dir);
+    let session_id = SessionId::new();
+    let label = Some(format!("Interactive controls from {}", parent.id.0));
+    let handle = store
+        .create(&SessionManifest::new(
+            &session_id,
+            Some(&parent.id),
+            SessionMode::Interactive,
+            label.clone(),
+        ))
+        .map_err(|error| format!("create immutable interactive control session: {error}"))?;
+    let save = || -> Result<TuiControlSession, String> {
+        let context = SessionContext::new(
+            &session_id,
+            pt_core::logging::get_host_id(),
+            pt_core::logging::generate_run_id(),
+            label,
+        );
+        handle
+            .write_context(&context)
+            .map_err(|error| format!("persist interactive control context: {error}"))?;
+        let mut plan = selection.clone();
+        plan.session_id = session_id.0.clone();
+        let identity = format!("{}:{}", session_id.0, selection.plan_id);
+        plan.plan_id = format!("plan-{:x}", Sha256::digest(identity.as_bytes()));
+        let mut document = serde_json::to_value(&plan)
+            .map_err(|error| format!("serialize interactive control plan: {error}"))?;
+        document["host_id"] = serde_json::json!(context.host_id);
+        document["parent_session_id"] = serde_json::json!(parent.id.0);
+        document["policy_snapshot"] = serde_json::json!(policy);
+        let content = serde_json::to_vec_pretty(&document)
+            .map_err(|error| format!("encode interactive control plan: {error}"))?;
+        let plan_sha256 = format!("{:x}", Sha256::digest(&content));
+        pt_core::session::write_serialized_json(&handle.dir.join("decision/plan.json"), &content)
+            .map_err(|error| format!("persist immutable interactive control plan: {error}"))?;
+        handle
+            .update_state(SessionState::Planned)
+            .map_err(|error| format!("persist interactive control planned state: {error}"))?;
+        // Publish the link before any controller can be changed. Even a crash
+        // before outcomes are saved leaves the original review and undo session
+        // connected; the child's manifest also records the parent relationship.
+        let reference = serde_json::json!({
+            "session_id": session_id.0,
+            "parent_session_id": parent.id.0,
+            "plan_sha256": plan_sha256,
+            "action_ids": plan.actions.iter().map(|action| &action.action_id).collect::<Vec<_>>(),
+            "undo_preview": format!("pt agent undo --session {} --all", session_id.0),
+        });
+        pt_core::session::write_json_pretty(
+            &parent
+                .dir
+                .join("action/control_sessions")
+                .join(format!("{}.json", session_id.0)),
+            &reference,
+        )
+        .map_err(|error| format!("persist interactive control session reference: {error}"))?;
+        Ok(TuiControlSession {
+            handle: handle.clone(),
+            plan,
+            plan_sha256,
+        })
+    };
+    save().map(Some).map_err(|error| {
+        let failure = handle.update_state(SessionState::Failed).err();
+        format!(
+            "{error}; control session {} retained; failure state error: {failure:?}",
+            session_id.0,
+        )
+    })
+}
+
 #[cfg(feature = "ui")]
 fn record_tui_execution_failure(
     handle: &SessionHandle,
@@ -4978,11 +5105,19 @@ fn execute_tui_plan_selection(
     // Keep execution serialized until its evidence and final state have been
     // persisted, including failures after a real action has already returned.
     let mut execution_lock = None;
+    let mut control_session = None;
     let execution = (|| {
         // Persist every earlier binding, but execute only this new selection.
         write_plan_to_session(handle, selection)?;
-        let ((result, mut evidence), lock) =
-            execute_plan_actions(handle, policy, selection, confirmed_agent_children, state)?;
+        control_session = prepare_tui_control_session(handle, policy, selection)?;
+        let ((result, mut evidence), lock) = execute_plan_actions(
+            handle,
+            policy,
+            selection,
+            confirmed_agent_children,
+            state,
+            control_session.as_ref(),
+        )?;
         execution_lock = Some(lock);
         #[cfg(unix)]
         for outcome in &result.outcomes {
@@ -4993,17 +5128,47 @@ fn execute_tui_plan_selection(
                     .find(|action| action.action_id == outcome.action_id),
                 evidence.get_mut(&outcome.action_id),
             ) {
+                let execution_session_id = control_session
+                    .as_ref()
+                    .map_or(selection.session_id.as_str(), |control| {
+                        control.handle.id.0.as_str()
+                    });
                 record_verified_term_grace(
                     state.term_grace_config_dir.as_deref(),
                     policy,
-                    &selection.session_id,
+                    execution_session_id,
                     action,
                     outcome,
                     captured,
                 );
             }
         }
-        let executions = write_outcomes_from_execution(handle, selection, &result, &evidence)?;
+        if let Some(control) = &control_session {
+            for captured in evidence.values_mut() {
+                captured["control_session_id"] = serde_json::json!(control.handle.id.0);
+                captured["control_plan_sha256"] = serde_json::json!(control.plan_sha256);
+                captured["undo_preview"] = serde_json::json!(format!(
+                    "pt agent undo --session {} --all",
+                    control.handle.id.0,
+                ));
+            }
+            write_outcomes_from_execution(
+                &control.handle,
+                &control.plan,
+                &result,
+                &evidence,
+                Some(control.handle.id.0.as_str()),
+            )?;
+        }
+        let executions = write_outcomes_from_execution(
+            handle,
+            selection,
+            &result,
+            &evidence,
+            control_session
+                .as_ref()
+                .map(|control| control.handle.id.0.as_str()),
+        )?;
         if executions
             .iter()
             .any(|execution| execution.action == Some(Action::Kill))
@@ -5030,8 +5195,12 @@ fn execute_tui_plan_selection(
                 )
             })?;
         }
-        if result.summary.actions_failed > 0 || result.outcomes.iter().any(|o| o.details.is_some())
-        {
+        let selection_failed = result.summary.actions_failed > 0
+            || result
+                .outcomes
+                .iter()
+                .any(|outcome| outcome.details.is_some());
+        if selection_failed {
             let error = result
                 .outcomes
                 .iter()
@@ -5044,6 +5213,16 @@ fn execute_tui_plan_selection(
                 });
             state.failure.get_or_insert(error);
         }
+        if let Some(control) = &control_session {
+            control
+                .handle
+                .update_state(if selection_failed {
+                    SessionState::Failed
+                } else {
+                    SessionState::Completed
+                })
+                .map_err(|error| format!("persist interactive control result state: {error}"))?;
+        }
         let final_state = if state.failure.is_some() {
             SessionState::Failed
         } else {
@@ -5054,7 +5233,18 @@ fn execute_tui_plan_selection(
             .map_err(|error| format!("persist interactive action result state: {error}"))?;
         Ok((result, evidence))
     })();
-    let execution = execution.map_err(|error| record_tui_execution_failure(handle, state, error));
+    let execution = execution.map_err(|error| {
+        let error = if let Some(control) = &control_session {
+            let failure = control.handle.update_state(SessionState::Failed).err();
+            format!(
+                "{error}; inspect controls with pt agent undo --session {} --all; control failure state error: {failure:?}",
+                control.handle.id.0,
+            )
+        } else {
+            error
+        };
+        record_tui_execution_failure(handle, state, error)
+    });
     drop(execution_lock);
     execution
 }
@@ -5066,6 +5256,7 @@ fn execute_plan_actions(
     plan: &Plan,
     confirmed_agent_children: &[pt_core::action::prechecks::ConfirmedAgentChildAction],
     state: &mut TuiExecutionState,
+    control_session: Option<&TuiControlSession>,
 ) -> Result<(RecordedExecution, GlobalLock), String> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
@@ -5073,9 +5264,6 @@ fn execute_plan_actions(
             ActionExecutor, CompositeActionRunner, LiveIdentityProvider, LivePreCheckConfig,
             LivePreCheckProvider,
         };
-        let action_dir = handle.dir.join("action");
-        std::fs::create_dir_all(&action_dir).map_err(|e| format!("create action dir: {}", e))?;
-        let lock_path = action_dir.join("lock");
         let identity_provider = LiveIdentityProvider::new();
         let (execution_lock, new_enforcer) = acquire_execution_policy(policy, None, handle)?;
         // The selection was saved before this lock was acquired. A concurrent
@@ -5131,9 +5319,66 @@ fn execute_plan_actions(
                 reasons.join("; "),
             ));
         }
+        let journal = control_session
+            .map(|control| {
+                let content = fs::read(control.handle.dir.join("decision/plan.json"))
+                    .map_err(|error| format!("read immutable interactive control plan: {error}"))?;
+                if format!("{:x}", Sha256::digest(&content)) != control.plan_sha256 {
+                    return Err(
+                        "immutable interactive control plan changed before execution".into(),
+                    );
+                }
+                let manifest = control.handle.read_manifest().map_err(|error| {
+                    format!("read interactive control session binding: {error}")
+                })?;
+                if control.plan.session_id != control.handle.id.0
+                    || manifest.session_id != control.handle.id.0
+                    || manifest.parent_session_id.as_deref() != Some(handle.id.0.as_str())
+                {
+                    return Err(
+                        "interactive control session no longer belongs to this review".into(),
+                    );
+                }
+                let mut expected = plan.clone();
+                expected.session_id = control.plan.session_id.clone();
+                expected.plan_id = control.plan.plan_id.clone();
+                if serde_json::to_value(&expected).map_err(|error| error.to_string())?
+                    != serde_json::to_value(&control.plan).map_err(|error| error.to_string())?
+                {
+                    return Err(
+                        "immutable control batch no longer matches the reviewed selection".into(),
+                    );
+                }
+                let sessions_root = control
+                    .handle
+                    .dir
+                    .parent()
+                    .ok_or("cannot resolve control session root")?;
+                pt_core::action::ReversalJournal::new(
+                    control.handle.dir.join("action"),
+                    control.handle.id.0.as_str(),
+                    control.plan_sha256.as_str(),
+                    sessions_root,
+                )
+                .map(Arc::new)
+                .map_err(|error| format!("bind interactive restoration journal: {error}"))
+            })
+            .transpose()?;
         handle
             .update_state(SessionState::Executing)
             .map_err(|error| format!("persist interactive execution state: {error}"))?;
+        let (handle, plan) = if let Some(control) = control_session {
+            control
+                .handle
+                .update_state(SessionState::Executing)
+                .map_err(|error| format!("persist interactive control execution state: {error}"))?;
+            (&control.handle, &control.plan)
+        } else {
+            (handle, plan)
+        };
+        let action_dir = handle.dir.join("action");
+        std::fs::create_dir_all(&action_dir).map_err(|e| format!("create action dir: {}", e))?;
+        let lock_path = action_dir.join("lock");
         let sessions_root = handle
             .dir
             .parent()
@@ -5151,10 +5396,13 @@ fn execute_plan_actions(
                 .map_err(|error| format!("persist expired-freeze recovery evidence: {error}"))?;
         }
         let runner = RecordedActionRunner {
-            // TUI selections append to their canonical plan. Guard existing
-            // durable owners without binding undo receipts to mutable bytes.
-            runner: CompositeActionRunner::with_defaults()
-                .with_reversal_ownership_guard(sessions_root),
+            runner: match journal {
+                Some(journal) => {
+                    CompositeActionRunner::with_defaults().with_reversal_journal(journal)
+                }
+                None => CompositeActionRunner::with_defaults()
+                    .with_reversal_ownership_guard(sessions_root),
+            },
             evidence: std::cell::RefCell::new(None),
         };
         let enforcer = state.enforcer.get_or_insert(new_enforcer);
@@ -5446,6 +5694,7 @@ fn execute_plan_actions(
         let _ = plan;
         let _ = confirmed_agent_children;
         let _ = state;
+        let _ = control_session;
         Err("execution not supported on this platform".to_string())
     }
 }
@@ -5502,6 +5751,7 @@ fn write_outcomes_from_execution(
     plan: &Plan,
     result: &pt_core::action::ExecutionResult,
     execution_evidence: &HashMap<String, serde_json::Value>,
+    control_session_id: Option<&str>,
 ) -> Result<Vec<pt_core::verify::SavedActionOutcome>, String> {
     use pt_core::action::ActionStatus;
 
@@ -5544,6 +5794,12 @@ fn write_outcomes_from_execution(
                     serde_json::Value::String(reason.clone()),
                 );
             }
+        }
+        // Both journals retain the actual result, including precheck refusals
+        // and skipped actions. Global history counts the canonical child once;
+        // a parent-scoped review still shows its complete interactive timeline.
+        if let Some(control_session_id) = control_session_id {
+            entry["control_session_id"] = serde_json::json!(control_session_id);
         }
         outcomes.push(entry);
     }
@@ -5853,8 +6109,8 @@ fn probe_action_feasibility(
     allow_memory_cap: bool,
 ) -> ActionFeasibility {
     if !allow_memory_cap {
-        // Interactive batches cannot persist the immutable plan binding needed
-        // for a durable memory-cap receipt. Saved agent plans can.
+        // Callers without an immutable plan and durable restoration journal
+        // cannot safely offer a memory cap.
         feasibility
             .disabled
             .push(pt_core::decision::DisabledAction {
@@ -7443,15 +7699,9 @@ fn build_tui_rows(
         let posterior_result = &score.posterior;
         let cpu_percent = process_cpu_percent(proc, score.activity.as_ref());
         let cpu_host_percent = pressure.cpu_goal_percent(proc, score.activity.as_ref());
-        let (mut feasibility, memory_cap) = candidate_action_capabilities(proc, &score);
-        // Interactive batches append to the saved plan. They do not yet retain
-        // the immutable plan binding required for a durable memory-cap receipt.
-        feasibility
-            .disabled
-            .push(pt_core::decision::DisabledAction {
-                action: Action::CapMemory,
-                reason: "memory caps require the saved agent plan/apply/undo workflow".to_string(),
-            });
+        // Reversible selections execute in immutable child sessions, so memory
+        // caps use the same durable restoration contract as saved agent plans.
+        let (feasibility, memory_cap) = candidate_action_capabilities(proc, &score);
         let inputs = match prepare_pressure_decision(
             &posterior_result.posterior,
             &decision_policy,
@@ -23769,7 +24019,7 @@ mod process_tree_safety_tests {
         .into_iter()
         .collect();
         let returned =
-            super::write_outcomes_from_execution(&handle, &plan, &result, &evidence).unwrap();
+            super::write_outcomes_from_execution(&handle, &plan, &result, &evidence, None).unwrap();
         assert_eq!(returned.len(), 1);
         assert_eq!(returned[0].action_id, execution.action_id);
         assert!(returned[0]
@@ -23794,8 +24044,9 @@ mod process_tree_safety_tests {
         let mut forged_evidence = evidence;
         forged_evidence.get_mut(&execution.action_id).unwrap()["target"]["uid"] =
             serde_json::json!(1001);
-        let error = super::write_outcomes_from_execution(&handle, &plan, &result, &forged_evidence)
-            .unwrap_err();
+        let error =
+            super::write_outcomes_from_execution(&handle, &plan, &result, &forged_evidence, None)
+                .unwrap_err();
         assert!(error.contains("cannot bind saved interactive execution evidence"));
         assert_eq!(result.outcomes[0].status, ActionStatus::Success);
         let saved = pt_core::verify::parse_action_outcomes(
@@ -25654,6 +25905,69 @@ mod process_tree_safety_tests {
             plan
         }
 
+        pub(super) fn pause_selection(
+            handle: &pt_core::session::SessionHandle,
+            policy: &pt_core::config::Policy,
+            target: &DetachedTarget,
+        ) -> pt_core::plan::Plan {
+            use pt_core::decision::{decide_action, Action, ActionFeasibility, DisabledAction};
+            use pt_core::inference::ClassScores;
+            use pt_core::plan::{generate_plan, DecisionBundle, DecisionCandidate};
+
+            let observed = selection(handle, policy, target);
+            // Exercise the actual pause planner/runner with a controlled remedy
+            // choice. Identity, infrastructure and data-loss gates remain live.
+            let feasibility = ActionFeasibility {
+                disabled: [
+                    Action::Keep,
+                    Action::Renice,
+                    Action::Freeze,
+                    Action::Throttle,
+                    Action::CapMemory,
+                    Action::Quarantine,
+                    Action::Restart,
+                    Action::Kill,
+                ]
+                .into_iter()
+                .map(|action| DisabledAction {
+                    action,
+                    reason: "fixture selects a reversible pause".into(),
+                })
+                .collect(),
+            };
+            let decision = decide_action(
+                &ClassScores {
+                    useful: 0.001,
+                    useful_bad: 0.0,
+                    abandoned: 0.999,
+                    zombie: 0.0,
+                },
+                policy,
+                &feasibility,
+            )
+            .unwrap();
+            let plan = generate_plan(&DecisionBundle {
+                session_id: handle.id.clone(),
+                policy: policy.clone(),
+                candidates: vec![DecisionCandidate {
+                    identity: observed.actions[0].target.clone(),
+                    ppid: Some(target.leader.id()),
+                    decision,
+                    blocked_reasons: Vec::new(),
+                    stage_pause_before_kill: false,
+                    process_state: Some(pt_core::collect::ProcessState::Sleeping),
+                    parent_identity: None,
+                    d_state_diagnostics: None,
+                    supervisor_restart: None,
+                    memory_cap: None,
+                }],
+                generated_at: None,
+            });
+            assert_eq!(plan.actions.len(), 1);
+            assert_eq!(plan.actions[0].action, Action::Pause);
+            plan
+        }
+
         pub(super) fn record(log_dir: &std::path::Path, evidence: serde_json::Value) {
             use std::io::Write;
 
@@ -25709,6 +26023,225 @@ mod process_tree_safety_tests {
         }
     }
 
+    #[cfg(all(feature = "ui", target_os = "linux"))]
+    #[test]
+    fn tui_control_batches_keep_durable_undo_after_later_selections() {
+        use pt_core::action::{RestorationStatus, ReversalJournal};
+        use pt_core::collect::{quick_scan, QuickScanOptions};
+        use pt_core::session::{SessionState, SessionStore};
+        use sha2::{Digest, Sha256};
+        use tui_live_fixtures::{case, pause_selection, policy, record, DetachedTarget};
+
+        let (parent, log_dir) = case("interactive-durable-controls");
+        let policy = policy(2);
+        let first = DetachedTarget::spawn();
+        let second = DetachedTarget::spawn();
+        let first_plan = pause_selection(&parent, &policy, &first);
+        let second_plan = pause_selection(&parent, &policy, &second);
+        let data_dir = parent.dir.parent().unwrap().parent().unwrap();
+        let store = SessionStore::at_data_dir(data_dir);
+        let mut state = super::TuiExecutionState::default();
+        let mut batches = Vec::new();
+        for plan in [&first_plan, &second_plan] {
+            let (result, evidence) =
+                super::execute_tui_plan_selection(&parent, &policy, plan, &[], &mut state)
+                    .expect("execute actual reversible selection");
+            record(
+                &log_dir,
+                serde_json::json!({"step": "pause", "result": result, "evidence": evidence}),
+            );
+            assert_eq!(result.summary.actions_succeeded, 1, "{result:?}");
+            let captured = &evidence[&plan.actions[0].action_id];
+            let id = pt_common::SessionId::parse(captured["control_session_id"].as_str().unwrap())
+                .unwrap();
+            let child = store.open(&id).unwrap();
+            assert_ne!(child.id, parent.id);
+            let manifest = child.read_manifest().unwrap();
+            assert_eq!(
+                manifest.parent_session_id.as_deref(),
+                Some(parent.id.0.as_str())
+            );
+            assert_eq!(manifest.state, SessionState::Completed);
+            let content = std::fs::read_to_string(child.dir.join("decision/plan.json")).unwrap();
+            assert_eq!(
+                captured["control_plan_sha256"],
+                format!("{:x}", Sha256::digest(content.as_bytes())),
+            );
+            let child_plan = pt_core::verify::parse_agent_plan(&content).unwrap();
+            assert_eq!(child_plan.session_id, child.id.0);
+            assert_eq!(
+                serde_json::to_value(&child_plan.actions).unwrap(),
+                serde_json::to_value(&plan.actions).unwrap(),
+            );
+            let journal = ReversalJournal::new(
+                child.dir.join("action"),
+                child.id.0.as_str(),
+                captured["control_plan_sha256"].as_str().unwrap(),
+                store.sessions_root(),
+            )
+            .unwrap();
+            let receipts = journal.inspect(&child_plan.actions[0]).unwrap();
+            assert_eq!(receipts.len(), 1);
+            assert!(receipts[0].restorations.is_empty());
+            assert!(parent
+                .dir
+                .join("action/control_sessions")
+                .join(format!("{}.json", child.id.0))
+                .is_file());
+            assert_eq!(
+                captured["undo_preview"],
+                format!("pt agent undo --session {} --all", child.id.0),
+            );
+            batches.push((child, content, child_plan));
+        }
+        assert_ne!(batches[0].0.id, batches[1].0.id);
+        assert_eq!(state.enforcer.as_ref().unwrap().current_run_kill_count(), 0);
+        let parent_plan = pt_core::verify::parse_agent_plan(
+            &std::fs::read_to_string(parent.dir.join("decision/plan.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(parent_plan.actions.len(), 2);
+        assert!(!super::session_has_control_receipts(&parent).unwrap());
+
+        let observe = || {
+            quick_scan(&QuickScanOptions {
+                pids: vec![first.pid, second.pid],
+                include_kernel_threads: false,
+                timeout: Some(std::time::Duration::from_secs(5)),
+                progress: None,
+            })
+            .unwrap()
+        };
+        let stopped = observe();
+        assert_eq!(stopped.processes.len(), 2);
+        assert!(stopped
+            .processes
+            .iter()
+            .all(|process| process.state == ProcessState::Stopped));
+        for (child, original_content, child_plan) in &batches {
+            assert_eq!(
+                std::fs::read_to_string(child.dir.join("decision/plan.json")).unwrap(),
+                *original_content,
+                "later selections must not change a previous undo binding",
+            );
+            assert!(super::update_canonical_session_plan(child, |_| Ok("{}".into())).is_err());
+            let _lock = super::GlobalLock::try_acquire(&data_dir.join(".execution-policy-lock"))
+                .unwrap()
+                .unwrap();
+            // Reopen from persisted bytes, as a later undo command does. No
+            // in-memory runner state from the original selection is retained.
+            let journal = ReversalJournal::new(
+                child.dir.join("action"),
+                child.id.0.as_str(),
+                format!("{:x}", Sha256::digest(original_content.as_bytes())),
+                store.sessions_root(),
+            )
+            .unwrap();
+            let restored = journal.restore(&child_plan.actions[0], None).unwrap();
+            record(
+                &log_dir,
+                serde_json::json!({"step": "undo", "session": child.id.0, "restoration": restored}),
+            );
+            assert_eq!(restored.status, RestorationStatus::Restored);
+            assert_eq!(restored.changed, Some(true));
+        }
+        let restored = observe();
+        assert_eq!(restored.processes.len(), 2);
+        assert!(restored
+            .processes
+            .iter()
+            .all(|process| process.state.is_active()));
+        let history = std::fs::read_to_string(parent.dir.join("action/outcomes.jsonl")).unwrap();
+        assert_eq!(history.lines().count(), 2);
+        assert!(history.lines().all(|line| {
+            serde_json::from_str::<serde_json::Value>(line).unwrap()["control_session_id"]
+                .as_str()
+                .is_some()
+        }));
+    }
+
+    #[cfg(all(feature = "ui", target_os = "linux"))]
+    #[test]
+    fn tui_control_handoff_refuses_changed_parent_child_and_selection_before_acting() {
+        use pt_core::decision::Action;
+        use pt_core::session::SessionState;
+
+        for case in [
+            "parent_action",
+            "child_bytes",
+            "child_parent",
+            "child_identity",
+            "selection",
+        ] {
+            let (_, parent, mut selection, _, _) =
+                tui_respawn_fixture(&format!("control-binding-{case}"));
+            let policy = pt_core::config::Policy::default();
+            selection.actions[0].action = Action::Pause;
+            selection.actions[0].action_id = format!("tui-control-{case}");
+            super::write_plan_to_session(&parent, &selection).unwrap();
+            let mut control = super::prepare_tui_control_session(&parent, &policy, &selection)
+                .unwrap()
+                .unwrap();
+            match case {
+                "parent_action" => {
+                    let mut changed = selection.clone();
+                    changed.actions[0].timeouts.verify_ms += 1;
+                    std::fs::write(
+                        parent.dir.join("decision/plan.json"),
+                        serde_json::to_vec_pretty(&changed).unwrap(),
+                    )
+                    .unwrap();
+                }
+                "child_bytes" => {
+                    let path = control.handle.dir.join("decision/plan.json");
+                    let content = std::fs::read_to_string(&path).unwrap();
+                    std::fs::write(path, format!("{content}\n")).unwrap();
+                }
+                "child_parent" => {
+                    let mut manifest = control.handle.read_manifest().unwrap();
+                    manifest.parent_session_id = None;
+                    control.handle.write_manifest(&manifest).unwrap();
+                }
+                "child_identity" => {
+                    let mut manifest = control.handle.read_manifest().unwrap();
+                    manifest.session_id = parent.id.0.clone();
+                    control.handle.write_manifest(&manifest).unwrap();
+                }
+                "selection" => control.plan.actions[0].target.uid += 1,
+                _ => unreachable!(),
+            }
+            let mut state = super::TuiExecutionState::default();
+            let error = super::execute_plan_actions(
+                &parent,
+                &policy,
+                &selection,
+                &[],
+                &mut state,
+                Some(&control),
+            )
+            .err()
+            .expect("changed canonical authority must refuse before acting");
+            let expected = match case {
+                "parent_action" => "changed in the canonical plan",
+                "child_bytes" => "plan changed before execution",
+                "child_parent" | "child_identity" => "no longer belongs to this review",
+                "selection" => "no longer matches the reviewed selection",
+                _ => unreachable!(),
+            };
+            assert!(error.contains(expected), "{case}: {error}");
+            assert!(!super::session_has_control_receipts(&control.handle).unwrap());
+            assert!(!control.handle.dir.join("action/outcomes.jsonl").exists());
+            assert_ne!(
+                parent.read_manifest().unwrap().state,
+                SessionState::Executing
+            );
+            assert_ne!(
+                control.handle.read_manifest().unwrap().state,
+                SessionState::Executing
+            );
+        }
+    }
+
     /// Exercise the handoff using blocked actions: no live mutation is requested.
     #[cfg(all(feature = "ui", any(target_os = "linux", target_os = "macos")))]
     #[test]
@@ -25756,6 +26289,7 @@ mod process_tree_safety_tests {
                 &selection,
                 &[],
                 &mut state,
+                None,
             );
             if case == "order" {
                 let ((result, evidence), lock) =
@@ -25765,7 +26299,7 @@ mod process_tree_safety_tests {
                 assert!(super::GlobalLock::try_acquire(&lock_path)
                     .unwrap()
                     .is_none());
-                super::write_outcomes_from_execution(&handle, &selection, &result, &evidence)
+                super::write_outcomes_from_execution(&handle, &selection, &result, &evidence, None)
                     .unwrap();
                 handle.update_state(SessionState::Completed).unwrap();
                 assert!(super::GlobalLock::try_acquire(&lock_path)
@@ -25917,9 +26451,9 @@ mod process_tree_safety_tests {
             .any(|record| record.pid.0 == missing.pid));
         let mut execution_state = super::TuiExecutionState::default();
         let ((result, execution_evidence), execution_lock) =
-            super::execute_plan_actions(&handle, &policy, &plan, &[], &mut execution_state)
+            super::execute_plan_actions(&handle, &policy, &plan, &[], &mut execution_state, None)
                 .expect("TUI helper retains results after missing policy evidence");
-        super::write_outcomes_from_execution(&handle, &plan, &result, &execution_evidence)
+        super::write_outcomes_from_execution(&handle, &plan, &result, &execution_evidence, None)
             .expect("save retained TUI outcomes");
         drop(execution_lock);
         writeln!(

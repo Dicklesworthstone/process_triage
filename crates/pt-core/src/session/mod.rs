@@ -498,6 +498,8 @@ impl SessionStore {
     /// session. This deliberately does not invent timestamps for blocked or
     /// skipped records, which may have no execution time. Only `limit` records
     /// are retained, but all selected journals are validated and counted.
+    /// Global queries omit a parent control mirror only after validating the same
+    /// ordered outcomes in its canonical child. Parent-scoped queries retain it.
     pub fn action_history(
         &self,
         session_id: Option<&SessionId>,
@@ -534,6 +536,7 @@ impl SessionStore {
         // Unlike list_sessions, discovery here never loads a plan or reads each
         // complete journal merely to count it before reading it a second time.
         let mut ordered = Vec::with_capacity(sessions.len());
+        let mut control_mirrors = session_id.is_none().then(ControlHistoryMirrors::default);
         for id in sessions {
             let dir = self.session_dir(&id);
             for path in [&self.sessions_root, &dir] {
@@ -578,6 +581,11 @@ impl SessionStore {
                 DateTime::parse_from_rfc3339(&manifest.timing.created_at).map_err(|error| {
                     history_data_error(&path, &format!("invalid creation time: {error}"))
                 })?;
+            if let Some(mirrors) = &mut control_mirrors {
+                mirrors
+                    .parents
+                    .insert(id.0.clone(), manifest.parent_session_id);
+            }
             ordered.push((created_at, id));
         }
         ordered.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1 .0.cmp(&b.1 .0)));
@@ -627,6 +635,7 @@ impl SessionStore {
                     limit.saturating_sub(history.actions.len())
                 },
                 ACTION_HISTORY_BYTE_LIMIT.saturating_sub(retained_bytes),
+                control_mirrors.as_mut(),
             )?;
             // Once a newer session's records were omitted by either bound,
             // including records from older sessions would break the ordering.
@@ -635,6 +644,9 @@ impl SessionStore {
             history.actions.extend(entries);
             history.total_count += count;
             history.sessions_examined += 1;
+        }
+        if let Some(mirrors) = control_mirrors {
+            mirrors.validate(&self.sessions_root)?;
         }
         history.truncated = history.total_count > history.actions.len() as u64;
         Ok(history)
@@ -1659,12 +1671,108 @@ fn open_history_file(path: &Path) -> Result<std::fs::File, SessionError> {
     Ok(file)
 }
 
+/// A fixed-size proof per discovered session, never a cache of journal rows.
+/// Both streams are collected in the existing single pass and checked before a
+/// global result is returned, regardless of journal order or output limits.
+#[derive(Default)]
+struct ControlHistoryMirrors {
+    parents: std::collections::HashMap<String, Option<String>>,
+    streams: std::collections::HashMap<String, ControlHistoryStreams>,
+}
+
+#[derive(Default)]
+struct ControlHistoryStreams {
+    canonical: ControlHistoryDigest,
+    mirrored: ControlHistoryDigest,
+}
+
+#[derive(Default)]
+struct ControlHistoryDigest {
+    count: u64,
+    digest: sha2::Sha256,
+}
+
+impl ControlHistoryMirrors {
+    /// Return true only for a parent row whose omission must be proven by
+    /// matching the complete ordered canonical stream at the end of the query.
+    fn record(
+        &mut self,
+        path: &Path,
+        session_id: &SessionId,
+        line_number: u64,
+        outcome: &serde_json::Value,
+    ) -> Result<bool, SessionError> {
+        use sha2::Digest;
+
+        let Some(owner) = outcome
+            .get("control_session_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|owner| SessionId::parse(owner).is_some())
+        else {
+            // An invalid reference cannot hide an otherwise readable attempt.
+            return Ok(false);
+        };
+        let mirrored = owner != session_id.0.as_str();
+        if mirrored
+            && self.parents.get(owner).and_then(Option::as_deref)
+                != Some(session_id.0.as_str())
+        {
+            return Err(history_data_error(
+                path,
+                &format!(
+                    "journal line {line_number} references missing or unrelated canonical control session {owner}"
+                ),
+            ));
+        }
+        // Only self-tagged child rows belong to the canonical control stream.
+        // Later ordinary apply outcomes remain independent visible history.
+        let streams = self.streams.entry(owner.to_string()).or_default();
+        let stream = if mirrored {
+            &mut streams.mirrored
+        } else {
+            &mut streams.canonical
+        };
+        let encoded = serde_json::to_vec(outcome).map_err(|source| SessionError::Json {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        // Length framing preserves full row boundaries as well as row order.
+        stream.digest.update((encoded.len() as u64).to_le_bytes());
+        stream.digest.update(&encoded);
+        stream.count += 1;
+        Ok(mirrored)
+    }
+
+    fn validate(self, sessions_root: &Path) -> Result<(), SessionError> {
+        use sha2::Digest;
+
+        for (owner, streams) in self.streams {
+            // A crash can leave only the child journal. With no parent mirrors
+            // omitted there is no deduplication claim that needs proving.
+            if streams.mirrored.count == 0 {
+                continue;
+            }
+            if streams.canonical.count == 0
+                || streams.canonical.count != streams.mirrored.count
+                || streams.canonical.digest.finalize() != streams.mirrored.digest.finalize()
+            {
+                return Err(history_data_error(
+                    &sessions_root.join(owner).join("action/outcomes.jsonl"),
+                    "canonical control outcomes do not match the complete ordered parent mirror stream",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 fn read_action_history_journal(
     file: std::fs::File,
     path: &Path,
     session_id: &SessionId,
     limit: usize,
     byte_limit: usize,
+    mut control_mirrors: Option<&mut ControlHistoryMirrors>,
 ) -> Result<(Vec<ActionHistoryEntry>, u64, usize), SessionError> {
     use std::io::{BufRead, Read};
     let length = file
@@ -1711,6 +1819,14 @@ fn read_action_history_journal(
         serde_json::from_value::<crate::verify::SavedActionOutcome>(outcome.clone()).map_err(
             |error| history_data_error(path, &format!("journal line {line_number}: {error}")),
         )?;
+        // Validate every row before filtering, including skipped and refused
+        // attempts. Mirrors consume neither row nor byte capacity; the complete
+        // child proof is checked even when no result rows can be retained.
+        if let Some(mirrors) = control_mirrors.as_deref_mut() {
+            if mirrors.record(path, session_id, line_number, &outcome)? {
+                continue;
+            }
+        }
         count += 1;
         if limit > 0 {
             latest.push_back((
@@ -2741,6 +2857,7 @@ mod tests {
             &id,
             10_000,
             first.len() * 2,
+            None,
         )
         .unwrap();
         assert_eq!(count, 3);
@@ -2748,6 +2865,322 @@ mod tests {
         assert_eq!(bytes, first.len() * 2);
         assert_eq!(entries[0].outcome["pid"], 3);
         assert_eq!(entries[1].outcome["pid"], 2);
+    }
+
+    #[test]
+    fn action_history_counts_controls_once_and_preserves_parent_timeline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = make_store(tmp.path());
+        let parent_id = SessionId::new();
+        let child_id = SessionId::new();
+        let mut parent_manifest =
+            SessionManifest::new(&parent_id, None, SessionMode::Interactive, None);
+        parent_manifest.timing.created_at =
+            (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        let parent = store.create(&parent_manifest).unwrap();
+        let child = store
+            .create(&SessionManifest::new(
+                &child_id,
+                Some(&parent_id),
+                SessionMode::Interactive,
+                None,
+            ))
+            .unwrap();
+        let controls = [
+            serde_json::json!({
+                "action_id": "pause",
+                "pid": 42,
+                "status": "success",
+                "control_session_id": child_id.0,
+            }),
+            serde_json::json!({
+                "action_id": "refused",
+                "pid": 43,
+                "status": "precheck_blocked",
+                "control_session_id": child_id.0,
+            }),
+        ];
+        let control_journal = controls
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let parent_journal = format!(
+            "{{\"action_id\":\"ordinary\",\"pid\":1,\"status\":\"failed\"}}\n{control_journal}"
+        );
+        let parent_path = parent.dir.join("action/outcomes.jsonl");
+        let child_path = child.dir.join("action/outcomes.jsonl");
+        std::fs::write(&parent_path, &parent_journal).unwrap();
+        std::fs::write(&child_path, &control_journal).unwrap();
+
+        let global = store.action_history(None, 10).unwrap();
+        assert_eq!(global.total_count, 3);
+        assert_eq!(global.actions.len(), 3);
+        assert_eq!(global.sessions_examined, 2);
+        assert!(!global.truncated);
+        assert_eq!(global.actions[0].session_id, child_id.0);
+        assert_eq!(global.actions[0].outcome["action_id"], "refused");
+        assert_eq!(global.actions[1].session_id, child_id.0);
+        assert_eq!(global.actions[1].outcome["action_id"], "pause");
+        assert_eq!(global.actions[2].session_id, parent_id.0);
+        assert_eq!(global.actions[2].outcome["action_id"], "ordinary");
+        for limit in [0, 1, 2] {
+            let limited = store.action_history(None, limit).unwrap();
+            assert_eq!(limited.total_count, 3);
+            assert_eq!(limited.actions.len(), limit);
+            assert!(limited.truncated);
+            assert!(limited
+                .actions
+                .iter()
+                .all(|entry| entry.session_id == child_id.0));
+        }
+
+        let timeline = store.action_history(Some(&parent_id), 10).unwrap();
+        assert_eq!(timeline.total_count, 3);
+        assert_eq!(timeline.actions.len(), 3);
+        assert_eq!(timeline.actions[0].journal_line, 3);
+        assert_eq!(timeline.actions[1].journal_line, 2);
+        assert_eq!(timeline.actions[2].journal_line, 1);
+        assert!(timeline
+            .actions
+            .iter()
+            .all(|entry| entry.session_id == parent_id.0));
+        let canonical = store.action_history(Some(&child_id), 10).unwrap();
+        assert_eq!(canonical.total_count, 2);
+        assert_eq!(canonical.actions.len(), 2);
+        assert_eq!(std::fs::read_to_string(parent_path).unwrap(), parent_journal);
+        assert_eq!(std::fs::read_to_string(child_path).unwrap(), control_journal);
+    }
+
+    #[test]
+    fn action_history_control_mirrors_require_complete_canonical_authority() {
+        for failure in [
+            "missing_child",
+            "unrelated_child",
+            "missing_journal",
+            "empty_journal",
+            "whitespace_journal",
+            "untagged_rows",
+            "changed_audit_fields",
+            "partial_journal",
+            "reordered_rows",
+            "malformed_outcome",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = make_store(tmp.path());
+            let parent_id = SessionId::new();
+            let child_id = SessionId::new();
+            let parent = store
+                .create(&SessionManifest::new(
+                    &parent_id,
+                    None,
+                    SessionMode::Interactive,
+                    None,
+                ))
+                .unwrap();
+            let controls = [
+                serde_json::json!({
+                    "action_id": "pause",
+                    "pid": 42,
+                    "status": "success",
+                    "control_session_id": child_id.0,
+                }),
+                serde_json::json!({
+                    "action_id": "refused",
+                    "pid": 43,
+                    "status": "precheck_blocked",
+                    "reason": "protected process",
+                    "control_session_id": child_id.0,
+                }),
+            ];
+            let journal = |rows: &[serde_json::Value]| {
+                rows.iter()
+                    .map(serde_json::Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    + "\n"
+            };
+            let parent_path = parent.dir.join("action/outcomes.jsonl");
+            let parent_journal = journal(&controls);
+            std::fs::write(&parent_path, &parent_journal).unwrap();
+
+            if failure != "missing_child" {
+                let child = store
+                    .create(&SessionManifest::new(
+                        &child_id,
+                        if failure == "unrelated_child" {
+                            None
+                        } else {
+                            Some(&parent_id)
+                        },
+                        SessionMode::Interactive,
+                        None,
+                    ))
+                    .unwrap();
+                let mut child_rows = controls.to_vec();
+                match failure {
+                    "untagged_rows" => {
+                        for row in &mut child_rows {
+                            row.as_object_mut().unwrap().remove("control_session_id");
+                        }
+                    }
+                    "changed_audit_fields" => {
+                        child_rows[1]["reason"] = serde_json::json!("different refusal");
+                    }
+                    "partial_journal" => child_rows.truncate(1),
+                    "reordered_rows" => child_rows.reverse(),
+                    "malformed_outcome" => {
+                        child_rows[0]["pid"] = serde_json::json!("not-a-pid");
+                    }
+                    _ => {}
+                }
+                let content = match failure {
+                    "empty_journal" => String::new(),
+                    "whitespace_journal" => " \n\t\n".to_string(),
+                    _ => journal(&child_rows),
+                };
+                if failure != "missing_journal" {
+                    std::fs::write(child.dir.join("action/outcomes.jsonl"), content).unwrap();
+                }
+            }
+
+            // A zero output limit must not disable authority validation.
+            for limit in [0, 1, 10] {
+                let error = store.action_history(None, limit).unwrap_err().to_string();
+                let expected = if failure == "malformed_outcome" {
+                    "journal line"
+                } else {
+                    "control"
+                };
+                assert!(error.contains(expected), "{failure}, limit {limit}: {error}");
+            }
+            let parent_history = store.action_history(Some(&parent_id), 10).unwrap();
+            assert_eq!(parent_history.total_count, 2, "{failure}");
+            assert_eq!(parent_history.actions.len(), 2, "{failure}");
+            assert_eq!(std::fs::read_to_string(parent_path).unwrap(), parent_journal);
+        }
+    }
+
+    #[test]
+    fn action_history_child_only_and_later_ordinary_outcomes_remain_visible() {
+        for mirror_parent in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = make_store(tmp.path());
+            let parent_id = SessionId::new();
+            let child_id = SessionId::new();
+            let parent = store
+                .create(&SessionManifest::new(
+                    &parent_id,
+                    None,
+                    SessionMode::Interactive,
+                    None,
+                ))
+                .unwrap();
+            let mut child_manifest = SessionManifest::new(
+                &child_id,
+                Some(&parent_id),
+                SessionMode::Interactive,
+                None,
+            );
+            // Proof must work even if wall-clock ordering places the parent first.
+            child_manifest.timing.created_at =
+                (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+            let child = store.create(&child_manifest).unwrap();
+            let control_journal = format!(
+                "{}\n{}\n",
+                serde_json::json!({
+                    "action_id": "pause",
+                    "pid": 42,
+                    "status": "success",
+                    "control_session_id": child_id.0,
+                }),
+                serde_json::json!({
+                    "action_id": "refused",
+                    "pid": 43,
+                    "status": "precheck_blocked",
+                    "control_session_id": child_id.0,
+                }),
+            );
+            let child_journal = format!(
+                "{control_journal}{{\"action_id\":\"later-cli\",\"pid\":44,\"status\":\"success\"}}\n"
+            );
+            std::fs::write(child.dir.join("action/outcomes.jsonl"), child_journal).unwrap();
+            if mirror_parent {
+                std::fs::write(parent.dir.join("action/outcomes.jsonl"), control_journal).unwrap();
+            }
+            for limit in [0, 1, 2, 10] {
+                let history = store.action_history(None, limit).unwrap();
+                assert_eq!(history.total_count, 3, "mirror_parent={mirror_parent}");
+                assert_eq!(history.actions.len(), limit.min(3));
+                assert_eq!(history.truncated, limit < 3);
+                assert!(history
+                    .actions
+                    .iter()
+                    .all(|entry| entry.session_id == child_id.0));
+                if limit > 0 {
+                    assert_eq!(history.actions[0].outcome["action_id"], "later-cli");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn action_history_mirror_filter_still_rejects_malformed_outcomes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("outcomes.jsonl");
+        let parent_id = SessionId::new();
+        let child_id = SessionId::new();
+        let invalid = serde_json::json!({
+            "action_id": "corrupt-mirror",
+            "pid": "not-a-pid",
+            "status": "success",
+            "control_session_id": child_id.0,
+        });
+        std::fs::write(&path, format!("{invalid}\n")).unwrap();
+        let error = read_action_history_journal(
+            open_history_file(&path).unwrap(),
+            &path,
+            &parent_id,
+            0,
+            0,
+            Some(&mut ControlHistoryMirrors::default()),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("journal line 1"));
+    }
+
+    #[test]
+    fn action_history_invalid_control_references_cannot_hide_attempts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("outcomes.jsonl");
+        let id = SessionId::new();
+        let mut journal = String::new();
+        for owner in [
+            serde_json::json!(null),
+            serde_json::json!(42),
+            serde_json::json!("../another-session"),
+        ] {
+            let row = serde_json::json!({
+                "action_id": "untrusted-reference",
+                "pid": 42,
+                "status": "failed",
+                "control_session_id": owner,
+            });
+            journal.push_str(&format!("{row}\n"));
+        }
+        std::fs::write(&path, journal).unwrap();
+        let (entries, count, _) = read_action_history_journal(
+            open_history_file(&path).unwrap(),
+            &path,
+            &id,
+            10,
+            ACTION_HISTORY_BYTE_LIMIT,
+            Some(&mut ControlHistoryMirrors::default()),
+        )
+        .unwrap();
+        assert_eq!(count, 3);
+        assert_eq!(entries.len(), 3);
     }
 
     #[test]

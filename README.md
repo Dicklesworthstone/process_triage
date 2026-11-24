@@ -153,7 +153,7 @@ Most tools only know "kill" or "don't kill." `pt` evaluates 8 possible actions r
 | **Pause** | `SIGSTOP` (resume: `SIGCONT`) | Yes | Linux, macOS |
 | **Freeze** | cgroup v2 freezer | Yes | Linux, if the target owns its cgroup |
 | **Throttle** | cgroup CPU quota | Durable session receipt on v2 | Linux, in an exclusive leaf |
-| **CapMemory** | cgroup v2 `memory.high` soft limit | Durable session receipt | Linux 6.16+, in an existing owned exclusive leaf; agent workflow |
+| **CapMemory** | cgroup v2 `memory.high` soft limit | Durable session receipt | Linux 6.16+, in an existing owned exclusive leaf; agent and TUI workflows |
 | **Quarantine** | cpuset controller | Explicit prior metadata | Linux, in an exclusive leaf |
 | **Restart** | via the supervisor | Partial | not executable yet (planned, e.g. for a zombie's parent); apply reports it as failed |
 | **Kill** | SIGTERM → SIGKILL | No | Linux, macOS |
@@ -1965,7 +1965,7 @@ not implemented.
 
 ### Restoring a recorded control
 
-`agent apply` records durable undo receipts for Linux **Pause**, **Renice** and cgroup-v2
+`agent apply` and interactive TUI control batches record durable undo receipts for Linux **Pause**, **Renice** and cgroup-v2
 **Freeze, Unfreeze, Throttle, CapMemory, and Quarantine** actions. Each receipt saves the
 original state before changing it: the job-control stop state for Pause, every thread's priority for Renice, or the
 freezer request, CPU quota and period, memory soft limit, or requested cpuset for cgroup controls.
@@ -2120,13 +2120,24 @@ manifests, and mounted directories remain preserved. Symlinks are not followed.
 `PROCESS_TRIAGE_RETENTION=off` disables automatic retention; explicit manual
 cleanup retains its existing behavior.
 
-This command currently covers Linux signal pauses, thread priorities and cgroup-v2 freezer,
-CPU bandwidth, memory soft limits, and cpuset controls from `agent apply`. Hybrid v1 throttling and
-quarantine record that durable undo is unsupported. Resume, service restart, macOS Pause,
-macOS Renice, and TUI actions do not capture these receipts; TUI control writes
-still respect existing receipt ownership. A bare Unquarantine action cannot
-reconstruct the old CPU set; restore the recorded Quarantine action with
-`agent undo`.
+Each Linux TUI control batch saves an immutable child session before execution.
+The TUI displays its undo preview command, and the parent session retains a link
+under `action/control_sessions/`. Use that child session ID with `agent undo`
+or `agent verify`. Later selections append to the parent's review history while
+earlier child plans and receipts remain unchanged. Both sessions retain the
+execution outcomes; global action history counts each child execution once.
+It verifies the complete ordered records in both journals before omitting a
+parent mirror. Missing or inconsistent child history returns an explicit error;
+the parent-scoped timeline remains available for inspection.
+The same durable workflow enables TUI memory caps when the existing kernel,
+identity, controller and exclusive-cgroup checks permit them.
+
+This command currently covers Linux signal pauses, thread priorities and cgroup-v2
+freezer, CPU bandwidth, memory soft limits, and cpuset controls from `agent apply`
+and TUI control batches. Hybrid v1 throttling and quarantine record that durable
+undo is unsupported. Resume, service restart, macOS Pause and macOS Renice do not
+capture these receipts. A bare Unquarantine action cannot reconstruct the old CPU
+set; restore the recorded Quarantine action with `agent undo`.
 
 ### cpuset Quarantine
 
