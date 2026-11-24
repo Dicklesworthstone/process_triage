@@ -848,7 +848,7 @@ fn has_ascii_suffix(path: &str, suffix: &str) -> bool {
 }
 
 /// Detect if a file path is a critical file for safety gates.
-fn detect_critical_file(fd: u32, path: &str) -> Option<CriticalFile> {
+pub(crate) fn detect_critical_file(fd: u32, path: &str) -> Option<CriticalFile> {
     // SQLite WAL and journal files - HARD block (active transaction in progress)
     let is_sqlite_wal = has_ascii_suffix(path, "-wal")
         || has_ascii_suffix(path, "-shm")

@@ -1170,14 +1170,23 @@ fn take_lsof_field_set<'a>(remaining: &mut &'a str) -> Result<Vec<&'a str>, Stri
     }
 }
 
-/// Count writable regular descriptors only from complete, scoped lsof evidence.
+/// Data-loss facts from a complete descriptor observation. The writable count
+/// is conservative across task tables; critical-file rules are shared with the
+/// inventory collector but never inferred from an incomplete inventory.
+#[derive(Debug, Clone, Default)]
+pub struct DescriptorSafetyEvidence {
+    pub open_write_fds: u32,
+    pub critical_writes: Vec<crate::collect::CriticalFile>,
+}
+
+/// Collect writable regular descriptors only from complete, scoped lsof evidence.
 /// The inventory collector can return an empty list on errors, omit unknown
 /// fields and keep partial output; none of those outcomes proves a safe zero.
 #[cfg(any(target_os = "macos", test))]
-fn lsof_write_fd_evidence(
+fn lsof_descriptor_safety_evidence(
     pid: u32,
     output: Result<crate::collect::tool_runner::ToolOutput, crate::collect::tool_runner::ToolError>,
-) -> Result<u32, String> {
+) -> Result<DescriptorSafetyEvidence, String> {
     let output = output.map_err(|error| format!("lsof for pid {pid}: {error}"))?;
     if !output.success() || output.timed_out || output.truncated || !output.stderr.is_empty() {
         return Err(format!(
@@ -1203,7 +1212,7 @@ fn lsof_write_fd_evidence(
     }
 
     let mut descriptors = HashSet::new();
-    let mut write_count = 0_u32;
+    let mut evidence = DescriptorSafetyEvidence::default();
     while !remaining.is_empty() {
         let fields = take_lsof_field_set(&mut remaining)?;
         let fd = fields[0]
@@ -1266,9 +1275,21 @@ fn lsof_write_fd_evidence(
                             // A path ending in " (deleted)" does not prove that
                             // every link/reference is gone. Unlike Linux's
                             // metadata probe, this query has no link-count proof.
-                            write_count = write_count.checked_add(1).ok_or_else(|| {
-                                "lsof writable-descriptor count overflow".to_string()
+                            evidence.open_write_fds =
+                                evidence.open_write_fds.checked_add(1).ok_or_else(|| {
+                                    "lsof writable-descriptor count overflow".to_string()
+                                })?;
+                            let number = fd.parse::<u32>().map_err(|_| {
+                                format!("invalid writable lsof descriptor for pid {pid}")
                             })?;
+                            if let Some(critical) =
+                                crate::collect::proc_parsers::detect_critical_file(
+                                    number,
+                                    name.expect("regular-file name validated"),
+                                )
+                            {
+                                evidence.critical_writes.push(critical);
+                            }
                         }
                         _ => {
                             return Err(format!(
@@ -1288,7 +1309,15 @@ fn lsof_write_fd_evidence(
             _ => return Err(format!("unknown lsof descriptor type for pid {pid}")),
         }
     }
-    Ok(write_count)
+    Ok(evidence)
+}
+
+#[cfg(test)]
+fn lsof_write_fd_evidence(
+    pid: u32,
+    output: Result<crate::collect::tool_runner::ToolOutput, crate::collect::tool_runner::ToolError>,
+) -> Result<u32, String> {
+    lsof_descriptor_safety_evidence(pid, output).map(|evidence| evidence.open_write_fds)
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -1553,10 +1582,10 @@ fn write_fd_snapshot_from(
 /// writable descriptors. Paths in this protocol are generated /proc paths, not
 /// displayed filenames; a filename containing whitespace cannot inject a row.
 #[cfg(target_os = "linux")]
-fn count_write_fd_metadata(
+fn descriptor_safety_from_metadata(
     requested: &std::collections::BTreeMap<String, &WriteFdObservation>,
     output: &crate::collect::tool_runner::ToolOutput,
-) -> Option<u32> {
+) -> Option<DescriptorSafetyEvidence> {
     if !output.success() || !output.stderr.is_empty() {
         return None;
     }
@@ -1565,7 +1594,7 @@ fn count_write_fd_metadata(
         return None;
     }
     let mut seen = HashSet::new();
-    let mut count = 0_u32;
+    let mut evidence = DescriptorSafetyEvidence::default();
     for line in content.lines() {
         let fields: Vec<_> = line.split_ascii_whitespace().collect();
         if fields.len() != 4 || !seen.insert(fields[0]) {
@@ -1615,17 +1644,30 @@ fn count_write_fd_metadata(
         // have live links. Conversely memfds and unlinked named scratch files
         // have no links. O_TMPFILE remains protected because it can be linked
         // into place later; its kernel flag is stronger evidence than "#123".
-        if mode & libc::S_IFMT == libc::S_IFREG
-            && (links > 0 || observation.flags & libc::O_TMPFILE as u32 == libc::O_TMPFILE as u32)
-        {
-            count = count.checked_add(1)?;
+        if mode & libc::S_IFMT == libc::S_IFREG {
+            if links > 0 || observation.flags & libc::O_TMPFILE as u32 == libc::O_TMPFILE as u32 {
+                evidence.open_write_fds = evidence.open_write_fds.checked_add(1)?;
+            }
+            let fd = std::path::Path::new(fields[0])
+                .file_name()?
+                .to_str()?
+                .parse::<u32>()
+                .ok()?;
+            // A malformed/unrepresentable path is not evidence that no named
+            // transaction is in progress. Never classify device/FIFO paths as
+            // lock files merely because their names resemble a critical file.
+            if let Some(critical) =
+                crate::collect::proc_parsers::detect_critical_file(fd, observation.target.to_str()?)
+            {
+                evidence.critical_writes.push(critical);
+            }
         }
     }
-    (seen.len() == requested.len()).then_some(count)
+    (seen.len() == requested.len()).then_some(evidence)
 }
 
 #[cfg(target_os = "linux")]
-fn open_write_fd_count_with_probe<F>(pid: u32, probe: F) -> Option<u32>
+fn descriptor_safety_with_probe<F>(pid: u32, probe: F) -> Option<DescriptorSafetyEvidence>
 where
     F: FnOnce(&[String], Duration) -> Option<crate::collect::tool_runner::ToolOutput>,
 {
@@ -1638,12 +1680,12 @@ where
         .filter(|(_, observation)| observation.writable())
         .map(|(path, observation)| (path.clone(), observation))
         .collect();
-    let count = if requested.is_empty() {
-        0
+    let evidence = if requested.is_empty() {
+        DescriptorSafetyEvidence::default()
     } else {
         let remaining = deadline.checked_duration_since(Instant::now())?;
         let paths: Vec<_> = requested.keys().cloned().collect();
-        count_write_fd_metadata(&requested, &probe(&paths, remaining)?)?
+        descriptor_safety_from_metadata(&requested, &probe(&paths, remaining)?)?
     };
     // The command inspected live numeric descriptors. Reject a close/reopen,
     // changed access mode, mount, pathname, task census or process incarnation
@@ -1651,7 +1693,23 @@ where
     if before != write_fd_snapshot(pid, deadline)? || read_io_birth(pid).ok()? != birth {
         return None;
     }
-    (Instant::now() < deadline).then_some(count)
+    (Instant::now() < deadline).then_some(evidence)
+}
+
+#[cfg(all(target_os = "linux", test))]
+fn count_write_fd_metadata(
+    requested: &std::collections::BTreeMap<String, &WriteFdObservation>,
+    output: &crate::collect::tool_runner::ToolOutput,
+) -> Option<u32> {
+    descriptor_safety_from_metadata(requested, output).map(|evidence| evidence.open_write_fds)
+}
+
+#[cfg(all(target_os = "linux", test))]
+fn open_write_fd_count_with_probe<F>(pid: u32, probe: F) -> Option<u32>
+where
+    F: FnOnce(&[String], Duration) -> Option<crate::collect::tool_runner::ToolOutput>,
+{
+    descriptor_safety_with_probe(pid, probe).map(|evidence| evidence.open_write_fds)
 }
 
 #[cfg(target_os = "linux")]
@@ -1672,10 +1730,64 @@ fn write_fd_probe_runner(remaining: Duration) -> crate::collect::tool_runner::To
 /// not prove shared ownership. `None` means incomplete, changing or over-budget
 /// evidence; only a complete zero proves there are no persistent writers.
 pub fn open_write_fd_count(pid: u32) -> Option<u32> {
+    collect_descriptor_safety_evidence(pid)
+        .ok()
+        .map(|evidence| evidence.open_write_fds)
+}
+
+/// Observe mandatory critical-file and configurable writable-file evidence for
+/// one complete, current process identity. Both checks use the same bounded task
+/// walk and metadata probe; an unavailable or changing observation is an error,
+/// never an empty set of critical files.
+pub fn descriptor_safety_evidence(
+    target: &pt_common::ProcessIdentity,
+) -> Result<DescriptorSafetyEvidence, String> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use super::executor::IdentityProvider;
+
+        let provider = super::signal::LiveIdentityProvider::new();
+        descriptor_safety_for_identity(
+            target,
+            || {
+                provider
+                    .revalidate(target)
+                    .map_err(|error| error.to_string())
+            },
+            || collect_descriptor_safety_evidence(target.pid.0),
+        )
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = target;
+        Err("complete descriptor safety evidence is unsupported on this platform".to_string())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn descriptor_safety_for_identity(
+    target: &pt_common::ProcessIdentity,
+    mut revalidate: impl FnMut() -> Result<bool, String>,
+    collect: impl FnOnce() -> Result<DescriptorSafetyEvidence, String>,
+) -> Result<DescriptorSafetyEvidence, String> {
+    if target.quality != pt_common::IdentityQuality::Full || !target.can_safely_revalidate() {
+        return Err("descriptor safety requires a complete process identity".to_string());
+    }
+    if !revalidate()? {
+        return Err("process identity changed before descriptor safety inspection".to_string());
+    }
+    let evidence = collect()?;
+    if !revalidate()? {
+        return Err("process identity changed during descriptor safety inspection".to_string());
+    }
+    Ok(evidence)
+}
+
+fn collect_descriptor_safety_evidence(pid: u32) -> Result<DescriptorSafetyEvidence, String> {
     #[cfg(target_os = "linux")]
     {
         use crate::collect::tool_runner::ToolSpec;
-        open_write_fd_count_with_probe(pid, |paths, remaining| {
+        descriptor_safety_with_probe(pid, |paths, remaining| {
             let mut args = vec![
                 "-L".to_string(),
                 "-c".to_string(),
@@ -1687,10 +1799,17 @@ pub fn open_write_fd_count(pid: u32) -> Option<u32> {
                 .run(&ToolSpec::new("stat", args))
                 .ok()
         })
+        .ok_or_else(|| {
+            format!(
+                "cannot establish complete data-loss evidence for pid {pid}: descriptor tables, access modes, file metadata or process identity are unavailable, changed or over budget"
+            )
+        })
     }
     #[cfg(target_os = "macos")]
     {
-        lsof_write_fd_evidence(
+        let before = crate::collect::macos::read_bsd_info(pid)
+            .ok_or_else(|| format!("cannot read descriptor owner identity for pid {pid}"))?;
+        let evidence = lsof_descriptor_safety_evidence(
             pid,
             crate::collect::tool_runner::run_tool(
                 crate::collect::macos::lsof_path(),
@@ -1698,13 +1817,18 @@ pub fn open_write_fd_count(pid: u32) -> Option<u32> {
                 Some(Duration::from_secs(5)),
                 None,
             ),
-        )
-        .ok()
+        )?;
+        let after = crate::collect::macos::read_bsd_info(pid)
+            .ok_or_else(|| format!("cannot recheck descriptor owner identity for pid {pid}"))?;
+        if before != after {
+            return Err(format!("descriptor owner identity changed for pid {pid}"));
+        }
+        Ok(evidence)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = pid;
-        None
+        Err("complete descriptor safety evidence is unsupported on this platform".to_string())
     }
 }
 
@@ -2433,6 +2557,7 @@ impl LivePreCheckProvider {
     }
 
     /// Check if process has open write file descriptors.
+    #[cfg(test)]
     fn has_open_write_fds(&self, pid: u32) -> Option<(bool, u32)> {
         let write_count = open_write_fd_count(pid)?;
         Some((write_count > self.config.max_open_write_fds, write_count))
@@ -3092,17 +3217,41 @@ impl PreCheckProvider for LivePreCheckProvider {
     fn check_data_loss(&self, pid: u32) -> PreCheckResult {
         trace!(pid, "checking data loss risk");
 
-        // Check open write file descriptors
-        if self.config.block_if_open_write_fds {
-            let Some((exceeds_max, write_count)) = self.has_open_write_fds(pid) else {
+        let unavailable = |error: &str| PreCheckResult::Blocked {
+            check: PreCheck::CheckDataLossGate,
+            reason: format!(
+                "cannot inspect open files; refusing without complete data-loss evidence: {error}"
+            ),
+        };
+        // Hard transaction/lock markers are mandatory even when the generic
+        // writable-file policy is disabled or allows some ordinary writers.
+        // The same complete observation supplies both rules. Preserve specific
+        // configured-gate diagnostics when independent evidence also refuses.
+        let descriptors = collect_descriptor_safety_evidence(pid);
+        if let Ok(evidence) = &descriptors {
+            if let Some(critical) = evidence
+                .critical_writes
+                .iter()
+                .find(|file| file.strength == crate::collect::DetectionStrength::Hard)
+            {
                 return PreCheckResult::Blocked {
                     check: PreCheck::CheckDataLossGate,
-                    reason:
-                        "cannot inspect open files; refusing without complete data-loss evidence"
-                            .to_string(),
+                    reason: format!(
+                        "process has critical file '{}' (rule: {}): {}",
+                        critical.path,
+                        critical.rule_id,
+                        critical.remediation_hint(),
+                    ),
                 };
+            }
+        }
+        if self.config.block_if_open_write_fds {
+            let evidence = match &descriptors {
+                Ok(evidence) => evidence,
+                Err(error) => return unavailable(error),
             };
-            if exceeds_max {
+            let write_count = evidence.open_write_fds;
+            if write_count > self.config.max_open_write_fds {
                 debug!(pid, write_count, "process has open write fds");
                 return PreCheckResult::Blocked {
                     check: PreCheck::CheckDataLossGate,
@@ -3164,7 +3313,10 @@ impl PreCheckProvider for LivePreCheckProvider {
             }
         }
 
-        PreCheckResult::Passed
+        match descriptors {
+            Ok(_) => PreCheckResult::Passed,
+            Err(error) => unavailable(&error),
+        }
     }
 
     fn check_supervisor(&self, pid: u32) -> PreCheckResult {
@@ -4311,6 +4463,100 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_safety_requires_full_identity_before_and_after_collection() {
+        use pt_common::{IdentityQuality, ProcessIdentity, StartId};
+
+        let target = ProcessIdentity::new(42, StartId::from_linux("boot", 100, 42), 1000);
+        for quality in [IdentityQuality::NoBootId, IdentityQuality::PidOnly] {
+            let mut weak = target.clone();
+            weak.quality = quality;
+            assert!(descriptor_safety_for_identity(
+                &weak,
+                || panic!("weak identities cannot begin inspection"),
+                || panic!("weak identities cannot collect descriptor evidence"),
+            )
+            .unwrap_err()
+            .contains("complete process identity"));
+        }
+        assert!(descriptor_safety_for_identity(
+            &target,
+            || Ok(false),
+            || panic!("stale identities cannot collect descriptor evidence"),
+        )
+        .unwrap_err()
+        .contains("before descriptor"));
+
+        let mut validations = 0;
+        let changed = descriptor_safety_for_identity(
+            &target,
+            || {
+                validations += 1;
+                Ok(validations == 1)
+            },
+            || Ok(DescriptorSafetyEvidence::default()),
+        );
+        assert_eq!(validations, 2);
+        assert!(changed.unwrap_err().contains("during descriptor"));
+        let unavailable = descriptor_safety_for_identity(
+            &target,
+            || Ok(true),
+            || Err("partial descriptor census".to_string()),
+        );
+        assert_eq!(unavailable.unwrap_err(), "partial descriptor census");
+
+        let mut validations = 0;
+        let observed = descriptor_safety_for_identity(
+            &target,
+            || {
+                validations += 1;
+                Ok(true)
+            },
+            || {
+                Ok(DescriptorSafetyEvidence {
+                    open_write_fds: 2,
+                    critical_writes: vec![crate::collect::proc_parsers::detect_critical_file(
+                        3,
+                        "/work/.git/index.lock",
+                    )
+                    .unwrap()],
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(validations, 2);
+        assert_eq!(observed.open_write_fds, 2);
+        assert_eq!(observed.critical_writes[0].rule_id, "git_lock_file");
+    }
+
+    #[test]
+    fn lsof_critical_files_require_regular_writers_and_complete_evidence() {
+        let content = concat!(
+            "p42\0\n",
+            "f3\0aw\0tREG\0n/work/\nproject/.git/index.lock\0\n",
+            "f4\0ar\0tREG\0n/work/state.sqlite-wal\0\n",
+            "f5\0au\0tFIFO\0n/work/.git/index.lock\0\n",
+            "f6\0au\0tREG\0n/work/state.sqlite\0\n",
+            "f7\0aw\0tCHR\0n/dev/transaction-wal\0\n",
+        );
+        let observed = lsof_descriptor_safety_evidence(42, Ok(lsof_output(content))).unwrap();
+        assert_eq!(observed.open_write_fds, 2);
+        assert_eq!(observed.critical_writes.len(), 2);
+        assert_eq!(observed.critical_writes[0].fd, 3);
+        assert_eq!(observed.critical_writes[0].rule_id, "git_lock_file");
+        assert_eq!(
+            observed.critical_writes[0].strength,
+            crate::collect::DetectionStrength::Hard
+        );
+        assert_eq!(observed.critical_writes[1].rule_id, "database_file");
+        assert_eq!(
+            observed.critical_writes[1].strength,
+            crate::collect::DetectionStrength::Soft
+        );
+        let partial = format!("{content}f8\0aw\0tREG\0n/work/incomplete");
+        assert!(lsof_descriptor_safety_evidence(42, Ok(lsof_output(&partial))).is_err());
+    }
+
+    #[test]
     fn lsof_writable_descriptors_require_observed_regular_write_access() {
         let content = concat!(
             "p42\0\n",
@@ -4568,7 +4814,11 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(disabled.check_data_loss(u32::MAX).is_passed());
+        assert!(matches!(
+            disabled.check_data_loss(u32::MAX),
+            PreCheckResult::Blocked { check: PreCheck::CheckDataLossGate, reason }
+                if reason.contains("complete data-loss evidence")
+        ));
         assert!(disabled.check_session_safety(u32::MAX, None).is_passed());
     }
 
@@ -4753,6 +5003,40 @@ mod tests {
                     .is_none(),
                 "{failure} must not produce complete descriptor evidence"
             );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_metadata_keeps_worker_critical_files_and_rejects_partial_census() {
+        let ordinary = write_fd_test_observation("/work/output.log", libc::O_WRONLY);
+        let mut critical = write_fd_test_observation("/work/.git/index.lock", libc::O_RDWR);
+        critical.inode = 43;
+        let requested = std::collections::BTreeMap::from([
+            ("/proc/42/task/42/fd/3".to_string(), &ordinary),
+            ("/proc/42/task/43/fd/3".to_string(), &critical),
+        ]);
+        let complete = "/proc/42/task/42/fd/3 81a4 1 42\n/proc/42/task/43/fd/3 81a4 1 43\n";
+        let observed = descriptor_safety_from_metadata(&requested, &lsof_output(complete)).unwrap();
+        assert_eq!(observed.open_write_fds, 2);
+        assert_eq!(observed.critical_writes.len(), 1);
+        assert_eq!(observed.critical_writes[0].fd, 3);
+        assert_eq!(observed.critical_writes[0].path, "/work/.git/index.lock");
+        assert_eq!(observed.critical_writes[0].rule_id, "git_lock_file");
+        for partial in [
+            "/proc/42/task/42/fd/3 81a4 1 42\n",
+            "/proc/42/task/43/fd/3 81a4 1 43\n",
+            "/proc/42/task/42/fd/3 81a4 1 42\n/proc/42/task/43/fd/3 81a4 1 44\n",
+        ] {
+            assert!(descriptor_safety_from_metadata(&requested, &lsof_output(partial)).is_none());
+        }
+        for mode in [libc::S_IFIFO, libc::S_IFSOCK, libc::S_IFCHR] {
+            let output =
+                format!("/proc/42/task/42/fd/3 81a4 1 42\n/proc/42/task/43/fd/3 {mode:x} 1 43\n");
+            let observed =
+                descriptor_safety_from_metadata(&requested, &lsof_output(&output)).unwrap();
+            assert_eq!(observed.open_write_fds, 1);
+            assert!(observed.critical_writes.is_empty());
         }
     }
 
@@ -4978,7 +5262,7 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn disabled_recent_io_gate_does_not_require_an_observation() {
+    fn disabled_recent_io_gate_still_requires_mandatory_file_evidence() {
         let provider = LivePreCheckProvider::new(
             None,
             LivePreCheckConfig {
@@ -4991,7 +5275,12 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(provider.check_data_loss(u32::MAX).is_passed());
+        assert_eq!(provider.config.block_if_recent_io_seconds, 0);
+        assert!(matches!(
+            provider.check_data_loss(u32::MAX),
+            PreCheckResult::Blocked { check: PreCheck::CheckDataLossGate, reason }
+                if reason.contains("complete data-loss evidence")
+        ));
     }
 
     // ── NoopPreCheckProvider ────────────────────────────────────────
@@ -5618,7 +5907,11 @@ mod tests {
                         && reason.contains("before sample")
                         && reason.contains("after sample")
             ));
-            assert!(io_only_provider(0).check_data_loss(u32::MAX).is_passed());
+            assert!(matches!(
+                io_only_provider(0).check_data_loss(u32::MAX),
+                PreCheckResult::Blocked { reason, .. }
+                    if reason.contains("complete data-loss evidence")
+            ));
             assert!(read_io_sample(0).is_err());
         }
 
@@ -5818,7 +6111,11 @@ mod tests {
                 },
             )
             .unwrap();
-            assert!(disabled.check_data_loss(u32::MAX).is_passed());
+            assert!(matches!(
+                disabled.check_data_loss(u32::MAX),
+                PreCheckResult::Blocked { reason, .. }
+                    if reason.contains("complete data-loss evidence")
+            ));
         }
 
         #[test]
@@ -6814,7 +7111,11 @@ finally:
                     && reason.contains("recent I/O evidence unavailable")
                     && reason.contains("before sample")
                     && reason.contains("after sample")));
-            assert!(io_only_provider(0).check_data_loss(u32::MAX).is_passed());
+            assert!(matches!(
+                io_only_provider(0).check_data_loss(u32::MAX),
+                PreCheckResult::Blocked { reason, .. }
+                    if reason.contains("complete data-loss evidence")
+            ));
         }
 
         #[test]
@@ -7562,6 +7863,99 @@ while True:
         }
 
         #[test]
+        fn critical_file_gate_survives_disabled_and_permissive_write_limits() {
+            let directory = tempfile::tempdir().unwrap().keep();
+            std::fs::create_dir(directory.join(".git")).unwrap();
+            for (name, rule) in [
+                (".git/index.lock", Some("git_lock_file")),
+                ("state.sqlite-wal", Some("sqlite_wal_journal")),
+                ("ordinary.log", None),
+            ] {
+                let path = directory.join(name);
+                std::fs::write(&path, b"pending work").unwrap();
+                for writable in [false, true] {
+                    let file = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(writable)
+                        .open(&path)
+                        .unwrap();
+                    let mut holder = descriptor_child(file, false);
+                    let pid = holder.child.id();
+                    let identity = crate::action::dispatch::read_cgroup_identity(pid).unwrap();
+                    let observed = descriptor_safety_evidence(&identity).unwrap();
+                    assert_eq!(observed.open_write_fds, u32::from(writable));
+                    assert_eq!(
+                        observed.critical_writes.len(),
+                        usize::from(writable && rule.is_some())
+                    );
+                    for enabled in [false, true] {
+                        let provider = LivePreCheckProvider::new(
+                            None,
+                            LivePreCheckConfig {
+                                block_if_open_write_fds: enabled,
+                                max_open_write_fds: 10,
+                                block_if_locked_files: false,
+                                block_if_deleted_cwd: false,
+                                block_if_recent_io_seconds: 0,
+                                ..LivePreCheckConfig::default()
+                            },
+                        )
+                        .unwrap();
+                        let result = provider.check_data_loss(pid);
+                        if let (true, Some(rule)) = (writable, rule) {
+                            assert!(matches!(
+                                result,
+                                PreCheckResult::Blocked { check, reason }
+                                    if check == PreCheck::CheckDataLossGate
+                                        && reason.contains("critical file")
+                                        && reason.contains(rule)
+                            ));
+                        } else {
+                            assert!(result.is_passed(), "{name}: {result:?}");
+                        }
+                    }
+                    let mut wrong_owner = identity.clone();
+                    wrong_owner.uid = wrong_owner.uid.wrapping_add(1);
+                    assert!(descriptor_safety_evidence(&wrong_owner).is_err());
+                    let mut wrong_birth = identity;
+                    wrong_birth.start_id = pt_common::StartId::from_linux("other-boot", 1, pid);
+                    assert!(descriptor_safety_evidence(&wrong_birth).is_err());
+                    assert!(holder.child.try_wait().unwrap().is_none());
+                }
+            }
+        }
+
+        #[test]
+        fn critical_file_gate_observes_private_worker_descriptor_tables() {
+            let directory = tempfile::tempdir().unwrap().keep();
+            std::fs::create_dir(directory.join(".git")).unwrap();
+            let path = directory.join(".git/index.lock");
+            std::fs::write(&path, b"pending index").unwrap();
+            let Some(mut holder) = thread_descriptor_child(&path, "writer", None) else {
+                return;
+            };
+            let pid = holder.fixture.child.id();
+            assert!(std::fs::read_dir(format!("/proc/{pid}/fd"))
+                .unwrap()
+                .all(|entry| std::fs::read_link(entry.unwrap().path()).unwrap() != path));
+            let identity = crate::action::dispatch::read_cgroup_identity(pid).unwrap();
+            let observed = descriptor_safety_evidence(&identity).unwrap();
+            assert_eq!(observed.open_write_fds, 1);
+            assert!(observed
+                .critical_writes
+                .iter()
+                .any(|file| file.rule_id == "git_lock_file" && file.fd == holder.fd));
+            let mut provider = lock_only_provider();
+            provider.config.block_if_locked_files = false;
+            assert!(matches!(
+                provider.check_data_loss(pid),
+                PreCheckResult::Blocked { reason, .. }
+                    if reason.contains("critical file") && reason.contains("git_lock_file")
+            ));
+            assert!(holder.fixture.child.try_wait().unwrap().is_none());
+        }
+
+        #[test]
         fn data_loss_refuses_without_descriptor_evidence() {
             let provider = LivePreCheckProvider::with_defaults();
             assert_eq!(open_write_fd_count(u32::MAX), None);
@@ -7871,9 +8265,14 @@ while True:
         fn live_provider_has_deleted_cwd_self() {
             let provider = LivePreCheckProvider::with_defaults();
             let pid = std::process::id();
-            // Our CWD should not be deleted
+            // Our CWD should not be deleted.
             assert_eq!(provider.has_deleted_cwd(pid), Ok(false));
-            assert!(cwd_only_provider().check_data_loss(pid).is_passed());
+            // The complete data-loss gate requires a stable descriptor census,
+            // unlike this test process's concurrently changing task/FD tables.
+            let fixture = descriptor_child(std::fs::File::open("/dev/null").unwrap(), false);
+            assert!(cwd_only_provider()
+                .check_data_loss(fixture.child.id())
+                .is_passed());
         }
 
         #[test]
@@ -7970,9 +8369,10 @@ while True:
                 protect_parent_shells: false,
             };
             let provider = LivePreCheckProvider::new(None, config).unwrap();
-            let pid = std::process::id();
-            // All data loss gates disabled → should pass
-            assert!(provider.check_data_loss(pid).is_passed());
+            let fixture = descriptor_child(std::fs::File::open("/dev/null").unwrap(), false);
+            // Optional gates are disabled; the stable child still supplies the
+            // mandatory complete observation excluding critical file writers.
+            assert!(provider.check_data_loss(fixture.child.id()).is_passed());
         }
     }
 }

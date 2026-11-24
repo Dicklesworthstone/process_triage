@@ -4105,6 +4105,9 @@ fn check_execution_policy(
         .iter()
         .find(|proc| proc.pid == action.target.pid)
         .ok_or("target is absent from current policy evidence")?;
+    if !action.target.matches(&process_identity_from_record(proc)) {
+        return Err("current policy evidence belongs to a different process identity".to_string());
+    }
     let mut candidate = process_policy_candidate(enforcer, proc, action.action)?;
     candidate.category = action.rationale.category.clone();
     candidate.posterior =
@@ -4164,6 +4167,19 @@ fn process_policy_candidate(
         }
         Some(group.to_string())
     };
+    // Critical lock rules are mandatory even when the configurable generic
+    // writable-file gate is relaxed. Capture both from one complete observation
+    // of this incarnation, never from the earlier plan or a partial FD parser.
+    let descriptors = if matches!(action, Action::Kill | Action::Restart) {
+        Some(
+            pt_core::action::prechecks::descriptor_safety_evidence(&process_identity_from_record(
+                proc,
+            ))
+            .map_err(|error| format!("descriptor safety evidence unavailable: {error}"))?,
+        )
+    } else {
+        None
+    };
     Ok(pt_core::decision::ProcessCandidate {
         pid: proc.pid.0 as i32,
         ppid: proc.ppid.0 as i32,
@@ -4175,16 +4191,16 @@ fn process_policy_candidate(
         posterior: None,
         memory_mb: Some(proc.rss_bytes as f64 / (1024.0 * 1024.0)),
         has_known_signature: false,
-        open_write_fds: matches!(action, Action::Kill | Action::Restart)
-            .then(|| pt_core::action::prechecks::open_write_fd_count(proc.pid.0))
-            .flatten(),
+        open_write_fds: descriptors.as_ref().map(|evidence| evidence.open_write_fds),
         has_locked_files: None,
         has_active_tty: Some(proc.has_tty()),
         seconds_since_io: None,
         cwd_deleted: None,
         process_state: Some(proc.state),
         wchan: None,
-        critical_files: Vec::new(),
+        critical_files: descriptors
+            .map(|evidence| evidence.critical_writes)
+            .unwrap_or_default(),
         cgroup_role: enforcer
             .requires_builtin_placement()
             .then(|| pt_core::collect::read_cgroup_role(proc.pid.0)),
@@ -4265,12 +4281,6 @@ fn planned_zombie_parent_refusal(
         source_posterior,
         Action::Restart,
     ));
-    #[cfg(target_os = "linux")]
-    {
-        target.critical_files = pt_core::collect::parse_fd(parent.pid.0)
-            .map(|fd| fd.critical_writes)
-            .unwrap_or_default();
-    }
     enforcer
         .check_action(&target, Action::Restart, robot)
         .violation
@@ -26490,17 +26500,51 @@ mod process_tree_safety_tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn routed_parent_checks_use_its_own_protection_age_and_memory() {
         use pt_core::decision::PolicyEnforcer;
         use pt_core::inference::ClassScores;
         use pt_core::supervision::SignatureDatabase;
 
+        // Policy facts remain independently controlled below, but destructive
+        // checks now require a real, complete descriptor observation. A stable
+        // owned child supplies that identity without borrowing the test runner's
+        // concurrently changing descriptor tables.
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let child = OwnedChild(
+            std::process::Command::new("sleep")
+                .arg("600")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn owned descriptor witness"),
+        );
+        let scan = pt_core::collect::quick_scan(&pt_core::collect::QuickScanOptions {
+            pids: vec![child.0.id()],
+            ..Default::default()
+        })
+        .unwrap();
+        let mut base_parent = scan
+            .processes
+            .into_iter()
+            .find(|process| process.pid.0 == child.0.id())
+            .expect("owned child in scan");
+        base_parent.elapsed = std::time::Duration::from_secs(7200);
+        base_parent.tty = None;
+
         let mut base_policy = pt_core::config::Policy::default();
         base_policy.guardrails.builtin_protection = false;
+        base_policy.guardrails.protected_users.clear();
         base_policy.data_loss_gates.block_if_open_write_fds = false;
         base_policy.robot_mode.enabled = true;
-        let base_parent = rec(900, 50, "worker", ProcessState::Sleeping);
         let posterior = ClassScores {
             useful: 0.001,
             useful_bad: 0.0,
@@ -26521,13 +26565,16 @@ mod process_tree_safety_tests {
             let mut parent = base_parent.clone();
             match case {
                 "init" => parent.pid = ProcessId(1),
-                "named_pid" => policy.guardrails.never_kill_pid.push(900),
+                "named_pid" => policy.guardrails.never_kill_pid.push(base_parent.pid.0),
                 "service" => {
                     policy.guardrails.builtin_protection = true;
                     parent.comm = "sshd".to_string();
                     parent.cmd = "sshd -D".to_string();
                 }
-                "user" => policy.guardrails.protected_users.push("u".to_string()),
+                "user" => policy
+                    .guardrails
+                    .protected_users
+                    .push(base_parent.user.clone()),
                 "young" => parent.elapsed = std::time::Duration::ZERO,
                 "memory" => {
                     policy.robot_mode.max_blast_radius_mb = 1.0;
@@ -26649,6 +26696,38 @@ mod process_tree_safety_tests {
             let evidence = super::process_policy_candidate(&enforcer, &missing, action)
                 .expect("recovery skips the disruptive-action FUSE and writable-FD probes");
             assert!(evidence.open_write_fds.is_none());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_policy_requires_complete_critical_file_evidence_with_generic_gates_disabled() {
+        use pt_core::decision::{Action, PolicyEnforcer};
+        let mut policy = pt_core::config::Policy::default();
+        policy.guardrails.builtin_protection = false;
+        policy.data_loss_gates.block_if_open_write_fds = false;
+        policy.data_loss_gates.block_if_locked_files = false;
+        policy.data_loss_gates.block_if_recent_io_seconds = Some(0);
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
+        let missing = rec(u32::MAX, 50, "unavailable", ProcessState::Sleeping);
+        for action in [Action::Kill, Action::Restart] {
+            let refusal = super::process_policy_candidate(&enforcer, &missing, action)
+                .expect_err("missing critical-file evidence must never become an empty safe list");
+            assert!(
+                refusal.contains("descriptor safety evidence unavailable"),
+                "{refusal}"
+            );
+        }
+        for action in [
+            Action::Keep,
+            Action::Renice,
+            Action::Resume,
+            Action::Unfreeze,
+        ] {
+            let candidate = super::process_policy_candidate(&enforcer, &missing, action)
+                .expect("non-destructive actions do not require writable-file evidence");
+            assert!(candidate.open_write_fds.is_none());
+            assert!(candidate.critical_files.is_empty());
         }
     }
 
@@ -33546,37 +33625,32 @@ fn candidate_recommendation(
     let fuse_refusal: Option<String> = None;
     let destructive =
         fuse_refusal.is_none() && matches!(decision.optimal_action, Action::Kill | Action::Restart);
-    let open_write_fds = if destructive {
+    let descriptor_evidence = if destructive && evidence_refusal.is_none() {
         subject.and_then(|subject| {
-            if routed_zombie {
+            let evidence = if routed_zombie {
                 // Preserve the parent's infrastructure/group evidence ordering;
                 // a dead source's empty or unreadable table proves nothing about it.
-                match process_policy_candidate(enforcer, subject, evidence_action) {
-                    Ok(target) => target.open_write_fds,
-                    Err(error) => {
-                        evidence_refusal =
-                            Some(format!("parent policy evidence unavailable: {error}"));
-                        None
-                    }
-                }
+                process_policy_candidate(enforcer, subject, evidence_action)
+                    .map(|target| (target.open_write_fds, target.critical_files))
             } else {
-                pt_core::action::prechecks::open_write_fd_count(subject.pid.0)
+                pt_core::action::prechecks::descriptor_safety_evidence(
+                    &process_identity_from_record(subject),
+                )
+                .map(|evidence| (Some(evidence.open_write_fds), evidence.critical_writes))
+            };
+            match evidence {
+                Ok(evidence) => Some(evidence),
+                Err(error) => {
+                    evidence_refusal =
+                        Some(format!("descriptor safety evidence unavailable: {error}"));
+                    None
+                }
             }
         })
     } else {
         None
     };
-    #[cfg(target_os = "linux")]
-    let critical_files = if destructive && evidence_refusal.is_none() {
-        subject
-            .and_then(|subject| pt_core::collect::parse_fd(subject.pid.0))
-            .map(|fd| fd.critical_writes)
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    #[cfg(not(target_os = "linux"))]
-    let critical_files = Vec::new();
+    let (open_write_fds, critical_files) = descriptor_evidence.unwrap_or_default();
     #[cfg(target_os = "linux")]
     let provenance = score.provenance.as_ref();
 

@@ -179,7 +179,7 @@ On Linux, `pt deep` reads 12+ files per process (raw records; the TUI turns netw
 | `/proc/net/udp` | UDP socket state |
 | `/proc/net/unix` | Unix domain sockets with reference counts |
 
-Critical file detection recognizes 20+ patterns: git locks (`.git/index.lock`), package manager locks (dpkg, apt, rpm, npm, pnpm, yarn, cargo), SQLite WAL/journal files, database write handles, and generic `.lock`/`.lck` files. At apply time the data-loss gate blocks any target holding a regular file open for writing or a file lock; the categorized critical-file rules are not yet attached to plans.
+Critical file detection recognizes 20+ patterns: git locks (`.git/index.lock`), package manager locks (dpkg, apt, rpm, npm, pnpm, yarn, cargo), SQLite WAL/journal files, database write handles, and generic `.lock`/`.lck` files. Planning and apply inspect current descriptors bound to the process identity. Hard critical-file rules block destructive actions even if the generic writable-file count gate is disabled or permits some open files. Apply repeats the observation, so a lock acquired after planning still blocks execution. Missing or incomplete descriptor evidence refuses the action.
 
 For standalone Linux and macOS deep scans, `pt deep --budget 5` (or `pt-core deep-scan --budget 5`) enforces a five-second collection deadline. The global `--timeout` also bounds this command; when both are supplied, the shorter duration applies. A deadline expiration, including a zero-second budget, returns exit code **22** without publishing a partial scan unless `--allow-partial` is explicitly supplied. With neither option, deep scanning uses native collection without an overall deadline.
 
@@ -1960,7 +1960,7 @@ Before killing any process, `pt` checks what files it has open. 20+ detection ru
 | **Application Locks** | `.lock`, `.lck`, `/lock/` patterns | Soft | Warns — process may hold coordination lock |
 | **Generic Writes** | Any file open for writing | Soft | Noted — contextual evaluation |
 
-These categories are implemented in the collector and policy enforcer, but plans do not attach critical files to candidates yet, so the category rules do not fire. What does run: `agent apply`'s data-loss gate blocks any target holding a regular file open for writing (on macOS via `lsof`, failing closed if it can't inspect) or holding a file lock.
+The planner, live policy revalidation, and destructive-action prechecks use the same critical-file classifications. A complete descriptor observation supplies both the writable-file count and critical-file findings; it verifies the process identity around the collection. On Linux the observation covers every task's descriptor table and rejects incomplete or changing evidence. On macOS it uses bounded `lsof` output and requires complete descriptor access, type, and name fields. Hard critical files always block Kill and Restart, independently of configurable generic count and advisory-lock gates. Soft classifications remain advisory unless another configured data-loss gate blocks the action. A saved plan never substitutes for the fresh apply-time observation.
 
 ---
 

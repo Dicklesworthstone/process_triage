@@ -5544,6 +5544,160 @@ fn agent_apply_data_loss_gate_blocks_kill_of_open_writer() {
     assert!(writer.alive(), "open writer must survive");
 }
 
+/// A clean plan cannot authorize a subsequently acquired critical write handle.
+/// The specific lock rule remains mandatory when the generic count is disabled
+/// or explicitly permits the descriptor. Ordinary writable files still follow
+/// that configured count policy.
+#[cfg(target_os = "linux")]
+#[test]
+fn agent_apply_rechecks_critical_files_acquired_after_real_planning() {
+    for (generic_gate, critical) in [(false, true), (true, true), (false, false)] {
+        let data_dir = TempDir::new().unwrap();
+        let config_dir = TempDir::new().unwrap();
+        let files = TempDir::new().unwrap();
+        write_test_policy(config_dir.path());
+        let policy_path = config_dir.path().join("policy.json");
+        let mut policy: Policy = serde_json::from_slice(&fs::read(&policy_path).unwrap()).unwrap();
+        policy.guardrails.protected_users.clear();
+        policy.guardrails.never_kill_ppid.clear();
+        policy.data_loss_gates.block_if_open_write_fds = generic_gate;
+        policy.data_loss_gates.max_open_write_fds = Some(10);
+        policy.data_loss_gates.block_if_locked_files = false;
+        policy.data_loss_gates.block_if_recent_io_seconds = Some(0);
+        policy.fdr_control.enabled = false;
+        // Explicit test economics admit this disposable workload. No safety
+        // check, target binding, saved action, or production default is changed.
+        for row in [
+            &mut policy.loss_matrix.useful,
+            &mut policy.loss_matrix.useful_bad,
+            &mut policy.loss_matrix.abandoned,
+            &mut policy.loss_matrix.zombie,
+        ] {
+            row.keep = 1000.0;
+            row.kill = 0.0;
+            row.pause = Some(1000.0);
+            row.throttle = Some(1000.0);
+            row.restart = Some(1000.0);
+            row.renice = Some(1000.0);
+        }
+        fs::write(&policy_path, serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+
+        let git_dir = files.path().join(".git");
+        fs::create_dir(&git_dir).unwrap();
+        let destination = if critical {
+            git_dir.join("index.lock")
+        } else {
+            files.path().join("ordinary.log")
+        };
+        let ready = files.path().join("ready");
+        let release = files.path().join("release");
+        let acquired = files.path().join("acquired");
+        assert!(ProcessCommand::new("mkfifo")
+            .arg(&release)
+            .status()
+            .expect("create the owned writer handshake")
+            .success());
+        let writer = ForeignTarget::spawn(&format!(
+            "python3 -c 'import os,time; open(\"{}\",\"w\").close(); \
+             gate=os.open(\"{}\",os.O_RDONLY); os.read(gate,1); os.close(gate); \
+             fd=os.open(\"{}\",os.O_WRONLY|os.O_CREAT,0o600); \
+             open(\"{}\",\"w\").close(); time.sleep(600)'",
+            ready.display(),
+            release.display(),
+            destination.display(),
+            acquired.display(),
+        ));
+        let await_marker = |marker: &Path| {
+            let started = std::time::Instant::now();
+            while !marker.exists() {
+                assert!(
+                    writer.alive(),
+                    "owned writer exited before {}",
+                    marker.display()
+                );
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "writer handshake timed out"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        await_marker(&ready);
+        let identity = live_identity(writer.pid);
+        let output = cargo_bin_cmd!("pt-core")
+            .timeout(Duration::from_secs(60))
+            .env("PT_SKIP_GLOBAL_LOCK", "1")
+            .env("PROCESS_TRIAGE_DATA", data_dir.path())
+            .env("PROCESS_TRIAGE_CONFIG", config_dir.path())
+            .env("PROCESS_TRIAGE_RETENTION", "off")
+            .args([
+                "--format",
+                "json",
+                "--robot",
+                "agent",
+                "plan",
+                "--min-posterior",
+                "0",
+                "--min-age",
+                "0",
+                "--probe-budget-ms",
+                "0",
+                "--window-ms",
+                "0",
+                "--pids",
+                &writer.pid.to_string(),
+            ])
+            .output()
+            .expect("plan the exact disposable writer before it opens a file");
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            document["candidates"][0]["recommended_action"], "kill",
+            "{document}"
+        );
+        let session = document["session_id"].as_str().unwrap();
+        let handle = SessionStore::at_data_dir(data_dir.path())
+            .open(&SessionId::parse(session).unwrap())
+            .unwrap();
+        let saved_path = handle.dir.join("decision/plan.json");
+        let saved_plan = fs::read(&saved_path).unwrap();
+        let plan: Plan = serde_json::from_slice(&saved_plan).unwrap();
+        assert_eq!(plan.actions.len(), 1, "{document}");
+        assert!(plan.actions[0].target.matches(&identity));
+        assert_eq!(plan.actions[0].action, Action::Kill);
+        assert!(!plan.actions[0].blocked);
+        assert!(
+            !destination.exists(),
+            "planning happened before the write handle existed"
+        );
+
+        fs::write(&release, b"open now").unwrap();
+        await_marker(&acquired);
+        let target = format!("{}:{}", writer.pid, identity.start_id.0);
+        let (status, result) = apply(data_dir.path(), config_dir.path(), session, &target);
+        if critical {
+            assert_eq!(status, "precheck_blocked", "{result}");
+            let reason = result["outcomes"][0]["reason"].as_str().unwrap_or("");
+            assert!(
+                reason.contains("critical") && reason.contains("index.lock"),
+                "{result}"
+            );
+            assert!(writer.alive(), "critical writer must survive");
+        } else {
+            assert_eq!(
+                status, "success",
+                "ordinary writes honor the explicit policy: {result}"
+            );
+            assert!(!writer.alive(), "the allowed ordinary writer should exit");
+        }
+        assert_eq!(
+            fs::read(saved_path).unwrap(),
+            saved_plan,
+            "apply must preserve the original plan"
+        );
+    }
+}
+
 /// --max-total-blast-radius accumulates the memory of each kill (bd-qr40.7): apply
 /// originally recorded 0 bytes, then trusted saved estimates. Allocate actual
 /// resident memory while recording zero estimates: two measured footprints fit
