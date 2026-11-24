@@ -750,8 +750,16 @@ enum BundleCommands {
 #[derive(Args, Debug)]
 struct ReportArgs {
     /// Session ID to generate report for (default: latest)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "bundle")]
     session: Option<String>,
+
+    /// Path to a .ptb bundle file (alternative to a local session)
+    #[arg(long)]
+    bundle: Option<String>,
+
+    /// Passphrase for encrypted bundles (or use PT_BUNDLE_PASSPHRASE)
+    #[arg(long, requires = "bundle")]
+    passphrase: Option<String>,
 
     /// Output path for the HTML report
     #[arg(short, long)]
@@ -1770,12 +1778,16 @@ struct AgentImportPriorsArgs {
 #[derive(Args, Debug)]
 struct AgentReportArgs {
     /// Session ID to generate report for (required unless using --bundle)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "bundle")]
     session: Option<String>,
 
     /// Path to a .ptb bundle file (alternative to --session)
     #[arg(long)]
     bundle: Option<String>,
+
+    /// Passphrase for encrypted bundles (or use PT_BUNDLE_PASSPHRASE)
+    #[arg(long, requires = "bundle")]
+    passphrase: Option<String>,
 
     /// Output path for the selected report format
     #[arg(short, long)]
@@ -13885,6 +13897,8 @@ fn run_bundle_extract(
 fn run_report(global: &GlobalOpts, args: &ReportArgs) -> ExitCode {
     let session = if let Some(ref session) = args.session {
         Some(session.clone())
+    } else if args.bundle.is_some() {
+        None
     } else {
         let store = match SessionStore::from_env() {
             Ok(store) => store,
@@ -13912,7 +13926,8 @@ fn run_report(global: &GlobalOpts, args: &ReportArgs) -> ExitCode {
 
     let agent_args = AgentReportArgs {
         session,
-        bundle: None,
+        bundle: args.bundle.clone(),
+        passphrase: args.passphrase.clone(),
         out: args.output.clone(),
         profile: "safe".to_string(),
         galaxy_brain: args.include_ledger,
@@ -41603,13 +41618,15 @@ fn run_agent_report(global: &GlobalOpts, args: &AgentReportArgs) -> ExitCode {
             return ExitCode::ArgsError;
         }
 
-        let mut reader = match pt_bundle::BundleReader::open(path) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("agent report: failed to read bundle: {}", e);
-                return ExitCode::InternalError;
-            }
-        };
+        let passphrase = resolve_bundle_passphrase(&args.passphrase);
+        let mut reader =
+            match pt_bundle::BundleReader::open_with_passphrase(path, passphrase.as_deref()) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("agent report: failed to read bundle: {}", e);
+                    return ExitCode::InternalError;
+                }
+            };
 
         generator.prepare_from_bundle(&mut reader)
     } else if let Some(ref session_id_str) = args.session {

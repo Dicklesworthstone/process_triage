@@ -1163,7 +1163,19 @@ pt bundle create --session <id> --encrypt --passphrase "correct horse battery st
 ```bash
 pt report --session <id> --output report.html
 pt report --session <id> --output report.html --include-ledger --embed-assets
+
+# Generate a report directly from a portable bundle, without a local session
+pt report --bundle session.ptb --output report.html --embed-assets
+
+# For encrypted bundles, set PT_BUNDLE_PASSPHRASE or supply --passphrase
+pt agent report --bundle encrypted.ptb --passphrase "correct horse battery staple" --out report.html
+
+# The same bundle supports structured prose and Slack-ready summaries
+pt agent report --bundle session.ptb --report-format prose --format json
 ```
+
+Encrypted reports use the same checksum verification and redaction profiles as
+plain bundles. An incorrect or missing passphrase fails before writing the report.
 
 ---
 

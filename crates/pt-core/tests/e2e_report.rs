@@ -98,6 +98,36 @@ mod args_validation {
     use super::*;
 
     #[test]
+    fn report_passphrase_requires_bundle() {
+        for command in [&["report"][..], &["agent", "report"][..]] {
+            pt_core()
+                .args(command)
+                .args(["--passphrase", "report-test-secret"])
+                .assert()
+                .code(10)
+                .stderr(predicate::str::contains("--bundle"))
+                .stderr(predicate::str::contains("report-test-secret").not());
+        }
+    }
+
+    #[test]
+    fn report_session_conflicts_with_bundle() {
+        for command in [&["report"][..], &["agent", "report"][..]] {
+            pt_core()
+                .args(command)
+                .args([
+                    "--session",
+                    "pt-20260101-000000-abcd",
+                    "--bundle",
+                    "unused.ptb",
+                ])
+                .assert()
+                .code(10)
+                .stderr(predicate::str::contains("cannot be used with"));
+        }
+    }
+
+    #[test]
     fn report_requires_session_or_bundle() {
         pt_core()
             .args(["agent", "report"])
@@ -932,32 +962,49 @@ fn recorded_session_bundle_and_report_preserve_data_without_leaking_canaries() {
             .any(|entry| entry["name"] == "private-original-worker"));
     }
 
-    for bundle_input in [false, true] {
+    for source in ["session", "bundle", "encrypted", "encrypted-env"] {
         let mut command = pt_core();
         command
             .env("PROCESS_TRIAGE_DATA", &data_dir)
+            .env_remove("PT_BUNDLE_PASSPHRASE")
             .arg("--config")
             .arg(&config_dir);
-        if bundle_input {
-            command
-                .args(["agent", "report", "--bundle"])
-                .arg(&plain_bundle)
-                .args(["--galaxy-brain", "--embed-assets"]);
-        } else {
-            command.args([
-                "report",
-                "--session",
-                &session_id.0,
-                "--include-ledger",
-                "--embed-assets",
-            ]);
+        match source {
+            "session" => {
+                command.args([
+                    "report",
+                    "--session",
+                    &session_id.0,
+                    "--include-ledger",
+                    "--embed-assets",
+                ]);
+            }
+            "encrypted-env" => {
+                // The short command must use the supplied archive even when
+                // there is no local session store to supply a latest session.
+                command
+                    .env("PROCESS_TRIAGE_DATA", data_dir.join("empty-report-store"))
+                    .env("PT_BUNDLE_PASSPHRASE", "test-passphrase")
+                    .args(["report", "--bundle"])
+                    .arg(data_dir.join("encrypted.ptb"))
+                    .args(["--include-ledger", "--embed-assets"]);
+            }
+            _ => {
+                command.args(["agent", "report", "--bundle"]);
+                if source == "encrypted" {
+                    // An explicit passphrase has precedence over the environment.
+                    command
+                        .env("PT_BUNDLE_PASSPHRASE", "incorrect-environment-passphrase")
+                        .arg(data_dir.join("encrypted.ptb"))
+                        .args(["--passphrase", "test-passphrase"]);
+                } else {
+                    command.arg(&plain_bundle);
+                }
+                command.args(["--galaxy-brain", "--embed-assets"]);
+            }
         }
         let assertion = command.assert();
-        let artifact = if bundle_input {
-            "bundle-report"
-        } else {
-            "session-report"
-        };
+        let artifact = format!("{source}-report");
         fs::write(
             data_dir.join(format!("{artifact}.stdout.html")),
             &assertion.get_output().stdout,
@@ -976,6 +1023,7 @@ fn recorded_session_bundle_and_report_preserve_data_without_leaking_canaries() {
         assert!(html.contains("blocked"));
         assert!(!html.contains("private-customer"));
         assert!(!html.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(!html.contains("test-passphrase"));
         assert!(!html.contains("<script src="));
         assert!(!html.contains("<link rel=\"stylesheet\""));
         let recorded_json = html
@@ -1006,6 +1054,59 @@ fn recorded_session_bundle_and_report_preserve_data_without_leaking_canaries() {
         );
         assert!(html.contains("robot_plan"));
         assert!(html.contains("created"));
+    }
+
+    // Text reports use the same decrypted, verified, redacted source as HTML.
+    for format in ["slack", "prose"] {
+        let output = pt_core()
+            .env("PROCESS_TRIAGE_DATA", &data_dir)
+            .env("PT_BUNDLE_PASSPHRASE", "test-passphrase")
+            .arg("--config")
+            .arg(&config_dir)
+            .args(["--format", "json", "agent", "report", "--bundle"])
+            .arg(data_dir.join("encrypted.ptb"))
+            .args(["--report-format", format])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["format"], format);
+        let content = response["content"].as_str().unwrap();
+        assert!(content.contains("1234"));
+        assert!(!content.contains("private-customer"));
+        assert!(!content.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(!content.contains("test-passphrase"));
+    }
+
+    // Authentication failures must not publish a report or overwrite an
+    // existing output, and error diagnostics must not echo the supplied secret.
+    let refused_report = data_dir.join("refused-report.html");
+    fs::write(&refused_report, "preserve existing report").unwrap();
+    for passphrase in [None, Some("wrong-report-passphrase")] {
+        let mut command = pt_core();
+        command
+            .env("PROCESS_TRIAGE_DATA", &data_dir)
+            .env_remove("PT_BUNDLE_PASSPHRASE")
+            .arg("--config")
+            .arg(&config_dir)
+            .args(["agent", "report", "--bundle"])
+            .arg(data_dir.join("encrypted.ptb"))
+            .arg("--out")
+            .arg(&refused_report);
+        if let Some(passphrase) = passphrase {
+            command.args(["--passphrase", passphrase]);
+        }
+        command
+            .assert()
+            .failure()
+            .stdout(predicate::str::is_empty())
+            .stderr(predicate::str::contains("failed to read bundle"))
+            .stderr(predicate::str::contains("wrong-report-passphrase").not());
+        assert_eq!(
+            fs::read_to_string(&refused_report).unwrap(),
+            "preserve existing report"
+        );
     }
 
     let signature_path = pt_core::signature_cli::user_signatures_path(&config_dir);
@@ -1623,9 +1724,9 @@ mod output_formats {
             ])
             .assert()
             .failure()
-            .stderr(predicate::str::contains(
-                "specify only one of --session or --bundle",
-            ));
+            .stderr(predicate::str::contains("cannot be used with"))
+            .stderr(predicate::str::contains("--session"))
+            .stderr(predicate::str::contains("--bundle"));
         pt_core_fast()
             .env("PROCESS_TRIAGE_DATA", tmp.path())
             .args([
