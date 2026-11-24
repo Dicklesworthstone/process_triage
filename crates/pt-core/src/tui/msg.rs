@@ -29,10 +29,30 @@ pub struct ExecutionOutcome {
     pub failed: usize,
 }
 
-/// Rows and goal metadata from the same completed scan.
+/// Display-only host observations and responsible units from one scan.
+/// These summaries never authorize a process or a whole-unit action.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PressureOverview {
+    pub header: Vec<String>,
+    pub details: Vec<String>,
+    pub units: Vec<PressureUnit>,
+}
+
+/// An attributed workload and the candidate rows from this same snapshot.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PressureUnit {
+    pub id: String,
+    pub label: String,
+    pub member_pids: Vec<u32>,
+    pub summary: String,
+    pub details: Vec<String>,
+}
+
+/// Rows, pressure observations, and goal metadata from the same completed scan.
 #[derive(Debug, Clone, Default)]
 pub struct RefreshOutcome {
     pub rows: Vec<ProcessRow>,
+    pub pressure: Option<PressureOverview>,
     pub goal_summary: Option<Vec<String>>,
     /// Only the executable goal selection is ranked. An empty map explicitly
     /// recommends no actions; `None` uses the ordinary row recommendations.
@@ -129,6 +149,10 @@ pub enum Msg {
     ToggleHelp,
     OpenUndo,
     CloseUndo,
+    OpenPressure,
+    ClosePressure,
+    FilterPressureUnit,
+    ClearPressureFilter,
 
     // Action messages
     RequestExecute {

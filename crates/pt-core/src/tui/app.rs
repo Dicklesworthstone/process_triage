@@ -39,7 +39,8 @@ use ftui::{
 use super::events::KeyBindings;
 use super::layout::{Breakpoint, LayoutState, ResponsiveLayout};
 use super::msg::{
-    ExecutionOutcome, Msg, RefreshOutcome, UndoBatch, UndoOverview, UndoRestoreOutcome,
+    ExecutionOutcome, Msg, PressureOverview, PressureUnit, RefreshOutcome, UndoBatch, UndoOverview,
+    UndoRestoreOutcome,
 };
 use super::theme::Theme;
 use super::widgets::{
@@ -73,6 +74,8 @@ pub enum AppState {
     Confirming,
     /// Help overlay is visible.
     Help,
+    /// Host pressure and responsible-unit observations from the current scan.
+    Pressure,
     /// Durable control batches are visible for inspection and restoration.
     Undo,
     /// A specific immutable control batch is awaiting explicit confirmation.
@@ -145,6 +148,11 @@ pub struct App {
     detail_view: DetailView,
     /// Optional goal summary lines to display.
     goal_summary: Option<Vec<String>>,
+    pressure: Option<PressureOverview>,
+    /// Zero is the host summary; subsequent entries are responsible units.
+    pressure_cursor: usize,
+    pressure_detail_offset: usize,
+    pressure_filter_label: Option<String>,
     /// Injected refresh operation for ftui Cmd::task (Send + 'static).
     /// Returns new rows and their goal metadata on success.
     refresh_op: Option<RefreshOp>,
@@ -214,6 +222,10 @@ impl App {
             detail_visible: true,
             detail_view: DetailView::Summary,
             goal_summary: None,
+            pressure: None,
+            pressure_cursor: 0,
+            pressure_detail_offset: 0,
+            pressure_filter_label: None,
             refresh_op: None,
             execute_op: None,
             undo_inspect_op: None,
@@ -311,6 +323,14 @@ impl App {
                 .with_description("Switch process table between score and goal ordering")
                 .with_tags(&["goal", "view", "sort"])
                 .with_category("Views"),
+            ActionItem::new("view.pressure", "Inspect pressure and workloads  [P]")
+                .with_description("Browse host pressure and responsible units from this scan")
+                .with_tags(&["pressure", "workload", "unit", "resource"])
+                .with_category("Views"),
+            ActionItem::new("view.clear_unit", "Clear workload filter  [c]")
+                .with_description("Show all process rows, retaining the text search")
+                .with_tags(&["filter", "workload", "unit", "clear"])
+                .with_category("Views"),
             ActionItem::new("view.help", "Show keyboard shortcuts  [?]")
                 .with_description("Open the full help overlay")
                 .with_tags(&["help", "shortcuts"])
@@ -405,7 +425,97 @@ impl App {
         self.process_table
             .set_goal_selection(outcome.goal_selection);
         self.goal_summary = outcome.goal_summary;
+        self.pressure = outcome.pressure;
+        self.pressure_cursor = 0;
+        self.pressure_detail_offset = 0;
+        self.pressure_filter_label = None;
+        if self.state == AppState::Pressure {
+            self.state = AppState::Normal;
+        }
         self.needs_redraw = true;
+    }
+
+    /// Host and workload observations belonging to the currently displayed scan.
+    pub fn pressure_overview(&self) -> Option<&PressureOverview> {
+        self.pressure.as_ref()
+    }
+
+    /// Highlighted workload, or `None` for the host summary.
+    pub fn selected_pressure_unit(&self) -> Option<&PressureUnit> {
+        self.pressure_cursor
+            .checked_sub(1)
+            .and_then(|index| self.pressure.as_ref()?.units.get(index))
+    }
+
+    fn move_pressure_cursor(&mut self, target: usize) {
+        if self.state != AppState::Pressure || !self.operation_is_idle() {
+            return;
+        }
+        let last = self
+            .pressure
+            .as_ref()
+            .map_or(0, |overview| overview.units.len());
+        self.pressure_cursor = target.min(last);
+        self.pressure_detail_offset = 0;
+        self.needs_redraw = true;
+    }
+
+    fn scroll_pressure_details(&mut self, forward: bool) {
+        if self.state != AppState::Pressure || !self.operation_is_idle() {
+            return;
+        }
+        let width = self.layout_state.size().0.saturating_sub(2);
+        let last = self.pressure_detail_lines(width).len().saturating_sub(1);
+        self.pressure_detail_offset = if forward {
+            self.pressure_detail_offset.saturating_add(4).min(last)
+        } else {
+            self.pressure_detail_offset.saturating_sub(4)
+        };
+        self.needs_redraw = true;
+    }
+
+    fn filter_pressure_unit(&mut self) {
+        if self.state != AppState::Pressure || !self.operation_is_idle() {
+            return;
+        }
+        let Some(unit) = self.selected_pressure_unit() else {
+            self.set_status("Host pressure is informational; select a workload to filter rows");
+            return;
+        };
+        let members: std::collections::HashSet<_> = unit.member_pids.iter().copied().collect();
+        let members: std::collections::HashSet<_> = self
+            .process_table
+            .rows
+            .iter()
+            .filter(|row| members.contains(&row.pid))
+            .map(|row| row.pid)
+            .collect();
+        if members.is_empty() {
+            self.set_status("This workload has no candidate rows in this scan; nothing selected");
+            return;
+        }
+        let label = unit.label.clone();
+        self.invalidate_selection();
+        self.process_table.set_member_filter(Some(members));
+        self.pressure_filter_label = Some(label.clone());
+        self.state = AppState::Normal;
+        self.focus = FocusTarget::ProcessList;
+        self.update_focus();
+        self.set_status(format!(
+            "Workload: {label}; {} visible rows, none selected. c clears the filter",
+            self.process_table.visible_rows().len()
+        ));
+    }
+
+    fn clear_pressure_filter(&mut self) {
+        if !self.operation_is_idle() || !matches!(self.state, AppState::Normal | AppState::Pressure)
+        {
+            return;
+        }
+        self.invalidate_selection();
+        self.process_table.set_member_filter(None);
+        self.pressure_filter_label = None;
+        self.set_status("Workload filter cleared; text search retained, no processes selected");
     }
 
     /// Set the async execute operation for ftui Cmd::task.
@@ -711,8 +821,8 @@ impl App {
             self.set_status("Finish or cancel the current confirmation before changing selection");
             return false;
         }
-        if self.state == AppState::Undo {
-            self.set_status("Close the undo panel before selecting process actions");
+        if matches!(self.state, AppState::Undo | AppState::Pressure) {
+            self.set_status("Close the inspection panel before selecting process actions");
             return false;
         }
         true
@@ -806,6 +916,8 @@ impl App {
             "view.genealogy" => "Show genealogy detail",
             "view.galaxy" => "Toggle galaxy brain detail",
             "view.goal" => "Toggle goal view",
+            "view.pressure" => "Inspect pressure and workloads",
+            "view.clear_unit" => "Clear workload filter",
             "view.help" => "Show keyboard shortcuts",
             "settings.theme.dark" => "Switch theme dark",
             "settings.theme.light" => "Switch theme light",
@@ -832,13 +944,18 @@ impl App {
             }
             "action.refresh" => self.handle_msg(Msg::RequestRefresh),
             "action.undo" => self.handle_msg(Msg::OpenUndo),
+            "view.pressure" => self.handle_msg(Msg::OpenPressure),
+            "view.clear_unit" => self.handle_msg(Msg::ClearPressureFilter),
 
             "navigation.first" => self.handle_msg(Msg::CursorHome),
             "navigation.last" => self.handle_msg(Msg::CursorEnd),
             "navigation.page_down" => self.handle_msg(Msg::PageDown),
             "navigation.page_up" => self.handle_msg(Msg::PageUp),
             "search.open" => {
-                if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo) {
+                if matches!(
+                    self.state,
+                    AppState::Undo | AppState::ConfirmingUndo | AppState::Pressure
+                ) {
                     return FtuiCmd::none();
                 }
                 self.state = AppState::Searching;
@@ -990,8 +1107,10 @@ impl App {
 
     /// Show confirmation dialog for executing actions.
     fn show_execute_confirmation(&mut self) {
-        if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo)
-            || !self.operation_is_idle()
+        if matches!(
+            self.state,
+            AppState::Undo | AppState::ConfirmingUndo | AppState::Pressure
+        ) || !self.operation_is_idle()
         {
             return;
         }
@@ -1026,7 +1145,10 @@ impl App {
 
     /// Handle confirmation dialog result.
     fn handle_confirmation(&mut self, choice: ConfirmChoice) -> FtuiCmd<Msg> {
-        if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo) {
+        if matches!(
+            self.state,
+            AppState::Undo | AppState::ConfirmingUndo | AppState::Pressure
+        ) {
             return FtuiCmd::none();
         }
         if !self.operation_is_idle() {
@@ -1076,17 +1198,18 @@ impl App {
     /// Handle a message from the ftui runtime while preserving existing state
     /// transitions from the legacy event handlers.
     fn handle_msg(&mut self, msg: Msg) -> FtuiCmd<Msg> {
-        if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo)
-            && matches!(
-                &msg,
-                Msg::SearchInput(_)
-                    | Msg::SearchBackspace
-                    | Msg::SearchCommit
-                    | Msg::SearchCancel
-                    | Msg::SearchHistoryUp
-                    | Msg::SearchHistoryDown
-            )
-        {
+        if matches!(
+            self.state,
+            AppState::Undo | AppState::ConfirmingUndo | AppState::Pressure
+        ) && matches!(
+            &msg,
+            Msg::SearchInput(_)
+                | Msg::SearchBackspace
+                | Msg::SearchCommit
+                | Msg::SearchCancel
+                | Msg::SearchHistoryUp
+                | Msg::SearchHistoryDown
+        ) {
             return FtuiCmd::none();
         }
         match msg {
@@ -1120,7 +1243,10 @@ impl App {
                 FtuiCmd::none()
             }
             Msg::PasteReceived { text, .. } => {
-                if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo) {
+                if matches!(
+                    self.state,
+                    AppState::Undo | AppState::ConfirmingUndo | AppState::Pressure
+                ) {
                     return FtuiCmd::none();
                 }
                 self.search.set_value(&text);
@@ -1136,7 +1262,9 @@ impl App {
             Msg::Noop => FtuiCmd::none(),
 
             Msg::CursorUp => {
-                if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo) {
+                if self.state == AppState::Pressure {
+                    self.move_pressure_cursor(self.pressure_cursor.saturating_sub(1));
+                } else if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo) {
                     self.move_undo_cursor(self.undo_cursor.saturating_sub(1));
                 } else {
                     self.process_table.cursor_up();
@@ -1144,7 +1272,9 @@ impl App {
                 FtuiCmd::none()
             }
             Msg::CursorDown => {
-                if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo) {
+                if self.state == AppState::Pressure {
+                    self.move_pressure_cursor(self.pressure_cursor.saturating_add(1));
+                } else if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo) {
                     self.move_undo_cursor(self.undo_cursor.saturating_add(1));
                 } else {
                     self.process_table.cursor_down();
@@ -1152,7 +1282,9 @@ impl App {
                 FtuiCmd::none()
             }
             Msg::CursorHome => {
-                if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo) {
+                if self.state == AppState::Pressure {
+                    self.move_pressure_cursor(0);
+                } else if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo) {
                     self.move_undo_cursor(0);
                 } else {
                     self.process_table.cursor_home();
@@ -1160,7 +1292,9 @@ impl App {
                 FtuiCmd::none()
             }
             Msg::CursorEnd => {
-                if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo) {
+                if self.state == AppState::Pressure {
+                    self.move_pressure_cursor(usize::MAX);
+                } else if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo) {
                     self.move_undo_cursor(usize::MAX);
                 } else {
                     self.process_table.cursor_end();
@@ -1168,7 +1302,9 @@ impl App {
                 FtuiCmd::none()
             }
             Msg::PageUp | Msg::HalfPageUp => {
-                if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo) {
+                if self.state == AppState::Pressure {
+                    self.move_pressure_cursor(self.pressure_cursor.saturating_sub(5));
+                } else if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo) {
                     self.move_undo_cursor(self.undo_cursor.saturating_sub(5));
                 } else {
                     self.process_table
@@ -1177,7 +1313,9 @@ impl App {
                 FtuiCmd::none()
             }
             Msg::PageDown | Msg::HalfPageDown => {
-                if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo) {
+                if self.state == AppState::Pressure {
+                    self.move_pressure_cursor(self.pressure_cursor.saturating_add(5));
+                } else if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo) {
                     self.move_undo_cursor(self.undo_cursor.saturating_add(5));
                 } else {
                     self.process_table
@@ -1223,7 +1361,10 @@ impl App {
             }
 
             Msg::EnterSearchMode => {
-                if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo) {
+                if matches!(
+                    self.state,
+                    AppState::Undo | AppState::ConfirmingUndo | AppState::Pressure
+                ) {
                     return FtuiCmd::none();
                 }
                 self.state = AppState::Searching;
@@ -1283,7 +1424,10 @@ impl App {
                 FtuiCmd::none()
             }
             Msg::ToggleHelp => {
-                if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo) {
+                if matches!(
+                    self.state,
+                    AppState::Undo | AppState::ConfirmingUndo | AppState::Pressure
+                ) {
                     return FtuiCmd::none();
                 }
                 self.state = if self.state == AppState::Help {
@@ -1294,6 +1438,31 @@ impl App {
                 FtuiCmd::none()
             }
 
+            Msg::OpenPressure => {
+                if self.operation_is_idle() {
+                    self.invalidate_selection();
+                    self.state = AppState::Pressure;
+                    self.set_status(
+                        "Inspecting this scan's pressure and workloads; no processes selected",
+                    );
+                }
+                FtuiCmd::none()
+            }
+            Msg::ClosePressure => {
+                if self.state == AppState::Pressure && self.operation_is_idle() {
+                    self.state = AppState::Normal;
+                    self.set_status("Pressure panel closed");
+                }
+                FtuiCmd::none()
+            }
+            Msg::FilterPressureUnit => {
+                self.filter_pressure_unit();
+                FtuiCmd::none()
+            }
+            Msg::ClearPressureFilter => {
+                self.clear_pressure_filter();
+                FtuiCmd::none()
+            }
             Msg::OpenUndo | Msg::RequestUndoRefresh => self.request_undo_refresh(),
             Msg::CloseUndo => {
                 if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo)
@@ -1391,6 +1560,11 @@ impl App {
                     return FtuiCmd::none();
                 }
                 self.invalidate_selection();
+                self.process_table.set_member_filter(None);
+                self.pressure_filter_label = None;
+                if self.state == AppState::Pressure {
+                    self.state = AppState::Normal;
+                }
                 let Some(ticket) = self.issue_operation_ticket() else {
                     return FtuiCmd::none();
                 };
@@ -1409,6 +1583,7 @@ impl App {
                     self.set_status("Refreshing process list (skeleton mode)...");
                     let prior = RefreshOutcome {
                         rows: self.process_table.rows.clone(),
+                        pressure: self.pressure.clone(),
                         goal_summary: self.goal_summary.clone(),
                         goal_selection: self.process_table.goal_selection().cloned(),
                     };
@@ -1668,6 +1843,7 @@ impl App {
             AppState::Searching => self.handle_ftui_search_key(key),
             AppState::Confirming => self.handle_ftui_confirm_key(key),
             AppState::Help => self.handle_ftui_help_key(key),
+            AppState::Pressure => self.handle_ftui_pressure_key(key),
             AppState::Undo => self.handle_ftui_undo_key(key),
             AppState::ConfirmingUndo => self.handle_ftui_confirm_key(key),
             AppState::Quitting => FtuiCmd::quit(),
@@ -1738,6 +1914,8 @@ impl App {
             FtuiKeyCode::Enter => self.toggle_detail_visibility(),
             FtuiKeyCode::Char('r') => return self.handle_msg(Msg::RequestRefresh),
             FtuiKeyCode::Char('U') => return self.handle_msg(Msg::OpenUndo),
+            FtuiKeyCode::Char('P') => return self.handle_msg(Msg::OpenPressure),
+            FtuiKeyCode::Char('c') => return self.handle_msg(Msg::ClearPressureFilter),
             FtuiKeyCode::Char('s') => self.set_detail_view(DetailView::Summary),
             FtuiKeyCode::Char('t') => self.set_detail_view(DetailView::Genealogy),
             FtuiKeyCode::Char('g') => {
@@ -1844,6 +2022,38 @@ impl App {
         }
     }
 
+    fn handle_ftui_pressure_key(&mut self, key: FtuiKeyEvent) -> FtuiCmd<Msg> {
+        if matches!(key.code, FtuiKeyCode::Escape | FtuiKeyCode::Char('P'))
+            || self.key_bindings.is_quit(&key)
+        {
+            return self.handle_msg(Msg::ClosePressure);
+        }
+        if self.key_bindings.is_next(&key) {
+            return self.handle_msg(Msg::CursorDown);
+        }
+        if self.key_bindings.is_prev(&key) {
+            return self.handle_msg(Msg::CursorUp);
+        }
+        match key.code {
+            FtuiKeyCode::Home => self.handle_msg(Msg::CursorHome),
+            FtuiKeyCode::End => self.handle_msg(Msg::CursorEnd),
+            FtuiKeyCode::PageUp => self.handle_msg(Msg::PageUp),
+            FtuiKeyCode::PageDown => self.handle_msg(Msg::PageDown),
+            FtuiKeyCode::Enter => self.handle_msg(Msg::FilterPressureUnit),
+            FtuiKeyCode::Char('c') => self.handle_msg(Msg::ClearPressureFilter),
+            FtuiKeyCode::Char('r') => self.handle_msg(Msg::RequestRefresh),
+            FtuiKeyCode::Char('[') => {
+                self.scroll_pressure_details(false);
+                FtuiCmd::none()
+            }
+            FtuiKeyCode::Char(']') => {
+                self.scroll_pressure_details(true);
+                FtuiCmd::none()
+            }
+            _ => FtuiCmd::none(),
+        }
+    }
+
     fn handle_ftui_help_key(&mut self, key: FtuiKeyEvent) -> FtuiCmd<Msg> {
         if matches!(
             key.code,
@@ -1857,6 +2067,131 @@ impl App {
             );
         }
         FtuiCmd::none()
+    }
+
+    fn pressure_detail_lines(&self, width: u16) -> Vec<FtuiLine> {
+        let style = self.theme.stylesheet().get_or_default("border.normal");
+        let details = if let Some(unit) = self.selected_pressure_unit() {
+            let mut lines = vec![unit.summary.clone()];
+            if unit.member_pids.is_empty() {
+                lines.push(
+                    "No candidate rows from this workload are displayed; filtering is unavailable."
+                        .to_string(),
+                );
+            }
+            lines.extend(unit.details.iter().cloned());
+            lines
+        } else if let Some(overview) = &self.pressure {
+            overview.details.clone()
+        } else {
+            vec!["Host pressure observations are unavailable for this snapshot. Refresh to collect a new scan.".to_string()]
+        };
+        details
+            .into_iter()
+            .flat_map(|detail| {
+                let text: String = detail
+                    .chars()
+                    .map(|ch| if ch.is_control() { ' ' } else { ch })
+                    .collect();
+                FtuiLine::from_spans([FtuiSpan::styled(text, style)])
+                    .wrap(width as usize, WrapMode::WordChar)
+            })
+            .collect()
+    }
+
+    fn render_pressure_panel(&self, area: Rect, frame: &mut FtuiFrame) {
+        let sheet = self.theme.stylesheet();
+        let normal = sheet.get_or_default("border.normal");
+        let heading = sheet.get_or_default("table.header");
+        let selected = sheet.get_or_default("table.selected");
+        let block = super::widgets::panel_block()
+            .title(" Pressure and responsible workloads ")
+            .border_style(normal);
+        let inner = block.inner(area);
+        block.render(area, frame);
+        if inner.height == 0 || inner.width == 0 {
+            return;
+        }
+        let clean = |text: &str| -> String {
+            text.chars()
+                .map(|ch| if ch.is_control() { ' ' } else { ch })
+                .collect()
+        };
+        let line = |text: String, style| FtuiLine::from_spans([FtuiSpan::styled(text, style)]);
+        let mut lines = vec![line(
+            if inner.width >= 76 {
+                "j/k browse  [/] details  Enter filter  c clear filter  r refresh  P/Esc close"
+                    .to_string()
+            } else {
+                "j/k browse | [/] details | Enter filter | c clear | Esc close".to_string()
+            },
+            heading,
+        )];
+        let units = self
+            .pressure
+            .as_ref()
+            .map_or(&[][..], |overview| overview.units.as_slice());
+        let entries = units.len().saturating_add(1);
+        let visible = ((inner.height as usize).saturating_sub(5) / 3)
+            .clamp(1, 7)
+            .min(entries);
+        let start = self
+            .pressure_cursor
+            .saturating_sub(visible.saturating_sub(1));
+        let end = start.saturating_add(visible).min(entries);
+        lines.push(line(
+            format!("Host and workloads {}-{} of {}", start + 1, end, entries),
+            heading,
+        ));
+        for index in start..end {
+            let label = if index == 0 {
+                "Host pressure".to_string()
+            } else {
+                let unit = &units[index - 1];
+                format!(
+                    "{} ({} candidate rows)",
+                    clean(&unit.label),
+                    unit.member_pids.len()
+                )
+            };
+            lines.push(line(
+                format!(
+                    "{} {}",
+                    if index == self.pressure_cursor {
+                        ">"
+                    } else {
+                        " "
+                    },
+                    label
+                ),
+                if index == self.pressure_cursor {
+                    selected
+                } else {
+                    normal
+                },
+            ));
+        }
+        let title = self
+            .selected_pressure_unit()
+            .map_or("Host pressure", |unit| unit.label.as_str());
+        lines.push(line(format!("Details: {}", clean(title)), heading));
+        let details = self.pressure_detail_lines(inner.width);
+        let offset = self
+            .pressure_detail_offset
+            .min(details.len().saturating_sub(1));
+        let shown = (inner.height as usize).saturating_sub(lines.len() + 1);
+        lines.push(line(
+            format!(
+                "Lines {}-{} of {}  ([/] scroll)",
+                usize::from(!details.is_empty()) + offset,
+                offset.saturating_add(shown).min(details.len()),
+                details.len()
+            ),
+            heading,
+        ));
+        lines.extend(details.into_iter().skip(offset).take(shown));
+        let text: FtuiText = lines.into_iter().collect();
+        FtuiParagraph::new(text).render(inner, frame);
     }
 
     fn undo_detail_lines(&self, width: u16) -> Vec<FtuiLine> {
@@ -2090,16 +2425,21 @@ impl FtuiModel for App {
             return;
         }
 
-        if matches!(self.state, AppState::Undo | AppState::ConfirmingUndo) {
-            self.render_undo_panel(
-                Rect::new(
-                    full_area.x,
-                    full_area.y,
-                    full_area.width,
-                    full_area.height.saturating_sub(1),
-                ),
-                frame,
+        if matches!(
+            self.state,
+            AppState::Undo | AppState::ConfirmingUndo | AppState::Pressure
+        ) {
+            let panel_area = Rect::new(
+                full_area.x,
+                full_area.y,
+                full_area.width,
+                full_area.height.saturating_sub(1),
             );
+            if self.state == AppState::Pressure {
+                self.render_pressure_panel(panel_area, frame);
+            } else {
+                self.render_undo_panel(panel_area, frame);
+            }
             let mut status = StatusBar::new().theme(&self.theme);
             if let Some(message) = &self.status_message {
                 status = status.message(message);
@@ -2122,24 +2462,38 @@ impl FtuiModel for App {
                         .render_view(layout.popup_area(80, 55), frame, &self.confirm_dialog);
                 }
             }
+            if self.command_palette.is_visible() {
+                self.command_palette.render(full_area, frame);
+            }
             return;
         }
 
-        // Compute areas with optional goal-summary header
-        let header_height = self
-            .goal_summary
+        // Pressure and goal observations always belong to the same displayed scan.
+        let mut header_lines: Vec<String> = self
+            .pressure
             .as_ref()
-            .map(|lines| lines.len().min(4) as u16)
-            .unwrap_or(0);
-        let areas = layout.main_areas_with_header(header_height);
+            .into_iter()
+            .flat_map(|overview| overview.header.iter().take(2).cloned())
+            .collect();
+        if let Some(label) = &self.pressure_filter_label {
+            header_lines.push(format!("Workload filter: {label}  [c clear | P inspect]"));
+        }
+        if let Some(lines) = &self.goal_summary {
+            header_lines.extend(lines.iter().take(4).cloned());
+        }
+        let areas = layout.main_areas_with_header(header_lines.len() as u16);
 
-        // ── Header (goal summary) ──────────────────────────────────────
-        if let (Some(header_area), Some(lines)) = (areas.header, &self.goal_summary) {
-            for (i, line) in lines.iter().enumerate() {
+        // ── Header (pressure, active workload, and goal summary) ────────
+        if let Some(header_area) = areas.header {
+            for (i, line) in header_lines.iter().enumerate() {
                 if i as u16 >= header_area.height {
                     break;
                 }
-                draw_ftui_text(frame, header_area.x, header_area.y + i as u16, line);
+                let line: String = line
+                    .chars()
+                    .map(|ch| if ch.is_control() { ' ' } else { ch })
+                    .collect();
+                draw_ftui_text(frame, header_area.x, header_area.y + i as u16, &line);
             }
         }
 
@@ -2181,7 +2535,9 @@ impl FtuiModel for App {
 
         // ── Status bar ─────────────────────────────────────────────────
         let status_mode = match self.state {
-            AppState::Normal | AppState::Quitting | AppState::Undo => StatusMode::Normal,
+            AppState::Normal | AppState::Quitting | AppState::Undo | AppState::Pressure => {
+                StatusMode::Normal
+            }
             AppState::Searching => StatusMode::Searching,
             AppState::Confirming | AppState::ConfirmingUndo => StatusMode::Confirming,
             AppState::Help => StatusMode::Help,
@@ -2834,6 +3190,7 @@ mod tests {
         let mut app = App::new();
         app.replace_processes(RefreshOutcome {
             rows: vec![kill_row(42), kill_row(99)],
+            pressure: None,
             goal_summary: Some(vec!["old forecast".to_string()]),
             goal_selection: Some([(42, 0)].into()),
         });
@@ -2842,6 +3199,7 @@ mod tests {
         app.set_refresh_op(Arc::new(move || {
             Ok(RefreshOutcome {
                 rows: vec![kill_row(42), kill_row(99)],
+                pressure: None,
                 goal_summary: Some(vec!["new forecast".to_string()]),
                 goal_selection: Some([(99, 0)].into()),
             })

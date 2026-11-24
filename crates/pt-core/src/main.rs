@@ -98,7 +98,8 @@ use pt_core::supervision::{
 use pt_core::tui::widgets::ProcessRow;
 #[cfg(feature = "ui")]
 use pt_core::tui::{
-    run_ftui, App, ExecutionOutcome, RefreshOutcome, UndoBatch, UndoOverview, UndoRestoreOutcome,
+    run_ftui, App, ExecutionOutcome, PressureOverview, PressureUnit, RefreshOutcome, UndoBatch,
+    UndoOverview, UndoRestoreOutcome,
 };
 use pt_core::verify::relief::{capture_resource_observation, ResourceDelta, DEFAULT_SETTLE_MS};
 use pt_core::verify::relief_store::{
@@ -2952,13 +2953,23 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
                     let undo_preview = execution_evidence
                         .values()
                         .find_map(|evidence| evidence["undo_preview"].as_str());
-                    let mode = (learning_warning.is_some() || undo_preview.is_some()).then(|| {
+                    let recovery =
+                        tui_recovery_summary(&handle_e, &plan, &result, &execution_evidence);
+                    let mode = (learning_warning.is_some()
+                        || undo_preview.is_some()
+                        || recovery.is_some())
+                    .then(|| {
                         let mut message = format!(
                             "{} succeeded, {} failed",
                             result.summary.actions_succeeded, result.summary.actions_failed,
                         );
+                        if let Some(recovery) = &recovery {
+                            message.push_str(&format!("; {recovery}"));
+                        }
                         if let Some(preview) = undo_preview {
-                            message.push_str(&format!("; undo preview: {preview}"));
+                            message.push_str(&format!(
+                                "; U: inspect recorded controls; CLI: {preview}"
+                            ));
                         }
                         if let Some(error) = learning_warning {
                             message.push_str(&format!(
@@ -3335,6 +3346,19 @@ fn score_tui_rows(
         session_id,
         &pressure,
     )?;
+    let activities: Vec<_> = population
+        .iter()
+        .filter_map(|process| scorer.activity_for(process))
+        .collect();
+    let visible_pids = output.snapshot.rows.iter().map(|row| row.pid).collect();
+    output.snapshot.pressure = Some(project_tui_pressure(
+        &system_state,
+        &pressure,
+        population,
+        census_complete,
+        &activities,
+        &visible_pids,
+    ));
     for row in &mut output.snapshot.rows {
         if selected.contains(&row.pid) {
             let record_observed =
@@ -3360,6 +3384,291 @@ fn score_tui_rows(
     system_state["deep_collection"] = serde_json::json!(probe_run.report);
     output.system_state = Some(system_state);
     Ok(output)
+}
+
+#[cfg(feature = "ui")]
+fn tui_pressure_bytes(bytes: f64) -> String {
+    for (scale, unit) in [
+        (1_073_741_824.0, "GiB"),
+        (1_048_576.0, "MiB"),
+        (1024.0, "KiB"),
+    ] {
+        if bytes >= scale {
+            return format!("{:.1} {unit}", bytes / scale);
+        }
+    }
+    format!("{bytes:.0} B")
+}
+
+/// A known subtotal never becomes a whole-unit total on the display surface.
+#[cfg(feature = "ui")]
+fn tui_observed_total(
+    total: &pt_core::collect::responsible_units::ObservedTotal,
+    format_value: impl Fn(f64) -> String,
+) -> String {
+    let valid = |value: f64| value.is_finite() && value >= 0.0;
+    let coverage = format!(
+        "measured {}/{}",
+        total.observed_members, total.total_members
+    );
+    if total.total_members > 0 && total.observed_members == total.total_members {
+        if let Some(value) = total.value.filter(|value| valid(*value)) {
+            return format!("{} ({coverage})", format_value(value));
+        }
+    }
+    match total.observed.filter(|value| valid(*value)) {
+        Some(value) if total.observed_members > 0 => format!(
+            "unknown total; observed subtotal {} ({coverage})",
+            format_value(value),
+        ),
+        _ => format!("unknown ({coverage})"),
+    }
+}
+
+#[cfg(feature = "ui")]
+fn tui_pressure_regime_name(kind: RegimeKind) -> &'static str {
+    match kind {
+        RegimeKind::CpuContention => "CPU contention",
+        RegimeKind::IoBound => "I/O pressure",
+        RegimeKind::MemoryExhaustion => "Memory exhaustion",
+        RegimeKind::CacheBloat => "Cache pressure",
+        RegimeKind::SwapThrash => "Swap thrashing",
+        RegimeKind::SwapParadox => "Swap with available RAM",
+        RegimeKind::SwapExhaustion => "Swap exhaustion",
+        RegimeKind::OomKills => "OOM kills",
+        RegimeKind::FdExhaustion => "File descriptor exhaustion",
+        RegimeKind::ZombieLeak => "Zombie accumulation",
+        RegimeKind::DstateStorm => "Blocked processes",
+    }
+}
+
+#[cfg(feature = "ui")]
+fn tui_pressure_severity(severity: PressureSeverity) -> &'static str {
+    match severity {
+        PressureSeverity::Ok => "ok",
+        PressureSeverity::Warn => "warn",
+        PressureSeverity::Crit => "crit",
+    }
+}
+
+/// Project the completed scan and its shared activity window without touching
+/// procfs, collecting cgroups, resampling rates, or changing action candidates.
+#[cfg(feature = "ui")]
+fn project_tui_pressure(
+    system_state: &serde_json::Value,
+    pressure: &PlanningPressure,
+    population: &[ProcessRecord],
+    census_complete: bool,
+    activities: &[pt_core::collect::ProcessActivity],
+    visible_pids: &HashSet<u32>,
+) -> PressureOverview {
+    use pt_core::collect::pressure::PsiLine;
+    use pt_core::decision::pressure_regime::PressureAssessment;
+
+    let host = pressure.snapshot.as_ref();
+    let online_cpus = host.map(|host| host.cpus).filter(|cpus| *cpus > 0);
+    let table = attribute_responsible_units(
+        population,
+        activities,
+        &[],
+        online_cpus,
+        responsible_unit_rank(pressure),
+    );
+    let valid_number = |value: f64| value.is_finite() && value >= 0.0;
+    let valid_percent = |value: f64| value.is_finite() && (0.0..=100.0).contains(&value);
+    let psi = |line: Option<PsiLine>| {
+        line.filter(|line| {
+            [line.avg10, line.avg60, line.avg300]
+                .into_iter()
+                .all(valid_percent)
+        })
+        .map(|line| line.avg10)
+    };
+    let percent = |value: Option<f64>| {
+        value.map_or_else(|| "unknown".to_string(), |value| format!("{value:.1}%"))
+    };
+    let load = host.and_then(|host| host.load).filter(|load| {
+        [load.one, load.five, load.fifteen]
+            .into_iter()
+            .all(valid_number)
+    });
+    let load_ratio = load
+        .zip(online_cpus)
+        .map(|(load, cpus)| load.one / f64::from(cpus));
+    let memory = host.and_then(|host| host.meminfo);
+    let total_memory = memory
+        .and_then(|memory| memory.total)
+        .filter(|total| *total > 0);
+    let available = memory
+        .and_then(|memory| memory.available)
+        .zip(total_memory)
+        .filter(|(available, total)| available <= total)
+        .map(|(available, _)| available);
+    // Do not turn malformed or absent swap evidence into an observed zero.
+    let swap = memory
+        .and_then(|memory| memory.swap_total.zip(memory.swap_free))
+        .filter(|(total, free)| free <= total)
+        .map(|(total, free)| total - free);
+    let cpu_psi = host.and_then(|host| host.cpu);
+    let memory_psi = host.and_then(|host| host.memory);
+    let io_psi = host.and_then(|host| host.io);
+    let observed: Vec<_> = population
+        .iter()
+        .filter(|process| table.unit_for(process).is_some())
+        .collect();
+    let complete = census_complete && observed.len() == population.len();
+    let zombies = observed
+        .iter()
+        .filter(|process| process.state == ProcessState::Zombie)
+        .count();
+    let blocked = observed
+        .iter()
+        .filter(|process| process.state == ProcessState::DiskSleep)
+        .count();
+    let assessment =
+        serde_json::from_value::<PressureAssessment>(system_state["assessment"].clone())
+            .ok()
+            .filter(|assessment| {
+                [
+                    assessment.cpu_some,
+                    assessment.memory_some,
+                    assessment.io_some,
+                ]
+                .into_iter()
+                .all(|value| value.is_none_or(valid_percent))
+                    && assessment.load_ratio.is_none_or(valid_number)
+                    && assessment
+                        .memory_used_fraction
+                        .is_none_or(|value| value.is_finite() && (0.0..=1.0).contains(&value))
+                    && [
+                        assessment.severity.cpu,
+                        assessment.severity.memory,
+                        assessment.severity.io,
+                        assessment.severity.fd,
+                    ]
+                    .into_iter()
+                    .all(|value| value.is_finite() && (0.0..=1.0).contains(&value))
+            });
+    let regimes = assessment.as_ref().map_or_else(
+        || "Regimes unknown".to_string(),
+        |assessment| match assessment.regimes.first() {
+            Some(regime) => format!(
+                "{}: {}{}",
+                tui_pressure_regime_name(regime.kind),
+                tui_pressure_severity(regime.severity),
+                if assessment.regimes.len() > 1 {
+                    format!(" (+{})", assessment.regimes.len() - 1)
+                } else {
+                    String::new()
+                },
+            ),
+            None => "No active regime detected".to_string(),
+        },
+    );
+    let header = vec![
+        format!(
+            "Load/online {} | Avail {} | Swap {} | {} {zombies}",
+            load_ratio.zip(online_cpus).map_or_else(
+                || "unknown".to_string(),
+                |(ratio, cpus)| format!("{ratio:.2}x/{cpus} CPUs")
+            ),
+            available.map_or_else(|| "unknown".to_string(), bytes_to_human),
+            swap.map_or_else(|| "unknown".to_string(), bytes_to_human),
+            if complete { "Z" } else { "Z observed" },
+        ),
+        format!(
+            "PSI some avg10 C/M/I {}/{}/{} | {regimes}",
+            percent(psi(cpu_psi.and_then(|resource| resource.some))),
+            percent(psi(memory_psi.and_then(|resource| resource.some))),
+            percent(psi(io_psi.and_then(|resource| resource.some))),
+        ),
+    ];
+    let rank = match table.rank_by {
+        AttributionResource::Cpu => "CPU",
+        AttributionResource::Memory => "memory",
+        AttributionResource::Io => "storage I/O",
+    };
+    let mut details = vec![
+        format!("Online logical CPUs: {}. Effective affinity/quota capacity is not inferred from this count.", online_cpus.map_or_else(|| "unknown".to_string(), |cpus| cpus.to_string())),
+        load.map_or_else(|| "Load averages: unknown".to_string(), |load| format!("Load averages (1/5/15 min): {:.2}/{:.2}/{:.2}", load.one, load.five, load.fifteen)),
+        format!("Available RAM: {}; total RAM: {}; swap used: {}", available.map_or_else(|| "unknown".to_string(), |value| tui_pressure_bytes(value as f64)), total_memory.map_or_else(|| "unknown".to_string(), |value| tui_pressure_bytes(value as f64)), swap.map_or_else(|| "unknown".to_string(), |value| tui_pressure_bytes(value as f64))),
+        format!("{} census: {} uniquely observed processes; zombies {zombies}; blocked D-state {blocked}. {}", if complete { "Complete" } else { "Partial" }, table.attributed_processes, if complete { "Counts belong to this scan." } else { "Unobserved processes are not counted; host totals remain unknown." }),
+        "PSI gauges are kernel avg10 averages. Recorded regime diagnoses may use the shared measurement-window deltas instead.".to_string(),
+        format!("Process-tree attribution only, ranked by observed {rank}; cgroup membership and kernel cgroup accounting were not observed for this view."),
+        "RSS sums can count shared pages more than once; they are not uniquely reclaimable memory.".to_string(),
+        "Unit membership describes this census. Filtering only intersects rows from the same scan and never selects or authorizes a group action.".to_string(),
+        table.sampling_window_ms.map_or_else(|| "Recent CPU/I/O sampling window: unknown; missing rates remain unknown.".to_string(), |milliseconds| format!("Recent CPU/I/O rates use the shared {milliseconds} ms process sampling window; lifetime CPU is not substituted.")),
+    ];
+    for (name, resource) in [("CPU", cpu_psi), ("Memory", memory_psi), ("I/O", io_psi)] {
+        details.push(format!(
+            "{name} PSI some avg10: {}; full avg10: {}",
+            percent(psi(resource.and_then(|resource| resource.some))),
+            percent(psi(resource.and_then(|resource| resource.full)))
+        ));
+    }
+    details.push(
+        pressure
+            .cpu_usage
+            .as_ref()
+            .and_then(|window| {
+                window.busy_percent().map(|busy| {
+                    format!(
+                        "Host CPU busy: {busy:.1}% over {:.3} s ({} observed online CPUs)",
+                        window.window_seconds, window.logical_cpus
+                    )
+                })
+            })
+            .unwrap_or_else(|| "Host CPU busy over the shared window: unknown".to_string()),
+    );
+    match &assessment {
+        Some(assessment) if assessment.regimes.is_empty() => details.push("No active pressure regime was detected in the available evidence; unavailable sources do not establish health.".to_string()),
+        Some(assessment) => details.extend(assessment.regimes.iter().map(|regime| format!("{}: {}{}; {}", tui_pressure_regime_name(regime.kind), tui_pressure_severity(regime.severity), if regime.sustained { " (sustained)" } else { "" }, regime.explanation))),
+        None => details.push("Pressure regimes: unknown; the recorded assessment is missing or invalid.".to_string()),
+    }
+    details.extend(
+        pressure
+            .unavailable
+            .iter()
+            .chain(&table.unavailable)
+            .map(|reason| format!("Unavailable: {reason}")),
+    );
+    details.extend(
+        table
+            .limitations
+            .iter()
+            .map(|limitation| limitation.to_string()),
+    );
+    let units = table.units.into_iter().map(|unit| {
+        let mut member_pids: Vec<_> = unit.members.iter().map(|member| member.pid)
+            .filter(|pid| visible_pids.contains(pid)).collect();
+        member_pids.sort_unstable();
+        member_pids.dedup();
+        let cpu = tui_observed_total(&unit.usage.cpu_cores, |value| format!("{value:.2} cores"));
+        let rss = tui_observed_total(&unit.usage.rss_bytes, tui_pressure_bytes);
+        let summary = format!("{} observed members / {} shown | CPU {cpu} | RSS {rss}", unit.member_count, member_pids.len());
+        let mut details = vec![
+            format!("{} observed census members; {} have rows in this same scan.", unit.member_count, member_pids.len()),
+            format!("CPU: {cpu}"),
+            format!("RSS sum: {rss}; shared pages may be counted more than once"),
+            format!("Swap: {}", tui_observed_total(&unit.usage.swap_bytes, tui_pressure_bytes)),
+            format!("Storage read: {}", tui_observed_total(&unit.usage.read_bytes_per_second, |value| format!("{}/s", tui_pressure_bytes(value)))),
+            format!("Storage write: {}", tui_observed_total(&unit.usage.write_bytes_per_second, |value| format!("{}/s", tui_pressure_bytes(value)))),
+            format!("Major faults: {}", tui_observed_total(&unit.usage.major_faults_per_second, |value| format!("{value:.2}/s"))),
+            format!("Leader run-queue wait: {}", tui_observed_total(&unit.usage.leader_run_queue_wait_seconds_per_second, |value| format!("{value:.3} s/s"))),
+            format!("Leader block-I/O delay: {}", tui_observed_total(&unit.usage.leader_blkio_delay_seconds_per_second, |value| format!("{value:.3} s/s"))),
+            "Cgroup membership/accounting: not observed; this is process-tree attribution.".to_string(),
+        ];
+        if member_pids.is_empty() {
+            details.push("No member has a displayed process row; this unit cannot filter or select action candidates.".to_string());
+        }
+        details.extend(unit.unavailable.into_iter().map(|reason| format!("Unavailable: {reason}")));
+        PressureUnit { id: unit.id, label: unit.label, member_pids, summary, details }
+    }).collect();
+    PressureOverview {
+        header,
+        details,
+        units,
+    }
 }
 
 #[cfg(feature = "ui")]
@@ -5876,7 +6185,12 @@ fn execute_tui_plan_selection(
             }
         }
         if let Some(control) = &control_session {
-            for captured in evidence.values_mut() {
+            for outcome in &result.outcomes {
+                // A child reference is useful even for a precheck refusal. It
+                // does not claim runner entry, an executed action, or a receipt.
+                let captured = evidence
+                    .entry(outcome.action_id.clone())
+                    .or_insert_with(|| serde_json::json!({}));
                 captured["control_session_id"] = serde_json::json!(control.handle.id.0);
                 captured["control_plan_sha256"] = serde_json::json!(control.plan_sha256);
                 captured["undo_preview"] = serde_json::json!(format!(
@@ -6454,6 +6768,41 @@ fn execution_result(
     }
 }
 
+/// Surface the first failed action immediately; the complete typed advice is
+/// retained with every durable outcome. This never retries an action or probes
+/// a PID merely to generate a hint.
+#[cfg(feature = "ui")]
+fn tui_recovery_summary(
+    parent: &SessionHandle,
+    plan: &Plan,
+    result: &pt_core::action::ExecutionResult,
+    execution_evidence: &HashMap<String, serde_json::Value>,
+) -> Option<String> {
+    result.outcomes.iter().find_map(|outcome| {
+        let category = pt_core::action::FailureCategory::from_action_status(&outcome.status)?;
+        let action = plan
+            .actions
+            .iter()
+            .find(|action| action.action_id == outcome.action_id)?;
+        let session = SessionId(
+            execution_evidence
+                .get(&outcome.action_id)
+                .and_then(|evidence| evidence["control_session_id"].as_str())
+                .unwrap_or(&parent.id.0)
+                .to_string(),
+        );
+        let guidance = pt_core::action::recovery_tree::advisory_recovery(
+            category,
+            Some(action.action),
+            &session,
+        );
+        Some(format!(
+            "{} Next: {}",
+            guidance.diagnosis, guidance.recovery_hint.agent_next_step
+        ))
+    })
+}
+
 #[cfg(feature = "ui")]
 fn write_outcomes_for_mode(
     handle: &SessionHandle,
@@ -6487,14 +6836,20 @@ fn write_outcomes_from_execution(
 ) -> Result<Vec<pt_core::verify::SavedActionOutcome>, String> {
     use pt_core::action::ActionStatus;
 
-    let mut by_id: HashMap<String, u32> = HashMap::new();
-    for action in &plan.actions {
-        by_id.insert(action.action_id.clone(), action.target.pid.0);
-    }
+    let by_id: HashMap<&str, &PlanAction> = plan
+        .actions
+        .iter()
+        .map(|action| (action.action_id.as_str(), action))
+        .collect();
+    // Parent mirrors must retain byte-equivalent recovery advice to their
+    // canonical child outcomes. Verification and inspection therefore refer
+    // to the immutable control session in both journals.
+    let recovery_session = SessionId(control_session_id.unwrap_or(&handle.id.0).to_string());
 
     let mut outcomes = Vec::with_capacity(result.outcomes.len());
     for outcome in &result.outcomes {
-        let pid = by_id.get(&outcome.action_id).copied().unwrap_or_default();
+        let action = by_id.get(outcome.action_id.as_str()).copied();
+        let pid = action.map(|action| action.target.pid.0).unwrap_or_default();
         let mut entry = serde_json::json!({
             "action_id": outcome.action_id,
             "pid": pid,
@@ -6526,6 +6881,17 @@ fn write_outcomes_from_execution(
                     serde_json::Value::String(reason.clone()),
                 );
             }
+        }
+        if let (Some(action), Some(category)) = (
+            action,
+            pt_core::action::FailureCategory::from_action_status(&outcome.status),
+        ) {
+            insert_apply_failure_recovery(
+                &recovery_session,
+                Some(action.action),
+                category,
+                &mut entry,
+            );
         }
         // Both journals retain the actual result, including precheck refusals
         // and skipped actions. Global history counts the canonical child once;
@@ -8772,6 +9138,7 @@ fn build_tui_rows(
             rows,
             goal_summary,
             goal_selection,
+            pressure: None,
         },
         plan_candidates,
         system_state: None,
@@ -27050,6 +27417,12 @@ mod process_tree_safety_tests {
                 .as_str()
                 .is_some()
         }));
+        for line in history.lines() {
+            let outcome: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert!(outcome.get("failure_type").is_none());
+            assert!(outcome.get("recovery_hint").is_none());
+            assert!(outcome.get("automatic_retry").is_none());
+        }
     }
 
     #[cfg(all(feature = "ui", target_os = "linux"))]
@@ -27163,6 +27536,127 @@ mod process_tree_safety_tests {
         .unwrap()
         .unwrap();
         (directory, parent, control)
+    }
+
+    #[cfg(all(feature = "ui", target_os = "linux"))]
+    #[test]
+    fn tui_recovery_advice_is_typed_durable_and_identical_in_child_and_parent() {
+        use pt_core::action::{ActionResult, ActionStatus};
+        use pt_core::plan::PreCheck;
+        use std::collections::HashMap;
+
+        for (label, status, expected) in [
+            (
+                "permission",
+                ActionStatus::PermissionDenied,
+                Some("permission_denied"),
+            ),
+            ("timeout", ActionStatus::Timeout, Some("timeout")),
+            (
+                "stale",
+                ActionStatus::IdentityMismatch,
+                Some("identity_mismatch"),
+            ),
+            (
+                "missing_identity",
+                ActionStatus::PreCheckBlocked {
+                    check: PreCheck::VerifyIdentity,
+                    reason: "untrusted diagnostic: sudo kill -9 123; retry".into(),
+                },
+                Some("evidence_unavailable"),
+            ),
+            (
+                "protected",
+                ActionStatus::PreCheckBlocked {
+                    check: PreCheck::CheckNotProtected,
+                    reason: "live infrastructure".into(),
+                },
+                Some("process_protected"),
+            ),
+            ("skipped", ActionStatus::Skipped, None),
+        ] {
+            let (_directory, parent, control) =
+                tui_undo_discovery_fixture(&format!("recovery-{label}"));
+            let child_bytes = std::fs::read(control.handle.dir.join("decision/plan.json")).unwrap();
+            let parent_bytes = std::fs::read(parent.dir.join("decision/plan.json")).unwrap();
+            let parent_plan =
+                pt_core::verify::parse_agent_plan(std::str::from_utf8(&parent_bytes).unwrap())
+                    .unwrap();
+            let action = &control.plan.actions[0];
+            let result = super::execution_result(vec![ActionResult {
+                action_id: action.action_id.clone(),
+                status,
+                time_ms: 7,
+                details: Some("actual execution diagnostic".into()),
+            }]);
+            let evidence = HashMap::new();
+            super::write_outcomes_from_execution(
+                &control.handle,
+                &control.plan,
+                &result,
+                &evidence,
+                Some(&control.handle.id.0),
+            )
+            .unwrap();
+            super::write_outcomes_from_execution(
+                &parent,
+                &parent_plan,
+                &result,
+                &evidence,
+                Some(&control.handle.id.0),
+            )
+            .unwrap();
+            let read_outcome = |handle: &pt_core::session::SessionHandle| {
+                let text =
+                    std::fs::read_to_string(handle.dir.join("action/outcomes.jsonl")).unwrap();
+                assert_eq!(text.lines().count(), 1);
+                serde_json::from_str::<serde_json::Value>(text.lines().next().unwrap()).unwrap()
+            };
+            let child = read_outcome(&control.handle);
+            let mirror = read_outcome(&parent);
+            assert_eq!(mirror["control_session_id"], control.handle.id.0);
+            assert_eq!(
+                mirror, child,
+                "recovery advice must preserve canonical mirror proof"
+            );
+            let immediate_evidence = HashMap::from([(
+                action.action_id.clone(),
+                serde_json::json!({"control_session_id": control.handle.id.0}),
+            )]);
+            let immediate =
+                super::tui_recovery_summary(&parent, &parent_plan, &result, &immediate_evidence);
+            if let Some(expected) = expected {
+                assert_eq!(child["failure_type"], expected);
+                assert_eq!(child["automatic_retry"], false);
+                assert!(!child["diagnosis"].as_str().unwrap().is_empty());
+                let hint = &child["recovery_hint"];
+                let next = hint["agent_next_step"].as_str().unwrap();
+                assert!(!next.contains("sudo"));
+                assert!(!next.contains("kill -"));
+                assert!(!next.contains("agent apply"));
+                assert!(!hint.to_string().contains("untrusted diagnostic"));
+                if hint["recommended_action"] != "replan" {
+                    assert!(next.contains(&control.handle.id.0), "{next}");
+                    assert!(!next.contains(&parent.id.0), "{next}");
+                }
+                assert!(immediate.unwrap().contains(next));
+            } else {
+                assert!(child.get("failure_type").is_none());
+                assert!(child.get("recovery_hint").is_none());
+                assert!(child.get("automatic_retry").is_none());
+                assert!(immediate.is_none());
+            }
+            assert_eq!(
+                std::fs::read(control.handle.dir.join("decision/plan.json")).unwrap(),
+                child_bytes
+            );
+            assert_eq!(
+                std::fs::read(parent.dir.join("decision/plan.json")).unwrap(),
+                parent_bytes
+            );
+            assert!(!control.handle.dir.join("action/reversals").exists());
+            assert!(!parent.dir.join("action/reversals").exists());
+        }
     }
 
     #[cfg(all(feature = "ui", target_os = "linux"))]
@@ -31317,6 +31811,259 @@ mod planning_pressure_tests {
                 ..ProcessPressureActivity::default()
             }),
         }
+    }
+
+    #[cfg(feature = "ui")]
+    fn tui_pressure_state(pressure: &PlanningPressure) -> serde_json::Value {
+        match &pressure.snapshot {
+            Some(snapshot) => serde_json::json!({
+                "assessment": assess_pressure(snapshot, None, None, &PressureThresholds::default()),
+            }),
+            None => serde_json::Value::Null,
+        }
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn tui_pressure_projection_uses_measured_rates_and_names_observation_windows() {
+        use pt_core::collect::pressure::{parse_psi, HostCpuWindow, LoadAvg};
+
+        let mut pressure = host();
+        let snapshot = pressure.snapshot.as_mut().unwrap();
+        snapshot.load = Some(LoadAvg {
+            one: 16.0,
+            five: 12.0,
+            fifteen: 8.0,
+            runnable: Some(4),
+            total: Some(100),
+        });
+        snapshot.cpu = parse_psi("some avg10=95.0 avg60=80.0 avg300=70.0 total=1000");
+        snapshot.meminfo = Some(MemInfo {
+            total: Some(8 << 30),
+            available: Some(2 << 30),
+            swap_total: Some(4 << 30),
+            swap_free: Some(3 << 30),
+            ..MemInfo::default()
+        });
+        pressure.cpu_usage = Some(HostCpuWindow {
+            total_ticks: 100,
+            busy_ticks: 25,
+            logical_cpus: 8,
+            window_seconds: 0.5,
+        });
+        let process = process();
+        let activity = activity(&process);
+        let overview = project_tui_pressure(
+            &tui_pressure_state(&pressure),
+            &pressure,
+            std::slice::from_ref(&process),
+            true,
+            std::slice::from_ref(&activity),
+            &HashSet::from([process.pid.0]),
+        );
+        assert_eq!(overview.header.len(), 2);
+        assert!(overview.header[0].contains("Load/online 2.00x/8 CPUs"));
+        assert!(overview.header[1].contains("PSI some avg10"));
+        assert!(overview.header[1].contains("95.0%"));
+        assert!(overview.header[1].contains("CPU contention: crit"));
+        assert!(overview
+            .details
+            .iter()
+            .any(|line| line.contains("Available RAM: 2.0 GiB")));
+        assert!(overview
+            .details
+            .iter()
+            .any(|line| line.contains("swap used: 1.0 GiB")));
+        assert!(overview
+            .details
+            .iter()
+            .any(|line| line.contains("Host CPU busy: 25.0% over 0.500 s")));
+        assert!(overview
+            .details
+            .iter()
+            .any(|line| line.contains("Effective affinity/quota capacity is not inferred")));
+        assert_eq!(overview.units.len(), 1);
+        assert!(overview.units[0]
+            .details
+            .iter()
+            .any(|line| line == "CPU: 4.00 cores (measured 1/1)"));
+        assert!(overview
+            .details
+            .iter()
+            .any(|line| line.contains("RSS sums can count shared pages")));
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn tui_pressure_projection_keeps_missing_invalid_and_lifetime_rates_unknown() {
+        use pt_core::collect::pressure::{parse_psi, HostCpuWindow, LoadAvg};
+
+        for invalid_host in [false, true] {
+            let mut pressure = PlanningPressure::default();
+            if invalid_host {
+                pressure = host();
+                let snapshot = pressure.snapshot.as_mut().unwrap();
+                snapshot.cpus = 0;
+                snapshot.load = Some(LoadAvg {
+                    one: f64::NAN,
+                    five: -1.0,
+                    fifteen: 1.0,
+                    runnable: None,
+                    total: None,
+                });
+                snapshot.cpu = parse_psi("some avg10=150.0 avg60=20.0 avg300=10.0 total=100");
+                snapshot.meminfo = Some(MemInfo {
+                    total: Some(1000),
+                    available: Some(2000),
+                    swap_total: Some(10),
+                    swap_free: Some(20),
+                    ..MemInfo::default()
+                });
+                pressure.cpu_usage = Some(HostCpuWindow {
+                    total_ticks: 100,
+                    busy_ticks: 200,
+                    logical_cpus: 8,
+                    window_seconds: 0.5,
+                });
+            }
+            let process = process();
+            let mut sample = activity(&process);
+            sample.source = "ps_lifetime_fallback".to_string();
+            sample.cpu_percent = Some(process.cpu_percent);
+            let overview = project_tui_pressure(
+                &tui_pressure_state(&pressure),
+                &pressure,
+                std::slice::from_ref(&process),
+                true,
+                &[sample],
+                &HashSet::from([process.pid.0]),
+            );
+            assert!(overview.header[0].contains("Load/online unknown"));
+            assert!(overview.header[0].contains("Avail unknown | Swap unknown"));
+            assert!(overview.header[1].contains("unknown/unknown/unknown"));
+            assert!(overview.header[1].contains("Regimes unknown"));
+            assert!(overview.units[0]
+                .details
+                .iter()
+                .any(|line| line == "CPU: unknown (measured 0/1)"));
+            let rendered = format!("{overview:?}");
+            assert!(!rendered.contains("NaN"));
+            assert!(!rendered.contains("150.0%"));
+            assert!(!rendered.contains("9.00 cores"));
+        }
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn tui_pressure_projection_labels_partial_subtotals_and_intersects_visible_members() {
+        let mut parent = process();
+        parent.comm = "claude".to_string();
+        parent.cmd = "claude".to_string();
+        let mut child = process();
+        child.pid = ProcessId(124);
+        child.ppid = parent.pid;
+        child.start_id = StartId::from_linux("pressure-test", 101, child.pid.0);
+        let sample = activity(&parent);
+        let overview = project_tui_pressure(
+            &serde_json::Value::Null,
+            &host(),
+            &[parent, child],
+            false,
+            &[sample],
+            &HashSet::from([124]),
+        );
+        assert_eq!(overview.units.len(), 1);
+        let unit = &overview.units[0];
+        assert_eq!(unit.member_pids, vec![124]);
+        assert!(unit.summary.contains("2 observed members / 1 shown"));
+        assert!(unit
+            .details
+            .iter()
+            .any(|line| line == "CPU: unknown total; observed subtotal 4.00 cores (measured 1/2)"));
+        assert!(unit
+            .details
+            .iter()
+            .any(|line| line == "Swap: unknown total; observed subtotal 200 B (measured 1/2)"));
+        assert!(unit
+            .details
+            .iter()
+            .any(|line| line.contains("Storage read: unknown total; observed subtotal")));
+        assert!(overview.header[0].contains("Z observed 0"));
+        assert!(overview
+            .details
+            .iter()
+            .any(|line| line.contains("host totals remain unknown")));
+        assert!(overview
+            .details
+            .iter()
+            .any(|line| line.contains("never selects or authorizes a group action")));
+        assert!(unit
+            .details
+            .iter()
+            .any(|line| line.contains("Cgroup membership/accounting: not observed")));
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn tui_pressure_projection_preserves_ranking_and_rejects_ambiguous_activity() {
+        let first = process();
+        let mut second = process();
+        second.pid = ProcessId(124);
+        second.start_id = StartId::from_linux("pressure-test", 101, second.pid.0);
+        let mut first_sample = activity(&first);
+        first_sample.cpu_percent = Some(100.0);
+        let mut second_sample = activity(&second);
+        second_sample.cpu_percent = Some(300.0);
+        let population = vec![first, second];
+        let samples = vec![first_sample, second_sample];
+        let visible = HashSet::from([123, 124]);
+        let project = |population: &[ProcessRecord], samples: &[ProcessActivity]| {
+            project_tui_pressure(
+                &serde_json::Value::Null,
+                &host(),
+                population,
+                true,
+                samples,
+                &visible,
+            )
+        };
+        let ranked = project(&population, &samples);
+        assert_eq!(ranked.units.len(), 2);
+        assert_eq!(ranked.units[0].member_pids, vec![124]);
+        let mut reused = samples.clone();
+        reused[1].start_id = StartId::from_linux("pressure-test", 999, 124);
+        let refused = project(&population, &reused);
+        let second = refused
+            .units
+            .iter()
+            .find(|unit| unit.member_pids == [124])
+            .unwrap();
+        assert!(second
+            .details
+            .iter()
+            .any(|line| line == "CPU: unknown (measured 0/1)"));
+        let mut mixed = samples.clone();
+        mixed[1].requested_window_ms = 1000;
+        let refused = project(&population, &mixed);
+        assert!(refused.units.iter().all(|unit| unit
+            .details
+            .iter()
+            .any(|line| line == "CPU: unknown (measured 0/1)")));
+        assert!(refused
+            .details
+            .iter()
+            .any(|line| line.contains("mixed requested sampling windows")));
+        let mut duplicate = population.clone();
+        duplicate.push(population[1].clone());
+        let refused = project(&duplicate, &samples);
+        assert!(refused
+            .units
+            .iter()
+            .all(|unit| !unit.member_pids.contains(&124)));
+        assert!(refused
+            .details
+            .iter()
+            .any(|line| line.contains("duplicate PID rows excluded")));
     }
 
     #[test]

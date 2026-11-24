@@ -8,7 +8,10 @@ use ftui::{
     Modifiers as FtuiModifiers,
 };
 use pt_core::tui::widgets::{DetailView, ProcessRow};
-use pt_core::tui::{App, AppState, Msg, UndoBatch, UndoOverview, UndoRestoreOutcome};
+use pt_core::tui::{
+    App, AppState, Msg, PressureOverview, PressureUnit, RefreshOutcome, UndoBatch, UndoOverview,
+    UndoRestoreOutcome,
+};
 
 // ===========================================================================
 // Helpers
@@ -46,6 +49,329 @@ fn confirmed_request(app: &mut App) -> Msg {
         panic!("a fresh confirmation must create a bound request");
     };
     request
+}
+
+fn pressure_overview() -> PressureOverview {
+    PressureOverview {
+        header: vec![
+            "Host load 3.0 / 8 online CPUs | PSI CPU some avg10 1.2%".into(),
+            "Available memory 2 GiB | Swap unknown | Regime cpu_contention [P details]".into(),
+        ],
+        details: vec![
+            "Observed host pressure from this scan".into(),
+            "Cgroup kernel accounting unavailable; process-tree grouping only".into(),
+        ],
+        units: vec![
+            PressureUnit {
+                id: "tree-alpha".into(),
+                label: "Alpha workload".into(),
+                member_pids: vec![1001, 1002],
+                summary: "CPU observed subtotal 0.5 cores, measured 1/2 members".into(),
+                details: vec!["RSS sums may count shared pages more than once".into()],
+            },
+            PressureUnit {
+                id: "tree-empty".into(),
+                label: "Protected workload".into(),
+                summary: "4 observed members; 0 candidate rows".into(),
+                ..PressureUnit::default()
+            },
+        ],
+    }
+}
+
+fn app_with_pressure() -> App {
+    let mut app = App::new();
+    app.replace_processes(RefreshOutcome {
+        rows: sample_rows(),
+        pressure: Some(pressure_overview()),
+        ..RefreshOutcome::default()
+    });
+    app
+}
+
+fn pressure_filter_first_unit(app: &mut App) {
+    send_msg(app, ftui_char('P'));
+    send_msg(app, Msg::CursorHome);
+    send_msg(app, ftui_char('j'));
+    send_msg(app, ftui_key(FtuiKeyCode::Enter));
+    assert_eq!(app.state, AppState::Normal);
+    assert_eq!(app.process_table.visible_rows().len(), 2);
+    assert_eq!(app.process_table.selected_count(), 0);
+}
+
+fn rendered_app(app: &App, width: u16, height: u16) -> String {
+    let mut pool = ftui::GraphemePool::new();
+    let mut frame = ftui::Frame::new(width, height, &mut pool);
+    <App as FtuiModel>::view(app, &mut frame);
+    ftui_harness::buffer_to_text(&frame.buffer)
+}
+
+#[test]
+fn pressure_header_and_scrollable_host_and_unit_details_render_without_a_goal() {
+    for (width, height) in [(80, 24), (120, 30), (200, 40)] {
+        let mut overview = pressure_overview();
+        overview
+            .details
+            .extend((1..=40).map(|n| format!("Host observation {n:02}")));
+        overview.units[0]
+            .details
+            .extend((1..=40).map(|n| format!("Unit observation {n:02}")));
+        let mut app = App::new();
+        app.replace_processes(RefreshOutcome {
+            rows: sample_rows(),
+            pressure: Some(overview),
+            ..RefreshOutcome::default()
+        });
+        send_msg(&mut app, Msg::Resized { width, height });
+        let text = rendered_app(&app, width, height);
+        assert!(text.contains("Host load 3.0 / 8 online CPUs"), "{text}");
+        assert!(text.contains("Swap unknown"), "{text}");
+        send_msg(&mut app, ftui_char('P'));
+        assert_eq!(app.state, AppState::Pressure);
+        assert!(app.selected_pressure_unit().is_none());
+        let text = rendered_app(&app, width, height);
+        assert!(
+            text.contains("Cgroup kernel accounting unavailable"),
+            "{text}"
+        );
+        for _ in 0..20 {
+            send_msg(&mut app, ftui_char(']'));
+        }
+        assert!(rendered_app(&app, width, height).contains("Host observation 40"));
+        send_msg(&mut app, ftui_char('j'));
+        let text = rendered_app(&app, width, height);
+        assert!(text.contains("measured 1/2 members"), "{text}");
+        assert!(text.contains("RSS sums may count shared pages"), "{text}");
+        for _ in 0..20 {
+            send_msg(&mut app, ftui_char(']'));
+        }
+        assert!(rendered_app(&app, width, height).contains("Unit observation 40"));
+        for _ in 0..20 {
+            send_msg(&mut app, ftui_char('['));
+        }
+        assert!(rendered_app(&app, width, height).contains("measured 1/2 members"));
+        assert_eq!(app.selected_pressure_unit().unwrap().id, "tree-alpha");
+        assert_eq!(app.process_table.selected_count(), 0);
+    }
+}
+
+#[test]
+fn pressure_filter_preserves_search_and_expires_process_confirmations_without_selecting() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let recorded = Arc::clone(&calls);
+    let mut app = app_with_pressure();
+    app.set_execute_op(Arc::new(move |_, _, _| {
+        recorded.fetch_add(1, Ordering::SeqCst);
+        Ok(pt_core::tui::ExecutionOutcome::default())
+    }));
+    send_msg(&mut app, Msg::SelectAll);
+    let old = confirmed_request(&mut app);
+    pressure_filter_first_unit(&mut app);
+    assert!(matches!(
+        <App as FtuiModel>::update(&mut app, old),
+        FtuiCmd::None
+    ));
+    assert!(app.process_table.get_explicitly_spared().is_empty());
+    assert!(app.process_table.get_explicitly_selected().is_empty());
+    assert_eq!(
+        app.process_table.rows.len(),
+        5,
+        "filtering retains canonical candidate rows"
+    );
+    app.search.set_value("node");
+    send_msg(&mut app, Msg::SearchCommit);
+    assert_eq!(app.process_table.visible_rows()[0].pid, 1001);
+    assert_eq!(app.process_table.visible_rows().len(), 1);
+    send_msg(&mut app, Msg::SelectAll);
+    let filtered = confirmed_request(&mut app);
+    send_msg(&mut app, ftui_char('c'));
+    assert_eq!(app.process_table.filter.as_deref(), Some("node"));
+    assert_eq!(app.process_table.visible_rows().len(), 1);
+    assert_eq!(app.process_table.selected_count(), 0);
+    assert!(matches!(
+        <App as FtuiModel>::update(&mut app, filtered),
+        FtuiCmd::None
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    app.search.set_value("");
+    send_msg(&mut app, Msg::SearchCommit);
+    assert_eq!(app.process_table.visible_rows().len(), 5);
+    send_msg(&mut app, Msg::OpenPressure);
+    send_msg(&mut app, Msg::SelectAll);
+    send_msg(&mut app, ftui_char('e'));
+    send_msg(&mut app, Msg::ConfirmExecute);
+    assert_eq!(app.state, AppState::Pressure);
+    assert_eq!(app.process_table.selected_count(), 0);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn pressure_refresh_replaces_observations_with_rows_and_discards_membership_filters() {
+    use std::sync::Arc;
+    let mut app = app_with_pressure();
+    let old_overview = app.pressure_overview().cloned();
+    pressure_filter_first_unit(&mut app);
+    send_msg(&mut app, Msg::SelectAll);
+    let old_request = confirmed_request(&mut app);
+    let mut new_overview = pressure_overview();
+    new_overview.header[0] = "New host pressure observation".into();
+    new_overview.units[0].member_pids = vec![1005];
+    new_overview.units[0].label = "New workload".into();
+    let expected = new_overview.clone();
+    app.set_refresh_op(Arc::new(move || {
+        Ok(RefreshOutcome {
+            rows: sample_rows()
+                .into_iter()
+                .filter(|row| row.pid == 1001 || row.pid == 1005)
+                .collect(),
+            pressure: Some(new_overview.clone()),
+            ..RefreshOutcome::default()
+        })
+    }));
+    let refresh = deferred_task(<App as FtuiModel>::update(&mut app, Msg::RequestRefresh));
+    assert_eq!(
+        app.process_table.visible_rows().len(),
+        5,
+        "refresh immediately clears the old filter"
+    );
+    let completed = refresh();
+    assert_eq!(
+        app.pressure_overview(),
+        old_overview.as_ref(),
+        "callback alone cannot update display"
+    );
+    for message in [
+        Msg::OpenPressure,
+        Msg::FilterPressureUnit,
+        Msg::ClearPressureFilter,
+        old_request,
+    ] {
+        assert!(matches!(
+            <App as FtuiModel>::update(&mut app, message),
+            FtuiCmd::None
+        ));
+    }
+    assert_eq!(app.state, AppState::Normal);
+    send_msg(
+        &mut app,
+        Msg::RefreshComplete {
+            ticket: u64::MAX,
+            result: Ok(RefreshOutcome::default()),
+        },
+    );
+    assert_eq!(app.pressure_overview(), old_overview.as_ref());
+    send_msg(&mut app, completed.clone());
+    assert_eq!(app.pressure_overview(), Some(&expected));
+    assert_eq!(app.process_table.visible_rows().len(), 2);
+    assert_eq!(app.process_table.selected_count(), 0);
+    send_msg(&mut app, completed);
+    send_msg(&mut app, ftui_char('P'));
+    assert!(app.selected_pressure_unit().is_none());
+    send_msg(&mut app, ftui_char('j'));
+    send_msg(&mut app, ftui_key(FtuiKeyCode::Enter));
+    assert_eq!(app.process_table.visible_rows().len(), 1);
+    assert_eq!(app.process_table.visible_rows()[0].pid, 1005);
+}
+
+#[test]
+fn pressure_unknown_and_unrepresented_units_never_widen_an_existing_filter() {
+    let mut app = app_with_rows();
+    send_msg(&mut app, ftui_char('P'));
+    assert!(rendered_app(&app, 80, 24).contains("Host pressure observations are unavailable"));
+    send_msg(&mut app, Msg::FilterPressureUnit);
+    assert_eq!(app.state, AppState::Pressure);
+    assert_eq!(app.process_table.visible_rows().len(), 5);
+    let mut overview = pressure_overview();
+    overview.units.push(PressureUnit {
+        id: "foreign".into(),
+        label: "No matching candidate".into(),
+        member_pids: vec![9999],
+        ..PressureUnit::default()
+    });
+    app.replace_processes(RefreshOutcome {
+        rows: sample_rows(),
+        pressure: Some(overview),
+        ..RefreshOutcome::default()
+    });
+    pressure_filter_first_unit(&mut app);
+    send_msg(&mut app, ftui_char('P'));
+    for expected in ["tree-empty", "foreign"] {
+        send_msg(&mut app, ftui_char('j'));
+        assert_eq!(app.selected_pressure_unit().unwrap().id, expected);
+        send_msg(&mut app, ftui_key(FtuiKeyCode::Enter));
+        assert_eq!(app.state, AppState::Pressure);
+        assert_eq!(app.process_table.visible_rows().len(), 2);
+        assert_eq!(app.process_table.selected_count(), 0);
+    }
+    send_msg(&mut app, ftui_char('c'));
+    assert_eq!(app.process_table.visible_rows().len(), 5);
+    send_msg(&mut app, Msg::ProcessesScanned(sample_rows()));
+    assert!(app.pressure_overview().is_none());
+    assert_eq!(app.state, AppState::Normal);
+    assert_eq!(app.process_table.visible_rows().len(), 5);
+}
+
+#[test]
+fn pressure_browsing_and_filter_changes_wait_for_execution_and_restoration() {
+    use std::sync::Arc;
+    let mut app = app_with_pressure();
+    app.set_execute_op(Arc::new(|_, _, _| {
+        Ok(pt_core::tui::ExecutionOutcome::default())
+    }));
+    pressure_filter_first_unit(&mut app);
+    send_msg(&mut app, Msg::SelectAll);
+    let request = confirmed_request(&mut app);
+    let execute = deferred_task(<App as FtuiModel>::update(&mut app, request));
+    for message in [
+        Msg::OpenPressure,
+        Msg::FilterPressureUnit,
+        Msg::ClearPressureFilter,
+    ] {
+        assert!(matches!(
+            <App as FtuiModel>::update(&mut app, message),
+            FtuiCmd::None
+        ));
+        assert_eq!(app.state, AppState::Normal);
+        assert_eq!(app.process_table.visible_rows().len(), 2);
+    }
+    send_msg(&mut app, execute());
+    app.set_undo_ops(
+        Arc::new(|| {
+            Ok(UndoOverview {
+                batches: vec![undo_batch("aaaa", 1)],
+                ..UndoOverview::default()
+            })
+        }),
+        Arc::new(|batch| {
+            Ok(UndoRestoreOutcome {
+                session_id: batch.session_id,
+                restored: 1,
+                ..UndoRestoreOutcome::default()
+            })
+        }),
+    );
+    load_undo(&mut app);
+    let request = confirmed_undo_request(&mut app);
+    let restore = deferred_task(<App as FtuiModel>::update(&mut app, request));
+    for message in [
+        Msg::OpenPressure,
+        Msg::FilterPressureUnit,
+        Msg::ClearPressureFilter,
+    ] {
+        assert!(matches!(
+            <App as FtuiModel>::update(&mut app, message),
+            FtuiCmd::None
+        ));
+        assert_eq!(app.state, AppState::Undo);
+        assert_eq!(app.process_table.visible_rows().len(), 2);
+    }
+    send_msg(&mut app, restore());
+    send_msg(&mut app, Msg::OpenPressure);
+    assert_eq!(app.state, AppState::Pressure);
 }
 
 fn undo_batch(suffix: &str, pending: usize) -> UndoBatch {

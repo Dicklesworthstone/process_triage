@@ -413,7 +413,7 @@ impl<'a> FtuiStatefulWidget for ProcessTable<'a> {
         let visible = state.visible_rows();
 
         if visible.is_empty() {
-            let msg = if state.filter.is_some() {
+            let msg = if state.filter.is_some() || state.member_filter.is_some() {
                 "No matching processes"
             } else {
                 "No process candidates found"
@@ -475,7 +475,7 @@ impl<'a> ProcessTable<'a> {
         let visible = state.visible_rows();
 
         if visible.is_empty() {
-            let msg = if state.filter.is_some() {
+            let msg = if state.filter.is_some() || state.member_filter.is_some() {
                 "No matching processes"
             } else {
                 "No process candidates found"
@@ -547,6 +547,8 @@ pub struct ProcessTableState {
     pub sort_order: SortOrder,
     /// Current filter query (lowercase).
     pub filter: Option<String>,
+    /// Display-only workload membership from the same scan as `rows`.
+    member_filter: Option<HashSet<u32>>,
     /// Current view mode (score vs goal ordering).
     pub view_mode: ViewMode,
     /// Executable goal selection (pid -> rank); an empty map selects nothing.
@@ -575,6 +577,7 @@ impl ProcessTableState {
             sort_column: SortColumn::Score,
             sort_order: SortOrder::Descending,
             filter: None,
+            member_filter: None,
             view_mode: ViewMode::SuspicionFirst,
             goal_rank: None,
             last_visible_height: 20,
@@ -584,6 +587,7 @@ impl ProcessTableState {
     /// Set the rows.
     pub fn set_rows(&mut self, rows: Vec<ProcessRow>) {
         self.deselect_all();
+        self.member_filter = None;
         self.rows = rows;
         self.cursor = 0;
         self.scroll_offset = 0;
@@ -644,20 +648,30 @@ impl ProcessTableState {
         self.scroll_offset = 0;
     }
 
+    /// Restrict visible rows to one workload without selecting any process.
+    /// `Some(empty)` intentionally shows no rows; only `None` clears the filter.
+    pub fn set_member_filter(&mut self, members: Option<HashSet<u32>>) {
+        self.deselect_all();
+        self.member_filter = members;
+        self.cursor = 0;
+        self.scroll_offset = 0;
+    }
+
     /// Get visible rows (after filtering).
     pub fn visible_rows(&self) -> Vec<&ProcessRow> {
-        if let Some(ref filter) = self.filter {
-            self.rows
-                .iter()
-                .filter(|r| {
-                    r.command.to_lowercase().contains(filter)
-                        || r.classification.to_lowercase().contains(filter)
-                        || r.pid.to_string().contains(filter)
-                })
-                .collect()
-        } else {
-            self.rows.iter().collect()
-        }
+        self.rows
+            .iter()
+            .filter(|row| {
+                self.member_filter
+                    .as_ref()
+                    .is_none_or(|members| members.contains(&row.pid))
+                    && self.filter.as_ref().is_none_or(|filter| {
+                        row.command.to_lowercase().contains(filter)
+                            || row.classification.to_lowercase().contains(filter)
+                            || row.pid.to_string().contains(filter)
+                    })
+            })
+            .collect()
     }
 
     /// Get the currently focused row (after filtering).

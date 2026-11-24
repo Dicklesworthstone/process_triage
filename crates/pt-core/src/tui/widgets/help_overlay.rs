@@ -123,6 +123,14 @@ const ACTIONS: &[Binding] = &[
         key: "v",
         desc: "Toggle goal view",
     },
+    Binding {
+        key: "P",
+        desc: "Pressure and workloads",
+    },
+    Binding {
+        key: "c",
+        desc: "Clear workload filter",
+    },
 ];
 
 const GENERAL: &[Binding] = &[
@@ -203,6 +211,7 @@ impl<'a> HelpOverlay<'a> {
             FtuiLine::raw("Search: /"),
             FtuiLine::raw("Select: Space/a/A/u/x"),
             FtuiLine::raw("Execute: e  Undo controls: U"),
+            FtuiLine::raw("Pressure: P  Clear workload filter: c"),
             FtuiLine::raw("Detail: Enter"),
             FtuiLine::raw("Views: s/t/g  Mode: v"),
             FtuiLine::raw("Help: ?  Quit: q"),

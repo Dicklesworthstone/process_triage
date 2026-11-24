@@ -193,6 +193,7 @@ The interactive TUI is built on **ftui** (an Elm-style Model-View-Update framewo
 - **Plan preview**: the canonical staged remedy, actual target PID, confidence, routing and live prechecks; parent-directed zombie remedies stay attached to the zombie's row
 - **Command palette**: fuzzy-searchable action palette for power users
 - **Undo controls** (`U`): inspect saved control batches and restore a selected batch after explicit confirmation
+- **Pressure and workloads** (`P`): inspect host pressure and responsible process trees from the displayed scan, then filter candidate rows by workload
 - **Inline mode** (`pt run --inline`): confines the UI to a bottom region, preserving terminal scrollback above
 
 From source: `cargo run -p pt-core -- run` (the `ui` feature is on by default).
@@ -204,6 +205,14 @@ allow inspection only. Restoration rechecks the saved batch and live control own
 stops on the first refusal or failure, and shows completed restorations alongside
 remaining pending controls. Already settled, unsupported, and unrecorded actions stay
 visible; irreversible actions cannot be undone.
+
+The pressure header remains visible without a relief goal. Press `P` to inspect host
+measurements and ranked workloads, `j`/`k` to browse, and `[`/`]` to scroll details.
+`Enter` filters the process table to that workload's candidate rows; it selects no
+actions. `c` clears the workload filter while preserving text search, and a refresh
+clears it automatically. Missing measurements and partial coverage stay explicit;
+process-tree totals are not exclusive cgroup accounting, and summed RSS can count
+shared pages more than once.
 
 ### Session Diffing
 
