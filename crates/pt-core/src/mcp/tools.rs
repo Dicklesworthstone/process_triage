@@ -9,7 +9,7 @@ use crate::collect::{deep_scan_with_budget, DeepScanOptions, DeepScanRecord, Dee
 use crate::collect::{quick_scan, ProcessActivity, ProcessRecord, QuickScanOptions, ScanResult};
 use crate::mcp::protocol::{ToolContent, ToolDefinition};
 use crate::scoring::{AgentActivityReport, ProcessScore, Scorer};
-use crate::signature_cli::load_user_signatures;
+use crate::supervision::pattern_persistence::{SignatureCatalog, SignatureOrigin};
 use crate::supervision::signature::ProcessMatchContext;
 use crate::supervision::{SignatureDatabase, SupervisorCategory};
 use std::collections::HashMap;
@@ -124,7 +124,8 @@ impl Evaluator {
             protected_filter,
             protected: HashMap::new(),
             min_age_seconds: config.policy.guardrails.min_process_age_seconds,
-            scorer: Scorer::from_config(&config).0,
+            scorer: Scorer::try_from_config(&config)
+                .map_err(|error| format!("failed to load scoring model: {error}"))?,
             #[cfg(target_os = "linux")]
             deep_records: HashMap::new(),
         })
@@ -1702,48 +1703,35 @@ fn tool_history(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
 }
 
 fn tool_signatures(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
-    let user_only = params
-        .get("user_only")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let user_only = match params.get("user_only") {
+        None => false,
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| "user_only must be a boolean".to_string())?,
+    };
     let category_filter = parse_signature_category_filter(params)?;
-
+    let catalog = SignatureCatalog::load(&config_dir())
+        .map_err(|error| format!("failed to load signature catalog: {error}"))?;
     let mut all_sigs = Vec::new();
-
-    if !user_only {
-        let mut db = SignatureDatabase::new();
-        db.add_default_signatures();
-        for sig in db.signatures() {
-            if let Some(parsed) = category_filter {
-                if sig.category != parsed {
-                    continue;
-                }
-            }
-            all_sigs.push(serde_json::json!({
-                "name": sig.name,
-                "category": format!("{:?}", sig.category),
-                "source": "builtin",
-                "priority": sig.priority,
-                "confidence": sig.confidence_weight,
-            }));
+    for entry in &catalog.entries {
+        if user_only && entry.origin == SignatureOrigin::BuiltIn {
+            continue;
         }
-    }
-
-    if let Some(user_schema) = load_user_signatures(&config_dir()) {
-        for sig in &user_schema.signatures {
-            if let Some(parsed) = category_filter {
-                if sig.category != parsed {
-                    continue;
-                }
-            }
-            all_sigs.push(serde_json::json!({
-                "name": sig.name,
-                "category": format!("{:?}", sig.category),
-                "source": "user",
-                "priority": sig.priority,
-                "confidence": sig.confidence_weight,
-            }));
+        let sig = &entry.signature;
+        if category_filter.is_some_and(|category| sig.category != category) {
+            continue;
         }
+        all_sigs.push(serde_json::json!({
+            "name": sig.name,
+            "category": format!("{:?}", sig.category),
+            "source": entry.origin.as_str(),
+            "provenance": entry.source,
+            "lifecycle": entry.lifecycle,
+            "active": entry.is_active(),
+            "disabled": entry.disabled,
+            "priority": sig.priority,
+            "confidence": sig.confidence_weight,
+        }));
     }
 
     let result = serde_json::json!({

@@ -51,25 +51,26 @@ pub use provenance::{
 /// Evidence-term name for desktop-application ownership.
 pub const DESKTOP_APP_FEATURE: &str = "desktop_app_session";
 
-/// Built-in signatures plus the user signatures in `config_dir` (see
-/// [`crate::signature_cli::user_signatures_path`]), with warnings for unreadable
-/// files and user signatures that could not be added.
+/// Load the complete active signature model from one coherent configuration
+/// snapshot. Explicit user signatures override custom/imported patterns, then
+/// learned patterns, then shipped defaults; disabled names suppress all layers.
+pub fn try_load_signature_database(config_dir: &Path) -> Result<SignatureDatabase, String> {
+    let catalog = crate::supervision::pattern_persistence::SignatureCatalog::load(config_dir)
+        .map_err(|error| format!("could not load signature configuration: {error}"))?;
+    catalog
+        .active_database()
+        .map_err(|error| format!("could not activate signature configuration: {error}"))
+}
+
+/// Best-effort read-only variant with an explicit warning for a failed model.
+/// A malformed or changing input activates no signatures: falling back to
+/// defaults could revive a name whose disable state could not be read. Live
+/// inference and action planning must use [`try_load_signature_database`].
 pub fn load_signature_database(config_dir: &Path) -> (SignatureDatabase, Vec<String>) {
-    let mut db = SignatureDatabase::with_defaults();
-    let mut warnings = Vec::new();
-    match crate::signature_cli::try_load_user_signatures(config_dir) {
-        Ok(Some(schema)) => {
-            for signature in schema.signatures {
-                let name = signature.name.clone();
-                if let Err(err) = db.add(signature) {
-                    warnings.push(format!("skipping invalid user signature '{name}': {err}"));
-                }
-            }
-        }
-        Ok(None) => {}
-        Err(error) => warnings.push(format!("ignoring unreadable user signatures: {error}")),
+    match try_load_signature_database(config_dir) {
+        Ok(database) => (database, Vec::new()),
+        Err(error) => (SignatureDatabase::new(), vec![error]),
     }
-    (db, warnings)
 }
 
 /// The signature fast-path settings of a policy.
@@ -868,9 +869,37 @@ impl Scorer {
         self
     }
 
-    /// The scorer for a loaded configuration: its priors and fast-path policy, the
-    /// learned verdicts and user signatures in its config directory. Returns warnings
-    /// for inputs that could not be read (the scorer then goes on without them).
+    /// Load a complete scorer, refusing unreadable or changing model inputs.
+    /// The priors and signature catalog must belong to the same fleet import
+    /// generation even when an import commits between their separate reads.
+    pub fn try_from_config(config: &ResolvedConfig) -> Result<Self, String> {
+        let verify_generation = || {
+            let current = crate::fleet::transfer::configuration_generation(&config.config_dir)
+                .map_err(|error| format!("could not load scoring configuration: {error}"))?;
+            if current != config.transfer_generation {
+                return Err(
+                    "configuration changed after priors were loaded; retry with a fresh configuration"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        };
+        verify_generation()?;
+        let decisions = DecisionStore::load(&config.config_dir)
+            .map_err(|error| format!("could not load decision store: {error}"))?;
+        let signatures = try_load_signature_database(&config.config_dir)?;
+        verify_generation()?;
+        Ok(Self::from_policy(
+            config.priors.clone(),
+            decisions,
+            signatures,
+            &config.policy,
+        ))
+    }
+
+    /// Best-effort scorer for read-only comparisons that inspect every returned
+    /// warning. A failed input is omitted, so this is not a complete configured
+    /// model; live inference and action planning use [`Self::try_from_config`].
     pub fn from_config(config: &ResolvedConfig) -> (Self, Vec<String>) {
         let mut warnings = Vec::new();
         let decisions = match DecisionStore::load(&config.config_dir) {
@@ -4071,16 +4100,130 @@ int main(int argc, char **argv) {
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("failed to parse user signatures"));
         assert!(warnings[0].contains("signatures.json"));
-        assert_eq!(
-            scorer.signatures.signatures().len(),
-            SignatureDatabase::with_defaults().signatures().len()
-        );
+        assert!(scorer.signatures.is_empty());
+        assert!(Scorer::try_from_config(&config).is_err());
 
         let unreadable = directory.join("unreadable");
         std::fs::create_dir_all(unreadable.join("signatures.json")).unwrap();
         let (_, warnings) = load_signature_database(&unreadable);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("failed to read user signatures"));
+    }
+
+    #[test]
+    fn persisted_patterns_change_inference_without_overriding_human_verdicts() {
+        use crate::supervision::pattern_persistence::PatternLibrary;
+
+        let directory = std::env::temp_dir().join(format!(
+            "pt-scorer-pattern-inference-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        eprintln!(
+            "retained pattern inference evidence: {}",
+            directory.display()
+        );
+        let options = crate::config::ConfigOptions {
+            config_dir: Some(directory.clone()),
+            ..Default::default()
+        };
+        let original = crate::config::load_config(&options).unwrap();
+        let before_scorer = Scorer::try_from_config(&original).unwrap();
+        let process = record(
+            5290,
+            "catalog-worker",
+            "catalog-worker --job alpha",
+            FOUR_DAYS,
+        );
+        let unrelated = record(
+            5291,
+            "unrelated-catalog-worker",
+            "unrelated-catalog-worker",
+            FOUR_DAYS,
+        );
+        let before = before_scorer
+            .score_with_desktop(&process, Evidence::default(), None)
+            .unwrap();
+        let before_unrelated = before_scorer
+            .score_with_desktop(&unrelated, Evidence::default(), None)
+            .unwrap();
+        assert_eq!(before.prior_source, "global");
+
+        let mut library = PatternLibrary::new(&directory);
+        library
+            .add_learned(
+                SupervisorSignature::new("pattern-only", SupervisorCategory::Other)
+                    .with_process_patterns(vec!["^catalog-worker$"])
+                    .with_priors(SignaturePriors::likely_abandoned())
+                    .with_confidence(0.4),
+            )
+            .unwrap();
+        library.save().unwrap();
+        let changed = Scorer::try_from_config(&original).unwrap_err();
+        assert!(
+            changed.contains("configuration changed after priors were loaded"),
+            "{changed}"
+        );
+        let fresh = crate::config::load_config(&options).unwrap();
+        let imported = Scorer::try_from_config(&fresh).unwrap();
+        let after = imported
+            .score_with_desktop(&process, Evidence::default(), None)
+            .unwrap();
+        assert_eq!(after.prior_source, "signature");
+        assert_eq!(
+            after.signature.as_ref().unwrap().signature.name,
+            "pattern-only"
+        );
+        assert_eq!(
+            after
+                .signature
+                .as_ref()
+                .unwrap()
+                .signature
+                .confidence_weight,
+            0.4
+        );
+        assert!(after.posterior.posterior.abandoned > before.posterior.posterior.abandoned);
+        let after_unrelated = imported
+            .score_with_desktop(&unrelated, Evidence::default(), None)
+            .unwrap();
+        assert_eq!(
+            after_unrelated.posterior.posterior,
+            before_unrelated.posterior.posterior
+        );
+
+        let mut decisions = DecisionStore::load(&directory).unwrap();
+        for _ in 0..3 {
+            decisions.record(&process.comm, &process.cmd, Verdict::Spare);
+        }
+        decisions.save().unwrap();
+        let reviewed = Scorer::try_from_config(&fresh).unwrap();
+        let with_verdict = reviewed
+            .score_with_desktop(&process, Evidence::default(), None)
+            .unwrap();
+        assert_eq!(with_verdict.prior_source, "user");
+        assert!(with_verdict.posterior.posterior.abandoned < after.posterior.posterior.abandoned);
+    }
+
+    #[test]
+    fn invalid_disable_state_cannot_fall_back_to_shipped_signatures() {
+        let directory =
+            std::env::temp_dir().join(format!("pt-scorer-disabled-model-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(directory.join("patterns")).unwrap();
+        eprintln!("retained disabled model evidence: {}", directory.display());
+        let path = directory.join("patterns/disabled.json");
+        std::fs::write(&path, b"{ malformed disabled names").unwrap();
+        let config = crate::config::load_config(&crate::config::ConfigOptions {
+            config_dir: Some(directory.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        let strict = Scorer::try_from_config(&config).unwrap_err();
+        assert!(strict.contains("disabled signatures"), "{strict}");
+        let (database, warnings) = load_signature_database(&directory);
+        assert!(database.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(std::fs::read(path).unwrap(), b"{ malformed disabled names");
     }
 
     #[cfg(unix)]

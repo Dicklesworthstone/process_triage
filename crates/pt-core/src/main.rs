@@ -2603,26 +2603,12 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
         ..Default::default()
     };
     let config = load_config(&config_options).map_err(|e| format!("load config: {}", e))?;
-    let priors = config.priors.clone();
     let policy = config.policy.clone();
-    // Explicit per-row judgments are recorded; later scans use them as learned
-    // priors. An unreadable store disables learning, not the TUI.
-    let decisions = match pt_core::decision::decision_store::DecisionStore::load(&config.config_dir)
-    {
-        Ok(store) => Some(store),
-        Err(e) => {
-            eprintln!("pt: decision learning disabled: {}", e);
-            None
-        }
-    };
-
-    // The same scorer as `agent plan`; each scan scores with the verdicts recorded so far.
-    let (signatures, signature_warnings) =
-        pt_core::scoring::load_signature_database(&config.config_dir);
-    for warning in signature_warnings {
-        eprintln!("pt: warning: {warning}");
-    }
-    let base_scorer = Scorer::from_policy(priors.clone(), Default::default(), signatures, &policy);
+    // A missing or damaged model input must not silently change what this
+    // action-capable view recommends. Each refresh retains this complete model
+    // while applying the explicitly recorded human verdicts.
+    let base_scorer = configured_scorer(&config).map_err(|error| error.to_string())?;
+    let decisions = Some(base_scorer.decisions.clone());
     let scorer_with = |decisions: Option<&pt_core::decision::decision_store::DecisionStore>| {
         let mut scorer = base_scorer.clone();
         scorer.decisions = decisions.cloned().unwrap_or_default();
@@ -9345,10 +9331,10 @@ fn run_scan(global: &GlobalOpts, args: &ScanArgs) -> ExitCode {
                     Ok(config) => config,
                     Err(error) => return output_config_error(global, &error),
                 };
-                let (mut scorer, warnings) = pt_core::scoring::Scorer::from_config(&config);
-                for warning in warnings {
-                    eprintln!("scan: replay recording warning: {warning}");
-                }
+                let mut scorer = match configured_scorer(&config) {
+                    Ok(scorer) => scorer,
+                    Err(error) => return output_config_error(global, &error),
+                };
                 let recording = pt_core::replay::capture_snapshot(
                     &result,
                     None,
@@ -9466,10 +9452,10 @@ fn run_replay_scores(global: &GlobalOpts, path: &std::path::Path) -> ExitCode {
         Ok(config) => config,
         Err(error) => return output_config_error(global, &error),
     };
-    let (scorer, warnings) = pt_core::scoring::Scorer::from_config(&config);
-    for warning in warnings {
-        eprintln!("scan: replay scores warning: {warning}");
-    }
+    let scorer = match configured_scorer(&config) {
+        Ok(scorer) => scorer,
+        Err(error) => return output_config_error(global, &error),
+    };
     let report = match pt_core::replay::replay_scores(&snapshot, &scorer, &config.policy) {
         Ok(report) => report,
         Err(error) => {
@@ -9648,18 +9634,14 @@ fn run_replay(global: &GlobalOpts, args: &ReplayArgs) -> ExitCode {
                 Ok(config) => config,
                 Err(error) => return output_config_error(global, &error),
             };
-            let (baseline_scorer, baseline_warnings) = Scorer::from_config(&baseline);
-            let (candidate_scorer, candidate_warnings) = Scorer::from_config(&candidate);
-            // An incomplete model must not silently become a different incumbent.
-            if !baseline_warnings.is_empty() || !candidate_warnings.is_empty() {
-                for warning in baseline_warnings {
-                    eprintln!("replay: baseline model could not be loaded completely: {warning}");
-                }
-                for warning in candidate_warnings {
-                    eprintln!("replay: candidate model could not be loaded completely: {warning}");
-                }
-                return ExitCode::ArgsError;
-            }
+            let baseline_scorer = match configured_scorer(&baseline) {
+                Ok(scorer) => scorer,
+                Err(error) => return output_config_error(global, &error),
+            };
+            let candidate_scorer = match configured_scorer(&candidate) {
+                Ok(scorer) => scorer,
+                Err(error) => return output_config_error(global, &error),
+            };
             let report = match evaluate_pair(
                 &snapshot,
                 &labels,
@@ -30733,10 +30715,10 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
             return ExitCode::InternalError;
         }
     };
-    let (mut scorer, scorer_warnings) = Scorer::from_config(&config);
-    for warning in scorer_warnings {
-        eprintln!("agent snapshot: warning: {warning}");
-    }
+    let mut scorer = match configured_scorer(&config) {
+        Ok(scorer) => scorer,
+        Err(error) => return output_config_error(global, &error),
+    };
     let policy = config.policy;
     let session_id = SessionId::new();
 
@@ -34264,12 +34246,12 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             return ExitCode::InternalError;
         }
     };
-    // Priors, human kill/spare verdicts, built-in + user signatures and the fast-path
-    // policy: the same scorer every other surface uses.
-    let (mut scorer, scorer_warnings) = pt_core::scoring::Scorer::from_config(&config);
-    for warning in scorer_warnings {
-        eprintln!("agent plan: warning: {warning}");
-    }
+    // Priors, human verdicts and every effective signature must load together;
+    // a partial model cannot authorize a newly generated action plan.
+    let mut scorer = match configured_scorer(&config) {
+        Ok(scorer) => scorer,
+        Err(error) => return output_config_error(global, &error),
+    };
     let fast_path_config = scorer.fast_path.clone();
     let policy = config.policy;
 
@@ -36367,29 +36349,29 @@ fn resolved_config_dir(global: &GlobalOpts) -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
-/// The scorer `agent plan` would use (priors, learned verdicts, signatures), with
-/// fallback to defaults when the config cannot be loaded.
+/// Load the complete scoring model and preserve configuration failures as
+/// structured command errors instead of silently substituting another model.
+fn configured_scorer(config: &pt_core::config::ResolvedConfig) -> Result<Scorer, ConfigError> {
+    Scorer::try_from_config(config).map_err(|message| ConfigError::SchemaError {
+        path: config.config_dir.clone(),
+        message,
+    })
+}
+
+/// The same complete model and protection policy used by `agent plan`.
 fn load_priors_for_explain(global: &GlobalOpts) -> Result<ExplainContext, ConfigError> {
-    let (scorer, guardrails) = match load_config(&config_options(global)) {
-        Ok(resolved) => {
-            let (scorer, warnings) = Scorer::from_config(&resolved);
-            for warning in warnings {
-                eprintln!("agent explain: warning: {warning}");
-            }
-            (scorer, resolved.policy.guardrails)
+    let resolved = load_config(&config_options(global))?;
+    let scorer = configured_scorer(&resolved)?;
+    let guardrails = resolved.policy.guardrails;
+    let protected = ProtectedFilter::from_guardrails(&guardrails).map_err(|error| {
+        ConfigError::SchemaError {
+            path: resolved.config_dir,
+            message: format!("invalid protection rules: {error}"),
         }
-        Err(_) => {
-            let policy = pt_core::config::Policy::default();
-            let (signatures, _) =
-                pt_core::scoring::load_signature_database(&resolved_config_dir(global));
-            let scorer =
-                Scorer::from_policy(Priors::default(), Default::default(), signatures, &policy);
-            (scorer, policy.guardrails)
-        }
-    };
+    })?;
     Ok(ExplainContext {
         scorer,
-        protected: ProtectedFilter::from_guardrails(&guardrails).ok(),
+        protected: Some(protected),
         min_age_seconds: guardrails.min_process_age_seconds,
     })
 }
@@ -43918,10 +43900,10 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
         }
     };
     // The same scorer as `agent plan`.
-    let (mut scorer, scorer_warnings) = Scorer::from_config(&config);
-    for warning in scorer_warnings {
-        eprintln!("agent watch: warning: {warning}");
-    }
+    let mut scorer = match configured_scorer(&config) {
+        Ok(scorer) => scorer,
+        Err(error) => return output_config_error(global, &error),
+    };
     let config_dir = config.config_dir.clone();
     let policy = config.policy;
 

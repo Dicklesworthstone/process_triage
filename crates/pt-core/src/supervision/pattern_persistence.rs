@@ -30,11 +30,13 @@
 //! New: First observation, confidence < 0.5
 //! Learning: Building confidence, 0.5 ≤ confidence < 0.8
 //! Stable: High confidence, confidence ≥ 0.8, count ≥ 10
-//! Deprecated: Marked for removal, still matches but warns
+//! Deprecated: Retained for review, no longer matches
 //! Removed: No longer in active library
 //! ```
 
-use super::signature::{SignatureError, SignatureSchema, SupervisorSignature, SCHEMA_VERSION};
+use super::signature::{
+    SignatureDatabase, SignatureError, SignatureSchema, SupervisorSignature, SCHEMA_VERSION,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -109,7 +111,7 @@ pub enum PatternLifecycle {
     Learning,
     /// High confidence, confidence ≥ 0.8, count ≥ 10
     Stable,
-    /// Marked for removal, still matches but warns
+    /// Retained for review, no longer matches
     Deprecated,
     /// No longer in active library (tombstone for sync)
     Removed,
@@ -121,7 +123,7 @@ impl PatternLifecycle {
         matches!(self, Self::New | Self::Learning | Self::Stable)
     }
 
-    /// Check if this pattern should warn on match.
+    /// Check if this pattern should warn when inspected.
     pub fn should_warn(&self) -> bool {
         matches!(self, Self::Deprecated)
     }
@@ -405,16 +407,31 @@ impl PersistedSchema {
 
     /// Validate the schema.
     pub fn validate(&self) -> Result<(), PersistenceError> {
+        self.validate_version()?;
+        for pattern in &self.patterns {
+            pattern.signature.validate()?;
+        }
+        Ok(())
+    }
+
+    /// Validate every configured matcher, including inactive entries that could
+    /// later be enabled. Redacted sharing exports are inspectable schemas, not
+    /// executable local configuration.
+    pub fn validate_for_activation(&self) -> Result<(), PersistenceError> {
+        self.validate_version()?;
+        for pattern in &self.patterns {
+            pattern.signature.validate_for_activation()?;
+        }
+        Ok(())
+    }
+
+    fn validate_version(&self) -> Result<(), PersistenceError> {
         if self.schema_version > SCHEMA_VERSION {
             return Err(SignatureError::UnsupportedVersion {
                 found: self.schema_version,
                 expected: SCHEMA_VERSION,
             }
             .into());
-        }
-
-        for pattern in &self.patterns {
-            pattern.signature.validate()?;
         }
 
         Ok(())
@@ -532,6 +549,323 @@ impl DisabledPatterns {
         fs::rename(&tmp_path, path)?;
         Ok(())
     }
+}
+
+/// The configuration layer that supplied a signature. Unlike serialized source
+/// metadata, this is derived from the actual input and determines precedence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignatureOrigin {
+    BuiltIn,
+    Learned,
+    Custom,
+    User,
+}
+
+impl SignatureOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BuiltIn => "builtin",
+            Self::Learned => "learned",
+            Self::Custom => "custom",
+            Self::User => "user",
+        }
+    }
+}
+
+/// One resolved signature, retained even when disabled or no longer active so
+/// inspection and management commands see the same name selected by scoring.
+#[derive(Debug, Clone)]
+pub struct SignatureCatalogEntry {
+    pub signature: SupervisorSignature,
+    pub origin: SignatureOrigin,
+    /// Declared pattern provenance; `origin` is the authoritative storage layer.
+    pub source: PatternSource,
+    pub lifecycle: Option<PatternLifecycle>,
+    pub disabled: bool,
+}
+
+impl SignatureCatalogEntry {
+    pub fn is_active(&self) -> bool {
+        !self.disabled && self.lifecycle.is_none_or(|lifecycle| lifecycle.is_active())
+    }
+}
+
+/// A read-only, coherent signature model for scoring and signature management.
+/// Explicit `signatures.json` entries override custom/imported patterns, then
+/// learned patterns, then shipped defaults. An inactive winning entry does not
+/// revive a lower-precedence entry with the same name. Disabled names apply to
+/// every source, including shipped defaults and explicit user signatures.
+#[derive(Debug, Clone)]
+pub struct SignatureCatalog {
+    /// Resolved names in deterministic order, including inactive entries.
+    pub entries: Vec<SignatureCatalogEntry>,
+    pub disabled: DisabledPatterns,
+    built_in: SignatureDatabase,
+}
+
+impl SignatureCatalog {
+    pub fn load(config_dir: &Path) -> Result<Self, PersistenceError> {
+        let legacy = crate::signature_cli::legacy_read_dir(config_dir);
+        Self::load_in(config_dir, legacy.as_deref())
+    }
+
+    fn load_in(config_dir: &Path, legacy: Option<&Path>) -> Result<Self, PersistenceError> {
+        let captured = SignatureInputs::read(config_dir, legacy)?;
+        let built_in = SignatureDatabase::with_defaults();
+        let mut entries: BTreeMap<String, SignatureCatalogEntry> = built_in
+            .signatures()
+            .iter()
+            .map(|signature| {
+                (
+                    signature.name.clone(),
+                    SignatureCatalogEntry {
+                        signature: signature.clone(),
+                        origin: SignatureOrigin::BuiltIn,
+                        source: PatternSource::BuiltIn,
+                        lifecycle: None,
+                        disabled: false,
+                    },
+                )
+            })
+            .collect();
+
+        for (relative, origin) in [
+            ("patterns/learned.json", SignatureOrigin::Learned),
+            ("patterns/custom.json", SignatureOrigin::Custom),
+        ] {
+            let input = &captured.files[relative];
+            let Some(bytes) = &input.bytes else {
+                continue;
+            };
+            let schema: PersistedSchema = serde_json::from_slice(bytes)
+                .map_err(|error| signature_input_error(input, error))?;
+            schema
+                .validate_for_activation()
+                .map_err(|error| signature_input_error(input, error))?;
+            let mut names = HashSet::new();
+            for pattern in schema.patterns {
+                if !names.insert(pattern.signature.name.clone()) {
+                    return Err(signature_input_error(
+                        input,
+                        format!("duplicate signature name '{}'", pattern.signature.name),
+                    ));
+                }
+                let mut signature = pattern.signature;
+                // A disk file cannot acquire shipped-only supervision semantics.
+                signature.builtin = false;
+                entries.insert(
+                    signature.name.clone(),
+                    SignatureCatalogEntry {
+                        signature,
+                        origin,
+                        source: pattern.source,
+                        lifecycle: Some(pattern.lifecycle),
+                        disabled: false,
+                    },
+                );
+            }
+        }
+
+        let user_input = &captured.files["signatures.json"];
+        if let Some(bytes) = &user_input.bytes {
+            let schema: SignatureSchema = serde_json::from_slice(bytes)
+                .map_err(|error| signature_input_error(user_input, error))?;
+            schema
+                .validate_for_activation()
+                .map_err(|error| signature_input_error(user_input, error))?;
+            let mut names = HashSet::new();
+            for mut signature in schema.signatures {
+                if !names.insert(signature.name.clone()) {
+                    return Err(signature_input_error(
+                        user_input,
+                        format!("duplicate signature name '{}'", signature.name),
+                    ));
+                }
+                signature.builtin = false;
+                entries.insert(
+                    signature.name.clone(),
+                    SignatureCatalogEntry {
+                        signature,
+                        origin: SignatureOrigin::User,
+                        source: PatternSource::Custom,
+                        lifecycle: None,
+                        disabled: false,
+                    },
+                );
+            }
+        }
+
+        let disabled_input = &captured.files["patterns/disabled.json"];
+        let disabled: DisabledPatterns = match &disabled_input.bytes {
+            Some(bytes) => serde_json::from_slice(bytes)
+                .map_err(|error| signature_input_error(disabled_input, error))?,
+            None => DisabledPatterns::default(),
+        };
+        for entry in entries.values_mut() {
+            entry.disabled = disabled.is_disabled(&entry.signature.name);
+        }
+
+        // Parse exactly the captured bytes, then check all consumed inputs and
+        // fleet generations again. Ordinary single-file writers do not advance
+        // the fleet generation, so checking only that token would miss them.
+        if SignatureInputs::read(config_dir, legacy)? != captured {
+            return Err(std::io::Error::other(
+                "signature configuration changed during loading; retry with a fresh configuration",
+            )
+            .into());
+        }
+        Ok(Self {
+            entries: entries.into_values().collect(),
+            disabled,
+            built_in,
+        })
+    }
+
+    /// Compile only active winners. Shipped matcher caches are retained for
+    /// unchanged defaults; every disk winner passes executable-matcher checks.
+    /// Pattern statistics never replace the signature's declared confidence.
+    pub fn active_database(&self) -> Result<SignatureDatabase, SignatureError> {
+        let active: BTreeMap<&str, &SupervisorSignature> = self
+            .entries
+            .iter()
+            .filter(|entry| entry.is_active())
+            .map(|entry| (entry.signature.name.as_str(), &entry.signature))
+            .collect();
+        let mut database = self.built_in.clone();
+        database.retain(|signature| {
+            active
+                .get(signature.name.as_str())
+                .is_some_and(|expected| **expected == *signature)
+        });
+        let retained: HashSet<String> = database
+            .signatures()
+            .iter()
+            .map(|signature| signature.name.clone())
+            .collect();
+        for entry in self.entries.iter().filter(|entry| entry.is_active()) {
+            if !retained.contains(&entry.signature.name) {
+                database.add(entry.signature.clone())?;
+            }
+        }
+        Ok(database)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SignatureInput {
+    path: PathBuf,
+    label: &'static str,
+    bytes: Option<Vec<u8>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SignatureInputs {
+    generations: BTreeMap<PathBuf, Option<crate::fleet::transfer::ConfigurationGeneration>>,
+    files: BTreeMap<&'static str, SignatureInput>,
+}
+
+impl SignatureInputs {
+    fn read(config_dir: &Path, legacy: Option<&Path>) -> Result<Self, PersistenceError> {
+        let generation = signature_generation(config_dir)?;
+        let mut generations = BTreeMap::from([(config_dir.to_path_buf(), generation)]);
+        let mut files = BTreeMap::new();
+        for (relative, label) in [
+            ("signatures.json", "user signatures"),
+            ("patterns/learned.json", "learned patterns"),
+            ("patterns/custom.json", "custom patterns"),
+            ("patterns/disabled.json", "disabled signatures"),
+        ] {
+            let mut path = config_dir.join(relative);
+            let read = |path: &Path| {
+                read_pattern_preimage(path)
+                    .and_then(|bytes| {
+                        if bytes.is_none() {
+                            validate_missing_signature_parent(path)?;
+                        }
+                        Ok(bytes)
+                    })
+                    .map_err(|error| {
+                        std::io::Error::new(
+                            error.kind(),
+                            format!("failed to read {label} at {}: {error}", path.display()),
+                        )
+                    })
+            };
+            let mut bytes = read(&path)?;
+            if bytes.is_none() {
+                if let Some(legacy) = legacy {
+                    if !generations.contains_key(legacy) {
+                        generations.insert(legacy.to_path_buf(), signature_generation(legacy)?);
+                    }
+                    path = legacy.join(relative);
+                    bytes = read(&path)?;
+                }
+            }
+            files.insert(relative, SignatureInput { path, label, bytes });
+        }
+        for (directory, expected) in &generations {
+            if signature_generation(directory)? != *expected {
+                return Err(std::io::Error::other(
+                    "signature configuration changed during loading; retry with a fresh configuration",
+                )
+                .into());
+            }
+        }
+        Ok(Self { generations, files })
+    }
+}
+
+/// A missing child below a dangling directory symlink is a broken configured
+/// input, not an optional absence. Walk only until the nearest existing parent;
+/// genuinely absent directories remain read-only and need not be created.
+fn validate_missing_signature_parent(path: &Path) -> Result<(), std::io::Error> {
+    for parent in path
+        .ancestors()
+        .skip(1)
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        let metadata = match fs::symlink_metadata(parent) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let metadata = if metadata.file_type().is_symlink() {
+            fs::metadata(parent)?
+        } else {
+            metadata
+        };
+        if !metadata.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotADirectory,
+                format!("signature parent {} is not a directory", parent.display()),
+            ));
+        }
+        return Ok(());
+    }
+    Ok(())
+}
+
+fn signature_generation(
+    config_dir: &Path,
+) -> Result<Option<crate::fleet::transfer::ConfigurationGeneration>, PersistenceError> {
+    crate::fleet::transfer::configuration_generation(config_dir)
+        .map_err(|error| std::io::Error::other(error.to_string()).into())
+}
+
+fn signature_input_error(
+    input: &SignatureInput,
+    error: impl std::fmt::Display,
+) -> PersistenceError {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "failed to parse {} at {}: {error}",
+            input.label,
+            input.path.display()
+        ),
+    )
+    .into()
 }
 
 /// All pattern statistics.
@@ -1283,6 +1617,319 @@ mod tests {
             expectations: Default::default(),
             priority: 100,
         }
+    }
+
+    fn catalog_test_directory(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "pt-signature-catalog-{label}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(path.join(PATTERNS_DIR_NAME)).unwrap();
+        eprintln!("retained signature catalog evidence: {}", path.display());
+        path
+    }
+
+    fn write_catalog_patterns(directory: &Path, file: &str, patterns: Vec<PersistedPattern>) {
+        let schema = PersistedSchema {
+            patterns,
+            ..PersistedSchema::default()
+        };
+        fs::write(
+            directory.join(PATTERNS_DIR_NAME).join(file),
+            schema.to_json().unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn signature_catalog_resolves_sources_before_lifecycle_and_disable_filtering() {
+        let directory = catalog_test_directory("precedence");
+        write_catalog_patterns(
+            &directory,
+            LEARNED_FILE,
+            vec![
+                PersistedPattern::new(
+                    make_test_signature("layered").with_priority(999),
+                    PatternSource::Learned,
+                ),
+                PersistedPattern::new(make_test_signature("learned-only"), PatternSource::Learned),
+                PersistedPattern::new(make_test_signature("tombstone"), PatternSource::Learned),
+            ],
+        );
+        let mut tombstone =
+            PersistedPattern::new(make_test_signature("tombstone"), PatternSource::Imported);
+        tombstone.lifecycle = PatternLifecycle::Removed;
+        let mut deprecated_default =
+            PersistedPattern::new(make_test_signature("claude"), PatternSource::Custom);
+        deprecated_default.lifecycle = PatternLifecycle::Deprecated;
+        write_catalog_patterns(
+            &directory,
+            CUSTOM_FILE,
+            vec![
+                PersistedPattern::new(
+                    make_test_signature("layered").with_confidence(0.3),
+                    PatternSource::Imported,
+                ),
+                PersistedPattern::new(
+                    make_test_signature("imported-only")
+                        .with_confidence(0.4)
+                        .as_builtin(),
+                    PatternSource::Imported,
+                ),
+                tombstone,
+                deprecated_default,
+            ],
+        );
+        let mut users = SignatureSchema::new();
+        users.add(
+            make_test_signature("layered")
+                .with_confidence(0.6)
+                .as_builtin(),
+        );
+        fs::write(
+            directory.join("signatures.json"),
+            serde_json::to_vec(&users).unwrap(),
+        )
+        .unwrap();
+        let mut disabled = DisabledPatterns::default();
+        for name in ["codex", "learned-only", "layered"] {
+            disabled.disable(name, Some("explicit local choice"));
+        }
+        fs::write(
+            directory.join(PATTERNS_DIR_NAME).join(DISABLED_FILE),
+            serde_json::to_vec(&disabled).unwrap(),
+        )
+        .unwrap();
+        // These files are not activation inputs. An obsolete disk default or
+        // an uncalibrated statistic must not replace the configured model.
+        fs::write(
+            directory.join(PATTERNS_DIR_NAME).join(BUILT_IN_FILE),
+            b"broken obsolete defaults",
+        )
+        .unwrap();
+        fs::write(directory.join(STATS_FILE), b"broken unused statistics").unwrap();
+
+        let catalog = SignatureCatalog::load(&directory).unwrap();
+        let layered = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.signature.name == "layered")
+            .unwrap();
+        assert_eq!(layered.origin, SignatureOrigin::User);
+        assert_eq!(layered.signature.confidence_weight, 0.6);
+        assert!(!layered.signature.builtin);
+        assert!(!layered.is_active());
+        let imported = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.signature.name == "imported-only")
+            .unwrap();
+        assert_eq!(imported.origin, SignatureOrigin::Custom);
+        assert_eq!(imported.source, PatternSource::Imported);
+        assert!(!imported.signature.builtin);
+        assert_eq!(imported.signature.confidence_weight, 0.4);
+        assert!(imported.is_active());
+
+        let database = catalog.active_database().unwrap();
+        let names: HashSet<&str> = database
+            .signatures()
+            .iter()
+            .map(|signature| signature.name.as_str())
+            .collect();
+        assert!(names.contains("imported-only"));
+        for excluded in ["codex", "learned-only", "layered", "tombstone", "claude"] {
+            assert!(
+                !names.contains(excluded),
+                "inactive name {excluded} was revived"
+            );
+        }
+        let matches = database.find_by_process_name("imported-only");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].confidence_weight, 0.4);
+    }
+
+    #[test]
+    fn signature_catalog_rejects_ambiguous_names_and_inactive_redacted_matchers() {
+        for relative in [
+            "signatures.json",
+            "patterns/learned.json",
+            "patterns/custom.json",
+        ] {
+            let directory = catalog_test_directory("duplicate");
+            let signature = make_test_signature("duplicate");
+            let bytes = if relative == "signatures.json" {
+                let mut schema = SignatureSchema::new();
+                schema.add(signature.clone());
+                schema.add(signature);
+                serde_json::to_vec(&schema).unwrap()
+            } else {
+                let pattern = PersistedPattern::new(signature, PatternSource::Custom);
+                serde_json::to_vec(&PersistedSchema {
+                    patterns: vec![pattern.clone(), pattern],
+                    ..PersistedSchema::default()
+                })
+                .unwrap()
+            };
+            fs::write(directory.join(relative), bytes).unwrap();
+            let error = SignatureCatalog::load(&directory).unwrap_err().to_string();
+            assert!(
+                error.contains("duplicate signature name 'duplicate'"),
+                "{error}"
+            );
+            assert!(error.contains(relative), "{error}");
+        }
+
+        for lifecycle in [
+            PatternLifecycle::New,
+            PatternLifecycle::Deprecated,
+            PatternLifecycle::Removed,
+        ] {
+            let directory = catalog_test_directory("redacted");
+            let mut pattern = PersistedPattern::new(
+                make_test_signature("redacted").with_process_patterns(vec!["[REDACTED]"]),
+                PatternSource::Imported,
+            );
+            pattern.lifecycle = lifecycle;
+            write_catalog_patterns(&directory, CUSTOM_FILE, vec![pattern]);
+            let mut disabled = DisabledPatterns::default();
+            disabled.disable("redacted", None);
+            fs::write(
+                directory.join(PATTERNS_DIR_NAME).join(DISABLED_FILE),
+                serde_json::to_vec(&disabled).unwrap(),
+            )
+            .unwrap();
+            let error = SignatureCatalog::load(&directory).unwrap_err().to_string();
+            assert!(error.contains("redacted matcher"), "{lifecycle:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn signature_catalog_reads_legacy_only_for_absent_inputs_without_migration() {
+        let directory = catalog_test_directory("legacy");
+        let config = directory.join("new-config");
+        let legacy = directory.join("legacy-config");
+        fs::create_dir_all(legacy.join(PATTERNS_DIR_NAME)).unwrap();
+        write_catalog_patterns(
+            &legacy,
+            CUSTOM_FILE,
+            vec![PersistedPattern::new(
+                make_test_signature("legacy-pattern"),
+                PatternSource::Custom,
+            )],
+        );
+        let bytes = fs::read(legacy.join(PATTERNS_DIR_NAME).join(CUSTOM_FILE)).unwrap();
+        let catalog = SignatureCatalog::load_in(&config, Some(&legacy)).unwrap();
+        assert!(
+            catalog
+                .active_database()
+                .unwrap()
+                .find_by_process_name("legacy-pattern")
+                .len()
+                == 1
+        );
+        assert!(
+            !config.exists(),
+            "read-only loading must not create or migrate config"
+        );
+        assert_eq!(
+            fs::read(legacy.join(PATTERNS_DIR_NAME).join(CUSTOM_FILE)).unwrap(),
+            bytes
+        );
+
+        fs::create_dir_all(config.join(PATTERNS_DIR_NAME)).unwrap();
+        fs::write(
+            config.join(PATTERNS_DIR_NAME).join(CUSTOM_FILE),
+            b"broken selected input",
+        )
+        .unwrap();
+        let error = SignatureCatalog::load_in(&config, Some(&legacy))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&config.display().to_string()), "{error}");
+        assert!(!error.contains(&legacy.display().to_string()), "{error}");
+    }
+
+    #[test]
+    fn signature_catalog_refuses_pending_import_without_recovering_or_writing() {
+        let directory = catalog_test_directory("pending");
+        let state = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "id": uuid::Uuid::new_v4(),
+            "journal_sha256": "0".repeat(64),
+            "phase": "pending"
+        }))
+        .unwrap();
+        let path = directory.join(".fleet-transfer-state.json");
+        fs::write(&path, &state).unwrap();
+        let error = SignatureCatalog::load(&directory).unwrap_err().to_string();
+        assert!(
+            error.contains("interrupted or active fleet import"),
+            "{error}"
+        );
+        assert_eq!(fs::read(path).unwrap(), state);
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signature_catalog_dangling_inputs_refuse_legacy_fallback() {
+        let directory = catalog_test_directory("dangling");
+        let legacy = directory.join("legacy");
+        fs::create_dir_all(legacy.join(PATTERNS_DIR_NAME)).unwrap();
+        write_catalog_patterns(
+            &legacy,
+            CUSTOM_FILE,
+            vec![PersistedPattern::new(
+                make_test_signature("legacy-pattern"),
+                PatternSource::Custom,
+            )],
+        );
+        let target = directory.join("missing-patterns.json");
+        let link = directory.join(PATTERNS_DIR_NAME).join(CUSTOM_FILE);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let error = SignatureCatalog::load_in(&directory, Some(&legacy))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("failed to read custom patterns"), "{error}");
+        assert!(error.contains(&link.display().to_string()), "{error}");
+        assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+        assert!(!target.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signature_catalog_dangling_parent_is_not_an_absent_disable_file() {
+        let directory = catalog_test_directory("dangling-parent");
+        let config = directory.join("config");
+        fs::create_dir(&config).unwrap();
+        let missing = directory.join("missing-patterns-directory");
+        let link = config.join(PATTERNS_DIR_NAME);
+        std::os::unix::fs::symlink(&missing, &link).unwrap();
+        let error = SignatureCatalog::load(&config).unwrap_err().to_string();
+        assert!(error.contains("failed to read learned patterns"), "{error}");
+        assert!(error.contains(&link.display().to_string()), "{error}");
+        assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+        assert!(!missing.exists());
+
+        let valid_config = directory.join("valid-config");
+        let actual_patterns = directory.join("actual-patterns");
+        fs::create_dir(&valid_config).unwrap();
+        fs::create_dir(&actual_patterns).unwrap();
+        let mut disabled = DisabledPatterns::default();
+        disabled.disable("codex", None);
+        fs::write(
+            actual_patterns.join(DISABLED_FILE),
+            serde_json::to_vec(&disabled).unwrap(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&actual_patterns, valid_config.join(PATTERNS_DIR_NAME)).unwrap();
+        let catalog = SignatureCatalog::load(&valid_config).unwrap();
+        assert!(!catalog
+            .active_database()
+            .unwrap()
+            .signatures()
+            .iter()
+            .any(|signature| signature.name == "codex"));
     }
 
     #[test]

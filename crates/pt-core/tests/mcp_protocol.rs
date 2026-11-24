@@ -1208,6 +1208,213 @@ fn actual_mcp_sampling_windows_are_advertised_and_rejected_before_process_work()
     }
 }
 
+#[test]
+fn actual_mcp_live_tools_refuse_incomplete_signature_models() {
+    use assert_cmd::cargo::cargo_bin_cmd;
+
+    let root = std::env::temp_dir().join(format!(
+        "pt-mcp-incomplete-signatures-{}",
+        uuid::Uuid::new_v4()
+    ));
+    for (label, relative) in [
+        ("disabled", "patterns/disabled.json"),
+        ("learned", "patterns/learned.json"),
+        ("custom", "patterns/custom.json"),
+        ("user", "signatures.json"),
+    ] {
+        let config = root.join(label).join("config");
+        let data = root.join(label).join("data");
+        std::fs::create_dir_all(config.join("patterns")).unwrap();
+        let broken_path = config.join(relative);
+        let broken = b"{incomplete-signature-model";
+        std::fs::write(&broken_path, broken).unwrap();
+        let requests = [
+            ("pt_signatures", serde_json::json!({"user_only": true})),
+            ("pt_scan", serde_json::json!({"min_age": 0, "window_ms": 0})),
+            (
+                "pt_explain",
+                serde_json::json!({"pid": std::process::id(), "window_ms": 0}),
+            ),
+            (
+                "pt_plan",
+                serde_json::json!({
+                    "pids": [std::process::id()], "min_age": 0, "min_score": 0,
+                    "window_ms": 0, "timeout_secs": 10,
+                }),
+            ),
+        ];
+        let input: String = requests
+            .iter()
+            .enumerate()
+            .map(|(index, (tool, arguments))| {
+                format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "id": index, "method": "tools/call",
+                        "params": {"name": tool, "arguments": arguments},
+                    })
+                )
+            })
+            .collect();
+        let output = cargo_bin_cmd!("pt-core")
+            .arg("--config")
+            .arg(&config)
+            .arg("mcp")
+            .env_remove("PT_CONFIG_DIR")
+            .env_remove("PT_SKIP_GLOBAL_LOCK")
+            .env("PROCESS_TRIAGE_DATA", &data)
+            .env("PROCESS_TRIAGE_RETENTION", "off")
+            .write_stdin(input)
+            .timeout(std::time::Duration::from_secs(30))
+            .output()
+            .expect("run actual MCP model-loading refusals");
+        assert!(output.status.success(), "{label}: {output:?}");
+        let responses: Vec<serde_json::Value> = std::str::from_utf8(&output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(responses.len(), requests.len(), "{label}: {responses:?}");
+        for (index, ((tool, _), response)) in requests.iter().zip(&responses).enumerate() {
+            assert_eq!(response["id"], index, "{label}: {response}");
+            assert!(response["error"].is_null(), "{label}: {response}");
+            assert_eq!(
+                response["result"]["isError"], true,
+                "{label}: {tool} returned a result from an incomplete model: {response}"
+            );
+            let message = response["result"]["content"][0]["text"]
+                .as_str()
+                .expect("model error text");
+            assert!(
+                message.contains(relative),
+                "{label}: {tool} must identify the broken model input: {message}"
+            );
+        }
+        assert_eq!(std::fs::read(&broken_path).unwrap(), broken);
+        if let Ok(sessions) = std::fs::read_dir(data.join("sessions")) {
+            for session in sessions {
+                assert!(
+                    !session.unwrap().path().join("decision/plan.json").exists(),
+                    "{label}: incomplete model produced an actionable saved plan"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn actual_mcp_signature_catalog_includes_imported_learned_and_disabled_patterns() {
+    use assert_cmd::cargo::cargo_bin_cmd;
+    use pt_core::supervision::pattern_persistence::{
+        ConflictResolution, DisabledPatterns, PatternLibrary, PatternSource, PersistedPattern,
+        PersistedSchema,
+    };
+    use pt_core::supervision::signature::{SignatureSchema, SupervisorSignature};
+    use pt_core::supervision::SupervisorCategory;
+
+    let root =
+        std::env::temp_dir().join(format!("pt-mcp-signature-catalog-{}", uuid::Uuid::new_v4()));
+    let config = root.join("config");
+    let data = root.join("data");
+    let signature = |name| {
+        SupervisorSignature::new(name, SupervisorCategory::Other)
+            .with_process_patterns(vec!["^pt-mcp-catalog-fixture$"])
+    };
+    let mut incoming = PersistedSchema::new();
+    incoming.patterns.push(PersistedPattern::new(
+        signature("mcp-imported"),
+        PatternSource::Custom,
+    ));
+    let mut library = PatternLibrary::new(&config);
+    library
+        .import(incoming, ConflictResolution::ReplaceWithImported)
+        .unwrap();
+    library.add_learned(signature("mcp-learned")).unwrap();
+    library.save().unwrap();
+    let mut users = SignatureSchema::new();
+    users.add(signature("mcp-explicit-user"));
+    pt_core::signature_cli::save_user_signatures(&config, &users).unwrap();
+    let unchanged_inputs = [
+        "signatures.json",
+        "patterns/learned.json",
+        "patterns/custom.json",
+    ]
+    .map(|relative| (relative, std::fs::read(config.join(relative)).unwrap()));
+    let call = || {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "pt_signatures", "arguments": {"user_only": true}},
+        });
+        let output = cargo_bin_cmd!("pt-core")
+            .arg("--config")
+            .arg(&config)
+            .arg("mcp")
+            .env_remove("PT_CONFIG_DIR")
+            .env("PROCESS_TRIAGE_DATA", &data)
+            .env("PROCESS_TRIAGE_RETENTION", "off")
+            .write_stdin(format!("{request}\n"))
+            .timeout(std::time::Duration::from_secs(15))
+            .output()
+            .expect("inspect imported pattern catalog through actual MCP server");
+        assert!(output.status.success(), "{output:?}");
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(response["error"].is_null(), "{response}");
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        serde_json::from_str::<serde_json::Value>(
+            response["result"]["content"][0]["text"].as_str().unwrap(),
+        )
+        .unwrap()
+    };
+    let first = call();
+    assert_eq!(first["count"], 3, "{first}");
+    for (name, source, provenance, lifecycle) in [
+        (
+            "mcp-imported",
+            "custom",
+            "imported",
+            serde_json::json!("new"),
+        ),
+        (
+            "mcp-learned",
+            "learned",
+            "learned",
+            serde_json::json!("new"),
+        ),
+        (
+            "mcp-explicit-user",
+            "user",
+            "custom",
+            serde_json::Value::Null,
+        ),
+    ] {
+        let entry = first["signatures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == name)
+            .unwrap_or_else(|| panic!("missing {name}: {first}"));
+        assert_eq!(entry["source"], source, "{entry}");
+        assert_eq!(entry["provenance"], provenance, "{entry}");
+        assert_eq!(entry["lifecycle"], lifecycle, "{entry}");
+        assert_eq!(entry["active"], true, "{entry}");
+        assert_eq!(entry["disabled"], false, "{entry}");
+    }
+
+    let mut disabled = DisabledPatterns::default();
+    disabled.disable("mcp-imported", Some("fixture review"));
+    pt_core::signature_cli::save_disabled_patterns(&config, &disabled).unwrap();
+    let second = call();
+    assert_eq!(second["count"], 3, "{second}");
+    for entry in second["signatures"].as_array().unwrap() {
+        let disabled = entry["name"] == "mcp-imported";
+        assert_eq!(entry["disabled"], disabled, "{entry}");
+        assert_eq!(entry["active"], !disabled, "{entry}");
+    }
+    for (relative, original) in unchanged_inputs {
+        assert_eq!(std::fs::read(config.join(relative)).unwrap(), original);
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn actual_mcp_recorded_explanation_preserves_the_plan_after_exit_and_config_changes() {
@@ -1305,9 +1512,10 @@ fn actual_mcp_recorded_explanation_preserves_the_plan_after_exit_and_config_chan
         .join("decision/plan.json");
     let original_plan = std::fs::read(&plan_path).unwrap();
     drop(target);
-    // Both a dead target and unreadable current priors must be irrelevant to a
-    // recorded explanation. A fallback to the live evaluator would fail here.
-    std::fs::write(config.join("priors.json"), b"{invalid-current-priors").unwrap();
+    // Neither a dead target nor an unreadable current signature catalog changes
+    // the recorded explanation. A fallback to the live evaluator would fail.
+    std::fs::create_dir_all(config.join("patterns")).unwrap();
+    std::fs::write(config.join("patterns/disabled.json"), b"{invalid-disabled").unwrap();
     let result = call(
         "recorded",
         "pt_explain",
@@ -1341,6 +1549,9 @@ fn actual_mcp_recorded_explanation_preserves_the_plan_after_exit_and_config_chan
     );
     assert_eq!(std::fs::read(&plan_path).unwrap(), original_plan);
 
+    // Current priors may also be unusable; PID-only recorded lookup still uses
+    // the exact saved evidence rather than reconstructing today's model.
+    std::fs::write(config.join("priors.json"), b"{invalid-current-priors").unwrap();
     let by_pid = call(
         "recorded_by_pid",
         "pt_explain",

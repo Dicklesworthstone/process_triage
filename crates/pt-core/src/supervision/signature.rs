@@ -991,6 +991,23 @@ impl SignatureDatabase {
         self.signatures.is_empty()
     }
 
+    /// Retain selected signatures together with their already compiled matchers.
+    /// Configuration overlays can suppress shipped names without recompiling
+    /// every unaffected default or desynchronizing the parallel matcher tables.
+    pub fn retain(&mut self, mut keep: impl FnMut(&SupervisorSignature) -> bool) {
+        let retained: Vec<bool> = self.signatures.iter().map(&mut keep).collect();
+        fn retain_selected<T>(values: &mut Vec<T>, retained: &[bool]) {
+            let mut flags = retained.iter();
+            values.retain(|_| *flags.next().expect("signature matcher tables stay aligned"));
+        }
+        retain_selected(&mut self.signatures, &retained);
+        retain_selected(&mut self.process_regexes, &retained);
+        retain_selected(&mut self.arg_regexes, &retained);
+        retain_selected(&mut self.working_dir_regexes, &retained);
+        retain_selected(&mut self.parent_regexes, &retained);
+        retain_selected(&mut self.env_regexes, &retained);
+    }
+
     /// Add a signature and compile its patterns.
     pub fn add(&mut self, signature: SupervisorSignature) -> Result<(), SignatureError> {
         signature.validate_for_activation()?;
@@ -2974,6 +2991,50 @@ mod tests {
         let best = db.best_match(&ctx);
 
         assert!(best.is_none());
+    }
+
+    #[test]
+    fn retaining_signatures_preserves_all_compiled_matcher_associations() {
+        fn signature(name: &str) -> SupervisorSignature {
+            let mut signature = SupervisorSignature::new(name, SupervisorCategory::Other);
+            signature.patterns = SignaturePatterns {
+                process_names: vec![format!("^{name}$")],
+                arg_patterns: vec![format!("^--{name}$")],
+                working_dir_patterns: vec![format!("^/{name}$")],
+                parent_patterns: vec![format!("^{name}-parent$")],
+                environment_vars: HashMap::from([("PT_RETAIN_MODE".into(), format!("^{name}$"))]),
+                min_matches: 5,
+                ..SignaturePatterns::default()
+            };
+            signature
+        }
+
+        let mut database = SignatureDatabase::new();
+        for name in ["first", "kept", "last"] {
+            database.add(signature(name)).unwrap();
+        }
+        database.retain(|signature| signature.name == "kept");
+        database.add(signature("appended")).unwrap();
+        assert_eq!(database.len(), 2);
+        for name in ["first", "kept", "last", "appended"] {
+            let command = format!("--{name}");
+            let directory = format!("/{name}");
+            let parent = format!("{name}-parent");
+            let environment = HashMap::from([("PT_RETAIN_MODE".to_string(), name.to_string())]);
+            let context = ProcessMatchContext::with_comm(name)
+                .cmdline(&command)
+                .cwd(&directory)
+                .parent_comm(&parent)
+                .env_vars(&environment);
+            let matches = database.match_process(&context);
+            if name == "kept" || name == "appended" {
+                assert_eq!(matches.len(), 1, "{name}");
+                assert_eq!(matches[0].signature.name, name);
+                assert_eq!(matches[0].details.pattern_types_matched, 5);
+            } else {
+                assert!(matches.is_empty(), "removed signature {name} still matches");
+            }
+        }
     }
 
     #[test]

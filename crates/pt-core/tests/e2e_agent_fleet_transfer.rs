@@ -5,12 +5,15 @@
 use assert_cmd::cargo::cargo_bin_cmd;
 use assert_cmd::Command;
 use pt_bundle::{BundleReader, BundleWriter, ExportProfile, FileEntry, FileType};
+use pt_common::{ProcessId, StartId};
 use pt_config::priors::{BetaParams, Priors};
+use pt_core::collect::{ProcessRecord, ProcessState};
+use pt_core::config::{load_config, ConfigOptions};
 use pt_core::fleet::transfer::{validate_bundle, BaselineStats, TransferBundle};
+use pt_core::inference::Evidence;
+use pt_core::scoring::{load_signature_database, Scorer};
 use pt_core::supervision::pattern_persistence::{PatternLibrary, PatternLifecycle};
-use pt_core::supervision::signature::{
-    ProcessMatchContext, SignatureDatabase, SupervisorSignature,
-};
+use pt_core::supervision::signature::{ProcessMatchContext, SignaturePriors, SupervisorSignature};
 use pt_core::supervision::SupervisorCategory;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
@@ -112,6 +115,167 @@ fn config_snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
     collect(dir, dir, &mut files);
     files.sort();
     files
+}
+
+#[test]
+fn fleet_transfer_activates_imported_patterns_in_shared_inference() {
+    let root = retained_dir();
+    let source_dir = root.join("source");
+    let target_dir = root.join("target");
+    let alternate_dir = root.join("alternate");
+    let artifacts = root.join("artifacts");
+    let bundle = root.join("patterns.json");
+    for dir in [&source_dir, &target_dir, &alternate_dir] {
+        write_priors(dir, &Priors::default());
+    }
+
+    let mut source = PatternLibrary::new(&source_dir);
+    source
+        .add_learned(
+            SupervisorSignature::new("fleet-learned-model", SupervisorCategory::Other)
+                .with_process_patterns(vec!["^pt-fleet-learned-probe$"])
+                .with_priors(SignaturePriors::likely_abandoned())
+                .with_confidence(0.8),
+        )
+        .expect("add source learned pattern");
+    source
+        .add_custom(
+            SupervisorSignature::new("fleet-custom-model", SupervisorCategory::Other)
+                .with_process_patterns(vec!["^pt-fleet-custom-probe$"])
+                .with_priors(SignaturePriors::likely_useful())
+                .with_confidence(0.9),
+        )
+        .expect("add source custom pattern");
+    source.save().expect("persist source patterns");
+
+    let configured = |dir: &Path| {
+        let config = load_config(&ConfigOptions {
+            config_dir: Some(dir.to_path_buf()),
+            ..Default::default()
+        })
+        .expect("load explicit model configuration");
+        Scorer::try_from_config(&config).expect("load complete configured scorer")
+    };
+    let record = |pid, command: &str| ProcessRecord {
+        pid: ProcessId(pid),
+        ppid: ProcessId(4000),
+        uid: 1000,
+        user: "fleet-fixture".into(),
+        pgid: Some(pid),
+        sid: Some(pid),
+        start_id: StartId::from_linux("fleet-transfer-fixture", 1_234_567_890, pid),
+        comm: command.into(),
+        cmd: command.into(),
+        state: ProcessState::Sleeping,
+        cpu_percent: 0.0,
+        rss_bytes: 1024 * 1024,
+        vsz_bytes: 2 * 1024 * 1024,
+        tty: None,
+        start_time_unix: 1_234_567_890,
+        elapsed: Duration::from_secs(3600),
+        source: "fleet-transfer-recorded-fixture".into(),
+        container_info: None,
+    };
+    let learned = record(41_001, "pt-fleet-learned-probe");
+    let custom = record(41_002, "pt-fleet-custom-probe");
+    let unrelated = record(41_003, "pt-fleet-unrelated-probe");
+    let score = |scorer: &Scorer, process: &ProcessRecord| {
+        // Use the same unknown activity evidence on both sides of the import.
+        // This isolates the configured prior and never inspects a live PID.
+        let result = scorer
+            .score_recorded(
+                process,
+                Evidence::default(),
+                scorer.recorded_observations(process, None),
+            )
+            .expect("score recorded process through production inference");
+        serde_json::json!({
+            "posterior": result.posterior.posterior,
+            "prior_source": result.prior_source,
+            "signature": result.signature.map(|matched| matched.signature.name.clone()),
+            "fast_path_used": result.fast_path_used,
+        })
+    };
+
+    let target_before = config_snapshot(&target_dir);
+    let alternate_before = config_snapshot(&alternate_dir);
+    let before = configured(&target_dir);
+    let unrelated_before = score(&before, &unrelated);
+    let learned_before = score(&before, &learned);
+    let custom_before = score(&before, &custom);
+    assert_eq!(learned_before["prior_source"], "global");
+    assert_eq!(custom_before["prior_source"], "global");
+    assert!(learned_before["signature"].is_null());
+    assert!(custom_before["signature"].is_null());
+    assert_eq!(config_snapshot(&target_dir), target_before);
+
+    let source_before = config_snapshot(&source_dir);
+    let source_scorer = configured(&source_dir);
+    let source_learned = score(&source_scorer, &learned);
+    let source_custom = score(&source_scorer, &custom);
+    assert_eq!(source_learned["signature"], "fleet-learned-model");
+    assert_eq!(source_custom["signature"], "fleet-custom-model");
+    assert_eq!(source_learned["prior_source"], "signature");
+    assert_eq!(source_custom["prior_source"], "signature");
+    assert_ne!(source_learned["posterior"], learned_before["posterior"]);
+    assert_ne!(source_custom["posterior"], custom_before["posterior"]);
+    assert_eq!(config_snapshot(&source_dir), source_before);
+
+    let mut export = transfer_command(&source_dir);
+    export.args(["export", "--out"]).arg(&bundle);
+    let output = run_retained(export, &artifacts, "activate-export");
+    assert!(output.status.success(), "export failed: {output:?}");
+    let mut import = transfer_command(&target_dir);
+    import
+        .args(["import", "--merge-strategy", "replace", "--from"])
+        .arg(&bundle);
+    let output = run_retained(import, &artifacts, "activate-import");
+    assert!(output.status.success(), "import failed: {output:?}");
+
+    let published = config_snapshot(&target_dir);
+    let after = configured(&target_dir);
+    let learned_after = score(&after, &learned);
+    let custom_after = score(&after, &custom);
+    assert_eq!(learned_after, source_learned);
+    assert_eq!(custom_after, source_custom);
+    assert_eq!(score(&after, &unrelated), unrelated_before);
+    assert_eq!(learned_after["fast_path_used"], false);
+    assert_eq!(custom_after["fast_path_used"], false);
+    assert_eq!(config_snapshot(&target_dir), published);
+
+    let alternate = configured(&alternate_dir);
+    assert_eq!(score(&alternate, &learned), learned_before);
+    assert_eq!(score(&alternate, &custom), custom_before);
+    assert_eq!(config_snapshot(&alternate_dir), alternate_before);
+    fs::write(
+        artifacts.join("activation-inference.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "learned_before": learned_before,
+            "learned_after": learned_after,
+            "custom_before": custom_before,
+            "custom_after": custom_after,
+            "unrelated": unrelated_before,
+        }))
+        .expect("serialize actual inference evidence"),
+    )
+    .expect("retain actual inference evidence");
+
+    let mut imported = PatternLibrary::new(&target_dir);
+    imported.load().expect("reload imported patterns");
+    imported
+        .disable_pattern("fleet-custom-model", Some("operator exclusion"))
+        .expect("disable imported pattern");
+    imported
+        .get_pattern_mut("fleet-learned-model")
+        .expect("imported learned pattern")
+        .transition_lifecycle(PatternLifecycle::Deprecated)
+        .expect("deprecate imported pattern");
+    imported.save().expect("save imported exclusions");
+    let excluded = config_snapshot(&target_dir);
+    let after_exclusion = configured(&target_dir);
+    assert_eq!(score(&after_exclusion, &learned), learned_before);
+    assert_eq!(score(&after_exclusion, &custom), custom_before);
+    assert_eq!(config_snapshot(&target_dir), excluded);
 }
 
 #[test]
@@ -961,10 +1125,8 @@ fn fleet_transfer_ptb_export_and_passphrase_reads() {
         .expect("actually imported signature")
         .signature;
     assert_eq!(actual_signature, &signature);
-    let mut database = SignatureDatabase::new();
-    database
-        .add(actual_signature.clone())
-        .expect("activate intact imported matcher");
+    let (database, warnings) = load_signature_database(&target_dir);
+    assert!(warnings.is_empty(), "{warnings:?}");
     let environment: HashMap<String, String> = [
         ("FLEET_MODE", "worker"),
         ("FLEET_ZONE", "west"),
@@ -1516,10 +1678,8 @@ fn fleet_transfer_import_and_diff_refuse_invalid_intact_configuration() {
                         .patterns[0]
                         .signature
                 );
-                let mut database = SignatureDatabase::new();
-                database
-                    .add(imported_signature.clone())
-                    .expect("activate actual imported signature");
+                let (database, warnings) = load_signature_database(&finite_target);
+                assert!(warnings.is_empty(), "{warnings:?}");
                 assert_eq!(
                     database
                         .match_process(&ProcessMatchContext::with_comm("incoming"))
@@ -2006,12 +2166,34 @@ fn fleet_transfer_signature_previews_match_persisted_conflict_resolution() {
         let mut persisted = PatternLibrary::new(&target_dir);
         persisted.load().expect("load persisted signatures");
         let active = persisted.all_active_patterns();
+        let published = config_snapshot(&target_dir);
+        let (database, warnings) = load_signature_database(&target_dir);
+        assert!(warnings.is_empty(), "{strategy}: {warnings:?}");
+        assert_eq!(config_snapshot(&target_dir), published);
         assert!(active
             .iter()
             .any(|pattern| pattern.signature.name == "local_only"));
         assert!(!active
             .iter()
             .any(|pattern| pattern.signature.name == "disabled"));
+        for command in ["local_disabled", "incoming_disabled"] {
+            assert!(
+                database
+                    .match_process(&ProcessMatchContext::with_comm(command))
+                    .is_empty(),
+                "{strategy} reactivated the locally disabled pattern"
+            );
+        }
+        for pattern in &active {
+            assert_eq!(
+                database
+                    .signatures()
+                    .iter()
+                    .find(|signature| signature.name == pattern.signature.name),
+                Some(&pattern.signature),
+                "{strategy} did not activate the persisted effective pattern"
+            );
+        }
         for change in changes {
             let name = change["name"].as_str().expect("preview signature name");
             match active.iter().find(|pattern| pattern.signature.name == name) {

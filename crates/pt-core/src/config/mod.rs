@@ -86,6 +86,10 @@ pub struct ResolvedConfig {
 
     /// The config directory used for resolution.
     pub config_dir: PathBuf,
+
+    /// Fleet publication observed while loading priors and policy. Scorer
+    /// construction must observe the same generation before activating patterns.
+    pub transfer_generation: Option<crate::fleet::transfer::ConfigurationGeneration>,
 }
 
 impl ResolvedConfig {
@@ -171,6 +175,7 @@ pub fn load_config(options: &ConfigOptions) -> Result<ResolvedConfig, ConfigErro
         policy_path,
         policy_hash,
         config_dir,
+        transfer_generation: generation,
     })
 }
 
