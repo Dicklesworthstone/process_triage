@@ -886,7 +886,27 @@ the scan, and stay separate from the observed-member sums. Subtrees can overlap;
 their charged memory is neither additive across units nor an estimate of private
 reclaimable memory. A single CPU counter reading is not a CPU rate.
 
-Collection reads at most 256 distinct cgroups once each, resolves the visible
+With a nonzero sampling window, `agent plan`, `agent snapshot`, and `agent watch`
+also report `cgroup_usage.cpu_rates`. Two reads of the same pinned `cpu.stat`
+file bracket the existing shared process-sampling window without another sleep.
+The output retains both counter snapshots, the cgroup and process witness,
+observed interval bounds, CPU usage/user/system cores, scheduling periods per
+second, throttled periods per second, and throttled seconds per second. This
+whole-subtree accounting includes work by children that exit between process
+censuses. It stays separate from the observed-process totals and does not change
+abandonment probabilities or authorize actions on a workload.
+
+One core means one CPU-second per elapsed second; parallel work can exceed one.
+Throttled seconds per second can also exceed one and is not a PSI percentage or
+a count of idle CPUs. The rate denominator is the midpoint of the monotonic
+read-bracket interval bounds, which remain visible in the output. Missing
+optional counters remain null, while observed zero remains zero. Counter resets,
+short or overlapping intervals, replaced directories or counter files, changed
+process identities or placement, changed boot/namespace/mount bindings, and
+unreadable evidence make the affected window unavailable with a reason.
+Zero-window and unsupported-platform observations have no CPU rate window.
+
+Each collection phase inspects at most 256 distinct cgroups, resolves the visible
 cgroup-v2 mount, pins its physical directory, and checks a census process's
 birth, owner, placement, and cgroup namespace around the read. The reader's boot
 and namespace bindings are retained. Changed identities, ambiguous mounts,

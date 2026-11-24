@@ -237,6 +237,185 @@ pub struct CgroupCpuAccounting {
     pub throttled_usec: Option<u64>,
 }
 
+/// One bounded cpu.stat read. Wall-clock time is descriptive only; interval
+/// arithmetic uses the monotonic read brackets retained by the sampler.
+#[derive(Debug, Clone, Serialize)]
+pub struct CgroupCpuSample {
+    pub observed_at_ms: Option<u64>,
+    pub read_duration_seconds: f64,
+    pub counter_device: u64,
+    pub counter_inode: u64,
+    pub counters: CgroupCpuAccounting,
+}
+
+/// Rates for the entire kernel cgroup subtree, including children that may have
+/// exited between process censuses. A core is one CPU-second per wall second.
+/// Throttled time may exceed one second per second across parallel runqueues;
+/// it is not a fraction of host capacity or permission to act on the subtree.
+#[derive(Debug, Clone, Serialize)]
+pub struct CgroupCpuRates {
+    pub available: bool,
+    pub scope: &'static str,
+    pub source: &'static str,
+    pub binding: Option<CgroupUsageBinding>,
+    pub before: Option<CgroupCpuSample>,
+    pub after: Option<CgroupCpuSample>,
+    /// Midpoint interval estimate, with bounds from the actual read brackets.
+    pub interval_seconds: Option<f64>,
+    pub minimum_interval_seconds: Option<f64>,
+    pub maximum_interval_seconds: Option<f64>,
+    pub usage_cores: Option<f64>,
+    pub user_cores: Option<f64>,
+    pub system_cores: Option<f64>,
+    pub periods_per_second: Option<f64>,
+    pub throttled_periods_per_second: Option<f64>,
+    pub throttled_seconds_per_second: Option<f64>,
+    pub unavailable: Vec<String>,
+}
+
+impl CgroupCpuRates {
+    #[cfg(target_os = "linux")]
+    fn unavailable(reason: impl Into<String>) -> Self {
+        Self {
+            available: false,
+            scope: "cgroup_subtree",
+            source: "cpu.stat",
+            binding: None,
+            before: None,
+            after: None,
+            interval_seconds: None,
+            minimum_interval_seconds: None,
+            maximum_interval_seconds: None,
+            usage_cores: None,
+            user_cores: None,
+            system_cores: None,
+            periods_per_second: None,
+            throttled_periods_per_second: None,
+            throttled_seconds_per_second: None,
+            unavailable: vec![reason.into()],
+        }
+    }
+
+    fn invalidate(&mut self, reason: impl Into<String>) {
+        self.available = false;
+        self.usage_cores = None;
+        self.user_cores = None;
+        self.system_cores = None;
+        self.periods_per_second = None;
+        self.throttled_periods_per_second = None;
+        self.throttled_seconds_per_second = None;
+        self.unavailable.push(reason.into());
+    }
+}
+
+/// Read-only baselines taken before the caller's existing shared sampling wait.
+/// This type never sleeps and never takes separate per-unit process samples.
+pub struct CgroupCpuSampler {
+    #[cfg(target_os = "linux")]
+    inner: linux_cgroup_usage::CpuSampler,
+}
+
+impl CgroupCpuSampler {
+    pub fn begin(processes: &[ProcessRecord]) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            let memberships = collect_cgroup_memberships(processes);
+            let table = attribute_responsible_units(
+                processes,
+                &[],
+                &memberships,
+                None,
+                AttributionResource::Cpu,
+            );
+            Self {
+                inner: linux_cgroup_usage::CpuSampler::begin_from(
+                    &table,
+                    processes,
+                    Path::new("/proc"),
+                    linux_cgroup_usage::verify_filesystem,
+                ),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = processes;
+            Self {}
+        }
+    }
+
+    pub fn finish(
+        self,
+        processes: &[ProcessRecord],
+        minimum_window: std::time::Duration,
+    ) -> CgroupCpuWindow {
+        #[cfg(target_os = "linux")]
+        {
+            self.inner
+                .finish_from(processes, Path::new("/proc"), minimum_window)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (processes, minimum_window);
+            CgroupCpuWindow::default()
+        }
+    }
+}
+
+/// Retains physical directory and counter pins until attribution consumes the
+/// rates. A reused pathname or inode cannot rebind the earlier observations.
+#[derive(Default)]
+pub struct CgroupCpuWindow {
+    observations: BTreeMap<String, CgroupCpuRates>,
+    #[cfg(target_os = "linux")]
+    pins: BTreeMap<String, linux_cgroup_usage::PinnedCpuScope>,
+}
+
+impl CgroupCpuWindow {
+    /// Attach only to matching current kernel-accounting scopes. Measured
+    /// process totals, posterior inputs and the unit ordering remain unchanged.
+    pub fn attach_to(&self, table: &mut ResponsibleUnitTable) {
+        for unit in &mut table.units {
+            let Some(usage) = unit.cgroup_usage.as_mut() else {
+                continue;
+            };
+            usage.cpu_rates = self.observations.get(&usage.path).map(|observation| {
+                let mut rates = observation.clone();
+                if let Some(binding) = &rates.binding {
+                    if usage
+                        .binding
+                        .as_ref()
+                        .is_none_or(|current| !same_cgroup_scope(binding, current))
+                    {
+                        rates.invalidate(
+                            "current cgroup accounting does not match the sampled scope",
+                        );
+                    }
+                    #[cfg(target_os = "linux")]
+                    if let Err(reason) = self
+                        .pins
+                        .get(&usage.path)
+                        .ok_or_else(|| "cgroup CPU observation pin is unavailable".to_string())
+                        .and_then(linux_cgroup_usage::PinnedCpuScope::validate)
+                    {
+                        rates.invalidate(reason);
+                    }
+                }
+                rates
+            });
+        }
+    }
+}
+
+fn same_cgroup_scope(left: &CgroupUsageBinding, right: &CgroupUsageBinding) -> bool {
+    left.directory_device == right.directory_device
+        && left.directory_inode == right.directory_inode
+        && left.mount_root == right.mount_root
+        && left.mount_point == right.mount_point
+        && left.mount_namespace == right.mount_namespace
+        && left.cgroup_namespace == right.cgroup_namespace
+        && left.boot_id == right.boot_id
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CgroupNamespaceIdentity {
     pub device: u64,
@@ -273,6 +452,7 @@ pub struct CgroupResourceUsage {
     pub memory_swap_current_bytes: Option<u64>,
     pub memory_headroom: Option<CgroupMemoryHeadroom>,
     pub cpu_stat: Option<CgroupCpuAccounting>,
+    pub cpu_rates: Option<CgroupCpuRates>,
     pub cpu_pressure: Option<super::pressure::PsiResource>,
     pub memory_pressure: Option<super::pressure::PsiResource>,
     pub io_pressure: Option<super::pressure::PsiResource>,
@@ -292,6 +472,7 @@ impl CgroupResourceUsage {
             memory_swap_current_bytes: None,
             memory_headroom: None,
             cpu_stat: None,
+            cpu_rates: None,
             cpu_pressure: None,
             memory_pressure: None,
             io_pressure: None,
@@ -518,6 +699,382 @@ mod linux_cgroup_usage {
         identity: AttributionIdentity,
         binding: Binding,
         membership: String,
+    }
+
+    pub(super) struct PinnedCpuScope {
+        directory: File,
+        counter: File,
+        path: PathBuf,
+    }
+
+    impl PinnedCpuScope {
+        pub(super) fn validate(&self) -> Result<(), String> {
+            same_directory(&self.directory, &self.path)?;
+            let current = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(self.path.join("cpu.stat"))
+                .map_err(|error| format!("cpu.stat binding unreadable: {error}"))?;
+            let old = self.counter.metadata().map_err(|error| error.to_string())?;
+            let new = current.metadata().map_err(|error| error.to_string())?;
+            if old.dev() != new.dev() || old.ino() != new.ino() {
+                return Err("cpu.stat counter file was replaced".into());
+            }
+            Ok(())
+        }
+    }
+
+    struct TimedCpuSample {
+        value: CgroupCpuSample,
+        started: std::time::Instant,
+        finished: std::time::Instant,
+        handle: File,
+    }
+
+    struct CpuBaseline {
+        pin: PinnedCpuScope,
+        witness: Witness,
+        binding: CgroupUsageBinding,
+        value: CgroupCpuSample,
+        started: std::time::Instant,
+        finished: std::time::Instant,
+    }
+
+    pub(super) struct CpuSampler {
+        context: Result<Context, String>,
+        baselines: BTreeMap<String, Result<CpuBaseline, String>>,
+    }
+
+    fn read_cpu_sample(directory: &File) -> Result<TimedCpuSample, String> {
+        let path = PathBuf::from(format!("/proc/self/fd/{}/cpu.stat", directory.as_raw_fd()));
+        let started = std::time::Instant::now();
+        let mut handle = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|error| format!("cpu.stat unreadable: {error}"))?;
+        let metadata = handle.metadata().map_err(|error| error.to_string())?;
+        if !metadata.is_file() {
+            return Err("cpu.stat is not a regular kernel file".into());
+        }
+        let mut bytes = Vec::new();
+        (&mut handle)
+            .take(MAX_CONTROL_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("cpu.stat unreadable: {error}"))?;
+        let finished = std::time::Instant::now();
+        if bytes.len() > MAX_CONTROL_BYTES {
+            return Err("cpu.stat exceeds the observation size limit".into());
+        }
+        let text = std::str::from_utf8(&bytes).map_err(|_| "cpu.stat is not UTF-8")?;
+        Ok(TimedCpuSample {
+            value: CgroupCpuSample {
+                observed_at_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
+                read_duration_seconds: finished.duration_since(started).as_secs_f64(),
+                counter_device: metadata.dev(),
+                counter_inode: metadata.ino(),
+                counters: cpu_stat(text)?,
+            },
+            started,
+            finished,
+            handle,
+        })
+    }
+
+    fn same_cpu_context(before: &Context, after: &Context, path: &str) -> Result<(), String> {
+        if before.boot != after.boot
+            || before.mount_namespace != after.mount_namespace
+            || before.cgroup_namespace != after.cgroup_namespace
+        {
+            return Err("reader boot or namespace changed during the CPU window".into());
+        }
+        let old = resolve_cgroup_mount(path, &before.mountinfo, "cgroup2", None)?;
+        let new = resolve_cgroup_mount(path, &after.mountinfo, "cgroup2", None)?;
+        if old.directory != new.directory
+            || old.mount_root != new.mount_root
+            || old.mount_point != new.mount_point
+        {
+            return Err("cgroup mount mapping changed during the CPU window".into());
+        }
+        Ok(())
+    }
+
+    impl CpuSampler {
+        pub(super) fn begin_from(
+            table: &ResponsibleUnitTable,
+            processes: &[ProcessRecord],
+            proc_root: &Path,
+            verify: impl Fn(&File) -> Result<(), String>,
+        ) -> Self {
+            let mut groups: BTreeMap<&str, BTreeMap<u32, &AttributionIdentity>> = BTreeMap::new();
+            for unit in &table.units {
+                if let Some(path) = unit.cgroup_path.as_deref() {
+                    let members = groups.entry(path).or_default();
+                    for member in &unit.members {
+                        members.entry(member.pid).or_insert(member);
+                    }
+                }
+            }
+            let (process_index, _) = unique_index(processes, |process| process.pid.0);
+            let before = context(proc_root);
+            let started = std::time::Instant::now();
+            let mut baselines = BTreeMap::new();
+            for (index, (path, members)) in groups.iter().enumerate() {
+                let observation = (|| {
+                    if index >= MAX_CGROUP_SAMPLES
+                        || started.elapsed() >= std::time::Duration::from_secs(2)
+                    {
+                        return Err("cgroup CPU observation budget reached".to_string());
+                    }
+                    let context = before.as_ref().map_err(Clone::clone)?;
+                    let mount = resolve_cgroup_mount(path, &context.mountinfo, "cgroup2", None)?;
+                    let mut reasons = Vec::new();
+                    for member in members.values().take(MAX_WITNESSES) {
+                        let Some(process) = process_index
+                            .get(&member.pid)
+                            .filter(|process| member.matches(process))
+                        else {
+                            continue;
+                        };
+                        let witness = match witness(proc_root, process, path, context) {
+                            Ok(witness) => witness,
+                            Err(reason) => {
+                                if reasons.len() < MAX_UNIT_DIAGNOSTICS {
+                                    reasons.push(format!("PID {}: {reason}", member.pid));
+                                }
+                                continue;
+                            }
+                        };
+                        let directory = open_directory(&mount.directory)?;
+                        verify(&directory)?;
+                        let metadata = directory.metadata().map_err(|error| error.to_string())?;
+                        validate_witness(proc_root, &witness, context)?;
+                        let sample = read_cpu_sample(&directory)?;
+                        let pin = PinnedCpuScope {
+                            directory,
+                            counter: sample.handle,
+                            path: mount.directory.clone(),
+                        };
+                        pin.validate()?;
+                        validate_witness(proc_root, &witness, context)?;
+                        let binding = CgroupUsageBinding {
+                            directory_device: metadata.dev(),
+                            directory_inode: metadata.ino(),
+                            mount_root: mount.mount_root.to_string_lossy().into_owned(),
+                            mount_point: mount.mount_point.to_string_lossy().into_owned(),
+                            mount_namespace: context.mount_namespace.clone(),
+                            cgroup_namespace: context.cgroup_namespace.clone(),
+                            boot_id: context.boot.clone(),
+                            witness: witness.identity.clone(),
+                        };
+                        return Ok(CpuBaseline {
+                            pin,
+                            witness,
+                            binding,
+                            value: sample.value,
+                            started: sample.started,
+                            finished: sample.finished,
+                        });
+                    }
+                    Err(format!(
+                        "no live census witness for CPU accounting: {}",
+                        reasons.join("; ")
+                    ))
+                })();
+                baselines.insert((*path).to_string(), observation);
+            }
+            let after = context(proc_root);
+            for (path, observation) in &mut baselines {
+                if observation.is_ok() {
+                    let valid = before.as_ref().map_err(Clone::clone).and_then(|before| {
+                        after
+                            .as_ref()
+                            .map_err(Clone::clone)
+                            .and_then(|after| same_cpu_context(before, after, path))
+                    });
+                    if let Err(reason) = valid {
+                        *observation = Err(reason);
+                    }
+                }
+            }
+            Self {
+                context: before,
+                baselines,
+            }
+        }
+
+        pub(super) fn finish_from(
+            self,
+            processes: &[ProcessRecord],
+            proc_root: &Path,
+            minimum_window: std::time::Duration,
+        ) -> CgroupCpuWindow {
+            let (process_index, _) = unique_index(processes, |process| process.pid.0);
+            let endpoint_context = context(proc_root);
+            let started = std::time::Instant::now();
+            let mut window = CgroupCpuWindow::default();
+            for (path, baseline) in self.baselines {
+                let baseline = match baseline {
+                    Ok(baseline) => baseline,
+                    Err(reason) => {
+                        window
+                            .observations
+                            .insert(path, CgroupCpuRates::unavailable(reason));
+                        continue;
+                    }
+                };
+                let result = (|| {
+                    if started.elapsed() >= std::time::Duration::from_secs(2) {
+                        return Err("cgroup CPU endpoint observation budget reached".to_string());
+                    }
+                    let original = self.context.as_ref().map_err(Clone::clone)?;
+                    let current = endpoint_context.as_ref().map_err(Clone::clone)?;
+                    same_cpu_context(original, current, &path)?;
+                    if process_index
+                        .get(&baseline.witness.identity.pid)
+                        .is_none_or(|process| !baseline.witness.identity.matches(process))
+                    {
+                        return Err("CPU observation witness is absent from the census".to_string());
+                    }
+                    validate_witness(proc_root, &baseline.witness, current)?;
+                    baseline.pin.validate()?;
+                    let sample = read_cpu_sample(&baseline.pin.directory)?;
+                    baseline.pin.validate()?;
+                    validate_witness(proc_root, &baseline.witness, current)?;
+                    let minimum = sample
+                        .started
+                        .checked_duration_since(baseline.finished)
+                        .ok_or("CPU sample read brackets overlap")?;
+                    let maximum = sample
+                        .finished
+                        .checked_duration_since(baseline.started)
+                        .ok_or("CPU sample clock moved backwards")?;
+                    Ok(cpu_rates(
+                        &baseline.value,
+                        &sample.value,
+                        minimum,
+                        maximum,
+                        minimum_window,
+                    ))
+                })();
+                let mut rates = result.unwrap_or_else(CgroupCpuRates::unavailable);
+                rates.binding = Some(baseline.binding);
+                if rates.before.is_none() {
+                    rates.before = Some(baseline.value);
+                }
+                window.pins.insert(path.clone(), baseline.pin);
+                window.observations.insert(path, rates);
+            }
+            let final_context = context(proc_root);
+            for (path, rates) in &mut window.observations {
+                if rates.binding.is_some() {
+                    let valid = self
+                        .context
+                        .as_ref()
+                        .map_err(Clone::clone)
+                        .and_then(|before| {
+                            final_context
+                                .as_ref()
+                                .map_err(Clone::clone)
+                                .and_then(|after| same_cpu_context(before, after, path))
+                        });
+                    if let Err(reason) = valid {
+                        rates.invalidate(reason);
+                    }
+                }
+            }
+            window
+        }
+    }
+
+    /// Counter arithmetic shared by live samples and deterministic fixtures.
+    pub(super) fn cpu_rates(
+        before: &CgroupCpuSample,
+        after: &CgroupCpuSample,
+        minimum: std::time::Duration,
+        maximum: std::time::Duration,
+        required: std::time::Duration,
+    ) -> CgroupCpuRates {
+        let mut result = CgroupCpuRates::unavailable("");
+        result.unavailable.clear();
+        result.before = Some(before.clone());
+        result.after = Some(after.clone());
+        if minimum.is_zero() || minimum < required || maximum < minimum {
+            result.invalidate("CPU sampling did not complete a positive requested interval");
+            return result;
+        }
+        if before.counter_device != after.counter_device
+            || before.counter_inode != after.counter_inode
+        {
+            result.invalidate("cpu.stat counter identity changed between samples");
+            return result;
+        }
+        let minimum_seconds = minimum.as_secs_f64();
+        let maximum_seconds = maximum.as_secs_f64();
+        let seconds = minimum_seconds + (maximum_seconds - minimum_seconds) / 2.0;
+        result.interval_seconds = Some(seconds);
+        result.minimum_interval_seconds = Some(minimum_seconds);
+        result.maximum_interval_seconds = Some(maximum_seconds);
+        let b = &before.counters;
+        let a = &after.counters;
+        let counters = [
+            ("usage_usec", Some(b.usage_usec), Some(a.usage_usec)),
+            ("user_usec", b.user_usec, a.user_usec),
+            ("system_usec", b.system_usec, a.system_usec),
+            ("nr_periods", b.nr_periods, a.nr_periods),
+            ("nr_throttled", b.nr_throttled, a.nr_throttled),
+            ("throttled_usec", b.throttled_usec, a.throttled_usec),
+        ];
+        for (name, before, after) in counters {
+            if before
+                .zip(after)
+                .is_some_and(|(before, after)| after < before)
+            {
+                result.invalidate(format!("cpu.stat counter moved backwards: {name}"));
+                return result;
+            }
+        }
+        let unavailable = &mut result.unavailable;
+        let mut rate =
+            |name, before: Option<u64>, after: Option<u64>, scale: f64| match before.zip(after) {
+                Some((before, after)) => {
+                    let value = after.checked_sub(before)? as f64 / seconds / scale;
+                    if value.is_finite() {
+                        Some(value)
+                    } else {
+                        unavailable.push(format!("cpu.stat {name} rate is not finite"));
+                        None
+                    }
+                }
+                None => {
+                    unavailable.push(format!(
+                        "cpu.stat {name} is unavailable at one or both endpoints"
+                    ));
+                    None
+                }
+            };
+        result.usage_cores = rate(
+            "usage_usec",
+            Some(b.usage_usec),
+            Some(a.usage_usec),
+            1_000_000.0,
+        );
+        result.user_cores = rate("user_usec", b.user_usec, a.user_usec, 1_000_000.0);
+        result.system_cores = rate("system_usec", b.system_usec, a.system_usec, 1_000_000.0);
+        result.periods_per_second = rate("nr_periods", b.nr_periods, a.nr_periods, 1.0);
+        result.throttled_periods_per_second =
+            rate("nr_throttled", b.nr_throttled, a.nr_throttled, 1.0);
+        result.throttled_seconds_per_second = rate(
+            "throttled_usec",
+            b.throttled_usec,
+            a.throttled_usec,
+            1_000_000.0,
+        );
+        result.available = result.usage_cores.is_some();
+        result
     }
 
     struct MemoryObservation {
@@ -1932,7 +2489,8 @@ pub fn attribute_responsible_units(
             "Ranking uses observed subtotals with coverage, not invented complete totals for unmeasured members.",
             "CPU and I/O totals require the caller's shared measurement window; lifetime CPU is never aggregated.",
             "Kernel cgroup observations cover whole subtrees, can overlap other units, and are separate from member sums and single-process relief credit.",
-            "Cgroup cpu.stat values are cumulative counters, not observed CPU rates; memory.current is charged memory, not private reclaimable pages.",
+            "Cgroup cpu.stat values are cumulative; cpu_rates requires two bound reads around the shared window. Neither subtree accounting nor its rates replace process-member sums or authorize group actions.",
+            "Cgroup CPU rates may include unobserved or exited members and overlapping subtrees; do not sum them. memory.current is charged memory, not private reclaimable pages.",
             "Terminal subtrees are inferred from observed mux/TTY ancestry, not a multiplexer pane-ID query.",
         ],
         lookup,
@@ -3379,6 +3937,353 @@ mod tests {
             .unavailable
             .iter()
             .any(|reason| reason.contains("not a cgroup-v2 filesystem")));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn cpu_sample() -> CgroupCpuSample {
+        CgroupCpuSample {
+            observed_at_ms: Some(10000),
+            read_duration_seconds: 0.001,
+            counter_device: 3,
+            counter_inode: 9,
+            counters: CgroupCpuAccounting {
+                usage_usec: 1_500_000,
+                user_usec: Some(1_200_000),
+                system_usec: Some(300_000),
+                nr_periods: Some(12),
+                nr_throttled: Some(2),
+                throttled_usec: Some(50),
+            },
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn cgroup_cpu_rates_use_counter_deltas_and_monotonic_read_brackets() {
+        use std::time::Duration;
+        let before = cpu_sample();
+        let mut after = before.clone();
+        // A wall-clock correction must not change the monotonic interval.
+        after.observed_at_ms = Some(1);
+        after.counters = CgroupCpuAccounting {
+            usage_usec: 5_500_000,
+            user_usec: Some(4_200_000),
+            system_usec: Some(1_300_000),
+            nr_periods: Some(20),
+            nr_throttled: Some(4),
+            throttled_usec: Some(5_000_050),
+        };
+        let rates = linux_cgroup_usage::cpu_rates(
+            &before,
+            &after,
+            Duration::from_millis(1990),
+            Duration::from_millis(2010),
+            Duration::from_millis(500),
+        );
+        assert!(rates.available);
+        assert_eq!(rates.interval_seconds, Some(2.0));
+        assert_eq!(rates.minimum_interval_seconds, Some(1.99));
+        assert_eq!(rates.maximum_interval_seconds, Some(2.01));
+        assert_eq!(rates.usage_cores, Some(2.0));
+        assert_eq!(rates.user_cores, Some(1.5));
+        assert_eq!(rates.system_cores, Some(0.5));
+        assert_eq!(rates.periods_per_second, Some(4.0));
+        assert_eq!(rates.throttled_periods_per_second, Some(1.0));
+        assert_eq!(rates.throttled_seconds_per_second, Some(2.5));
+        assert!(rates.unavailable.is_empty());
+
+        let mut huge = before.clone();
+        huge.counters.usage_usec = u64::MAX - 10;
+        let mut later = huge.clone();
+        later.counters.usage_usec = u64::MAX;
+        let rates = linux_cgroup_usage::cpu_rates(
+            &huge,
+            &later,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Duration::ZERO,
+        );
+        assert_eq!(rates.usage_cores, Some(0.000005));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn cgroup_cpu_rates_preserve_zero_and_independently_missing_optional_counters() {
+        use std::time::Duration;
+        let before = cpu_sample();
+        let mut after = before.clone();
+        after.counters.user_usec = None;
+        after.counters.nr_periods = None;
+        after.counters.throttled_usec = None;
+        let rates = linux_cgroup_usage::cpu_rates(
+            &before,
+            &after,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        assert!(rates.available);
+        assert_eq!(rates.usage_cores, Some(0.0));
+        assert_eq!(rates.system_cores, Some(0.0));
+        assert_eq!(rates.throttled_periods_per_second, Some(0.0));
+        assert_eq!(rates.user_cores, None);
+        assert_eq!(rates.periods_per_second, None);
+        assert_eq!(rates.throttled_seconds_per_second, None);
+        assert_eq!(rates.unavailable.len(), 3);
+        let json = serde_json::to_value(&rates).unwrap();
+        assert_eq!(json["usage_cores"], 0.0);
+        assert!(json["user_cores"].is_null());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn cgroup_cpu_rates_reject_every_counter_reset_short_window_and_changed_file() {
+        use std::time::Duration;
+        let before = cpu_sample();
+        for field in 0..6 {
+            let mut after = before.clone();
+            match field {
+                0 => after.counters.usage_usec = 0,
+                1 => after.counters.user_usec = Some(0),
+                2 => after.counters.system_usec = Some(0),
+                3 => after.counters.nr_periods = Some(0),
+                4 => after.counters.nr_throttled = Some(0),
+                5 => after.counters.throttled_usec = Some(0),
+                _ => unreachable!(),
+            }
+            let rates = linux_cgroup_usage::cpu_rates(
+                &before,
+                &after,
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::ZERO,
+            );
+            assert!(!rates.available, "field {field}");
+            assert!(rates.usage_cores.is_none());
+            assert!(rates.user_cores.is_none());
+            assert!(rates.system_cores.is_none());
+            assert!(rates.periods_per_second.is_none());
+            assert!(rates.throttled_periods_per_second.is_none());
+            assert!(rates.throttled_seconds_per_second.is_none());
+            assert!(rates.before.is_some() && rates.after.is_some());
+            assert!(rates.unavailable[0].contains("counter moved backwards"));
+        }
+        for (minimum, maximum, requested) in [(0, 1, 0), (499, 501, 500), (500, 499, 0)] {
+            let rates = linux_cgroup_usage::cpu_rates(
+                &before,
+                &before,
+                Duration::from_millis(minimum),
+                Duration::from_millis(maximum),
+                Duration::from_millis(requested),
+            );
+            assert!(!rates.available && rates.usage_cores.is_none());
+        }
+        for inode_change in [true, false] {
+            let mut after = before.clone();
+            if inode_change {
+                after.counter_inode += 1;
+            } else {
+                after.counter_device += 1;
+            }
+            let rates = linux_cgroup_usage::cpu_rates(
+                &before,
+                &after,
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::ZERO,
+            );
+            assert!(!rates.available);
+            assert!(rates.unavailable[0].contains("counter identity changed"));
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn cgroup_cpu_window_reads_shared_scopes_once_and_keeps_member_totals_separate() {
+        use std::time::Duration;
+        let mut processes = vec![
+            process(100, 1, "worker", 100),
+            process(101, 1, "worker", 101),
+        ];
+        processes[1].uid = 2000;
+        let fixture = telemetry_fixture(&processes);
+        let proc_root = fixture.path().join("proc");
+        let directory = fixture
+            .path()
+            .join("cgroup")
+            .join(AGENT_SCOPE.trim_start_matches('/'));
+        let mut observed = telemetry_table(fixture.path(), &processes);
+        let member_usage: Vec<_> = observed
+            .units
+            .iter()
+            .map(|unit| serde_json::to_value(&unit.usage).unwrap())
+            .collect();
+        let reads = std::cell::Cell::new(0);
+        let sampler =
+            linux_cgroup_usage::CpuSampler::begin_from(&observed, &processes, &proc_root, |_| {
+                reads.set(reads.get() + 1);
+                Ok(())
+            });
+        assert_eq!(reads.get(), 1);
+        std::fs::write(directory.join("cpu.stat"),
+            "usage_usec 3500000\nuser_usec 2700000\nsystem_usec 800000\nnr_periods 20\nnr_throttled 2\nthrottled_usec 50\n",
+        ).unwrap();
+        let window = sampler.finish_from(&processes, &proc_root, Duration::ZERO);
+        linux_cgroup_usage::collect_from(&mut observed, &processes, &proc_root, |_| Ok(()));
+        window.attach_to(&mut observed);
+        assert_eq!(observed.units.len(), 2);
+        for (unit, previous) in observed.units.iter().zip(member_usage) {
+            assert_eq!(serde_json::to_value(&unit.usage).unwrap(), previous);
+            let rates = unit
+                .cgroup_usage
+                .as_ref()
+                .unwrap()
+                .cpu_rates
+                .as_ref()
+                .unwrap();
+            assert!(rates.available, "{:?}", rates.unavailable);
+            assert!(
+                (rates.usage_cores.unwrap() * rates.interval_seconds.unwrap() - 2.0).abs() < 1e-9
+            );
+            assert_eq!(rates.throttled_seconds_per_second, Some(0.0));
+            assert_eq!(rates.binding.as_ref().unwrap().witness.pid, 100);
+            assert!(unit.usage.cpu_cores.value.is_none());
+        }
+        CgroupCpuWindow::default().attach_to(&mut observed);
+        assert!(observed.units.iter().all(|unit| unit
+            .cgroup_usage
+            .as_ref()
+            .unwrap()
+            .cpu_rates
+            .is_none()));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn cgroup_cpu_window_refuses_changed_witness_scope_and_missing_counter_evidence() {
+        use std::time::Duration;
+        let processes = vec![process(100, 1, "worker", 100)];
+        for change in [
+            "birth",
+            "owner",
+            "parent",
+            "placement",
+            "boot",
+            "namespace",
+            "mount",
+            "missing_counter",
+            "malformed_counter",
+            "counter_file",
+            "directory",
+        ] {
+            let fixture = telemetry_fixture(&processes);
+            let proc_root = fixture.path().join("proc");
+            let directory = fixture
+                .path()
+                .join("cgroup")
+                .join(AGENT_SCOPE.trim_start_matches('/'));
+            let observed = telemetry_table(fixture.path(), &processes);
+            let sampler = linux_cgroup_usage::CpuSampler::begin_from(
+                &observed,
+                &processes,
+                &proc_root,
+                |_| Ok(()),
+            );
+            match change {
+                "birth" => write_proc_fixture(&proc_root, &processes[0], 101, 1000),
+                "owner" => write_proc_fixture(&proc_root, &processes[0], 100, 2000),
+                "parent" => {
+                    let mut changed = processes[0].clone();
+                    changed.ppid = ProcessId(2);
+                    write_proc_fixture(&proc_root, &changed, 100, 1000);
+                }
+                "placement" => {
+                    std::fs::write(proc_root.join("100/cgroup"), "0::/other.scope\n").unwrap()
+                }
+                "boot" => {
+                    std::fs::write(proc_root.join("sys/kernel/random/boot_id"), "other\n").unwrap()
+                }
+                "namespace" => {
+                    let path = proc_root.join("100/ns/cgroup");
+                    std::fs::rename(&path, path.with_extension("previous")).unwrap();
+                    std::fs::write(path, "another namespace").unwrap();
+                }
+                "mount" => std::fs::write(
+                    proc_root.join("self/mountinfo"),
+                    "42 25 0:27 / /different-mount rw - cgroup2 cgroup rw\n",
+                )
+                .unwrap(),
+                "missing_counter" => {
+                    std::fs::rename(directory.join("cpu.stat"), directory.join("saved-cpu.stat"))
+                        .unwrap()
+                }
+                "malformed_counter" => {
+                    std::fs::write(directory.join("cpu.stat"), "usage_usec 1\nusage_usec 2\n")
+                        .unwrap()
+                }
+                "counter_file" => {
+                    std::fs::rename(directory.join("cpu.stat"), directory.join("saved-cpu.stat"))
+                        .unwrap();
+                    std::fs::write(directory.join("cpu.stat"), "usage_usec 1500000\n").unwrap();
+                }
+                "directory" => {
+                    std::fs::rename(&directory, directory.with_extension("previous")).unwrap();
+                    std::fs::create_dir(&directory).unwrap();
+                    std::fs::write(directory.join("cpu.stat"), "usage_usec 1500000\n").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let window = sampler.finish_from(&processes, &proc_root, Duration::ZERO);
+            let rates = window.observations.get(AGENT_SCOPE).unwrap();
+            assert!(!rates.available && rates.usage_cores.is_none(), "{change}");
+            assert!(!rates.unavailable.is_empty(), "{change}");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn cgroup_cpu_rates_cannot_attach_after_scope_or_counter_replacement() {
+        use std::time::Duration;
+        let processes = vec![process(100, 1, "worker", 100)];
+        for replace_directory in [true, false] {
+            let fixture = telemetry_fixture(&processes);
+            let proc_root = fixture.path().join("proc");
+            let directory = fixture
+                .path()
+                .join("cgroup")
+                .join(AGENT_SCOPE.trim_start_matches('/'));
+            let mut observed = telemetry_table(fixture.path(), &processes);
+            let sampler = linux_cgroup_usage::CpuSampler::begin_from(
+                &observed,
+                &processes,
+                &proc_root,
+                |_| Ok(()),
+            );
+            let window = sampler.finish_from(&processes, &proc_root, Duration::ZERO);
+            assert!(window.observations[AGENT_SCOPE].available);
+            if replace_directory {
+                std::fs::rename(&directory, directory.with_extension("previous")).unwrap();
+                std::fs::create_dir(&directory).unwrap();
+            } else {
+                std::fs::rename(directory.join("cpu.stat"), directory.join("saved-cpu.stat"))
+                    .unwrap();
+            }
+            std::fs::write(directory.join("cpu.stat"), "usage_usec 1500000\n").unwrap();
+            linux_cgroup_usage::collect_from(&mut observed, &processes, &proc_root, |_| Ok(()));
+            window.attach_to(&mut observed);
+            let rates = observed.units[0]
+                .cgroup_usage
+                .as_ref()
+                .unwrap()
+                .cpu_rates
+                .as_ref()
+                .unwrap();
+            assert!(!rates.available && rates.usage_cores.is_none());
+            assert!(rates
+                .unavailable
+                .iter()
+                .any(|reason| reason.contains("replaced") || reason.contains("match")));
+        }
     }
 
     proptest! {

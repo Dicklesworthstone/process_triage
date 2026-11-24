@@ -20,7 +20,7 @@ use pt_core::collect::pressure::{pressure_window, PressureSnapshot, PressureWind
 use pt_core::collect::protected::ProtectedFilter;
 use pt_core::collect::responsible_units::{
     attribute_responsible_units, collect_cgroup_memberships, collect_cgroup_usage,
-    AttributionResource, ResponsibleUnit, ResponsibleUnitTable,
+    AttributionResource, CgroupCpuSampler, CgroupCpuWindow, ResponsibleUnit, ResponsibleUnitTable,
 };
 #[cfg(target_os = "linux")]
 use pt_core::collect::ContainerRuntime;
@@ -3305,8 +3305,8 @@ fn score_tui_rows(
         .filter(|proc| proc.elapsed.as_secs() >= min_age)
         .collect();
     scorer.collect_provenance(&eligible, population, census_complete);
-    let system_state =
-        collect_planning_activity(&mut scorer, population, window_ms, census_complete);
+    let (system_state, _) =
+        collect_planning_activity(&mut scorer, population, window_ms, census_complete, false);
     scorer.prepare_agent_activity(population, census_complete);
     let pressure = PlanningPressure::from_system_state(&system_state);
     let probe_advice = if probe_budget.is_zero() {
@@ -31035,20 +31035,22 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
         }
     };
 
-    let mut system_state = match &scan_result {
+    let (mut system_state, cgroup_cpu) = match &scan_result {
         Some(scan) if args.minimal => collect_observational_activity(
             &mut scorer,
             &scan.processes,
             args.window_ms,
             scan.metadata.warnings.is_empty(),
+            true,
         ),
         Some(scan) => collect_planning_activity(
             &mut scorer,
             &scan.processes,
             args.window_ms,
             scan.metadata.warnings.is_empty(),
+            true,
         ),
-        None => collect_system_state(None),
+        None => (collect_system_state(None), CgroupCpuWindow::default()),
     };
     if args.minimal {
         if let Some(system) = system_state.as_object_mut() {
@@ -31067,7 +31069,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
     let pressure = PlanningPressure::from_system_state(&system_state);
     let responsible_units = scan_result
         .as_ref()
-        .map(|scan| collect_responsible_units(scan, &scorer, &pressure));
+        .map(|scan| collect_responsible_units(scan, &scorer, &pressure, &cgroup_cpu));
     let agent_activity = scan_result.as_ref().map(|scan| {
         scorer.prepare_agent_activity(&scan.processes, scan.metadata.warnings.is_empty())
     });
@@ -32963,11 +32965,18 @@ fn collect_planning_activity(
     population: &[ProcessRecord],
     window_ms: u64,
     census_complete: bool,
-) -> serde_json::Value {
-    let mut system = collect_observational_activity(scorer, population, window_ms, census_complete);
+    collect_cgroup_rates: bool,
+) -> (serde_json::Value, CgroupCpuWindow) {
+    let (mut system, cgroup_cpu) = collect_observational_activity(
+        scorer,
+        population,
+        window_ms,
+        census_complete,
+        collect_cgroup_rates,
+    );
     system["respawn_history"] = collect_planning_respawn_history(scorer, population);
     system["workloads"] = collect_planning_workloads(scorer, population, census_complete);
-    system
+    (system, cgroup_cpu)
 }
 
 /// A shared rate window for read-only health observations, without collecting
@@ -32977,7 +32986,8 @@ fn collect_observational_activity(
     population: &[ProcessRecord],
     window_ms: u64,
     census_complete: bool,
-) -> serde_json::Value {
+    collect_cgroup_rates: bool,
+) -> (serde_json::Value, CgroupCpuWindow) {
     use pt_core::collect::pressure::{
         host_cpu_window, process_io_window, read_host_cpu_counters, read_pressure_snapshot,
     };
@@ -32986,6 +32996,14 @@ fn collect_observational_activity(
     // host counters around that work without a second sleep, and use its actual
     // monotonic duration rather than the requested delay or wall-clock delta.
     let requested = Duration::from_millis(window_ms);
+    // Whole-subtree counters include short-lived children that the PID census
+    // can miss. Pin those scopes around the existing shared wait; never sleep
+    // once per cgroup, and keep their measured rates separate from PID sums.
+    let cgroup_sampler = (collect_cgroup_rates
+        && cfg!(target_os = "linux")
+        && !requested.is_zero()
+        && !population.is_empty())
+    .then(|| CgroupCpuSampler::begin(population));
     let baseline = (cfg!(target_os = "linux") && !requested.is_zero() && !population.is_empty())
         .then(|| {
             let snapshot = read_pressure_snapshot();
@@ -33047,7 +33065,10 @@ fn collect_observational_activity(
     let mut system = system_state_from_pressure(snapshot, window, Some(population));
     system["cpu_usage"] = serde_json::json!(cpu_usage.ok());
     system["io_accounting"] = serde_json::json!(io_accounting.ok());
-    system
+    let cgroup_cpu = cgroup_sampler
+        .map(|sampler| sampler.finish(population, requested))
+        .unwrap_or_default();
+    (system, cgroup_cpu)
 }
 
 /// Diagnose duplicate and competing launches once for the full census. This
@@ -33180,6 +33201,7 @@ fn collect_responsible_units(
     scan: &ScanResult,
     scorer: &Scorer,
     pressure: &PlanningPressure,
+    cgroup_cpu: &CgroupCpuWindow,
 ) -> ResponsibleUnitTable {
     let activities: Vec<_> = scan
         .processes
@@ -33196,6 +33218,7 @@ fn collect_responsible_units(
         responsible_unit_rank(pressure),
     );
     collect_cgroup_usage(&mut table, &scan.processes);
+    cgroup_cpu.attach_to(&mut table);
     table.unavailable.extend(
         scan.metadata
             .warnings
@@ -33457,7 +33480,7 @@ fn print_memory_limit_report(report: &serde_json::Value) {
 
 fn print_responsible_units(table: &ResponsibleUnitTable) {
     println!("\n## Responsible Workloads\n");
-    println!("Observed census only; totals do not authorize a group action.");
+    println!("Process totals use observed census members; cgroup measurements cover whole subtrees. Neither authorizes a group action.");
     for unit in table.units.iter().take(8) {
         let cpu = unit
             .usage
@@ -33475,6 +33498,27 @@ fn print_responsible_units(table: &ResponsibleUnitTable) {
             "- {}: {} members; {}; {}",
             unit.label, unit.member_count, cpu, rss
         );
+        if let Some(rates) = unit
+            .cgroup_usage
+            .as_ref()
+            .and_then(|usage| usage.cpu_rates.as_ref())
+        {
+            match rates
+                .usage_cores
+                .zip(rates.interval_seconds)
+                .filter(|_| rates.available)
+            {
+                Some((cores, seconds)) => println!(
+                    "  Whole cgroup subtree: {cores:.2} CPU cores over {seconds:.3}s; overlapping scopes are not additive."
+                ),
+                None => println!(
+                    "  Cgroup CPU rate unavailable: {}",
+                    fleet_inspection_text(
+                        rates.unavailable.first().map(String::as_str).unwrap_or("incomplete sampling evidence")
+                    )
+                ),
+            }
+        }
     }
     if table.units.len() > 8 {
         println!(
@@ -34656,11 +34700,12 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         &scan_result.processes,
         scan_result.metadata.warnings.is_empty(),
     );
-    let system_state = collect_planning_activity(
+    let (system_state, cgroup_cpu) = collect_planning_activity(
         &mut scorer,
         &scan_result.processes,
         args.window_ms,
         scan_result.metadata.warnings.is_empty(),
+        true,
     );
     let activity_observed_at_ms = chrono::Utc::now().timestamp_millis();
     let prediction_history = args.include_predictions.then(|| {
@@ -34680,7 +34725,8 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         )
     });
     let pressure = PlanningPressure::from_system_state(&system_state);
-    let responsible_units = collect_responsible_units(&scan_result, &scorer, &pressure);
+    let responsible_units =
+        collect_responsible_units(&scan_result, &scorer, &pressure, &cgroup_cpu);
     let agent_activity = scorer.prepare_agent_activity(
         &scan_result.processes,
         scan_result.metadata.warnings.is_empty(),
@@ -44241,14 +44287,16 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
             &scan_result.processes,
             scan_result.metadata.warnings.is_empty(),
         );
-        let system_state = collect_planning_activity(
+        let (system_state, cgroup_cpu) = collect_planning_activity(
             &mut scorer,
             &scan_result.processes,
             args.window_ms,
             scan_result.metadata.warnings.is_empty(),
+            true,
         );
         let pressure = PlanningPressure::from_system_state(&system_state);
-        let responsible_units = collect_responsible_units(&scan_result, &scorer, &pressure);
+        let responsible_units =
+            collect_responsible_units(&scan_result, &scorer, &pressure, &cgroup_cpu);
         // These are system events, independent of process age and posterior
         // filters. An incomplete process census cannot establish recovery from
         // a zombie leak or D-state storm.
@@ -44877,6 +44925,7 @@ mod memory_limit_diagnostic_tests {
                 memory_swap_current_bytes: Some(0),
                 memory_headroom: Some(headroom),
                 cpu_stat: None,
+                cpu_rates: None,
                 cpu_pressure: None,
                 memory_pressure: None,
                 io_pressure: None,
