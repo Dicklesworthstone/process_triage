@@ -3300,11 +3300,19 @@ mod tests {
                     .execute(&action)
                     .expect_err("changed command must not inherit forced-kill authorization");
                 let message = error.to_string();
-                assert!(message.contains("command changed after SIGTERM"), "{message}");
-                assert!(message.contains("create a new plan"), "{message}");
-                assert!(child.0.try_wait().unwrap().is_none(), "new command survives");
                 assert!(
-                    LiveIdentityProvider::new().revalidate(&action.target).unwrap(),
+                    message.contains("command changed after SIGTERM"),
+                    "{message}"
+                );
+                assert!(message.contains("create a new plan"), "{message}");
+                assert!(
+                    child.0.try_wait().unwrap().is_none(),
+                    "new command survives"
+                );
+                assert!(
+                    LiveIdentityProvider::new()
+                        .revalidate(&action.target)
+                        .unwrap(),
                     "exec preserves birth, owner, group and session"
                 );
                 assert_ne!(
@@ -3332,7 +3340,10 @@ mod tests {
 
                 // Confirmed exit after refusal needs no further signal, even
                 // though the recorded command can no longer be inspected.
-                child.0.kill().expect("clean up the owned replacement command");
+                child
+                    .0
+                    .kill()
+                    .expect("clean up the owned replacement command");
                 child.0.wait().expect("reap the owned child");
                 assert!(!runner.prepare_kill_escalation(&action, &outcome).unwrap());
             }
