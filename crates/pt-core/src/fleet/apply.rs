@@ -688,11 +688,22 @@ fn interpret_remote_result(prepared: &PreparedHostApply, output: ToolOutput) -> 
         && document["status"] == "blocked"
         && document["error"].is_string()
     {
-        result.status = HostApplyStatus::Blocked;
-        result.error = Some(format!(
-            "remote apply refused execution: {}",
-            document["error"].as_str().unwrap()
-        ));
+        if document["error"] == "incomplete_execution" {
+            // Refusing a replay proves no new admission, but does not resolve
+            // actions admitted before the remote journal became incomplete.
+            result.error = Some(format!(
+                "remote apply refused uncertain replay; earlier action completion is unknown: {}",
+                document["message"]
+                    .as_str()
+                    .unwrap_or("incomplete execution history")
+            ));
+        } else {
+            result.status = HostApplyStatus::Blocked;
+            result.error = Some(format!(
+                "remote apply refused execution: {}",
+                document["error"].as_str().unwrap()
+            ));
+        }
         return result;
     }
     let actions: HashMap<&str, &PlanAction> = request
@@ -752,7 +763,11 @@ fn interpret_remote_result(prepared: &PreparedHostApply, output: ToolOutput) -> 
     result.kill_signals_delivered = delivered;
     result.status = if successes == actions.len() && output.exit_code == Some(2) {
         HostApplyStatus::Applied
-    } else if !outcomes.is_empty() && refused == outcomes.len() && delivered == 0 {
+    } else if !outcomes.is_empty()
+        && seen.len() == actions.len()
+        && refused == outcomes.len()
+        && delivered == 0
+    {
         HostApplyStatus::Blocked
     } else if successes > 0 || delivered > 0 {
         HostApplyStatus::Partial
@@ -760,7 +775,14 @@ fn interpret_remote_result(prepared: &PreparedHostApply, output: ToolOutput) -> 
         HostApplyStatus::Unknown
     };
     if result.status.is_failure() {
-        result.error = Some("not all approved actions have confirmed successful outcomes; inspect the remote receipt before retrying".into());
+        result.error = Some(if seen.len() < actions.len() {
+            format!(
+                "remote response omitted {} approved action outcome(s); their completion is unknown; inspect the remote receipt before retrying",
+                actions.len() - seen.len()
+            )
+        } else {
+            "not all approved actions have confirmed successful outcomes; inspect the remote receipt before retrying".into()
+        });
     }
     result
 }
@@ -1670,6 +1692,96 @@ mod tests {
         assert_eq!(result.status, HostApplyStatus::NoActions);
         assert_eq!(result.successful_actions, 0);
         assert_eq!(result.kill_signals_delivered, 0);
+    }
+
+    #[test]
+    fn all_refused_requires_receipts_for_the_complete_approved_selection() {
+        let fleet = retained_fleet(vec![(
+            "alpha",
+            remote_document("alpha", &[(101, 0.999), (102, 0.999)]),
+        )]);
+        let prepared = prepare_fleet_apply(&fleet).unwrap();
+        let request = prepared[0].request.as_ref().unwrap();
+        assert_eq!(request.actions.len(), 2);
+        let mut output = result_output(request, "precheck_blocked", 4);
+        let mut response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        response["outcomes"][1]["status"] = serde_json::json!("blocked_by_policy");
+        output.stdout = serde_json::to_vec(&response).unwrap();
+
+        let complete = interpret_remote_result(&prepared[0], output.clone());
+        assert_eq!(complete.status, HostApplyStatus::Blocked);
+        assert_eq!(complete.successful_actions, 0);
+        assert_eq!(complete.kill_signals_delivered, 0);
+
+        response["outcomes"].as_array_mut().unwrap().pop();
+        // Aggregate claims cannot supply the missing per-action evidence.
+        response["status"] = serde_json::json!("blocked");
+        response["summary"] = serde_json::json!({
+            "selected": 2, "attempted": 0, "succeeded": 0, "blocked": 2
+        });
+        output.stdout = serde_json::to_vec(&response).unwrap();
+        let partial = interpret_remote_result(&prepared[0], output);
+        assert_eq!(partial.status, HostApplyStatus::Unknown);
+        assert_eq!(partial.successful_actions, 0);
+        assert_eq!(partial.kill_signals_delivered, 0);
+        assert!(partial
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("omitted 1 approved action outcome"));
+    }
+
+    #[test]
+    fn missing_receipts_preserve_confirmed_partial_success() {
+        let fleet = retained_fleet(vec![(
+            "alpha",
+            remote_document("alpha", &[(101, 0.999), (102, 0.999)]),
+        )]);
+        let prepared = prepare_fleet_apply(&fleet).unwrap();
+        let request = prepared[0].request.as_ref().unwrap();
+        assert_eq!(request.actions.len(), 2);
+        let mut output = result_output(request, "success", 2);
+        let mut response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        response["outcomes"].as_array_mut().unwrap().pop();
+        response["summary"] = serde_json::json!({"succeeded": 2});
+        output.stdout = serde_json::to_vec(&response).unwrap();
+
+        let result = interpret_remote_result(&prepared[0], output);
+        assert_eq!(result.status, HostApplyStatus::Partial);
+        assert_eq!(result.successful_actions, 1);
+        assert_eq!(result.kill_signals_delivered, 1);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("omitted 1 approved action outcome"));
+    }
+
+    #[test]
+    fn incomplete_execution_refusal_keeps_prior_action_completion_unknown() {
+        let fleet = retained_fleet(vec![("alpha", remote_document("alpha", &[(101, 0.999)]))]);
+        let prepared = prepare_fleet_apply(&fleet).unwrap();
+        let request = prepared[0].request.as_ref().unwrap();
+        let mut output = result_output(request, "precheck_blocked", 4);
+        output.stdout = serde_json::to_vec(&serde_json::json!({
+            "session_id": request.binding.session_id,
+            "mode": "robot_apply",
+            "status": "blocked",
+            "error": "incomplete_execution",
+            "message": "admitted action has no terminal receipt",
+            "execution_binding": request.binding,
+            "summary": {"attempted": 0},
+            "outcomes": [],
+        }))
+        .unwrap();
+
+        let result = interpret_remote_result(&prepared[0], output);
+        assert_eq!(result.status, HostApplyStatus::Unknown);
+        assert_eq!(result.successful_actions, 0);
+        assert_eq!(result.kill_signals_delivered, 0);
+        let error = result.error.unwrap();
+        assert!(error.contains("earlier action completion is unknown"));
+        assert!(error.contains("admitted action has no terminal receipt"));
     }
 
     #[test]
