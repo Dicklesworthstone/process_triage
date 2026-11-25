@@ -789,6 +789,76 @@ fn sessions_detail_shows_session_info() {
 }
 
 #[test]
+fn sessions_report_interrupted_admissions_without_completed_progress_or_resume_hints() {
+    with_temp_data_dir(|dir| {
+        use pt_core::session::SessionState;
+
+        let identity = test_identity(222_224);
+        let session_id = create_session_with_plan(dir, identity.clone(), false);
+        let store = SessionStore::from_env().unwrap();
+        let handle = store.open(&session_id).unwrap();
+        handle.update_state(SessionState::Executing).unwrap();
+        let journal = handle.dir.join("action/outcomes.jsonl");
+        fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        let started = serde_json::json!({
+            "action_id": "action-1",
+            "pid": identity.pid.0,
+            "status": "execution_started",
+            "action": "kill",
+            "target": identity,
+            "command": "worker --owned-test",
+            "parent_pid": 99,
+            "executed_at": chrono::Utc::now() - chrono::Duration::seconds(2),
+            "execution_clock": {"boot_id": "boot", "ticks": 2},
+        });
+        let mut completed = started.clone();
+        completed["status"] = serde_json::json!("success");
+        let mut later = started.clone();
+        later["executed_at"] = serde_json::json!(chrono::Utc::now() - chrono::Duration::seconds(1));
+        later["execution_clock"]["ticks"] = serde_json::json!(3);
+
+        for (records, count, uncertain) in [
+            (vec![started.clone()], 0, true),
+            (vec![started.clone(), completed.clone()], 1, false),
+            (vec![started, completed, later], 0, true),
+        ] {
+            let content: String = records.iter().map(|record| format!("{record}\n")).collect();
+            fs::write(&journal, &content).unwrap();
+            let output = pt_core_fast()
+                .env("PROCESS_TRIAGE_DATA", dir.path())
+                .args([
+                    "--format",
+                    "json",
+                    "agent",
+                    "sessions",
+                    "--session",
+                    &session_id.0,
+                    "--detail",
+                ])
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone();
+            let status: Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(status["progress"]["total_actions"], 1, "{status}");
+            assert_eq!(status["progress"]["completed_actions"], count, "{status}");
+            assert_eq!(status["progress"]["pending_actions"], 1 - count, "{status}");
+            assert_eq!(status["execution_uncertain"], uncertain, "{status}");
+            assert_eq!(status["resumable"], !uncertain, "{status}");
+            assert_eq!(status["resume_command"].is_null(), uncertain, "{status}");
+            assert_eq!(
+                status["resume_refusal_reason"].is_string(),
+                uncertain,
+                "{status}"
+            );
+            assert_eq!(status["outcomes"].as_array().unwrap().len(), records.len());
+            assert_eq!(fs::read_to_string(&journal).unwrap(), content);
+        }
+    });
+}
+
+#[test]
 fn sessions_detail_marks_successful_outcomes_in_human_output() {
     with_temp_data_dir(|dir| {
         let session_id = create_session_with_plan(dir, test_identity(222_223), false);
@@ -825,6 +895,88 @@ fn sessions_detail_marks_successful_outcomes_in_human_output() {
             "expected successful outcome marker, got:\n{text}"
         );
     });
+}
+
+#[cfg(unix)]
+#[test]
+fn sessions_and_bundle_refuse_nonregular_outcome_journals_without_blocking() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::symlink;
+
+    for kind in ["fifo", "symlink", "hardlink", "directory", "invalid_utf8"] {
+        with_temp_data_dir(|dir| {
+            let session_id = create_session_with_plan(dir, test_identity(222_224), false);
+            let store = SessionStore::from_env().expect("session store from env");
+            let handle = store.open(&session_id).expect("open session");
+            let action_dir = handle.dir.join("action");
+            fs::create_dir_all(&action_dir).unwrap();
+            let journal = action_dir.join("outcomes.jsonl");
+            match kind {
+                "fifo" => {
+                    let path = std::ffi::CString::new(journal.as_os_str().as_bytes()).unwrap();
+                    // SAFETY: the C string is live and NUL-terminated, and this
+                    // creates only the owned test fixture's named pipe.
+                    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+                }
+                "symlink" | "hardlink" => {
+                    let target = dir.path().join("other-journal.jsonl");
+                    fs::write(&target, b"{}\n").unwrap();
+                    if kind == "symlink" {
+                        symlink(&target, &journal).unwrap();
+                    } else {
+                        fs::hard_link(&target, &journal).unwrap();
+                    }
+                }
+                "directory" => fs::create_dir(&journal).unwrap(),
+                "invalid_utf8" => fs::write(&journal, [0xff, b'\n']).unwrap(),
+                _ => unreachable!(),
+            }
+
+            for detail in [false, true] {
+                let mut command = pt_core_fast();
+                command
+                    .timeout(Duration::from_secs(5))
+                    .env("PROCESS_TRIAGE_DATA", dir.path())
+                    .args([
+                        "--format",
+                        "json",
+                        "agent",
+                        "sessions",
+                        "--session",
+                        &session_id.0,
+                    ]);
+                if detail {
+                    command.arg("--detail");
+                }
+                let output = command
+                    .assert()
+                    .code(ExitCode::IoError.as_i32())
+                    .get_output()
+                    .clone();
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("cannot read action outcomes"),
+                    "{kind}: {output:?}",
+                );
+            }
+
+            let destination = dir.path().join("export.ptb");
+            let output = pt_core_fast()
+                .timeout(Duration::from_secs(5))
+                .env("PROCESS_TRIAGE_DATA", dir.path())
+                .args(["bundle", "create", "--session", &session_id.0, "--output"])
+                .arg(&destination)
+                .assert()
+                .code(ExitCode::IoError.as_i32())
+                .get_output()
+                .clone();
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("cannot read action/outcomes.jsonl"),
+                "{kind}: {output:?}",
+            );
+            assert!(!destination.exists(), "{kind}: unsafe journal was exported");
+        });
+    }
 }
 
 #[test]

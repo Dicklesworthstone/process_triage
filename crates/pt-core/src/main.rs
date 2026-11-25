@@ -111,7 +111,8 @@ use pt_core::verify::resource_prediction::{
     RESOURCE_PREDICTION_SCHEMA_VERSION,
 };
 use pt_core::verify::{
-    executed_plan_actions, observe_live_postcondition, parse_action_outcomes, parse_agent_plan,
+    completed_execution_count, executed_plan_actions, observe_live_postcondition,
+    parse_action_outcomes, parse_agent_plan, validate_execution_replay,
     verify_plan_with_postconditions, VerifyOutcome,
 };
 use pt_telemetry::retention::{RetentionConfig, RetentionEnforcer, RetentionError};
@@ -5364,18 +5365,60 @@ fn recover_expired_freezes_for_execution(
     report
 }
 
-/// Record the current context at runner entry, after the executor's safety checks.
 #[cfg(all(feature = "ui", any(target_os = "linux", target_os = "macos")))]
-struct RecordedActionRunner {
+fn append_tui_execution_admission(
+    journals: &mut HashMap<PathBuf, pt_core::session::DurableJsonlJournal>,
+    action: &PlanAction,
+    evidence: &serde_json::Value,
+) -> Result<(), String> {
+    if journals.is_empty() {
+        return Err("interactive outcome journals were not prepared".into());
+    }
+    let mut fields = evidence
+        .as_object()
+        .cloned()
+        .ok_or("interactive execution evidence is not an object")?;
+    fields.insert("action_id".into(), serde_json::json!(action.action_id));
+    fields.insert("pid".into(), serde_json::json!(action.target.pid.0));
+    fields.insert("status".into(), serde_json::json!("execution_started"));
+    let admission = serde_json::Value::Object(fields);
+    let mut destinations: Vec<_> = journals.iter_mut().collect();
+    destinations.sort_by(|(left, _), (right, _)| left.cmp(right));
+    for (path, journal) in destinations {
+        journal
+            .append(std::slice::from_ref(&admission))
+            .map_err(|error| {
+                format!(
+                    "checkpoint interactive admission in {}: {error}",
+                    path.display()
+                )
+            })?;
+    }
+    Ok(())
+}
+
+/// Record and synchronize current context after safety checks, before control.
+#[cfg(all(feature = "ui", any(target_os = "linux", target_os = "macos")))]
+struct RecordedActionRunner<'a> {
     runner: pt_core::action::CompositeActionRunner,
     evidence: std::cell::RefCell<Option<serde_json::Value>>,
+    admit: &'a dyn Fn(&PlanAction, &mut serde_json::Value) -> Result<(), String>,
+    admission_failure: std::cell::RefCell<Option<String>>,
 }
 
 #[cfg(all(feature = "ui", any(target_os = "linux", target_os = "macos")))]
-impl pt_core::action::ActionRunner for RecordedActionRunner {
+impl pt_core::action::ActionRunner for RecordedActionRunner<'_> {
     fn execute(&self, action: &PlanAction) -> Result<(), pt_core::action::ActionError> {
-        let evidence = capture_current_action_execution_evidence(action, None)
+        let mut evidence = capture_current_action_execution_evidence(action, None)
             .map_err(pt_core::action::ActionError::Failed)?;
+        if action.action != Action::Keep {
+            if let Err(error) = (self.admit)(action, &mut evidence) {
+                // A preceding journal may already contain this admission. Do
+                // not supply terminal evidence or enter the runner on failure.
+                *self.admission_failure.borrow_mut() = Some(error.clone());
+                return Err(pt_core::action::ActionError::Failed(error));
+            }
+        }
         *self.evidence.borrow_mut() = Some(evidence);
         self.runner.execute(action)
     }
@@ -5409,6 +5452,7 @@ struct TuiExecutionState {
     enforcer: Option<pt_core::decision::PolicyEnforcer>,
     #[cfg(target_os = "linux")]
     recent_io_baselines: Vec<pt_core::action::prechecks::RecentIoBaseline>,
+    outcome_journals: HashMap<PathBuf, pt_core::session::DurableJsonlJournal>,
     failure: Option<String>,
 }
 
@@ -6328,6 +6372,7 @@ fn execute_tui_plan_selection(
                 &result,
                 &evidence,
                 Some(control.handle.id.0.as_str()),
+                state.outcome_journals.get_mut(&control.handle.dir),
             )?;
         }
         let executions = write_outcomes_from_execution(
@@ -6338,6 +6383,7 @@ fn execute_tui_plan_selection(
             control_session
                 .as_ref()
                 .map(|control| control.handle.id.0.as_str()),
+            state.outcome_journals.get_mut(&handle.dir),
         )?;
         if executions
             .iter()
@@ -6438,45 +6484,10 @@ fn execute_plan_actions(
         let (execution_lock, new_enforcer) = acquire_execution_policy(policy, None, handle)?;
         // The selection was saved before this lock was acquired. A concurrent
         // replan must not leave real actions without their canonical bindings.
-        let canonical_content = std::fs::read_to_string(handle.dir.join("decision/plan.json"))
-            .map_err(|error| format!("cannot revalidate saved interactive plan: {error}"))?;
-        let canonical = parse_agent_plan(&canonical_content)
-            .map_err(|error| format!("invalid saved interactive plan: {error}"))?;
-        if canonical.session_id != handle.id.0
-            || canonical.session_id != plan.session_id
-            || canonical.policy_id != plan.policy_id
-            || canonical.policy_version != plan.policy_version
-        {
-            return Err(
-                "interactive selection no longer matches its saved session and policy".to_string(),
-            );
-        }
+        let canonical = validate_tui_selection(handle, plan)?;
+        let outcomes_snapshot = validate_tui_execution_history(handle, &canonical)?;
         for action in &plan.actions {
             validate_term_grace_policy_cap(action, policy, None)?;
-            let mut saved = canonical
-                .actions
-                .iter()
-                .find(|saved| saved.action_id == action.action_id)
-                .cloned()
-                .ok_or_else(|| {
-                    format!(
-                        "selected action {} is no longer in the canonical plan",
-                        action.action_id
-                    )
-                })?;
-            // Cumulative plans append action orders. Every intrinsic field,
-            // including identity, gates, routing, deadlines and hooks, must match.
-            saved.order = action.order;
-            let saved = serde_json::to_value(&saved)
-                .map_err(|error| format!("cannot compare saved action binding: {error}"))?;
-            let selected = serde_json::to_value(action)
-                .map_err(|error| format!("cannot compare selected action binding: {error}"))?;
-            if saved != selected {
-                return Err(format!(
-                    "selected action {} changed in the canonical plan",
-                    action.action_id
-                ));
-            }
         }
         let selected_actions: Vec<_> = plan.actions.iter().collect();
         let (fdr_refusals, _) = execution_fdr_gate(plan, &selected_actions, policy, None);
@@ -6509,6 +6520,14 @@ fn execute_plan_actions(
                         "interactive control session no longer belongs to this review".into(),
                     );
                 }
+                if manifest.state != SessionState::Planned
+                    || manifest
+                        .state_history
+                        .iter()
+                        .any(|entry| entry.state == SessionState::Executing)
+                {
+                    return Err("interactive control session is not a fresh planned batch".into());
+                }
                 let mut expected = plan.clone();
                 expected.session_id = control.plan.session_id.clone();
                 expected.plan_id = control.plan.plan_id.clone();
@@ -6534,6 +6553,27 @@ fn execute_plan_actions(
                 .map_err(|error| format!("bind interactive restoration journal: {error}"))
             })
             .transpose()?;
+        // Pin both the immutable execution journal and its review mirror before
+        // any runner starts. The same handles survive through final persistence.
+        state.outcome_journals.clear();
+        state.outcome_journals.insert(
+            handle.dir.clone(),
+            prepare_action_outcome_journal_from_snapshot(
+                &handle.dir.join("action"),
+                outcomes_snapshot.as_deref(),
+            )?,
+        );
+        if let Some(control) = control_session {
+            state.outcome_journals.insert(
+                control.handle.dir.clone(),
+                // Every control selection gets a new immutable child. No
+                // execution history may appear between its creation and pinning.
+                prepare_action_outcome_journal_from_snapshot(
+                    &control.handle.dir.join("action"),
+                    None,
+                )?,
+            );
+        }
         handle
             .update_state(SessionState::Executing)
             .map_err(|error| format!("persist interactive execution state: {error}"))?;
@@ -6565,6 +6605,19 @@ fn execute_plan_actions(
             fs::write(action_dir.join("freeze_recovery.json"), content)
                 .map_err(|error| format!("persist expired-freeze recovery evidence: {error}"))?;
         }
+        let outcome_journals = std::cell::RefCell::new(&mut state.outcome_journals);
+        let admit = |action: &PlanAction, evidence: &mut serde_json::Value| {
+            if let Some(control) = control_session {
+                evidence["control_session_id"] = serde_json::json!(control.handle.id.0);
+                evidence["control_plan_sha256"] = serde_json::json!(control.plan_sha256);
+                evidence["undo_preview"] = serde_json::json!(format!(
+                    "pt agent undo --session {} --all",
+                    control.handle.id.0,
+                ));
+            }
+            let mut journals = outcome_journals.borrow_mut();
+            append_tui_execution_admission(&mut journals, action, evidence)
+        };
         let runner = RecordedActionRunner {
             runner: match journal {
                 Some(journal) => {
@@ -6574,6 +6627,8 @@ fn execute_plan_actions(
                     .with_reversal_ownership_guard(sessions_root),
             },
             evidence: std::cell::RefCell::new(None),
+            admit: &admit,
+            admission_failure: std::cell::RefCell::new(None),
         };
         let enforcer = state.enforcer.get_or_insert(new_enforcer);
         let pre_checks = LivePreCheckProvider::new(
@@ -6615,6 +6670,21 @@ fn execute_plan_actions(
             ($count:expr) => {
                 finish_tui_kills(&mut pending, $count, &mut outcomes, &mut execution_evidence)
             };
+        }
+        macro_rules! abort_admission {
+            ($error:expr, $accounting_started:expr) => {{
+                let error = $error;
+                let accounting_error = if $accounting_started {
+                    enforcer.finish_kill_accounting(false).err()
+                } else {
+                    None
+                };
+                finish_pending!(usize::MAX);
+                return Err(format!(
+                    "interactive execution admission was not durably checkpointed: {error}; control was not started for this action; inspect retained admissions before continuing; accounting completion error: {accounting_error:?}; prior action outcomes: {}",
+                    serde_json::json!({"outcomes": outcomes, "evidence": execution_evidence}),
+                ));
+            }};
         }
         for action in &plan.actions {
             // Known relations and all non-kill/stage boundaries wait before
@@ -6746,6 +6816,23 @@ fn execute_plan_actions(
             let _ = runner.runner.take_signal_outcome();
             runner.runner.take_kill_signal_delivered();
             runner.runner.take_supervisor_restart_attempted();
+            if let Some(error) = outcome_journals
+                .borrow()
+                .values()
+                .find_map(|journal| journal.validate().err())
+            {
+                finish_pending!(usize::MAX);
+                outcomes.push(pt_core::action::ActionResult {
+                    action_id: action.action_id.clone(),
+                    status: pt_core::action::ActionStatus::PreCheckBlocked {
+                        check: pt_core::plan::PreCheck::CheckNotProtected,
+                        reason: format!("action outcome journal unavailable: {error}"),
+                    },
+                    time_ms: 0,
+                    details: Some(format!("revalidate interactive action outcomes: {error}")),
+                });
+                break;
+            }
             let accounting_started = action_uses_kill_budget(action) && !action.blocked;
             if accounting_started {
                 if let Err(error) = enforcer.begin_kill_accounting() {
@@ -6763,12 +6850,16 @@ fn execute_plan_actions(
                 }
             }
             if let Some(mut evidence) = parallel_evidence {
+                if let Err(error) = admit(action, &mut evidence) {
+                    abort_admission!(error, accounting_started);
+                }
                 let preflight_ms = preflight_started.elapsed().as_millis();
                 let worker = match pt_core::action::signal::PendingSignalKill::start(action) {
                     Ok(worker) => worker,
                     Err(error) => {
                         let accounting_error = enforcer.finish_kill_accounting(false).err();
                         finish_pending!(usize::MAX);
+                        execution_evidence.insert(action.action_id.clone(), evidence);
                         outcomes.push(pt_core::action::ActionResult {
                             action_id: action.action_id.clone(),
                             status: pt_core::action::ActionStatus::Failed,
@@ -6811,6 +6902,9 @@ fn execute_plan_actions(
             }
 
             let mut outcome = execution.execute_action(action);
+            if let Some(error) = runner.admission_failure.borrow_mut().take() {
+                abort_admission!(error, accounting_started);
+            }
             let signal_outcome = runner.runner.take_signal_outcome();
             if let Some(mut evidence) = runner.evidence.borrow().clone() {
                 if let Some(signal_outcome) = signal_outcome {
@@ -6927,12 +7021,73 @@ fn tui_recovery_summary(
     })
 }
 
+/// Revalidate while the caller holds the shared execution-policy lock.
+#[cfg(feature = "ui")]
+fn validate_tui_selection(handle: &SessionHandle, plan: &Plan) -> Result<Plan, String> {
+    let content = std::fs::read_to_string(handle.dir.join("decision/plan.json"))
+        .map_err(|error| format!("cannot revalidate saved interactive plan: {error}"))?;
+    let canonical = parse_agent_plan(&content)
+        .map_err(|error| format!("invalid saved interactive plan: {error}"))?;
+    if canonical.session_id != handle.id.0
+        || canonical.session_id != plan.session_id
+        || canonical.policy_id != plan.policy_id
+        || canonical.policy_version != plan.policy_version
+    {
+        return Err("interactive selection no longer matches its saved session and policy".into());
+    }
+    for action in &plan.actions {
+        let mut saved = canonical
+            .actions
+            .iter()
+            .find(|saved| saved.action_id == action.action_id)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "selected action {} is no longer in the canonical plan",
+                    action.action_id,
+                )
+            })?;
+        // Cumulative plans append action orders. Every intrinsic field,
+        // including identity, gates, routing, deadlines and hooks, must match.
+        saved.order = action.order;
+        let saved = serde_json::to_value(&saved)
+            .map_err(|error| format!("cannot compare saved action binding: {error}"))?;
+        let selected = serde_json::to_value(action)
+            .map_err(|error| format!("cannot compare selected action binding: {error}"))?;
+        if saved != selected {
+            return Err(format!(
+                "selected action {} changed in the canonical plan",
+                action.action_id,
+            ));
+        }
+    }
+    Ok(canonical)
+}
+
+#[cfg(feature = "ui")]
+fn validate_tui_execution_history(
+    handle: &SessionHandle,
+    canonical: &Plan,
+) -> Result<Option<Vec<u8>>, String> {
+    let content = read_action_outcomes(&handle.dir.join("action/outcomes.jsonl"))?;
+    if execution_history_is_missing(handle, content.as_deref().map(str::as_bytes))? {
+        return Err("this interactive session entered execution without complete saved history; inspect live state and create a fresh plan".into());
+    }
+    let saved = parse_action_outcomes(content.as_deref().unwrap_or_default())
+        .map_err(|error| format!("invalid saved interactive outcomes: {error}"))?;
+    validate_execution_replay(canonical, &saved).map_err(|error| error.to_string())?;
+    Ok(content.map(String::into_bytes))
+}
+
 #[cfg(feature = "ui")]
 fn write_outcomes_for_mode(
     handle: &SessionHandle,
     plan: &Plan,
     status: &str,
 ) -> Result<(), String> {
+    let _lock = lock_canonical_session_plan(handle)?;
+    let canonical = validate_tui_selection(handle, plan)?;
+    let outcomes_snapshot = validate_tui_execution_history(handle, &canonical)?;
     let outcomes: Vec<_> = plan
         .actions
         .iter()
@@ -6944,7 +7099,16 @@ fn write_outcomes_for_mode(
             })
         })
         .collect();
-    append_action_outcomes(&handle.dir.join("action"), &outcomes).map_err(|error| {
+    let persisted = prepare_action_outcome_journal_from_snapshot(
+        &handle.dir.join("action"),
+        outcomes_snapshot.as_deref(),
+    )
+    .and_then(|mut journal| {
+        journal
+            .append(&outcomes)
+            .map_err(|error| format!("checkpoint interactive preview: {error}"))
+    });
+    persisted.map_err(|error| {
         let state_error = handle.update_state(SessionState::Failed).err();
         format!("{error}; session failure state error: {state_error:?}")
     })
@@ -6957,6 +7121,7 @@ fn write_outcomes_from_execution(
     result: &pt_core::action::ExecutionResult,
     execution_evidence: &HashMap<String, serde_json::Value>,
     control_session_id: Option<&str>,
+    journal: Option<&mut pt_core::session::DurableJsonlJournal>,
 ) -> Result<Vec<pt_core::verify::SavedActionOutcome>, String> {
     use pt_core::action::ActionStatus;
 
@@ -7025,7 +7190,13 @@ fn write_outcomes_from_execution(
         }
         outcomes.push(entry);
     }
-    append_action_outcomes(&handle.dir.join("action"), &outcomes).map_err(|error| {
+    let persisted = match journal {
+        Some(journal) => journal
+            .append(&outcomes)
+            .map_err(|error| format!("checkpoint action outcomes: {error}")),
+        None => append_action_outcomes(&handle.dir.join("action"), &outcomes),
+    };
+    persisted.map_err(|error| {
         let state_error = handle.update_state(SessionState::Failed).err();
         let actual = serde_json::json!({"summary": result.summary, "outcomes": outcomes});
         format!(
@@ -7109,9 +7280,9 @@ fn observe_tui_respawns(
 #[cfg(feature = "ui")]
 fn observe_saved_tui_respawns(handle: &SessionHandle, scan: &ScanResult) -> Result<(), String> {
     let outcomes_path = handle.dir.join("action/outcomes.jsonl");
-    let content = match std::fs::read_to_string(&outcomes_path) {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+    let content = match read_action_outcomes(&outcomes_path) {
+        Ok(Some(content)) => content,
+        Ok(None) => return Ok(()),
         Err(error) => {
             return Err(format!(
                 "cannot read interactive execution outcomes: {error}"
@@ -14240,6 +14411,23 @@ fn run_bundle_create(
         }
     }
 
+    // Outcome journals share the nonblocking, identity-checked reader used by
+    // verification and resume. A FIFO or substituted link must not hang export.
+    match read_action_outcomes(&handle.dir.join("action/outcomes.jsonl")) {
+        Ok(Some(content)) => {
+            writer.add_file(
+                "logs/outcomes.jsonl",
+                content.into_bytes(),
+                Some(FileType::Log),
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("bundle create: cannot read action/outcomes.jsonl: {error}");
+            return ExitCode::IoError;
+        }
+    }
+
     // Optional artifacts may be absent; existing unreadable artifacts must not
     // silently disappear from a successful export.
     for (source, destination, file_type) in [
@@ -14250,11 +14438,6 @@ fn run_bundle_create(
             "inference/results.json",
             "inference/results.json",
             FileType::Json,
-        ),
-        (
-            "action/outcomes.jsonl",
-            "logs/outcomes.jsonl",
-            FileType::Log,
         ),
         ("logs/session.jsonl", "logs/session.jsonl", FileType::Log),
         (
@@ -25301,6 +25484,68 @@ mod process_tree_safety_tests {
 
     #[cfg(all(feature = "ui", unix))]
     #[test]
+    fn tui_previews_hold_the_execution_lock_and_revalidate_saved_bindings() {
+        for mode in ["dry_run", "shadow"] {
+            let (_, handle, plan, mut execution, _) = tui_respawn_fixture(mode);
+            let path = handle.dir.join("action/outcomes.jsonl");
+            let manifest = std::fs::read(handle.manifest_path()).unwrap();
+            let lock = super::lock_canonical_session_plan(&handle).unwrap();
+            let error = super::write_outcomes_for_mode(&handle, &plan, mode).unwrap_err();
+            assert!(error.contains("executing or restoring"), "{error}");
+            assert!(!path.exists());
+            assert_eq!(std::fs::read(handle.manifest_path()).unwrap(), manifest);
+            drop(lock);
+
+            super::write_outcomes_for_mode(&handle, &plan, mode).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let mut changed = plan.clone();
+            changed.actions[0].timeouts.verify_ms += 1;
+            let error = super::write_outcomes_for_mode(&handle, &changed, mode).unwrap_err();
+            assert!(error.contains("changed in the canonical plan"), "{error}");
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+
+            execution.status = "execution_started".into();
+            super::append_action_outcomes(
+                &handle.dir.join("action"),
+                &[serde_json::to_value(execution).unwrap()],
+            )
+            .unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let error = super::write_outcomes_for_mode(&handle, &plan, mode).unwrap_err();
+            assert!(error.contains("execution outcome is uncertain"), "{error}");
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+
+    #[cfg(all(feature = "ui", unix))]
+    #[test]
+    fn tui_validated_history_must_match_the_prepared_descriptor() {
+        let (_, handle, plan, mut execution, _) = tui_respawn_fixture("tui-history-pin");
+        let _lock = super::lock_canonical_session_plan(&handle).unwrap();
+        let directory = handle.dir.join("action");
+        super::append_action_outcomes(&directory, &[serde_json::to_value(&execution).unwrap()])
+            .unwrap();
+        let snapshot = super::validate_tui_execution_history(&handle, &plan).unwrap();
+        execution.command = Some("sleep 700".into());
+        let mut changed = serde_json::to_vec(&serde_json::to_value(execution).unwrap()).unwrap();
+        changed.push(b'\n');
+        assert_eq!(changed.len(), snapshot.as_ref().unwrap().len());
+        assert_ne!(Some(&changed), snapshot.as_ref());
+        let path = directory.join("outcomes.jsonl");
+        std::fs::write(&path, &changed).unwrap();
+        let error =
+            super::prepare_action_outcome_journal_from_snapshot(&directory, snapshot.as_deref())
+                .unwrap_err();
+        assert!(error.contains("changed while preparing"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), changed);
+        assert_ne!(
+            handle.read_manifest().unwrap().state,
+            pt_core::session::SessionState::Executing
+        );
+    }
+
+    #[cfg(all(feature = "ui", unix))]
+    #[test]
     fn tui_execution_writer_returns_only_bound_successful_evidence() {
         use pt_core::action::{ActionResult, ActionStatus};
 
@@ -25341,7 +25586,8 @@ mod process_tree_safety_tests {
         .into_iter()
         .collect();
         let returned =
-            super::write_outcomes_from_execution(&handle, &plan, &result, &evidence, None).unwrap();
+            super::write_outcomes_from_execution(&handle, &plan, &result, &evidence, None, None)
+                .unwrap();
         assert_eq!(returned.len(), 1);
         assert_eq!(returned[0].action_id, execution.action_id);
         assert!(returned[0]
@@ -25366,9 +25612,15 @@ mod process_tree_safety_tests {
         let mut forged_evidence = evidence;
         forged_evidence.get_mut(&execution.action_id).unwrap()["target"]["uid"] =
             serde_json::json!(1001);
-        let error =
-            super::write_outcomes_from_execution(&handle, &plan, &result, &forged_evidence, None)
-                .unwrap_err();
+        let error = super::write_outcomes_from_execution(
+            &handle,
+            &plan,
+            &result,
+            &forged_evidence,
+            None,
+            None,
+        )
+        .unwrap_err();
         assert!(error.contains("cannot bind saved interactive execution evidence"));
         assert_eq!(result.outcomes[0].status, ActionStatus::Success);
         let saved = pt_core::verify::parse_action_outcomes(
@@ -25568,7 +25820,7 @@ mod process_tree_safety_tests {
         std::fs::write(&not_directory, "retained sentinel").unwrap();
         let records = vec![serde_json::json!({"action_id":"a1", "pid":100, "status":"success"})];
         let creation = super::append_action_outcomes(&not_directory, &records).unwrap_err();
-        assert!(creation.contains("create action outcome directory"));
+        assert!(creation.contains("prepare action outcomes"));
         assert_eq!(
             std::fs::read_to_string(&not_directory).unwrap(),
             "retained sentinel"
@@ -25576,34 +25828,34 @@ mod process_tree_safety_tests {
         let action_dir = root.join("action");
         std::fs::create_dir_all(action_dir.join("outcomes.jsonl")).unwrap();
         let open = super::append_action_outcomes(&action_dir, &records).unwrap_err();
-        assert!(open.contains("open action outcomes"));
+        assert!(open.contains("prepare action outcomes"));
         assert_eq!(records[0]["status"], "success");
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn action_outcome_log_reports_real_flush_failure() {
+    fn action_outcome_log_refuses_a_full_device_symlink_before_writing() {
         use std::os::unix::fs::symlink;
         let directory = retained_outcome_fixture("flush");
         std::fs::create_dir_all(&directory).unwrap();
         symlink("/dev/full", directory.join("outcomes.jsonl")).unwrap();
         let records = vec![serde_json::json!({"action_id":"a1", "pid":100, "status":"success"})];
         let error = super::append_action_outcomes(&directory, &records).unwrap_err();
-        assert!(error.contains("flush action outcomes"), "{error}");
+        assert!(error.contains("prepare action outcomes"), "{error}");
         assert_eq!(records[0]["status"], "success");
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn action_outcome_log_reports_real_sync_failure() {
+    fn action_outcome_log_refuses_a_null_device_symlink_before_writing() {
         use std::os::unix::fs::symlink;
         let directory = retained_outcome_fixture("sync");
         std::fs::create_dir_all(&directory).unwrap();
-        // /dev/null accepts the write and flush but cannot durably retain it.
+        // A device that accepts writes cannot become durable execution evidence.
         symlink("/dev/null", directory.join("outcomes.jsonl")).unwrap();
         let records = vec![serde_json::json!({"action_id":"a1", "pid":100, "status":"success"})];
         let error = super::append_action_outcomes(&directory, &records).unwrap_err();
-        assert!(error.contains("sync action outcomes"), "{error}");
+        assert!(error.contains("prepare action outcomes"), "{error}");
         assert_eq!(records[0]["status"], "success");
     }
 
@@ -27416,6 +27668,104 @@ mod process_tree_safety_tests {
 
     #[cfg(all(feature = "ui", target_os = "linux"))]
     #[test]
+    fn tui_partial_admission_checkpoint_preserves_uncertainty_without_control() {
+        use pt_core::action::{ActionRunner, CompositeActionRunner};
+        use pt_core::collect::{quick_scan, QuickScanOptions};
+        use pt_core::verify::{
+            parse_action_outcomes, validate_execution_replay, verify_plan, VerifyOutcome,
+        };
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        use tui_live_fixtures::{case, pause_selection, policy, record, DetachedTarget};
+
+        let (handle, log_dir) = case("tui-partial-admission");
+        let target = DetachedTarget::spawn();
+        let plan = pause_selection(&handle, &policy(1), &target);
+        let first = log_dir.join("admission-a");
+        let second = log_dir.join("admission-z");
+        let mut journals = HashMap::new();
+        for path in [&first, &second] {
+            journals.insert(
+                path.clone(),
+                super::prepare_action_outcome_journal(path).unwrap(),
+            );
+        }
+        // The first destination remains writable; the second has changed after
+        // preparation. A partially durable admission must never enter control.
+        std::fs::write(second.join("outcomes.jsonl"), b"interrupted").unwrap();
+        let journals = RefCell::new(journals);
+        let admit = |action: &pt_core::plan::PlanAction, evidence: &mut serde_json::Value| {
+            super::append_tui_execution_admission(&mut journals.borrow_mut(), action, evidence)
+        };
+        let runner = super::RecordedActionRunner {
+            runner: CompositeActionRunner::with_defaults(),
+            evidence: RefCell::new(None),
+            admit: &admit,
+            admission_failure: RefCell::new(None),
+        };
+        let error = runner.execute(&plan.actions[0]).unwrap_err();
+        assert!(runner.admission_failure.borrow().is_some(), "{error}");
+        assert!(runner.evidence.borrow().is_none());
+        let current = quick_scan(&QuickScanOptions {
+            pids: vec![target.pid],
+            ..Default::default()
+        })
+        .unwrap();
+        let live = current
+            .processes
+            .iter()
+            .find(|proc| proc.pid.0 == target.pid)
+            .unwrap();
+        assert!(
+            live.state.is_active(),
+            "the original process was not paused"
+        );
+        assert_eq!(process_identity_from_record(live), plan.actions[0].target);
+        let saved =
+            parse_action_outcomes(&std::fs::read_to_string(first.join("outcomes.jsonl")).unwrap())
+                .unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].status, "execution_started");
+        assert!(validate_execution_replay(&plan, &saved).is_err());
+        let now = chrono::Utc::now();
+        let report = verify_plan(&plan, &saved, &current.processes, now, now).unwrap();
+        assert_eq!(
+            report.action_outcomes[0].outcome,
+            VerifyOutcome::ExecutionUncertain
+        );
+        assert_eq!(report.action_outcomes[0].verified, None);
+        assert_eq!(
+            std::fs::read(second.join("outcomes.jsonl")).unwrap(),
+            b"interrupted"
+        );
+        super::write_plan_to_session(&handle, &plan).unwrap();
+        super::append_action_outcomes(
+            &handle.dir.join("action"),
+            &[serde_json::to_value(&saved[0]).unwrap()],
+        )
+        .unwrap();
+        let mut state = super::TuiExecutionState::default();
+        let retry = super::execute_tui_plan_selection(&handle, &policy(1), &plan, &[], &mut state)
+            .unwrap_err();
+        assert!(retry.contains("execution outcome is uncertain"), "{retry}");
+        assert!(
+            state.enforcer.is_none(),
+            "replay was refused before execution setup"
+        );
+        record(
+            &log_dir,
+            serde_json::json!({
+                "step": "partial_admission_prevented_pause",
+                "saved": saved,
+                "current": current.processes,
+                "verification": report,
+                "error": error.to_string(),
+            }),
+        );
+    }
+
+    #[cfg(all(feature = "ui", target_os = "linux"))]
+    #[test]
     fn tui_control_batches_keep_durable_undo_after_later_selections() {
         use pt_core::action::{ActionRunner, ReversalJournal, SignalActionRunner};
         use pt_core::collect::{quick_scan, QuickScanOptions};
@@ -27474,6 +27824,27 @@ mod process_tree_safety_tests {
                 serde_json::to_value(&child_plan.actions).unwrap(),
                 serde_json::to_value(&plan.actions).unwrap(),
             );
+            for journal_handle in [&child, &parent] {
+                let saved = pt_core::verify::parse_action_outcomes(
+                    &std::fs::read_to_string(journal_handle.dir.join("action/outcomes.jsonl"))
+                        .unwrap(),
+                )
+                .unwrap();
+                let attempt: Vec<_> = saved
+                    .into_iter()
+                    .filter(|outcome| outcome.action_id == plan.actions[0].action_id)
+                    .collect();
+                assert_eq!(attempt.len(), 2);
+                assert_eq!(attempt[0].status, "execution_started");
+                assert_eq!(attempt[1].status, "success");
+                pt_core::verify::validate_execution_replay(&child_plan, &attempt).unwrap();
+                assert_eq!(
+                    pt_core::verify::executed_plan_actions(&child_plan, &attempt)
+                        .unwrap()
+                        .len(),
+                    1,
+                );
+            }
             let journal = ReversalJournal::new(
                 child.dir.join("action"),
                 child.id.0.as_str(),
@@ -27703,7 +28074,7 @@ mod process_tree_safety_tests {
             original_history
         );
         let history = std::fs::read_to_string(parent.dir.join("action/outcomes.jsonl")).unwrap();
-        assert_eq!(history.lines().count(), 2);
+        assert_eq!(history.lines().count(), 4);
         assert!(history.lines().all(|line| {
             serde_json::from_str::<serde_json::Value>(line).unwrap()["control_session_id"]
                 .as_str()
@@ -27728,6 +28099,8 @@ mod process_tree_safety_tests {
             "child_bytes",
             "child_parent",
             "child_identity",
+            "child_history",
+            "child_previous_execution",
             "selection",
         ] {
             let (_, parent, mut selection, _, _) =
@@ -27764,6 +28137,21 @@ mod process_tree_safety_tests {
                     manifest.session_id = parent.id.0.clone();
                     control.handle.write_manifest(&manifest).unwrap();
                 }
+                "child_history" => {
+                    std::fs::create_dir_all(control.handle.dir.join("action")).unwrap();
+                    std::fs::write(
+                        control.handle.dir.join("action/outcomes.jsonl"),
+                        b"{\"status\":\"dry_run\"}\n",
+                    )
+                    .unwrap();
+                }
+                "child_previous_execution" => {
+                    control
+                        .handle
+                        .update_state(SessionState::Executing)
+                        .unwrap();
+                    control.handle.update_state(SessionState::Failed).unwrap();
+                }
                 "selection" => control.plan.actions[0].target.uid += 1,
                 _ => unreachable!(),
             }
@@ -27782,12 +28170,21 @@ mod process_tree_safety_tests {
                 "parent_action" => "changed in the canonical plan",
                 "child_bytes" => "plan changed before execution",
                 "child_parent" | "child_identity" => "no longer belongs to this review",
+                "child_history" => "changed while preparing",
+                "child_previous_execution" => "not a fresh planned batch",
                 "selection" => "no longer matches the reviewed selection",
                 _ => unreachable!(),
             };
             assert!(error.contains(expected), "{case}: {error}");
             assert!(!super::session_has_control_receipts(&control.handle).unwrap());
-            assert!(!control.handle.dir.join("action/outcomes.jsonl").exists());
+            if case == "child_history" {
+                assert_eq!(
+                    std::fs::read(control.handle.dir.join("action/outcomes.jsonl")).unwrap(),
+                    b"{\"status\":\"dry_run\"}\n",
+                );
+            } else {
+                assert!(!control.handle.dir.join("action/outcomes.jsonl").exists());
+            }
             assert_ne!(
                 parent.read_manifest().unwrap().state,
                 SessionState::Executing
@@ -27888,6 +28285,7 @@ mod process_tree_safety_tests {
                 &result,
                 &evidence,
                 Some(&control.handle.id.0),
+                None,
             )
             .unwrap();
             super::write_outcomes_from_execution(
@@ -27896,6 +28294,7 @@ mod process_tree_safety_tests {
                 &result,
                 &evidence,
                 Some(&control.handle.id.0),
+                None,
             )
             .unwrap();
             let read_outcome = |handle: &pt_core::session::SessionHandle| {
@@ -28232,8 +28631,10 @@ mod process_tree_safety_tests {
                 assert!(super::GlobalLock::try_acquire(&lock_path)
                     .unwrap()
                     .is_none());
-                super::write_outcomes_from_execution(&handle, &selection, &result, &evidence, None)
-                    .unwrap();
+                super::write_outcomes_from_execution(
+                    &handle, &selection, &result, &evidence, None, None,
+                )
+                .unwrap();
                 handle.update_state(SessionState::Completed).unwrap();
                 assert!(super::GlobalLock::try_acquire(&lock_path)
                     .unwrap()
@@ -28386,8 +28787,15 @@ mod process_tree_safety_tests {
         let ((result, execution_evidence), execution_lock) =
             super::execute_plan_actions(&handle, &policy, &plan, &[], &mut execution_state, None)
                 .expect("TUI helper retains results after missing policy evidence");
-        super::write_outcomes_from_execution(&handle, &plan, &result, &execution_evidence, None)
-            .expect("save retained TUI outcomes");
+        super::write_outcomes_from_execution(
+            &handle,
+            &plan,
+            &result,
+            &execution_evidence,
+            None,
+            None,
+        )
+        .expect("save retained TUI outcomes");
         drop(execution_lock);
         writeln!(
             evidence,
@@ -28410,7 +28818,9 @@ mod process_tree_safety_tests {
         let saved_outcomes = std::fs::read_to_string(handle.dir.join("action/outcomes.jsonl"))
             .expect("saved TUI outcomes");
         let typed_outcomes = pt_core::verify::parse_action_outcomes(&saved_outcomes).unwrap();
-        assert_eq!(typed_outcomes[0].status, "success");
+        assert_eq!(typed_outcomes[0].status, "execution_started");
+        assert_eq!(typed_outcomes[1].status, "success");
+        pt_core::verify::validate_execution_replay(&plan, &typed_outcomes).unwrap();
         assert_eq!(typed_outcomes[0].action, Some(Action::Kill));
         assert!(typed_outcomes[0]
             .target
@@ -28453,11 +28863,13 @@ mod process_tree_safety_tests {
             .lines()
             .map(|line| serde_json::from_str(line).expect("saved outcome JSON"))
             .collect();
-        assert_eq!(persisted.len(), 2);
+        assert_eq!(persisted.len(), 3);
         assert_eq!(persisted[0]["action_id"], plan.actions[0].action_id);
-        assert_eq!(persisted[0]["status"], "success");
-        assert_eq!(persisted[1]["action_id"], plan.actions[1].action_id);
-        assert_eq!(persisted[1]["status"], "precheck_blocked");
+        assert_eq!(persisted[0]["status"], "execution_started");
+        assert_eq!(persisted[1]["action_id"], plan.actions[0].action_id);
+        assert_eq!(persisted[1]["status"], "success");
+        assert_eq!(persisted[2]["action_id"], plan.actions[1].action_id);
+        assert_eq!(persisted[2]["status"], "precheck_blocked");
     }
 
     /// The actual headless TUI execution boundary consumes a one-selection
@@ -28754,9 +29166,10 @@ mod process_tree_safety_tests {
             &std::fs::read_to_string(handle.dir.join("action/outcomes.jsonl")).unwrap(),
         )
         .unwrap();
-        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes.len(), 3);
         assert_eq!(outcomes[0].status, "precheck_blocked");
-        assert_eq!(outcomes[1].status, "success");
+        assert_eq!(outcomes[1].status, "execution_started");
+        assert_eq!(outcomes[2].status, "success");
         record(
             &log_dir,
             serde_json::json!({"step": "parent_and_sibling_survived", "after": after.processes, "outcomes": outcomes}),
@@ -28984,8 +29397,12 @@ mod process_tree_safety_tests {
             "later success must preserve the original failed attempt bytes"
         );
         let saved = parse_action_outcomes(&raw_outcomes).expect("decode all actual attempts");
-        assert_eq!(saved.len(), 3);
+        assert_eq!(saved.len(), 5);
         assert_eq!(saved[0].status, "identity_mismatch");
+        assert_eq!(saved[1].status, "execution_started");
+        assert_eq!(saved[2].status, "success");
+        assert_eq!(saved[3].status, "execution_started");
+        assert_eq!(saved[4].status, "success");
         let raw_plan = std::fs::read_to_string(handle.dir.join("decision/plan.json"))
             .expect("read cumulative canonical plan");
         let canonical = parse_agent_plan(&raw_plan).expect("decode cumulative action bindings");
@@ -29166,9 +29583,19 @@ mod process_tree_safety_tests {
             &std::fs::read_to_string(handle.dir.join("action/outcomes.jsonl")).unwrap(),
         )
         .unwrap();
+        assert_eq!(saved.len(), 6);
         assert_eq!(
             saved
                 .iter()
+                .filter(|outcome| outcome.status == "execution_started")
+                .count(),
+            3,
+        );
+        pt_core::verify::validate_execution_replay(&batch, &saved).unwrap();
+        assert_eq!(
+            saved
+                .iter()
+                .filter(|outcome| outcome.status != "execution_started")
                 .map(|outcome| outcome.action_id.as_str())
                 .collect::<Vec<_>>(),
             batch
@@ -29343,9 +29770,10 @@ mod process_tree_safety_tests {
         )
         .unwrap();
         assert_eq!(canonical.actions.len(), 2);
-        assert_eq!(saved.len(), 2);
-        assert_eq!(saved[0].status, "success");
-        assert_eq!(saved[1].status, "precheck_blocked");
+        assert_eq!(saved.len(), 3);
+        assert_eq!(saved[0].status, "execution_started");
+        assert_eq!(saved[1].status, "success");
+        assert_eq!(saved[2].status, "precheck_blocked");
         assert_eq!(executed_plan_actions(&canonical, &saved).unwrap().len(), 1);
         let budget: serde_json::Value =
             serde_json::from_slice(&std::fs::read(log_dir.join("data/rate_limit.json")).unwrap())
@@ -29360,27 +29788,22 @@ mod process_tree_safety_tests {
 
     #[cfg(all(feature = "ui", target_os = "linux"))]
     #[test]
-    fn tui_actual_kill_persistence_failure_and_state_io_failure_reach_outer_exit() {
+    fn tui_invalid_outcome_destination_blocks_control_and_state_io_failure_reaches_exit() {
         use tui_live_fixtures::{case, policy, record, selection, DetachedTarget};
 
         let (handle, log_dir) = case("tui-persistence-failure");
         let policy = policy(1);
         let mut target = DetachedTarget::spawn();
         let selected = selection(&handle, &policy, &target);
-        // A real filesystem refusal at the append destination must retain the
-        // delivered kill in the error response, never report a clean session.
+        // A real filesystem refusal must be discovered before control starts.
         std::fs::create_dir_all(handle.dir.join("action/outcomes.jsonl")).unwrap();
         let mut state = super::TuiExecutionState::default();
         let error = super::execute_tui_plan_selection(&handle, &policy, &selected, &[], &mut state)
             .expect_err("directory cannot accept append-only outcome records");
-        target
-            .leader
-            .wait()
-            .expect("reap the actually delivered kill");
-        assert!(error.contains("actual execution results"));
-        assert!(error.contains("\"status\":\"success\""));
-        assert!(error.contains("\"kill_signal_delivered\":true"));
-        assert_eq!(state.enforcer.as_ref().unwrap().current_run_kill_count(), 1);
+        assert!(target.leader.try_wait().unwrap().is_none());
+        assert!(error.contains("read action outcomes"), "{error}");
+        assert!(!error.contains("\"kill_signal_delivered\":true"));
+        assert!(state.enforcer.is_none());
         assert_eq!(
             handle.read_manifest().unwrap().state,
             pt_core::session::SessionState::Failed
@@ -29388,7 +29811,7 @@ mod process_tree_safety_tests {
         assert!(super::finish_tui_session(&handle, &state).is_err());
         record(
             &log_dir,
-            serde_json::json!({"step": "actual_kill_append_refusal", "selection": selected, "error": error, "failure": state.failure}),
+            serde_json::json!({"step": "outcome_destination_prevented_kill", "selection": selected, "error": error, "failure": state.failure}),
         );
 
         let (unreadable, unreadable_log) = case("tui-state-io-failure");
@@ -38046,68 +38469,72 @@ fn record_respawn_history_in_data_dir(
 /// execution log. Sync completed records before another action can begin. A
 /// returned error must not turn a completed kill into a failure, and callers must
 /// not retry the same records: a failed write or sync may have published bytes.
+#[cfg(any(feature = "ui", test))]
 fn append_action_outcomes(action_dir: &Path, outcomes: &[serde_json::Value]) -> Result<(), String> {
     if outcomes.is_empty() {
         return Ok(());
     }
-    let directory_existed = action_dir.try_exists().map_err(|error| {
-        format!(
-            "inspect action outcome directory {}: {error}",
-            action_dir.display()
-        )
-    })?;
-    std::fs::create_dir_all(action_dir).map_err(|error| {
-        format!(
-            "create action outcome directory {}: {error}",
-            action_dir.display()
-        )
-    })?;
-    let path = action_dir.join("outcomes.jsonl");
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|error| format!("open action outcomes {}: {error}", path.display()))?;
-    let mut writer = std::io::BufWriter::new(file);
-    for outcome in outcomes {
-        writeln!(writer, "{outcome}")
-            .map_err(|error| format!("write action outcomes {}: {error}", path.display()))?;
-    }
-    writer
-        .flush()
-        .map_err(|error| format!("flush action outcomes {}: {error}", path.display()))?;
-    writer
-        .get_ref()
-        .sync_all()
-        .map_err(|error| format!("sync action outcomes {}: {error}", path.display()))?;
-    #[cfg(unix)]
+    let mut journal = prepare_action_outcome_journal(action_dir)?;
+    journal
+        .append(outcomes)
+        .map_err(|error| format!("checkpoint action outcomes: {error}"))
+}
+
+fn prepare_action_outcome_journal(
+    action_dir: &Path,
+) -> Result<pt_core::session::DurableJsonlJournal, String> {
+    pt_core::session::DurableJsonlJournal::open(&action_dir.join("outcomes.jsonl"))
+        .map_err(|error| format!("prepare action outcomes: {error}"))
+}
+
+fn prepare_action_outcome_journal_from_snapshot(
+    action_dir: &Path,
+    expected: Option<&[u8]>,
+) -> Result<pt_core::session::DurableJsonlJournal, String> {
+    let journal = prepare_action_outcome_journal(action_dir)?;
+    if !journal
+        .matches_snapshot(expected.unwrap_or_default())
+        .map_err(|error| format!("revalidate pinned execution evidence: {error}"))?
     {
-        // File sync alone does not make a newly created journal's directory
-        // entry durable. The action directory may also be new for this session.
-        std::fs::File::open(action_dir)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| {
-                format!(
-                    "sync action outcome directory {}: {error}",
-                    action_dir.display()
-                )
-            })?;
-        if !directory_existed {
-            if let Some(parent) = action_dir.parent() {
-                std::fs::File::open(parent)
-                    .and_then(|directory| directory.sync_all())
-                    .map_err(|error| {
-                        format!(
-                            "sync action outcome parent directory {}: {error}",
-                            parent.display()
-                        )
-                    })?;
-            }
-        }
+        return Err("saved action outcomes changed while preparing the execution journal".into());
     }
-    #[cfg(not(unix))]
-    let _ = directory_existed;
-    Ok(())
+    Ok(journal)
+}
+
+fn append_prepared_action_outcomes(
+    journal: &mut Option<pt_core::session::DurableJsonlJournal>,
+    outcomes: &[serde_json::Value],
+) -> Result<(), String> {
+    journal
+        .as_mut()
+        .ok_or_else(|| "action outcome journal was not prepared before execution".to_string())?
+        .append(outcomes)
+        .map_err(|error| format!("checkpoint action outcomes: {error}"))
+}
+
+fn read_action_outcomes(path: &Path) -> Result<Option<String>, String> {
+    pt_core::session::read_jsonl(path)
+        .map_err(|error| format!("read action outcomes: {error}"))?
+        .map(String::from_utf8)
+        .transpose()
+        .map_err(|error| format!("action outcomes are not UTF-8: {error}"))
+}
+
+fn execution_history_is_missing(
+    handle: &pt_core::session::SessionHandle,
+    outcomes: Option<&[u8]>,
+) -> Result<bool, String> {
+    if outcomes.is_some_and(|bytes| bytes.iter().any(|byte| !byte.is_ascii_whitespace())) {
+        return Ok(false);
+    }
+    let manifest = handle
+        .read_manifest()
+        .map_err(|error| format!("cannot inspect execution history: {error}"))?;
+    Ok(manifest.state == SessionState::Executing
+        || manifest
+            .state_history
+            .iter()
+            .any(|transition| transition.state == SessionState::Executing))
 }
 
 fn goal_report_json(report: &GoalProgressReport, planning_only: bool) -> serde_json::Value {
@@ -38280,50 +38707,6 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             }
         };
 
-    // Resume only executions bound to this canonical action and target identity.
-    // Retain the exact bytes (including absence) until the execution lock is held:
-    // another apply may complete while this invocation prepares its safety checks.
-    #[cfg_attr(
-        not(any(target_os = "linux", target_os = "macos")),
-        allow(unused_variables)
-    )]
-    let (completed_action_ids, resume_outcomes_snapshot): (
-        std::collections::HashSet<String>,
-        Option<Vec<u8>>,
-    ) = if args.resume {
-        let outcomes_path = handle.dir.join("action").join("outcomes.jsonl");
-        match std::fs::read_to_string(&outcomes_path) {
-            Ok(content) => match parse_action_outcomes(&content).and_then(|saved| {
-                executed_plan_actions(&plan, &saved).map(|executed| {
-                    executed
-                        .into_iter()
-                        .map(|(action, _)| action.action_id.clone())
-                        .collect()
-                })
-            }) {
-                Ok(completed) => (completed, Some(content.into_bytes())),
-                Err(error) => {
-                    eprintln!(
-                        "agent apply: saved execution evidence is invalid for this Plan; refusing --resume: {error}"
-                    );
-                    return ExitCode::PolicyBlocked;
-                }
-            },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                (std::collections::HashSet::new(), None)
-            }
-            Err(error) => {
-                eprintln!(
-                    "agent apply: cannot read saved execution evidence {}: {error}",
-                    outcomes_path.display()
-                );
-                return ExitCode::IoError;
-            }
-        }
-    } else {
-        (std::collections::HashSet::new(), None)
-    };
-
     // Determine which actions to apply
     let use_recommended =
         args.recommended || (args.resume && args.pids.is_empty() && args.targets.is_empty());
@@ -38371,6 +38754,100 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         eprintln!("agent apply: must specify --recommended, --pids, or --targets");
         return ExitCode::ArgsError;
     };
+
+    // An interrupted admission blocks the entire session, including a narrower
+    // selection or an invocation without --resume. Neither may erase uncertainty
+    // about a control that could already have reached the kernel.
+    let selected_count = plan
+        .actions
+        .iter()
+        .filter(|action| target_pids.contains(&action.target.pid.0))
+        .filter(|action| {
+            selected_identities.as_ref().is_none_or(|identities| {
+                identities.contains(&(action.target.pid.0, action.target.start_id.0.clone()))
+            })
+        })
+        .count() as u64;
+    let outcomes_path = handle.dir.join("action/outcomes.jsonl");
+    let saved_content = match read_action_outcomes(&outcomes_path) {
+        Ok(content) => content,
+        Err(error) => {
+            return output_apply_journal_refusal(
+                global,
+                &sid,
+                execution_binding.as_ref(),
+                selected_count,
+                &error,
+            );
+        }
+    };
+    if saved_content
+        .as_ref()
+        .is_some_and(|content| !content.is_empty() && !content.ends_with('\n'))
+    {
+        return output_apply_journal_refusal(
+            global,
+            &sid,
+            execution_binding.as_ref(),
+            selected_count,
+            "action outcome journal has an incomplete final record",
+        );
+    }
+    let saved_outcomes = match parse_action_outcomes(saved_content.as_deref().unwrap_or_default()) {
+        Ok(saved) => saved,
+        Err(error) => {
+            return output_apply_incomplete_execution(
+                global,
+                &sid,
+                execution_binding.as_ref(),
+                &error.to_string(),
+            );
+        }
+    };
+    if let Err(error) = validate_execution_replay(&plan, &saved_outcomes) {
+        return output_apply_incomplete_execution(
+            global,
+            &sid,
+            execution_binding.as_ref(),
+            &error.to_string(),
+        );
+    }
+    let completed_action_ids: HashSet<String> = if args.resume {
+        match executed_plan_actions(&plan, &saved_outcomes) {
+            Ok(executed) => executed
+                .into_iter()
+                .map(|(action, _)| action.action_id.clone())
+                .collect(),
+            Err(error) => {
+                return output_apply_incomplete_execution(
+                    global,
+                    &sid,
+                    execution_binding.as_ref(),
+                    &error.to_string(),
+                );
+            }
+        }
+    } else {
+        HashSet::new()
+    };
+    // Compare these exact bytes again under the execution lock for every apply,
+    // since a concurrent executor can introduce an unresolved admission too.
+    let outcomes_snapshot = saved_content.map(String::into_bytes);
+    match execution_history_is_missing(&handle, outcomes_snapshot.as_deref()) {
+        Ok(false) => {}
+        Ok(true) => {
+            return output_apply_incomplete_execution(
+                global,
+                &sid,
+                execution_binding.as_ref(),
+                "this session entered execution but its action history is missing or empty; inspect live state and create a fresh plan",
+            );
+        }
+        Err(error) => {
+            eprintln!("agent apply: {error}");
+            return ExitCode::IoError;
+        }
+    }
 
     let invalid_policy_snapshot = |reason: String| {
         eprintln!("agent apply: requires a valid recorded policy snapshot: {reason}");
@@ -38757,16 +39234,22 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     let mut outcomes: Vec<serde_json::Value> = Vec::new();
     let action_dir = handle.dir.join("action");
     let mut persistence_error = None;
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(unused_mut))]
+    let mut outcome_journal = None;
     // All branches, including refusals and early breaks, checkpoint their real
     // outcome before the next target. Keep a failed checkpoint's original result
     // in the response, stop immediately, and never append it again at finalization.
-    // This narrows the crash window; a syscall followed by a crash before its
-    // outcome is recorded still cannot provide exactly-once execution on resume.
+    // A separate durable admission precedes each actual control. If the terminal
+    // checkpoint never arrives, verification reports uncertainty and replay is
+    // refused instead of assuming that the control was never attempted.
     macro_rules! checkpoint_outcome {
         ($outcome:expr) => {{
             let mut outcome = $outcome;
             attach_apply_failure_recovery(&sid, &recovery_actions, &mut outcome);
-            let persisted = append_action_outcomes(&action_dir, std::slice::from_ref(&outcome));
+            let persisted = append_prepared_action_outcomes(
+                &mut outcome_journal,
+                std::slice::from_ref(&outcome),
+            );
             outcomes.push(outcome);
             if let Err(error) = persisted {
                 persistence_error = Some(error);
@@ -38827,23 +39310,53 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     return ExitCode::IoError;
                 }
             }
-            if args.resume {
-                let current = match fs::read(handle.dir.join("action/outcomes.jsonl")) {
-                    Ok(content) => Some(content),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                    Err(error) => {
-                        eprintln!(
-                            "agent apply: cannot revalidate preview resume evidence: {error}"
+            {
+                let current =
+                    match pt_core::session::read_jsonl(&handle.dir.join("action/outcomes.jsonl")) {
+                        Ok(content) => content,
+                        Err(error) => {
+                            eprintln!(
+                            "agent apply: cannot revalidate preview execution evidence: {error}"
                         );
+                            return ExitCode::IoError;
+                        }
+                    };
+                if current != outcomes_snapshot {
+                    eprintln!("agent apply: execution outcomes changed before preview acquired the lock; inspect the current saved evidence");
+                    return ExitCode::PolicyBlocked;
+                }
+                match execution_history_is_missing(&handle, current.as_deref()) {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        return output_apply_incomplete_execution(
+                            global, &sid, execution_binding.as_ref(),
+                            "this session entered execution but its action history is missing or empty; inspect live state and create a fresh plan",
+                        );
+                    }
+                    Err(error) => {
+                        eprintln!("agent apply: {error}");
                         return ExitCode::IoError;
                     }
-                };
-                if current != resume_outcomes_snapshot {
-                    eprintln!("agent apply: execution outcomes changed before preview acquired the lock; retry --resume against the current saved evidence");
-                    return ExitCode::PolicyBlocked;
                 }
             }
             // Non-destructive actions never inspect or charge a kill budget.
+            outcome_journal = Some(
+                match prepare_action_outcome_journal_from_snapshot(
+                    &action_dir,
+                    outcomes_snapshot.as_deref(),
+                ) {
+                    Ok(journal) => journal,
+                    Err(error) => {
+                        return output_apply_journal_refusal(
+                            global,
+                            &sid,
+                            execution_binding.as_ref(),
+                            total_actions,
+                            &error,
+                        );
+                    }
+                },
+            );
             let preview = if actions_to_apply
                 .iter()
                 .any(|action| !action.blocked && action_uses_kill_budget(action))
@@ -39275,23 +39788,50 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     return ExitCode::IoError;
                 }
             }
-            if args.resume {
+            {
                 let outcomes_path = handle.dir.join("action/outcomes.jsonl");
-                let current = match fs::read(&outcomes_path) {
-                    Ok(content) => Some(content),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                let current = match pt_core::session::read_jsonl(&outcomes_path) {
+                    Ok(content) => content,
                     Err(error) => {
-                        eprintln!(
-                            "agent apply: cannot revalidate resume execution evidence: {error}"
-                        );
+                        eprintln!("agent apply: cannot revalidate execution evidence: {error}");
                         return ExitCode::IoError;
                     }
                 };
-                if current != resume_outcomes_snapshot {
-                    eprintln!("agent apply: execution outcomes changed before resume acquired the action lock; retry --resume against the current saved evidence");
+                if current != outcomes_snapshot {
+                    eprintln!("agent apply: execution outcomes changed before acquiring the action lock; inspect the current saved evidence");
                     return ExitCode::PolicyBlocked;
                 }
+                match execution_history_is_missing(&handle, current.as_deref()) {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        return output_apply_incomplete_execution(
+                            global, &sid, execution_binding.as_ref(),
+                            "this session entered execution but its action history is missing or empty; inspect live state and create a fresh plan",
+                        );
+                    }
+                    Err(error) => {
+                        eprintln!("agent apply: {error}");
+                        return ExitCode::IoError;
+                    }
+                }
             }
+            outcome_journal = Some(
+                match prepare_action_outcome_journal_from_snapshot(
+                    &action_dir,
+                    outcomes_snapshot.as_deref(),
+                ) {
+                    Ok(journal) => journal,
+                    Err(error) => {
+                        return output_apply_journal_refusal(
+                            global,
+                            &sid,
+                            execution_binding.as_ref(),
+                            total_actions,
+                            &error,
+                        );
+                    }
+                },
+            );
             // Preview modes never enter an execution phase. Real execution
             // publishes this state under the lock held through final persistence.
             if deadline_expired() {
@@ -39408,8 +39948,8 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                         // published bytes. Still join and report every already
                         // admitted action before releasing the execution lock.
                         if persistence_error.is_none() {
-                            if let Err(error) = append_action_outcomes(
-                                &action_dir,
+                            if let Err(error) = append_prepared_action_outcomes(
+                                &mut outcome_journal,
                                 std::slice::from_ref(&outcome),
                             ) {
                                 persistence_error = Some(error);
@@ -39452,8 +39992,10 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                         &plan,
                         &mut outcome,
                     );
-                    let persisted =
-                        append_action_outcomes(&action_dir, std::slice::from_ref(&outcome));
+                    let persisted = append_prepared_action_outcomes(
+                        &mut outcome_journal,
+                        std::slice::from_ref(&outcome),
+                    );
                     outcomes.push(outcome);
                     if let Err(error) = persisted {
                         persistence_error = Some(error);
@@ -39853,6 +40395,16 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     break;
                 }
 
+                if let Err(error) = outcome_journal
+                    .as_ref()
+                    .expect("real execution prepared its outcome journal")
+                    .validate()
+                {
+                    persistence_error = Some(format!(
+                        "revalidate action outcomes before admission: {error}"
+                    ));
+                    break;
+                }
                 if action_uses_kill_budget(action) {
                     if let Err(error) = enforcer.begin_kill_accounting() {
                         accounting_error = Some(error.to_string());
@@ -39909,6 +40461,56 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     checkpoint_outcome!(outcome);
                     break;
                 }
+                if action.action != Action::Keep {
+                    let mut admission = serde_json::json!({
+                        "action_id": action.action_id,
+                        "pid": action.target.pid.0,
+                        "status": "execution_started",
+                    });
+                    if let (Some(fields), Some(evidence)) =
+                        (admission.as_object_mut(), execution_evidence.as_object())
+                    {
+                        fields.extend(evidence.clone());
+                    }
+                    if let Err(error) = append_prepared_action_outcomes(
+                        &mut outcome_journal,
+                        std::slice::from_ref(&admission),
+                    ) {
+                        // No control has started. A failed sync may still have
+                        // published the admission, so preserve it and stop; never
+                        // manufacture a terminal result or retry these bytes.
+                        persistence_error = Some(error);
+                        if action_uses_kill_budget(action) {
+                            if let Err(error) = enforcer.finish_kill_accounting(false) {
+                                accounting_error = Some(error.to_string());
+                            }
+                        }
+                        break;
+                    }
+                }
+                // Synchronizing admission may itself exhaust the operation
+                // budget. Resolve this known-unstarted attempt with its exact
+                // evidence before stopping; do not launch a late control.
+                if deadline_expired() {
+                    if action_uses_kill_budget(action) {
+                        if let Err(error) = enforcer.finish_kill_accounting(false) {
+                            accounting_error = Some(error.to_string());
+                        }
+                    }
+                    operation_timed_out = true;
+                    failed += 1;
+                    let mut outcome = apply_timeout_outcome(action, start.elapsed());
+                    outcome["error"] = serde_json::json!("operation deadline expired while synchronizing execution admission; control was not started");
+                    outcome["control_started"] = serde_json::json!(false);
+                    outcome["accounting_error"] = serde_json::json!(accounting_error);
+                    if let (Some(fields), Some(evidence)) =
+                        (outcome.as_object_mut(), execution_evidence.as_object())
+                    {
+                        fields.extend(evidence.clone());
+                    }
+                    checkpoint_outcome!(outcome);
+                    break;
+                }
                 if parallel {
                     let preflight_ms = start.elapsed().as_millis();
                     let worker = match pt_core::action::signal::PendingSignalKill::start(action) {
@@ -39918,7 +40520,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                                 accounting_error = Some(error.to_string());
                             }
                             failed += 1;
-                            checkpoint_outcome!(serde_json::json!({
+                            let mut outcome = serde_json::json!({
                                 "action_id": action.action_id,
                                 "pid": action.target.pid.0,
                                 "status": "failed",
@@ -39927,7 +40529,13 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                                 "kill_signal_delivered": false,
                                 "time_ms": start.elapsed().as_millis(),
                                 "accounting_error": accounting_error,
-                            }));
+                            });
+                            if let (Some(fields), Some(evidence)) =
+                                (outcome.as_object_mut(), execution_evidence.as_object())
+                            {
+                                fields.extend(evidence.clone());
+                            }
+                            checkpoint_outcome!(outcome);
                             if accounting_error.is_some() {
                                 break;
                             }
@@ -40750,6 +41358,59 @@ fn output_apply_timeout(
     ExitCode::TimeoutError
 }
 
+fn output_apply_journal_refusal(
+    global: &GlobalOpts,
+    sid: &SessionId,
+    binding: Option<&ApplyBindingReceipt>,
+    selected: u64,
+    error: &str,
+) -> ExitCode {
+    let mut result = apply_refusal_document(sid, "outcome_journal_unavailable", error, binding);
+    result["mode"] = serde_json::json!("robot_apply");
+    result["status"] = serde_json::json!("blocked");
+    result["persistence_error"] = serde_json::json!(error);
+    result["summary"] = serde_json::json!({
+        "selected": selected,
+        "attempted": 0,
+        "not_attempted": selected,
+        "succeeded": 0,
+        "failed": 0,
+    });
+    result["outcomes"] = serde_json::json!([]);
+    match global.format {
+        OutputFormat::Json | OutputFormat::Toon => {
+            println!("{}", format_structured_output(global, result));
+        }
+        OutputFormat::Jsonl => println!("{}", global.process_output_value(result)),
+        OutputFormat::Exitcode => {}
+        _ => println!("[{sid}] apply: no actions admitted: {error}"),
+    }
+    ExitCode::IoError
+}
+
+fn output_apply_incomplete_execution(
+    global: &GlobalOpts,
+    sid: &SessionId,
+    binding: Option<&ApplyBindingReceipt>,
+    reason: &str,
+) -> ExitCode {
+    eprintln!("agent apply: refusing uncertain execution replay: {reason}");
+    let mut result = apply_refusal_document(sid, "incomplete_execution", reason, binding);
+    result["mode"] = serde_json::json!("robot_apply");
+    result["status"] = serde_json::json!("blocked");
+    result["summary"] = serde_json::json!({"attempted": 0});
+    result["outcomes"] = serde_json::json!([]);
+    match global.format {
+        OutputFormat::Json | OutputFormat::Toon => {
+            println!("{}", format_structured_output(global, result));
+        }
+        OutputFormat::Jsonl => println!("{}", global.process_output_value(result)),
+        OutputFormat::Exitcode => {}
+        _ => println!("[{sid}] apply: execution outcome uncertain: {reason}"),
+    }
+    ExitCode::PolicyBlocked
+}
+
 fn apply_refusal_document(
     sid: &SessionId,
     error: &str,
@@ -40761,9 +41422,10 @@ fn apply_refusal_document(
     let mut result = serde_json::json!({"session_id": sid.0, "error": error, "message": message});
     let category = match error {
         "operation_timeout" => FailureCategory::Timeout,
-        "invalid_policy_snapshot" | "preview_budget_unavailable" => {
-            FailureCategory::EvidenceUnavailable
-        }
+        "invalid_policy_snapshot"
+        | "preview_budget_unavailable"
+        | "outcome_journal_unavailable"
+        | "incomplete_execution" => FailureCategory::EvidenceUnavailable,
         "confirmation_required" | "robot_mode_disabled" => FailureCategory::PolicyBlocked,
         _ => FailureCategory::UnexpectedError,
     };
@@ -40881,9 +41543,8 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
             }
         };
     let outcomes_path = handle.dir.join("action/outcomes.jsonl");
-    let outcomes_content = match std::fs::read_to_string(&outcomes_path) {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+    let outcomes_content = match read_action_outcomes(&outcomes_path) {
+        Ok(content) => content.unwrap_or_default(),
         Err(error) => {
             eprintln!(
                 "agent verify: cannot read {}: {error}",
@@ -47383,11 +48044,11 @@ fn prepare_report_from_session(
     let plan_path = handle.dir.join("decision").join("plan.json");
     let plan: serde_json::Value = serde_json::from_slice(&std::fs::read(&plan_path)?)?;
     let outcomes_path = handle.dir.join("action/outcomes.jsonl");
-    let outcomes = match std::fs::read(&outcomes_path) {
-        Ok(bytes) => pt_report::generator::parse_outcomes(&bytes)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => return Err(error.into()),
-    };
+    let outcomes =
+        match read_action_outcomes(&outcomes_path).map_err(pt_report::ReportError::MissingData)? {
+            Some(content) => pt_report::generator::parse_outcomes(content.as_bytes())?,
+            None => Vec::new(),
+        };
     generator.prepare_from_session_artifacts(overview, &plan, &outcomes)
 }
 
@@ -47762,12 +48423,65 @@ fn run_agent_session_status(
         .ok()
         .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok());
 
-    let completed_actions = if outcomes_path.exists() {
-        let content = std::fs::read_to_string(&outcomes_path).unwrap_or_default();
-        content.lines().filter(|l| !l.trim().is_empty()).count()
-    } else {
-        0
+    let outcome_content = match read_action_outcomes(&outcomes_path) {
+        Ok(content) => content,
+        Err(error) => {
+            eprintln!("agent sessions: cannot read action outcomes: {error}");
+            return ExitCode::IoError;
+        }
     };
+    let outcome_records = match outcome_content
+        .as_deref()
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(records) => records,
+        Err(error) => {
+            eprintln!("agent sessions: invalid action outcomes: {error}");
+            return ExitCode::IoError;
+        }
+    };
+    let mut completed_actions = outcome_records
+        .iter()
+        .filter(|record| record["status"] != "execution_started")
+        .count();
+    let has_admissions = outcome_records
+        .iter()
+        .any(|record| record["status"] == "execution_started");
+    let resume_refusal_reason = if has_admissions {
+        // Once the admission protocol is present, progress follows validated
+        // latest attempts rather than counting old successes or journal lines.
+        completed_actions = 0;
+        plan_value
+            .as_ref()
+            .ok_or_else(|| "saved plan is missing for execution admissions".to_string())
+            .and_then(|document| {
+                parse_agent_plan(&document.to_string()).map_err(|error| error.to_string())
+            })
+            .and_then(|plan| {
+                let saved = parse_action_outcomes(outcome_content.as_deref().unwrap_or_default())
+                    .map_err(|error| error.to_string())?;
+                completed_actions =
+                    completed_execution_count(&plan, &saved).map_err(|error| error.to_string())?;
+                validate_execution_replay(&plan, &saved).map_err(|error| error.to_string())
+            })
+            .err()
+    } else if outcome_records.is_empty()
+        && (manifest.state == SessionState::Executing
+            || manifest
+                .state_history
+                .iter()
+                .any(|transition| transition.state == SessionState::Executing))
+    {
+        Some("execution history is missing or empty after execution began; inspect live state and create a fresh plan".to_string())
+    } else {
+        None
+    };
+    let execution_uncertain = resume_refusal_reason.is_some();
+    let resumable = resumable && !execution_uncertain;
 
     let plan_total = plan_value
         .as_ref()
@@ -47807,22 +48521,7 @@ fn run_agent_session_status(
     let plan_detail = if include_detail { plan_value } else { None };
 
     // Load action outcomes if --detail flag is set
-    let outcomes_detail = if include_detail {
-        let outcomes_path = handle.dir.join("action").join("outcomes.jsonl");
-        if outcomes_path.exists() {
-            std::fs::read_to_string(&outcomes_path).ok().map(|content| {
-                content
-                    .lines()
-                    .filter(|l| !l.trim().is_empty())
-                    .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-                    .collect::<Vec<_>>()
-            })
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let outcomes_detail = include_detail.then_some(outcome_records);
 
     match global.format {
         OutputFormat::Json | OutputFormat::Jsonl | OutputFormat::Toon => {
@@ -47851,6 +48550,8 @@ fn run_agent_session_status(
                     "pending_actions": pending_actions,
                 },
                 "resumable": resumable,
+                "execution_uncertain": execution_uncertain,
+                "resume_refusal_reason": resume_refusal_reason,
                 "resume_command": if resumable && matches!(manifest.state, SessionState::Planned | SessionState::Executing) {
                     Some(format!("pt agent apply --session {} --resume", manifest.session_id))
                 } else {
@@ -47903,7 +48604,13 @@ fn run_agent_session_status(
                 );
                 return ExitCode::Clean;
             }
-            let status_char = if resumable { "⏸" } else { "✓" };
+            let status_char = if execution_uncertain {
+                "!"
+            } else if resumable {
+                "⏸"
+            } else {
+                "✓"
+            };
             println!(
                 "[{}] {} {:?} ({}/{} actions)",
                 manifest.session_id, status_char, manifest.state, completed_actions, total_actions
@@ -47929,6 +48636,9 @@ fn run_agent_session_status(
             println!("  Pending: {}", pending_actions);
             println!();
             println!("Resumable: {}", if resumable { "yes" } else { "no" });
+            if let Some(reason) = &resume_refusal_reason {
+                println!("Execution outcome uncertain: {reason}");
+            }
             if resumable
                 && matches!(
                     manifest.state,

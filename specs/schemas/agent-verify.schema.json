@@ -90,6 +90,7 @@
             "confirmed_dead",
             "confirmed_stopped",
             "confirmed_effect",
+            "execution_uncertain",
             "effect_not_observed",
             "still_running",
             "respawned",

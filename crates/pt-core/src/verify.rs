@@ -17,8 +17,9 @@ use resource_prediction::ValidatedResourcePredictions;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-/// One persisted action/outcomes.jsonl record. Unsuccessful records may omit
-/// execution evidence; successful records are validated against Plan.actions.
+/// One persisted action/outcomes.jsonl record. Admissions and successes carry
+/// validated execution evidence; a terminal result must match its admission.
+/// Historical unsuccessful records may omit evidence when no admission exists.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SavedActionOutcome {
     pub action_id: String,
@@ -47,7 +48,7 @@ pub struct SavedActionOutcome {
 }
 
 /// Linux boot-relative execution cutoff, in the same units as /proc starttime.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ExecutionClock {
     pub boot_id: String,
     pub ticks: u64,
@@ -155,6 +156,8 @@ pub enum VerifyOutcome {
     ConfirmedRestored,
     /// Undo evidence or its current original state could not be independently verified.
     RestorationUnverified,
+    /// Execution was durably admitted, but no matching terminal record survived.
+    ExecutionUncertain,
     /// Current evidence establishes that the reversible postcondition is unmet.
     EffectNotObserved,
     StillRunning,
@@ -784,7 +787,7 @@ pub fn parse_agent_plan(content: &str) -> Result<Plan, VerifyError> {
 }
 
 pub fn parse_action_outcomes(content: &str) -> Result<Vec<SavedActionOutcome>, VerifyError> {
-    content
+    let outcomes: Vec<SavedActionOutcome> = content
         .lines()
         .enumerate()
         .filter(|(_, line)| !line.trim().is_empty())
@@ -793,7 +796,20 @@ pub fn parse_action_outcomes(content: &str) -> Result<Vec<SavedActionOutcome>, V
                 VerifyError::InvalidOutcomes(format!("line {}: {error}", index + 1))
             })
         })
-        .collect()
+        .collect::<Result<_, _>>()?;
+    // A complete newline is part of the durable admission protocol. A partial
+    // terminal write can contain valid JSON but still cannot resolve its start.
+    // Older outcome-only inputs retain their historical no-final-newline support.
+    if !content.ends_with('\n')
+        && outcomes
+            .iter()
+            .any(|outcome| outcome.status == "execution_started")
+    {
+        return Err(VerifyError::InvalidOutcomes(
+            "execution journal has an incomplete final record; preserve it for inspection instead of treating a partial write as a completed attempt".into(),
+        ));
+    }
+    Ok(outcomes)
 }
 
 fn is_failed_attempt(status: &str) -> bool {
@@ -823,6 +839,61 @@ pub fn executed_plan_actions<'a>(
         .collect())
 }
 
+/// Count actions whose latest substantive attempt has a terminal result.
+/// Admissions and non-executing records never complete an action, and a later
+/// interrupted admission supersedes that action's earlier completed attempt.
+pub fn completed_execution_count(
+    plan: &Plan,
+    saved: &[SavedActionOutcome],
+) -> Result<usize, VerifyError> {
+    let recorded = recorded_plan_actions(plan, saved)?;
+    validate_execution_timestamps(saved, Utc::now())?;
+    Ok(recorded
+        .into_iter()
+        .filter(|(_, outcome)| outcome.status != "execution_started")
+        .count())
+}
+
+/// Refuse replay when an admitted execution has no durable terminal outcome.
+/// A process may have changed after the kernel accepted an action, so a fresh
+/// observation alone cannot establish whether retrying that attempt is safe.
+pub fn validate_execution_replay(
+    plan: &Plan,
+    saved: &[SavedActionOutcome],
+) -> Result<(), VerifyError> {
+    let recorded = recorded_plan_actions(plan, saved)?;
+    validate_execution_timestamps(saved, Utc::now())?;
+    let unresolved: Vec<_> = recorded
+        .into_iter()
+        .filter(|(_, outcome)| outcome.status == "execution_started")
+        .map(|(action, _)| action.action_id.as_str())
+        .collect();
+    if unresolved.is_empty() {
+        Ok(())
+    } else {
+        Err(VerifyError::InvalidOutcomes(format!(
+            "execution outcome is uncertain for action(s) {}; inspect with agent verify and create a fresh plan instead of replaying this session",
+            unresolved.join(", "),
+        )))
+    }
+}
+
+/// The terminal record must come from the exact admission whose evidence was
+/// synchronized before actuation. A generic failure, skipped record, or an old
+/// success cannot resolve a later interrupted attempt at the same PID.
+fn same_execution_attempt(started: &SavedActionOutcome, outcome: &SavedActionOutcome) -> bool {
+    started.action_id == outcome.action_id
+        && started.pid == outcome.pid
+        && started.action == outcome.action
+        && started.target == outcome.target
+        && started.supervisor_restart == outcome.supervisor_restart
+        && started.command == outcome.command
+        && started.parent_pid == outcome.parent_pid
+        && started.parent_identity == outcome.parent_identity
+        && started.executed_at == outcome.executed_at
+        && started.execution_clock == outcome.execution_clock
+}
+
 /// Retain the latest substantive attempt per action. A later valid success
 /// resolves that action's failure; skipped/dry-run records resolve nothing.
 fn recorded_plan_actions<'a>(
@@ -849,7 +920,8 @@ fn recorded_plan_actions<'a>(
         ) {
             continue;
         }
-        if outcome.status != "success" && !is_failed_attempt(&outcome.status) {
+        let started = outcome.status == "execution_started";
+        if outcome.status != "success" && !started && !is_failed_attempt(&outcome.status) {
             return Err(VerifyError::InvalidOutcomes(format!(
                 "{} has unknown execution status {}",
                 outcome.action_id, outcome.status
@@ -861,14 +933,31 @@ fn recorded_plan_actions<'a>(
                 outcome.status, outcome.action_id
             )));
         };
-        if outcome.status == "success" && outcome.action != Some(action.action) {
+        if (outcome.status == "success" || started) && outcome.action != Some(action.action) {
             return Err(VerifyError::InvalidOutcomes(format!(
                 "{} successful execution action kind {:?} does not match plan action {:?}",
                 outcome.action_id, outcome.action, action.action
             )));
         }
         if action.action == Action::Keep {
+            if started {
+                return Err(VerifyError::InvalidOutcomes(format!(
+                    "{} cannot admit execution of a keep action",
+                    outcome.action_id,
+                )));
+            }
             continue;
+        }
+        if let Some(pending) = latest
+            .get(outcome.action_id.as_str())
+            .filter(|previous| previous.status == "execution_started")
+        {
+            if started || !same_execution_attempt(pending, outcome) {
+                return Err(VerifyError::InvalidOutcomes(format!(
+                    "{} has an unresolved execution admission; this record does not complete that exact attempt",
+                    outcome.action_id,
+                )));
+            }
         }
         if is_failed_attempt(&outcome.status) {
             if outcome.pid != action.target.pid.0
@@ -976,6 +1065,19 @@ fn recorded_plan_actions<'a>(
             )));
         }
         let previous = latest.get(outcome.action_id.as_str());
+        if started {
+            if previous
+                .and_then(|previous| previous.executed_at)
+                .is_some_and(|at| executed_at < at)
+            {
+                return Err(VerifyError::InvalidOutcomes(format!(
+                    "{} execution admission predates its previous outcome",
+                    outcome.action_id,
+                )));
+            }
+            latest.insert(&outcome.action_id, outcome);
+            continue;
+        }
         if previous.is_none_or(|previous| {
             is_failed_attempt(&previous.status)
                 || previous.executed_at.is_none_or(|at| executed_at >= at)
@@ -1082,10 +1184,10 @@ fn validate_execution_timestamps(
     saved: &[SavedActionOutcome],
     completed_at: DateTime<Utc>,
 ) -> Result<(), VerifyError> {
-    for execution in saved
-        .iter()
-        .filter(|execution| execution.status == "success" || is_failed_attempt(&execution.status))
-    {
+    for execution in saved.iter().filter(|execution| {
+        matches!(execution.status.as_str(), "success" | "execution_started")
+            || is_failed_attempt(&execution.status)
+    }) {
         if execution.executed_at.is_some_and(|at| at > completed_at) {
             return Err(VerifyError::InvalidTimestamp(format!(
                 "{} execution occurs after verification",
@@ -1156,12 +1258,20 @@ pub fn verify_plan_with_postconditions(
     let mut any_success = false;
 
     for (action, execution) in recorded {
-        if is_failed_attempt(&execution.status) {
+        if is_failed_attempt(&execution.status) || execution.status == "execution_started" {
             any_failed = true;
-            recommendations.push(format!(
-                "PID {} apply attempt failed; inspect the saved outcome before retrying",
-                action.target.pid.0
-            ));
+            let uncertain = execution.status == "execution_started";
+            recommendations.push(if uncertain {
+                format!(
+                    "PID {} execution was admitted but its result was not recorded; do not replay this session. Inspect the live process and create a fresh plan",
+                    action.target.pid.0,
+                )
+            } else {
+                format!(
+                    "PID {} apply attempt failed; inspect the saved outcome before retrying",
+                    action.target.pid.0,
+                )
+            });
             let command = execution
                 .command
                 .as_ref()
@@ -1177,17 +1287,29 @@ pub fn verify_plan_with_postconditions(
                     cmd_full: command.cloned(),
                 },
                 action: action.action.as_str().to_string(),
-                outcome: VerifyOutcome::Unsupported,
+                outcome: if uncertain {
+                    VerifyOutcome::ExecutionUncertain
+                } else {
+                    VerifyOutcome::Unsupported
+                },
                 time_to_death_ms: None,
                 expected_resources_freed: None,
                 respawn_detected: None,
                 expected: Some("successful_execution".to_string()),
-                actual: Some("failed_attempt".to_string()),
-                verified: Some(false),
-                note: Some(format!(
-                    "Apply recorded a {} attempt; its effects and respawns are not established",
-                    execution.status
-                )),
+                actual: Some(if uncertain {
+                    "terminal_outcome_missing".to_string()
+                } else {
+                    "failed_attempt".to_string()
+                }),
+                verified: (!uncertain).then_some(false),
+                note: Some(if uncertain {
+                    "The action may or may not have reached the kernel. Current process state cannot establish execution, failure, resource relief, or permission to replay it".to_string()
+                } else {
+                    format!(
+                        "Apply recorded a {} attempt; its effects and respawns are not established",
+                        execution.status,
+                    )
+                }),
                 restoration: None,
             });
             continue;
@@ -2281,6 +2403,167 @@ mod tests {
         assert!(executed_plan_actions(&blocked, std::slice::from_ref(&injected)).is_err());
         let replacement = make_proc(999, 1000, "node app --port 3000", 20, ProcessState::Running);
         assert!(detect_respawn(&blocked.actions[0], &injected, &[replacement]).is_none());
+    }
+
+    #[test]
+    fn interrupted_execution_is_uncertain_even_when_the_target_has_disappeared() {
+        let plan = make_plan(vec![make_action(123, Action::Kill)]);
+        let mut started = execution(&plan.actions[0]);
+        started.status = "execution_started".into();
+        let saved = [started];
+        assert!(validate_execution_replay(&plan, &saved)
+            .unwrap_err()
+            .to_string()
+            .contains("execution outcome is uncertain"));
+        assert!(executed_plan_actions(&plan, &saved).unwrap().is_empty());
+        assert_eq!(completed_execution_count(&plan, &saved).unwrap(), 0);
+        let verified = verify_plan_with_postconditions(
+            &plan,
+            &saved,
+            &[],
+            DateTime::from_timestamp(30, 0).unwrap(),
+            DateTime::from_timestamp(31, 0).unwrap(),
+            |_| panic!("An incomplete execution must not inspect or claim its effects"),
+            Some(&private_predictions(&plan, &[(0, 8 * 1024 * 1024)])),
+        )
+        .unwrap();
+        assert_eq!(verified.action_outcomes.len(), 1);
+        let outcome = &verified.action_outcomes[0];
+        assert_eq!(outcome.outcome, VerifyOutcome::ExecutionUncertain);
+        assert_eq!(outcome.actual.as_deref(), Some("terminal_outcome_missing"));
+        assert_eq!(outcome.verified, None);
+        assert!(outcome.expected_resources_freed.is_none());
+        assert!(outcome.respawn_detected.is_none());
+        assert!(verified.resource_summary.is_none());
+        assert_eq!(verified.follow_up_needed, Some(true));
+        assert_eq!(verified.verification.overall_status, "failure");
+    }
+
+    #[test]
+    fn exact_terminal_outcome_resolves_an_execution_admission() {
+        let plan = make_plan(vec![make_action(123, Action::Kill)]);
+        for status in ["success", "failed"] {
+            let mut completed = execution(&plan.actions[0]);
+            completed.status = status.into();
+            let mut started = completed.clone();
+            started.status = "execution_started".into();
+            let records = [started, completed];
+            validate_execution_replay(&plan, &records).unwrap();
+            assert_eq!(completed_execution_count(&plan, &records).unwrap(), 1);
+            assert_eq!(
+                executed_plan_actions(&plan, &records).unwrap().len(),
+                usize::from(status == "success"),
+            );
+            let verified = report(&plan, &records, &[]);
+            assert_eq!(verified.action_outcomes.len(), 1);
+            assert_eq!(
+                verified.action_outcomes[0].verified,
+                Some(status == "success")
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_terminal_line_cannot_resolve_a_durable_admission() {
+        let plan = make_plan(vec![make_action(123, Action::Kill)]);
+        let completed = execution(&plan.actions[0]);
+        let mut started = completed.clone();
+        started.status = "execution_started".into();
+        let start_line = serde_json::to_string(&started).unwrap();
+        let terminal_line = serde_json::to_string(&completed).unwrap();
+
+        let complete = parse_action_outcomes(&format!("{start_line}\n{terminal_line}\n")).unwrap();
+        validate_execution_replay(&plan, &complete).unwrap();
+        assert_eq!(completed_execution_count(&plan, &complete).unwrap(), 1);
+        for interrupted in [start_line.clone(), format!("{start_line}\n{terminal_line}")] {
+            assert!(parse_action_outcomes(&interrupted)
+                .unwrap_err()
+                .to_string()
+                .contains("incomplete final record"));
+        }
+        let pending = parse_action_outcomes(&format!("{start_line}\n")).unwrap();
+        assert!(validate_execution_replay(&plan, &pending).is_err());
+        assert_eq!(completed_execution_count(&plan, &pending).unwrap(), 0);
+        // Outcome-only historical inputs were allowed without a final newline.
+        let legacy = parse_action_outcomes(&terminal_line).unwrap();
+        validate_execution_replay(&plan, &legacy).unwrap();
+    }
+
+    #[test]
+    fn skipped_records_and_old_successes_cannot_erase_an_interrupted_attempt() {
+        let plan = make_plan(vec![make_action(123, Action::Kill)]);
+        let previous = execution(&plan.actions[0]);
+        let mut started = previous.clone();
+        started.status = "execution_started".into();
+        started.executed_at = Some(DateTime::from_timestamp(20, 0).unwrap());
+        for status in [
+            "dry_run",
+            "shadow",
+            "skipped",
+            "precheck_blocked",
+            "already_completed",
+        ] {
+            let mut skipped = previous.clone();
+            skipped.status = status.into();
+            let records = [previous.clone(), started.clone(), skipped];
+            assert!(
+                validate_execution_replay(&plan, &records).is_err(),
+                "{status}"
+            );
+            assert!(
+                executed_plan_actions(&plan, &records).unwrap().is_empty(),
+                "{status}"
+            );
+            assert_eq!(completed_execution_count(&plan, &records).unwrap(), 0);
+            assert_eq!(
+                report(&plan, &records, &[]).action_outcomes[0].outcome,
+                VerifyOutcome::ExecutionUncertain,
+                "{status}",
+            );
+        }
+        // A stale completion is not evidence about the newly admitted attempt.
+        assert!(validate_execution_replay(&plan, &[started, previous]).is_err());
+    }
+
+    #[test]
+    fn execution_admissions_require_exact_terminal_evidence() {
+        let plan = make_plan(vec![make_action(123, Action::Kill)]);
+        let completed = execution(&plan.actions[0]);
+        let mut started = completed.clone();
+        started.status = "execution_started".into();
+        for field in [
+            "action",
+            "target",
+            "command",
+            "parent",
+            "clock",
+            "timestamp",
+            "generic_failure",
+            "second_start",
+        ] {
+            let mut other = completed.clone();
+            match field {
+                "action" => other.action = Some(Action::Pause),
+                "target" => other.target.as_mut().unwrap().uid += 1,
+                "command" => other.command = Some("different workload".into()),
+                "parent" => other.parent_pid = Some(999),
+                "clock" => other.execution_clock.as_mut().unwrap().ticks += 1,
+                "timestamp" => other.executed_at = Some(DateTime::from_timestamp(11, 0).unwrap()),
+                "generic_failure" => other = failed_attempt(&plan.actions[0]),
+                "second_start" => other.status = "execution_started".into(),
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_execution_replay(&plan, &[started.clone(), other]).is_err(),
+                "{field}",
+            );
+        }
+        let mut invalid = started.clone();
+        invalid.target = None;
+        assert!(validate_execution_replay(&plan, &[invalid]).is_err());
+        let mut future = started;
+        future.executed_at = Some(Utc::now() + chrono::Duration::days(1));
+        assert!(validate_execution_replay(&plan, &[future]).is_err());
     }
 
     #[test]
@@ -4091,6 +4374,7 @@ mod tests {
             (VerifyOutcome::Respawned, "respawned"),
             (VerifyOutcome::PidReused, "pid_reused"),
             (VerifyOutcome::Unsupported, "unsupported"),
+            (VerifyOutcome::ExecutionUncertain, "execution_uncertain"),
         ] {
             assert_eq!(serde_json::to_value(outcome).unwrap(), wire);
         }

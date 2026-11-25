@@ -500,6 +500,8 @@ impl SessionStore {
     /// are retained, but all selected journals are validated and counted.
     /// Global queries omit a parent control mirror only after validating the same
     /// ordered outcomes in its canonical child. Parent-scoped queries retain it.
+    /// Execution admissions are validated but never counted as terminal attempts;
+    /// verification and session status report any unresolved execution instead.
     pub fn action_history(
         &self,
         session_id: Option<&SessionId>,
@@ -1788,6 +1790,8 @@ fn read_action_history_journal(
     let mut line_number = 0_u64;
     let mut count = 0_u64;
     let mut retained_bytes = 0;
+    let mut has_admissions = false;
+    let mut complete_tail = true;
     loop {
         line.clear();
         let bytes = (&mut reader)
@@ -1800,6 +1804,7 @@ fn read_action_history_journal(
         if bytes == 0 {
             break;
         }
+        complete_tail = line.ends_with(b"\n");
         line_number += 1;
         if bytes as u64 > MAX_HISTORY_RECORD_BYTES {
             return Err(history_data_error(
@@ -1818,6 +1823,8 @@ fn read_action_history_journal(
         serde_json::from_value::<crate::verify::SavedActionOutcome>(outcome.clone()).map_err(
             |error| history_data_error(path, &format!("journal line {line_number}: {error}")),
         )?;
+        let admission = outcome["status"] == "execution_started";
+        has_admissions |= admission;
         // Validate every row before filtering, including skipped and refused
         // attempts. Mirrors consume neither row nor byte capacity; the complete
         // child proof is checked even when no result rows can be retained.
@@ -1825,6 +1832,12 @@ fn read_action_history_journal(
             if mirrors.record(path, session_id, line_number, &outcome)? {
                 continue;
             }
+        }
+        // Admission is evidence that execution may have started, not a result.
+        // Preserve it in mirror proofs, but do not let it claim completion or
+        // consume result capacity at the expense of an actual terminal attempt.
+        if admission {
+            continue;
         }
         count += 1;
         if limit > 0 {
@@ -1848,6 +1861,12 @@ fn read_action_history_journal(
         return Err(history_data_error(
             path,
             "journal was truncated while being read",
+        ));
+    }
+    if has_admissions && !complete_tail {
+        return Err(history_data_error(
+            path,
+            "execution journal has an incomplete final record",
         ));
     }
     Ok((
@@ -2372,10 +2391,337 @@ fn artifact_name(name: &std::ffi::OsStr) -> Result<std::ffi::CString, std::io::E
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
 }
 
+/// An append-only JSONL journal pinned before any externally visible action.
+///
+/// Callers serialize writers with their execution lock and retain this handle
+/// through the last checkpoint. Neither an existing symlink/device nor a later
+/// replacement of the file or its directory can redirect writes. A failed
+/// checkpoint may already have published bytes, so the handle refuses retries.
+#[derive(Debug)]
+pub struct DurableJsonlJournal {
+    path: PathBuf,
+    #[cfg(unix)]
+    directory: JsonDirectory,
+    #[cfg(unix)]
+    file: std::fs::File,
+    #[cfg(unix)]
+    expected_len: u64,
+    failed: bool,
+}
+
+impl DurableJsonlJournal {
+    /// Preflight the actual destination and synchronize its directory entry.
+    /// Existing bytes are never truncated, repaired or replaced.
+    pub fn open(path: &Path) -> Result<Self, SessionError> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::{AsRawFd, FromRawFd};
+            use std::os::unix::fs::{FileExt, MetadataExt};
+            let name = path.file_name().ok_or_else(|| {
+                session_io(path, std::io::Error::other("journal has no filename"))
+            })?;
+            let component = artifact_name(name).map_err(|error| session_io(path, error))?;
+            let directory = JsonDirectory::create(artifact_parent(path))?;
+            directory.revalidate()?;
+            // SAFETY: the live directory fd and validated single-component name
+            // remain valid. NONBLOCK makes FIFO/device rejection nonblocking.
+            let fd = unsafe {
+                libc::openat(
+                    directory.handle.as_raw_fd(),
+                    component.as_ptr(),
+                    libc::O_RDWR
+                        | libc::O_APPEND
+                        | libc::O_CREAT
+                        | libc::O_NOFOLLOW
+                        | libc::O_NONBLOCK
+                        | libc::O_CLOEXEC,
+                    0o600 as libc::c_uint,
+                )
+            };
+            if fd < 0 {
+                return Err(session_io(path, std::io::Error::last_os_error()));
+            }
+            // SAFETY: ownership of this newly opened fd is transferred once.
+            let file = unsafe { std::fs::File::from_raw_fd(fd) };
+            let metadata = file.metadata().map_err(|error| session_io(path, error))?;
+            if !metadata.is_file() || metadata.nlink() != 1 {
+                return Err(session_io(
+                    path,
+                    std::io::Error::other("journal must be a regular, singly linked file"),
+                ));
+            }
+            let expected_len = metadata.len();
+            if expected_len > 0 {
+                let mut tail = [0];
+                if file
+                    .read_at(&mut tail, expected_len - 1)
+                    .map_err(|error| session_io(path, error))?
+                    != 1
+                    || tail != [b'\n']
+                {
+                    return Err(session_io(
+                        path,
+                        std::io::Error::other("journal has an incomplete final record"),
+                    ));
+                }
+            }
+            let journal = Self {
+                path: path.to_path_buf(),
+                directory,
+                file,
+                expected_len,
+                failed: false,
+            };
+            journal.validate()?;
+            journal
+                .file
+                .sync_all()
+                .map_err(|error| session_io(path, error))?;
+            journal
+                .directory
+                .handle
+                .sync_all()
+                .map_err(|error| session_io(artifact_parent(path), error))?;
+            journal.validate()?;
+            Ok(journal)
+        }
+        #[cfg(not(unix))]
+        {
+            Err(session_io(
+                path,
+                std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "durable journals require Unix directory synchronization",
+                ),
+            ))
+        }
+    }
+
+    /// Refuse changed paths, new hard links, truncation or unexpected appends.
+    pub fn validate(&self) -> Result<(), SessionError> {
+        if self.failed {
+            return Err(session_io(
+                &self.path,
+                std::io::Error::other(
+                    "journal checkpoint failed; uncertain bytes must not be retried",
+                ),
+            ));
+        }
+        #[cfg(unix)]
+        {
+            validate_journal_file(&self.path, &self.directory, &self.file, self.expected_len)
+        }
+        #[cfg(not(unix))]
+        {
+            Err(session_io(
+                &self.path,
+                std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "durable journal unavailable",
+                ),
+            ))
+        }
+    }
+
+    /// Bind previously validated bytes to this exact append destination.
+    /// Reads use the held descriptor without changing its cursor. A different
+    /// snapshot returns false; an invalid or replaced journal remains an error.
+    pub fn matches_snapshot(&self, expected: &[u8]) -> Result<bool, SessionError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            self.matches_snapshot_with(expected, |file, buffer, offset| {
+                file.read_exact_at(buffer, offset)
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = expected;
+            self.validate().map(|()| false)
+        }
+    }
+
+    #[cfg(unix)]
+    fn matches_snapshot_with(
+        &self,
+        expected: &[u8],
+        mut read: impl FnMut(&std::fs::File, &mut [u8], u64) -> std::io::Result<()>,
+    ) -> Result<bool, SessionError> {
+        self.validate()?;
+        let mut matches = self.expected_len == expected.len() as u64;
+        if matches {
+            let mut buffer = [0; 8192];
+            let mut offset = 0;
+            for chunk in expected.chunks(buffer.len()) {
+                let observed = &mut buffer[..chunk.len()];
+                read(&self.file, observed, offset)
+                    .map_err(|error| session_io(&self.path, error))?;
+                if observed != chunk {
+                    matches = false;
+                    break;
+                }
+                offset += chunk.len() as u64;
+            }
+        }
+        self.validate()?;
+        Ok(matches)
+    }
+
+    /// Append complete serialized records and durably checkpoint before return.
+    /// Serialization failure writes nothing and leaves the handle reusable.
+    pub fn append<T: Serialize>(&mut self, records: &[T]) -> Result<(), SessionError> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let mut content = Vec::new();
+        for record in records {
+            serde_json::to_writer(&mut content, record).map_err(|source| SessionError::Json {
+                path: self.path.clone(),
+                source,
+            })?;
+            content.push(b'\n');
+        }
+        #[cfg(unix)]
+        {
+            self.append_bytes_with(
+                &content,
+                |mut file, bytes| {
+                    use std::io::Write;
+                    file.write_all(bytes)
+                },
+                std::fs::File::sync_all,
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = content;
+            self.validate()
+        }
+    }
+
+    #[cfg(unix)]
+    fn append_bytes_with(
+        &mut self,
+        content: &[u8],
+        write: impl FnOnce(&std::fs::File, &[u8]) -> std::io::Result<()>,
+        synchronize: impl Fn(&std::fs::File) -> std::io::Result<()>,
+    ) -> Result<(), SessionError> {
+        self.validate()?;
+        let next_len = self
+            .expected_len
+            .checked_add(content.len() as u64)
+            .ok_or_else(|| {
+                session_io(&self.path, std::io::Error::other("journal length overflow"))
+            })?;
+        self.failed = true;
+        write(&self.file, content).map_err(|error| session_io(&self.path, error))?;
+        synchronize(&self.file).map_err(|error| session_io(&self.path, error))?;
+        synchronize(&self.directory.handle)
+            .map_err(|error| session_io(&self.directory.path, error))?;
+        validate_journal_file(&self.path, &self.directory, &self.file, next_len)?;
+        self.expected_len = next_len;
+        self.failed = false;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn validate_journal_file(
+    path: &Path,
+    directory: &JsonDirectory,
+    file: &std::fs::File,
+    expected_len: u64,
+) -> Result<(), SessionError> {
+    use std::os::unix::fs::MetadataExt;
+    directory.revalidate()?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| session_io(path, std::io::Error::other("journal has no filename")))?;
+    let current = directory.open_artifact(name)?;
+    let saved = file.metadata().map_err(|error| session_io(path, error))?;
+    let current = current
+        .metadata()
+        .map_err(|error| session_io(path, error))?;
+    if !saved.is_file()
+        || saved.nlink() != 1
+        || current.nlink() != 1
+        || saved.dev() != current.dev()
+        || saved.ino() != current.ino()
+        || saved.len() != expected_len
+        || current.len() != expected_len
+    {
+        return Err(session_io(
+            path,
+            std::io::Error::other("journal identity or length changed"),
+        ));
+    }
+    directory.revalidate()
+}
+
+/// Read existing journal bytes without following links or blocking on FIFOs.
+/// Missing journals remain absent; this read never creates or repairs a file.
+pub fn read_jsonl(path: &Path) -> Result<Option<Vec<u8>>, SessionError> {
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        let directory = match JsonDirectory::open(artifact_parent(path)) {
+            Ok(directory) => directory,
+            Err(SessionError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Ok(None)
+            }
+            Err(error) => return Err(error),
+        };
+        let name = path
+            .file_name()
+            .ok_or_else(|| session_io(path, std::io::Error::other("journal has no filename")))?;
+        let file = match directory.open_artifact(name) {
+            Ok(file) => file,
+            Err(SessionError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                directory.revalidate()?;
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let len = file
+            .metadata()
+            .map_err(|error| session_io(path, error))?
+            .len();
+        validate_journal_file(path, &directory, &file, len)?;
+        let mut content = Vec::new();
+        (&file)
+            .take(len.saturating_add(1))
+            .read_to_end(&mut content)
+            .map_err(|error| session_io(path, error))?;
+        validate_journal_file(path, &directory, &file, len)?;
+        if content.len() as u64 != len {
+            return Err(session_io(
+                path,
+                std::io::Error::other("journal changed while reading"),
+            ));
+        }
+        Ok(Some(content))
+    }
+    #[cfg(not(unix))]
+    {
+        Err(session_io(
+            path,
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "durable journal unavailable",
+            ),
+        ))
+    }
+}
+
 /// Hold the parent inode throughout creation, synchronization and rename. Path
 /// revalidation detects moved directories; descriptor-relative operations never
 /// follow a replacement directory or a temporary-file symlink.
 #[cfg(unix)]
+#[derive(Debug)]
 struct JsonDirectory {
     path: PathBuf,
     handle: std::fs::File,
@@ -2886,6 +3232,348 @@ mod tests {
     use super::*;
     use pt_common::SessionId;
 
+    #[cfg(unix)]
+    #[test]
+    fn durable_jsonl_preserves_records_and_preflights_private_storage() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap().keep();
+        let path = root.join("new/action/outcomes.jsonl");
+        assert!(read_jsonl(&path).unwrap().is_none());
+        assert!(!root.join("new").exists());
+        let mut journal = DurableJsonlJournal::open(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let first = serde_json::json!({"action_id": "first", "status": "success"});
+        let second = serde_json::json!({"action_id": "second", "status": "precheck_blocked"});
+        journal.append(std::slice::from_ref(&first)).unwrap();
+        let prefix = std::fs::read(&path).unwrap();
+        journal.append(std::slice::from_ref(&second)).unwrap();
+        let bytes = read_jsonl(&path).unwrap().unwrap();
+        assert!(bytes.starts_with(&prefix));
+        assert_eq!(bytes.last(), Some(&b'\n'));
+        let actual: Vec<serde_json::Value> = std::str::from_utf8(&bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(actual, vec![first, second]);
+        journal.validate().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_jsonl_snapshot_compares_exact_bytes_without_moving_the_cursor() {
+        use std::io::{Seek, SeekFrom};
+        let root = tempfile::tempdir().unwrap().keep();
+        let path = root.join("outcomes.jsonl");
+        let mut journal = DurableJsonlJournal::open(&path).unwrap();
+        assert!(journal.matches_snapshot(b"").unwrap());
+        assert!(!journal.matches_snapshot(b"\n").unwrap());
+        journal
+            .append(&[serde_json::json!({"payload": "x".repeat(20_000)})])
+            .unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let mut cursor = &journal.file;
+        cursor.seek(SeekFrom::Start(7)).unwrap();
+        assert!(journal.matches_snapshot(&original).unwrap());
+        assert!(!journal
+            .matches_snapshot(&original[..original.len() - 1])
+            .unwrap());
+        let mut different = original.clone();
+        // Change a byte beyond the first read buffer, preserving JSON and length.
+        different[original.len() - 4] = b'y';
+        assert!(!journal.matches_snapshot(&different).unwrap());
+        assert_eq!(cursor.stream_position().unwrap(), 7);
+
+        // In-place edits preserve the inode and length, so metadata validation
+        // alone cannot bind the previously accepted execution evidence.
+        std::fs::write(&path, &different).unwrap();
+        journal.validate().unwrap();
+        assert!(!journal.matches_snapshot(&original).unwrap());
+        assert!(journal.matches_snapshot(&different).unwrap());
+        assert_eq!(cursor.stream_position().unwrap(), 7);
+        journal
+            .append(&[serde_json::json!({"next": true})])
+            .unwrap();
+        let appended = std::fs::read(&path).unwrap();
+        assert!(appended.starts_with(&different));
+        assert!(journal.matches_snapshot(&appended).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_jsonl_snapshot_cannot_follow_a_replacement_file_or_directory() {
+        for replace_parent in [false, true] {
+            let root = tempfile::tempdir().unwrap().keep();
+            let parent = root.join("action");
+            let path = parent.join("outcomes.jsonl");
+            let mut journal = DurableJsonlJournal::open(&path).unwrap();
+            journal
+                .append(&[serde_json::json!({"generation": 1})])
+                .unwrap();
+            let original = std::fs::read(&path).unwrap();
+            let replacement = b"{\"generation\":2}\n";
+            assert_eq!(original.len(), replacement.len());
+            let retained = if replace_parent {
+                let retained_parent = root.join("original-action");
+                std::fs::rename(&parent, &retained_parent).unwrap();
+                std::fs::create_dir(&parent).unwrap();
+                retained_parent.join("outcomes.jsonl")
+            } else {
+                let retained = root.join("original.jsonl");
+                std::fs::rename(&path, &retained).unwrap();
+                retained
+            };
+            std::fs::write(&path, replacement).unwrap();
+            assert!(journal.matches_snapshot(&original).is_err());
+            assert!(journal.matches_snapshot(replacement).is_err());
+            assert_eq!(std::fs::read(&retained).unwrap(), original);
+            assert_eq!(std::fs::read(&path).unwrap(), replacement);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_jsonl_snapshot_rechecks_identity_after_reading_the_held_descriptor() {
+        use std::os::unix::fs::FileExt;
+        let root = tempfile::tempdir().unwrap().keep();
+        let parent = root.join("action");
+        let path = parent.join("outcomes.jsonl");
+        let mut journal = DurableJsonlJournal::open(&path).unwrap();
+        journal
+            .append(&[serde_json::json!({"generation": 1})])
+            .unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let replacement = b"{\"generation\":2}\n";
+        let retained = root.join("original-action");
+        let error = journal
+            .matches_snapshot_with(&original, |file, buffer, offset| {
+                // Substitute after the initial validation. The content comparison
+                // must read the original descriptor, and final validation must
+                // still reject the now-unbound append destination.
+                std::fs::rename(&parent, &retained)?;
+                std::fs::create_dir(&parent)?;
+                std::fs::write(&path, replacement)?;
+                file.read_exact_at(buffer, offset)?;
+                assert_eq!(buffer, original.as_slice());
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("directory identity changed"));
+        assert_eq!(
+            std::fs::read(retained.join("outcomes.jsonl")).unwrap(),
+            original
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), replacement);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_jsonl_refuses_links_nonregular_files_and_torn_tails_without_writes() {
+        use std::os::unix::{ffi::OsStrExt, fs::symlink};
+        for case in ["symlink", "hardlink", "fifo", "directory", "torn"] {
+            let root = tempfile::tempdir().unwrap().keep();
+            let path = root.join("outcomes.jsonl");
+            let outside = root.join("outside.jsonl");
+            let original = b"{\"sentinel\":true}\n";
+            std::fs::write(&outside, original).unwrap();
+            match case {
+                "symlink" => symlink(&outside, &path).unwrap(),
+                "hardlink" => std::fs::hard_link(&outside, &path).unwrap(),
+                "fifo" => {
+                    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+                    // SAFETY: the valid path is a new owned fixture endpoint.
+                    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+                }
+                "directory" => std::fs::create_dir(&path).unwrap(),
+                "torn" => std::fs::write(&path, b"{\"action_id\":").unwrap(),
+                _ => unreachable!(),
+            }
+            let started = std::time::Instant::now();
+            assert!(DurableJsonlJournal::open(&path).is_err(), "{case}");
+            if case != "torn" {
+                assert!(read_jsonl(&path).is_err(), "{case}");
+            } else {
+                assert_eq!(read_jsonl(&path).unwrap().unwrap(), b"{\"action_id\":");
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "{case} blocked"
+            );
+            assert_eq!(std::fs::read(&outside).unwrap(), original);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_jsonl_pins_file_and_directory_across_substitution() {
+        use std::os::unix::fs::symlink;
+        for case in [
+            "file",
+            "symlink",
+            "directory",
+            "hardlink",
+            "truncate",
+            "append",
+        ] {
+            let root = tempfile::tempdir().unwrap().keep();
+            let parent = root.join("action");
+            let path = parent.join("outcomes.jsonl");
+            let mut journal = DurableJsonlJournal::open(&path).unwrap();
+            journal
+                .append(&[serde_json::json!({"original": true})])
+                .unwrap();
+            let original = std::fs::read(&path).unwrap();
+            let retained = root.join("retained.jsonl");
+            let sentinel = b"{\"replacement\":true}\n";
+            match case {
+                "file" | "symlink" => {
+                    std::fs::rename(&path, &retained).unwrap();
+                    if case == "file" {
+                        std::fs::write(&path, sentinel).unwrap();
+                    } else {
+                        let outside = root.join("outside.jsonl");
+                        std::fs::write(&outside, sentinel).unwrap();
+                        symlink(outside, &path).unwrap();
+                    }
+                }
+                "directory" => {
+                    std::fs::rename(&parent, root.join("retained-action")).unwrap();
+                    std::fs::create_dir(&parent).unwrap();
+                    std::fs::write(&path, sentinel).unwrap();
+                }
+                "hardlink" => std::fs::hard_link(&path, &retained).unwrap(),
+                "truncate" => std::fs::write(&path, b"").unwrap(),
+                "append" => {
+                    use std::io::Write;
+                    std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&path)
+                        .unwrap()
+                        .write_all(sentinel)
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let before = std::fs::read(&path).unwrap();
+            assert!(
+                journal
+                    .append(&[serde_json::json!({"must_not_write": true})])
+                    .is_err(),
+                "{case}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before, "{case}");
+            if matches!(case, "file" | "symlink" | "hardlink") {
+                assert_eq!(std::fs::read(&retained).unwrap(), original, "{case}");
+            }
+            if case == "directory" {
+                assert_eq!(
+                    std::fs::read(root.join("retained-action/outcomes.jsonl")).unwrap(),
+                    original
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_jsonl_late_directory_replacement_cannot_redirect_checkpoint_bytes() {
+        use std::io::Write;
+        let root = tempfile::tempdir().unwrap().keep();
+        let parent = root.join("action");
+        let retained = root.join("retained-action");
+        let path = parent.join("outcomes.jsonl");
+        let mut journal = DurableJsonlJournal::open(&path).unwrap();
+        journal
+            .append(&[serde_json::json!({"completed": true})])
+            .unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let next = b"{\"next\":true}\n";
+        let replacement = b"{\"replacement\":true}\n";
+        let error = journal
+            .append_bytes_with(
+                next,
+                |mut file, bytes| {
+                    // Replace the path AFTER admission's identity check. The write
+                    // must still reach the pinned original inode, never this file.
+                    std::fs::rename(&parent, &retained)?;
+                    std::fs::create_dir(&parent)?;
+                    std::fs::write(&path, replacement)?;
+                    file.write_all(bytes)
+                },
+                std::fs::File::sync_all,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("directory identity changed"));
+        assert_eq!(std::fs::read(&path).unwrap(), replacement);
+        let retained_bytes = std::fs::read(retained.join("outcomes.jsonl")).unwrap();
+        assert_eq!(retained_bytes, [original.as_slice(), next].concat());
+        assert!(journal
+            .append(&[serde_json::json!({"retry": true})])
+            .is_err());
+        assert_eq!(
+            std::fs::read(retained.join("outcomes.jsonl")).unwrap(),
+            retained_bytes
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), replacement);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_jsonl_failed_write_or_sync_preserves_bytes_and_refuses_retries() {
+        use std::io::Write;
+        for failure in ["write", "file_sync", "directory_sync"] {
+            let root = tempfile::tempdir().unwrap().keep();
+            let path = root.join("outcomes.jsonl");
+            let mut journal = DurableJsonlJournal::open(&path).unwrap();
+            journal
+                .append(&[serde_json::json!({"completed": true})])
+                .unwrap();
+            let original = std::fs::read(&path).unwrap();
+            let checkpoint = b"{\"next\":true}\n";
+            let error = journal
+                .append_bytes_with(
+                    checkpoint,
+                    |mut file, bytes| {
+                        if failure == "write" {
+                            file.write_all(&bytes[..4])?;
+                            Err(std::io::Error::other("injected short write"))
+                        } else {
+                            file.write_all(bytes)
+                        }
+                    },
+                    |file| {
+                        if file.metadata()?.is_dir() == (failure == "directory_sync") {
+                            Err(std::io::Error::other("injected sync failure"))
+                        } else {
+                            file.sync_all()
+                        }
+                    },
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("injected"), "{error}");
+            let bytes = std::fs::read(&path).unwrap();
+            let appended: &[u8] = if failure == "write" {
+                &checkpoint[..4]
+            } else {
+                checkpoint
+            };
+            assert_eq!(bytes, [original.as_slice(), appended].concat());
+            assert!(journal
+                .matches_snapshot(&bytes)
+                .unwrap_err()
+                .to_string()
+                .contains("must not be retried"));
+            let retry = journal
+                .append(&[serde_json::json!({"retry": true})])
+                .unwrap_err();
+            assert!(retry.to_string().contains("must not be retried"));
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+    }
+
     // ── SessionState serde ──────────────────────────────────────────
 
     #[test]
@@ -3188,6 +3876,131 @@ mod tests {
     }
 
     #[test]
+    fn action_history_excludes_lone_and_paired_execution_admissions() {
+        let tmp = tempfile::tempdir().unwrap().keep();
+        let store = make_store(&tmp);
+        let id = SessionId::new();
+        let handle = store
+            .create(&SessionManifest::new(
+                &id,
+                None,
+                SessionMode::RobotApply,
+                None,
+            ))
+            .unwrap();
+        let path = handle.dir.join("action/outcomes.jsonl");
+        let admission = serde_json::json!({
+            "action_id": "admitted", "pid": 42, "status": "execution_started",
+        });
+        let pending = serde_json::json!({
+            "action_id": "interrupted", "pid": 43, "status": "execution_started",
+        });
+        for status in [None, Some("success"), Some("failed")] {
+            let terminal = status.map(|status| {
+                serde_json::json!({
+                    "action_id": "admitted", "pid": 42, "status": status,
+                })
+            });
+            let terminal_line = terminal
+                .as_ref()
+                .map(|record| format!("{record}\n"))
+                .unwrap_or_default();
+            let journal = format!("{admission}\n{terminal_line}{pending}\n");
+            std::fs::write(&path, &journal).unwrap();
+            let expected_count = u64::from(terminal.is_some());
+
+            for limit in [0, 1, 10] {
+                let (entries, count, retained_bytes) = read_action_history_journal(
+                    open_history_file(&path).unwrap(),
+                    &path,
+                    &id,
+                    limit,
+                    terminal_line.len(),
+                    None,
+                )
+                .unwrap();
+                assert_eq!(count, expected_count, "{status:?}");
+                assert_eq!(entries.len(), usize::from(terminal.is_some() && limit > 0));
+                assert_eq!(
+                    retained_bytes,
+                    if limit == 0 { 0 } else { terminal_line.len() }
+                );
+                if let Some(entry) = entries.first() {
+                    assert_eq!(entry.journal_line, 2);
+                    assert_eq!(Some(&entry.outcome), terminal.as_ref());
+                }
+                for scope in [None, Some(&id)] {
+                    let history = store.action_history(scope, limit).unwrap();
+                    assert_eq!(history.total_count, expected_count);
+                    assert_eq!(history.actions.len(), entries.len());
+                    assert_eq!(history.truncated, expected_count > entries.len() as u64);
+                }
+            }
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), journal);
+        }
+
+        // Admission filtering must not conceal a malformed journal, including
+        // when the caller requests no result rows.
+        std::fs::write(
+            &path,
+            "{\"action_id\":\"admitted\",\"pid\":\"invalid\",\"status\":\"execution_started\"}\n",
+        )
+        .unwrap();
+        for limit in [0, 1] {
+            assert!(store
+                .action_history(Some(&id), limit)
+                .unwrap_err()
+                .to_string()
+                .contains("journal line 1"));
+        }
+    }
+
+    #[test]
+    fn action_history_refuses_torn_admission_records_and_preserves_legacy_rows() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let store = make_store(&root);
+        let id = SessionId::new();
+        let handle = store
+            .create(&SessionManifest::new(
+                &id,
+                None,
+                SessionMode::RobotApply,
+                None,
+            ))
+            .unwrap();
+        let path = handle.dir.join("action/outcomes.jsonl");
+        let started = serde_json::json!({
+            "action_id": "owned", "pid": 42, "status": "execution_started",
+        });
+        let terminal = serde_json::json!({
+            "action_id": "owned", "pid": 42, "status": "success",
+        });
+        for (content, uncertain) in [
+            (started.to_string(), true),
+            (format!("{started}\n{terminal}"), true),
+            (terminal.to_string(), false),
+        ] {
+            std::fs::write(&path, &content).unwrap();
+            for scope in [None, Some(&id)] {
+                for limit in [0, 1] {
+                    let result = store.action_history(scope, limit);
+                    if uncertain {
+                        assert!(result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("incomplete final record"));
+                    } else {
+                        let history = result.unwrap();
+                        assert_eq!(history.total_count, 1);
+                        assert_eq!(history.actions.len(), limit);
+                    }
+                }
+            }
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+        }
+    }
+
+    #[test]
     fn action_history_counts_controls_once_and_preserves_parent_timeline() {
         let tmp = tempfile::tempdir().unwrap();
         let store = make_store(tmp.path());
@@ -3207,6 +4020,12 @@ mod tests {
             ))
             .unwrap();
         let controls = [
+            serde_json::json!({
+                "action_id": "pause",
+                "pid": 42,
+                "status": "execution_started",
+                "control_session_id": child_id.0,
+            }),
             serde_json::json!({
                 "action_id": "pause",
                 "pid": 42,
@@ -3259,8 +4078,8 @@ mod tests {
         let timeline = store.action_history(Some(&parent_id), 10).unwrap();
         assert_eq!(timeline.total_count, 3);
         assert_eq!(timeline.actions.len(), 3);
-        assert_eq!(timeline.actions[0].journal_line, 3);
-        assert_eq!(timeline.actions[1].journal_line, 2);
+        assert_eq!(timeline.actions[0].journal_line, 4);
+        assert_eq!(timeline.actions[1].journal_line, 3);
         assert_eq!(timeline.actions[2].journal_line, 1);
         assert!(timeline
             .actions
@@ -3287,6 +4106,7 @@ mod tests {
             "missing_journal",
             "empty_journal",
             "whitespace_journal",
+            "missing_admission",
             "untagged_rows",
             "changed_audit_fields",
             "partial_journal",
@@ -3306,6 +4126,12 @@ mod tests {
                 ))
                 .unwrap();
             let controls = [
+                serde_json::json!({
+                    "action_id": "pause",
+                    "pid": 42,
+                    "status": "execution_started",
+                    "control_session_id": child_id.0,
+                }),
                 serde_json::json!({
                     "action_id": "pause",
                     "pid": 42,
@@ -3346,13 +4172,16 @@ mod tests {
                     .unwrap();
                 let mut child_rows = controls.to_vec();
                 match failure {
+                    "missing_admission" => {
+                        child_rows.remove(0);
+                    }
                     "untagged_rows" => {
                         for row in &mut child_rows {
                             row.as_object_mut().unwrap().remove("control_session_id");
                         }
                     }
                     "changed_audit_fields" => {
-                        child_rows[1]["reason"] = serde_json::json!("different refusal");
+                        child_rows[2]["reason"] = serde_json::json!("different refusal");
                     }
                     "partial_journal" => child_rows.truncate(1),
                     "reordered_rows" => child_rows.reverse(),

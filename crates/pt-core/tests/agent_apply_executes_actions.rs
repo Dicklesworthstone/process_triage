@@ -745,6 +745,40 @@ fn apply_with_args(
     (status, json)
 }
 
+/// A durable admission and its terminal result must describe the same attempt.
+/// Comparing both typed and raw records also keeps internal admission records
+/// distinct from the terminal-only outcomes returned to callers.
+fn assert_execution_pair(started: &impl serde::Serialize, terminal: &impl serde::Serialize) {
+    let started = serde_json::to_value(started).unwrap();
+    let terminal = serde_json::to_value(terminal).unwrap();
+    assert_eq!(started["status"], "execution_started", "{started}");
+    assert!(
+        matches!(terminal["status"].as_str(), Some("success" | "failed")),
+        "an admitted attempt needs an explicit terminal result: {terminal}"
+    );
+    assert!(!started["action"].is_null(), "{started}");
+    assert!(!started["target"].is_null(), "{started}");
+    assert!(!started["executed_at"].is_null(), "{started}");
+    for field in [
+        "action_id",
+        "pid",
+        "action",
+        "target",
+        "supervisor_restart",
+        "command",
+        "parent_pid",
+        "parent_identity",
+        "executed_at",
+        "execution_clock",
+        "resource_run_id",
+    ] {
+        assert_eq!(
+            started[field], terminal[field],
+            "admission and terminal {field} must match: {started}; {terminal}",
+        );
+    }
+}
+
 fn assert_recovery_is_persisted(
     data_dir: &Path,
     session: &str,
@@ -2272,24 +2306,31 @@ finally:
     let wrong_start_id = format!("{}:{wrong_birth}:{pid}", start_parts.next().unwrap());
     for field in ["pid", "start_id", "uid", "executed_at"] {
         let mut altered = saved_outcomes.clone();
-        let saved_success = &mut altered[successful_index];
-        match field {
-            "pid" => {
-                saved_success["pid"] = serde_json::json!(resume_survivor.pid.0);
-                saved_success["target"]["pid"] = serde_json::json!(resume_survivor.pid.0);
+        let future_execution = chrono::Utc::now() + chrono::Duration::days(1);
+        // Keep admission/terminal evidence paired so these cases continue to
+        // exercise canonical target and timestamp validation independently.
+        for saved in altered.iter_mut().filter(|saved| {
+            saved["action_id"] == action.action_id
+                && matches!(
+                    saved["status"].as_str(),
+                    Some("execution_started" | "success")
+                )
+        }) {
+            match field {
+                "pid" => {
+                    saved["pid"] = serde_json::json!(resume_survivor.pid.0);
+                    saved["target"]["pid"] = serde_json::json!(resume_survivor.pid.0);
+                }
+                "start_id" => saved["target"]["start_id"] = serde_json::json!(wrong_start_id),
+                "uid" => {
+                    saved["target"]["uid"] = serde_json::json!(identity.uid.wrapping_add(1));
+                }
+                "executed_at" => saved["executed_at"] = serde_json::json!(future_execution),
+                _ => unreachable!("fixed identity mutation cases"),
             }
-            "start_id" => saved_success["target"]["start_id"] = serde_json::json!(wrong_start_id),
-            "uid" => {
-                saved_success["target"]["uid"] = serde_json::json!(identity.uid.wrapping_add(1));
-            }
-            "executed_at" => {
-                saved_success["executed_at"] =
-                    serde_json::json!(chrono::Utc::now() + chrono::Duration::days(1));
-            }
-            _ => unreachable!("fixed identity mutation cases"),
         }
-        assert_eq!(saved_success["action_id"], action.action_id);
-        assert_eq!(saved_success["status"], "success");
+        assert_eq!(altered[successful_index]["action_id"], action.action_id);
+        assert_eq!(altered[successful_index]["status"], "success");
         let altered_bytes = altered
             .iter()
             .map(|saved| serde_json::to_string(saved).unwrap())
@@ -2317,8 +2358,13 @@ finally:
         );
         let error = String::from_utf8_lossy(&refused.stderr);
         assert!(
-            error.contains("saved execution evidence is invalid for this Plan; refusing --resume")
+            error.contains("refusing uncertain execution replay"),
+            "{error}"
         );
+        let refusal: Value = serde_json::from_slice(&refused.stdout).unwrap();
+        assert_eq!(refusal["error"], "incomplete_execution");
+        assert_eq!(refusal["summary"]["attempted"], 0);
+        assert!(refusal["outcomes"].as_array().unwrap().is_empty());
         if field == "executed_at" {
             assert!(error.contains("invalid execution timestamp"));
             assert!(error.contains(&format!(
@@ -2358,8 +2404,15 @@ finally:
         "{refused:?}"
     );
     let error = String::from_utf8_lossy(&refused.stderr);
-    assert!(error.contains("saved execution evidence is invalid for this Plan; refusing --resume"));
+    assert!(
+        error.contains("refusing uncertain execution replay"),
+        "{error}"
+    );
     assert!(error.contains("invalid saved action outcomes: line "));
+    let refusal: Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(refusal["error"], "incomplete_execution");
+    assert_eq!(refusal["summary"]["attempted"], 0);
+    assert!(refusal["outcomes"].as_array().unwrap().is_empty());
     assert_resume_unchanged(&persisted, &malformed_outcomes);
     fs::write(&outcomes_path, &original_outcomes).unwrap();
     assert_resume_unchanged(&persisted, &original_outcomes);
@@ -4428,14 +4481,14 @@ fn agent_apply_records_and_replays_bound_resource_windows_without_inventing_rate
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(
-        journal.len(),
-        1,
-        "the executed attempt is persisted exactly once"
-    );
-    assert_eq!(journal[0]["resource_run_id"], run_id);
-    assert_eq!(journal[0]["target"], binding["target"]);
-    assert_eq!(journal[0]["execution_clock"], binding["execution_clock"]);
+    assert_eq!(journal.len(), 2, "one admission and one terminal result");
+    assert_execution_pair(&journal[0], &journal[1]);
+    assert_eq!(journal[1]["status"], "success");
+    for record in &journal {
+        assert_eq!(record["resource_run_id"], run_id);
+        assert_eq!(record["target"], binding["target"]);
+        assert_eq!(record["execution_clock"], binding["execution_clock"]);
+    }
 
     let raw_path = action_dir.join("resource_samples.jsonl");
     let raw_bytes = fs::read(&raw_path).expect("raw before/after samples");
@@ -4544,9 +4597,11 @@ fn state_of(pid: u32) -> Option<char> {
 #[cfg(target_os = "linux")]
 #[test]
 fn agent_apply_checkpoints_outcomes_and_stops_on_persistence_failure() {
-    use std::os::unix::fs::symlink;
+    use std::os::unix::{ffi::OsStrExt, fs::symlink};
 
-    for failure in ["none", "flush", "sync", "refusal"] {
+    for failure in [
+        "none", "flush", "sync", "refusal", "hardlink", "fifo", "partial",
+    ] {
         let data_dir = TempDir::new().unwrap().keep();
         let config_dir = TempDir::new().unwrap().keep();
         write_test_policy(&config_dir);
@@ -4564,10 +4619,23 @@ fn agent_apply_checkpoints_outcomes_and_stops_on_persistence_failure() {
             .open(&SessionId::parse(&session).unwrap())
             .unwrap();
         let journal = handle.dir.join("action/outcomes.jsonl");
+        let outside = data_dir.join("outside.jsonl");
+        let sentinel = b"{\"untouched\":true}\n";
+        let manifest_before = fs::read(handle.dir.join("manifest.json")).unwrap();
         match failure {
             "flush" => symlink("/dev/full", &journal).unwrap(),
             "sync" => symlink("/dev/null", &journal).unwrap(),
             "refusal" => fs::create_dir(&journal).unwrap(),
+            "hardlink" => {
+                fs::write(&outside, sentinel).unwrap();
+                fs::hard_link(&outside, &journal).unwrap();
+            }
+            "fifo" => {
+                let name = std::ffi::CString::new(journal.as_os_str().as_bytes()).unwrap();
+                // SAFETY: this is a new FIFO in the owned test session.
+                assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            }
+            "partial" => fs::write(&journal, b"{\"action_id\":").unwrap(),
             _ => {}
         }
         let targets = format!(
@@ -4618,10 +4686,14 @@ fn agent_apply_checkpoints_outcomes_and_stops_on_persistence_failure() {
         });
         assert_eq!(document["summary"]["selected"], 2, "{document}");
         let outcomes = document["outcomes"].as_array().unwrap();
-        assert_eq!(outcomes[0]["action_id"], "checkpoint-first", "{document}");
         assert!(first.alive());
         assert!(later.alive());
         if failure == "none" {
+            assert_eq!(outcomes.len(), 2, "admissions are not response outcomes");
+            assert!(outcomes
+                .iter()
+                .all(|outcome| outcome["status"] == "success"));
+            assert_eq!(outcomes[0]["action_id"], "checkpoint-first", "{document}");
             assert_eq!(output.status.code(), Some(2), "{document}");
             assert_eq!(document["summary"]["attempted"], 2);
             assert_eq!(document["summary"]["not_attempted"], 0);
@@ -4633,51 +4705,162 @@ fn agent_apply_checkpoints_outcomes_and_stops_on_persistence_failure() {
                     .unwrap();
             assert_eq!(
                 saved.len(),
-                2,
-                "finalization must not append checkpoints again"
+                4,
+                "each action needs one admission and one terminal checkpoint"
             );
-            assert_eq!(saved[0].action_id, "checkpoint-first");
-            assert_eq!(saved[1].action_id, "checkpoint-later");
-            assert!(saved.iter().all(|outcome| outcome.status == "success"));
+            for (pair, action_id) in saved
+                .chunks_exact(2)
+                .zip(["checkpoint-first", "checkpoint-later"])
+            {
+                assert_execution_pair(&pair[0], &pair[1]);
+                assert_eq!(pair[0].action_id, action_id);
+                assert_eq!(pair[1].status, "success");
+                assert_eq!(pair[1].action, Some(Action::Pause));
+            }
         } else {
             assert_eq!(output.status.code(), Some(21), "{document}");
-            assert_eq!(outcomes.len(), 1, "later action must not start: {document}");
-            assert_eq!(document["summary"]["attempted"], 1);
-            assert_eq!(document["summary"]["not_attempted"], 1);
+            assert!(
+                outcomes.is_empty(),
+                "no action may precede journal preflight: {document}"
+            );
+            assert_eq!(document["summary"]["attempted"], 0);
+            assert_eq!(document["summary"]["not_attempted"], 2);
+            assert_eq!(document["summary"]["succeeded"], 0);
+            assert_ne!(state_of(first.pid), Some('T'), "first target was mutated");
             assert_ne!(state_of(later.pid), Some('T'), "later target was mutated");
             let error = document["persistence_error"].as_str().unwrap();
-            let operation = match failure {
-                "flush" => "flush action outcomes",
-                "sync" => "sync action outcomes",
-                _ => "open action outcomes",
-            };
-            assert!(error.contains(operation), "{error}");
-            assert_eq!(
-                handle.read_manifest().unwrap().state,
-                pt_core::session::SessionState::Failed,
-            );
-            if failure == "refusal" {
-                assert_eq!(outcomes[0]["status"], "blocked_by_plan");
-                assert_eq!(document["summary"]["succeeded"], 0);
-                assert_ne!(state_of(first.pid), Some('T'));
+            if failure == "partial" {
+                assert!(error.contains("incomplete final record"), "{error}");
             } else {
-                // A persistence error is not a failed pause; retain exact actual
-                // execution evidence while preventing the next mutation.
-                assert_eq!(outcomes[0]["status"], "success");
-                assert_eq!(outcomes[0]["action"], "pause");
-                assert_eq!(document["summary"]["succeeded"], 1);
-                assert_eq!(state_of(first.pid), Some('T'));
-                let target: ProcessIdentity =
-                    serde_json::from_value(outcomes[0]["target"].clone()).unwrap();
-                assert!(target.matches(&first_identity));
+                assert!(error.contains("read action outcomes"), "{error}");
+            }
+            assert_eq!(
+                fs::read(handle.dir.join("manifest.json")).unwrap(),
+                manifest_before,
+                "journal refusal must not begin execution or rewrite session state",
+            );
+            if failure == "hardlink" {
+                assert_eq!(fs::read(&outside).unwrap(), sentinel);
+            }
+            if failure == "partial" {
+                assert_eq!(fs::read(&journal).unwrap(), b"{\"action_id\":");
+            } else {
+                // Both readers run before ordinary append preflight. A FIFO
+                // must be rejected here too, never waited on as a text file.
+                for command in ["resume", "verify"] {
+                    let mut reader = cargo_bin_cmd!("pt-core");
+                    reader
+                        .timeout(Duration::from_secs(30))
+                        .env("PT_SKIP_GLOBAL_LOCK", "1")
+                        .env("PROCESS_TRIAGE_DATA", &data_dir)
+                        .env("PROCESS_TRIAGE_CONFIG", &config_dir)
+                        .env("PROCESS_TRIAGE_RETENTION", "off")
+                        .args(["--format", "json", "agent"]);
+                    if command == "resume" {
+                        reader.args(["apply", "--session", &session, "--resume", "--yes"]);
+                    } else {
+                        reader.args(["verify", "--session", &session]);
+                    }
+                    let refused = reader.output().unwrap();
+                    assert_eq!(
+                        refused.status.code(),
+                        Some(21),
+                        "{failure}/{command}: {refused:?}"
+                    );
+                    assert_ne!(state_of(first.pid), Some('T'));
+                    assert_ne!(state_of(later.pid), Some('T'));
+                }
             }
         }
     }
 }
 
+#[test]
+fn agent_apply_keep_does_not_admit_or_poison_execution_history() {
+    let data_dir = TempDir::new().unwrap().keep();
+    let config_dir = TempDir::new().unwrap().keep();
+    write_test_policy(&config_dir);
+    let victim = ForeignTarget::spawn("sleep 375");
+    let identity = live_identity(victim.pid);
+    let target = format!("{}:{}", victim.pid, identity.start_id.0);
+    let nice_before = nice_of(victim.pid).unwrap();
+    let session = session_with_plan(&data_dir, plan_action(Action::Keep, &identity));
+    let handle = SessionStore::at_data_dir(&data_dir)
+        .open(&SessionId::parse(&session).unwrap())
+        .unwrap();
+    let journal = handle.dir.join("action/outcomes.jsonl");
+
+    for resume in [false, true] {
+        let mut args = vec![
+            "--format",
+            "json",
+            "agent",
+            "apply",
+            "--session",
+            &session,
+            "--targets",
+            &target,
+            "--yes",
+            "--settle",
+            "0",
+        ];
+        if resume {
+            args.push("--resume");
+        }
+        let (code, result) = recorded_action_command(
+            &data_dir,
+            &config_dir,
+            &session,
+            &format!("keep-resume-{resume}"),
+            &args,
+        );
+        assert_eq!(
+            code,
+            Some(pt_core::exit_codes::ExitCode::ActionsOk.as_i32()),
+            "{result}"
+        );
+        assert_eq!(result["outcomes"].as_array().unwrap().len(), 1);
+        assert_eq!(result["outcomes"][0]["status"], "success");
+        assert_eq!(result["outcomes"][0]["action"], "keep");
+        let saved =
+            pt_core::verify::parse_action_outcomes(&fs::read_to_string(&journal).unwrap()).unwrap();
+        assert_eq!(saved.len(), if resume { 2 } else { 1 });
+        assert!(
+            saved
+                .iter()
+                .all(|record| record.status == "success" && record.action == Some(Action::Keep)),
+            "{saved:?}"
+        );
+        assert!(victim.alive());
+        assert_eq!(live_identity(victim.pid), identity);
+        assert_ne!(state_of(victim.pid), Some('T'));
+        assert_eq!(nice_of(victim.pid).unwrap(), nice_before);
+    }
+
+    let before_verify = fs::read(&journal).unwrap();
+    let (code, verified) = recorded_action_command(
+        &data_dir,
+        &config_dir,
+        &session,
+        "keep-verify",
+        &["--format", "json", "agent", "verify", "--session", &session],
+    );
+    assert_eq!(
+        code,
+        Some(pt_core::exit_codes::ExitCode::Clean.as_i32()),
+        "{verified}"
+    );
+    assert!(verified["action_outcomes"].as_array().unwrap().is_empty());
+    assert_eq!(fs::read(&journal).unwrap(), before_verify);
+    assert!(victim.alive());
+    assert_eq!(live_identity(victim.pid), identity);
+    assert_ne!(state_of(victim.pid), Some('T'));
+    assert_eq!(nice_of(victim.pid).unwrap(), nice_before);
+}
+
 #[cfg(target_os = "linux")]
 #[test]
-fn agent_apply_interruption_retains_completed_predecessor_for_resume() {
+fn agent_apply_interruption_preserves_admissions_and_refuses_uncertain_replay() {
     use std::process::Stdio;
 
     struct OwnedApply(Child);
@@ -4772,8 +4955,9 @@ while True:
             .spawn()
             .unwrap(),
     );
-    // The marker proves the second owned action has begun and is waiting through
-    // its SIGTERM grace period. A completed predecessor must already be durable.
+    // The target's marker proves the second owned action has reached the kernel
+    // and is waiting through its SIGTERM grace period. The first action's result
+    // and the second action's admission must already be durable at this point.
     while !term_received.exists() {
         assert!(
             applying.0.try_wait().unwrap().is_none(),
@@ -4815,36 +4999,230 @@ while True:
     fs::write(data_dir.join("interrupted.checkpoint.jsonl"), &checkpoint).unwrap();
     let saved =
         pt_core::verify::parse_action_outcomes(std::str::from_utf8(&checkpoint).unwrap()).unwrap();
-    assert_eq!(saved.len(), 1);
+    assert_eq!(saved.len(), 3, "two admissions and one completed result");
+    assert_execution_pair(&saved[0], &saved[1]);
     assert_eq!(saved[0].action_id, "checkpoint-completed");
-    assert_eq!(saved[0].status, "success");
-    assert_eq!(saved[0].action, Some(Action::Pause));
-    assert!(saved[0].target.as_ref().unwrap().matches(&first_identity));
+    assert_eq!(saved[1].status, "success");
+    assert_eq!(saved[1].action, Some(Action::Pause));
+    assert!(saved[1].target.as_ref().unwrap().matches(&first_identity));
+    assert_eq!(saved[2].action_id, "checkpoint-interrupted");
+    assert_eq!(saved[2].status, "execution_started");
+    assert_eq!(saved[2].action, Some(Action::Kill));
+    assert!(saved[2].target.as_ref().unwrap().matches(&later_identity));
+    assert!(saved[2].executed_at.is_some());
+    assert!(saved[2]
+        .execution_clock
+        .as_ref()
+        .is_some_and(|clock| !clock.boot_id.is_empty() && clock.ticks > 0));
     assert_eq!(
         handle.read_manifest().unwrap().state,
         pt_core::session::SessionState::Executing
     );
 
-    // Resume the known-completed target only. The interrupted syscall-to-outcome
-    // window of the second action is deliberately not claimed to be idempotent.
+    // No selection may hide an unresolved admission, even if it contains only
+    // the completed predecessor or omits --resume. Refusal preserves evidence
+    // and accounting without sending another signal to either owned target.
+    let manifest_before = fs::read(handle.dir.join("manifest.json")).unwrap();
+    let budget_before = fs::read(data_dir.join("rate_limit.json")).ok();
     let first_target = format!("{}:{}", first.pid, first_identity.start_id.0);
-    let (_, resumed) = apply_with_args(
+    for (selection, target) in [
+        ("all", targets.as_str()),
+        ("completed", first_target.as_str()),
+    ] {
+        for resume in [false, true] {
+            let mut replay_args = vec![
+                "--format",
+                "json",
+                "agent",
+                "apply",
+                "--session",
+                &session,
+                "--targets",
+                target,
+                "--yes",
+                "--settle",
+                "0",
+            ];
+            if resume {
+                replay_args.push("--resume");
+            }
+            let (code, refused) = recorded_action_command(
+                &data_dir,
+                &config_dir,
+                &session,
+                &format!("interrupted-{selection}-resume-{resume}"),
+                &replay_args,
+            );
+            assert_eq!(
+                code,
+                Some(pt_core::exit_codes::ExitCode::PolicyBlocked.as_i32()),
+                "{refused}",
+            );
+            assert_eq!(refused["error"], "incomplete_execution", "{refused}");
+            assert_eq!(refused["status"], "blocked");
+            assert_eq!(refused["summary"]["attempted"], 0);
+            assert!(refused["outcomes"].as_array().unwrap().is_empty());
+            assert!(refused["message"]
+                .as_str()
+                .unwrap()
+                .contains("checkpoint-interrupted"));
+            assert_eq!(fs::read(&journal_path).unwrap(), checkpoint);
+            assert_eq!(
+                fs::read(handle.dir.join("manifest.json")).unwrap(),
+                manifest_before
+            );
+            assert_eq!(
+                fs::read(data_dir.join("rate_limit.json")).ok(),
+                budget_before
+            );
+            assert_eq!(state_of(first.pid), Some('T'));
+            assert!(later.alive());
+            assert_eq!(live_identity(later.pid), later_identity);
+        }
+    }
+
+    let (code, verified) = recorded_action_command(
         &data_dir,
         &config_dir,
         &session,
-        &first_target,
-        &["--resume"],
+        "interrupted-verify",
+        &[
+            "--format",
+            "json",
+            "agent",
+            "verify",
+            "--session",
+            &session,
+            "--check-respawn",
+        ],
     );
-    assert_eq!(resumed["note"], "nothing_to_do", "{resumed}");
-    assert_eq!(resumed["summary"]["attempted"], 0);
-    assert!(resumed["outcomes"].as_array().unwrap().is_empty());
     assert_eq!(
-        fs::read(journal_path).unwrap(),
+        code,
+        Some(pt_core::exit_codes::ExitCode::PartialFail.as_i32()),
+        "{verified}"
+    );
+    let outcomes = verified["action_outcomes"].as_array().unwrap();
+    assert_eq!(outcomes.len(), 2);
+    let completed = outcomes
+        .iter()
+        .find(|outcome| outcome["action_id"] == "checkpoint-completed")
+        .unwrap();
+    assert_eq!(completed["outcome"], "confirmed_stopped", "{verified}");
+    assert_eq!(completed["verified"], true);
+    let uncertain = outcomes
+        .iter()
+        .find(|outcome| outcome["action_id"] == "checkpoint-interrupted")
+        .unwrap();
+    assert_eq!(uncertain["outcome"], "execution_uncertain", "{verified}");
+    assert_eq!(uncertain["actual"], "terminal_outcome_missing");
+    assert!(uncertain["verified"].is_null());
+    assert!(uncertain["time_to_death_ms"].is_null());
+    assert!(uncertain["expected_resources_freed"].is_null());
+    assert!(uncertain["respawn_detected"].is_null());
+    assert!(verified["resource_summary"].is_null());
+    assert!(verified["resource_delta"].is_null());
+    assert!(verified["resource_runs"]["reports"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(verified["follow_up_needed"], true);
+    assert_eq!(
+        fs::read(&journal_path).unwrap(),
         checkpoint,
-        "resume must not repeat the predecessor"
+        "verification must not rewrite an uncertain attempt as a terminal result",
+    );
+    assert_eq!(
+        fs::read(data_dir.join("rate_limit.json")).ok(),
+        budget_before
     );
     assert_eq!(state_of(first.pid), Some('T'));
     assert!(later.alive());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn agent_apply_refuses_missing_or_empty_journals_after_execution_begins() {
+    use pt_core::session::SessionState;
+
+    let config_dir = TempDir::new().unwrap().keep();
+    write_test_policy(&config_dir);
+    let victim = ForeignTarget::spawn("sleep 374");
+    let identity = live_identity(victim.pid);
+    let target = format!("{}:{}", victim.pid, identity.start_id.0);
+
+    for historical in [false, true] {
+        for (case, content) in [
+            ("missing", None),
+            ("empty", Some("")),
+            ("blank", Some(" \n\t\n")),
+        ] {
+            let data_dir = TempDir::new().unwrap().keep();
+            let session = session_with_plan(&data_dir, plan_action(Action::Pause, &identity));
+            let handle = SessionStore::at_data_dir(&data_dir)
+                .open(&SessionId::parse(&session).unwrap())
+                .unwrap();
+            handle.update_state(SessionState::Executing).unwrap();
+            if historical {
+                handle.update_state(SessionState::Completed).unwrap();
+            }
+            let journal_path = handle.dir.join("action/outcomes.jsonl");
+            if let Some(content) = content {
+                fs::write(&journal_path, content).unwrap();
+            }
+            let journal_before = fs::read(&journal_path).ok();
+            let manifest_before = fs::read(handle.dir.join("manifest.json")).unwrap();
+            let budget_before = fs::read(data_dir.join("rate_limit.json")).ok();
+            for resume in [false, true] {
+                let mut args = vec![
+                    "--format",
+                    "json",
+                    "agent",
+                    "apply",
+                    "--session",
+                    &session,
+                    "--targets",
+                    &target,
+                    "--yes",
+                    "--settle",
+                    "0",
+                ];
+                if resume {
+                    args.push("--resume");
+                }
+                let (code, refused) = recorded_action_command(
+                    &data_dir,
+                    &config_dir,
+                    &session,
+                    &format!("{case}-historical-{historical}-resume-{resume}"),
+                    &args,
+                );
+                assert_eq!(
+                    code,
+                    Some(pt_core::exit_codes::ExitCode::PolicyBlocked.as_i32()),
+                    "{refused}",
+                );
+                assert_eq!(refused["error"], "incomplete_execution", "{refused}");
+                assert_eq!(refused["summary"]["attempted"], 0);
+                assert!(refused["outcomes"].as_array().unwrap().is_empty());
+                assert!(refused["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("history is missing or empty"));
+                assert_eq!(fs::read(&journal_path).ok(), journal_before);
+                assert_eq!(
+                    fs::read(handle.dir.join("manifest.json")).unwrap(),
+                    manifest_before
+                );
+                assert_eq!(
+                    fs::read(data_dir.join("rate_limit.json")).ok(),
+                    budget_before
+                );
+                assert!(victim.alive());
+                assert_ne!(state_of(victim.pid), Some('T'));
+                assert_eq!(live_identity(victim.pid), identity);
+            }
+        }
+    }
 }
 
 #[test]
@@ -5447,14 +5825,48 @@ fn agent_apply_deadline_preserves_started_grace_and_blocks_later_admission() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(persisted.len(), 3);
-    for (saved, actual) in persisted.iter().zip(outcomes) {
+    assert_eq!(
+        persisted.len(),
+        5,
+        "two admissions and three terminal outcomes"
+    );
+    let terminal: Vec<_> = persisted
+        .iter()
+        .filter(|saved| saved["status"] != "execution_started")
+        .collect();
+    assert_eq!(terminal.len(), 3);
+    for (saved, actual) in terminal.iter().zip(outcomes) {
         assert_eq!(saved["action_id"], actual["action_id"]);
         assert_eq!(saved["status"], actual["status"]);
         assert_eq!(
             saved["kill_signal_delivered"],
             actual["kill_signal_delivered"]
         );
+        let admissions: Vec<_> = persisted
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| {
+                record["status"] == "execution_started"
+                    && record["action_id"] == actual["action_id"]
+            })
+            .collect();
+        if actual["status"] == "success" {
+            assert_eq!(admissions.len(), 1);
+            assert_execution_pair(admissions[0].1, *saved);
+            let terminal_index = persisted
+                .iter()
+                .position(|record| record == *saved)
+                .unwrap();
+            assert!(
+                admissions[0].0 < terminal_index,
+                "admission must precede execution result"
+            );
+        } else {
+            assert!(
+                admissions.is_empty(),
+                "an unadmitted timeout must not claim execution"
+            );
+        }
     }
 }
 
@@ -6176,8 +6588,9 @@ mod live_agent_verify {
         let executions =
             pt_core::verify::parse_action_outcomes(std::str::from_utf8(&saved).unwrap())
                 .expect("typed successful execution evidence");
-        assert_eq!(executions.len(), 1);
-        let executed = executions.into_iter().next().unwrap();
+        assert_eq!(executions.len(), 2, "one admission and one completed kill");
+        assert_execution_pair(&executions[0], &executions[1]);
+        let executed = executions.into_iter().nth(1).unwrap();
         assert_eq!(executed.status, "success");
         assert!(executed.target.as_ref().unwrap().matches(&action.target));
         assert_eq!(executed.command.as_deref(), Some("sleep 1000"));

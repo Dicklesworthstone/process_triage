@@ -101,6 +101,7 @@
       "enum": [
         "confirmed_dead",
         "confirmed_stopped",
+        "execution_uncertain",
         "still_running",
         "respawned",
         "pid_reused",

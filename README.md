@@ -1110,16 +1110,33 @@ filtered out of earlier plans have no recorded samples in those plans.
 
 #### Durable progress and resume
 
-`agent apply` appends and syncs each action outcome, including refusals, before
-starting the next target. An interruption during a later action preserves the
-completed outcomes used by `--resume`. If a checkpoint cannot be persisted,
-apply stops before further actions and retains the actual result in its response;
-`summary.selected`, `attempted`, and `not_attempted` distinguish the selected
-batch from the work reached before stopping.
+`agent apply` prepares and synchronizes its outcome journal before execution.
+The journal must be a regular file with a single hard link and complete JSONL
+records; symlinks, devices, pipes and directories are refused before any selected
+control runs. Apply and the TUI retain the opened file and directory identities
+through execution, so replacement, truncation or unexpected appends stop further
+admissions. Session status, verification, report and bundle readers also refuse
+unsafe journal paths without following links or waiting on a pipe.
 
-There is still a crash window between an operating-system action and recording
-its result. An incomplete action needs inspection before retrying; per-action
-checkpoints do not guarantee exactly-once execution of that interrupted action.
+Immediately before each actual control, `agent apply` and the TUI synchronize an
+`execution_started` record containing its exact action, target and execution
+evidence. A matching terminal outcome then completes that attempt. Completed
+outcomes remain available to `--resume`; admission records are not counted as
+completed actions. If a checkpoint cannot be persisted, apply stops before
+further actions and retains observed results in its response. It never blindly
+retries bytes from a failed write or sync. `summary.selected`, `attempted`, and
+`not_attempted` distinguish the selected batch from work reached before stopping.
+Admission records remain inspectable in session details and the raw journal;
+they do not inflate completed progress or terminal action-query results.
+
+An admission without its matching terminal outcome is explicitly uncertain:
+`agent verify` reports `execution_uncertain`, with no confirmed effect or resource
+credit. Apply refuses to replay that session, with or without `--resume` and even
+when a narrower selection omits the uncertain action. A missing or empty journal
+after a session entered execution also blocks replay. Inspect the live state and
+create a fresh plan before taking further action. This does not promise exactly-once
+execution: an interruption can occur before the operating-system control or after
+it, and current process state cannot establish which happened.
 
 #### Measuring relief after apply
 
