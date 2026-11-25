@@ -354,7 +354,7 @@ fn should_resume_after_sigterm(state: Option<char>, use_group: bool) -> bool {
     cfg!(target_os = "linux") && !use_group && state == Some('T')
 }
 
-/// Fingerprint complete Linux argv bytes for adaptive cleanup. The NUL
+/// Fingerprint complete Linux argv bytes for cleanup authorization. The NUL
 /// separators are part of the digest; ps formatting and UTF-8 conversion must
 /// never merge different programs. Missing, partial or oversized data is unknown.
 pub fn capture_term_command_sha256(
@@ -1261,6 +1261,44 @@ impl SignalActionRunner {
         self.check_identity_now(action)
     }
 
+    /// A process can exec another command without changing its birth identity,
+    /// even while held by a pidfd. Do not carry TERM's authorization across that
+    /// change into a forced kill. Once complete argv was observed, a missing
+    /// recheck is uncertainty, not permission to escalate. Platforms without
+    /// complete argv evidence retain the ordinary identity-bound signal path.
+    #[cfg(unix)]
+    fn prepare_kill_escalation(
+        &self,
+        action: &PlanAction,
+        outcome: &SignalExecutionOutcome,
+    ) -> Result<bool, ActionError> {
+        if SignalExpectation::Exited.satisfied(observe_signal_target(&action.target)?)? {
+            return Ok(false);
+        }
+        if let Some(expected) = &outcome.term_command_sha256 {
+            let current = capture_term_command_sha256(&action.target);
+            if !current.as_ref().is_ok_and(|current| current == expected) {
+                // Exit between the observation and argv read needs no KILL.
+                // In particular a zombie's empty argv is not a changed workload.
+                if SignalExpectation::Exited.satisfied(observe_signal_target(&action.target)?)? {
+                    return Ok(false);
+                }
+                return Err(ActionError::Failed(match current {
+                    Ok(_) => "command changed after SIGTERM; refusing SIGKILL, create a new plan"
+                        .to_string(),
+                    Err(error) => format!(
+                        "command evidence unavailable after SIGTERM; refusing SIGKILL, create a new plan: {error}"
+                    ),
+                }));
+            }
+        }
+        // Command collection and its final identity check are observations, not
+        // an atomic exec lock. Preserve the final birth/owner/group/session check.
+        SignalExpectation::Exited
+            .satisfied(observe_signal_target(&action.target)?)
+            .map(|exited| !exited)
+    }
+
     /// Execute a kill action (SIGTERM → SIGKILL).
     #[cfg(unix)]
     fn execute_kill(&self, action: &PlanAction) -> Result<(), ActionError> {
@@ -1348,7 +1386,7 @@ impl SignalActionRunner {
                 return if self.wait_for_term_or_escalation(action, &deadline, use_group, outcome)? {
                     Ok(())
                 } else {
-                    if !self.original_target_still_present(action)? {
+                    if !self.prepare_kill_escalation(action, outcome)? {
                         return Ok(());
                     }
                     deadline.remaining()?;
@@ -1395,9 +1433,9 @@ impl SignalActionRunner {
             return Ok(());
         }
 
-        // Revalidate all recorded identity fields after the grace period.
+        // Revalidate both the recorded identity and TERM's command after grace.
         // A new occupant or an exited original needs no further signal.
-        if self.original_target_still_present(action)? {
+        if self.prepare_kill_escalation(action, outcome)? {
             deadline.remaining()?;
             self.send_signal(target, libc::SIGKILL, use_group)?;
             outcome.sigkill_delivered = true;
@@ -3230,6 +3268,117 @@ mod tests {
                 .expect("cleanup was joined")
                 .success());
             assert_eq!(std::fs::read_to_string(marker).unwrap(), "handled");
+        }
+
+        #[test]
+        fn forced_kill_refuses_a_changed_command_after_term_without_losing_delivery() {
+            for learned_grace in [false, true] {
+                let dir = tempfile::tempdir().expect("marker directory");
+                let marker = dir.path().join("unused");
+                let (mut child, mut action) = stopped_signal_child(
+                    "trap 'exec sleep 30' TERM\nkill -STOP \"$$\"\nwhile :; do read -r line || :; done",
+                    &marker,
+                    false,
+                );
+                let stat = crate::collect::proc_parsers::read_required_proc_stat(child.0.id())
+                    .expect("owned child identity");
+                action.target.pgid = Some(u32::try_from(stat.pgrp).unwrap());
+                action.target.sid = Some(u32::try_from(stat.session).unwrap());
+                let original =
+                    capture_term_command_sha256(&action.target).expect("complete shell argv");
+                action.timeouts.term_grace_ms = Some(1_000);
+                action.timeouts.execute_ms = 5_000;
+                if learned_grace {
+                    action.timeouts.term_grace_command_sha256 = Some(original.clone());
+                }
+                let runner = SignalActionRunner::new(SignalConfig {
+                    poll_interval_ms: 10,
+                    ..SignalConfig::default()
+                });
+
+                let error = runner
+                    .execute(&action)
+                    .expect_err("changed command must not inherit forced-kill authorization");
+                let message = error.to_string();
+                assert!(message.contains("command changed after SIGTERM"), "{message}");
+                assert!(message.contains("create a new plan"), "{message}");
+                assert!(child.0.try_wait().unwrap().is_none(), "new command survives");
+                assert!(
+                    LiveIdentityProvider::new().revalidate(&action.target).unwrap(),
+                    "exec preserves birth, owner, group and session"
+                );
+                assert_ne!(
+                    capture_term_command_sha256(&action.target).unwrap(),
+                    original,
+                    "the same process now runs a different command"
+                );
+                assert!(
+                    runner.take_kill_signal_delivered(),
+                    "TERM still spends the budget"
+                );
+                let outcome = runner.take_signal_outcome().expect("refusal receipt");
+                assert_eq!(outcome.target.as_ref(), Some(&action.target));
+                assert_eq!(outcome.term_command_sha256.as_ref(), Some(&original));
+                assert_eq!(outcome.sigterm_disposition, SignalDisposition::Caught);
+                assert!(outcome.sigterm_delivered);
+                assert!(outcome.sigcont_delivered);
+                assert!(!outcome.sigkill_delivered);
+                assert_eq!(
+                    outcome.escalation_reason,
+                    Some(SignalEscalationReason::GraceExpired)
+                );
+                assert!(outcome.term_exit_observed_ms.is_none());
+                assert!(outcome.observed_grace_ms.unwrap() >= 1_000);
+
+                // Confirmed exit after refusal needs no further signal, even
+                // though the recorded command can no longer be inspected.
+                child.0.kill().expect("clean up the owned replacement command");
+                child.0.wait().expect("reap the owned child");
+                assert!(!runner.prepare_kill_escalation(&action, &outcome).unwrap());
+            }
+        }
+
+        #[test]
+        fn forced_kill_refuses_unreadable_complete_command_after_term() {
+            let dir = tempfile::tempdir().expect("marker directory");
+            let marker = dir.path().join("unused");
+            let (mut child, mut action) = stopped_signal_child(
+                r#"padding=xxxxxxxx
+while [ "${#padding}" -lt 65536 ]; do padding="${padding}${padding}"; done
+trap 'exec sh -c "read -r line" pt-oversized-argv "$padding"' TERM
+kill -STOP "$$"
+while :; do read -r line || :; done"#,
+                &marker,
+                false,
+            );
+            let original =
+                capture_term_command_sha256(&action.target).expect("complete original argv");
+            action.timeouts.term_grace_ms = Some(1_000);
+            action.timeouts.execute_ms = 5_000;
+            let runner = SignalActionRunner::new(SignalConfig {
+                poll_interval_ms: 10,
+                ..SignalConfig::default()
+            });
+
+            let error = runner
+                .execute(&action)
+                .expect_err("missing complete argv must not authorize forced termination");
+            let message = error.to_string();
+            let expected = "command evidence unavailable after SIGTERM";
+            assert!(message.contains(expected), "{message}");
+            assert!(message.contains("refusing SIGKILL"), "{message}");
+            assert!(child.0.try_wait().unwrap().is_none());
+            let identity = LiveIdentityProvider::new();
+            assert!(identity.revalidate(&action.target).unwrap());
+            let capture_error = capture_term_command_sha256(&action.target).unwrap_err();
+            assert!(capture_error.to_string().contains("65536 bytes"));
+            assert!(runner.take_kill_signal_delivered());
+            let outcome = runner.take_signal_outcome().expect("refusal receipt");
+            assert_eq!(outcome.term_command_sha256.as_ref(), Some(&original));
+            assert!(outcome.sigterm_delivered);
+            assert!(outcome.sigcont_delivered);
+            assert!(!outcome.sigkill_delivered);
+            assert!(outcome.term_exit_observed_ms.is_none());
         }
 
         #[test]
