@@ -11,6 +11,33 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use serde_json::Value;
 use std::time::Duration;
+use tempfile::TempDir;
+
+thread_local! {
+    /// Private pt state for the running test. libtest runs every test on its own
+    /// thread, so all of one test's invocations share this directory, no two
+    /// tests share one, and it is removed when the test ends. Without it, the
+    /// tests used the runner's own pt data directory: parallel tests collided on
+    /// its execution-policy lock (exit 4) and its shadow state, and every run
+    /// left sessions there.
+    static PRIVATE_STATE: TempDir = tempfile::Builder::new()
+        .prefix("pt-automation-mode-")
+        .tempdir()
+        .expect("create private pt state directory");
+}
+
+/// Point every pt data, config and cache location at the test's private state.
+fn isolate(cmd: &mut Command) {
+    PRIVATE_STATE.with(|state| {
+        let root = state.path();
+        cmd.env("PROCESS_TRIAGE_DATA", root.join("data"))
+            .env("PROCESS_TRIAGE_CONFIG", root.join("config"))
+            .env("XDG_DATA_HOME", root.join("xdg-data"))
+            .env("XDG_CONFIG_HOME", root.join("xdg-config"))
+            .env("XDG_CACHE_HOME", root.join("xdg-cache"))
+            .env_remove("PT_CONFIG_DIR");
+    });
+}
 
 /// Predicate for valid `agent plan` exit codes.
 /// Exit code 0 = Clean (no candidates)
@@ -27,6 +54,7 @@ fn pt_core() -> Command {
     cmd.timeout(Duration::from_secs(300));
     // Avoid lock contention when tests run in parallel
     cmd.env("PT_SKIP_GLOBAL_LOCK", "1");
+    isolate(&mut cmd);
     cmd
 }
 

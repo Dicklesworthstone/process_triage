@@ -7,6 +7,17 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use serde_json::Value;
 use std::time::Duration;
+use tempfile::TempDir;
+
+thread_local! {
+    /// Private pt state for the running test (libtest gives each test its own
+    /// thread), removed when the test ends. Keeps the test out of the runner's
+    /// own pt data directory and its execution-policy lock.
+    static PRIVATE_STATE: TempDir = tempfile::Builder::new()
+        .prefix("pt-agent-plan-policy-")
+        .tempdir()
+        .expect("create private pt state directory");
+}
 
 /// Get a Command for pt-core binary with sample-size limit for faster testing.
 fn pt_core_fast() -> Command {
@@ -14,6 +25,15 @@ fn pt_core_fast() -> Command {
     cmd.timeout(Duration::from_secs(120));
     // Avoid lock contention when tests run in parallel
     cmd.env("PT_SKIP_GLOBAL_LOCK", "1");
+    PRIVATE_STATE.with(|state| {
+        let root = state.path();
+        cmd.env("PROCESS_TRIAGE_DATA", root.join("data"))
+            .env("PROCESS_TRIAGE_CONFIG", root.join("config"))
+            .env("XDG_DATA_HOME", root.join("xdg-data"))
+            .env("XDG_CONFIG_HOME", root.join("xdg-config"))
+            .env("XDG_CACHE_HOME", root.join("xdg-cache"))
+            .env_remove("PT_CONFIG_DIR");
+    });
     cmd.args(["--standalone"]);
     cmd
 }
