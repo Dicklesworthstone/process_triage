@@ -13,7 +13,7 @@ chrono = { version = "0.4", features = ["serde"] }
 thiserror.workspace = true
 sha2 = "0.10"
 hex = "0.4"
-dirs = "6"
+dirs = "7"
 hostname = "0.4"
 
 # Internal crates

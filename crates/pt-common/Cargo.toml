@@ -15,7 +15,7 @@ thiserror.workspace = true
 clap = { version = "4.6.9", features = ["derive"] }
 sha2 = "0.10"
 hex = "0.4"
-dirs = "6"
+dirs = "7"
 regex = "1.13.2"
 
 [dev-dependencies]

@@ -27,7 +27,7 @@ toml = "1.2"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 thiserror.workspace = true
-dirs = "6"
+dirs = "7"
 libc = "0.2"
 regex = "1.13.2"
 sha2 = "0.10"
