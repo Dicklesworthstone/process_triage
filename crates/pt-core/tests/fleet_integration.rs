@@ -433,7 +433,10 @@ fn fleet_plan_controls_reach_remote_argv_and_must_be_acknowledged() {
         .into_iter()
         .chain(requested)
         .collect();
-    assert_eq!(arguments, expected, "remote shell must preserve every value");
+    assert_eq!(
+        arguments, expected,
+        "remote shell must preserve every value"
+    );
     let session_dir = result["session_dir"].as_str().unwrap();
     let saved: serde_json::Value = serde_json::from_slice(
         &std::fs::read(std::path::Path::new(session_dir).join("fleet.json")).unwrap(),
@@ -454,12 +457,16 @@ fn fleet_plan_controls_reach_remote_argv_and_must_be_acknowledged() {
     let failed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(failed["scan_summary"]["successful"], 0);
     assert_eq!(failed["scan_summary"]["failed"], 1);
-    assert!(failed["warnings"].as_array().unwrap().iter().any(|warning| {
-        warning
-            .as_str()
-            .unwrap()
-            .contains("did not acknowledge requested --window-ms")
-    }));
+    assert!(failed["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| {
+            warning
+                .as_str()
+                .unwrap()
+                .contains("did not acknowledge requested --window-ms")
+        }));
     assert!(
         failed["fleet_session"]["execution"]["hosts"][0]["selected_targets"]
             .as_array()

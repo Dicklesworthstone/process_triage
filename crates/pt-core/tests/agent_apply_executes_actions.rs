@@ -4709,7 +4709,9 @@ fn agent_apply_checkpoints_outcomes_and_stops_on_persistence_failure() {
                 "each action needs one admission and one terminal checkpoint"
             );
             for (pair, action_id) in saved
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .zip(["checkpoint-first", "checkpoint-later"])
             {
                 assert_execution_pair(&pair[0], &pair[1]);

@@ -3118,7 +3118,11 @@ mod tests {
                     assert_eq!(violation.rule, "guardrails.protected_groups");
                     assert!(violation.message.contains("evidence is unavailable"));
                 }
-                assert!(enforcer.check_action(&candidate, Action::Keep, robot).allowed);
+                assert!(
+                    enforcer
+                        .check_action(&candidate, Action::Keep, robot)
+                        .allowed
+                );
             }
         }
     }
@@ -3160,8 +3164,15 @@ mod tests {
                 PolicyEnforcer::new_with_recorded_policy(current, Some(recorded), None).unwrap();
             let result = enforcer.check_action(&candidate, Action::Kill, false);
             assert!(!result.allowed);
-            assert_eq!(result.violation.unwrap().rule, "guardrails.protected_groups");
-            assert!(enforcer.check_action(&candidate, Action::Keep, false).allowed);
+            assert_eq!(
+                result.violation.unwrap().rule,
+                "guardrails.protected_groups"
+            );
+            assert!(
+                enforcer
+                    .check_action(&candidate, Action::Keep, false)
+                    .allowed
+            );
         }
     }
 

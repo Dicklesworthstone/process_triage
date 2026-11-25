@@ -294,11 +294,13 @@ fn required_protection_metadata(
     protected_users: &HashSet<String>,
     require_owner_name: bool,
 ) -> Result<(String, String, String), PreCheckResult> {
-    let unavailable = |field: &str| PreCheckResult::Blocked {
+    let unavailable = |field: &str| {
+        PreCheckResult::Blocked {
         check: PreCheck::CheckNotProtected,
         reason: format!(
             "protection evidence unavailable for PID {pid}: cannot read complete {field}; refusing to bypass configured protection rules"
         ),
+    }
     };
     let required = |value: Option<String>, field: &str| {
         value
@@ -4145,14 +4147,8 @@ mod tests {
                     uid: 1000,
                     name: Some(name),
                 });
-                let result = required_protection_metadata(
-                    42,
-                    comm,
-                    cmdline,
-                    owner,
-                    &protected_users,
-                    false,
-                );
+                let result =
+                    required_protection_metadata(42, comm, cmdline, owner, &protected_users, false);
                 assert!(matches!(
                     result,
                     Err(PreCheckResult::Blocked { check: PreCheck::CheckNotProtected, reason })
@@ -4243,7 +4239,10 @@ mod tests {
                 ));
             }
         }
-        assert_eq!(metadata(Some("worker"), &["alice"], true).unwrap().2, "worker");
+        assert_eq!(
+            metadata(Some("worker"), &["alice"], true).unwrap().2,
+            "worker"
+        );
         assert!(matches!(
             required_protection_metadata(
                 42,
@@ -8321,7 +8320,9 @@ while True:
         fn live_provider_read_owner_self() {
             let provider = LivePreCheckProvider::with_defaults();
             let pid = std::process::id();
-            let owner = provider.read_owner(pid).expect("read live numeric ownership");
+            let owner = provider
+                .read_owner(pid)
+                .expect("read live numeric ownership");
             // SAFETY: getuid only reads this process's real credentials.
             assert_eq!(owner.uid, unsafe { libc::getuid() });
             assert!(owner

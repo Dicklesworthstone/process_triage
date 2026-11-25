@@ -25,7 +25,7 @@ use pt_core::collect::responsible_units::{
 #[cfg(target_os = "linux")]
 use pt_core::collect::ContainerRuntime;
 use pt_core::config::{
-    get_preset, list_presets, load_config, ConfigError, ConfigOptions, PresetName, Priors,
+    get_preset, list_presets, load_config, ConfigError, ConfigOptions, PresetName,
 };
 #[cfg(feature = "daemon")]
 use pt_core::daemon::escalation::DaemonEscalationResult;
@@ -5383,7 +5383,7 @@ fn append_tui_execution_admission(
     fields.insert("status".into(), serde_json::json!("execution_started"));
     let admission = serde_json::Value::Object(fields);
     let mut destinations: Vec<_> = journals.iter_mut().collect();
-    destinations.sort_by(|(left, _), (right, _)| left.cmp(right));
+    destinations.sort_by_key(|(path, _)| *path);
     for (path, journal) in destinations {
         journal
             .append(std::slice::from_ref(&admission))
@@ -7954,7 +7954,7 @@ mod planning_probe_tests {
     #[cfg(target_os = "linux")]
     fn scorer() -> Scorer {
         Scorer::new(
-            Priors::default(),
+            pt_core::config::Priors::default(),
             Default::default(),
             Default::default(),
             Default::default(),
@@ -25071,7 +25071,7 @@ mod process_tree_safety_tests {
             // Equal observation likelihoods isolate the configured class prior.
             // The candidate is mostly useful-bad, with P(intervention)=0.6;
             // changing display coverage must not authorize its unavailable PID.
-            let mut priors = Priors::default();
+            let mut priors = pt_core::config::Priors::default();
             let neutral = priors.classes.useful.clone();
             priors.classes.useful_bad = neutral.clone();
             priors.classes.abandoned = neutral.clone();
@@ -39234,7 +39234,11 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     let mut outcomes: Vec<serde_json::Value> = Vec::new();
     let action_dir = handle.dir.join("action");
     let mut persistence_error = None;
+    // On Linux every path that checkpoints an outcome assigns the journal
+    // first, so rustc reports the initial `None` as never read. It stays as
+    // the defined value for builds where no assignment is compiled in.
     #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(unused_mut))]
+    #[allow(unused_assignments)]
     let mut outcome_journal = None;
     // All branches, including refusals and early breaks, checkpoint their real
     // outcome before the next target. Keep a failed checkpoint's original result

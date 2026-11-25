@@ -90,8 +90,7 @@ impl RemotePlanOptions {
             (
                 "goal",
                 self.goal.as_deref().is_some_and(|value| {
-                    args["goal"].as_str() != Some(value)
-                        || document["goal"].as_str() != Some(value)
+                    args["goal"].as_str() != Some(value) || document["goal"].as_str() != Some(value)
                 }),
             ),
             (
@@ -910,7 +909,10 @@ pub fn ssh_scan_host(host: &str, config: &SshScanConfig) -> HostScanResult {
     }
 
     let parsed = parse_remote_plan(&output.stdout_str()).and_then(|plan| {
-        let document = plan.document.as_ref().ok_or("remote plan document missing")?;
+        let document = plan
+            .document
+            .as_ref()
+            .ok_or("remote plan document missing")?;
         config.plan_options.validate_response(document)?;
         Ok(plan)
     });
@@ -1251,7 +1253,11 @@ mod tests {
 
     #[test]
     fn remote_planner_controls_reject_invalid_requests_before_ssh() {
-        for goal in ["", "free port 70000", "free 1GB RAM and silently ignore this"] {
+        for goal in [
+            "",
+            "free port 70000",
+            "free 1GB RAM and silently ignore this",
+        ] {
             let config = SshScanConfig {
                 plan_options: RemotePlanOptions {
                     goal: Some(goal.into()),
@@ -1320,7 +1326,10 @@ mod tests {
                 let mut stale = document.clone();
                 stale["args"][field] = value;
                 assert!(
-                    options.validate_response(&stale).unwrap_err().contains(flag),
+                    options
+                        .validate_response(&stale)
+                        .unwrap_err()
+                        .contains(flag),
                     "{field}"
                 );
             }
@@ -1668,7 +1677,8 @@ mod tests {
                         document["candidates"][0]["action_target"].clone();
                 }
                 "weak_identity" => {
-                    let quality = serde_json::to_value(pt_common::IdentityQuality::PidOnly).unwrap();
+                    let quality =
+                        serde_json::to_value(pt_common::IdentityQuality::PidOnly).unwrap();
                     document["candidates"][0]["action_target"]["quality"] = quality.clone();
                     document["actions"][0]["target"]["quality"] = quality;
                 }

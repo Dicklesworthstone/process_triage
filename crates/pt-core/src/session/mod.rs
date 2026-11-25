@@ -2457,7 +2457,7 @@ impl DurableJsonlJournal {
                     .read_at(&mut tail, expected_len - 1)
                     .map_err(|error| session_io(path, error))?
                     != 1
-                    || tail != [b'\n']
+                    || tail != *b"\n"
                 {
                     return Err(session_io(
                         path,
