@@ -11,6 +11,7 @@
 
 pub mod action;
 pub mod agent_init;
+mod atomic_file;
 pub mod audit;
 pub mod calibrate;
 pub mod capabilities;

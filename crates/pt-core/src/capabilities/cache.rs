@@ -4,8 +4,7 @@
 
 use super::detect::{detect_capabilities, Capabilities};
 use serde::{Deserialize, Serialize};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 use thiserror::Error;
@@ -254,21 +253,10 @@ impl CapabilityCache {
         let cached = CachedCapabilities::new(capabilities.clone(), self.host_id.clone());
         let json = serde_json::to_vec_pretty(&cached)?;
 
-        // Write atomically
+        // Write atomically. Concurrent pt processes can refresh the cache at once,
+        // so each stages its bytes under its own temporary name.
         let cache_path = self.cache_path();
-        let tmp_path = cache_path.with_extension("json.tmp");
-
-        {
-            let mut file = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&tmp_path)?;
-            file.write_all(&json)?;
-            file.flush()?;
-        }
-
-        fs::rename(tmp_path, &cache_path)?;
+        crate::atomic_file::replace(&cache_path, &json)?;
 
         debug!(path = %cache_path.display(), "capabilities cached");
         Ok(())

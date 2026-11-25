@@ -393,14 +393,12 @@ impl InboxStore {
             content.push('\n');
         }
 
-        let tmp_path = self.inbox_path.with_extension("tmp");
-        fs::write(&tmp_path, content).map_err(|e| InboxError::Io {
-            path: tmp_path.clone(),
-            source: e,
-        })?;
-        fs::rename(&tmp_path, &self.inbox_path).map_err(|e| InboxError::Io {
-            path: self.inbox_path.clone(),
-            source: e,
+        // Several pt processes can rewrite the inbox; never share a fixed temp name.
+        crate::atomic_file::replace(&self.inbox_path, content.as_bytes()).map_err(|e| {
+            InboxError::Io {
+                path: self.inbox_path.clone(),
+                source: e,
+            }
         })?;
 
         Ok(())

@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const DEFAULT_MISS_THRESHOLD: u32 = 2;
 
@@ -847,7 +847,7 @@ fn load_pending(path: &PathBuf) -> Result<HashMap<String, PendingObservation>, S
 }
 
 fn persist_pending(
-    path: &PathBuf,
+    path: &Path,
     pending: &HashMap<String, PendingObservation>,
 ) -> Result<(), ShadowRecordError> {
     if let Some(parent) = path.parent() {
@@ -856,9 +856,10 @@ fn persist_pending(
     let mut records: Vec<&PendingObservation> = pending.values().collect();
     records.sort_by(|a, b| a.identity_hash.cmp(&b.identity_hash));
     let content = serde_json::to_string_pretty(&records)?;
-    let tmp_path = path.with_extension("tmp");
-    fs::write(&tmp_path, content)?;
-    fs::rename(&tmp_path, path)?;
+    // Concurrent shadow runs share this file. A fixed `pending.tmp` let one run
+    // rename another's half-written file into place, and the other run's rename
+    // then failed with NotFound.
+    crate::atomic_file::replace(path, content.as_bytes())?;
     Ok(())
 }
 
@@ -1927,6 +1928,62 @@ mod tests {
         assert_eq!(records[0].identity_hash, "aaa");
         assert_eq!(records[1].identity_hash, "mmm");
         assert_eq!(records[2].identity_hash, "zzz");
+    }
+
+    #[test]
+    fn concurrent_persists_into_one_directory_all_succeed() {
+        // Regression: concurrent `--shadow` runs shared a fixed `pending.tmp`,
+        // so one run's rename failed with NotFound (exit 21) or published
+        // another run's partial file.
+        const WRITERS: u32 = 6;
+        const ROUNDS: usize = 20;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pending.json");
+        let maps: Vec<HashMap<String, PendingObservation>> = (0..WRITERS)
+            .map(|writer| {
+                (0..200u32)
+                    .map(|index| {
+                        let hash = format!("w{writer}-{index:03}");
+                        let entry = make_pending(&hash, writer * 1000 + index, "sleep");
+                        (hash, entry)
+                    })
+                    .collect()
+            })
+            .collect();
+        let barrier = std::sync::Barrier::new(WRITERS as usize);
+        let (barrier, shared_path) = (&barrier, &path);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = maps
+                .iter()
+                .map(|map| {
+                    scope.spawn(move || {
+                        barrier.wait();
+                        (0..ROUNDS)
+                            .map(|_| {
+                                persist_pending(shared_path, map).map_err(|err| format!("{err:?}"))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            for handle in handles {
+                for result in handle.join().unwrap() {
+                    result.expect("every concurrent persist succeeds");
+                }
+            }
+        });
+        let loaded = load_pending(&path).expect("the final pending file is valid");
+        assert!(
+            maps.iter()
+                .any(|map| loaded.len() == map.len() && map.keys().all(|k| loaded.contains_key(k))),
+            "the final pending file is one writer's complete map"
+        );
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name != "pending.json")
+            .collect();
+        assert!(leftovers.is_empty(), "staged files left: {leftovers:?}");
     }
 
     // ── PendingObservation serde ────────────────────────────────────
