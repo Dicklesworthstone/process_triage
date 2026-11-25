@@ -35042,6 +35042,13 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         None
     };
     let mut shadow_recorded = 0u64;
+    if let Some(ref mut recorder) = shadow_recorder {
+        if let Err(err) = recorder.observe_processes(&scan_result.processes) {
+            eprintln!("shadow mode: failed to observe process presence: {:?}", err);
+            return ExitCode::IoError;
+        }
+        shadow_recorded = recorder.recorded_count();
+    }
 
     // Apply min-age filter before sampling: --min-age, else the policy guardrail
     // (a 0-minute-old compiler at 10% CPU is never an abandonment candidate).
@@ -35769,6 +35776,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             eprintln!("shadow mode: failed to flush storage: {:?}", err);
             return ExitCode::IoError;
         }
+        shadow_recorded = recorder.recorded_count();
     }
 
     // Process-tree safety: never kill a process whose live children are not being

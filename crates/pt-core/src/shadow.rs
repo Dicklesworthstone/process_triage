@@ -213,6 +213,58 @@ impl ShadowRecorder {
         })
     }
 
+    /// Observe process presence before protection, age, PID or sampling filters.
+    /// This records no new predictions. A partial census can establish presence,
+    /// but absence still requires a separate, incarnation-bound live check.
+    /// Call this even when no process will be scored in the current scan.
+    pub fn observe_processes(
+        &mut self,
+        processes: &[ProcessRecord],
+    ) -> Result<(), ShadowRecordError> {
+        self.had_records = true;
+        let by_pid: HashMap<_, _> = processes.iter().map(|proc| (proc.pid.0, proc)).collect();
+        for entry in self.pending.values() {
+            let Some(proc) = by_pid.get(&entry.pid) else {
+                continue;
+            };
+            // A command rewrite, exec or owner change does not end a process
+            // incarnation. Keep its earlier prediction without manufacturing
+            // another prediction from the last recorded belief.
+            let same_birth = entry.identity.as_ref().is_some_and(|identity| {
+                identity.pid == proc.pid && identity.start_id == proc.start_id
+            });
+            let current_hash = self
+                .seen_pids
+                .entry(proc.pid.0)
+                .or_insert_with(|| compute_identity_hash(proc));
+            if same_birth || entry.identity_hash == *current_hash {
+                self.seen_identities.insert(entry.identity_hash.clone());
+            }
+        }
+        for proc in processes {
+            // Exit status may be observable even when the zombie is excluded
+            // from inference. Only follow an already tracked incarnation here;
+            // an unrelated zombie supplies no prediction to calibrate.
+            if proc.state.is_zombie()
+                && self
+                    .latest_pending_by_pid
+                    .get(&proc.pid.0)
+                    .and_then(|hash| self.pending.get(hash))
+                    .and_then(|entry| entry.identity.as_ref())
+                    .is_some_and(|identity| {
+                        identity.matches(&ProcessIdentity::new(
+                            proc.pid.0,
+                            proc.start_id.clone(),
+                            proc.uid,
+                        ))
+                    })
+            {
+                self.record_zombie_exit(proc)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn record_candidate(
         &mut self,
         proc: &ProcessRecord,
@@ -414,6 +466,13 @@ impl ShadowRecorder {
     }
 
     fn record_outcomes_for_missing(&mut self) -> Result<(), ShadowRecordError> {
+        self.record_outcomes_for_missing_with(observed_exit_target_gone)
+    }
+
+    fn record_outcomes_for_missing_with(
+        &mut self,
+        mut target_gone: impl FnMut(&PendingObservation) -> bool,
+    ) -> Result<(), ShadowRecordError> {
         if !self.had_records {
             self.seen_identities.clear();
             self.seen_pids.clear();
@@ -430,6 +489,13 @@ impl ShadowRecorder {
                 continue;
             }
 
+            // Inference only visits selected processes. Missing recommendations
+            // never establish an exit, even after repeated filtered scans. An
+            // unreadable identity is unknown, not a successful absence check.
+            if !target_gone(entry) {
+                entry.miss_count = 0;
+                continue;
+            }
             entry.miss_count = entry.miss_count.saturating_add(1);
             if entry.miss_count >= self.miss_threshold {
                 resolved.push(entry.clone());
@@ -437,18 +503,12 @@ impl ShadowRecorder {
         }
 
         for entry in resolved {
-            // A filtered/incomplete scan is not proof that a previously
-            // observed zombie has been reaped. Keep its deduplication marker
-            // until its full incarnation is actually gone or replaced.
-            if entry.exit_recorded && !observed_exit_target_gone(&entry) {
-                continue;
-            }
-            self.pending.remove(&entry.identity_hash);
-            if self.latest_pending_by_pid.get(&entry.pid) == Some(&entry.identity_hash) {
-                self.latest_pending_by_pid.remove(&entry.pid);
-            }
             if entry.exit_recorded {
                 // Never replace a known wait status with a later "missing".
+                self.pending.remove(&entry.identity_hash);
+                if self.latest_pending_by_pid.get(&entry.pid) == Some(&entry.identity_hash) {
+                    self.latest_pending_by_pid.remove(&entry.pid);
+                }
                 continue;
             }
             let reuse = self
@@ -459,6 +519,7 @@ impl ShadowRecorder {
             let reason = if reuse { "pid_reused" } else { "missing" };
             let details = serde_json::json!({
                 "reason": reason,
+                "source": "verified_identity_absence",
                 "miss_count": entry.miss_count,
                 "last_seen": entry.last_seen.to_rfc3339(),
                 "comm": entry.comm,
@@ -473,12 +534,27 @@ impl ShadowRecorder {
             let observation = Observation {
                 timestamp: now,
                 pid: entry.pid,
-                identity_hash: entry.identity_hash,
+                identity_hash: entry.identity_hash.clone(),
                 state: entry.state,
                 events: vec![event],
-                belief: entry.belief,
+                // An exit is an outcome-only observation. Copying the previous
+                // belief here would turn stale evidence into a fresh prediction.
+                belief: BeliefState {
+                    p_abandoned: 0.0,
+                    p_legitimate: 0.0,
+                    p_zombie: 0.0,
+                    p_useful_but_bad: 0.0,
+                    confidence: 0.0,
+                    score: 0.0,
+                    recommendation: "observed_exit".to_string(),
+                },
             };
             self.storage.record(observation)?;
+            self.recorded = self.recorded.saturating_add(1);
+            self.pending.remove(&entry.identity_hash);
+            if self.latest_pending_by_pid.get(&entry.pid) == Some(&entry.identity_hash) {
+                self.latest_pending_by_pid.remove(&entry.pid);
+            }
         }
 
         self.seen_identities.clear();
@@ -620,6 +696,9 @@ fn observed_exit_target_gone(entry: &PendingObservation) -> bool {
     let Some(identity) = &entry.identity else {
         return false;
     };
+    if crate::action::signal::ensure_action_pid_namespace().is_err() {
+        return false;
+    }
     let Ok(boot_id) = fs::read_to_string("/proc/sys/kernel/random/boot_id") else {
         return false;
     };
@@ -653,7 +732,7 @@ fn observed_exit_target_gone_with(
     read_birth: impl FnOnce(u32) -> Result<u64, crate::collect::proc_parsers::StatReadError>,
     probe_absent: impl FnOnce(u32) -> bool,
 ) -> bool {
-    if current_boot.is_empty() || current_boot == "unknown" {
+    if !identity.can_safely_revalidate() || current_boot.is_empty() || current_boot == "unknown" {
         return false;
     }
     let Some(recorded_boot) = identity.start_id.0.split(':').next() else {
@@ -667,7 +746,7 @@ fn observed_exit_target_gone_with(
         return true;
     }
     match read_birth(identity.pid.0) {
-        Ok(current_ticks) => current_ticks != ticks,
+        Ok(current_ticks) => current_ticks > 0 && current_ticks != ticks,
         Err(crate::collect::proc_parsers::StatReadError::Read { source, .. }) => {
             // hidepid and changing procfs visibility can also produce ENOENT.
             // Only an independent ESRCH permits retiring the terminal marker.
@@ -867,7 +946,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_entries_emit_exit_event() {
+    fn verified_missing_entries_emit_exit_event() {
         let _guard = ENV_LOCK.lock().unwrap();
         let temp_dir = TempDir::new().expect("temp dir");
         let old_env = std::env::var("PROCESS_TRIAGE_DATA").ok();
@@ -893,7 +972,7 @@ mod tests {
         );
 
         recorder
-            .record_outcomes_for_missing()
+            .record_outcomes_for_missing_with(|_| true)
             .expect("record outcomes");
 
         let events = recorder.storage.get_events(
@@ -1013,6 +1092,88 @@ mod tests {
             identity: None,
             exit_recorded: false,
         }
+    }
+
+    #[test]
+    fn unscored_presence_survives_restart_command_and_owner_changes() {
+        let directory = TempDir::new().unwrap();
+        let config = ShadowStorageConfig {
+            base_dir: directory.path().to_path_buf(),
+            auto_compact: false,
+            delete_expired: false,
+            ..Default::default()
+        };
+        let mut proc = make_proc(42, "worker", "worker --first-job");
+        let hash = compute_identity_hash(&proc);
+        let mut recorder = ShadowRecorder::with_config(config.clone()).unwrap();
+        let ledger = make_ledger(Confidence::Medium, vec![], vec![], "earlier prediction");
+        recorder
+            .record_candidate(
+                &proc,
+                &ledger.posterior.posterior,
+                &ledger,
+                &make_decision(Action::Keep),
+            )
+            .unwrap();
+        recorder.flush().unwrap();
+        drop(recorder);
+
+        proc.comm = "another-worker".to_string();
+        proc.cmd = "another-worker --second-job".to_string();
+        proc.uid = 1001;
+        assert_ne!(compute_identity_hash(&proc), hash);
+        for _ in 0..3 {
+            let mut recorder = ShadowRecorder::with_config(config.clone()).unwrap();
+            recorder
+                .observe_processes(std::slice::from_ref(&proc))
+                .unwrap();
+            recorder
+                .record_outcomes_for_missing_with(|_| panic!("the incarnation was observed"))
+                .unwrap();
+            recorder.flush().unwrap();
+            assert_eq!(recorder.pending.len(), 1);
+            assert_eq!(recorder.pending[&hash].miss_count, 0);
+            assert_eq!(recorder.pending[&hash].comm, "worker");
+            assert_eq!(recorder.recorded_count(), 0);
+        }
+    }
+
+    #[test]
+    fn incomplete_or_unreadable_presence_cannot_accumulate_exit_misses() {
+        let directory = TempDir::new().unwrap();
+        let config = ShadowStorageConfig {
+            base_dir: directory.path().to_path_buf(),
+            auto_compact: false,
+            delete_expired: false,
+            ..Default::default()
+        };
+        let mut recorder = ShadowRecorder::with_config(config).unwrap();
+        let mut pending = make_pending("unseen", 42, "worker");
+        pending.miss_count = 1;
+        recorder
+            .pending
+            .insert(pending.identity_hash.clone(), pending);
+
+        // Legacy records without birth identity remain unknown, even after
+        // successful planner runs that have no eligible candidates.
+        for _ in 0..3 {
+            recorder.observe_processes(&[]).unwrap();
+            recorder.flush().unwrap();
+            assert_eq!(recorder.pending["unseen"].miss_count, 0);
+            assert_eq!(recorder.recorded_count(), 0);
+        }
+        recorder.pending.get_mut("unseen").unwrap().identity = Some(ProcessIdentity::new(
+            42,
+            pt_common::StartId::from_linux("boot", 5, 42),
+            1000,
+        ));
+        // An unreadable check interrupts two otherwise positive checks.
+        for (gone, expected_misses) in [(true, 1), (false, 0), (true, 1)] {
+            recorder.observe_processes(&[]).unwrap();
+            recorder.record_outcomes_for_missing_with(|_| gone).unwrap();
+            assert_eq!(recorder.pending["unseen"].miss_count, expected_misses);
+        }
+        assert_eq!(recorder.recorded_count(), 0);
     }
 
     #[cfg(target_os = "linux")]
@@ -1146,6 +1307,12 @@ mod tests {
             |_| Ok(5),
             |_| true
         ));
+        assert!(!observed_exit_target_gone_with(
+            &identity,
+            "boot",
+            |_| Ok(0),
+            |_| true
+        ));
         assert!(observed_exit_target_gone_with(
             &identity,
             "boot",
@@ -1174,6 +1341,31 @@ mod tests {
             missing,
             |_| true
         ));
+        let mut weak = identity;
+        weak.quality = pt_common::IdentityQuality::PidOnly;
+        assert!(!observed_exit_target_gone_with(
+            &weak,
+            "boot",
+            |_| Ok(6),
+            |_| true
+        ));
+        for start in [
+            "garbage",
+            "boot:0:42",
+            "boot:5:43",
+            "boot:5:42:extra",
+            "unknown:5:42",
+        ] {
+            let malformed = ProcessIdentity::new(42, pt_common::StartId(start.into()), 1000);
+            for boot in ["boot", "new-boot"] {
+                assert!(!observed_exit_target_gone_with(
+                    &malformed,
+                    boot,
+                    |_| panic!("invalid saved identity must not reach the live probe"),
+                    |_| true
+                ));
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -1338,6 +1530,14 @@ mod tests {
             proc.state = crate::collect::ProcessState::Zombie;
             proc.cmd.clear();
             assert_ne!(compute_identity_hash(&proc), identity_hash);
+            recorder
+                .observe_processes(std::slice::from_ref(&proc))
+                .unwrap();
+            assert_eq!(
+                recorder.recorded_count(),
+                2,
+                "unfiltered presence records the exit before candidate selection"
+            );
             recorder
                 .record_candidate(&proc, &posterior, &ledger, &decision)
                 .unwrap();
@@ -1986,7 +2186,7 @@ mod tests {
         // But pid 42 now has a different identity (pid reuse)
         recorder.seen_pids.insert(42, "new_hash".to_string());
 
-        recorder.record_outcomes_for_missing().unwrap();
+        recorder.record_outcomes_for_missing_with(|_| true).unwrap();
 
         // old_hash should be removed from pending (resolved with pid_reused reason)
         assert!(!recorder.pending.contains_key("old_hash"));

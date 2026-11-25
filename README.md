@@ -1978,6 +1978,8 @@ before computing metrics; see [the shadow calibration tutorial](docs/tutorials/0
 
 Shadow reports also break calibration down by the signature category recorded with each prediction. Each category shows kill/spare label counts, unlabeled outcomes, and pending predictions. With at least five independent labels of each class **in that category**, it gains ECE, Brier score, log loss, AUC-ROC, and reliability-curve bins in JSON and the text report. Categories with fewer labels remain explicitly uncalibrated even when the pooled report has enough data. Older predictions without recorded signature metadata stay in `unknown`; a later verdict cannot supply or change the prediction's category or host. These diagnostics do not automatically fit new four-class priors from binary verdicts.
 
+Shadow tracking retains processes that are excluded by PID, age, protection or sampling filters. It uses the full scan to establish continued presence, without copying an old belief into a new prediction. On Linux, an unseen process becomes an unlabeled departure only after repeated checks confirm that its original birth identity is gone; unreadable, weak or unsupported identity evidence stays pending. Empty candidate sets still check tracked processes, and observed zombie exits keep their original prediction identity.
+
 Each verdict is stored at three specificity levels:
 
 | Level | What's Preserved | Example |

@@ -856,6 +856,154 @@ fn shadow_observer_uses_explicit_config_and_accepts_plan_ready() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn shadow_filtered_empty_plans_preserve_live_trajectories_and_confirm_exits() {
+    use pt_telemetry::shadow::{EventType, Observation};
+    use std::process::{Child, Command as ProcessCommand, Stdio};
+
+    struct OwnedChild(Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let dir = tempdir().unwrap();
+    let config = dir.path().join("config");
+    let data = dir.path().join("data");
+    write_observer_policy(&config);
+    let spawn = || {
+        OwnedChild(
+            ProcessCommand::new("sh")
+                .args(["-c", "read ignored"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        )
+    };
+    let mut child = spawn();
+    let mut other = spawn();
+    let pid = child.0.id().to_string();
+    let other_pid = other.0.id().to_string();
+    let plan = |selected_pid: &str, sample: Option<&str>| {
+        let mut cmd = pt_core();
+        cmd.env("PROCESS_TRIAGE_DATA", &data)
+            .env("PROCESS_TRIAGE_RETENTION", "off")
+            .arg("--config")
+            .arg(&config)
+            .args([
+                "--format",
+                "json",
+                "--shadow",
+                "agent",
+                "plan",
+                "--pids",
+                selected_pid,
+                "--min-age",
+                "0",
+                "--min-posterior",
+                "0",
+                "--window-ms",
+                "0",
+                "--probe-budget-ms",
+                "0",
+            ]);
+        if let Some(sample) = sample {
+            cmd.args(["--sample-size", sample]);
+        }
+        cmd.assert().code(if sample == Some("0") { 0 } else { 1 });
+    };
+    plan(&pid, None);
+    let pending_path = data.join("shadow/pending.json");
+    let pending =
+        || -> Vec<Value> { serde_json::from_slice(&fs::read(&pending_path).unwrap()).unwrap() };
+    let initial = pending();
+    assert_eq!(initial.len(), 1);
+    let hash = initial[0]["identity_hash"].clone();
+
+    // Each invocation reopens persisted state. The first child stays in the
+    // census while a PID filter directs all inference to the other child.
+    for _ in 0..3 {
+        plan(&other_pid, None);
+        assert!(child.0.try_wait().unwrap().is_none());
+        let records = pending();
+        assert_eq!(records.len(), 2);
+        let original = records
+            .iter()
+            .find(|record| record["identity_hash"] == hash)
+            .unwrap();
+        assert_eq!(original["miss_count"], 0);
+        assert_eq!(original["exit_recorded"], false);
+    }
+
+    // EOF lets this owned child finish; wait reaps it before any subsequent
+    // scan, so no zombie wait status can explain the observed disappearance.
+    drop(child.0.stdin.take());
+    child.0.wait().unwrap();
+    plan(&other_pid, Some("0"));
+    let records = pending();
+    let original = records
+        .iter()
+        .find(|record| record["identity_hash"] == hash)
+        .unwrap();
+    assert_eq!(original["miss_count"], 1);
+    plan(&other_pid, Some("0"));
+    let records = pending();
+    assert_eq!(records.len(), 1);
+    assert_ne!(records[0]["identity_hash"], hash);
+    assert!(other.0.try_wait().unwrap().is_none());
+
+    let output = pt_core()
+        .env("PROCESS_TRIAGE_DATA", &data)
+        .args(["--format", "json", "shadow", "export"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let observations: Vec<Observation> = serde_json::from_slice(&output).unwrap();
+    assert_eq!(
+        observations.len(),
+        5,
+        "four scored observations and one true departure"
+    );
+    let exits: Vec<_> = observations
+        .iter()
+        .filter(|observation| {
+            observation
+                .events
+                .iter()
+                .any(|event| event.event_type == EventType::ProcessExit)
+        })
+        .collect();
+    assert_eq!(exits.len(), 1);
+    let exit = exits[0];
+    assert_eq!(serde_json::json!(exit.identity_hash), hash);
+    assert_eq!(exit.belief.recommendation, "observed_exit");
+    assert_eq!(exit.belief.p_abandoned, 0.0);
+    assert_eq!(exit.belief.p_legitimate, 0.0);
+
+    let output = pt_core()
+        .env("PROCESS_TRIAGE_DATA", &data)
+        .args(["--format", "json", "shadow", "report"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(report["total_predictions"], 2);
+    assert_eq!(report["pending_predictions"], 1);
+    assert_eq!(report["unlabeled_outcomes"], 1);
+    assert_eq!(report["positive_labels"], 0);
+    assert_eq!(report["negative_labels"], 0);
+    assert!(report["metrics"].is_null());
+}
+
 #[test]
 fn shadow_observer_reports_failed_iterations_and_returns_failure() {
     let dir = tempdir().expect("tempdir");
