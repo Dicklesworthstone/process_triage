@@ -2565,7 +2565,12 @@ _arguments "${_arguments_options[@]}" : \
 '--parallel=[Max concurrent host connections]:PARALLEL:_default' \
 '--timeout=[Per-host timeout (seconds) for the remote \`agent plan\`]:TIMEOUT:_default' \
 '--remote-binary=[Remote pt-core command (default\: \`pt-core\` on the host'\''s PATH)]:REMOTE_BINARY:_default' \
-'--host-profile=[Apply host-group priors]:HOST_PROFILE:_default' \
+'--goal=[Resource goal applied independently on each host (not a fleet-wide total)]:GOAL:_default' \
+'--min-age=[Override the minimum process age on each host (seconds)]:MIN_AGE:_default' \
+'--min-posterior=[Override the candidate posterior threshold on each host]:MIN_POSTERIOR:_default' \
+'--window-ms=[Override each host'\''s activity sampling window in milliseconds]:WINDOW_MS:_default' \
+'--max-candidates=[Override the maximum number of candidates returned by each host]:MAX_CANDIDATES:_default' \
+'--host-profile=[Unsupported\: configure priors on each host instead]:HOST_PROFILE:_default' \
 '--label=[Optional label for the fleet session]:LABEL:_default' \
 '--max-fdr=[Fleet-wide max FDR budget]:MAX_FDR:_default' \
 '--capabilities=[Path to capabilities manifest (from pt wrapper)]:CAPABILITIES:_default' \
@@ -4411,7 +4416,12 @@ _arguments "${_arguments_options[@]}" : \
 '--parallel=[Max concurrent host connections]:PARALLEL:_default' \
 '--timeout=[Per-host timeout (seconds) for the remote \`agent plan\`]:TIMEOUT:_default' \
 '--remote-binary=[Remote pt-core command (default\: \`pt-core\` on the host'\''s PATH)]:REMOTE_BINARY:_default' \
-'--host-profile=[Apply host-group priors]:HOST_PROFILE:_default' \
+'--goal=[Resource goal applied independently on each host (not a fleet-wide total)]:GOAL:_default' \
+'--min-age=[Override the minimum process age on each host (seconds)]:MIN_AGE:_default' \
+'--min-posterior=[Override the candidate posterior threshold on each host]:MIN_POSTERIOR:_default' \
+'--window-ms=[Override each host'\''s activity sampling window in milliseconds]:WINDOW_MS:_default' \
+'--max-candidates=[Override the maximum number of candidates returned by each host]:MAX_CANDIDATES:_default' \
+'--host-profile=[Unsupported\: configure priors on each host instead]:HOST_PROFILE:_default' \
 '--label=[Optional label for the fleet session]:LABEL:_default' \
 '--max-fdr=[Fleet-wide max FDR budget]:MAX_FDR:_default' \
 '--capabilities=[Path to capabilities manifest (from pt wrapper)]:CAPABILITIES:_default' \
@@ -6564,7 +6574,7 @@ prose\:"Structured natural language for agent-to-user communication"))' \
 '--timeout=[Abort if operation exceeds time limit (seconds)]:TIMEOUT:_default' \
 '--fields=[Select specific output fields (comma-separated or preset\: minimal, standard, full)]:FIELDS:_default' \
 '--max-tokens=[Maximum token budget for output (enables truncation with continuation)]:TOKENS:_default' \
-'--user-only[Only show user-defined signatures]' \
+'--user-only[Only show user-managed signatures (including learned and imported)]' \
 '--builtin-only[Only show built-in signatures]' \
 '*-v[Increase verbosity (-v, -vv, -vvv)]' \
 '*--verbose[Increase verbosity (-v, -vv, -vvv)]' \
@@ -6839,7 +6849,7 @@ prose\:"Structured natural language for agent-to-user communication"))' \
 '--timeout=[Abort if operation exceeds time limit (seconds)]:TIMEOUT:_default' \
 '--fields=[Select specific output fields (comma-separated or preset\: minimal, standard, full)]:FIELDS:_default' \
 '--max-tokens=[Maximum token budget for output (enables truncation with continuation)]:TOKENS:_default' \
-'--user-only[Only export user signatures]' \
+'--user-only[Only export user-managed signatures (including learned and imported)]' \
 '*-v[Increase verbosity (-v, -vv, -vvv)]' \
 '*--verbose[Increase verbosity (-v, -vv, -vvv)]' \
 '-q[Decrease verbosity (quiet mode)]' \
@@ -9527,13 +9537,13 @@ _pt-core__subcmd__help__subcmd__shadow__subcmd__stop_commands() {
 (( $+functions[_pt-core__subcmd__help__subcmd__signature_commands] )) ||
 _pt-core__subcmd__help__subcmd__signature_commands() {
     local commands; commands=(
-'list:List all signatures (built-in and user-defined)' \
+'list:List effective built-in, learned, custom, and user signatures' \
 'show:Show details of a specific signature' \
 'add:Add a new user signature' \
 'remove:Remove a user signature' \
 'test:Test if a process name matches any signature' \
-'validate:Validate user signatures file' \
-'export:Export signatures to a file' \
+'validate:Validate all configured signature sources and disabled-pattern state' \
+'export:Export active effective signatures to a file' \
 'disable:Disable a signature without deleting it' \
 'enable:Re-enable a previously disabled signature' \
 'import:Import signatures from a file or .ptb bundle' \
@@ -9963,13 +9973,13 @@ _pt-core__subcmd__shadow__subcmd__stop_commands() {
 (( $+functions[_pt-core__subcmd__signature_commands] )) ||
 _pt-core__subcmd__signature_commands() {
     local commands; commands=(
-'list:List all signatures (built-in and user-defined)' \
+'list:List effective built-in, learned, custom, and user signatures' \
 'show:Show details of a specific signature' \
 'add:Add a new user signature' \
 'remove:Remove a user signature' \
 'test:Test if a process name matches any signature' \
-'validate:Validate user signatures file' \
-'export:Export signatures to a file' \
+'validate:Validate all configured signature sources and disabled-pattern state' \
+'export:Export active effective signatures to a file' \
 'disable:Disable a signature without deleting it' \
 'enable:Re-enable a previously disabled signature' \
 'import:Import signatures from a file or .ptb bundle' \
@@ -10001,13 +10011,13 @@ _pt-core__subcmd__signature__subcmd__export_commands() {
 (( $+functions[_pt-core__subcmd__signature__subcmd__help_commands] )) ||
 _pt-core__subcmd__signature__subcmd__help_commands() {
     local commands; commands=(
-'list:List all signatures (built-in and user-defined)' \
+'list:List effective built-in, learned, custom, and user signatures' \
 'show:Show details of a specific signature' \
 'add:Add a new user signature' \
 'remove:Remove a user signature' \
 'test:Test if a process name matches any signature' \
-'validate:Validate user signatures file' \
-'export:Export signatures to a file' \
+'validate:Validate all configured signature sources and disabled-pattern state' \
+'export:Export active effective signatures to a file' \
 'disable:Disable a signature without deleting it' \
 'enable:Re-enable a previously disabled signature' \
 'import:Import signatures from a file or .ptb bundle' \

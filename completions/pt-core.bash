@@ -2031,7 +2031,7 @@ _pt__core() {
             return 0
             ;;
         pt__subcmd__core__subcmd__agent__subcmd__fleet__subcmd__plan)
-            opts="-f -v -q -h -V --hosts --inventory --discovery-config --ssh-config --host-filter --parallel --timeout --remote-binary --continue-on-error --host-profile --label --max-fdr --capabilities --config --format --verbose --quiet --no-color --robot --shadow --dry-run --standalone --fields --compact --max-tokens --estimate-tokens --help --version"
+            opts="-f -v -q -h -V --hosts --inventory --discovery-config --ssh-config --host-filter --parallel --timeout --remote-binary --continue-on-error --goal --min-age --min-posterior --window-ms --max-candidates --host-profile --label --max-fdr --capabilities --config --format --verbose --quiet --no-color --robot --shadow --dry-run --standalone --fields --compact --max-tokens --estimate-tokens --help --version"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2066,6 +2066,26 @@ _pt__core() {
                     return 0
                     ;;
                 --remote-binary)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --goal)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --min-age)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --min-posterior)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --window-ms)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --max-candidates)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
