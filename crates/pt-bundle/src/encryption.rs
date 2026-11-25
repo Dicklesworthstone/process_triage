@@ -7,7 +7,6 @@ use crate::{BundleError, Result};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use pbkdf2::pbkdf2_hmac;
-use rand_core::{OsRng, RngCore};
 use sha2::Sha256;
 
 const MAGIC: &[u8; 8] = b"PTBENC01";
@@ -72,13 +71,13 @@ pub fn encrypt_bytes(plaintext: &[u8], passphrase: &str) -> Result<Vec<u8>> {
 
     let mut salt = [0u8; SALT_LEN];
     let mut nonce = [0u8; NONCE_LEN];
-    OsRng.fill_bytes(&mut salt);
-    OsRng.fill_bytes(&mut nonce);
+    getrandom::fill(&mut salt).map_err(|_| BundleError::EncryptionFailed)?;
+    getrandom::fill(&mut nonce).map_err(|_| BundleError::EncryptionFailed)?;
 
     let key = derive_key(passphrase, &salt, KDF_ITERS);
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+    let cipher = ChaCha20Poly1305::new(&Key::from(key));
     let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce), plaintext)
+        .encrypt(&Nonce::from(nonce), plaintext)
         .map_err(|_| BundleError::EncryptionFailed)?;
 
     let mut output = Vec::with_capacity(HEADER_LEN + ciphertext.len());
@@ -104,9 +103,9 @@ pub fn decrypt_bytes(bytes: &[u8], passphrase: &str) -> Result<Vec<u8>> {
     }
 
     let key = derive_key(passphrase, &salt, iterations);
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+    let cipher = ChaCha20Poly1305::new(&Key::from(key));
     cipher
-        .decrypt(Nonce::from_slice(&nonce), ciphertext)
+        .decrypt(&Nonce::from(nonce), ciphertext)
         .map_err(|_| BundleError::DecryptionFailed)
 }
 
@@ -131,6 +130,27 @@ mod tests {
 
         let result = decrypt_bytes(&encrypted, "bad");
         assert!(matches!(result, Err(BundleError::DecryptionFailed)));
+    }
+
+    #[test]
+    fn test_decrypts_independently_produced_envelope() {
+        // Bundles written by earlier releases must keep decrypting. This
+        // envelope was built outside pt (Python hashlib PBKDF2-HMAC-SHA256 and
+        // the `cryptography` ChaCha20-Poly1305) with the documented layout:
+        // magic, iterations (u32 BE, 1000 here), salt 00..0f, nonce 64..6f,
+        // ciphertext with tag.
+        let envelope = hex::decode(
+            "505442454e433031000003e8000102030405060708090a0b0c0d0e0f\
+             6465666768696a6b6c6d6e6fe29aea9d9ddc80517e3f7b72e6d07e7e\
+             92478b69371352c832434edc1d2d2f8d731e8c39b4687be94370df0c39fa",
+        )
+        .unwrap();
+        let decrypted = decrypt_bytes(&envelope, "correct horse battery staple").unwrap();
+        assert_eq!(decrypted, b"pt-bundle known-answer payload");
+        assert!(matches!(
+            decrypt_bytes(&envelope, "wrong passphrase"),
+            Err(BundleError::DecryptionFailed)
+        ));
     }
 
     #[test]
