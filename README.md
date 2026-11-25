@@ -1269,6 +1269,10 @@ pt-core agent fleet plan --inventory hosts.toml --parallel 10
 # Or list hosts directly; kills pooled across hosts within an expected FDR of 5%
 pt-core agent fleet plan --hosts host-a,host-b,host-c --max-fdr 0.05
 
+# Ask each host to free the same port using its own policy and live evidence
+pt-core agent fleet plan --hosts host-a,host-b --goal 'free port 8080' \
+  --min-age 3600 --min-posterior 0.9 --window-ms 1000 --max-candidates 50
+
 # Inspect the saved selection locally; this starts no SSH command
 pt-core agent fleet apply --session pt-YYYYMMDD-HHMMSS-xxxx
 
@@ -1287,6 +1291,10 @@ pt-core --dry-run agent fleet apply --session pt-YYYYMMDD-HHMMSS-xxxx --confirm
 Inspections use four concurrent SSH slots by default (`--parallel 1..32`), a 60-second per-host command deadline (`--timeout`), and a separate 10-second connection deadline (`--connect-timeout`). A finished host immediately frees its slot. Three consecutive failed inspections stop new connections by default; `--max-consecutive-failures 0` disables that limit. Already-running inspections are retained, skipped hosts remain in the result, and no host is retried automatically. Doctor's exit code 1 means findings that need attention when its report agrees; it is not treated as an SSH failure. Missing, malformed, timed-out, or truncated observations remain explicitly unavailable. Results put critical and warning hosts first and report coverage and remote version differences; a quiet partial health snapshot or static doctor audit does not establish complete host health.
 
 SSH discovery enumerates concrete `Host` aliases and reads bounded `Include` files; wildcard-only `Host` rules do not create destinations. It never runs `Match exec` or another command during discovery. Conditional includes that cannot be resolved safely are reported as errors. Connections use each original alias with `ssh -F` and the selected config, leaving `HostName`, `User`, `Port`, `ProxyJump`, and credentials to OpenSSH. The absolute config path is retained in the fleet session for apply. Any SSH option tags shown in the inventory are informational observations; conditional SSH settings remain OpenSSH's responsibility.
+
+Fleet planning forwards explicit `--goal`, `--min-age`, `--min-posterior`, `--window-ms`, and `--max-candidates` values to each remote planner. Omitted controls keep that host's defaults. A goal applies independently to every selected host: `free 1GB RAM` requests 1 GiB per host, and a disk path is interpreted on each remote filesystem. The requested controls are validated before connecting and must be acknowledged in the host's saved plan. Hosts that reject, ignore, or cannot report an explicit control fail visibly. `--host-profile` is rejected because it cannot select remote priors; configure each host's priors before planning.
+
+Goal plans keep independent recommendations visible, but fleet approval includes only the goal-selected direct kills present in that host's executable plan. Unselected kills remain in the retained remote document and cannot expand the approved fleet target set. Pressure-relief goals may select reversible remedies; fleet apply remains limited to direct kill sequences, so review and apply those other remedies on their host.
 
 Each host runs its own `pt-core agent plan`, evaluating protection, cgroup placement and the posterior on that host. Fleet planning requires every direct kill target's recorded `P(useful or useful_bad)` to fit `--max-fdr`. A safer host cannot subsidize a riskier target, so the mean recorded risk stays within the ceiling for any subset left after failed, skipped, or unknown remote actions. The saved fleet session retains complete remote plans, their real session and host identities, the approved process identities and a SHA-256 digest of each plan. Apply recomputes the selection and independently checks the executable actions' normalized class posteriors against the fleet ceiling, even when a remote policy disabled its local FDR gate. Candidate and action evidence must agree. Changed evidence, duplicate host identities, or older selections that no longer meet these checks require a new fleet plan.
 

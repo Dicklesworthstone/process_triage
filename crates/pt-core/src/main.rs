@@ -1018,7 +1018,27 @@ struct AgentFleetPlanArgs {
     #[arg(long)]
     continue_on_error: bool,
 
-    /// Apply host-group priors
+    /// Resource goal applied independently on each host (not a fleet-wide total)
+    #[arg(long)]
+    goal: Option<String>,
+
+    /// Override the minimum process age on each host (seconds)
+    #[arg(long)]
+    min_age: Option<u64>,
+
+    /// Override the candidate posterior threshold on each host
+    #[arg(long, value_parser = parse_probability)]
+    min_posterior: Option<f64>,
+
+    /// Override each host's activity sampling window in milliseconds
+    #[arg(long, value_parser = clap::value_parser!(u64).range(0..=60_000))]
+    window_ms: Option<u64>,
+
+    /// Override the maximum number of candidates returned by each host
+    #[arg(long)]
+    max_candidates: Option<u32>,
+
+    /// Unsupported: configure priors on each host instead
     #[arg(long)]
     host_profile: Option<String>,
 
@@ -16182,6 +16202,23 @@ fn fleet_inspection_text(value: &str) -> String {
 }
 
 fn run_agent_fleet_plan(global: &GlobalOpts, args: &AgentFleetPlanArgs) -> ExitCode {
+    if args.host_profile.is_some() {
+        return output_agent_error(
+            global,
+            "fleet plan",
+            "--host-profile cannot select remote priors; configure priors on each host before planning",
+        );
+    }
+    let plan_options = pt_core::fleet::ssh_scan::RemotePlanOptions {
+        goal: args.goal.clone(),
+        min_age: args.min_age,
+        min_posterior: args.min_posterior,
+        window_ms: args.window_ms,
+        max_candidates: args.max_candidates,
+    };
+    if let Err(error) = plan_options.validate() {
+        return output_agent_error(global, "fleet plan", &error);
+    }
     let selection = match resolve_fleet_targets(&args.targets, false) {
         Ok(selection) => selection,
         Err(error) => return output_agent_error(global, "fleet plan", &error),
@@ -16202,6 +16239,7 @@ fn run_agent_fleet_plan(global: &GlobalOpts, args: &AgentFleetPlanArgs) -> ExitC
             .remote_binary
             .clone()
             .unwrap_or_else(|| defaults.remote_binary.clone()),
+        plan_options,
         ..defaults
     };
 
@@ -16320,7 +16358,8 @@ fn run_agent_fleet_plan(global: &GlobalOpts, args: &AgentFleetPlanArgs) -> ExitC
             "parallel": args.parallel,
             "timeout_secs": args.timeout,
             "continue_on_error": args.continue_on_error,
-            "host_profile": args.host_profile,
+            "plan_options": ssh_config.plan_options,
+            "goal_scope": args.goal.as_ref().map(|_| "per_host"),
             "label": args.label,
             "max_fdr": args.max_fdr,
         },

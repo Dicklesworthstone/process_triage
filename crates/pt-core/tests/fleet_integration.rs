@@ -319,6 +319,176 @@ fn fleet_plan_uses_discovered_alias_and_retains_explicit_ssh_config() {
     assert_eq!(saved["execution"]["transport"]["config_file"], path);
 }
 
+#[cfg(unix)]
+#[test]
+fn fleet_plan_controls_reach_remote_argv_and_must_be_acknowledged() {
+    use assert_cmd::cargo::cargo_bin_cmd;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let ssh = dir.path().join("ssh");
+    let planner = dir.path().join("remote planner's binary");
+    let argv = dir.path().join("remote-argv");
+    let response = dir.path().join("remote-plan.json");
+    let quote = |path: &std::path::Path| path.to_str().unwrap().replace('\'', "'\\''");
+    std::fs::write(
+        &ssh,
+        "#!/bin/sh\nlast=''\nfor argument do last=$argument; done\nexec /bin/sh -c \"$last\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &planner,
+        format!(
+            "#!/bin/sh\nprintf '%s\\000' \"$@\" >> '{}'\nexec /bin/cat '{}'\n",
+            quote(&argv),
+            quote(&response),
+        ),
+    )
+    .unwrap();
+    for path in [&ssh, &planner] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let mut paths = vec![dir.path().to_path_buf()];
+    if let Some(existing) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    let path = std::env::join_paths(paths).unwrap();
+    let goal = r#"free-disk 1GB on "/data/agent's $(printf injected); cache""#;
+    let requested = [
+        "--goal",
+        goal,
+        "--min-age",
+        "0",
+        "--min-posterior",
+        "0.25",
+        "--window-ms",
+        "1000",
+        "--max-candidates",
+        "40",
+    ];
+    let document = serde_json::json!({
+        "command": "agent plan",
+        "plan_id": "fleet-controls-test",
+        "session_id": pt_common::SessionId::new().0,
+        "host_id": "fleet-controls-test-host",
+        "generated_at": "2026-11-24T12:00:00Z",
+        "pt_version": env!("CARGO_PKG_VERSION"),
+        "policy_id": null,
+        "policy_version": "1.0.0",
+        "actions": [],
+        "pre_toggled": [],
+        "gates_summary": {"total_candidates": 0, "blocked_candidates": 0, "pre_toggled_actions": 0},
+        "summary": {"total_processes_scanned": 5, "goal_mode": true},
+        "candidates": [],
+        "goal": goal,
+        "args": {
+            "goal": goal,
+            "min_age": 0,
+            "min_posterior": 0.25,
+            "window_ms": 1000,
+            "max_candidates": 40,
+        },
+    });
+    std::fs::write(&response, serde_json::to_vec(&document).unwrap()).unwrap();
+    let run = |options: &[&str], name: &str| {
+        cargo_bin_cmd!("pt-core")
+            .args([
+                "--format",
+                "json",
+                "agent",
+                "fleet",
+                "plan",
+                "--hosts",
+                "worker",
+                "--parallel",
+                "1",
+                "--remote-binary",
+            ])
+            .arg(&planner)
+            .args(options)
+            .env("PATH", &path)
+            .env("PROCESS_TRIAGE_DATA", dir.path().join(name))
+            .timeout(std::time::Duration::from_secs(15))
+            .output()
+            .unwrap()
+    };
+    let output = run(&requested, "success");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["scan_summary"]["successful"], 1);
+    assert_eq!(result["inputs"]["goal_scope"], "per_host");
+    assert_eq!(result["inputs"]["plan_options"], document["args"]);
+    let arguments = std::fs::read(&argv).unwrap();
+    let arguments: Vec<_> = arguments
+        .strip_suffix(&[0])
+        .unwrap()
+        .split(|byte| *byte == 0)
+        .map(|argument| std::str::from_utf8(argument).unwrap())
+        .collect();
+    let expected: Vec<_> = ["--format", "json", "agent", "plan"]
+        .into_iter()
+        .chain(requested)
+        .collect();
+    assert_eq!(arguments, expected, "remote shell must preserve every value");
+    let session_dir = result["session_dir"].as_str().unwrap();
+    let saved: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(std::path::Path::new(session_dir).join("fleet.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        saved["execution"]["transport"]["plan_options"],
+        document["args"]
+    );
+    assert_eq!(saved["execution"]["hosts"][0]["document"], document);
+
+    // An old or defective host must not silently accept a requested override.
+    let mut ignored = document.clone();
+    ignored["args"]["window_ms"] = serde_json::json!(500);
+    std::fs::write(&response, serde_json::to_vec(&ignored).unwrap()).unwrap();
+    let output = run(&requested, "unacknowledged");
+    assert!(!output.status.success());
+    let failed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(failed["scan_summary"]["successful"], 0);
+    assert_eq!(failed["scan_summary"]["failed"], 1);
+    assert!(failed["warnings"].as_array().unwrap().iter().any(|warning| {
+        warning
+            .as_str()
+            .unwrap()
+            .contains("did not acknowledge requested --window-ms")
+    }));
+    assert!(
+        failed["fleet_session"]["execution"]["hosts"][0]["selected_targets"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    // All local refusals happen before the first connection, even when the
+    // configured SSH helper would otherwise succeed.
+    let contacted = std::fs::read(&argv).unwrap();
+    for (name, invalid) in [
+        ("invalid-goal", vec!["--goal", "free port 70000"]),
+        ("invalid-window", vec!["--window-ms", "60001"]),
+        ("invalid-probability", vec!["--min-posterior", "NaN"]),
+        ("unsupported-profile", vec!["--host-profile", "worker"]),
+    ] {
+        let output = run(&invalid, name);
+        assert!(!output.status.success(), "{name}");
+        assert_eq!(std::fs::read(&argv).unwrap(), contacted, "{name}");
+        if name == "unsupported-profile" {
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("cannot select remote priors"),
+                "{}",
+                String::from_utf8_lossy(&output.stdout),
+            );
+        }
+    }
+}
+
 #[test]
 fn inventory_toml_detailed_hosts_with_tags() {
     let toml = r#"

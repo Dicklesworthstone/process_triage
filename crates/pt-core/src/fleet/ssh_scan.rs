@@ -3,7 +3,8 @@
 //! Runs `pt-core --format json agent plan` on each host via `ssh`, so every host
 //! is judged by pt's real decision pipeline with its own live checks (protection,
 //! cgroup placement, posterior, loss matrix, policy). The fleet only aggregates
-//! those per-host decisions; it never re-classifies processes itself. (It used
+//! those per-host decisions, restricting goal plans to their selected actions;
+//! it never re-classifies processes itself. (It used
 //! to fetch a raw scan and apply a local state heuristic that, for example,
 //! recommended `kill` for every zombie and every process stopped for an hour.)
 
@@ -18,6 +19,118 @@ use crate::collect::pressure::{
 };
 use crate::decision::pressure_regime::{assess, PressureThresholds, ProcessCensus, Severity};
 use crate::session::fleet::{HostHealth, HostHealthStatus, PressureCoverage};
+
+/// Explicit overrides for the remote planner. Absent values leave each host's
+/// defaults intact; these options never change its policy or authorize execution.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RemotePlanOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_age: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_posterior: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_candidates: Option<u32>,
+}
+
+impl RemotePlanOptions {
+    /// Validate before any connection, using the local planner's own goal grammar.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(goal) = &self.goal {
+            crate::decision::goal_parser::parse_goal(goal)
+                .map_err(|error| format!("invalid fleet --goal: {error}"))?;
+        }
+        if self
+            .min_posterior
+            .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+        {
+            return Err("--min-posterior must be a finite probability between 0 and 1".into());
+        }
+        if self.window_ms.is_some_and(|value| value > 60_000) {
+            return Err("--window-ms must be between 0 and 60000".into());
+        }
+        Ok(())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.goal.is_none()
+            && self.min_age.is_none()
+            && self.min_posterior.is_none()
+            && self.window_ms.is_none()
+            && self.max_candidates.is_none()
+    }
+
+    fn append_args(&self, command: &mut Vec<String>) {
+        if let Some(goal) = &self.goal {
+            command.extend(["--goal".to_string(), goal.clone()]);
+        }
+        if let Some(value) = self.min_age {
+            command.extend(["--min-age".to_string(), value.to_string()]);
+        }
+        if let Some(value) = self.min_posterior {
+            command.extend(["--min-posterior".to_string(), value.to_string()]);
+        }
+        if let Some(value) = self.window_ms {
+            command.extend(["--window-ms".to_string(), value.to_string()]);
+        }
+        if let Some(value) = self.max_candidates {
+            command.extend(["--max-candidates".to_string(), value.to_string()]);
+        }
+    }
+
+    /// Explicit controls require acknowledgment from the host's saved output.
+    /// Old hosts may still use their defaults when no override was requested.
+    fn validate_response(&self, document: &serde_json::Value) -> Result<(), String> {
+        let args = &document["args"];
+        for (name, mismatched) in [
+            (
+                "goal",
+                self.goal.as_deref().is_some_and(|value| {
+                    args["goal"].as_str() != Some(value)
+                        || document["goal"].as_str() != Some(value)
+                }),
+            ),
+            (
+                "min-age",
+                self.min_age
+                    .is_some_and(|value| args["min_age"].as_u64() != Some(value)),
+            ),
+            (
+                "min-posterior",
+                self.min_posterior
+                    .is_some_and(|value| args["min_posterior"].as_f64() != Some(value)),
+            ),
+            (
+                "window-ms",
+                self.window_ms
+                    .is_some_and(|value| args["window_ms"].as_u64() != Some(value)),
+            ),
+            (
+                "max-candidates",
+                self.max_candidates
+                    .is_some_and(|value| args["max_candidates"].as_u64() != Some(u64::from(value))),
+            ),
+        ] {
+            if mismatched {
+                return Err(format!(
+                    "remote plan did not acknowledge requested --{name}; inspect or upgrade the remote pt-core"
+                ));
+            }
+        }
+        if self.goal.is_some() {
+            if let Some(error) = document["goal_summary"]["error"].as_str() {
+                return Err(format!(
+                    "remote planner could not prepare the requested goal: {error}"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
 
 /// Configuration for SSH-based fleet scanning.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +158,9 @@ pub struct SshScanConfig {
     pub parallel: usize,
     /// Continue scanning remaining hosts if one fails.
     pub continue_on_error: bool,
+    /// Optional host-local planner controls, retained with the fleet session.
+    #[serde(skip_serializing_if = "RemotePlanOptions::is_empty")]
+    pub plan_options: RemotePlanOptions,
 }
 
 impl Default for SshScanConfig {
@@ -63,6 +179,7 @@ impl Default for SshScanConfig {
             ],
             parallel: 10,
             continue_on_error: true,
+            plan_options: RemotePlanOptions::default(),
         }
     }
 }
@@ -179,9 +296,64 @@ pub struct RemotePlan {
     pub document: Option<serde_json::Value>,
 }
 
+/// Goal plans retain independent advice for candidates outside the selected
+/// recovery set. Keep that advice in the original document, but never pool an
+/// excluded kill as executable fleet work.
+fn goal_recommendation(
+    candidate: &serde_json::Value,
+    plan: &crate::plan::Plan,
+) -> Result<String, &'static str> {
+    let recommendation = candidate["recommendation"].as_str().unwrap_or_default();
+    if !recommendation.eq_ignore_ascii_case("kill") {
+        return Ok(recommendation.to_string());
+    }
+    match candidate["goal_selected"].as_bool() {
+        Some(false) => return Ok("REVIEW".to_string()),
+        Some(true) => {}
+        None => return Err("goal candidate is missing its explicit selection"),
+    }
+    let target: pt_common::ProcessIdentity =
+        serde_json::from_value(candidate["action_target"].clone())
+            .map_err(|_| "selected goal kill has no complete action target")?;
+    if candidate["recommended_action"].as_str() != Some("kill")
+        || candidate["pid"].as_u64() != Some(u64::from(target.pid.0))
+        || candidate["start_id"].as_str() != Some(target.start_id.0.as_str())
+        || candidate["uid"].as_u64() != Some(u64::from(target.uid))
+        || !target.can_safely_revalidate()
+    {
+        return Err("selected goal kill has inconsistent process identity or advice");
+    }
+    let mut kills = plan
+        .actions
+        .iter()
+        .filter(|action| action.target == target && action.action == crate::decision::Action::Kill);
+    let kill = kills
+        .next()
+        .ok_or("selected goal kill is absent from the executable plan")?;
+    if kills.next().is_some()
+        || kill.blocked
+        || kill.routing != crate::plan::ActionRouting::Direct
+        || kill.original_zombie_target.is_some()
+    {
+        return Err("selected goal kill has a blocked, routed or ambiguous executable action");
+    }
+    Ok(recommendation.to_string())
+}
+
 /// Parse `pt-core --format json agent plan` output.
 pub fn parse_remote_plan(json: &str) -> Result<RemotePlan, String> {
     let v: serde_json::Value = serde_json::from_str(json).map_err(|e| format!("not JSON: {e}"))?;
+    let goal_plan = if !v["goal"].is_null()
+        || !v["args"]["goal"].is_null()
+        || v["summary"]["goal_mode"].as_bool() == Some(true)
+    {
+        Some(
+            serde_json::from_value::<crate::plan::Plan>(v.clone())
+                .map_err(|error| format!("goal output has no valid executable plan: {error}"))?,
+        )
+    } else {
+        None
+    };
     let total_processes = v["summary"]["total_processes_scanned"]
         .as_u64()
         .ok_or("not an `agent plan` output: summary.total_processes_scanned missing")?;
@@ -220,7 +392,10 @@ pub fn parse_remote_plan(json: &str) -> Result<RemotePlan, String> {
                 pid,
                 comm: text("command_short"),
                 classification: text("classification"),
-                recommendation: text("recommendation"),
+                recommendation: match &goal_plan {
+                    Some(plan) => goal_recommendation(c, plan)?,
+                    None => text("recommendation"),
+                },
                 score: (probabilities[2] + probabilities[3]).min(1.0),
             })
         })
@@ -637,17 +812,16 @@ pub(super) fn build_ssh_command_args(
 
 /// Build the SSH command arguments for scanning a remote host.
 fn build_ssh_args(host: &str, config: &SshScanConfig) -> Result<Vec<String>, String> {
-    build_ssh_command_args(
-        host,
-        config,
-        &[
-            config.remote_binary.clone(),
-            "--format".to_string(),
-            "json".to_string(),
-            "agent".to_string(),
-            "plan".to_string(),
-        ],
-    )
+    config.plan_options.validate()?;
+    let mut command = vec![
+        config.remote_binary.clone(),
+        "--format".to_string(),
+        "json".to_string(),
+        "agent".to_string(),
+        "plan".to_string(),
+    ];
+    config.plan_options.append_args(&mut command);
+    build_ssh_command_args(host, config, &command)
 }
 
 /// Scan a single host via SSH and parse the result.
@@ -735,7 +909,12 @@ pub fn ssh_scan_host(host: &str, config: &SshScanConfig) -> HostScanResult {
         };
     }
 
-    match parse_remote_plan(&output.stdout_str()) {
+    let parsed = parse_remote_plan(&output.stdout_str()).and_then(|plan| {
+        let document = plan.document.as_ref().ok_or("remote plan document missing")?;
+        config.plan_options.validate_response(document)?;
+        Ok(plan)
+    });
+    match parsed {
         Ok(plan) => HostScanResult {
             host: host.to_string(),
             success: true,
@@ -908,7 +1087,8 @@ pub fn scan_result_to_host_input(result: &HostScanResult) -> crate::session::fle
     use crate::session::fleet::{CandidateInfo, HostInput};
 
     match &result.plan {
-        // The host's own decisions, unchanged.
+        // Host decisions retain their final goal selection, if any. The complete
+        // document also preserves independent advice for excluded candidates.
         Some(plan) => HostInput {
             host_id: result.host.clone(),
             session_id: plan
@@ -1007,6 +1187,156 @@ mod tests {
             args.last().map(String::as_str),
             Some("pt-core --format json agent plan")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_planner_controls_survive_transport_and_shell_parsing() {
+        let goal = r#"free-disk 1GB on "/data/agent's $(printf injected); cache""#;
+        let config = SshScanConfig {
+            remote_binary: "/opt/pt tools/pt-core".to_string(),
+            plan_options: RemotePlanOptions {
+                goal: Some(goal.to_string()),
+                min_age: Some(0),
+                min_posterior: Some(0.0),
+                window_ms: Some(60_000),
+                max_candidates: Some(200),
+            },
+            ..SshScanConfig::default()
+        };
+        let restored: SshScanConfig =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert_eq!(restored.plan_options, config.plan_options);
+        let args = build_ssh_args("worker", &restored).unwrap();
+        // Parse exactly as the remote shell would, without running a planner.
+        // If quoting regresses, command substitution changes the captured goal.
+        let script = format!("set -- {}; printf '%s\\000' \"$@\"", args.last().unwrap());
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let bytes = output.stdout.strip_suffix(&[0]).unwrap();
+        let parsed: Vec<_> = bytes
+            .split(|byte| *byte == 0)
+            .map(|argument| std::str::from_utf8(argument).unwrap())
+            .collect();
+        assert_eq!(
+            parsed,
+            [
+                "/opt/pt tools/pt-core",
+                "--format",
+                "json",
+                "agent",
+                "plan",
+                "--goal",
+                goal,
+                "--min-age",
+                "0",
+                "--min-posterior",
+                "0",
+                "--window-ms",
+                "60000",
+                "--max-candidates",
+                "200",
+            ]
+        );
+        let old: SshScanConfig = serde_json::from_str("{}").unwrap();
+        assert!(old.plan_options.is_empty());
+        assert_eq!(
+            build_ssh_args("worker", &old).unwrap().last().unwrap(),
+            "pt-core --format json agent plan"
+        );
+    }
+
+    #[test]
+    fn remote_planner_controls_reject_invalid_requests_before_ssh() {
+        for goal in ["", "free port 70000", "free 1GB RAM and silently ignore this"] {
+            let config = SshScanConfig {
+                plan_options: RemotePlanOptions {
+                    goal: Some(goal.into()),
+                    ..RemotePlanOptions::default()
+                },
+                ..SshScanConfig::default()
+            };
+            assert!(build_ssh_args("worker", &config).is_err(), "{goal:?}");
+        }
+        for probability in [f64::NAN, f64::INFINITY, -0.1, 1.01] {
+            let options = RemotePlanOptions {
+                min_posterior: Some(probability),
+                ..RemotePlanOptions::default()
+            };
+            assert!(options.validate().is_err(), "{probability}");
+        }
+        assert!(RemotePlanOptions {
+            window_ms: Some(60_001),
+            ..RemotePlanOptions::default()
+        }
+        .validate()
+        .is_err());
+        for boundary in [0, 60_000] {
+            assert!(RemotePlanOptions {
+                window_ms: Some(boundary),
+                min_age: Some(0),
+                max_candidates: Some(0),
+                ..RemotePlanOptions::default()
+            }
+            .validate()
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn explicit_remote_controls_require_matching_saved_arguments() {
+        let options = RemotePlanOptions {
+            goal: Some("free port 43123".into()),
+            min_age: Some(0),
+            min_posterior: Some(0.25),
+            window_ms: Some(1000),
+            max_candidates: Some(40),
+        };
+        let document = serde_json::json!({
+            "goal": "free port 43123",
+            "args": {
+                "goal": "free port 43123",
+                "min_age": 0,
+                "min_posterior": 0.25,
+                "window_ms": 1000,
+                "max_candidates": 40,
+            },
+        });
+        assert!(options.validate_response(&document).is_ok());
+        assert!(RemotePlanOptions::default()
+            .validate_response(&serde_json::json!({}))
+            .is_ok());
+        for (field, flag, changed) in [
+            ("goal", "--goal", serde_json::json!("free port 43124")),
+            ("min_age", "--min-age", serde_json::json!(3600)),
+            ("min_posterior", "--min-posterior", serde_json::json!(0.7)),
+            ("window_ms", "--window-ms", serde_json::json!(500)),
+            ("max_candidates", "--max-candidates", serde_json::json!(20)),
+        ] {
+            for value in [changed, serde_json::Value::Null] {
+                let mut stale = document.clone();
+                stale["args"][field] = value;
+                assert!(
+                    options.validate_response(&stale).unwrap_err().contains(flag),
+                    "{field}"
+                );
+            }
+        }
+        let mut no_goal = document.clone();
+        no_goal["goal"] = serde_json::Value::Null;
+        assert!(options
+            .validate_response(&no_goal)
+            .unwrap_err()
+            .contains("--goal"));
+        let mut failed_goal = document;
+        failed_goal["goal_summary"] = serde_json::json!({"error": "private memory unavailable"});
+        assert!(options
+            .validate_response(&failed_goal)
+            .unwrap_err()
+            .contains("private memory unavailable"));
     }
 
     #[test]
@@ -1208,6 +1538,144 @@ mod tests {
             r#"{"summary": {"total_processes_scanned": 1}, "candidates": [{"command_short": "x"}]}"#
         )
         .is_err());
+    }
+
+    fn selected_goal_document() -> serde_json::Value {
+        let target = pt_common::ProcessIdentity::new(
+            101,
+            pt_common::StartId::from_linux("goal-boot", 42, 101),
+            1000,
+        );
+        let posterior = serde_json::json!({
+            "useful": 0.01,
+            "useful_bad": 0.0,
+            "abandoned": 0.99,
+            "zombie": 0.0,
+        });
+        serde_json::json!({
+            "command": "agent plan",
+            "host_id": "goal-host",
+            "session_id": "pt-20261105-120000-abcd",
+            "plan_id": "selected-goal",
+            "generated_at": "2026-11-05T12:00:00Z",
+            "policy_version": "1.0.0",
+            "goal": "free port 43123",
+            "summary": {"total_processes_scanned": 2, "goal_mode": true},
+            "actions": [{
+                "action_id": "kill-101", "target": target, "action": "kill",
+                "order": 0, "stage": 0, "timeouts": crate::plan::ActionTimeouts::default(),
+                "pre_checks": [], "rationale": {"posterior": posterior},
+                "on_success": [], "on_failure": [], "blocked": false,
+            }],
+            "pre_toggled": ["kill-101"],
+            "gates_summary": {"total_candidates": 2, "blocked_candidates": 0, "pre_toggled_actions": 1},
+            "candidates": [
+                {
+                    "pid": 101, "start_id": target.start_id, "uid": 1000,
+                    "command_short": "listener", "classification": "abandoned",
+                    "recommendation": "KILL", "recommended_action": "kill",
+                    "posterior": posterior, "action_target": target, "goal_selected": true,
+                },
+                {
+                    "pid": 102, "command_short": "other", "classification": "abandoned",
+                    "recommendation": "KILL", "recommended_action": "kill",
+                    "posterior": posterior, "goal_selected": false,
+                },
+            ],
+        })
+    }
+
+    #[test]
+    fn fleet_goal_approval_preserves_only_the_hosts_executable_selection() {
+        let document = selected_goal_document();
+        let plan = parse_remote_plan(&document.to_string()).unwrap();
+        assert_eq!(plan.candidates[0].recommendation, "KILL");
+        assert_eq!(plan.candidates[1].recommendation, "REVIEW");
+        assert_eq!(plan.candidates[1].classification, "abandoned");
+        assert_eq!(plan.document.as_ref().unwrap(), &document);
+        let scan = FleetScanResult {
+            total_hosts: 1,
+            successful: 1,
+            failed: 0,
+            results: vec![HostScanResult {
+                host: "worker".into(),
+                success: true,
+                plan: Some(plan),
+                error: None,
+                duration_ms: 1,
+                provenance: None,
+            }],
+            duration_ms: 1,
+            provenance_aggregate: None,
+        };
+        let inputs = vec![scan_result_to_host_input(&scan.results[0])];
+        let mut fleet = crate::session::fleet::create_fleet_session(
+            "pt-20261105-120001-abcd",
+            None,
+            &inputs,
+            0.05,
+        );
+        assert_eq!(fleet.hosts[0].selected_kill_pids, [101]);
+        fleet.execution = Some(crate::fleet::apply::bind_fleet_execution(
+            &fleet,
+            &scan,
+            &SshScanConfig::default(),
+        ));
+        let prepared = crate::fleet::apply::prepare_fleet_apply(&fleet).unwrap();
+        let request = prepared[0].request.as_ref().unwrap();
+        assert_eq!(request.targets.len(), 1);
+        assert_eq!(request.targets[0].pid.0, 101);
+        assert_eq!(request.actions.len(), 1);
+        assert_eq!(request.actions[0].action_id, "kill-101");
+    }
+
+    #[test]
+    fn selected_goal_kills_require_complete_matching_executable_actions() {
+        for case in [
+            "selection",
+            "target",
+            "birth",
+            "owner",
+            "missing",
+            "duplicate",
+            "blocked",
+            "routed",
+            "original_zombie",
+            "weak_identity",
+        ] {
+            let mut document = selected_goal_document();
+            match case {
+                "selection" => {
+                    document["candidates"][0]["goal_selected"] = serde_json::Value::Null;
+                }
+                "target" => document["candidates"][0]["action_target"] = serde_json::Value::Null,
+                "birth" => {
+                    document["candidates"][0]["start_id"] = serde_json::json!("other:1:101");
+                }
+                "owner" => document["candidates"][0]["uid"] = serde_json::json!(1001),
+                "missing" => document["actions"] = serde_json::json!([]),
+                "duplicate" => {
+                    let action = document["actions"][0].clone();
+                    document["actions"].as_array_mut().unwrap().push(action);
+                }
+                "blocked" => document["actions"][0]["blocked"] = serde_json::json!(true),
+                "routed" => {
+                    document["actions"][0]["routing"] =
+                        serde_json::to_value(crate::plan::ActionRouting::ZombieToParent).unwrap();
+                }
+                "original_zombie" => {
+                    document["actions"][0]["original_zombie_target"] =
+                        document["candidates"][0]["action_target"].clone();
+                }
+                "weak_identity" => {
+                    let quality = serde_json::to_value(pt_common::IdentityQuality::PidOnly).unwrap();
+                    document["candidates"][0]["action_target"]["quality"] = quality.clone();
+                    document["actions"][0]["target"]["quality"] = quality;
+                }
+                _ => unreachable!(),
+            }
+            assert!(parse_remote_plan(&document.to_string()).is_err(), "{case}");
+        }
     }
 
     #[test]
