@@ -594,6 +594,13 @@ pub fn remote_apply_args(
             "--format".into(),
             "json".into(),
             "--robot".into(),
+            // The SSH watchdog cannot guarantee remote cancellation. Bound
+            // admission independently on the host, starting when agent apply
+            // starts; already-started cleanup retains its approved grace and
+            // completes its receipts. Preserve zero as an expired remote budget,
+            // independently of the one-second SSH watchdog floor.
+            "--timeout".into(),
+            config.timeout_secs.to_string(),
             "agent".into(),
             "apply".into(),
             "--session".into(),
@@ -1453,6 +1460,7 @@ mod tests {
             |request, args, timeout| {
                 assert_eq!(timeout, Duration::from_secs(30));
                 let command = args.last().unwrap();
+                assert!(command.contains("--robot --timeout 30 agent apply"));
                 assert!(command.contains("--targets 101:fixture-boot:42:101"));
                 assert!(!command.contains("--recommended"));
                 assert!(!command.contains("102:"));
@@ -1475,6 +1483,101 @@ mod tests {
         assert_eq!(report.hosts[0].kill_signals_delivered, 1);
         assert_eq!(receipts.len(), 1);
         assert_eq!(receipts[0].binding, report.hosts[0].binding);
+    }
+
+    #[test]
+    fn zero_apply_budget_is_not_extended_by_the_ssh_watchdog_floor() {
+        let fleet = retained_fleet(vec![("alpha", remote_document("alpha", &[(101, 0.999)]))]);
+        let prepared = prepare_fleet_apply(&fleet).unwrap();
+        let options = FleetApplyConfig {
+            timeout_secs: 0,
+            ..config()
+        };
+        let calls = AtomicUsize::new(0);
+        let report = execute_fleet_apply_with(
+            &prepared,
+            &fleet.execution.as_ref().unwrap().transport,
+            &options,
+            |_request, args, timeout| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(timeout, Duration::from_secs(1));
+                assert!(args.contains(&"ConnectTimeout=1".to_string()));
+                assert!(args
+                    .last()
+                    .unwrap()
+                    .contains("--robot --timeout 0 agent apply"));
+                Err("simulated SSH timeout".to_string())
+            },
+            |_| Ok(()),
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(report.hosts[0].status, HostApplyStatus::Unknown);
+        assert_eq!(report.hosts[0].successful_actions, 0);
+        assert_eq!(report.hosts[0].kill_signals_delivered, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_apply_deadline_and_bindings_survive_shell_quoting() {
+        let fleet = retained_fleet(vec![("alpha", remote_document("alpha", &[(101, 0.999)]))]);
+        let prepared = prepare_fleet_apply(&fleet).unwrap();
+        let mut request = prepared[0].request.clone().unwrap();
+        request.binding.host_id = "machine alpha's $(printf substituted); #".into();
+        let transport = SshScanConfig {
+            remote_binary: "/opt/pt tools/pt's core $(printf substituted)".into(),
+            connect_timeout: 60,
+            ..SshScanConfig::default()
+        };
+        let options = FleetApplyConfig {
+            timeout_secs: 17,
+            ..config()
+        };
+        let args = remote_apply_args(&request, &transport, &options).unwrap();
+        assert!(args.contains(&"ConnectTimeout=17".to_string()));
+        // Exercise the receiving shell's actual tokenization without invoking
+        // SSH or the supplied executable. Shell syntax inside data must remain
+        // literal, and --timeout must remain a separate global CLI argument.
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "set -- {}; printf '%s\\0' \"$@\"",
+                args.last().unwrap()
+            ))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        let words: Vec<_> = output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|word| !word.is_empty())
+            .map(|word| std::str::from_utf8(word).unwrap())
+            .collect();
+        assert_eq!(
+            words,
+            vec![
+                transport.remote_binary.as_str(),
+                "--format",
+                "json",
+                "--robot",
+                "--timeout",
+                "17",
+                "agent",
+                "apply",
+                "--session",
+                request.binding.session_id.as_str(),
+                "--targets",
+                "101:fixture-boot:42:101",
+                "--expected-host-id",
+                request.binding.host_id.as_str(),
+                "--expected-plan-sha256",
+                request.binding.plan_sha256.as_str(),
+                "--max-kills",
+                "3",
+                "--yes",
+                "--resume",
+                "--abort-on-unknown",
+            ]
+        );
     }
 
     #[test]
