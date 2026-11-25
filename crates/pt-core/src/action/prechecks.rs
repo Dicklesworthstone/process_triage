@@ -274,6 +274,15 @@ impl PreCheckResult {
     }
 }
 
+/// Numeric ownership and name resolution are separate observations. A readable
+/// UID remains useful when account lookup fails, but is never a resolved name.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[derive(Debug, Clone)]
+struct ProtectionOwner {
+    uid: u32,
+    name: Option<String>,
+}
+
 /// Command and owner rules need observed values. An unreadable or empty field
 /// cannot prove that a target does not match a configured protection rule.
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
@@ -281,23 +290,50 @@ fn required_protection_metadata(
     pid: u32,
     comm: Option<String>,
     cmdline: Option<String>,
-    user: Option<String>,
+    owner: Option<ProtectionOwner>,
+    protected_users: &HashSet<String>,
+    require_owner_name: bool,
 ) -> Result<(String, String, String), PreCheckResult> {
-    let required = |value: Option<String>, field: &str| {
-        value.filter(|value| !value.trim().is_empty()).ok_or_else(|| {
-            PreCheckResult::Blocked {
-                check: PreCheck::CheckNotProtected,
-                reason: format!(
-                    "protection evidence unavailable for PID {pid}: cannot read complete {field}; refusing to bypass configured protection rules"
-                ),
-            }
-        })
+    let unavailable = |field: &str| PreCheckResult::Blocked {
+        check: PreCheck::CheckNotProtected,
+        reason: format!(
+            "protection evidence unavailable for PID {pid}: cannot read complete {field}; refusing to bypass configured protection rules"
+        ),
     };
-    Ok((
-        required(comm, "process name")?,
-        required(cmdline, "command line")?,
-        required(user, "process owner")?,
-    ))
+    let required = |value: Option<String>, field: &str| {
+        value
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| unavailable(field))
+    };
+    let comm = required(comm, "process name")?;
+    let cmdline = required(cmdline, "command line")?;
+    let owner = owner.ok_or_else(|| unavailable("process owner"))?;
+
+    // An explicit numeric rule protects the observed UID even when a name was
+    // resolved. Unlike the named root rule, it has no session-workload exception.
+    if protected_users
+        .iter()
+        .any(|user| user.parse::<u32>().ok() == Some(owner.uid))
+    {
+        return Err(PreCheckResult::Blocked {
+            check: PreCheck::CheckNotProtected,
+            reason: format!("owned by protected user UID: {}", owner.uid),
+        });
+    }
+
+    let name = owner.name.filter(|name| !name.trim().is_empty());
+    let name_required = require_owner_name
+        || protected_users
+            .iter()
+            .any(|user| user.parse::<u32>().is_err());
+    let user = match name {
+        Some(name) => name,
+        None if name_required => return Err(unavailable("process owner name")),
+        // No name-based rule or placement decision relies on this label. The
+        // numeric policy check above used the observed UID, not this string.
+        None => owner.uid.to_string(),
+    };
+    Ok((comm, cmdline, user))
 }
 
 /// Recommended supervisor action for a managed process.
@@ -2479,34 +2515,31 @@ impl LivePreCheckProvider {
         }
     }
 
-    /// Read process owner username.
-    fn read_user(&self, pid: u32) -> Option<String> {
+    /// Read numeric ownership without disguising an unresolved name as a UID.
+    fn read_owner(&self, pid: u32) -> Option<ProtectionOwner> {
         let uid = self.read_uid(pid)?;
-        // macOS keeps real users in Directory Services, not /etc/passwd: ask the
-        // system resolver so operator-listed protected users match by name.
+        // Retain the existing macOS resolver. Linux uses the local account file;
+        // missing NSS-only names remain unknown rather than adding an unbounded
+        // network-backed resolver call to an action's safety checks.
         #[cfg(target_os = "macos")]
-        if let Some(name) = user_name_for_uid(uid) {
-            return Some(name);
+        let name = user_name_for_uid(uid);
+        #[cfg(not(target_os = "macos"))]
+        let name: Option<String> = None;
+        let name = name.or_else(|| {
+            let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+            passwd.lines().find_map(|line| {
+                let mut fields = line.split(':');
+                let username = fields.next()?;
+                let _password = fields.next()?;
+                let account_uid = fields.next()?.parse::<u32>().ok()?;
+                (account_uid == uid && !username.trim().is_empty()).then(|| username.to_string())
+            })
+        });
+        // A credential change during lookup invalidates the owner/name pair.
+        if self.read_uid(pid)? != uid {
+            return None;
         }
-        // Try to resolve UID to username safely
-        #[cfg(unix)]
-        {
-            if let Ok(passwd) = std::fs::read_to_string("/etc/passwd") {
-                let uid_str_target = uid.to_string();
-                for pwd_line in passwd.lines() {
-                    let mut fields = pwd_line.split(':');
-                    let username = fields.next();
-                    let _passwd = fields.next();
-                    let uid_field = fields.next();
-                    if let (Some(u), Some(f)) = (username, uid_field) {
-                        if f == uid_str_target {
-                            return Some(u.to_string());
-                        }
-                    }
-                }
-            }
-        }
-        Some(uid.to_string())
+        Some(ProtectionOwner { uid, name })
     }
 
     /// Read process UID.
@@ -2826,7 +2859,9 @@ impl LivePreCheckProvider {
                 pid,
                 self.read_comm(pid),
                 self.read_cmdline(pid),
-                self.read_user(pid),
+                self.read_owner(pid),
+                filter.protected_users(),
+                cfg!(target_os = "macos") && filter.builtin_enabled(),
             ) {
                 Ok(metadata) => metadata,
                 Err(blocked) => return blocked,
@@ -4096,6 +4131,7 @@ mod tests {
     #[test]
     fn protection_metadata_requires_each_complete_observation() {
         let observed = ["sleep", "sleep 60", "worker"];
+        let protected_users = HashSet::from(["administrator".to_string()]);
         for (missing, field) in [
             (0, "process name"),
             (1, "command line"),
@@ -4105,7 +4141,18 @@ mod tests {
                 let mut values = observed.map(|value| Some(value.to_string()));
                 values[missing] = unavailable;
                 let [comm, cmdline, user] = values;
-                let result = required_protection_metadata(42, comm, cmdline, user);
+                let owner = user.map(|name| ProtectionOwner {
+                    uid: 1000,
+                    name: Some(name),
+                });
+                let result = required_protection_metadata(
+                    42,
+                    comm,
+                    cmdline,
+                    owner,
+                    &protected_users,
+                    false,
+                );
                 assert!(matches!(
                     result,
                     Err(PreCheckResult::Blocked { check: PreCheck::CheckNotProtected, reason })
@@ -4119,7 +4166,12 @@ mod tests {
                 42,
                 Some("ssh".to_string()),
                 Some("ssh -M -N host".to_string()),
-                Some("worker".to_string()),
+                Some(ProtectionOwner {
+                    uid: 1000,
+                    name: Some("worker".to_string()),
+                }),
+                &protected_users,
+                false,
             )
             .unwrap(),
             (
@@ -4128,6 +4180,82 @@ mod tests {
                 "worker".to_string()
             )
         );
+    }
+
+    #[test]
+    fn numeric_owner_protection_survives_resolved_and_unavailable_names() {
+        for name in [None, Some("alice"), Some("1000"), Some(""), Some(" \n")] {
+            for users in [&["1000"][..], &["01000"][..], &["alice", "1000"][..]] {
+                let protected_users = users.iter().map(|user| user.to_string()).collect();
+                let result = required_protection_metadata(
+                    42,
+                    Some("sleep".to_string()),
+                    Some("sleep 60".to_string()),
+                    Some(ProtectionOwner {
+                        uid: 1000,
+                        name: name.map(str::to_string),
+                    }),
+                    &protected_users,
+                    true,
+                );
+                assert!(matches!(
+                    result,
+                    Err(PreCheckResult::Blocked { check: PreCheck::CheckNotProtected, reason })
+                        if reason == "owned by protected user UID: 1000"
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn unresolved_owner_names_never_bypass_named_rules_or_macos_placement() {
+        let metadata = |name: Option<&str>, users: &[&str], require_name: bool| {
+            let protected_users = users.iter().map(|user| user.to_string()).collect();
+            required_protection_metadata(
+                42,
+                Some("sleep".to_string()),
+                Some("sleep 60".to_string()),
+                Some(ProtectionOwner {
+                    uid: 1000,
+                    name: name.map(str::to_string),
+                }),
+                &protected_users,
+                require_name,
+            )
+        };
+        for name in [None, Some(""), Some(" \n")] {
+            for users in [&["alice"][..], &["root"][..], &["alice", "2000"][..]] {
+                assert!(matches!(
+                    metadata(name, users, false),
+                    Err(PreCheckResult::Blocked { check: PreCheck::CheckNotProtected, reason })
+                        if reason.contains("PID 42") && reason.contains("process owner name")
+                            && reason.contains("protection evidence unavailable")
+                ));
+            }
+            // Numeric ownership is sufficient only if no name-based rule or
+            // platform placement requires a resolved account name.
+            for users in [&[][..], &["2000"][..]] {
+                assert_eq!(metadata(name, users, false).unwrap().2, "1000");
+                assert!(matches!(
+                    metadata(name, users, true),
+                    Err(PreCheckResult::Blocked { check: PreCheck::CheckNotProtected, reason })
+                        if reason.contains("process owner name")
+                ));
+            }
+        }
+        assert_eq!(metadata(Some("worker"), &["alice"], true).unwrap().2, "worker");
+        assert!(matches!(
+            required_protection_metadata(
+                42,
+                Some("sleep".to_string()),
+                Some("sleep 60".to_string()),
+                None,
+                &HashSet::new(),
+                false,
+            ),
+            Err(PreCheckResult::Blocked { check: PreCheck::CheckNotProtected, reason })
+                if reason.contains("process owner")
+        ));
     }
 
     #[test]
@@ -8051,12 +8179,20 @@ while True:
                 PreCheckResult::Blocked { check: PreCheck::CheckNotProtected, reason }
                     if reason.contains(&command_rule)
             ));
-            let owner = control.read_user(child.0.id()).unwrap();
-            let owner_protected = provider(&[], std::slice::from_ref(&owner));
+            let owner = control.read_owner(child.0.id()).unwrap();
+            let user = owner.name.unwrap_or_else(|| owner.uid.to_string());
+            let owner_protected = provider(&[], std::slice::from_ref(&user));
             assert!(matches!(
                 owner_protected.check_not_protected(child.0.id()),
                 PreCheckResult::Blocked { check: PreCheck::CheckNotProtected, reason }
-                    if reason.contains("owned by protected user") && reason.contains(&owner)
+                    if reason.contains("owned by protected user") && reason.contains(&user)
+            ));
+            // A normal resolved account name must not hide an explicit UID rule.
+            let numeric_protected = provider(&[], &[owner.uid.to_string()]);
+            assert!(matches!(
+                numeric_protected.check_not_protected(child.0.id()),
+                PreCheckResult::Blocked { check: PreCheck::CheckNotProtected, reason }
+                    if reason == format!("owned by protected user UID: {}", owner.uid)
             ));
             assert!(control.check_not_protected(child.0.id()).is_passed());
         }
@@ -8182,11 +8318,16 @@ while True:
         }
 
         #[test]
-        fn live_provider_read_user_self() {
+        fn live_provider_read_owner_self() {
             let provider = LivePreCheckProvider::with_defaults();
             let pid = std::process::id();
-            let user = provider.read_user(pid);
-            assert!(user.is_some());
+            let owner = provider.read_owner(pid).expect("read live numeric ownership");
+            // SAFETY: getuid only reads this process's real credentials.
+            assert_eq!(owner.uid, unsafe { libc::getuid() });
+            assert!(owner
+                .name
+                .as_deref()
+                .is_none_or(|name| !name.trim().is_empty()));
         }
 
         #[test]

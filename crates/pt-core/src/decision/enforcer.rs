@@ -721,8 +721,22 @@ impl PolicyEnforcer {
             }
         }
 
-        // Check protected group
-        if let Some(ref group) = candidate.group {
+        // A missing group is not evidence of non-membership. Live callers may
+        // lack this observation, but must still honor explicit group protection.
+        if !self.protected_groups.is_empty() {
+            let Some(group) = candidate
+                .group
+                .as_deref()
+                .filter(|group| !group.trim().is_empty())
+            else {
+                return PolicyCheckResult::blocked(PolicyViolation {
+                    kind: ViolationKind::ProtectedGroup,
+                    message: "process group evidence is unavailable; cannot evaluate configured protected groups"
+                        .to_string(),
+                    rule: "guardrails.protected_groups".to_string(),
+                    context: None,
+                });
+            };
             if self.protected_groups.contains(&group.to_lowercase()) {
                 return PolicyCheckResult::blocked(PolicyViolation {
                     kind: ViolationKind::ProtectedGroup,
@@ -3084,6 +3098,71 @@ mod tests {
 
         let result = enforcer.check_action(&candidate, Action::Kill, false);
         assert!(!result.allowed);
+    }
+
+    #[test]
+    fn protected_groups_refuse_missing_evidence_for_interventions() {
+        let mut policy = test_policy();
+        policy.guardrails.protected_groups = vec!["wheel".to_string()];
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
+
+        for group in [None, Some(String::new()), Some("  ".to_string())] {
+            let mut candidate = test_candidate();
+            candidate.group = group;
+            for robot in [false, true] {
+                for action in [Action::Kill, Action::Restart, Action::Pause, Action::Renice] {
+                    let result = enforcer.check_action(&candidate, action, robot);
+                    assert!(!result.allowed, "{action:?}, robot={robot}");
+                    let violation = result.violation.unwrap();
+                    assert_eq!(violation.kind, ViolationKind::ProtectedGroup);
+                    assert_eq!(violation.rule, "guardrails.protected_groups");
+                    assert!(violation.message.contains("evidence is unavailable"));
+                }
+                assert!(enforcer.check_action(&candidate, Action::Keep, robot).allowed);
+            }
+        }
+    }
+
+    #[test]
+    fn group_evidence_is_required_only_when_group_rules_exist() {
+        let mut candidate = test_candidate();
+        candidate.group = None;
+        let mut policy = test_policy();
+        policy.guardrails.protected_groups.clear();
+        assert!(
+            PolicyEnforcer::new(&policy, None)
+                .unwrap()
+                .check_action(&candidate, Action::Kill, false)
+                .allowed
+        );
+
+        policy.guardrails.protected_groups = vec!["wheel".to_string()];
+        candidate.group = Some("developers".to_string());
+        assert!(
+            PolicyEnforcer::new(&policy, None)
+                .unwrap()
+                .check_action(&candidate, Action::Kill, false)
+                .allowed
+        );
+    }
+
+    #[test]
+    fn recorded_group_rules_cannot_be_bypassed_by_missing_current_evidence() {
+        let mut current = test_policy();
+        current.guardrails.protected_groups.clear();
+        let mut recorded = current.clone();
+        recorded.guardrails.protected_groups = vec!["wheel".to_string()];
+        let mut candidate = test_candidate();
+        candidate.group = None;
+
+        for (current, recorded) in [(&current, &recorded), (&recorded, &current)] {
+            let enforcer =
+                PolicyEnforcer::new_with_recorded_policy(current, Some(recorded), None).unwrap();
+            let result = enforcer.check_action(&candidate, Action::Kill, false);
+            assert!(!result.allowed);
+            assert_eq!(result.violation.unwrap().rule, "guardrails.protected_groups");
+            assert!(enforcer.check_action(&candidate, Action::Keep, false).allowed);
+        }
     }
 
     // ── Force review in robot mode (enabled) ────────────────────────
