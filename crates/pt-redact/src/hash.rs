@@ -25,7 +25,7 @@ impl KeyMaterial {
     /// Create new key material with a random key.
     pub fn generate(key_id: &str) -> Result<Self> {
         let mut key = [0u8; 32];
-        getrandom::getrandom(&mut key).map_err(|e| {
+        getrandom::fill(&mut key).map_err(|e| {
             RedactionError::KeyError(format!("failed to generate random key: {}", e))
         })?;
         Ok(Self {
