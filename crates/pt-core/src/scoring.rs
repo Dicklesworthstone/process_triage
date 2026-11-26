@@ -1462,7 +1462,12 @@ impl Scorer {
         }
     }
 
-    /// Score one process from its evidence (usually `Evidence::from_snapshot`, plus
+    /// Map a kernel observation into this scorer's configured state categories.
+    pub fn snapshot_evidence(&self, proc: &ProcessRecord) -> Evidence {
+        Evidence::from_snapshot_with_priors(proc, &self.priors)
+    }
+
+    /// Score one process from its evidence (usually `snapshot_evidence`, plus
     /// any deep-scan signals). `None` if the posterior cannot be computed.
     pub fn score(&self, proc: &ProcessRecord, evidence: Evidence) -> Option<ProcessScore<'_>> {
         self.score_with_desktop(proc, evidence, desktop_app_unit_for(proc))
@@ -2844,6 +2849,100 @@ mod tests {
     }
 
     const FOUR_DAYS: Duration = Duration::from_secs(4 * 24 * 3600);
+
+    #[test]
+    fn snapshot_scores_follow_named_kernel_states_across_model_orders_and_encodings() {
+        let reference = scorer(SignatureDatabase::new());
+        let mut reordered = reference.clone();
+        let flags = reordered.priors.state_flags.as_mut().unwrap();
+        flags.flag_names = ["X", "Z", "R", "I", "D", "T", "S"]
+            .map(str::to_string)
+            .to_vec();
+        let order = [6, 3, 0, 5, 2, 4, 1];
+        for class in [
+            &mut flags.useful,
+            &mut flags.useful_bad,
+            &mut flags.abandoned,
+            &mut flags.zombie,
+        ] {
+            let alpha = &mut class.as_mut().unwrap().alpha;
+            *alpha = order.map(|i| alpha[i]).to_vec();
+        }
+
+        let mut process = record(4212, "worker", "worker", Duration::from_secs(60));
+        for (state, expected_index) in [
+            (ProcessState::Running, 2),
+            (ProcessState::Sleeping, 6),
+            (ProcessState::DiskSleep, 4),
+            (ProcessState::Zombie, 1),
+            (ProcessState::Stopped, 5),
+            (ProcessState::Idle, 3),
+            (ProcessState::Dead, 0),
+        ] {
+            process.state = state;
+            let evidence = reordered.snapshot_evidence(&process);
+            assert_eq!(evidence.state_flag, Some(expected_index));
+            let observed = reference.recorded_observations(&process, None);
+            let expected = reference
+                .score_recorded(
+                    &process,
+                    reference.snapshot_evidence(&process),
+                    observed.clone(),
+                )
+                .unwrap();
+            let actual = reordered
+                .score_recorded(&process, evidence, observed)
+                .unwrap();
+            let left = actual.posterior.posterior;
+            let right = expected.posterior.posterior;
+            for (a, b) in [
+                (left.useful, right.useful),
+                (left.useful_bad, right.useful_bad),
+                (left.abandoned, right.abandoned),
+                (left.zombie, right.zombie),
+            ] {
+                assert!((a - b).abs() < 1e-12, "{state:?}: {left:?} != {right:?}");
+            }
+            assert_eq!(actual.ledger.classification, expected.ledger.classification);
+            let explanation =
+                crate::inference::build_process_explanation(&process, &reordered.priors);
+            assert_eq!(explanation["evidence"]["state_flag"], expected_index);
+            assert_eq!(
+                explanation["classification"],
+                actual.ledger.classification.label()
+            );
+        }
+    }
+
+    #[test]
+    fn unmodeled_ambiguous_and_unknown_kernel_states_leave_other_evidence_intact() {
+        let mut custom = scorer(SignatureDatabase::new());
+        let flags = custom.priors.state_flags.as_mut().unwrap();
+        flags.flag_names = ["Zombie", "T", "t"].map(str::to_string).to_vec();
+        for class in [
+            &mut flags.useful,
+            &mut flags.useful_bad,
+            &mut flags.abandoned,
+            &mut flags.zombie,
+        ] {
+            class.as_mut().unwrap().alpha.truncate(3);
+        }
+        let mut process = record(4212, "worker", "worker", Duration::from_secs(60));
+        for state in [
+            ProcessState::Sleeping,
+            ProcessState::Stopped,
+            ProcessState::Unknown,
+        ] {
+            process.state = state;
+            let evidence = custom.snapshot_evidence(&process);
+            assert_eq!(evidence.state_flag, None);
+            let observed = custom.recorded_observations(&process, None);
+            let score = custom.score_recorded(&process, evidence, observed).unwrap();
+            let terms = &score.posterior.evidence_terms;
+            assert!(terms.iter().any(|term| term.feature == "runtime"));
+            assert!(terms.iter().all(|term| term.feature != "state_flag"));
+        }
+    }
 
     fn agent_record(pid: u32, parent: u32, command: &str) -> ProcessRecord {
         let mut process = record(

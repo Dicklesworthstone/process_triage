@@ -240,32 +240,9 @@ pub fn default_glyph_map() -> std::collections::HashMap<String, char> {
 }
 
 pub fn build_process_explanation(proc: &ProcessRecord, priors: &Priors) -> serde_json::Value {
-    // 1. Convert ProcessRecord to Evidence
-    // This requires mapping logic which is likely in decision/mod.rs or inference/mod.rs
-    // For now, we'll construct minimal evidence based on the record
-    use crate::inference::{compute_posterior, CpuEvidence, Evidence};
+    use crate::inference::{compute_posterior, Evidence};
 
-    let state_flag = priors.state_flags.as_ref().and_then(|sf| {
-        let state_str = proc.state.to_string();
-        sf.flag_names.iter().position(|name| name == &state_str)
-    });
-
-    let evidence = Evidence {
-        cpu: Some(CpuEvidence::Fraction {
-            occupancy: (proc.cpu_percent / 100.0).clamp(0.0, 1.0),
-        }),
-        runtime_seconds: Some(proc.elapsed.as_secs_f64()),
-        orphan: Some(proc.ppid.0 == 1),
-        tty: Some(proc.tty.is_some()),
-        // Other fields would come from deep scan if available
-        net: None,
-        io_active: None,
-        state_flag,
-        command_category: None, // Needs category mapping
-        queue_saturated: None,
-    };
-
-    // 2. Compute posterior
+    let evidence = Evidence::from_snapshot_with_priors(proc, priors);
     let result = match compute_posterior(priors, &evidence) {
         Ok(res) => res,
         Err(e) => {
@@ -276,64 +253,15 @@ pub fn build_process_explanation(proc: &ProcessRecord, priors: &Priors) -> serde
         }
     };
 
-    // 3. Determine classification and confidence
-    let (class, prob) = if result.posterior.abandoned > result.posterior.useful {
-        ("abandoned", result.posterior.abandoned)
-    } else {
-        ("useful", result.posterior.useful)
+    let ledger = EvidenceLedger::from_posterior_result(&result, Some(proc.pid.0), None);
+    let class = ledger.classification.label();
+    let prob = match ledger.classification {
+        Classification::Useful => result.posterior.useful,
+        Classification::UsefulBad => result.posterior.useful_bad,
+        Classification::Abandoned => result.posterior.abandoned,
+        Classification::Zombie => result.posterior.zombie,
     };
 
-    let confidence = if prob > 0.99 {
-        Confidence::VeryHigh
-    } else if prob > 0.95 {
-        Confidence::High
-    } else if prob > 0.80 {
-        Confidence::Medium
-    } else {
-        Confidence::Low
-    };
-
-    // 4. Calculate per-feature Bayes Factors (Abandoned vs Useful)
-    let mut bfs: Vec<BayesFactorEntry> = Vec::new();
-    for term in &result.evidence_terms {
-        let log_bf = term.log_likelihood.abandoned - term.log_likelihood.useful;
-        if log_bf.abs() < 0.01 {
-            continue;
-        }
-        let bf = log_bf.exp();
-        let delta_bits = log_bf / std::f64::consts::LN_2;
-        let direction = if log_bf > 0.0 {
-            "supports abandoned".to_string()
-        } else {
-            "supports useful".to_string()
-        };
-        let abs_bits = delta_bits.abs();
-        let strength = if abs_bits > 3.3 {
-            "decisive".to_string()
-        } else if abs_bits > 2.0 {
-            "strong".to_string()
-        } else if abs_bits > 1.0 {
-            "substantial".to_string()
-        } else {
-            "weak".to_string()
-        };
-        bfs.push(BayesFactorEntry {
-            feature: term.feature.clone(),
-            bf,
-            log_bf,
-            delta_bits,
-            direction,
-            strength,
-        });
-    }
-    bfs.sort_by(|a, b| {
-        b.delta_bits
-            .abs()
-            .partial_cmp(&a.delta_bits.abs())
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    // 5. Generate summary
     let summary = format!(
         "Process {} is likely {} ({:.1}% confidence).",
         proc.pid.0,
@@ -344,9 +272,9 @@ pub fn build_process_explanation(proc: &ProcessRecord, priors: &Priors) -> serde
     serde_json::json!({
         "pid": proc.pid.0,
         "classification": class,
-        "confidence": confidence.to_string(),
+        "confidence": ledger.confidence.to_string(),
         "posterior": result.posterior,
-        "bayes_factors": bfs,
+        "bayes_factors": ledger.bayes_factors,
         "why_summary": summary,
         "evidence": evidence_to_json(&evidence),
     })

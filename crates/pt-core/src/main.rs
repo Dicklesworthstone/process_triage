@@ -7607,7 +7607,7 @@ fn compute_probe_advice(
     let cost_model = pt_core::decision::ProbeCostModel::default();
 
     for &proc in processes {
-        let Some(score) = scorer.score(proc, Evidence::from_snapshot(proc)) else {
+        let Some(score) = scorer.score(proc, scorer.snapshot_evidence(proc)) else {
             continue;
         };
         let (feasibility, _) = candidate_action_capabilities(proc, &score);
@@ -9184,7 +9184,7 @@ fn build_tui_rows(
             net: deep.and_then(|d| d.net_active),
             io_active: deep.and_then(|d| d.io_active),
             queue_saturated: deep.and_then(|d| d.queue_saturated),
-            ..Evidence::from_snapshot(proc)
+            ..scorer.snapshot_evidence(proc)
         };
 
         let Some(score) = scorer.score(proc, evidence) else {
@@ -25585,7 +25585,7 @@ mod process_tree_safety_tests {
                 ProcessState::Sleeping,
             );
             let posterior = scorer
-                .score(&process, Evidence::from_snapshot(&process))
+                .score(&process, scorer.snapshot_evidence(&process))
                 .unwrap();
             assert!((posterior.posterior.posterior.intervention_probability() - 0.6).abs() < 1e-10);
             let mut policy = pt_core::config::Policy::default();
@@ -30604,7 +30604,6 @@ mod tui_learning_tests {
     use pt_core::config::Priors;
     use pt_core::decision::decision_store::DecisionStore;
     use pt_core::decision::{decide_action, Action, ActionFeasibility};
-    use pt_core::inference::Evidence;
     use pt_core::plan::{
         ActionConfidence, ActionRationale, ActionRouting, ActionTimeouts, GatesSummary, Plan,
         PlanAction,
@@ -30707,7 +30706,7 @@ mod tui_learning_tests {
             Default::default(),
         );
         let score = scorer
-            .score(&process, Evidence::from_snapshot(&process))
+            .score(&process, scorer.snapshot_evidence(&process))
             .expect("recorded model prediction");
         let decision = decide_action(
             &score.posterior.posterior,
@@ -32694,7 +32693,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
         let mut action_inputs = HashMap::new();
         let mut supervision = pt_core::supervision::SupervisionDetector::for_scan();
         for proc in plan_eligible {
-            let Some(score) = scorer.score(proc, Evidence::from_snapshot(proc)) else {
+            let Some(score) = scorer.score(proc, scorer.snapshot_evidence(proc)) else {
                 completion.record_inference_error(proc.pid.0, "Process scoring unavailable");
                 continue;
             };
@@ -36279,7 +36278,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             net: deep.and_then(|d| d.net_active),
             io_active: deep.and_then(|d| d.io_active),
             queue_saturated: deep.and_then(|d| d.queue_saturated),
-            ..Evidence::from_snapshot(proc)
+            ..scorer.snapshot_evidence(proc)
         };
 
         // One scoring path for every surface: learned verdicts, signatures (and their
@@ -38303,7 +38302,7 @@ fn build_process_explanation(
 ) -> serde_json::Value {
     // Scored through the same path as `agent plan`: learned verdicts,
     // signatures, desktop-app ownership, provenance, and sampled activity.
-    let Some(score) = scorer.score(proc, Evidence::from_snapshot(proc)) else {
+    let Some(score) = scorer.score(proc, scorer.snapshot_evidence(proc)) else {
         return serde_json::json!({
             "pid": proc.pid.0,
             "comm": proc.comm,
@@ -46310,7 +46309,7 @@ fn evaluate_watch_candidate(
     supervision: &mut pt_core::supervision::SupervisionDetector,
     pressure: &PlanningPressure,
 ) -> Option<WatchEval> {
-    let score = scorer.score(proc, Evidence::from_snapshot(proc))?;
+    let score = scorer.score(proc, scorer.snapshot_evidence(proc))?;
     let (feasibility, memory_cap) = candidate_action_capabilities(proc, &score);
     let inputs = prepare_pressure_decision(
         &score.posterior.posterior,

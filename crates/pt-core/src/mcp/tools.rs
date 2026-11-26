@@ -291,7 +291,7 @@ impl Evaluator {
     }
 
     fn evidence(&self, process: &ProcessRecord) -> crate::inference::Evidence {
-        let evidence = crate::inference::Evidence::from_snapshot(process);
+        let evidence = self.scorer.snapshot_evidence(process);
         #[cfg(target_os = "linux")]
         let evidence = crate::inference::Evidence {
             net: self

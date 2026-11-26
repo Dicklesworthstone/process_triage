@@ -587,7 +587,11 @@ pub fn replay_scores(
         } else if let Some(observations) = &input.observations {
             match scorer.score_recorded(
                 process,
-                build_evidence(process, snapshot.deep_signals.get(&process.pid.0)),
+                build_evidence(
+                    process,
+                    snapshot.deep_signals.get(&process.pid.0),
+                    &scorer.priors,
+                ),
                 observations.clone(),
             ) {
                 Some(score) => {
@@ -766,7 +770,7 @@ pub fn replay_inference(
         let deep = snapshot.deep_signals.get(&proc.pid.0);
 
         // Build evidence from the process record + optional deep signals
-        let evidence = build_evidence(proc, deep);
+        let evidence = build_evidence(proc, deep, priors);
 
         // Compute posterior
         let posterior =
@@ -803,11 +807,15 @@ pub fn replay_inference(
 }
 
 /// Use the same snapshot evidence mapping as live scoring.
-fn build_evidence(proc: &ProcessRecord, deep: Option<&DeepSignalRecord>) -> Evidence {
+fn build_evidence(
+    proc: &ProcessRecord,
+    deep: Option<&DeepSignalRecord>,
+    priors: &Priors,
+) -> Evidence {
     Evidence {
         net: deep.and_then(|signal| signal.net_active),
         io_active: deep.and_then(|signal| signal.io_active),
-        ..Evidence::from_snapshot(proc)
+        ..Evidence::from_snapshot_with_priors(proc, priors)
     }
 }
 
@@ -1384,7 +1392,7 @@ mod tests {
             .elapsed_secs(0)
             .state(crate::collect::ProcessState::Dead)
             .build();
-        let evidence = build_evidence(&process, None);
+        let evidence = build_evidence(&process, None, &Priors::default());
         assert_eq!(evidence.runtime_seconds, None);
         assert_eq!(evidence.state_flag, Some(6));
     }
@@ -1518,7 +1526,7 @@ mod tests {
             io_active: Some(false),
         };
 
-        let evidence = build_evidence(&proc, Some(&deep));
+        let evidence = build_evidence(&proc, Some(&deep), &Priors::default());
         assert!(evidence.cpu.is_some());
         assert_eq!(evidence.runtime_seconds, Some(3600.0));
         assert_eq!(evidence.net, Some(true));

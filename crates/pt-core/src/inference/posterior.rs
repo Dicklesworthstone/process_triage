@@ -3,6 +3,7 @@
 //! Combines class priors with per-feature likelihoods in log-domain and
 //! returns normalized posteriors plus log-odds.
 
+use crate::collect::ProcessState;
 use crate::config::priors::{ClassParams, CommandCategories, DirichletParams, Priors, StateFlags};
 use pt_math::math::precomputed::{CachedBetaPrior, CachedGammaPrior};
 use pt_math::{log_beta, log_beta_pdf, log_gamma, normalize_log_probs_array};
@@ -30,6 +31,7 @@ pub struct Evidence {
     pub tty: Option<bool>,
     pub net: Option<bool>,
     pub io_active: Option<bool>,
+    /// Index into the active priors' `state_flags.flag_names` and Dirichlet vectors.
     pub state_flag: Option<usize>,
     pub command_category: Option<usize>,
     /// Queue saturation signal from queueing-theoretic stall detection.
@@ -97,12 +99,62 @@ pub struct EvidenceTerm {
     pub log_likelihood: ClassScores,
 }
 
+// The built-in model order is retained for callers constructing default-model
+// evidence. Configured models identify the same kernel observations by label.
+const DEFAULT_KERNEL_STATES: [(ProcessState, &str); 7] = [
+    (ProcessState::Running, "Running"),
+    (ProcessState::Sleeping, "Sleeping"),
+    (ProcessState::DiskSleep, "DiskSleep"),
+    (ProcessState::Zombie, "Zombie"),
+    (ProcessState::Stopped, "Stopped"),
+    (ProcessState::Idle, "Idle"),
+    (ProcessState::Dead, "Dead"),
+];
+
+fn kernel_state_for_label(label: &str) -> Option<ProcessState> {
+    if label.len() == 1 {
+        let state = ProcessState::from_char(char::from(label.as_bytes()[0]));
+        return (state != ProcessState::Unknown).then_some(state);
+    }
+    DEFAULT_KERNEL_STATES
+        .iter()
+        .find(|(_, name)| name.eq_ignore_ascii_case(label))
+        .map(|(state, _)| *state)
+}
+
 impl Evidence {
-    /// Evidence available from a single quick-scan record (CPU occupancy, runtime,
-    /// orphan, controlling TTY, kernel state): the same features `agent plan`,
-    /// `agent explain` and the TUI start from before deep/provenance evidence.
+    /// Quick-scan evidence for the built-in order of state flags. For a configured
+    /// model, use `from_snapshot_with_priors` so indices match its Dirichlet vectors.
     pub fn from_snapshot(proc: &crate::collect::ProcessRecord) -> Self {
-        use crate::collect::ProcessState;
+        let state_flag = DEFAULT_KERNEL_STATES
+            .iter()
+            .position(|(state, _)| *state == proc.state);
+        Self::from_snapshot_with_state_flag(proc, state_flag)
+    }
+
+    /// Quick-scan evidence bound to the active model's named state categories.
+    pub fn from_snapshot_with_priors(
+        proc: &crate::collect::ProcessRecord,
+        priors: &Priors,
+    ) -> Self {
+        let state_flag = priors.state_flags.as_ref().and_then(|flags| {
+            let mut matches = flags
+                .flag_names
+                .iter()
+                .enumerate()
+                .filter(|(_, label)| kernel_state_for_label(label) == Some(proc.state));
+            let (index, _) = matches.next()?;
+            // A scan normalizes e.g. T and t to Stopped. If both are modeled
+            // separately, this observation cannot identify either category.
+            matches.next().is_none().then_some(index)
+        });
+        Self::from_snapshot_with_state_flag(proc, state_flag)
+    }
+
+    fn from_snapshot_with_state_flag(
+        proc: &crate::collect::ProcessRecord,
+        state_flag: Option<usize>,
+    ) -> Self {
         Evidence {
             cpu: Some(CpuEvidence::Fraction {
                 occupancy: (proc.cpu_percent / 100.0).clamp(0.0, 1.0),
@@ -115,16 +167,7 @@ impl Evidence {
             tty: Some(proc.has_tty()),
             net: None,
             io_active: None,
-            state_flag: match proc.state {
-                ProcessState::Running => Some(0),
-                ProcessState::Sleeping => Some(1),
-                ProcessState::DiskSleep => Some(2),
-                ProcessState::Zombie => Some(3),
-                ProcessState::Stopped => Some(4),
-                ProcessState::Idle => Some(5),
-                ProcessState::Dead => Some(6),
-                ProcessState::Unknown => None,
-            },
+            state_flag,
             command_category: None,
             queue_saturated: None,
         }
@@ -624,7 +667,8 @@ pub(crate) fn compute_posterior_with_activity_expectations(
             .state_flags
             .as_ref()
             .and_then(|f| f.flag_names.get(idx))
-            .is_some_and(|name| name == "Zombie" || name == "Dead")
+            .and_then(|name| kernel_state_for_label(name))
+            .is_some_and(|state| matches!(state, ProcessState::Zombie | ProcessState::Dead))
     });
     for term in evidence_terms.iter_mut().skip(1) {
         if !(terminal_state && term.feature == "state_flag") {
