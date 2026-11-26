@@ -505,7 +505,7 @@ fn is_export_field(key: &str) -> bool {
             signatures metadata name patterns confidence_weight notes builtin priors expectations priority
             process_names arg_patterns environment_vars working_dir_patterns socket_paths pid_files
             parent_patterns min_matches typical_lifetime_seconds max_normal_lifetime_seconds
-            cpu_during_run idle_cpu_normal expected_memory_bytes expects_network expects_disk_io
+            cpu_during_run idle_cpu_normal idle_disk_io_normal expected_memory_bytes expects_network expects_disk_io
             signature_age_weight system_state pressure assessment sampled_at_ms cpus psi
             some full avg10 avg60 avg300 total_us load one five fifteen runnable meminfo vmstat file_handles macos_pressure
             total_gb available_gb used_gb process_count unavailable source reason load_ratio

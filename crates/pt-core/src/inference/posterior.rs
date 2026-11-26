@@ -312,15 +312,16 @@ pub fn compute_posterior(
     priors: &Priors,
     evidence: &Evidence,
 ) -> Result<PosteriorResult, PosteriorError> {
-    compute_posterior_with_cpu_expectation(priors, evidence, false)
+    compute_posterior_with_activity_expectations(priors, evidence, false, false)
 }
 
-/// Apply the ordinary CPU model with an optional directional bound for signatures
-/// whose useful processes routinely wait for work.
-pub(crate) fn compute_posterior_with_cpu_expectation(
+/// Bound measured inactivity evidence when a matching signature explicitly
+/// describes that behavior as normal. Each signal has its own expectation.
+pub(crate) fn compute_posterior_with_activity_expectations(
     priors: &Priors,
     evidence: &Evidence,
     idle_cpu_normal: bool,
+    idle_disk_io_normal: bool,
 ) -> Result<PosteriorResult, PosteriorError> {
     let cache = hot_path_cache(priors);
     let prior_scores = ClassScores {
@@ -483,7 +484,7 @@ pub(crate) fn compute_posterior_with_cpu_expectation(
     }
 
     if let Some(io_active) = evidence.io_active {
-        let term = ClassScores {
+        let mut term = ClassScores {
             useful: log_lik_optional_beta_bernoulli(
                 io_active,
                 priors.classes.useful.io_active_beta.as_ref(),
@@ -505,6 +506,14 @@ pub(crate) fn compute_posterior_with_cpu_expectation(
                 "io_active",
             )?,
         };
+        if !io_active && idle_disk_io_normal {
+            // Lack of storage traffic is compatible with a healthy service.
+            // Only raise useful likelihoods, so a custom model that already
+            // favors useful work remains informative.
+            let idle_likelihood = term.abandoned.max(term.zombie);
+            term.useful = term.useful.max(idle_likelihood);
+            term.useful_bad = term.useful_bad.max(idle_likelihood);
+        }
         evidence_terms.push(EvidenceTerm {
             feature: "io_active".to_string(),
             log_likelihood: term,

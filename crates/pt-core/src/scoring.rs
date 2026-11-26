@@ -32,7 +32,7 @@ use crate::collect::{ProcessActivity, ProcessRecord};
 use crate::config::{Policy, Priors, ResolvedConfig};
 use crate::decision::decision_store::{DecisionStore, LearnedPrior};
 use crate::decision::respawn_loop::{RespawnHistorySnapshot, RespawnLoopSummary};
-use crate::inference::posterior::compute_posterior_with_cpu_expectation;
+use crate::inference::posterior::compute_posterior_with_activity_expectations;
 use crate::inference::{
     apply_evidence_terms, resolve_priors, try_signature_fast_path, ClassScores, Classification,
     CpuEvidence, Evidence, EvidenceLedger, EvidenceTerm, FastPathConfig, FastPathResult,
@@ -1641,16 +1641,37 @@ impl Scorer {
         // average covers the process lifetime and cannot establish a quiet
         // window. Match the workload by command or arguments, including
         // interpreted servers such as node running the Vite executable.
-        let idle_cpu_normal = activity.as_ref().is_some_and(|sample| {
-            sample.source == "procfs_window" && sample.cpu_ticks.is_some() && evidence.cpu.is_some()
-        }) && signature.as_ref().is_some_and(|matched| {
-            (matched.details.process_name_matched || matched.details.args_matched)
-                && matched.signature.expectations.idle_cpu_normal
-        });
+        let expectations = signature
+            .as_ref()
+            .filter(|matched| matched.details.process_name_matched || matched.details.args_matched)
+            .map(|matched| &matched.signature.expectations);
+        let window = activity
+            .as_ref()
+            .filter(|sample| sample.source == "procfs_window");
+        let idle_cpu_normal = expectations.is_some_and(|expected| expected.idle_cpu_normal)
+            && window.is_some_and(|sample| sample.cpu_ticks.is_some() && evidence.cpu.is_some());
+        let idle_disk_io_normal = expectations.is_some_and(|expected| expected.idle_disk_io_normal)
+            && window.is_some_and(|sample| {
+                sample.io_active == Some(false)
+                    && sample.io_error.is_none()
+                    // Older recordings store the measured rates alone.
+                    && sample.read_bytes_per_second == Some(0.0)
+                    && sample.write_bytes_per_second == Some(0.0)
+                    && sample.io_read_bytes.is_none_or(|bytes| bytes == 0)
+                    && sample.io_write_bytes.is_none_or(|bytes| bytes == 0)
+                    && sample.requested_window_ms > 0
+                    && sample
+                        .io_window_seconds
+                        .is_some_and(|secs| secs.is_finite() && secs >= sample.requested_window_ms as f64 / 1000.0)
+            });
         let resolved = resolve_priors(&prior_context);
-        let mut posterior =
-            compute_posterior_with_cpu_expectation(&resolved.priors, &evidence, idle_cpu_normal)
-                .ok()?;
+        let mut posterior = compute_posterior_with_activity_expectations(
+            &resolved.priors,
+            &evidence,
+            idle_cpu_normal,
+            idle_disk_io_normal,
+        )
+        .ok()?;
         let mut ledger = EvidenceLedger::from_posterior_result(&posterior, Some(pid), None);
         let prior_source = resolved.source_info.source.to_string();
         let signature_verification = signature_candidate
@@ -1720,6 +1741,12 @@ impl Scorer {
         if idle_cpu_normal {
             ledger.top_evidence.push(
                 "The matched signature expects idle CPU. Windowed CPU can support active work, but a quiet window contributes no evidence for abandonment."
+                    .to_string(),
+            );
+        }
+        if idle_disk_io_normal {
+            ledger.top_evidence.push(
+                "The matched signature can wait without disk I/O. Zero bytes read and written during this window do not count against useful work."
                     .to_string(),
             );
         }
@@ -4921,6 +4948,116 @@ int main(int argc, char **argv) {
                         .iter()
                         .any(|line| line.contains("expects idle CPU")),
                     process.pid != build.pid
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quiet_disk_io_expectation_changes_only_measured_silence() {
+        let make_scorer = |idle_disk_io_normal| {
+            let mut db = SignatureDatabase::new();
+            db.add(
+                SupervisorSignature::new("service", SupervisorCategory::Other)
+                    .with_process_patterns(vec![r"^service$"])
+                    .with_expectations(ProcessExpectations {
+                        idle_disk_io_normal,
+                        ..Default::default()
+                    }),
+            )
+            .unwrap();
+            scorer(db)
+        };
+        let baseline = make_scorer(false);
+        let candidate = make_scorer(true);
+        let process = record(1234, "service", "service", FOUR_DAYS);
+        for case in [
+            "idle",
+            "legacy",
+            "active",
+            "missing",
+            "snapshot",
+            "partial",
+            "conflicting",
+            "short",
+        ] {
+            let mut observations = baseline.recorded_observations(&process, None);
+            let mut sample = sampled_idle(&process);
+            match case {
+                "active" => {
+                    sample.io_active = Some(true);
+                    sample.io_read_bytes = Some(4096);
+                    sample.read_bytes_per_second = Some(8192.0);
+                }
+                "missing" => {
+                    sample.io_active = None;
+                    sample.io_error = Some("counter unavailable".into());
+                }
+                "legacy" => {
+                    sample.io_read_bytes = None;
+                    sample.io_write_bytes = None;
+                }
+                "partial" => sample.read_bytes_per_second = None,
+                "conflicting" => sample.io_write_bytes = Some(4096),
+                "short" => sample.io_window_seconds = Some(0.05),
+                _ => {}
+            }
+            if case != "snapshot" {
+                observations.activity = Some(sample);
+            }
+            let evidence = Evidence {
+                io_active: Some(false),
+                ..Evidence::from_snapshot(&process)
+            };
+            let original = baseline
+                .score_recorded(&process, evidence.clone(), observations.clone())
+                .unwrap();
+            let adjusted = candidate
+                .score_recorded(&process, evidence, observations)
+                .unwrap();
+            assert_eq!(
+                adjusted
+                    .ledger
+                    .top_evidence
+                    .iter()
+                    .any(|message| message.contains("can wait without disk I/O")),
+                matches!(case, "idle" | "legacy"),
+                "{case}"
+            );
+            if matches!(case, "idle" | "legacy") {
+                assert!(
+                    adjusted.posterior.posterior.abandonment_probability()
+                        < original.posterior.posterior.abandonment_probability()
+                );
+                for (before, after) in original
+                    .posterior
+                    .evidence_terms
+                    .iter()
+                    .zip(&adjusted.posterior.evidence_terms)
+                {
+                    if before.feature == "io_active" {
+                        let ll = after.log_likelihood;
+                        assert!(ll.useful.min(ll.useful_bad) >= ll.abandoned.max(ll.zombie));
+                    } else {
+                        assert_eq!(before, after);
+                    }
+                }
+            } else {
+                assert_eq!(
+                    original.posterior.evidence_terms, adjusted.posterior.evidence_terms,
+                    "{case}"
+                );
+                assert_eq!(
+                    original.posterior.posterior, adjusted.posterior.posterior,
+                    "{case}"
+                );
+                assert_eq!(
+                    adjusted
+                        .posterior
+                        .evidence_terms
+                        .iter()
+                        .any(|term| term.feature == "io_active"),
+                    case != "missing"
                 );
             }
         }

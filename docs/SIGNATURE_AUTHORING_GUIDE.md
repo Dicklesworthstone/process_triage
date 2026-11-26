@@ -129,6 +129,7 @@ Guidance:
 - `max_normal_lifetime_seconds`: beyond this, process becomes suspicious.
 - `cpu_during_run`: expected CPU fraction (0.0 to 1.0).
 - `idle_cpu_normal`: true if idle CPU is expected.
+- `idle_disk_io_normal` (default `false`) allows a healthy process to go a full sampling interval without disk I/O. Set this for event-driven services or clients waiting on remote work. Observed reads and writes still use the configured I/O likelihoods.
 - `expected_memory_bytes`: rough memory footprint.
 - `expects_network` / `expects_disk_io`: expected IO traits.
 

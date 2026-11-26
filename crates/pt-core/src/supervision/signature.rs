@@ -172,6 +172,10 @@ pub struct ProcessExpectations {
     #[serde(default, skip_serializing_if = "is_false")]
     pub idle_cpu_normal: bool,
 
+    /// Whether healthy instances routinely wait without reading or writing storage.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub idle_disk_io_normal: bool,
+
     /// Expected memory footprint in bytes (rough order of magnitude).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_memory_bytes: Option<u64>,
@@ -215,6 +219,7 @@ impl ProcessExpectations {
             max_normal_lifetime_seconds: None, // Can run indefinitely
             cpu_during_run: Some(0.05),        // Low CPU when serving
             idle_cpu_normal: true,
+            idle_disk_io_normal: true, // Waiting for requests does not require disk traffic
             expects_network: true,
             ..Default::default()
         }
@@ -226,7 +231,8 @@ impl ProcessExpectations {
             typical_lifetime_seconds: Some(3600),     // ~1 hour session
             max_normal_lifetime_seconds: Some(28800), // 8 hours max
             cpu_during_run: Some(0.3),
-            idle_cpu_normal: true, // Idle between requests
+            idle_cpu_normal: true,     // Idle between requests
+            idle_disk_io_normal: true, // An idle file watcher need not touch storage
             expects_network: true,
             expects_disk_io: true, // File watching
             ..Default::default()
@@ -239,6 +245,7 @@ impl ProcessExpectations {
             && self.max_normal_lifetime_seconds.is_none()
             && self.cpu_during_run.is_none()
             && !self.idle_cpu_normal
+            && !self.idle_disk_io_normal
             && self.expected_memory_bytes.is_none()
             && !self.expects_network
             && !self.expects_disk_io
@@ -1980,6 +1987,7 @@ impl SignatureDatabase {
                 .with_priors(SignaturePriors::likely_abandoned())
                 .with_expectations(ProcessExpectations {
                     idle_cpu_normal: true,
+                    idle_disk_io_normal: true, // Compilation I/O happens on the worker
                     ..ProcessExpectations::task_lasting(600, 4 * 3600)
                 })
                 .as_builtin(),
@@ -2787,6 +2795,7 @@ mod tests {
         assert!(exp.typical_lifetime_seconds.is_some());
         assert!(exp.max_normal_lifetime_seconds.is_some());
         assert!(!exp.idle_cpu_normal);
+        assert!(!exp.idle_disk_io_normal);
         assert!(exp.expects_disk_io);
         assert!(!exp.is_empty());
     }
@@ -2799,6 +2808,7 @@ mod tests {
         assert!(exp.typical_lifetime_seconds.is_none());
         assert!(exp.max_normal_lifetime_seconds.is_none());
         assert!(exp.idle_cpu_normal);
+        assert!(exp.idle_disk_io_normal);
         assert!(exp.expects_network);
         assert!(!exp.is_empty());
     }
@@ -2809,6 +2819,7 @@ mod tests {
 
         assert!(exp.typical_lifetime_seconds.is_some());
         assert!(exp.idle_cpu_normal);
+        assert!(exp.idle_disk_io_normal);
         assert!(exp.expects_network);
         assert!(exp.expects_disk_io);
         assert!(!exp.is_empty());
@@ -2846,6 +2857,13 @@ mod tests {
             ..Default::default()
         };
         assert!(!with_cpu.is_empty());
+
+        let legacy: ProcessExpectations =
+            serde_json::from_str(r#"{"idle_cpu_normal":true}"#).unwrap();
+        assert!(!legacy.idle_disk_io_normal);
+        let io_only: ProcessExpectations =
+            serde_json::from_str(r#"{"idle_disk_io_normal":true}"#).unwrap();
+        assert!(!io_only.is_empty());
     }
 
     #[test]
