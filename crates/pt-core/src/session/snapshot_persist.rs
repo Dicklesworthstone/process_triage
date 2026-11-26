@@ -789,8 +789,64 @@ pub fn load_inference_unchecked(
 #[derive(Debug)]
 pub struct RecordedExplanationSnapshot {
     pub candidates: BTreeMap<u32, serde_json::Value>,
+    pub protected: BTreeMap<u32, RecordedProtection>,
     pub source: serde_json::Value,
     pub activity_window_ms: Option<u64>,
+}
+
+#[derive(Debug)]
+pub struct RecordedProtection {
+    pub rule: String,
+    /// Older plans recorded exclusion rules by PID alone.
+    pub start_id: Option<pt_common::StartId>,
+}
+
+fn valid_recorded_start_id(pid: u32, start_id: &str) -> bool {
+    pt_common::StartId::parse(start_id).is_some()
+        && start_id.rsplit(':').next().and_then(|p| p.parse().ok()) == Some(pid)
+}
+
+fn recorded_protection(
+    summary: &serde_json::Value,
+    candidates: &BTreeMap<u32, serde_json::Value>,
+) -> Result<BTreeMap<u32, RecordedProtection>, String> {
+    let rules: BTreeMap<u32, String> = summary
+        .get("protected_by_pid")
+        .map(|rules| serde_json::from_value(rules.clone()))
+        .transpose()
+        .map_err(|error| format!("invalid recorded protection rules: {error}"))?
+        .unwrap_or_default();
+    let start_ids: Option<BTreeMap<u32, pt_common::StartId>> = summary
+        .get("protected_start_ids")
+        .map(|ids| serde_json::from_value(ids.clone()))
+        .transpose()
+        .map_err(|error| format!("invalid recorded protection identities: {error}"))?;
+    if start_ids
+        .as_ref()
+        .is_some_and(|ids| !ids.keys().eq(rules.keys()))
+    {
+        return Err("recorded protection rules and identities disagree".into());
+    }
+    rules
+        .into_iter()
+        .map(|(pid, rule)| {
+            if rule.is_empty() || candidates.contains_key(&pid) {
+                return Err(format!(
+                    "invalid or conflicting recorded protection for PID {pid}"
+                ));
+            }
+            let start_id = start_ids.as_ref().and_then(|ids| ids.get(&pid)).cloned();
+            if start_id
+                .as_ref()
+                .is_some_and(|id| !valid_recorded_start_id(pid, &id.0))
+            {
+                return Err(format!(
+                    "invalid recorded protection identity for PID {pid}"
+                ));
+            }
+            Ok((pid, RecordedProtection { rule, start_id }))
+        })
+        .collect()
 }
 
 fn index_explanation_candidates(
@@ -806,13 +862,7 @@ fn index_explanation_candidates(
         let start_id = candidate["start_id"]
             .as_str()
             .ok_or("recorded candidate has no process birth identity")?;
-        if pt_common::StartId::parse(start_id).is_none()
-            || start_id
-                .rsplit(':')
-                .next()
-                .and_then(|pid| pid.parse::<u32>().ok())
-                != Some(pid)
-        {
+        if !valid_recorded_start_id(pid, start_id) {
             return Err(format!(
                 "recorded PID {pid} has an invalid process birth identity"
             ));
@@ -870,8 +920,10 @@ pub fn load_recorded_explanation_snapshot(
                 let candidates = candidates
                     .as_array()
                     .ok_or("recorded plan candidates must be an array")?;
+                let candidates = index_explanation_candidates(candidates.clone())?;
                 return Ok(RecordedExplanationSnapshot {
-                    candidates: index_explanation_candidates(candidates.clone())?,
+                    protected: recorded_protection(&plan["summary"], &candidates)?,
+                    candidates,
                     source,
                     activity_window_ms: plan["args"]["window_ms"].as_u64(),
                 });
@@ -890,6 +942,7 @@ pub fn load_recorded_explanation_snapshot(
             return plan_source
                 .map(|source| RecordedExplanationSnapshot {
                     candidates: BTreeMap::new(),
+                    protected: BTreeMap::new(),
                     source,
                     activity_window_ms: None,
                 })
@@ -959,6 +1012,7 @@ pub fn load_recorded_explanation_snapshot(
         .collect::<Result<Vec<_>, String>>()?;
     Ok(RecordedExplanationSnapshot {
         candidates: index_explanation_candidates(candidates)?,
+        protected: BTreeMap::new(),
         source: serde_json::json!({
             "artifact": INFERENCE_FILE,
             "integrity_sha256": inference.integrity_sha256,
@@ -1258,6 +1312,31 @@ mod tests {
         assert!(load_recorded_explanation_snapshot(&handle)
             .unwrap_err()
             .contains("invalid recorded plan"));
+    }
+
+    #[test]
+    fn recorded_protection_validates_birth_id_and_handles_pid_only_plans() {
+        let candidates = BTreeMap::new();
+        let mut summary = serde_json::json!({"protected_by_pid": {"12": "builtin.invoker_chain"}});
+        let legacy = recorded_protection(&summary, &candidates).unwrap();
+        assert_eq!(legacy[&12].rule, "builtin.invoker_chain");
+        assert!(legacy[&12].start_id.is_none());
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({"12":"boot:100:11"}),
+            serde_json::json!({"12":"invalid"}),
+            serde_json::json!({"12":"boot:100:12", "13":"boot:101:13"}),
+        ] {
+            summary["protected_start_ids"] = invalid;
+            assert!(recorded_protection(&summary, &candidates).is_err());
+        }
+        summary["protected_start_ids"] = serde_json::json!({"12":"boot:100:12"});
+        let saved = recorded_protection(&summary, &candidates).unwrap();
+        assert_eq!(saved[&12].start_id.as_ref().unwrap().0, "boot:100:12");
+        assert!(
+            recorded_protection(&summary, &BTreeMap::from([(12, serde_json::Value::Null)]))
+                .is_err()
+        );
     }
 
     #[test]

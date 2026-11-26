@@ -296,6 +296,7 @@ fn explain_reports_protection_reason() {
         let plain_pid = plain.id();
         let _plain = ChildGuard { child: plain };
         let mux_pid = _mux.child.id();
+        let invoker_pid = std::process::id();
         std::thread::sleep(Duration::from_millis(300));
 
         let session_id = create_session_with_plan(dir, test_identity(mux_pid), false);
@@ -311,7 +312,7 @@ fn explain_reports_protection_reason() {
             ])
             .arg(&session_id.0)
             .arg("--pids")
-            .arg(format!("{mux_pid},{plain_pid}"))
+            .arg(format!("{mux_pid},{plain_pid},{invoker_pid}"))
             .assert()
             .success()
             .get_output()
@@ -332,6 +333,11 @@ fn explain_reports_protection_reason() {
         assert_eq!(mux["protection"]["rule"], "builtin.multiplexer", "{mux}");
         let plain = by_pid(plain_pid);
         assert_eq!(plain["protection"]["protected"], false, "{plain}");
+        let invoker = by_pid(invoker_pid);
+        assert_eq!(
+            invoker["protection"]["rule"], "builtin.invoker_chain",
+            "{invoker}"
+        );
     });
 }
 
@@ -465,6 +471,8 @@ fn explain_recorded_plan_survives_process_exit_and_configuration_changes() {
         // The producer observes only our owned child, including on root-owned
         // build workers. No action is applied by this test.
         let mut policy = pt_core::config::Policy::default();
+        let protected_pid = std::process::id();
+        policy.guardrails.never_kill_pid.push(protected_pid);
         policy.guardrails.builtin_protection = false;
         policy.guardrails.protected_users.clear();
         policy.guardrails.protected_groups.clear();
@@ -515,6 +523,14 @@ fn explain_recorded_plan_survives_process_exit_and_configuration_changes() {
             .join(session)
             .join("decision/plan.json");
         let original_plan = fs::read(&plan_path).unwrap();
+        let protected_id = plan["summary"]["protected_start_ids"][protected_pid.to_string()]
+            .as_str()
+            .expect("birth identity for excluded PID");
+        let rule = format!("never_kill_pid[{protected_pid}]");
+        assert_eq!(
+            plan["summary"]["protected_by_pid"][protected_pid.to_string()],
+            rule
+        );
         drop(child);
         // A historical explanation must not even need readable current priors.
         fs::write(
@@ -568,6 +584,48 @@ fn explain_recorded_plan_survives_process_exit_and_configuration_changes() {
             candidate["inference"]["learned_prior"]
         );
         assert_eq!(fs::read(&plan_path).unwrap(), original_plan);
+
+        // This identity was explicitly excluded before inference, so the
+        // archived policy reason is available even with invalid current priors.
+        for (birth, status) in [
+            (protected_id.to_owned(), ExitCode::Clean),
+            (
+                format!("another-boot:1:{protected_pid}"),
+                ExitCode::IdentityError,
+            ),
+        ] {
+            let output = pt_core_fast()
+                .env("PROCESS_TRIAGE_DATA", dir.path())
+                .arg("--config")
+                .arg(config.path())
+                .args([
+                    "--format",
+                    "json",
+                    "agent",
+                    "explain",
+                    "--session",
+                    session,
+                    "--target",
+                ])
+                .arg(format!("{protected_pid}:{birth}"))
+                .assert()
+                .code(status.as_i32())
+                .get_output()
+                .stdout
+                .clone();
+            let output: Value = serde_json::from_slice(&output).unwrap();
+            let row = &output["explanations"][0];
+            if status == ExitCode::Clean {
+                assert_eq!(row["protection"]["rule"], rule);
+                assert_eq!(row["start_id"], protected_id);
+                assert_eq!(row["ledger_status"], "not_evaluated");
+                assert!(row["command"].is_null());
+            } else {
+                assert!(row["error"].is_string());
+                assert!(row["protection"].is_null());
+            }
+            assert!(row["posterior"].is_null());
+        }
 
         // A stable target cannot silently degrade to a PID-only lookup.
         let wrong_target = format!("{pid}:different-boot:1:{pid}");

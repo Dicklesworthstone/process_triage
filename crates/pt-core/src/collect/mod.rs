@@ -97,7 +97,8 @@ pub use provenance_continuity::{
     ProvenanceDelta, ResourceChange,
 };
 pub use quick_scan::{
-    parse_ps_output_synthetic_linux, quick_scan, QuickScanError, QuickScanOptions,
+    parse_ps_output_synthetic_linux, quick_scan, scan_explanation_population, QuickScanError,
+    QuickScanOptions,
 };
 pub use resource_collector::collect_local_resource_evidence;
 pub use shared_resource_graph::{BlastRadius, SharedResource, SharedResourceGraph};

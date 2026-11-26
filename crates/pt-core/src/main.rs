@@ -37025,8 +37025,12 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         "protected_filtered": protected_filtered_count,
         "protected_by_rule": protected_by_rule,
         // Per-PID reasons distinguish protection from age/threshold filtering;
-        // expose no command lines or other process metadata for protected rows.
+        // retain only the rule and birth identity for historical explanations.
         "protected_by_pid": protected_rule_by_pid,
+        "protected_start_ids": scan_result.processes.iter()
+            .filter(|proc| protected_rule_by_pid.contains_key(&proc.pid.0))
+            .map(|proc| (proc.pid.0, &proc.start_id))
+            .collect::<BTreeMap<_, _>>(),
         "candidates_evaluated": candidates_evaluated,
         "deep_scan_ms": deep_scan_ms,
         "deep_evidence_pids": deep_signals.as_ref().map(|m| m.len()),
@@ -37680,6 +37684,23 @@ fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
                     }));
                 }
                 Some(candidate) => explanations.push(recorded_process_explanation(candidate, args)),
+                None if recorded.protected.contains_key(pid) => {
+                    let exclusion = &recorded.protected[pid];
+                    if target.as_ref().is_some_and(|(_, id)| exclusion.start_id.as_ref() != Some(id)) {
+                        exit_code = ExitCode::IdentityError;
+                        explanations.push(serde_json::json!({
+                            "pid": pid, "classification": null,
+                            "error": "requested process identity cannot be verified against the recorded protection",
+                        }));
+                    } else {
+                        explanations.push(serde_json::json!({
+                            "pid": pid, "start_id": exclusion.start_id,
+                            "protection": {"protected": true, "rule": exclusion.rule},
+                            "classification": null, "ledger_status": "not_evaluated",
+                            "why_summary": format!("Excluded from inference by {}.", exclusion.rule),
+                        }));
+                    }
+                }
                 None => explanations.push(serde_json::json!({
                     "pid": pid,
                     "error": "process not found in recorded session inference; use --live for a new observation",
@@ -37702,62 +37723,74 @@ fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
                 return ExitCode::InternalError;
             }
         };
-        let scan_options = QuickScanOptions {
-            pids: pids_to_explain.clone(),
-            include_kernel_threads: false,
-            timeout: global.timeout.map(std::time::Duration::from_secs),
-            progress: None,
-        };
-        let mut scan_result = match quick_scan(&scan_options) {
+        let scan_result = match pt_core::collect::scan_explanation_population(
+            &pids_to_explain,
+            global.timeout.map(Duration::from_secs),
+        ) {
             Ok(result) => result,
             Err(error) => {
                 eprintln!("agent explain: scan failed: {error}");
                 return ExitCode::InternalError;
             }
         };
-        if let Some((pid, start_id)) = &target {
-            if scan_result
-                .processes
-                .iter()
-                .any(|process| process.pid.0 == *pid && process.start_id != *start_id)
-            {
-                exit_code = ExitCode::IdentityError;
-                scan_result.processes.clear();
-            }
-        }
+        let targets: Vec<_> = scan_result
+            .processes
+            .iter()
+            .filter(|proc| pids_to_explain.contains(&proc.pid.0))
+            .collect();
+        let filtered = filter_planning_scan(&protected, &scan_result, &mut scorer);
         collect_explain_provenance(
-            global,
             &mut scorer,
-            protected.as_ref(),
+            &scan_result,
+            &filtered.passed,
             min_age_seconds,
-            &scan_result.processes,
+            &targets,
             args.window_ms,
         );
         for pid in &pids_to_explain {
-            match scan_result
-                .processes
-                .iter()
-                .find(|process| process.pid.0 == *pid)
-            {
+            match targets.iter().find(|process| process.pid.0 == *pid) {
+                Some(process)
+                    if target
+                        .as_ref()
+                        .is_some_and(|(_, id)| &process.start_id != id) =>
+                {
+                    exit_code = ExitCode::IdentityError;
+                    explanations.push(serde_json::json!({
+                        "pid": pid, "classification": null,
+                        "error": "requested process identity does not match the live process",
+                    }));
+                }
                 Some(process) => {
                     let mut explanation = build_process_explanation(process, &scorer, args);
-                    if let Some(ref filter) = protected {
-                        explanation["protection"] = explain_protection(filter, process);
-                    }
+                    explanation["protection"] = match filtered
+                        .filtered
+                        .iter()
+                        .find(|m| m.pid == *pid)
+                    {
+                        Some(m) => {
+                            serde_json::json!({"protected": true, "rule": m.pattern, "notes": m.notes})
+                        }
+                        None if scan_result.metadata.warnings.is_empty() => {
+                            serde_json::json!({"protected": false})
+                        }
+                        None => {
+                            serde_json::json!({"protected": null, "notes": "An incomplete process census cannot exclude ancestry-based protection."})
+                        }
+                    };
                     explanations.push(explanation);
                 }
                 None => explanations.push(serde_json::json!({
                     "pid": pid,
-                    "error": if exit_code == ExitCode::IdentityError {
-                        "requested process identity does not match the live process"
-                    } else {
-                        "process not found (may have exited)"
-                    },
+                    "error": "process not found (may have exited)",
                     "classification": null,
                 })),
             }
         }
-        source = serde_json::json!({"observed_at": chrono::Utc::now().to_rfc3339()});
+        source = serde_json::json!({
+            "observed_at": chrono::Utc::now().to_rfc3339(),
+            "census_complete": scan_result.metadata.warnings.is_empty(),
+            "warnings": scan_result.metadata.warnings,
+        });
         activity_window_ms = Some(args.window_ms);
     }
 
@@ -37788,6 +37821,10 @@ fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
         }
         OutputFormat::Summary => {
             for expl in &explanations {
+                if let Some(rule) = expl["protection"]["rule"].as_str() {
+                    println!("[{}] PID {}: protected by {}", sid, expl["pid"], rule);
+                    continue;
+                }
                 if let (Some(pid), Some(class)) = (expl.get("pid"), expl.get("classification")) {
                     let conf = expl
                         .get("confidence")
@@ -37819,6 +37856,13 @@ fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
                     println!("## PID {}\n", pid);
                     println!("Error: {}\n", err);
                     continue;
+                }
+
+                if let Some(rule) = expl["protection"]["rule"].as_str() {
+                    println!("## PID {pid} - protected by {rule}\n");
+                    if !args.live {
+                        continue;
+                    }
                 }
 
                 let class = expl
@@ -37914,7 +37958,7 @@ fn load_priors_for_explain(global: &GlobalOpts) -> Result<ExplainContext, Config
     })?;
     Ok(ExplainContext {
         scorer,
-        protected: Some(protected),
+        protected,
         min_age_seconds: guardrails.min_process_age_seconds,
     })
 }
@@ -37922,7 +37966,7 @@ fn load_priors_for_explain(global: &GlobalOpts) -> Result<ExplainContext, Config
 /// What `agent explain` evaluates a process against.
 struct ExplainContext {
     scorer: Scorer,
-    protected: Option<ProtectedFilter>,
+    protected: ProtectedFilter,
     /// `agent plan`'s default age floor for candidates.
     min_age_seconds: u64,
 }
@@ -37930,35 +37974,13 @@ struct ExplainContext {
 /// Collect target lineage and full-census dependency evidence as `agent plan`
 /// does. Protected/young peers remain visible in the explanation's blast radius.
 fn collect_explain_provenance(
-    global: &GlobalOpts,
     scorer: &mut Scorer,
-    protected: Option<&ProtectedFilter>,
+    population: &ScanResult,
+    passed: &[ProcessRecord],
     min_age_seconds: u64,
-    targets: &[ProcessRecord],
+    targets: &[&ProcessRecord],
     window_ms: u64,
 ) {
-    let scan_options = QuickScanOptions {
-        pids: vec![],
-        include_kernel_threads: false,
-        timeout: global.timeout.map(std::time::Duration::from_secs),
-        progress: None,
-    };
-    let population = match quick_scan(&scan_options) {
-        Ok(result) => result,
-        Err(e) => {
-            eprintln!("agent explain: warning: provenance scan failed: {e}");
-            scorer.collect_activity(
-                &targets.iter().collect::<Vec<_>>(),
-                Duration::from_millis(window_ms),
-            );
-            scorer.prepare_agent_activity(targets, false);
-            scorer.collect_respawn_history(None, &[], chrono::Utc::now());
-            collect_planning_workloads(scorer, &[], false);
-            scorer.collect_supervisor_restarts(&[]);
-            scorer.collect_provenance(&targets.iter().collect::<Vec<_>>(), targets, false);
-            return;
-        }
-    };
     // Descendant work is meaningful even when only the root was requested.
     // Sample the census once, as plan/TUI/watch do, and retain its identities.
     scorer.collect_activity(
@@ -37974,27 +37996,20 @@ fn collect_explain_provenance(
         &population.processes,
         population.metadata.warnings.is_empty(),
     );
-    let history = collect_planning_respawn_history(scorer, &population.processes);
-    if history["available"].as_bool() == Some(false) {
-        eprintln!(
-            "agent explain: respawn history unavailable: {}",
-            history["error"]
-        );
+    if population.metadata.warnings.is_empty() {
+        let history = collect_planning_respawn_history(scorer, &population.processes);
+        if history["available"].as_bool() == Some(false) {
+            eprintln!(
+                "agent explain: respawn history unavailable: {}",
+                history["error"]
+            );
+        }
+    } else {
+        scorer.collect_respawn_history(None, &[], chrono::Utc::now());
     }
     if !cfg!(target_os = "linux") {
         return;
     }
-    let passed = match protected {
-        Some(filter) => filter_planning_scan(filter, &population, scorer).passed,
-        None => {
-            scorer.collect_supervisor_restarts(if population.metadata.warnings.is_empty() {
-                &population.processes
-            } else {
-                &[]
-            });
-            population.processes.clone()
-        }
-    };
     let mut set: Vec<&ProcessRecord> = passed
         .iter()
         .filter(|proc| proc.elapsed.as_secs() >= min_age_seconds)
@@ -38009,31 +38024,6 @@ fn collect_explain_provenance(
         &population.processes,
         population.metadata.warnings.is_empty(),
     );
-}
-
-/// Why a process would be skipped by `agent plan` (not evaluated), if it would be.
-fn explain_protection(filter: &ProtectedFilter, proc: &ProcessRecord) -> serde_json::Value {
-    let hit = filter
-        .is_protected(proc)
-        .map(|m| (m.pattern, m.notes))
-        .or_else(|| {
-            filter
-                .builtin_enabled()
-                .then(|| pt_core::collect::protected::live_service_ancestor(proc.pid.0))
-                .flatten()
-                .map(|(pid, daemon)| {
-                    (
-                        "builtin.service_child".to_string(),
-                        Some(format!("worker/plugin of service {daemon} (pid {pid})")),
-                    )
-                })
-        });
-    match hit {
-        Some((rule, notes)) => {
-            serde_json::json!({ "protected": true, "rule": rule, "notes": notes })
-        }
-        None => serde_json::json!({ "protected": false }),
-    }
 }
 
 /// Build a JSON explanation for a single process.

@@ -1152,6 +1152,48 @@ fn is_kernel_thread(record: &ProcessRecord) -> bool {
     false
 }
 
+/// Inspect explicitly named targets alongside the ordinary planning population.
+/// A failed census can still yield a targeted observation, marked incomplete so
+/// absence of ancestors or peers cannot establish negative protection evidence.
+pub fn scan_explanation_population(
+    pids: &[u32],
+    timeout: Option<Duration>,
+) -> Result<ScanResult, QuickScanError> {
+    explanation_population_with(pids, timeout, quick_scan)
+}
+
+fn explanation_population_with(
+    pids: &[u32],
+    timeout: Option<Duration>,
+    mut scan: impl FnMut(&QuickScanOptions) -> Result<ScanResult, QuickScanError>,
+) -> Result<ScanResult, QuickScanError> {
+    let mut options = QuickScanOptions {
+        include_kernel_threads: true,
+        timeout,
+        ..Default::default()
+    };
+    match scan(&options) {
+        Ok(mut population) => {
+            let requested: HashSet<_> = pids.iter().copied().collect();
+            population
+                .processes
+                .retain(|record| !is_kernel_thread(record) || requested.contains(&record.pid.0));
+            population.metadata.process_count = population.processes.len();
+            Ok(population)
+        }
+        Err(error) if !pids.is_empty() => {
+            options.pids = pids.to_vec();
+            let mut targets = scan(&options)?;
+            targets
+                .metadata
+                .warnings
+                .push(format!("Full process census unavailable: {error}"));
+            Ok(targets)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2244,6 +2286,58 @@ mod tests {
             is_kernel_thread(&kthreadd),
             "kthreadd should be detected as kernel thread"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn explanation_population_preserves_explicit_kernel_targets_and_falls_back_on_census_failure() {
+        let census = ScanResult {
+            metadata: ScanMetadata {
+                scan_type: "quick".into(),
+                platform: "linux".into(),
+                boot_id: None,
+                started_at: "2026-01-01T00:00:00Z".into(),
+                duration_ms: 1,
+                process_count: 3,
+                warnings: vec![],
+            },
+            processes: vec![
+                make_record(177, 2, "[kworker]", ProcessState::Sleeping),
+                make_record(178, 2, "[kworker]", ProcessState::Sleeping),
+                make_record(216, 10, "sleep", ProcessState::Sleeping),
+            ],
+        };
+        let population = explanation_population_with(&[177], None, |options| {
+            assert!(options.include_kernel_threads && options.pids.is_empty());
+            Ok(census.clone())
+        })
+        .unwrap();
+        assert_eq!(
+            population
+                .processes
+                .iter()
+                .map(|p| p.pid.0)
+                .collect::<Vec<_>>(),
+            [177, 216]
+        );
+        assert_eq!(population.metadata.process_count, 2);
+        assert!(population.metadata.warnings.is_empty());
+
+        let partial = explanation_population_with(&[177], None, |options| {
+            if options.pids.is_empty() {
+                return Err(QuickScanError::CommandFailed(
+                    "fixture census failure".into(),
+                ));
+            }
+            assert_eq!(options.pids, [177]);
+            let mut targets = census.clone();
+            targets.processes.truncate(1);
+            targets.metadata.process_count = 1;
+            Ok(targets)
+        })
+        .unwrap();
+        assert_eq!(partial.processes[0].pid.0, 177);
+        assert!(partial.metadata.warnings[0].contains("fixture census failure"));
     }
 
     // Children of kthreadd (PID 2) are kernel threads on Linux only.
