@@ -8915,7 +8915,8 @@ fn finalize_tui_goal_selection(
     session_id: &SessionId,
     goal: &Goal,
     current_cpu_pct: f64,
-    rows: &mut [ProcessRow],
+    rows: &mut Vec<ProcessRow>,
+    max_candidates: usize,
     goal_candidates: &mut HashMap<u32, serde_json::Value>,
     plan_candidates: &mut HashMap<u32, PlanCandidateInput>,
     policy: &pt_core::config::Policy,
@@ -8941,6 +8942,9 @@ fn finalize_tui_goal_selection(
             .collect();
         rows.sort_by_key(|row| ranks.get(&row.pid).copied().unwrap_or(usize::MAX));
     }
+    // The goal can depend on a holder below the suspicion-ranked display limit.
+    // Rank the full candidate set first, then recheck the exact retained set.
+    rows.truncate(max_candidates);
     finalize_tui_recommendations(rows, goal_candidates, plan_candidates, population, policy);
     candidates = rows
         .iter()
@@ -9337,8 +9341,6 @@ fn build_tui_rows(
             .total_cmp(&relief(a.pid))
             .then_with(|| b.score.cmp(&a.score))
     });
-    rows.truncate(MAX_CANDIDATES);
-
     let mut goal_summary: Option<Vec<String>> = None;
     let mut goal_selection = goal_str.map(|_| HashMap::new());
 
@@ -9354,6 +9356,7 @@ fn build_tui_rows(
                     &parsed,
                     cpu_total,
                     &mut rows,
+                    MAX_CANDIDATES,
                     &mut goal_candidates,
                     &mut plan_candidates,
                     &decision_policy,
@@ -9380,6 +9383,7 @@ fn build_tui_rows(
                 }
             }
             Err(err) => {
+                rows.truncate(MAX_CANDIDATES);
                 finalize_tui_recommendations(
                     &mut rows,
                     &mut goal_candidates,
@@ -9397,6 +9401,7 @@ fn build_tui_rows(
             }
         }
     } else {
+        rows.truncate(MAX_CANDIDATES);
         finalize_tui_recommendations(
             &mut rows,
             &mut goal_candidates,
@@ -25047,11 +25052,23 @@ mod process_tree_safety_tests {
                 cpu: f64,
                 resources: &GoalResourceSnapshot,
             ) -> Result<GoalPlanOutput, String> {
+                let max_candidates = self.rows.len();
+                self.optimize_with_limit(goal, cpu, resources, max_candidates)
+            }
+
+            fn optimize_with_limit(
+                &mut self,
+                goal: &str,
+                cpu: f64,
+                resources: &GoalResourceSnapshot,
+                max_candidates: usize,
+            ) -> Result<GoalPlanOutput, String> {
                 finalize_tui_goal_selection(
                     &self.session,
                     &parse_goal(goal).unwrap(),
                     cpu,
                     &mut self.rows,
+                    max_candidates,
                     &mut self.candidates,
                     &mut self.inputs,
                     &self.policy,
@@ -25154,6 +25171,158 @@ mod process_tree_safety_tests {
                     .is_empty());
                 }
             }
+        }
+
+        #[test]
+        fn goal_ranking_precedes_tui_candidate_limit() {
+            let mut fixture = Fixture::new(&[
+                (100, 1, 4096, ProcessState::Sleeping),
+                (200, 1, 1000, ProcessState::Sleeping),
+            ]);
+            fixture.rows[0].score = 99;
+            fixture.rows[1].score = 80;
+            let resources =
+                fixture.measured_private_memory(&[(100, 1024 * 1024), (200, 1000 * 1024 * 1024)]);
+            fixture.policy.guardrails.max_kills_per_run = 1;
+            let output = fixture
+                .optimize_with_limit("free 100MB RAM", 0.0, &resources, 1)
+                .unwrap();
+            assert!(output.result.feasible);
+            assert_eq!(output.selected_pids, [200]);
+            assert_eq!(output.result.total_contributions, [1000.0]);
+            assert_eq!(fixture.rows.len(), 1);
+            assert_eq!(fixture.rows[0].pid, 200);
+            assert!(fixture.rows[0].selected);
+            let plan = fixture.executable(&output.selected_pids);
+            assert_eq!(plan.actions.len(), 1);
+            assert_eq!(plan.actions[0].target, fixture.inputs[&200].identity);
+        }
+
+        #[test]
+        fn port_goal_finds_holder_below_cutoff_without_promoting_keep_or_review() {
+            for holder_action in ["kill", "keep", "review"] {
+                let mut fixture = Fixture::new(&[
+                    (100, 1, 1000, ProcessState::Sleeping),
+                    (200, 1, 1, ProcessState::Sleeping),
+                ]);
+                fixture.rows[0].score = 99;
+                fixture.rows[1].score = 80;
+                fixture.candidates.get_mut(&200).unwrap()["recommended_action"] =
+                    serde_json::json!(holder_action);
+                let resources = GoalResourceSnapshot {
+                    ports: [(
+                        3000,
+                        PortGoalResources {
+                            holders: Some(vec![fixture.inputs[&200].identity.clone()]),
+                            bound_socket_count: Some(1),
+                        },
+                    )]
+                    .into(),
+                    ..Default::default()
+                };
+                let output = fixture
+                    .optimize_with_limit("free port 3000", 0.0, &resources, 1)
+                    .unwrap();
+                assert_eq!(fixture.rows.len(), 1);
+                if holder_action == "kill" {
+                    assert!(output.result.feasible);
+                    assert_eq!(output.selected_pids, [200]);
+                    assert_eq!(fixture.rows[0].pid, 200);
+                    assert!(fixture.rows[0].selected);
+                    let plan = fixture.executable(&output.selected_pids);
+                    assert_eq!(plan.actions.len(), 1);
+                    assert_eq!(plan.actions[0].target, fixture.inputs[&200].identity);
+                } else {
+                    assert!(!output.result.feasible, "{holder_action}");
+                    assert!(output.selected_pids.is_empty(), "{holder_action}");
+                    assert_eq!(output.result.total_contributions, [0.0]);
+                    assert_eq!(fixture.rows[0].pid, 100);
+                    assert!(!fixture.rows[0].selected);
+                }
+            }
+        }
+
+        #[test]
+        fn candidate_limit_cannot_claim_release_of_a_shared_port() {
+            let mut fixture = Fixture::new(&[
+                (100, 1, 1000, ProcessState::Sleeping),
+                (200, 1, 1, ProcessState::Sleeping),
+                (300, 1, 1, ProcessState::Sleeping),
+            ]);
+            let resources = GoalResourceSnapshot {
+                ports: [(
+                    3000,
+                    PortGoalResources {
+                        holders: Some(vec![
+                            fixture.inputs[&200].identity.clone(),
+                            fixture.inputs[&300].identity.clone(),
+                        ]),
+                        bound_socket_count: Some(1),
+                    },
+                )]
+                .into(),
+                ..Default::default()
+            };
+            let output = fixture
+                .optimize_with_limit("free port 3000", 0.0, &resources, 1)
+                .unwrap();
+            assert_eq!(fixture.rows.len(), 1);
+            assert!([200, 300].contains(&fixture.rows[0].pid));
+            assert!(!output.result.feasible);
+            assert!(output.selected_pids.is_empty());
+            assert_eq!(output.result.total_contributions, [0.0]);
+            assert!(!fixture.rows[0].selected);
+        }
+
+        #[test]
+        fn goal_candidate_limit_preserves_live_child_safety() {
+            let mut fixture = Fixture::new(&[
+                (100, 1, 1000, ProcessState::Sleeping),
+                (200, 100, 10, ProcessState::Sleeping),
+            ]);
+            let resources = fixture
+                .measured_private_memory(&[(100, 1000 * 1024 * 1024), (200, 10 * 1024 * 1024)]);
+            let output = fixture
+                .optimize_with_limit("free 100MB RAM", 0.0, &resources, 1)
+                .unwrap();
+            assert_eq!(fixture.rows.len(), 1);
+            assert_eq!(fixture.rows[0].pid, 100);
+            assert_eq!(fixture.rows[0].classification, "REVIEW");
+            assert!(!fixture.rows[0].selected);
+            assert_eq!(fixture.candidates[&100]["tree_safety"]["rule"], "live_child");
+            assert!(!output.result.feasible);
+            assert!(output.selected_pids.is_empty());
+            assert_eq!(output.result.total_contributions, [0.0]);
+            assert!(fixture.executable(&[100]).actions.is_empty());
+        }
+
+        #[test]
+        fn goal_candidate_limit_handles_empty_and_unmeasurable_selections() {
+            let mut fixture = Fixture::new(&[(100, 1, 1000, ProcessState::Sleeping)]);
+            let resources = fixture.measured_private_memory(&[(100, 1000 * 1024 * 1024)]);
+            let output = fixture
+                .optimize_with_limit("free 100MB RAM", 0.0, &resources, 0)
+                .unwrap();
+            assert!(fixture.rows.is_empty());
+            assert!(!output.result.feasible);
+            assert!(output.selected_pids.is_empty());
+            assert_eq!(output.result.total_contributions, [0.0]);
+
+            let mut fixture = Fixture::new(&[
+                (100, 1, 1000, ProcessState::Sleeping),
+                (200, 1, 1, ProcessState::Sleeping),
+            ]);
+            assert!(fixture
+                .optimize_with_limit(
+                    "reduce CPU below 50%",
+                    f64::NAN,
+                    &GoalResourceSnapshot::default(),
+                    1,
+                )
+                .is_err());
+            assert_eq!(fixture.rows.len(), 1);
+            assert_eq!(fixture.rows[0].pid, 100);
+            assert!(!fixture.rows[0].selected);
         }
 
         #[test]
@@ -29002,6 +29171,7 @@ mod process_tree_safety_tests {
             &goal,
             0.0,
             &mut rows,
+            usize::MAX,
             &mut candidates,
             &mut inputs,
             &policy,
@@ -36231,28 +36401,15 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     // reapply the filter to that final contract below.
     all_candidates.retain(|candidate| candidate_matches_filter(&candidate.1, &args.only));
 
-    // Take top N candidates after pressure-relief and evidence ranking.
+    // Keep the full post-policy candidate set through resource-goal ranking.
+    // A display limit must not hide the only holder that can satisfy the goal.
     let mut candidates: Vec<serde_json::Value> = Vec::new();
     let mut persisted_inventory_records: Vec<PersistedProcess> = Vec::new();
     let mut persisted_inference_records: Vec<PersistedInference> = Vec::new();
-    for (_, candidate_json, proc_rec, inf_rec) in all_candidates
-        .into_iter()
-        .take(args.max_candidates as usize)
-    {
+    for (_, candidate_json, proc_rec, inf_rec) in all_candidates {
         candidates.push(candidate_json);
         persisted_inventory_records.push(proc_rec);
         persisted_inference_records.push(inf_rec);
-    }
-
-    // Truncation can remove a child that made its parent's kill safe in the
-    // earlier full candidate set. Re-evaluate the actual final action set.
-    {
-        let mut candidate_values: Vec<&mut serde_json::Value> = candidates.iter_mut().collect();
-        apply_process_tree_safety(
-            &mut candidate_values,
-            &scan_result.processes,
-            decision_policy.guardrails.builtin_protection,
-        );
     }
 
     let mut goal_summary: Option<serde_json::Value> = None;
@@ -36327,6 +36484,20 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 }));
             }
         }
+    }
+
+    // Select the displayed rows only after goal ranking over all candidates.
+    candidates.truncate(args.max_candidates as usize);
+
+    // Truncation can remove a child that made its parent's kill safe in the
+    // earlier full candidate set. Re-evaluate the actual final action set.
+    {
+        let mut candidate_values: Vec<&mut serde_json::Value> = candidates.iter_mut().collect();
+        apply_process_tree_safety(
+            &mut candidate_values,
+            &scan_result.processes,
+            decision_policy.guardrails.builtin_protection,
+        );
     }
 
     // Planning does not record executions, so enforce the final kill count after
