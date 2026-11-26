@@ -22450,13 +22450,13 @@ fn run_daemon_escalation(
     triggers: &[pt_core::daemon::triggers::FiredTrigger],
     esc_config: &pt_core::daemon::escalation::EscalationConfig,
 ) -> Result<DaemonEscalationResult, String> {
-    let pressure_relief = daemon_requests_pressure_relief(triggers);
+    let relief_goal = daemon_relief_goal(triggers);
     let quick = run_daemon_plan(
         global,
         None,
         false,
         esc_config.max_deep_scan_targets,
-        pressure_relief,
+        relief_goal,
     )?;
     if quick.candidates_found == 0 {
         return Ok(quick);
@@ -22467,7 +22467,7 @@ fn run_daemon_escalation(
         Some(&quick.session_id),
         true,
         esc_config.max_deep_scan_targets,
-        pressure_relief,
+        relief_goal,
     ) {
         Ok(deep) => Ok(deep),
         Err(err) => {
@@ -22481,14 +22481,63 @@ fn run_daemon_escalation(
 }
 
 #[cfg(feature = "daemon")]
-fn daemon_requests_pressure_relief(triggers: &[pt_core::daemon::triggers::FiredTrigger]) -> bool {
+fn daemon_relief_goal(triggers: &[pt_core::daemon::triggers::FiredTrigger]) -> Option<ReliefGoal> {
     use pt_core::daemon::triggers::TriggerKind;
-    triggers.iter().any(|trigger| {
-        matches!(
-            trigger.kind,
-            TriggerKind::PressureRegime | TriggerKind::MemoryPressure | TriggerKind::SustainedLoad
-        )
-    })
+    use pt_core::decision::mem_pressure::PressureMode;
+
+    let (mut cpu, mut memory, mut io, mut load) = (false, false, false, false);
+    for trigger in triggers {
+        match trigger.kind {
+            TriggerKind::PressureRegime => {
+                let Some(regime) = trigger
+                    .pressure_regime
+                    .as_ref()
+                    .filter(|regime| regime.severity != PressureSeverity::Ok)
+                else {
+                    continue;
+                };
+                match regime.kind {
+                    RegimeKind::CpuContention => cpu = true,
+                    RegimeKind::IoBound => io = true,
+                    RegimeKind::MemoryExhaustion
+                    | RegimeKind::CacheBloat
+                    | RegimeKind::SwapThrash
+                    | RegimeKind::SwapParadox
+                    | RegimeKind::SwapExhaustion
+                    | RegimeKind::OomKills => memory = true,
+                    // These findings do not establish CPU, memory or I/O
+                    // relief. Keep ordinary planning and its zombie routing;
+                    // D state alone does not identify a remediable resource.
+                    RegimeKind::FdExhaustion | RegimeKind::ZombieLeak | RegimeKind::DstateStorm => {
+                    }
+                }
+            }
+            TriggerKind::MemoryPressure => {
+                // Legacy utilization triggers have no richer payload. When a
+                // payload exists, its current mode must still be active.
+                memory |= trigger
+                    .memory_pressure
+                    .as_ref()
+                    .is_none_or(|pressure| pressure.mode != PressureMode::Normal);
+            }
+            TriggerKind::SustainedLoad => load = true,
+            TriggerKind::OrphanSpike => {}
+        }
+    }
+
+    // Load alone cannot distinguish CPU competition from blocked work. A
+    // typed CPU/I/O diagnosis explains the co-occurring load trigger; otherwise
+    // retain the generic relief request instead of inventing CPU attribution.
+    if load && !cpu && !io {
+        return Some(ReliefGoal::All);
+    }
+    match (cpu, memory, io) {
+        (false, false, false) => None,
+        (true, false, false) => Some(ReliefGoal::Cpu),
+        (false, true, false) => Some(ReliefGoal::Memory),
+        (false, false, true) => Some(ReliefGoal::Io),
+        _ => Some(ReliefGoal::All),
+    }
 }
 
 #[cfg(feature = "daemon")]
@@ -22497,17 +22546,10 @@ fn run_daemon_plan(
     session_id: Option<&str>,
     deep: bool,
     max_candidates: u32,
-    pressure_relief: bool,
+    relief_goal: Option<ReliefGoal>,
 ) -> Result<DaemonEscalationResult, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let spec = daemon_planner_spec(
-        global,
-        &exe,
-        session_id,
-        deep,
-        max_candidates,
-        pressure_relief,
-    )?;
+    let spec = daemon_planner_spec(global, &exe, session_id, deep, max_candidates, relief_goal)?;
     pt_core::daemon::escalation::run_planner(&spec, session_id)
 }
 
@@ -22518,7 +22560,7 @@ fn daemon_planner_spec(
     session_id: Option<&str>,
     deep: bool,
     max_candidates: u32,
-    pressure_relief: bool,
+    relief_goal: Option<ReliefGoal>,
 ) -> Result<pt_core::collect::tool_runner::ToolSpec, String> {
     use pt_core::collect::tool_runner::ToolSpec;
     use pt_core::daemon::escalation::PLAN_TIMEOUT_SECS;
@@ -22526,8 +22568,8 @@ fn daemon_planner_spec(
     let mut cmd = std::process::Command::new(executable);
     cmd.args(["--format", "json", "agent", "plan", "--max-candidates"])
         .arg(max_candidates.to_string());
-    if pressure_relief {
-        cmd.args(["--goal", "relieve"]);
+    if let Some(goal) = relief_goal {
+        cmd.args(["--goal", goal.canonical()]);
     }
     if deep {
         cmd.arg("--deep");
@@ -23000,7 +23042,7 @@ mod daemon_pressure_tests {
             Some(session),
             true,
             13,
-            true,
+            Some(ReliefGoal::All),
         )
         .unwrap();
         assert_eq!(spec.timeout, Some(std::time::Duration::from_secs(7)));
@@ -23045,7 +23087,7 @@ mod daemon_pressure_tests {
             None,
             false,
             10,
-            false,
+            None,
         )
         .unwrap();
         assert_eq!(spec.timeout, Some(std::time::Duration::from_secs(60)));
@@ -23067,6 +23109,188 @@ mod daemon_pressure_tests {
                 sustained: true,
                 explanation: "I/O pressure requires review; no safe action candidates".into(),
             }),
+        }
+    }
+
+    fn regime_trigger(kind: RegimeKind) -> pt_core::daemon::triggers::FiredTrigger {
+        let mut trigger = critical_io_trigger();
+        trigger.pressure_regime.as_mut().unwrap().kind = kind;
+        trigger
+    }
+
+    fn scalar_trigger(
+        kind: pt_core::daemon::triggers::TriggerKind,
+    ) -> pt_core::daemon::triggers::FiredTrigger {
+        let mut trigger = critical_io_trigger();
+        trigger.kind = kind;
+        trigger.pressure_regime = None;
+        trigger
+    }
+
+    #[test]
+    fn daemon_relief_goal_tracks_the_fired_resource() {
+        for (kind, expected) in [
+            (RegimeKind::CpuContention, Some(ReliefGoal::Cpu)),
+            (RegimeKind::IoBound, Some(ReliefGoal::Io)),
+            (RegimeKind::MemoryExhaustion, Some(ReliefGoal::Memory)),
+            (RegimeKind::CacheBloat, Some(ReliefGoal::Memory)),
+            (RegimeKind::SwapThrash, Some(ReliefGoal::Memory)),
+            (RegimeKind::SwapParadox, Some(ReliefGoal::Memory)),
+            (RegimeKind::SwapExhaustion, Some(ReliefGoal::Memory)),
+            (RegimeKind::OomKills, Some(ReliefGoal::Memory)),
+            (RegimeKind::FdExhaustion, None),
+            (RegimeKind::ZombieLeak, None),
+            (RegimeKind::DstateStorm, None),
+        ] {
+            for severity in [PressureSeverity::Warn, PressureSeverity::Crit] {
+                let mut trigger = regime_trigger(kind);
+                let regime = trigger.pressure_regime.as_mut().unwrap();
+                regime.severity = severity;
+                // One-shot OOM events need not be sustained. Trigger delivery
+                // already decides which diagnoses are eligible for escalation.
+                regime.sustained = false;
+                assert_eq!(daemon_relief_goal(&[trigger]), expected, "{kind:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn daemon_relief_goal_combines_resources_without_widening_same_resource_events() {
+        use pt_core::daemon::triggers::TriggerKind;
+        for (kinds, expected) in [
+            (vec![RegimeKind::CpuContention; 2], ReliefGoal::Cpu),
+            (
+                vec![RegimeKind::MemoryExhaustion, RegimeKind::OomKills],
+                ReliefGoal::Memory,
+            ),
+            (
+                vec![RegimeKind::CpuContention, RegimeKind::IoBound],
+                ReliefGoal::All,
+            ),
+            (
+                vec![RegimeKind::CpuContention, RegimeKind::MemoryExhaustion],
+                ReliefGoal::All,
+            ),
+            (
+                vec![RegimeKind::MemoryExhaustion, RegimeKind::IoBound],
+                ReliefGoal::All,
+            ),
+        ] {
+            let mut triggers: Vec<_> = kinds.into_iter().map(regime_trigger).collect();
+            triggers.push(scalar_trigger(TriggerKind::OrphanSpike));
+            assert_eq!(daemon_relief_goal(&triggers), Some(expected));
+            triggers.reverse();
+            assert_eq!(daemon_relief_goal(&triggers), Some(expected));
+        }
+        for (kind, expected) in [
+            (RegimeKind::CpuContention, ReliefGoal::Cpu),
+            (RegimeKind::IoBound, ReliefGoal::Io),
+            (RegimeKind::MemoryExhaustion, ReliefGoal::All),
+        ] {
+            let triggers = [
+                scalar_trigger(TriggerKind::SustainedLoad),
+                regime_trigger(kind),
+            ];
+            assert_eq!(daemon_relief_goal(&triggers), Some(expected));
+        }
+        assert_eq!(
+            daemon_relief_goal(&[scalar_trigger(TriggerKind::SustainedLoad)]),
+            Some(ReliefGoal::All)
+        );
+    }
+
+    #[test]
+    fn daemon_relief_goal_ignores_absent_inactive_and_unrelated_payloads() {
+        use pt_core::daemon::triggers::TriggerKind;
+        assert_eq!(daemon_relief_goal(&[]), None);
+        let mut inactive = critical_io_trigger();
+        inactive.pressure_regime.as_mut().unwrap().severity = PressureSeverity::Ok;
+        let mut unrelated = critical_io_trigger();
+        unrelated.kind = TriggerKind::OrphanSpike;
+        assert_eq!(
+            daemon_relief_goal(&[
+                inactive,
+                unrelated,
+                scalar_trigger(TriggerKind::PressureRegime),
+            ]),
+            None
+        );
+
+        let mut memory = scalar_trigger(TriggerKind::MemoryPressure);
+        assert_eq!(
+            daemon_relief_goal(std::slice::from_ref(&memory)),
+            Some(ReliefGoal::Memory)
+        );
+        memory.memory_pressure = Some(pt_core::decision::mem_pressure::PressureEvaluation {
+            mode: PressureMode::Normal,
+            previous_mode: Some(PressureMode::Emergency),
+            transitioned: true,
+            action: pt_core::decision::mem_pressure::PressureAction::Continue,
+            scan_interval_secs: 60.0,
+            utilization: 0.5,
+            psi_some10: Some(0.0),
+            evidence_complete: true,
+            explanation: "recovered".into(),
+        });
+        assert_eq!(daemon_relief_goal(std::slice::from_ref(&memory)), None);
+        for mode in [PressureMode::Warning, PressureMode::Emergency] {
+            memory.memory_pressure.as_mut().unwrap().mode = mode;
+            assert_eq!(
+                daemon_relief_goal(&[memory.clone(), regime_trigger(RegimeKind::CacheBloat)]),
+                Some(ReliefGoal::Memory)
+            );
+        }
+    }
+
+    #[test]
+    fn daemon_quick_and_deep_planners_preserve_the_fired_resource_goal() {
+        use pt_core::daemon::triggers::TriggerKind;
+        let cli = Cli::try_parse_from(["pt-core", "daemon"]).unwrap();
+        for (triggers, expected) in [
+            (
+                vec![regime_trigger(RegimeKind::CpuContention)],
+                Some("cpu-pressure"),
+            ),
+            (vec![critical_io_trigger()], Some("io-pressure")),
+            (
+                vec![scalar_trigger(TriggerKind::MemoryPressure)],
+                Some("mem-pressure"),
+            ),
+            (
+                vec![
+                    regime_trigger(RegimeKind::MemoryExhaustion),
+                    critical_io_trigger(),
+                ],
+                Some("relieve"),
+            ),
+            (vec![regime_trigger(RegimeKind::ZombieLeak)], None),
+        ] {
+            for deep in [false, true] {
+                let session = deep.then_some("pt-20261112-123456-abcd");
+                let spec = daemon_planner_spec(
+                    &cli.global,
+                    Path::new("/tmp/pt-core"),
+                    session,
+                    deep,
+                    10,
+                    daemon_relief_goal(&triggers),
+                )
+                .unwrap();
+                let child = Cli::try_parse_from(
+                    std::iter::once(spec.command.as_str())
+                        .chain(spec.args.iter().map(String::as_str)),
+                )
+                .unwrap();
+                let Some(Commands::Agent(AgentArgs {
+                    command: AgentCommands::Plan(args),
+                })) = child.command
+                else {
+                    panic!("daemon must invoke the real agent planner");
+                };
+                assert_eq!(args.goal.as_deref(), expected);
+                assert_eq!(args.deep, deep);
+                assert_eq!(args.session.as_deref(), session);
+            }
         }
     }
 
@@ -23204,6 +23428,7 @@ mod daemon_pressure_tests {
             assert_eq!(pressure.mode, PressureMode::Emergency);
             assert_eq!(pressure.utilization, 0.25);
             assert_eq!(pressure.psi_some10, Some(75.0));
+            assert_eq!(daemon_relief_goal(fired), Some(ReliefGoal::Memory));
             pt_core::daemon::escalation::EscalationOutcome {
                 status: pt_core::daemon::escalation::EscalationStatus::Completed,
                 reason: "pressure review plan generated".to_string(),
