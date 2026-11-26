@@ -137,18 +137,22 @@ impl Evidence {
         proc: &crate::collect::ProcessRecord,
         priors: &Priors,
     ) -> Self {
-        let state_flag = priors.state_flags.as_ref().and_then(|flags| {
+        let state_flag = Self::state_flag_with_priors(proc.state, priors);
+        Self::from_snapshot_with_state_flag(proc, state_flag)
+    }
+
+    pub(crate) fn state_flag_with_priors(state: ProcessState, priors: &Priors) -> Option<usize> {
+        priors.state_flags.as_ref().and_then(|flags| {
             let mut matches = flags
                 .flag_names
                 .iter()
                 .enumerate()
-                .filter(|(_, label)| kernel_state_for_label(label) == Some(proc.state));
+                .filter(|(_, label)| kernel_state_for_label(label) == Some(state));
             let (index, _) = matches.next()?;
             // A scan normalizes e.g. T and t to Stopped. If both are modeled
             // separately, this observation cannot identify either category.
             matches.next().is_none().then_some(index)
-        });
-        Self::from_snapshot_with_state_flag(proc, state_flag)
+        })
     }
 
     fn from_snapshot_with_state_flag(

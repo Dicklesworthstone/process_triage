@@ -1556,6 +1556,10 @@ impl Scorer {
         let respawn_history = observations.respawn_history;
         let work = observations.work;
         if let Some(activity) = &activity {
+            let (state, _) = proc.decision_state(Some(activity));
+            if state != proc.state {
+                evidence.state_flag = Evidence::state_flag_with_priors(state, &self.priors);
+            }
             evidence.cpu = activity
                 .cpu_occupancy_fraction()
                 .map(|occupancy| CpuEvidence::Fraction { occupancy });
@@ -2911,6 +2915,58 @@ mod tests {
                 explanation["classification"],
                 actual.ledger.classification.label()
             );
+        }
+    }
+
+    #[test]
+    fn sampled_d_state_uses_the_active_model_for_live_and_replayed_scores() {
+        use crate::collect::{LeaderWait, ProcessPressureActivity, WaitClass};
+
+        // D is deliberately away from the built-in index. A model may omit
+        // D, or represent it twice in a way this observation cannot resolve.
+        for (names, expected_index) in [
+            (["R", "S", "T", "Z", "I", "X", "D"], Some(6)),
+            (["R", "S", "T", "Z", "I", "X", "other"], None),
+            (["R", "S", "T", "Z", "I", "D", "DiskSleep"], None),
+        ] {
+            let mut model = scorer(SignatureDatabase::new());
+            model.priors.state_flags.as_mut().unwrap().flag_names =
+                names.map(str::to_string).to_vec();
+            let mut process = record(4212, "worker", "worker", Duration::from_secs(60));
+            let mut activity = agent_activity_sample(&process, 0.0, 0.0);
+            activity.pressure = Some(ProcessPressureActivity {
+                leader_wait: Some(LeaderWait {
+                    state: ProcessState::DiskSleep,
+                    class: WaitClass::Uninterruptible,
+                    wchan: Some("io_schedule".into()),
+                }),
+                ..Default::default()
+            });
+            model.activity_window = Some(Duration::from_millis(500));
+            model.activity.insert(process.pid.0, activity);
+            for quick in [
+                ProcessState::Running, ProcessState::Sleeping, ProcessState::DiskSleep,
+                ProcessState::Stopped, ProcessState::Idle, ProcessState::Unknown,
+                ProcessState::Zombie, ProcessState::Dead,
+            ] {
+                process.state = quick;
+                let evidence = model.snapshot_evidence(&process);
+                let captured = model.recorded_observations(&process, None);
+                let mut expected_process = process.clone();
+                if !matches!(quick, ProcessState::Zombie | ProcessState::Dead) {
+                    expected_process.state = ProcessState::DiskSleep;
+                    assert_eq!(model.snapshot_evidence(&expected_process).state_flag, expected_index);
+                }
+                let mut baseline = captured.clone();
+                baseline.activity.as_mut().unwrap().pressure = None;
+                let expected = model
+                    .score_recorded(&expected_process, model.snapshot_evidence(&expected_process), baseline)
+                    .unwrap();
+                let live = model.score_with_desktop(&process, evidence.clone(), None).unwrap();
+                let replayed = model.score_recorded(&process, evidence, captured).unwrap();
+                assert_eq!(live.posterior.evidence_terms, expected.posterior.evidence_terms, "{quick:?}");
+                assert_eq!(replayed.posterior.evidence_terms, expected.posterior.evidence_terms, "{quick:?}");
+            }
         }
     }
 

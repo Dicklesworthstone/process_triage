@@ -169,6 +169,24 @@ pub struct ProcessRecord {
 }
 
 impl ProcessRecord {
+    /// Kernel state used for scoring and planning, with its observed D-state
+    /// channel when available. A later leader wait can tighten feasibility for
+    /// a nonterminal process. Terminal snapshots retain their existing routing.
+    pub fn decision_state<'a>(
+        &self,
+        activity: Option<&'a ProcessActivity>,
+    ) -> (ProcessState, Option<&'a str>) {
+        if !matches!(self.state, ProcessState::Zombie | ProcessState::Dead) {
+            if let Some(wait) = activity
+                .and_then(|sample| sample.leader_wait_for(self))
+                .filter(|wait| wait.state.is_disksleep())
+            {
+                return (wait.state, wait.wchan.as_deref());
+            }
+        }
+        (self.state, None)
+    }
+
     /// Check if process has a controlling terminal.
     pub fn has_tty(&self) -> bool {
         self.tty.is_some()

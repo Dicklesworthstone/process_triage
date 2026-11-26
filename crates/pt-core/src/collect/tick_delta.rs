@@ -1380,6 +1380,18 @@ mod tests {
         let activity = sample_process_activity(&processes, Duration::from_millis(500));
         let busy = &activity[&busy.0.id()];
         let idle = &activity[&idle.0.id()];
+        // sleep remains blocked throughout. Some kernels hide symbols even
+        // for an owned child, in which case the wait cause stays unavailable.
+        let channel = super::super::proc_parsers::parse_wchan(idle.pid);
+        let expected = LeaderWait::from_sample(
+            ProcessState::Sleeping,
+            ProcessState::Sleeping,
+            channel.as_deref(),
+        );
+        assert_eq!(
+            idle.pressure.as_ref().unwrap().leader_wait.as_ref(),
+            expected.as_ref()
+        );
         let busy_cpu = busy.cpu_percent.expect("busy CPU sample is available");
         let idle_cpu = idle.cpu_percent.expect("sleeping CPU sample is available");
         // Shared/limited CI hosts may grant much less than a whole core; the

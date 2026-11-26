@@ -9435,6 +9435,7 @@ fn build_tui_rows(
                 "start_id": proc.start_id,
                 "uid": proc.uid,
                 "state": proc.state.to_string(),
+                "decision_state": wait.state.to_string(),
                 "recommended_action": recommendation,
                 "action_rationale": rationale,
                 "agent_liveness": advice.agent_liveness,
@@ -33769,8 +33770,18 @@ mod planning_pressure_tests {
         let mask = ActionFeasibility::from_process_state(false, wait.state.is_disksleep(), wait.wchan.as_deref());
         assert!(!mask.is_allowed(Action::Kill));
         assert!(mask.disabled.iter().any(|rule| rule.reason.contains("io_schedule")));
-        proc.state = ProcessState::Zombie;
-        assert_eq!(PlanningWaitState::from_activity(&proc, Some(&sample)).state, ProcessState::Zombie);
+        for nonterminal in [ProcessState::Stopped, ProcessState::Idle, ProcessState::Unknown] {
+            proc.state = nonterminal;
+            let wait = PlanningWaitState::from_activity(&proc, Some(&sample));
+            assert_eq!(wait.state, ProcessState::DiskSleep);
+            assert_eq!(wait.wchan.as_deref(), Some("io_schedule"));
+        }
+        for terminal in [ProcessState::Zombie, ProcessState::Dead] {
+            proc.state = terminal;
+            let wait = PlanningWaitState::from_activity(&proc, Some(&sample));
+            assert_eq!(wait.state, terminal);
+            assert!(wait.wchan.is_none());
+        }
         proc.state = ProcessState::Running;
         sample.uid += 1;
         assert_eq!(PlanningWaitState::from_activity(&proc, Some(&sample)).state, ProcessState::Running);
@@ -35281,16 +35292,11 @@ struct PlanningWaitState {
 
 impl PlanningWaitState {
     fn from_activity(proc: &ProcessRecord, activity: Option<&pt_core::collect::ProcessActivity>) -> Self {
-        let blocked = activity
-            .and_then(|sample| sample.leader_wait_for(proc))
-            .filter(|wait| wait.state.is_disksleep());
-        if let Some(wait) = blocked.filter(|_| matches!(proc.state, ProcessState::Running | ProcessState::Sleeping | ProcessState::DiskSleep)) {
-            return Self {
-                state: ProcessState::DiskSleep,
-                wchan: wait.wchan.clone(),
-            };
+        let (state, wchan) = proc.decision_state(activity);
+        Self {
+            state,
+            wchan: wchan.map(str::to_owned),
         }
-        Self { state: proc.state, wchan: None }
     }
 
     fn diagnostics(&self) -> Option<pt_core::plan::DStateDiagnostics> {
@@ -36869,6 +36875,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             "pid": proc.pid.0,
             "ppid": proc.ppid.0,
             "state": proc.state.to_string(),
+            "decision_state": proc.decision_state(activity.as_ref()).0.to_string(),
             "agent_kind": agent_kind,
             "agent_liveness": agent_liveness,
             "fuse_server": fuse_server,
@@ -38616,6 +38623,7 @@ fn build_process_explanation(
         "comm": proc.comm,
         "user": proc.user,
         "state": proc.state.to_string(),
+        "decision_state": proc.decision_state(activity).0.to_string(),
         "agent_kind": pt_core::collect::protected::agent_kind(&proc.cmd),
         "agent_liveness": agent_liveness_json(proc, &score),
         "elapsed_seconds": proc.elapsed.as_secs(),
@@ -38687,7 +38695,7 @@ fn build_process_explanation(
             "runtime_seconds": proc.elapsed.as_secs_f64(),
             "is_orphan": score.orphaned,
             "has_tty": proc.has_tty(),
-            "state": proc.state.to_string(),
+            "state": proc.decision_state(activity).0.to_string(),
         });
     }
 
@@ -46854,6 +46862,7 @@ fn evaluate_watch_candidate(
         },
         recommendation: serde_json::json!({
             "pid": proc.pid.0,
+            "decision_state": wait.state.to_string(),
             "recommended_action": advice.action,
             "action_rationale": advice.rationale,
             "agent_liveness": advice.agent_liveness,
