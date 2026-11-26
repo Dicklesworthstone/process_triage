@@ -749,9 +749,16 @@ mod tests {
         assert_eq!(window.oom_kills, Some(1));
         assert_eq!(window.swap_in_per_s, Some(6000.0));
         let regimes = health.assessment.unwrap().regimes;
-        assert!(regimes.iter().any(|regime| regime.kind == RegimeKind::OomKills));
-        assert!(regimes.iter().any(|regime| regime.kind == RegimeKind::SwapThrash));
-        assert_eq!(result.system_state.as_ref(), Some(&document["system_state"]));
+        assert!(regimes
+            .iter()
+            .any(|regime| regime.kind == RegimeKind::OomKills));
+        assert!(regimes
+            .iter()
+            .any(|regime| regime.kind == RegimeKind::SwapThrash));
+        assert_eq!(
+            result.system_state.as_ref(),
+            Some(&document["system_state"])
+        );
 
         document["system_state"]["pressure_window"]["seconds"] = json!(0);
         let invalid = parse_output("ssh-alias", InspectionKind::Health, &output(&document, 0));

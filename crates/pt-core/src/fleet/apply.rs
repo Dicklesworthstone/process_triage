@@ -126,6 +126,132 @@ pub struct PreparedHostApply {
     pub error: Option<String>,
 }
 
+/// Approve only the exact reversible tier saved by an explicit pressure goal.
+/// Re-run the shared selector against retained evidence: --targets selects every
+/// action for a PID/start pair, so no extra stage or later tier may remain.
+fn approved_pressure_remedies(
+    document: &Value,
+    plan: &Plan,
+    candidates: &[Value],
+) -> Result<Vec<PlanAction>, String> {
+    use crate::decision::goal_parser::{parse_goal, Goal};
+    use crate::decision::relief::select_relief_plan;
+
+    let goal_text = document["goal"].as_str();
+    let argument_goal = document["args"]["goal"].as_str();
+    let parsed = goal_text.and_then(|goal| parse_goal(goal).ok());
+    let summary = &document["goal_summary"];
+    let scope = match parsed {
+        Some(Goal::Relieve(scope)) => scope,
+        _ => {
+            if summary["execution_scope"] == "selected_pressure_remedies"
+                || argument_goal
+                    .and_then(|goal| parse_goal(goal).ok())
+                    .is_some_and(|goal| matches!(goal, Goal::Relieve(_)))
+            {
+                return Err(
+                    "pressure goal is missing or disagrees with its saved arguments".into(),
+                );
+            }
+            return Ok(Vec::new());
+        }
+    };
+    if argument_goal != goal_text
+        || summary["goal"].as_str() != goal_text
+        || summary["parsed"] != serde_json::json!(Goal::Relieve(scope).canonical())
+        || summary["execution_scope"] != "selected_pressure_remedies"
+        || !summary["error"].is_null()
+    {
+        return Err("pressure goal and its saved selection summary disagree".into());
+    }
+
+    let relief = select_relief_plan(scope, candidates, plan, None);
+    let selected_ids: HashSet<&str> = relief
+        .selected_action_ids
+        .iter()
+        .map(String::as_str)
+        .collect();
+    if selected_ids.len() != relief.selected_action_ids.len()
+        || selected_ids.len() != plan.actions.len()
+        || plan
+            .actions
+            .iter()
+            .any(|action| !selected_ids.contains(action.action_id.as_str()))
+    {
+        return Err(
+            "pressure goal contains unselected, unsafe, unsupported or later-tier actions".into(),
+        );
+    }
+    let expected = serde_json::to_value(&relief)
+        .map_err(|error| format!("cannot validate pressure goal selection: {error}"))?;
+    for field in [
+        "selected_tier",
+        "selected_action_ids",
+        "selected_targets",
+        "selected_pids",
+    ] {
+        if summary[field] != expected[field] {
+            return Err(format!(
+                "pressure goal {field} differs from the independently validated selection"
+            ));
+        }
+    }
+    for candidate in candidates {
+        let target: Option<ProcessIdentity> =
+            serde_json::from_value(candidate["action_target"].clone()).ok();
+        let action_ids: Vec<&str> = plan
+            .actions
+            .iter()
+            .filter(|action| target.as_ref() == Some(&action.target))
+            .map(|action| action.action_id.as_str())
+            .collect();
+        if candidate["goal_selected"].as_bool() != Some(!action_ids.is_empty())
+            || candidate["plan_action_ids"] != serde_json::json!(action_ids)
+        {
+            return Err(
+                "pressure candidate selection or action IDs disagree with the executable plan"
+                    .into(),
+            );
+        }
+    }
+
+    let mut remedy_ids = HashSet::new();
+    for step in &relief.remediation_ladder {
+        match step.action {
+            // A staged pause belongs to its kill. It must never be dispatched
+            // separately when the fleet risk budget refuses the primary kill.
+            Action::Kill => {}
+            Action::Renice
+            | Action::Throttle
+            | Action::Pause
+            | Action::Freeze
+            | Action::CapMemory => {
+                remedy_ids.extend(step.action_ids.iter().map(String::as_str));
+            }
+            _ => return Err("unsupported fleet pressure remedy".into()),
+        }
+    }
+    let mut remedies = Vec::new();
+    for action in &plan.actions {
+        if !remedy_ids.contains(action.action_id.as_str()) {
+            continue;
+        }
+        if i32::try_from(action.target.pid.0).is_err()
+            || !action.target.can_safely_revalidate()
+            || action
+                .target
+                .start_id
+                .0
+                .chars()
+                .any(|character| character == ',' || character.is_control())
+        {
+            return Err("pressure remedy has an unusable remote target identity".into());
+        }
+        remedies.push(action.clone());
+    }
+    Ok(remedies)
+}
+
 fn request_from_document(
     host: &str,
     document: &Value,
@@ -154,6 +280,7 @@ fn request_from_document(
     let candidates = document["candidates"]
         .as_array()
         .ok_or("remote candidate evidence is unavailable")?;
+    let pressure_remedies = approved_pressure_remedies(document, &plan, candidates)?;
     let mut targets = Vec::new();
     let mut posteriors = HashMap::new();
     for &pid in selected_pids {
@@ -269,6 +396,19 @@ fn request_from_document(
             decision.target.pid.0, decision.reason
         ));
     }
+    // The original pooled-risk gate applies only to its approved kill sequence.
+    // Reversible remedies have their own explicit goal/tier approval above and
+    // retain the remote host's identity, policy, live checks and undo machinery.
+    for action in pressure_remedies {
+        if targets.iter().any(|target| target.pid == action.target.pid)
+            || !action_ids.insert(action.action_id.clone())
+        {
+            return Err("pressure remedy overlaps an approved target or action".into());
+        }
+        targets.push(action.target.clone());
+        actions.push(action);
+    }
+    actions.sort_by_key(|action| action.order);
     Ok(HostApplyRequest {
         host: host.to_string(),
         binding,
@@ -452,9 +592,11 @@ pub fn prepare_fleet_apply(fleet: &FleetSession) -> Result<Vec<PreparedHostApply
                     error: None,
                 });
             }
-            Some(Err(error)) if !host.selected_kill_pids.is_empty() => {
+            Some(Err(error))
+                if !host.selected_kill_pids.is_empty() || !binding.selected_targets.is_empty() =>
+            {
                 return Err(format!(
-                    "{} cannot execute its pooled-approved selection: {error}; refusing the whole fleet because an approved execution request is invalid",
+                    "{} cannot execute its approved selection: {error}; refusing the whole fleet because an approved execution request is invalid",
                     host.host_id
                 ));
             }
@@ -561,11 +703,15 @@ pub fn remote_apply_args(
     if request.targets.is_empty() {
         return Err("empty target set must never invoke remote apply".into());
     }
-    if request.targets.len() > config.max_kills_per_host as usize {
+    let kill_count = request
+        .actions
+        .iter()
+        .filter(|action| matches!(action.action, Action::Kill | Action::Restart))
+        .count();
+    if kill_count > config.max_kills_per_host as usize {
         return Err(format!(
             "{} approved kills exceed per-host cap {}",
-            request.targets.len(),
-            config.max_kills_per_host
+            kill_count, config.max_kills_per_host
         ));
     }
     let targets = request
@@ -998,6 +1144,119 @@ mod tests {
         })
     }
 
+    fn refresh_pressure_summary(document: &mut Value) {
+        let plan: Plan = serde_json::from_value(document.clone()).unwrap();
+        let goal_text = document["goal"].as_str().unwrap();
+        let crate::decision::goal_parser::Goal::Relieve(scope) =
+            crate::decision::goal_parser::parse_goal(goal_text).unwrap()
+        else {
+            panic!("pressure fixture requires a relief goal");
+        };
+        let relief = crate::decision::relief::select_relief_plan(
+            scope,
+            document["candidates"].as_array().unwrap(),
+            &plan,
+            None,
+        );
+        let mut summary = serde_json::to_value(relief).unwrap();
+        summary["goal"] = serde_json::json!(goal_text);
+        summary["parsed"] =
+            serde_json::json!(crate::decision::goal_parser::Goal::Relieve(scope).canonical());
+        summary["execution_scope"] = serde_json::json!("selected_pressure_remedies");
+        document["goal_summary"] = summary;
+    }
+
+    fn remote_relief_document(host: &str, rows: &[(u32, Action)]) -> Value {
+        let probabilities: Vec<_> = rows
+            .iter()
+            .map(|(pid, action)| (*pid, if *action == Action::Kill { 0.999 } else { 0.2 }))
+            .collect();
+        let mut document = remote_document(host, &probabilities);
+        document["goal"] = serde_json::json!("relieve");
+        document["args"]["goal"] = serde_json::json!("relieve");
+        document["summary"]["goal_mode"] = serde_json::json!(true);
+        for (index, &(pid, action)) in rows.iter().enumerate() {
+            let boot = "11111111-2222-4333-8444-555555555555";
+            let target = ProcessIdentity::full(
+                pid,
+                StartId::from_linux(boot, 42, pid),
+                1000,
+                Some(50),
+                Some(40),
+                pt_common::IdentityQuality::Full,
+            );
+            let action_id = format!("remedy-{pid}-{action:?}");
+            document["actions"][index]["action_id"] = serde_json::json!(action_id);
+            document["actions"][index]["target"] = serde_json::json!(target);
+            document["actions"][index]["action"] = serde_json::json!(action);
+            let memory = action == Action::CapMemory;
+            let costs = if memory {
+                serde_json::json!({"cpu": 0.0, "memory": 1.0, "io": 0.0})
+            } else {
+                serde_json::json!({"cpu": 1.0, "memory": 0.0, "io": 0.0})
+            };
+            let candidate = &mut document["candidates"][index];
+            candidate["start_id"] = serde_json::json!(target.start_id);
+            candidate["action_target"] = serde_json::json!(target);
+            candidate["recommended_action"] = serde_json::json!(action);
+            candidate["recommendation"] = serde_json::json!(serde_json::to_value(action)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_ascii_uppercase());
+            candidate["state"] = serde_json::json!("S");
+            candidate["goal_selected"] = serde_json::json!(true);
+            candidate["plan_action_ids"] = serde_json::json!([action_id]);
+            candidate["pressure_decision"] = serde_json::json!({
+                "enabled": true, "applied": true, "status": "applied", "scope": "process",
+                "chosen_action": action,
+                "evidence_only_action": if action == Action::Kill { "kill" } else { "keep" },
+                "severity": {"cpu": 0.5, "memory": 0.5, "io": 0.5},
+                "shares": {"cpu": 0.25, "memory": 0.25, "io": 0.25},
+                "modeled_pressure_relief": 1.0,
+                "actions": [
+                    {"action": "keep", "pressure_cost": 1.0, "pressure_by_resource": costs},
+                    {"action": action, "pressure_cost": 0.0, "adjusted_loss": 0.1,
+                     "eligible": true,
+                     "pressure_by_resource": {"cpu": 0.0, "memory": 0.0, "io": 0.0}}
+                ]
+            });
+            if memory {
+                let cap = crate::action::memory_cap::MemoryCapPlan {
+                    target: target.clone(),
+                    scope: crate::action::reversal::ReversalScope {
+                        cgroup_path: "/user.slice/owned/workload".into(),
+                        device: 1,
+                        inode: 2,
+                        mount_id: 3,
+                        boot_id: boot.into(),
+                        mount_namespace_device: 4,
+                        mount_namespace_inode: 5,
+                        cgroup_namespace_device: 6,
+                        cgroup_namespace_inode: 7,
+                    },
+                    limit_bytes: 180 * 1024 * 1024,
+                    observed_high_bytes: None,
+                    observed_current_bytes: 200 * 1024 * 1024,
+                    observed_low_bytes: 0,
+                    observed_min_bytes: 0,
+                    page_size_bytes: 4096,
+                };
+                cap.validate(&target).unwrap();
+                document["candidates"][index]["memory_cap"] = serde_json::json!(cap);
+                document["actions"][index]["memory_cap"] = serde_json::json!(cap);
+            }
+        }
+        document["pre_toggled"] = serde_json::json!(document["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|action| action["action_id"].as_str().unwrap())
+            .collect::<Vec<_>>());
+        refresh_pressure_summary(&mut document);
+        document
+    }
+
     fn retained_fleet(documents: Vec<(&str, Value)>) -> FleetSession {
         retained_fleet_with_budget(documents, 0.05)
     }
@@ -1074,6 +1333,409 @@ mod tests {
             duration: Duration::from_millis(12),
             timed_out: false,
         }
+    }
+
+    #[test]
+    fn pressure_goal_remedies_survive_binding_and_dispatch_with_zero_kill_budget() {
+        for action in [
+            Action::Renice,
+            Action::Throttle,
+            Action::Pause,
+            Action::Freeze,
+            Action::CapMemory,
+        ] {
+            let document = remote_relief_document("alpha", &[(101, action)]);
+            let original = document.clone();
+            let fleet = retained_fleet(vec![("alpha", document)]);
+            assert!(fleet.hosts[0].selected_kill_pids.is_empty());
+            assert_eq!(fleet.safety_budget.pooled_fdr.selected_kills, 0);
+            let restored: FleetSession =
+                serde_json::from_str(&serde_json::to_string(&fleet).unwrap()).unwrap();
+            let prepared = prepare_fleet_apply(&restored).unwrap();
+            let request = prepared[0].request.as_ref().unwrap();
+            assert_eq!(request.targets.len(), 1, "{action:?}");
+            assert_eq!(request.targets[0].pid.0, 101);
+            assert_eq!(request.targets[0].pgid, Some(50));
+            assert_eq!(request.actions.len(), 1);
+            assert_eq!(request.actions[0].action, action);
+            assert_eq!(
+                request.binding.plan_sha256,
+                plan_document_sha256(&original).unwrap()
+            );
+            if action == Action::CapMemory {
+                assert_eq!(
+                    serde_json::to_value(&request.actions[0].memory_cap).unwrap(),
+                    original["candidates"][0]["memory_cap"]
+                );
+            }
+            let options = FleetApplyConfig {
+                max_kills_per_host: 0,
+                ..config()
+            };
+            let calls = AtomicUsize::new(0);
+            let report = execute_fleet_apply_with(
+                &prepared,
+                &restored.execution.as_ref().unwrap().transport,
+                &options,
+                |request, args, _| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let command = args.last().unwrap();
+                    assert!(command.contains("--max-kills 0"));
+                    assert!(command.contains("--yes --resume --abort-on-unknown"));
+                    assert!(command.contains(&request.binding.plan_sha256));
+                    assert!(!command.contains("--recommended"));
+                    assert!(args.contains(&"StrictHostKeyChecking=yes".into()));
+                    Ok(result_output(request, "success", 2))
+                },
+                |_| Ok(()),
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "{action:?}");
+            assert_eq!(report.hosts[0].status, HostApplyStatus::Applied);
+            assert_eq!(report.hosts[0].successful_actions, 1);
+            assert_eq!(report.hosts[0].kill_signals_delivered, 0);
+            assert_eq!(report.hosts[0].selected_targets, request.targets);
+        }
+    }
+
+    #[test]
+    fn pressure_dispatch_does_not_expand_ordinary_plans_or_refused_kill_stages() {
+        let mut ordinary = remote_relief_document("ordinary", &[(101, Action::Renice)]);
+        ordinary["goal"] = Value::Null;
+        ordinary["args"]["goal"] = Value::Null;
+        ordinary["goal_summary"] = Value::Null;
+        ordinary["summary"]["goal_mode"] = Value::Null;
+        let mut refused = remote_relief_document("refused", &[(201, Action::Kill)]);
+        let posterior = serde_json::json!({
+            "useful": 0.04, "useful_bad": 0.0, "abandoned": 0.96, "zombie": 0.0,
+        });
+        refused["candidates"][0]["posterior"] = posterior.clone();
+        refused["actions"][0]["rationale"]["posterior"] = posterior;
+        let mut pause = refused["actions"][0].clone();
+        pause["action_id"] = serde_json::json!("prepare-201");
+        pause["action"] = serde_json::json!("pause");
+        refused["actions"][0]["stage"] = serde_json::json!(1);
+        refused["actions"][0]["order"] = serde_json::json!(1);
+        refused["actions"].as_array_mut().unwrap().insert(0, pause);
+        refused["candidates"][0]["plan_action_ids"] =
+            serde_json::json!(["prepare-201", "remedy-201-Kill"]);
+        refused["pre_toggled"] = serde_json::json!(["prepare-201", "remedy-201-Kill"]);
+        refresh_pressure_summary(&mut refused);
+        let fleet =
+            retained_fleet_with_budget(vec![("ordinary", ordinary), ("refused", refused)], 0.01);
+        let prepared = prepare_fleet_apply(&fleet).unwrap();
+        assert!(prepared.iter().all(|host| {
+            let request = host.request.as_ref().unwrap();
+            request.targets.is_empty() && request.actions.is_empty()
+        }));
+        let options = FleetApplyConfig {
+            max_kills_per_host: 0,
+            ..config()
+        };
+        let report = execute_fleet_apply_with(
+            &prepared,
+            &fleet.execution.as_ref().unwrap().transport,
+            &options,
+            |_, _, _| panic!("unselected advice or a refused kill's pause must never dispatch"),
+            |_| Ok(()),
+        );
+        assert!(report
+            .hosts
+            .iter()
+            .all(|host| host.status == HostApplyStatus::NoActions));
+
+        let kill_fleet = retained_fleet(vec![("kill", remote_document("kill", &[(301, 0.999)]))]);
+        let kills = prepare_fleet_apply(&kill_fleet).unwrap();
+        let blocked = execute_fleet_apply_with(
+            &kills,
+            &kill_fleet.execution.as_ref().unwrap().transport,
+            &options,
+            |_, _, _| panic!("zero kill cap must still refuse a pooled-approved kill"),
+            |_| Ok(()),
+        );
+        assert_eq!(blocked.hosts[0].status, HostApplyStatus::Blocked);
+    }
+
+    #[test]
+    fn pressure_binding_refuses_unselected_unsafe_or_changed_remedies() {
+        for invalid in [
+            "goal",
+            "selection",
+            "candidate_ids",
+            "summary_ids",
+            "summary_target",
+            "attribution",
+            "blocked",
+            "routed",
+            "uid",
+            "extra_uid_stage",
+            "extra_stage",
+            "later_tier",
+            "unsupported",
+            "cap_binding",
+        ] {
+            let action = if invalid == "cap_binding" {
+                Action::CapMemory
+            } else {
+                Action::Renice
+            };
+            let mut document = remote_relief_document("alpha", &[(101, action)]);
+            match invalid {
+                "goal" => document["args"]["goal"] = serde_json::json!("mem-pressure"),
+                "selection" => {
+                    document["candidates"][0]["goal_selected"] = serde_json::json!(false)
+                }
+                "candidate_ids" => {
+                    document["candidates"][0]["plan_action_ids"] = serde_json::json!(["other"])
+                }
+                "summary_ids" => {
+                    document["goal_summary"]["selected_action_ids"] = serde_json::json!(["other"])
+                }
+                "summary_target" => {
+                    document["goal_summary"]["selected_targets"][0]["uid"] = serde_json::json!(0)
+                }
+                "attribution" => {
+                    document["candidates"][0]["pressure_decision"]["shares"]["cpu"] = Value::Null
+                }
+                "blocked" => document["actions"][0]["blocked"] = serde_json::json!(true),
+                "routed" => document["actions"][0]["routing"] = serde_json::json!("supervisor"),
+                "uid" => document["actions"][0]["target"]["uid"] = serde_json::json!(0),
+                "extra_uid_stage" | "extra_stage" => {
+                    let mut extra = document["actions"][0].clone();
+                    extra["action_id"] = serde_json::json!("unapproved-extra");
+                    if invalid == "extra_uid_stage" {
+                        extra["target"]["uid"] = serde_json::json!(0);
+                    } else {
+                        extra["action"] = serde_json::json!("pause");
+                        extra["stage"] = serde_json::json!(1);
+                    }
+                    document["actions"].as_array_mut().unwrap().push(extra);
+                }
+                "later_tier" => {
+                    document = remote_relief_document(
+                        "alpha",
+                        &[(101, Action::Renice), (201, Action::Pause)],
+                    );
+                }
+                "unsupported" => {
+                    document = remote_relief_document("alpha", &[(101, Action::Restart)]);
+                }
+                _ => {
+                    document["actions"][0]["memory_cap"]["limit_bytes"] =
+                        serde_json::json!(100 * 1024 * 1024);
+                }
+            }
+            assert!(
+                request_from_document("alpha", &document, &[], 0.05).is_err(),
+                "{invalid}"
+            );
+        }
+
+        let original = retained_fleet(vec![(
+            "alpha",
+            remote_relief_document("alpha", &[(101, Action::Renice)]),
+        )]);
+        let mut legacy = original.clone();
+        legacy.execution.as_mut().unwrap().hosts[0]
+            .selected_targets
+            .clear();
+        assert!(prepare_fleet_apply(&legacy)
+            .unwrap_err()
+            .contains("selection no longer matches"));
+        let mut changed = original;
+        changed.execution.as_mut().unwrap().hosts[0]
+            .document
+            .as_mut()
+            .unwrap()["goal"] = serde_json::json!("mem-pressure");
+        assert!(prepare_fleet_apply(&changed)
+            .unwrap_err()
+            .contains("digest changed"));
+    }
+
+    #[test]
+    fn invalid_pressure_host_blocks_every_dispatch_before_ssh() {
+        let good = remote_relief_document("alpha", &[(101, Action::Renice)]);
+        let mut bad = remote_relief_document("beta", &[(201, Action::Throttle)]);
+        bad["candidates"][0]["goal_selected"] = serde_json::json!(false);
+        let fleet = retained_fleet(vec![("alpha", good), ("beta", bad)]);
+        let prepared = prepare_fleet_apply(&fleet).unwrap();
+        assert!(prepared[1].error.is_some());
+        let options = FleetApplyConfig {
+            max_kills_per_host: 0,
+            continue_on_error: true,
+            parallel: 2,
+            ..config()
+        };
+        let report = execute_fleet_apply_with(
+            &prepared,
+            &fleet.execution.as_ref().unwrap().transport,
+            &options,
+            |_, _, _| panic!("invalid pressure binding must refuse the complete fleet"),
+            |_| Ok(()),
+        );
+        assert!(report
+            .hosts
+            .iter()
+            .all(|host| host.status == HostApplyStatus::Blocked && !host.attempted));
+    }
+
+    #[test]
+    fn pressure_receipts_preserve_policy_refusals_and_uncertain_resume() {
+        let fleet = retained_fleet(vec![(
+            "alpha",
+            remote_relief_document("alpha", &[(101, Action::Renice)]),
+        )]);
+        let prepared = prepare_fleet_apply(&fleet).unwrap();
+        let request = prepared[0].request.as_ref().unwrap();
+        let refused =
+            interpret_remote_result(&prepared[0], result_output(request, "blocked_by_policy", 4));
+        assert_eq!(refused.status, HostApplyStatus::Blocked);
+        assert_eq!(refused.successful_actions, 0);
+
+        let mut output = result_output(request, "success", 2);
+        let mut response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        response["outcomes"] = serde_json::json!([]);
+        response["note"] = serde_json::json!("nothing_to_do");
+        output.stdout = serde_json::to_vec(&response).unwrap();
+        output.exit_code = Some(0);
+        let resumed = interpret_remote_result(&prepared[0], output.clone());
+        assert_eq!(resumed.status, HostApplyStatus::NoActions);
+        assert_eq!(resumed.successful_actions, 0);
+        assert_eq!(resumed.selected_targets, request.targets);
+
+        response["status"] = serde_json::json!("blocked");
+        response["error"] = serde_json::json!("incomplete_execution");
+        response["message"] = serde_json::json!("earlier action admission has no complete receipt");
+        output.stdout = serde_json::to_vec(&response).unwrap();
+        output.exit_code = Some(4);
+        let uncertain = interpret_remote_result(&prepared[0], output);
+        assert_eq!(uncertain.status, HostApplyStatus::Unknown);
+        assert_eq!(uncertain.successful_actions, 0);
+        assert_eq!(uncertain.kill_signals_delivered, 0);
+
+        let mut forged = result_output(request, "success", 2);
+        let mut response: Value = serde_json::from_slice(&forged.stdout).unwrap();
+        response["outcomes"][0]["action"] = serde_json::json!("kill");
+        forged.stdout = serde_json::to_vec(&response).unwrap();
+        assert_eq!(
+            interpret_remote_result(&prepared[0], forged).status,
+            HostApplyStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn model_produced_io_relief_reaches_confirmed_fleet_dispatch() {
+        use crate::collect::ProcessState;
+        use crate::decision::load_aware::{
+            prepare_pressure_decision, PressureContext, ResourceShares,
+        };
+        use crate::decision::pressure_regime::ResourceSeverity;
+        use crate::decision::{ActionFeasibility, DisabledAction};
+        use crate::inference::ClassScores;
+        use crate::plan::{generate_plan, DecisionBundle, DecisionCandidate};
+
+        let mut policy = crate::config::Policy::default();
+        policy.load_aware.enabled = true;
+        policy.load_aware.pressure.pause_io_relief = 0.5;
+        let posterior = ClassScores {
+            useful: 0.0,
+            useful_bad: 1.0,
+            abandoned: 0.0,
+            zombie: 0.0,
+        };
+        let feasibility = ActionFeasibility {
+            disabled: Action::ALL
+                .into_iter()
+                .filter(|action| *action != Action::Keep && *action != Action::Pause)
+                .map(|action| DisabledAction {
+                    action,
+                    reason: "only the observed stop capability is available".into(),
+                })
+                .collect(),
+        };
+        let pressure = prepare_pressure_decision(
+            &posterior,
+            &policy,
+            &feasibility,
+            &PressureContext {
+                severity: ResourceSeverity {
+                    io: 1.0,
+                    ..Default::default()
+                },
+                shares: ResourceShares {
+                    io: Some(0.8),
+                    ..Default::default()
+                },
+                unavailable: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(pressure.decision.optimal_action, Action::Pause);
+        assert_eq!(pressure.report.evidence_only_action, Action::Keep);
+
+        let mut document = remote_relief_document("alpha", &[(101, Action::Pause)]);
+        let target: ProcessIdentity =
+            serde_json::from_value(document["candidates"][0]["action_target"].clone()).unwrap();
+        let plan = generate_plan(&DecisionBundle {
+            session_id: SessionId("pt-20261105-120000-abcd".into()),
+            policy: policy.clone(),
+            candidates: vec![DecisionCandidate {
+                identity: target,
+                ppid: Some(50),
+                decision: pressure.decision,
+                blocked_reasons: Vec::new(),
+                stage_pause_before_kill: false,
+                process_state: Some(ProcessState::Sleeping),
+                parent_identity: None,
+                d_state_diagnostics: None,
+                supervisor_restart: None,
+                memory_cap: None,
+            }],
+            generated_at: Some("2026-11-05T12:00:00Z".into()),
+        });
+        assert_eq!(plan.actions.len(), 1);
+        assert!(!plan.actions[0].blocked);
+        document["candidates"][0]["plan_action_ids"] =
+            serde_json::json!([plan.actions[0].action_id]);
+        document["candidates"][0]["posterior"] = serde_json::json!(posterior);
+        document["candidates"][0]["pressure_decision"] =
+            serde_json::to_value(pressure.report).unwrap();
+        document["goal"] = serde_json::json!("io-pressure");
+        document["args"]["goal"] = serde_json::json!("io-pressure");
+        document["policy_snapshot"] = serde_json::to_value(policy).unwrap();
+        let Value::Object(fields) = serde_json::to_value(plan).unwrap() else {
+            unreachable!()
+        };
+        document.as_object_mut().unwrap().extend(fields);
+        refresh_pressure_summary(&mut document);
+        assert_eq!(
+            document["goal_summary"]["selected_pids"],
+            serde_json::json!([101])
+        );
+        assert_eq!(document["goal_summary"]["total_modeled_relief"], 0.4);
+
+        let fleet = retained_fleet(vec![("alpha", document)]);
+        let prepared = prepare_fleet_apply(&fleet).unwrap();
+        let options = FleetApplyConfig {
+            max_kills_per_host: 0,
+            ..config()
+        };
+        let calls = AtomicUsize::new(0);
+        let report = execute_fleet_apply_with(
+            &prepared,
+            &fleet.execution.as_ref().unwrap().transport,
+            &options,
+            |request, _, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(request.actions.len(), 1);
+                assert_eq!(request.actions[0].action, Action::Pause);
+                Ok(result_output(request, "success", 2))
+            },
+            |_| Ok(()),
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(report.hosts[0].status, HostApplyStatus::Applied);
+        assert_eq!(report.hosts[0].successful_actions, 1);
+        assert_eq!(report.hosts[0].kill_signals_delivered, 0);
     }
 
     #[test]

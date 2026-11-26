@@ -2080,7 +2080,9 @@ mod tests {
             let window = input.health.pressure_window.unwrap();
             assert_eq!(window.seconds, 0.5);
             let checked = serde_json::to_value(window).unwrap();
-            assert!(checked.pointer(field).is_none_or(serde_json::Value::is_null));
+            assert!(checked
+                .pointer(field)
+                .is_none_or(serde_json::Value::is_null));
             if field != "/oom_kills" {
                 assert_eq!(window.oom_kills, Some(2));
             } else {
