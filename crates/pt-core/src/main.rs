@@ -17654,7 +17654,13 @@ fn run_agent_fleet_status(global: &GlobalOpts, args: &AgentFleetStatusArgs) -> E
         Err(e) => return output_agent_error(global, "fleet status", &e),
     };
 
+    let attempts = match pt_core::fleet::receipts::apply_history(&session_dir, &fleet.fleet_session_id) {
+        Ok(attempts) => attempts,
+        Err(error) => return output_agent_error(global, "fleet status", &format!("read apply receipts: {error}")),
+    };
+    let receipt_errors = attempts.iter().any(|attempt| attempt.receipt_error.is_some());
     let response = serde_json::json!({
+        "apply_attempts": attempts,
         "schema_version": SCHEMA_VERSION,
         "fleet_session_id": fleet.fleet_session_id,
         "generated_at": chrono::Utc::now().to_rfc3339(),
@@ -17703,6 +17709,20 @@ fn run_agent_fleet_status(global: &GlobalOpts, args: &AgentFleetStatusArgs) -> E
             println!("Hosts:      {}", fleet.aggregate.total_hosts);
             println!("Processes:  {}", fleet.aggregate.total_processes);
             println!("Candidates: {}", fleet.aggregate.total_candidates);
+            println!("Recorded apply attempts: {}", attempts.len());
+            for attempt in &attempts {
+                let state = if attempt.finished { "finished" } else { "incomplete" };
+                println!("  {} ({state})", attempt.attempt_id);
+                if let Some(error) = &attempt.receipt_error {
+                    println!("    receipt error: {error}");
+                }
+                for host in &attempt.hosts {
+                    let successes = host.successful_actions.map(|n| n.to_string()).unwrap_or_else(|| "unknown".into());
+                    let signals = host.kill_signals_delivered.map(|n| n.to_string()).unwrap_or_else(|| "unknown".into());
+                    println!("    {}: {:?}, confirmed actions {successes}, confirmed kill signals {signals}, remote session {}",
+                        host.host, host.status, host.remote_session_id.as_deref().unwrap_or("unavailable"));
+                }
+            }
             print_fleet_health_summary(fleet.aggregate.health.as_ref());
             for host in &fleet.hosts {
                 let health = fleet_host_health_summary(&host.health);
@@ -17728,7 +17748,7 @@ fn run_agent_fleet_status(global: &GlobalOpts, args: &AgentFleetStatusArgs) -> E
         }
     }
 
-    ExitCode::Clean
+    if receipt_errors { ExitCode::PartialFail } else { ExitCode::Clean }
 }
 
 fn run_agent_fleet_transfer(global: &GlobalOpts, args: &AgentFleetTransferArgs) -> ExitCode {
