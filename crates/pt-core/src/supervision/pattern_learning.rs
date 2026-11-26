@@ -153,6 +153,25 @@ static HASH_RE: LazyLock<Regex> =
 #[derive(Default)]
 pub struct CommandNormalizer;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InterpreterFamily {
+    Shell,
+    Python,
+    Node,
+    Ruby,
+    Perl,
+}
+
+/// Existing, unambiguous script/module keys keep their historical verdicts.
+/// Newly preserved interpreter jobs use a separate namespace so lossy old
+/// source identities cannot contribute a second generalization vote.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LearningKeyMode {
+    Existing,
+    InlineProgram,
+    OpaqueInterpreter,
+}
+
 impl CommandNormalizer {
     /// Create a new normalizer.
     pub fn new() -> Self {
@@ -242,11 +261,7 @@ impl CommandNormalizer {
         result.trim().to_string()
     }
 
-    /// Locate an interpreter's inline program without parsing it as shell syntax.
-    /// Process command lines are flattened argv, so quote and argument boundaries
-    /// cannot be recovered reliably. Once an execution option is found, the whole
-    /// remaining command is an opaque identity, including its whitespace.
-    fn inline_program_index(process_name: &str, args: &[&str]) -> Option<usize> {
+    fn interpreter_family(process_name: &str) -> Option<InterpreterFamily> {
         let name = process_name.rsplit('/').next().unwrap_or(process_name);
         let versioned = |prefix: &str| {
             name.strip_prefix(prefix).is_some_and(|version| {
@@ -256,18 +271,33 @@ impl CommandNormalizer {
                         .all(|character| character.is_ascii_digit() || character == '.')
             })
         };
-        let shell = matches!(
-            name,
-            "sh" | "bash" | "dash" | "ash" | "zsh" | "ksh" | "fish"
-        );
-        let python = versioned("python") || versioned("pypy");
-        let node = versioned("node") || matches!(name, "nodejs" | "bun");
-        let ruby = versioned("ruby");
-        let perl = versioned("perl");
-        let ruby_or_perl = ruby || perl;
-        if !(shell || python || node || ruby_or_perl) {
-            return None;
+        if matches!(name, "sh" | "bash" | "dash" | "ash" | "zsh" | "ksh" | "fish") {
+            Some(InterpreterFamily::Shell)
+        } else if versioned("python") || versioned("pypy") {
+            Some(InterpreterFamily::Python)
+        } else if versioned("node") || matches!(name, "nodejs" | "bun") {
+            Some(InterpreterFamily::Node)
+        } else if versioned("ruby") {
+            Some(InterpreterFamily::Ruby)
+        } else if versioned("perl") {
+            Some(InterpreterFamily::Perl)
+        } else {
+            None
         }
+    }
+
+    /// Locate an interpreter's inline program without parsing it as shell syntax.
+    /// Process command lines are flattened argv, so quote and argument boundaries
+    /// cannot be recovered reliably. Once an execution option is found, the whole
+    /// remaining command is an opaque identity, including its whitespace.
+    fn inline_program_index(process_name: &str, args: &[&str]) -> Option<usize> {
+        let family = Self::interpreter_family(process_name)?;
+        let shell = family == InterpreterFamily::Shell;
+        let python = family == InterpreterFamily::Python;
+        let node = family == InterpreterFamily::Node;
+        let ruby = family == InterpreterFamily::Ruby;
+        let perl = family == InterpreterFamily::Perl;
+        let ruby_or_perl = ruby || perl;
 
         let mut skip_value = false;
         for (index, argument) in args.iter().enumerate() {
@@ -358,6 +388,95 @@ impl CommandNormalizer {
         Self::inline_program_index(process_name, &args[skip..]).is_some()
     }
 
+    /// Identify only simple invocations whose script/module identity the
+    /// existing exact and standard normalizers already retain. Options taking
+    /// values, unknown syntax and extensionless programs keep the entire argv
+    /// suffix instead: an rcfile/preload operand must never stand in for the job.
+    pub(crate) fn learning_key_mode(&self, process_name: &str, cmdline: &str) -> LearningKeyMode {
+        if self.has_inline_program(process_name, cmdline) {
+            return LearningKeyMode::InlineProgram;
+        }
+        let Some(family) = Self::interpreter_family(process_name) else {
+            return LearningKeyMode::Existing;
+        };
+        let args: Vec<&str> = cmdline.split_whitespace().collect();
+        let args = &args[Self::command_word_count(process_name, &args)..];
+        if args.is_empty() {
+            return LearningKeyMode::Existing;
+        }
+        // Bun also dispatches subcommands such as "run"; their first positional
+        // word is not necessarily the program. Retain the complete invocation.
+        if process_name.rsplit('/').next() == Some("bun") {
+            return LearningKeyMode::OpaqueInterpreter;
+        }
+        let Some((program, module)) = Self::simple_program_index(family, args) else {
+            return LearningKeyMode::OpaqueInterpreter;
+        };
+        let argument = args[program];
+        if self.is_significant_arg(argument) && (module || Self::is_script_arg(argument)) {
+            LearningKeyMode::Existing
+        } else {
+            LearningKeyMode::OpaqueInterpreter
+        }
+    }
+
+    /// Deliberately recognize only switches with no operand. Any option whose
+    /// value or grammar is uncertain uses an opaque identity, not a guessed
+    /// positional script. Flattened command lines cannot recover argv quoting.
+    fn simple_program_index(family: InterpreterFamily, args: &[&str]) -> Option<(usize, bool)> {
+        for (index, argument) in args.iter().enumerate() {
+            if *argument == "--" {
+                return args
+                    .get(index + 1)
+                    .filter(|program| **program != "-")
+                    .map(|_| (index + 1, false));
+            }
+            if *argument == "-" || argument.starts_with('+') {
+                return None;
+            }
+            if family == InterpreterFamily::Python && *argument == "-m" {
+                return args
+                    .get(index + 1)
+                    .filter(|module| !module.starts_with('-'))
+                    .map(|_| (index + 1, true));
+            }
+            if !argument.starts_with('-') {
+                return Some((index, false));
+            }
+            let short_switches = match family {
+                InterpreterFamily::Shell => "efinuvxl",
+                InterpreterFamily::Python => "bBdEiIOPqRsSuUvVx",
+                InterpreterFamily::Ruby | InterpreterFamily::Perl => "anpw",
+                InterpreterFamily::Node => "",
+            };
+            let known_short = !argument.starts_with("--")
+                && argument.len() > 1
+                && argument[1..]
+                    .chars()
+                    .all(|option| short_switches.contains(option));
+            let known_long = match family {
+                InterpreterFamily::Shell => {
+                    matches!(*argument, "--noprofile" | "--norc" | "--posix")
+                }
+                InterpreterFamily::Node => matches!(
+                    *argument,
+                    "--watch"
+                        | "--test"
+                        | "--no-warnings"
+                        | "--enable-source-maps"
+                        | "--no-deprecation"
+                        | "--trace-warnings"
+                        | "--trace-deprecation"
+                ),
+                _ => false,
+            };
+            if !known_short && !known_long {
+                return None;
+            }
+        }
+        None
+    }
+
     fn command_word_count(process_name: &str, args: &[&str]) -> usize {
         usize::from(args.first().is_some_and(|first| {
             first.ends_with(process_name) || first.ends_with(&format!("/{process_name}"))
@@ -387,15 +506,25 @@ impl CommandNormalizer {
         let skip = Self::command_word_count(process_name, &args);
         let args_to_process = &args[skip..];
         let inline_index = Self::inline_program_index(process_name, args_to_process);
-        let inline_program = inline_index.and_then(|_| Self::argument_suffix(cmdline, &args, skip));
-        let ordinary_args = &args_to_process[..inline_index.unwrap_or(args_to_process.len())];
+        let key_mode = self.learning_key_mode(process_name, cmdline);
+        let opaque_program = (key_mode != LearningKeyMode::Existing)
+            .then(|| Self::argument_suffix(cmdline, &args, skip))
+            .flatten();
+        let ordinary_args = if key_mode == LearningKeyMode::OpaqueInterpreter {
+            // A script path, preload value or unknown option operand can look
+            // like a flag after argv flattening. Do not turn it into a broad
+            // operation category.
+            &args_to_process[..0]
+        } else {
+            &args_to_process[..inline_index.unwrap_or(args_to_process.len())]
+        };
 
         let mut candidates = Vec::new();
 
         // Generate exact pattern
-        let exact_args: Vec<String> = if let Some(program) = inline_program {
+        let exact_args: Vec<String> = if let Some(program) = opaque_program {
             // Preloads, rc files and options before the execution flag also
-            // change what inline code does. Preserve all argument bytes rather
+            // change what the program does. Preserve all argument bytes rather
             // than discarding their paths or normalizing source literals.
             vec![regex::escape(program)]
         } else {
@@ -436,9 +565,10 @@ impl CommandNormalizer {
             })
             .map(|(_, a)| self.normalize_arg_standard(a))
             .collect();
-        if let Some(program) = inline_program {
-            // Inline programs have no safely generalizable argument subset.
-            // Only the separately gated broad level can transfer their labels.
+        if let Some(program) = opaque_program {
+            // Inline code and ambiguous interpreter invocations have no safely
+            // generalizable argument subset. Only the separately gated broad
+            // level can transfer their labels.
             std_args = vec![regex::escape(program)];
         }
 
@@ -986,6 +1116,122 @@ mod tests {
             .find(|candidate| candidate.level == SpecificityLevel::Broad)
             .unwrap();
         assert!(broad.arg_patterns.is_empty());
+    }
+
+    #[test]
+    fn opaque_interpreter_jobs_retain_scripts_and_option_operands() {
+        let normalizer = CommandNormalizer::new();
+        for (comm, first, second) in [
+            ("bash", "bash /srv/backup", "bash /srv/build"),
+            ("bash", "bash backup", "bash build"),
+            ("bash", "bash -eu /srv/backup", "bash -eu /srv/build"),
+            ("sh", "sh -- /srv/backup/run", "sh -- /srv/build/run"),
+            ("bash", "bash /srv/nightly backup", "bash /srv/nightly build"),
+            (
+                "python3",
+                "python3 /srv/jobs/cleanup",
+                "python3 /srv/jobs/backup",
+            ),
+            ("node", "node /srv/cleanup", "node /srv/backup"),
+            ("ruby", "ruby /srv/cleanup", "ruby /srv/backup"),
+            ("perl", "perl /srv/cleanup", "perl /srv/backup"),
+            (
+                "bash",
+                "bash --rcfile /srv/shared.sh /srv/backup.sh",
+                "bash --rcfile /srv/shared.sh /srv/build.sh",
+            ),
+            (
+                "node",
+                "node -r /srv/shared.js /srv/backup.js",
+                "node -r /srv/shared.js /srv/build.js",
+            ),
+            (
+                "python3",
+                "python3 -W ignore /srv/worker.py",
+                "python3 -W error /srv/worker.py",
+            ),
+            (
+                "ruby",
+                "ruby -I /srv/first /srv/worker.rb",
+                "ruby -I /srv/second /srv/worker.rb",
+            ),
+            (
+                "python3",
+                "python3 --unknown /srv/config.py /srv/backup",
+                "python3 --unknown /srv/config.py /srv/build",
+            ),
+            ("bun", "bun run /srv/backup.js", "bun run /srv/build.js"),
+        ] {
+            assert!(
+                normalizer.learning_key_mode(comm, first) == LearningKeyMode::OpaqueInterpreter,
+                "{first}"
+            );
+            let a = normalizer.generate_candidates(comm, first);
+            let b = normalizer.generate_candidates(comm, second);
+            for level in [SpecificityLevel::Exact, SpecificityLevel::Standard] {
+                let first_pattern = a
+                    .iter()
+                    .find(|candidate| candidate.level == level)
+                    .unwrap();
+                let second_pattern = b
+                    .iter()
+                    .find(|candidate| candidate.level == level)
+                    .unwrap();
+                assert_ne!(
+                    first_pattern.arg_patterns,
+                    second_pattern.arg_patterns,
+                    "{first}"
+                );
+                let expression = Regex::new(&first_pattern.arg_patterns[0]).unwrap();
+                assert!(expression.is_match(first));
+                assert!(!expression.is_match(second));
+            }
+        }
+    }
+
+    #[test]
+    fn unambiguous_existing_scripts_and_modules_keep_their_patterns() {
+        let normalizer = CommandNormalizer::new();
+        for (comm, cmdline, standard) in [
+            (
+                "node",
+                "node /srv/worker.js --watch",
+                vec![".*worker.js", "--watch"],
+            ),
+            (
+                "python3",
+                "python3 -I /srv/worker.py",
+                vec!["-I", ".*worker.py"],
+            ),
+            ("python3", "python3 -m pytest -v", vec!["-m", "pytest", "-v"]),
+            ("node", "node -- /srv/worker.js", vec!["--", ".*worker.js"]),
+            ("ruby", "ruby /srv/worker.rb", vec![".*worker.rb"]),
+            ("cargo", "cargo build --release", vec!["build", "--release"]),
+        ] {
+            assert!(normalizer.learning_key_mode(comm, cmdline) == LearningKeyMode::Existing);
+            let candidates = normalizer.generate_candidates(comm, cmdline);
+            assert_eq!(
+                candidates
+                    .iter()
+                    .find(|candidate| candidate.level == SpecificityLevel::Standard)
+                    .unwrap()
+                    .arg_patterns,
+                standard,
+                "{cmdline}"
+            );
+        }
+    }
+
+    #[test]
+    fn opaque_script_arguments_cannot_become_broad_operation_flags() {
+        let candidates =
+            CommandNormalizer::new().generate_candidates("bash", "bash /srv/backup --watch secret");
+        assert!(candidates
+            .iter()
+            .find(|candidate| candidate.level == SpecificityLevel::Broad)
+            .unwrap()
+            .arg_patterns
+            .is_empty());
     }
 
     #[test]

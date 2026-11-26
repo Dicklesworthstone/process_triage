@@ -18,7 +18,7 @@
 
 use crate::config::priors::Priors;
 use crate::inference::prior_override::UserPriorOverrides;
-use crate::supervision::pattern_learning::{CommandNormalizer, SpecificityLevel};
+use crate::supervision::pattern_learning::{CommandNormalizer, LearningKeyMode, SpecificityLevel};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -1094,7 +1094,7 @@ impl DecisionStore {
     /// Pattern keys for a process, most specific first.
     pub fn pattern_keys(comm: &str, cmdline: &str) -> Vec<String> {
         let normalizer = CommandNormalizer::new();
-        let inline_program = normalizer.has_inline_program(comm, cmdline);
+        let key_mode = normalizer.learning_key_mode(comm, cmdline);
         let mut candidates = normalizer.generate_candidates(comm, cmdline);
         candidates.sort_by_key(|c| c.level.priority_offset());
         candidates
@@ -1105,24 +1105,36 @@ impl DecisionStore {
                     SpecificityLevel::Standard => "standard",
                     SpecificityLevel::Broad => "broad",
                 };
-                let arguments = if inline_program && c.level != SpecificityLevel::Broad {
-                    // Inline programs can contain credentials and other private
-                    // literals. Retain their exact identity without copying the
-                    // source into the durable learning store. Length prefixes
-                    // distinguish argument boundaries independently of contents.
+                let arguments = if key_mode != LearningKeyMode::Existing
+                    && c.level != SpecificityLevel::Broad
+                {
+                    // Source, script arguments and option operands can contain
+                    // private literals. Preserve the complete identity without
+                    // copying it into the durable learning store. Length prefixes
+                    // distinguish pattern boundaries independently of contents.
                     let mut digest = Sha256::new();
                     for argument in &c.arg_patterns {
                         digest.update((argument.len() as u64).to_le_bytes());
                         digest.update(argument.as_bytes());
                     }
-                    format!("inline:{}", hex::encode(digest.finalize()))
-                } else if inline_program {
+                    let namespace = if key_mode == LearningKeyMode::InlineProgram {
+                        "inline"
+                    } else {
+                        "program-v2"
+                    };
+                    format!("{namespace}:{}", hex::encode(digest.finalize()))
+                } else if key_mode == LearningKeyMode::InlineProgram {
                     // Previous broad keys mixed inline source with script jobs
                     // and tracked source ids from the lossy old normalization.
                     // Do not combine those votes with new opaque identities:
                     // one job labeled before and after an upgrade is still one
                     // source, not the two needed to establish a broad habit.
                     format!("inline:{}", c.arg_patterns.join(" "))
+                } else if key_mode == LearningKeyMode::OpaqueInterpreter {
+                    // The old exact/standard keys could omit this entire script
+                    // or mistake an option operand for its identity. Never mix
+                    // those old source IDs with the newly preserved invocation.
+                    format!("program-v2:{}", c.arg_patterns.join(" "))
                 } else {
                     c.arg_patterns.join(" ")
                 };
@@ -2175,6 +2187,167 @@ mod tests {
             "{}",
             learned.pattern_key
         );
+    }
+
+    #[test]
+    fn one_extensionless_or_option_bound_job_cannot_label_another() {
+        for (comm, first, second) in [
+            ("bash", "bash /srv/backup", "bash /srv/build"),
+            ("bash", "bash backup", "bash build"),
+            ("sh", "sh -- /srv/backup/run", "sh -- /srv/build/run"),
+            ("python3", "python3 /srv/cleanup", "python3 /srv/backup"),
+            ("node", "node /srv/cleanup", "node /srv/backup"),
+            (
+                "bash",
+                "bash --rcfile /srv/shared.sh /srv/backup.sh",
+                "bash --rcfile /srv/shared.sh /srv/build.sh",
+            ),
+            (
+                "node",
+                "node -r /srv/shared.js /srv/backup.js",
+                "node -r /srv/shared.js /srv/build.js",
+            ),
+            (
+                "python3",
+                "python3 -W ignore /srv/worker.py",
+                "python3 -W error /srv/worker.py",
+            ),
+            ("bash", "bash /srv/nightly backup", "bash /srv/nightly build"),
+        ] {
+            for verdict in [Verdict::Kill, Verdict::Spare] {
+                let mut store = DecisionStore::default();
+                store.record_at(comm, first, verdict, test_time());
+                let learned = store
+                    .learned_prior_at(comm, first, &global(), test_time())
+                    .unwrap();
+                assert_eq!(learned.specificity, "exact");
+                assert_eq!(learned.kill, u32::from(verdict == Verdict::Kill));
+                assert_eq!(learned.spare, u32::from(verdict == Verdict::Spare));
+                assert!(
+                    store
+                        .learned_prior_at(comm, second, &global(), test_time())
+                        .is_none(),
+                    "{verdict:?}: {first} must not label {second}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn corrected_interpreter_keys_roundtrip_without_private_arguments() {
+        for verdict in [Verdict::Kill, Verdict::Spare] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut store = DecisionStore::load(directory.path()).unwrap();
+            let first = "bash /srv/PRIVATE_SCRIPT_CANARY --token LEARNING_SECRET_CANARY";
+            let second = "bash /srv/unrelated --token LEARNING_SECRET_CANARY";
+            store.record_at("bash", first, verdict, test_time());
+            store.save().unwrap();
+            let saved = std::fs::read_to_string(directory.path().join(DECISIONS_FILE)).unwrap();
+            assert!(!saved.contains("PRIVATE_SCRIPT_CANARY"));
+            assert!(!saved.contains("LEARNING_SECRET_CANARY"));
+            let restored = DecisionStore::load(directory.path()).unwrap();
+            let same = restored
+                .learned_prior_at("bash", first, &global(), test_time())
+                .unwrap();
+            assert_eq!(
+                (same.kill, same.spare),
+                (u32::from(verdict == Verdict::Kill), u32::from(verdict == Verdict::Spare))
+            );
+            assert!(restored
+                .learned_prior_at("bash", second, &global(), test_time())
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn legacy_extensionless_source_cannot_supply_a_second_generalization_vote() {
+        let mut store = DecisionStore::default();
+        for old_key in ["standard|bash|", "broad|bash.*|"] {
+            store.entries.insert(
+                old_key.to_string(),
+                PatternCounts {
+                    kill: 1,
+                    updated_at: Some(test_time().to_rfc3339()),
+                    source_weights: BTreeMap::from([(
+                        source_id("standard|bash|"),
+                        SourceWeights {
+                            kill: 1.0,
+                            spare: 0.0,
+                        },
+                    )]),
+                    ..Default::default()
+                },
+            );
+        }
+        let first = "bash /srv/backup";
+        let second = "bash /srv/build";
+        let unseen = "bash /srv/deploy";
+        // No old bare standard key may silently label a newly identified job.
+        assert!(store
+            .learned_prior_at("bash", unseen, &global(), test_time())
+            .is_none());
+        store.record_at("bash", first, Verdict::Kill, test_time());
+        assert!(store
+            .learned_prior_at("bash", unseen, &global(), test_time())
+            .is_none());
+        // Two independent new identities still satisfy the existing broad gate.
+        store.record_at("bash", second, Verdict::Kill, test_time());
+        let learned = store
+            .learned_prior_at("bash", unseen, &global(), test_time())
+            .unwrap();
+        assert_eq!(learned.specificity, "broad");
+        assert_eq!(learned.kill, 2);
+        assert!(learned.pattern_key.contains("program-v2:"));
+    }
+
+    #[test]
+    fn opaque_interpreter_generalization_requires_concordant_distinct_jobs() {
+        let mut store = DecisionStore::default();
+        for _ in 0..50 {
+            store.record_at("bash", "bash /srv/backup", Verdict::Kill, test_time());
+        }
+        assert!(store
+            .learned_prior_at("bash", "bash /srv/unseen", &global(), test_time())
+            .is_none());
+        store.record_at("bash", "bash /srv/build", Verdict::Spare, test_time());
+        assert!(store
+            .learned_prior_at("bash", "bash /srv/unseen", &global(), test_time())
+            .is_none());
+        let spared = store
+            .learned_prior_at("bash", "bash /srv/build", &global(), test_time())
+            .unwrap();
+        assert_eq!((spared.kill, spared.spare), (0, 1));
+    }
+
+    #[test]
+    fn existing_script_and_module_spares_remain_effective() {
+        for (comm, command, legacy_key) in [
+            ("node", "node /srv/worker.js", "standard|node|.*worker.js"),
+            ("python3", "python3 -m pytest", "standard|python.*|-m pytest"),
+            (
+                "python3",
+                "python3 /srv/worker.py",
+                "standard|python.*|.*worker.py",
+            ),
+        ] {
+            let mut store = DecisionStore::default();
+            store.entries.insert(
+                legacy_key.to_string(),
+                PatternCounts {
+                    spare: 1,
+                    updated_at: Some(test_time().to_rfc3339()),
+                    ..Default::default()
+                },
+            );
+            let learned = store
+                .learned_prior_at(comm, command, &global(), test_time())
+                .unwrap();
+            assert_eq!(learned.pattern_key, legacy_key);
+            assert_eq!((learned.kill, learned.spare), (0, 1));
+            assert!(!DecisionStore::pattern_keys(comm, command)
+                .iter()
+                .any(|key| key.contains("program-v2:")));
+        }
     }
 
     #[test]

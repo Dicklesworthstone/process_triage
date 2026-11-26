@@ -801,3 +801,72 @@ fn signature_prior_from_config_override_reaches_plan_and_explain() {
         "MCP lists the user signature from PT_CONFIG_DIR: {stdout}"
     );
 }
+
+#[test]
+fn labels_of_extensionless_scripts_do_not_train_unrelated_jobs() {
+    let scripts = TempDir::new().expect("script directory");
+    let first_path = scripts.path().join("backup");
+    let second_path = scripts.path().join("worker");
+    // A shell builtin keeps each interpreter alive without spawning children.
+    // ChildGuard owns the write end of stdin until cleanup, so read cannot see EOF.
+    for path in [&first_path, &second_path] {
+        std::fs::write(path, "IFS= read -r line\n").expect("write extensionless script");
+    }
+    let spawn = |path: &Path| {
+        ChildGuard(
+            ProcessCommand::new("bash")
+                .arg(path)
+                .env_remove("BASH_ENV")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn extensionless script"),
+        )
+    };
+    let mut first = spawn(&first_path);
+    let mut second = spawn(&second_path);
+
+    for verdict in ["--kill", "--spare"] {
+        let config = TempDir::new().expect("config directory");
+        let data = TempDir::new().expect("data directory");
+        let output = pt_core(config.path(), data.path())
+            .args(["--format", "json", "agent", "label", "--pid"])
+            .arg(first.0.id().to_string())
+            .arg(verdict)
+            .output()
+            .expect("label the first script");
+        assert!(
+            output.status.success(),
+            "{verdict}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let label: Value = serde_json::from_slice(&output.stdout).expect("label response");
+        assert!(label["learned_prior"].is_object(), "{label}");
+        assert!(config.path().join("decisions.json").is_file());
+
+        let labeled = explain(config.path(), data.path(), first.0.id());
+        assert!(labeled["learned_prior"].is_object(), "{verdict}: {labeled}");
+        assert_eq!(
+            labeled["learned_prior"][if verdict == "--kill" { "kill" } else { "spare" }],
+            1,
+            "{labeled}"
+        );
+        let unrelated = explain(config.path(), data.path(), second.0.id());
+        assert!(unrelated.is_object(), "missing explanation: {unrelated}");
+        assert_eq!(unrelated["pid"], second.0.id(), "{unrelated}");
+        assert!(unrelated["posterior"].is_object(), "{unrelated}");
+        assert!(
+            unrelated["learned_prior"].is_null(),
+            "one {verdict} must not become an interpreter-wide verdict: {unrelated}"
+        );
+        assert!(
+            first.0.try_wait().unwrap().is_none(),
+            "labels never execute actions"
+        );
+        assert!(
+            second.0.try_wait().unwrap().is_none(),
+            "the other job stays alive"
+        );
+    }
+}
