@@ -1439,7 +1439,8 @@ use pt_core::action::{ActionRunner, IdentityProvider, LiveIdentityProvider};
 use pt_core::decision::{
     goal_contribution::GoalResourceSnapshot,
     goal_optimizer::{
-        optimize_greedy, optimize_ilp, OptCandidate, OptimizationResult, ResourceGoal,
+        optimize_greedy_with_limit, optimize_ilp_with_limit, OptCandidate, OptimizationResult,
+        ResourceGoal,
     },
     goal_parser::{parse_goal, Comparator, Goal, Metric, ResourceTarget},
     relief::{select_relief_plan, ReliefGoal, ReliefPlan},
@@ -8971,6 +8972,7 @@ fn finalize_tui_goal_selection(
         current_cpu_pct,
         &candidates,
         resources,
+        max_candidates.min(planned_kill_limit(policy, false)),
     ) {
         let ranks: HashMap<_, _> = preliminary
             .selected_pids
@@ -10626,6 +10628,7 @@ fn build_goal_plan_from_candidates(
     current_cpu_pct: f64,
     candidates: &[serde_json::Value],
     resources: &GoalResourceSnapshot,
+    max_actions: usize,
 ) -> Result<GoalPlanOutput, String> {
     let _ = goal.disk_target().map_err(|error| error.to_string())?;
     let mut warnings = resources.warnings.clone();
@@ -10767,7 +10770,7 @@ fn build_goal_plan_from_candidates(
                 warnings.append(&mut w);
                 let goals = vec![g.clone()];
                 let opt_candidates = build_opt_candidates_for_goals(candidates, &goals, resources);
-                let result = optimize_ilp(&opt_candidates, &goals);
+                let result = optimize_ilp_with_limit(&opt_candidates, &goals, max_actions);
                 let achieved = result
                     .goal_achievement
                     .first()
@@ -10821,9 +10824,9 @@ fn build_goal_plan_from_candidates(
 
     let opt_candidates = build_opt_candidates_for_goals(candidates, &goals, resources);
     let result = if goals.len() == 1 {
-        optimize_ilp(&opt_candidates, &goals)
+        optimize_ilp_with_limit(&opt_candidates, &goals, max_actions)
     } else {
-        optimize_greedy(&opt_candidates, &goals)
+        optimize_greedy_with_limit(&opt_candidates, &goals, max_actions)
     };
 
     let selected_pids = result
@@ -10952,6 +10955,7 @@ fn build_goal_plan_from_executable_actions(
         current_cpu_pct,
         &executable_candidates,
         resources,
+        executable_candidates.len(),
     )?;
     let selected_rank: HashMap<u32, usize> = output
         .selected_pids
@@ -11784,6 +11788,99 @@ mod executable_goal_tests {
         }
     }
 
+    #[test]
+    fn bounded_goal_finds_a_feasible_process_above_the_unbounded_minimum_loss() {
+        let goal_text = "free 100MB RAM";
+        let goal = parse_goal(goal_text).unwrap();
+        let (mut candidates, plan) = fixture(&[(100, 60, 0.0), (200, 60, 0.0), (300, 100, 0.0)]);
+        for (candidate, loss) in candidates.iter_mut().zip([1.0, 1.0, 3.0]) {
+            candidate["expected_loss"] = serde_json::json!([{"action": "kill", "loss": loss}]);
+        }
+        let resources =
+            memory_resources(&plan, &[(100, 60 * MIB), (200, 60 * MIB), (300, 100 * MIB)]);
+        let unbounded = build_goal_plan_from_candidates(
+            goal_text,
+            &goal,
+            0.0,
+            &candidates,
+            &resources,
+            usize::MAX,
+        )
+        .unwrap();
+        assert!(unbounded.result.feasible);
+        assert_eq!(unbounded.selected_pids.len(), 2);
+        assert_eq!(unbounded.result.total_loss, 2.0);
+
+        let mut policy = pt_core::config::Policy::default();
+        policy.guardrails.max_kills_per_run = 2;
+        policy.robot_mode.max_kills = 1;
+        let bounded = build_goal_plan_from_candidates(
+            goal_text,
+            &goal,
+            0.0,
+            &candidates,
+            &resources,
+            planned_kill_limit(&policy, true),
+        )
+        .unwrap();
+        assert!(bounded.result.feasible);
+        assert_eq!(bounded.selected_pids, [300]);
+        assert_eq!(bounded.result.total_loss, 3.0);
+        assert_eq!(bounded.result.total_contributions, [100.0]);
+
+        policy.robot_mode.max_kills = 0;
+        let prohibited = build_goal_plan_from_candidates(
+            goal_text,
+            &goal,
+            0.0,
+            &candidates,
+            &resources,
+            planned_kill_limit(&policy, true),
+        )
+        .unwrap();
+        assert!(!prohibited.result.feasible);
+        assert!(prohibited.selected_pids.is_empty());
+        assert_eq!(prohibited.result.total_contributions, [0.0]);
+    }
+
+    #[test]
+    fn combined_and_alternative_goals_apply_the_same_selection_limit() {
+        let memory = parse_goal("free 100MB RAM").unwrap();
+        let cpu = parse_goal("CPU < 50%").unwrap();
+        let (mut candidates, plan) = fixture(&[(100, 60, 30.0), (200, 60, 30.0), (300, 100, 60.0)]);
+        for (candidate, loss) in candidates.iter_mut().zip([1.0, 1.0, 3.0]) {
+            candidate["expected_loss"] = serde_json::json!([{"action": "kill", "loss": loss}]);
+        }
+        for (goal, third_memory) in [
+            (Goal::And(vec![memory.clone(), cpu.clone()]), 100 * MIB),
+            (Goal::Or(vec![memory, cpu]), 0),
+        ] {
+            let resources = memory_resources(
+                &plan,
+                &[(100, 60 * MIB), (200, 60 * MIB), (300, third_memory)],
+            );
+            let output = build_goal_plan_from_candidates(
+                &goal.canonical(),
+                &goal,
+                100.0,
+                &candidates,
+                &resources,
+                1,
+            )
+            .unwrap();
+            assert!(output.result.feasible);
+            assert_eq!(output.selected_pids, [300]);
+            if matches!(goal, Goal::Or(_)) {
+                // Neither small memory holder can meet its branch within one
+                // action. The CPU branch still has a feasible single target.
+                assert_eq!(output.goals.len(), 1);
+                assert_eq!(output.goals[0].resource, "cpu_pct");
+            } else {
+                assert_eq!(output.goals.len(), 2);
+            }
+        }
+    }
+
     fn assert_empty_saved_goal_plan(plan: &Plan, candidates: &[serde_json::Value]) {
         // Apply loads these Plan fields from JSON and --recommended selects all
         // unblocked actions. Exercise that same boundary without any signals.
@@ -12327,6 +12424,7 @@ mod executable_goal_tests {
                 100.0,
                 &candidates,
                 &resources,
+                usize::MAX,
             )
             .unwrap();
             assert!(!output.result.feasible, "action={action}");
@@ -13097,8 +13195,15 @@ mod executable_goal_tests {
         // Large display footprints cannot increase either measured contribution.
         candidates[0]["memory_mb"] = serde_json::json!(1_000_000);
         candidates[1]["memory_mb"] = serde_json::json!(1_000_000);
-        let preliminary =
-            build_goal_plan_from_candidates(goal_str, &goal, 0.0, &candidates, &resources).unwrap();
+        let preliminary = build_goal_plan_from_candidates(
+            goal_str,
+            &goal,
+            0.0,
+            &candidates,
+            &resources,
+            usize::MAX,
+        )
+        .unwrap();
         assert!(preliminary.result.feasible);
 
         // A one-kill budget leaves only the first executable action. The
@@ -13201,6 +13306,7 @@ mod executable_goal_tests {
             f64::NAN,
             &candidates,
             &resources,
+            usize::MAX,
         )
         .unwrap();
         assert!(output.result.feasible);
@@ -13294,6 +13400,7 @@ mod executable_goal_tests {
             original_cpu,
             &candidates,
             &GoalResourceSnapshot::default(),
+            usize::MAX,
         )
         .unwrap();
         assert!(!preliminary.result.feasible);
@@ -18604,6 +18711,20 @@ fn apply_process_tree_safety(
     downgraded
 }
 
+/// The optimizer and final budget gate must use the same per-run kill cap.
+/// Robot policy may tighten the general cap, including a zero-kill policy.
+fn planned_kill_limit(policy: &pt_core::config::Policy, robot: bool) -> usize {
+    let limit = if robot {
+        policy
+            .guardrails
+            .max_kills_per_run
+            .min(policy.robot_mode.max_kills)
+    } else {
+        policy.guardrails.max_kills_per_run
+    };
+    usize::try_from(limit).unwrap_or(usize::MAX)
+}
+
 /// Cap the final planned kill set without spending the execution rate budget.
 /// Children are eligible before parents; unrelated eligible choices retain the
 /// planner's ranking. Recheck tree safety after any budget exclusions.
@@ -18615,15 +18736,7 @@ fn apply_planned_kill_budget(
 ) -> usize {
     let mut downgraded =
         apply_process_tree_safety(candidates, processes, policy.guardrails.builtin_protection);
-    let limit = if robot {
-        policy
-            .guardrails
-            .max_kills_per_run
-            .min(policy.robot_mode.max_kills)
-    } else {
-        policy.guardrails.max_kills_per_run
-    };
-    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let limit = planned_kill_limit(policy, robot);
     let kill_indices: Vec<usize> = candidates
         .iter()
         .enumerate()
@@ -25552,7 +25665,10 @@ mod process_tree_safety_tests {
             assert_eq!(fixture.rows[0].pid, 100);
             assert_eq!(fixture.rows[0].classification, "REVIEW");
             assert!(!fixture.rows[0].selected);
-            assert_eq!(fixture.candidates[&100]["tree_safety"]["rule"], "live_child");
+            assert_eq!(
+                fixture.candidates[&100]["tree_safety"]["rule"],
+                "live_child"
+            );
             assert!(!output.result.feasible);
             assert!(output.selected_pids.is_empty());
             assert_eq!(output.result.total_contributions, [0.0]);
@@ -25586,6 +25702,46 @@ mod process_tree_safety_tests {
             assert_eq!(fixture.rows.len(), 1);
             assert_eq!(fixture.rows[0].pid, 100);
             assert!(!fixture.rows[0].selected);
+        }
+
+        #[test]
+        fn tui_goal_solves_within_display_and_policy_limits_before_truncation() {
+            for (row_limit, kill_limit) in [(1, 10), (3, 1)] {
+                let mut fixture = Fixture::new(&[
+                    (100, 1, 60, ProcessState::Sleeping),
+                    (200, 1, 60, ProcessState::Sleeping),
+                    (300, 1, 100, ProcessState::Sleeping),
+                ]);
+                for (pid, loss) in [(100, 1.0), (200, 1.0), (300, 3.0)] {
+                    fixture.candidates.get_mut(&pid).unwrap()["expected_loss"] =
+                        serde_json::json!([{"action": "kill", "loss": loss}]);
+                }
+                let resources = fixture.measured_private_memory(&[
+                    (100, 60 * 1024 * 1024),
+                    (200, 60 * 1024 * 1024),
+                    (300, 100 * 1024 * 1024),
+                ]);
+                fixture.policy.guardrails.max_kills_per_run = kill_limit;
+                let output = fixture
+                    .optimize_with_limit("free 100MB RAM", 0.0, &resources, row_limit)
+                    .unwrap();
+                assert!(output.result.feasible);
+                assert_eq!(output.selected_pids, [300]);
+                assert_eq!(output.result.total_contributions, [100.0]);
+                assert_eq!(
+                    fixture
+                        .rows
+                        .iter()
+                        .filter(|row| row.selected)
+                        .map(|row| row.pid)
+                        .collect::<Vec<_>>(),
+                    [300]
+                );
+                let plan = fixture.executable(&output.selected_pids);
+                assert_eq!(plan.actions.len(), 1);
+                assert_eq!(plan.actions[0].target, fixture.inputs[&300].identity);
+                assert_eq!(fixture.rows.len(), row_limit);
+            }
         }
 
         #[test]
@@ -36709,6 +36865,8 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                         total_cpu_pct_for_goal,
                         &candidates,
                         &goal_resources,
+                        (args.max_candidates as usize)
+                            .min(planned_kill_limit(&decision_policy, global.robot)),
                     ) {
                         Ok(goal_output) => {
                             let selected_rank: HashMap<u32, usize> = goal_output

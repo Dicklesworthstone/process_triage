@@ -987,7 +987,13 @@ pub fn optimize_ilp_with_limit(
         event.note = Some("candidate_limit: recursive search not entered".to_string());
         event.search = Some(IlpSearchBudget::default().summary(eligible.len(), false));
         log_events.push(event);
-        return ilp_greedy_fallback(candidates, goals, max_actions, "candidate_limit", log_events);
+        return ilp_greedy_fallback(
+            candidates,
+            goals,
+            max_actions,
+            "candidate_limit",
+            log_events,
+        );
     }
 
     let target = goals[0].target;
@@ -1046,7 +1052,11 @@ pub fn optimize_ilp_with_limit(
         by_capacity.sort_by(|&a, &b| {
             ordered[b].contributions[0]
                 .total_cmp(&ordered[a].contributions[0])
-                .then_with(|| ordered[a].expected_loss.total_cmp(&ordered[b].expected_loss))
+                .then_with(|| {
+                    ordered[a]
+                        .expected_loss
+                        .total_cmp(&ordered[b].expected_loss)
+                })
                 .then_with(|| a.cmp(&b))
         });
         let (capacity_loss, capacity_selection) =
@@ -2651,7 +2661,6 @@ mod tests {
 
     // --- ILP tests ---
 
-
     #[test]
     fn action_limit_changes_the_optimum_instead_of_truncating_it() {
         let candidates = [
@@ -2676,7 +2685,10 @@ mod tests {
             assert_eq!(selected_ids(&result), ["sufficient"]);
             assert_eq!(result.total_loss, 5.0);
             assert_eq!(result.total_contributions, [100.0]);
-            assert!(result.alternatives.iter().all(|plan| plan.action_count <= 1));
+            assert!(result
+                .alternatives
+                .iter()
+                .all(|plan| plan.action_count <= 1));
         }
 
         assert_eq!(
@@ -2685,7 +2697,8 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(optimize_greedy(&candidates, &goals)).unwrap(),
-            serde_json::to_value(optimize_greedy_with_limit(&candidates, &goals, usize::MAX)).unwrap()
+            serde_json::to_value(optimize_greedy_with_limit(&candidates, &goals, usize::MAX))
+                .unwrap()
         );
     }
 
@@ -2740,13 +2753,19 @@ mod tests {
                 assert_eq!(selected_ids(&result), ["joint-holder"]);
                 assert_eq!(result.total_loss, 9.0);
                 assert_eq!(result.total_contributions, [100.0, 100.0]);
-                assert!(result.alternatives.iter().all(|plan| plan.action_count <= 1));
+                assert!(result
+                    .alternatives
+                    .iter()
+                    .all(|plan| plan.action_count <= 1));
             }
             let result = optimize_greedy_with_limit(&candidates, &goals, 2);
             assert!(result.feasible);
             assert_eq!(result.total_loss, 2.0);
             assert_eq!(result.selected.len(), 2);
-            assert!(result.alternatives.iter().all(|plan| plan.action_count <= 2));
+            assert!(result
+                .alternatives
+                .iter()
+                .all(|plan| plan.action_count <= 2));
         }
     }
 
@@ -2778,7 +2797,10 @@ mod tests {
             assert_eq!(result.total_loss, 1.0);
             assert_eq!(result.total_contributions, [60.0]);
             assert_eq!(result.goal_achievement[0].shortfall, 40.0);
-            assert!(result.alternatives.iter().all(|plan| plan.action_count <= 1));
+            assert!(result
+                .alternatives
+                .iter()
+                .all(|plan| plan.action_count <= 1));
         }
 
         let invalid_goal = [ResourceGoal {
