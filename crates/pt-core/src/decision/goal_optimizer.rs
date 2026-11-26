@@ -228,7 +228,31 @@ impl PreferenceModel {
 /// deficit earns no selection credit. Thus units (bytes versus MiB, for example)
 /// do not change the objective and a satisfied goal cannot keep driving kills.
 pub fn optimize_greedy(candidates: &[OptCandidate], goals: &[ResourceGoal]) -> OptimizationResult {
-    optimize_greedy_internal(candidates, goals, None, "greedy", true)
+    optimize_greedy_internal(
+        candidates,
+        goals,
+        None,
+        "greedy",
+        true,
+        usize::MAX,
+        GreedyObjective::LossEfficiency,
+    )
+}
+
+/// Greedy optimization subject to a hard limit on the number of actions.
+///
+/// Compares loss-efficient and maximum-progress selections, plus individually
+/// feasible actions. This avoids spending a small action budget on cheap partial
+/// contributors when a larger contributor can meet the goals within the limit.
+/// Multi-goal selection remains a heuristic: an unmet result is not proof that
+/// no feasible combination exists. Neither selections nor alternatives exceed
+/// `max_actions`.
+pub fn optimize_greedy_with_limit(
+    candidates: &[OptCandidate],
+    goals: &[ResourceGoal],
+    max_actions: usize,
+) -> OptimizationResult {
+    optimize_greedy_limited_internal(candidates, goals, max_actions, true)
 }
 
 /// Greedy optimization with a user preference model applied to loss sensitivity.
@@ -237,7 +261,21 @@ pub fn optimize_greedy_with_preferences(
     goals: &[ResourceGoal],
     prefs: &PreferenceModel,
 ) -> OptimizationResult {
-    optimize_greedy_internal(candidates, goals, Some(prefs), "greedy_pref", true)
+    optimize_greedy_internal(
+        candidates,
+        goals,
+        Some(prefs),
+        "greedy_pref",
+        true,
+        usize::MAX,
+        GreedyObjective::LossEfficiency,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum GreedyObjective {
+    LossEfficiency,
+    Progress,
 }
 
 /// A stale entry is an upper bound: deficits only decrease, so marginal gain
@@ -366,6 +404,8 @@ fn optimize_greedy_internal(
     prefs: Option<&PreferenceModel>,
     algorithm_label: &str,
     include_alternatives: bool,
+    max_actions: usize,
+    objective: GreedyObjective,
 ) -> OptimizationResult {
     let mut log_events = Vec::new();
     let mut start_event = OptimizationLogEvent::new("optimizer_start", algorithm_label);
@@ -377,6 +417,15 @@ fn optimize_greedy_internal(
     log_events.push(start_event);
 
     let adjust_loss = |loss: f64| prefs.map_or(loss, |p| p.adjust_loss(loss));
+    let ranking_loss = |loss: f64| match objective {
+        GreedyObjective::LossEfficiency => adjust_loss(loss),
+        GreedyObjective::Progress => 1.0,
+    };
+    if max_actions < candidates.len() {
+        let mut event = OptimizationLogEvent::new("action_limit", algorithm_label);
+        event.note = Some(format!("max_actions={max_actions}"));
+        log_events.push(event);
+    }
 
     if !valid_goal_inputs(goals) || prefs.is_some_and(|prefs| !prefs.risk_tolerance.is_finite()) {
         let mut invalid = OptimizationLogEvent::new("invalid_input", algorithm_label);
@@ -439,7 +488,7 @@ fn optimize_greedy_internal(
         .filter_map(|(index, candidate)| {
             marginal_rank(
                 candidate,
-                adjust_loss(candidate.expected_loss),
+                ranking_loss(candidate.expected_loss),
                 goals,
                 remaining_targets.iter().copied(),
                 *index,
@@ -449,15 +498,15 @@ fn optimize_greedy_internal(
         .collect();
 
     while let Some(rank) = heap.pop() {
-        // Check if all goals are already met.
-        if remaining_targets.iter().all(|t| *t <= 0.0) {
+        // Stop when goals are met or the executable action budget is spent.
+        if selected.len() >= max_actions || remaining_targets.iter().all(|t| *t <= 0.0) {
             break;
         }
         let cand = &candidates[rank.index];
         if rank.generation != selected.len() {
             if let Some(updated) = marginal_rank(
                 cand,
-                adjust_loss(cand.expected_loss),
+                ranking_loss(cand.expected_loss),
                 goals,
                 remaining_targets.iter().copied(),
                 rank.index,
@@ -526,7 +575,7 @@ fn optimize_greedy_internal(
     // The bounded exact-search fallback must not enter the exponential Pareto
     // enumeration, nor collect an unbounded per-candidate diagnostic log.
     let alternatives = if include_alternatives {
-        generate_alternatives(&selected, goals, &eligible, &mut log_events)
+        generate_alternatives(&selected, goals, &eligible, max_actions, &mut log_events)
     } else {
         Vec::new()
     };
@@ -545,6 +594,156 @@ fn optimize_greedy_internal(
         alternatives,
         log_events,
     }
+}
+
+// Rank partial plans by capped, target-normalized progress. Log space keeps
+// comparisons finite even when resource weights span extreme magnitudes.
+fn partial_progress(result: &OptimizationResult, goals: &[ResourceGoal]) -> (f64, f64) {
+    let mut weighted = f64::NEG_INFINITY;
+    let mut unweighted = f64::NEG_INFINITY;
+    for (total, goal) in result.total_contributions.iter().zip(goals) {
+        if *total <= 0.0 || goal.target <= 0.0 {
+            continue;
+        }
+        let fraction = total.min(goal.target).ln() - goal.target.ln();
+        unweighted = log_add_positive(unweighted, fraction);
+        if goal.weight > 0.0 {
+            weighted = log_add_positive(weighted, fraction + goal.weight.ln());
+        }
+    }
+    (weighted, unweighted)
+}
+
+fn prefer_bounded_result(
+    candidate: &OptimizationResult,
+    current: &OptimizationResult,
+    goals: &[ResourceGoal],
+) -> bool {
+    if candidate.feasible != current.feasible {
+        return candidate.feasible;
+    }
+    if !candidate.feasible {
+        let proposed = partial_progress(candidate, goals);
+        let existing = partial_progress(current, goals);
+        let progress = proposed
+            .0
+            .total_cmp(&existing.0)
+            .then_with(|| proposed.1.total_cmp(&existing.1));
+        if progress != Ordering::Equal {
+            return progress == Ordering::Greater;
+        }
+    }
+    candidate.total_loss < current.total_loss
+        || (candidate.total_loss == current.total_loss
+            && candidate.selected.len() < current.selected.len())
+}
+
+fn optimize_greedy_limited_internal(
+    candidates: &[OptCandidate],
+    goals: &[ResourceGoal],
+    max_actions: usize,
+    include_alternatives: bool,
+) -> OptimizationResult {
+    // Preserve the existing unconstrained objective and diagnostics when the
+    // limit cannot bind; invalid inputs and zero budgets need only one pass.
+    if max_actions >= candidates.len() || max_actions == 0 || !valid_goal_inputs(goals) {
+        return optimize_greedy_internal(
+            candidates,
+            goals,
+            None,
+            "greedy",
+            include_alternatives,
+            max_actions,
+            GreedyObjective::LossEfficiency,
+        );
+    }
+
+    let mut result = optimize_greedy_internal(
+        candidates,
+        goals,
+        None,
+        "greedy",
+        false,
+        max_actions,
+        GreedyObjective::LossEfficiency,
+    );
+    let mut strategy = "loss_efficiency";
+    let progress = optimize_greedy_internal(
+        candidates,
+        goals,
+        None,
+        "greedy_progress",
+        false,
+        max_actions,
+        GreedyObjective::Progress,
+    );
+    if prefer_bounded_result(&progress, &result, goals) {
+        result = progress;
+        strategy = "maximum_progress";
+    }
+
+    // A zero-weight constraint can tie a partial contributor with an action
+    // satisfying every goal. Explicitly retain the cheapest one-action solution
+    // instead of allowing input order or weights to hide that feasible plan.
+    if let Some(single) = candidates
+        .iter()
+        .filter(|candidate| {
+            !candidate.blocked
+                && valid_candidate_inputs(candidate, goals.len())
+                && candidate
+                    .contributions
+                    .iter()
+                    .zip(goals)
+                    .all(|(contribution, goal)| *contribution >= goal.target)
+        })
+        .min_by(|a, b| a.expected_loss.total_cmp(&b.expected_loss))
+    {
+        let one_action = optimize_greedy_internal(
+            std::slice::from_ref(single),
+            goals,
+            None,
+            "greedy_single_action",
+            false,
+            max_actions,
+            GreedyObjective::LossEfficiency,
+        );
+        if prefer_bounded_result(&one_action, &result, goals) {
+            result = one_action;
+            strategy = "single_action";
+        }
+    }
+
+    if include_alternatives {
+        let eligible: Vec<_> = candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| {
+                !candidate.blocked
+                    && valid_candidate_inputs(candidate, goals.len())
+                    && candidate
+                        .contributions
+                        .iter()
+                        .zip(goals)
+                        .any(|(contribution, goal)| *contribution > 0.0 && goal.target > 0.0)
+            })
+            .collect();
+        result.alternatives = generate_alternatives(
+            &result.selected,
+            goals,
+            &eligible,
+            max_actions,
+            &mut result.log_events,
+        );
+    }
+    result.algorithm = "greedy (action limit, multi-start heuristic)".to_string();
+    let mut event = OptimizationLogEvent::new("bounded_strategy", "greedy");
+    event.note = Some(format!(
+        "max_actions={max_actions} strategy={strategy}; multi-goal feasibility and optimality are not proven"
+    ));
+    event.total_loss = Some(result.total_loss);
+    event.total_contributions = result.total_contributions.clone();
+    result.log_events.push(event);
+    result
 }
 
 /// DP-exact optimization for small candidate sets.
@@ -715,10 +914,11 @@ impl IlpSearchBudget {
 fn ilp_greedy_fallback(
     candidates: &[OptCandidate],
     goals: &[ResourceGoal],
+    max_actions: usize,
     reason: &str,
     log_events: Vec<OptimizationLogEvent>,
 ) -> OptimizationResult {
-    let mut result = optimize_greedy_internal(candidates, goals, None, "greedy", false);
+    let mut result = optimize_greedy_limited_internal(candidates, goals, max_actions, false);
     result.algorithm = format!("ilp_branch_bound ({reason}, greedy fallback; optimum not proven)");
     result.log_events.extend(log_events);
     result
@@ -732,6 +932,20 @@ fn ilp_greedy_fallback(
 /// candidate decisions may be recursive; larger sets use greedy selection.
 /// Budget exhaustion retains a feasible incumbent without claiming optimality.
 pub fn optimize_ilp(candidates: &[OptCandidate], goals: &[ResourceGoal]) -> OptimizationResult {
+    optimize_ilp_with_limit(candidates, goals, usize::MAX)
+}
+
+/// Branch-and-bound optimization with a hard action-count constraint.
+///
+/// The incumbent, remaining-capacity bound, search, and greedy fallback all
+/// respect `max_actions`. A capacity-ordered seed keeps a large contribution
+/// from being hidden behind cheaper partial contributors when work is bounded.
+/// Single-goal optimality is reported only if the bounded search completes.
+pub fn optimize_ilp_with_limit(
+    candidates: &[OptCandidate],
+    goals: &[ResourceGoal],
+    max_actions: usize,
+) -> OptimizationResult {
     let mut log_events = Vec::new();
     let mut start_event = OptimizationLogEvent::new("optimizer_start", "ilp_branch_bound");
     start_event.note = Some(format!(
@@ -742,7 +956,7 @@ pub fn optimize_ilp(candidates: &[OptCandidate], goals: &[ResourceGoal]) -> Opti
     log_events.push(start_event);
 
     if goals.len() != 1 || candidates.is_empty() || !valid_goal_inputs(goals) {
-        return ilp_greedy_fallback(candidates, goals, "unsupported", log_events);
+        return ilp_greedy_fallback(candidates, goals, max_actions, "unsupported", log_events);
     }
 
     record_invalid_candidates(
@@ -766,14 +980,14 @@ pub fn optimize_ilp(candidates: &[OptCandidate], goals: &[ResourceGoal]) -> Opti
         .collect();
 
     if eligible.is_empty() {
-        return ilp_greedy_fallback(candidates, goals, "no_candidates", log_events);
+        return ilp_greedy_fallback(candidates, goals, max_actions, "no_candidates", log_events);
     }
     if eligible.len() > ILP_CANDIDATE_LIMIT {
         let mut event = OptimizationLogEvent::new("search_budget_exhausted", "ilp_branch_bound");
         event.note = Some("candidate_limit: recursive search not entered".to_string());
         event.search = Some(IlpSearchBudget::default().summary(eligible.len(), false));
         log_events.push(event);
-        return ilp_greedy_fallback(candidates, goals, "candidate_limit", log_events);
+        return ilp_greedy_fallback(candidates, goals, max_actions, "candidate_limit", log_events);
     }
 
     let target = goals[0].target;
@@ -781,27 +995,66 @@ pub fn optimize_ilp(candidates: &[OptCandidate], goals: &[ResourceGoal]) -> Opti
     ordered.sort_by_cached_key(|candidate| std::cmp::Reverse(pareto_efficiency(candidate, goals)));
 
     let n = ordered.len();
-    let mut suffix_max = vec![0.0; n + 1];
+    // Clamp before sizing the table: the unconstrained API passes usize::MAX.
+    let max_actions = max_actions.min(n);
+    let mut suffix_capacity = vec![vec![0.0_f64; max_actions + 1]; n + 1];
     for i in (0..n).rev() {
-        suffix_max[i] = suffix_max[i + 1] + ordered[i].contributions[0];
+        for slots in 1..=max_actions {
+            // Round up so floating-point addition cannot underestimate the
+            // maximum attainable contribution and prune a feasible branch.
+            let with_candidate =
+                (ordered[i].contributions[0] + suffix_capacity[i + 1][slots - 1]).next_up();
+            suffix_capacity[i][slots] = suffix_capacity[i + 1][slots].max(with_candidate);
+        }
     }
 
-    // Seed the search with a feasible efficiency-ordered set. Even if the work
-    // budget expires, the search can only improve on this incumbent's loss.
-    let mut best_loss = 0.0;
-    let mut best_selection: Vec<usize> = Vec::new();
-    let mut seed_contribution = 0.0;
-    for (idx, candidate) in ordered.iter().enumerate() {
-        if seed_contribution >= target {
-            break;
+    fn feasible_seed(
+        ordered: &[&OptCandidate],
+        indices: impl IntoIterator<Item = usize>,
+        target: f64,
+        max_actions: usize,
+    ) -> (f64, Vec<usize>) {
+        let mut loss = 0.0;
+        let mut contribution = 0.0;
+        let mut selection = Vec::new();
+        for idx in indices {
+            if contribution >= target || selection.len() >= max_actions {
+                break;
+            }
+            let next_loss = loss + ordered[idx].expected_loss;
+            let next_contribution = contribution + ordered[idx].contributions[0];
+            if !next_loss.is_finite() || !next_contribution.is_finite() {
+                continue;
+            }
+            loss = next_loss;
+            contribution = next_contribution;
+            selection.push(idx);
         }
-        best_loss += candidate.expected_loss;
-        seed_contribution += candidate.contributions[0];
-        best_selection.push(idx);
+        if contribution >= target {
+            (loss, selection)
+        } else {
+            (f64::INFINITY, Vec::new())
+        }
     }
-    if seed_contribution < target {
-        best_loss = f64::INFINITY;
-        best_selection.clear();
+
+    // An efficiency seed may spend all slots without meeting the target.
+    // Also try the largest contributors so the search starts with a feasible
+    // bounded incumbent whenever their aggregate is finite and sufficient.
+    let (mut best_loss, mut best_selection) = feasible_seed(&ordered, 0..n, target, max_actions);
+    if max_actions < n {
+        let mut by_capacity: Vec<usize> = (0..n).collect();
+        by_capacity.sort_by(|&a, &b| {
+            ordered[b].contributions[0]
+                .total_cmp(&ordered[a].contributions[0])
+                .then_with(|| ordered[a].expected_loss.total_cmp(&ordered[b].expected_loss))
+                .then_with(|| a.cmp(&b))
+        });
+        let (capacity_loss, capacity_selection) =
+            feasible_seed(&ordered, by_capacity, target, max_actions);
+        if capacity_loss < best_loss {
+            best_loss = capacity_loss;
+            best_selection = capacity_selection;
+        }
     }
     let mut current: Vec<usize> = Vec::new();
     let mut budget = IlpSearchBudget::default();
@@ -811,7 +1064,8 @@ pub fn optimize_ilp(candidates: &[OptCandidate], goals: &[ResourceGoal]) -> Opti
         idx: usize,
         ordered: &[&OptCandidate],
         target: f64,
-        suffix_max: &[f64],
+        suffix_capacity: &[Vec<f64>],
+        max_actions: usize,
         current_loss: f64,
         current_contrib: f64,
         current: &mut Vec<usize>,
@@ -836,7 +1090,7 @@ pub fn optimize_ilp(candidates: &[OptCandidate], goals: &[ResourceGoal]) -> Opti
             return;
         }
 
-        if idx >= ordered.len() {
+        if idx >= ordered.len() || current.len() >= max_actions {
             return;
         }
 
@@ -844,31 +1098,37 @@ pub fn optimize_ilp(candidates: &[OptCandidate], goals: &[ResourceGoal]) -> Opti
             return;
         }
 
-        if current_contrib + suffix_max[idx] < target {
+        let remaining_max = suffix_capacity[idx][max_actions - current.len()];
+        if (current_contrib + remaining_max).next_up() < target {
             let mut event = OptimizationLogEvent::new("constraint_prune", "ilp_branch_bound");
             event.current_contribution = Some(current_contrib);
-            event.remaining_max = Some(suffix_max[idx]);
+            event.remaining_max = Some(remaining_max);
             event.target = Some(target);
             budget.record(log_events, event);
             return;
         }
 
-        // Include candidate.
-        current.push(idx);
-        dfs(
-            idx + 1,
-            ordered,
-            target,
-            suffix_max,
-            current_loss + ordered[idx].expected_loss,
-            current_contrib + ordered[idx].contributions[0],
-            current,
-            best_loss,
-            best_selection,
-            log_events,
-            budget,
-        );
-        current.pop();
+        // Include only actions whose reported aggregate remains finite.
+        let next_loss = current_loss + ordered[idx].expected_loss;
+        let next_contrib = current_contrib + ordered[idx].contributions[0];
+        if next_loss.is_finite() && next_contrib.is_finite() {
+            current.push(idx);
+            dfs(
+                idx + 1,
+                ordered,
+                target,
+                suffix_capacity,
+                max_actions,
+                next_loss,
+                next_contrib,
+                current,
+                best_loss,
+                best_selection,
+                log_events,
+                budget,
+            );
+            current.pop();
+        }
         if budget.exhausted {
             return;
         }
@@ -878,7 +1138,8 @@ pub fn optimize_ilp(candidates: &[OptCandidate], goals: &[ResourceGoal]) -> Opti
             idx + 1,
             ordered,
             target,
-            suffix_max,
+            suffix_capacity,
+            max_actions,
             current_loss,
             current_contrib,
             current,
@@ -893,7 +1154,8 @@ pub fn optimize_ilp(candidates: &[OptCandidate], goals: &[ResourceGoal]) -> Opti
         0,
         &ordered,
         target,
-        &suffix_max,
+        &suffix_capacity,
+        max_actions,
         0.0,
         0.0,
         &mut current,
@@ -922,7 +1184,7 @@ pub fn optimize_ilp(candidates: &[OptCandidate], goals: &[ResourceGoal]) -> Opti
         let mut event = OptimizationLogEvent::new("constraint_violation", "ilp_branch_bound");
         event.note = Some("ilp_infeasible".to_string());
         log_events.push(event);
-        return ilp_greedy_fallback(candidates, goals, "infeasible", log_events);
+        return ilp_greedy_fallback(candidates, goals, max_actions, "infeasible", log_events);
     }
 
     let selected: Vec<SelectedAction> = best_selection
@@ -1140,13 +1402,15 @@ fn generate_alternatives(
     selected: &[SelectedAction],
     goals: &[ResourceGoal],
     eligible: &[(usize, &OptCandidate)],
+    max_actions: usize,
     log_events: &mut Vec<OptimizationLogEvent>,
 ) -> Vec<AlternativePlan> {
     let mut alts: Vec<AlternativePlan> = Vec::new();
     let mut seen = HashSet::new();
 
     let mut push_unique = |alt: AlternativePlan| {
-        if !alt.total_loss.is_finite()
+        if alt.action_count > max_actions
+            || !alt.total_loss.is_finite()
             || alt
                 .goal_achievement
                 .iter()
@@ -1178,7 +1442,7 @@ fn generate_alternatives(
     }
 
     // Aggressive: add one more action if available.
-    if selected.len() < eligible.len() {
+    if selected.len() < eligible.len() && selected.len() < max_actions {
         let selected_ids: HashSet<&str> = selected.iter().map(|s| s.id.as_str()).collect();
         let next = eligible
             .iter()
@@ -1204,7 +1468,7 @@ fn generate_alternatives(
         }
     }
 
-    for alt in compute_pareto_frontier(eligible, goals, 8, log_events) {
+    for alt in compute_pareto_frontier(eligible, goals, 8, max_actions, log_events) {
         push_unique(alt);
     }
 
@@ -1252,9 +1516,10 @@ fn compute_pareto_frontier(
     eligible: &[(usize, &OptCandidate)],
     goals: &[ResourceGoal],
     max_sets: usize,
+    max_actions: usize,
     log_events: &mut Vec<OptimizationLogEvent>,
 ) -> Vec<AlternativePlan> {
-    if eligible.is_empty() || goals.is_empty() || max_sets == 0 {
+    if eligible.is_empty() || goals.is_empty() || max_sets == 0 || max_actions == 0 {
         return Vec::new();
     }
 
@@ -1278,6 +1543,9 @@ fn compute_pareto_frontier(
     let mut sets: Vec<ParetoSet> = Vec::new();
 
     for mask in 1..(1_u32 << n) {
+        if mask.count_ones() as usize > max_actions {
+            continue;
+        }
         let mut actions = Vec::new();
         let mut total_loss = 0.0;
         let mut totals = vec![0.0; goals_len];
@@ -2382,6 +2650,290 @@ mod tests {
     }
 
     // --- ILP tests ---
+
+
+    #[test]
+    fn action_limit_changes_the_optimum_instead_of_truncating_it() {
+        let candidates = [
+            goal_candidate("cheap-a", 1.0, &[60.0]),
+            goal_candidate("cheap-b", 1.0, &[60.0]),
+            goal_candidate("sufficient", 5.0, &[100.0]),
+        ];
+        let goals = [ResourceGoal {
+            resource: "memory".into(),
+            target: 100.0,
+            weight: 1.0,
+        }];
+        let unconstrained = optimize_ilp(&candidates, &goals);
+        assert_eq!(unconstrained.total_loss, 2.0);
+        assert_eq!(unconstrained.selected.len(), 2);
+
+        for result in [
+            optimize_ilp_with_limit(&candidates, &goals, 1),
+            optimize_greedy_with_limit(&candidates, &goals, 1),
+        ] {
+            assert!(result.feasible);
+            assert_eq!(selected_ids(&result), ["sufficient"]);
+            assert_eq!(result.total_loss, 5.0);
+            assert_eq!(result.total_contributions, [100.0]);
+            assert!(result.alternatives.iter().all(|plan| plan.action_count <= 1));
+        }
+
+        assert_eq!(
+            serde_json::to_value(optimize_ilp(&candidates, &goals)).unwrap(),
+            serde_json::to_value(optimize_ilp_with_limit(&candidates, &goals, usize::MAX)).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(optimize_greedy(&candidates, &goals)).unwrap(),
+            serde_json::to_value(optimize_greedy_with_limit(&candidates, &goals, usize::MAX)).unwrap()
+        );
+    }
+
+    #[test]
+    fn zero_action_limit_reports_shortfall_but_accepts_already_met_goals() {
+        let candidates = [goal_candidate("holder", 1.0, &[100.0])];
+        for target in [0.0, 100.0] {
+            let goals = [ResourceGoal {
+                resource: "memory".into(),
+                target,
+                weight: 1.0,
+            }];
+            for result in [
+                optimize_ilp_with_limit(&candidates, &goals, 0),
+                optimize_greedy_with_limit(&candidates, &goals, 0),
+            ] {
+                assert!(result.selected.is_empty());
+                assert!(result.alternatives.is_empty());
+                assert_eq!(result.feasible, target == 0.0);
+                assert_eq!(result.total_loss, 0.0);
+                assert_eq!(result.total_contributions, [0.0]);
+                assert_eq!(result.goal_achievement[0].shortfall, target);
+            }
+        }
+    }
+
+    #[test]
+    fn limited_multigoal_greedy_preserves_a_joint_holder_even_with_zero_weight() {
+        let candidates = [
+            goal_candidate("memory-only", 1.0, &[100.0, 0.0]),
+            goal_candidate("fds-only", 1.0, &[0.0, 100.0]),
+            goal_candidate("joint-holder", 9.0, &[100.0, 100.0]),
+        ];
+        for fd_weight in [0.0, 1.0] {
+            let goals = [
+                ResourceGoal {
+                    resource: "memory".into(),
+                    target: 100.0,
+                    weight: 1.0,
+                },
+                ResourceGoal {
+                    resource: "fds".into(),
+                    target: 100.0,
+                    weight: fd_weight,
+                },
+            ];
+            for result in [
+                optimize_greedy_with_limit(&candidates, &goals, 1),
+                optimize_ilp_with_limit(&candidates, &goals, 1),
+            ] {
+                assert!(result.feasible);
+                assert_eq!(selected_ids(&result), ["joint-holder"]);
+                assert_eq!(result.total_loss, 9.0);
+                assert_eq!(result.total_contributions, [100.0, 100.0]);
+                assert!(result.alternatives.iter().all(|plan| plan.action_count <= 1));
+            }
+            let result = optimize_greedy_with_limit(&candidates, &goals, 2);
+            assert!(result.feasible);
+            assert_eq!(result.total_loss, 2.0);
+            assert_eq!(result.selected.len(), 2);
+            assert!(result.alternatives.iter().all(|plan| plan.action_count <= 2));
+        }
+    }
+
+    #[test]
+    fn limited_solvers_exclude_blocked_and_invalid_candidates() {
+        let mut protected = goal_candidate("protected", 0.0, &[1000.0]);
+        protected.blocked = true;
+        protected.block_reason = Some("protected process".into());
+        let candidates = [
+            protected,
+            goal_candidate("nan-loss", f64::NAN, &[1000.0]),
+            goal_candidate("infinite-contribution", 0.0, &[f64::INFINITY]),
+            goal_candidate("missing-observation", 0.0, &[]),
+            goal_candidate("no-progress", 0.0, &[0.0]),
+            goal_candidate("safe-partial", 1.0, &[60.0]),
+            goal_candidate("safe-partial-2", 1.0, &[60.0]),
+        ];
+        let goals = [ResourceGoal {
+            resource: "memory".into(),
+            target: 100.0,
+            weight: 1.0,
+        }];
+        for result in [
+            optimize_ilp_with_limit(&candidates, &goals, 1),
+            optimize_greedy_with_limit(&candidates, &goals, 1),
+        ] {
+            assert!(!result.feasible);
+            assert_eq!(selected_ids(&result), ["safe-partial"]);
+            assert_eq!(result.total_loss, 1.0);
+            assert_eq!(result.total_contributions, [60.0]);
+            assert_eq!(result.goal_achievement[0].shortfall, 40.0);
+            assert!(result.alternatives.iter().all(|plan| plan.action_count <= 1));
+        }
+
+        let invalid_goal = [ResourceGoal {
+            target: f64::NAN,
+            ..goals[0].clone()
+        }];
+        for result in [
+            optimize_ilp_with_limit(&candidates, &invalid_goal, 1),
+            optimize_greedy_with_limit(&candidates, &invalid_goal, 1),
+        ] {
+            assert!(!result.feasible);
+            assert!(result.selected.is_empty());
+            assert!(result.goal_achievement.is_empty());
+        }
+    }
+
+    #[test]
+    fn limited_ilp_matches_an_independent_exhaustive_subset_oracle() {
+        let mut state = 0x71c9_43b8_2a65_0df1_u64;
+        let mut sample = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            state >> 32
+        };
+        for case in 0..48 {
+            let count = 1 + (sample() % 8) as usize;
+            let candidates: Vec<_> = (0..count)
+                .map(|index| {
+                    let mut candidate = goal_candidate(
+                        &format!("case-{case}-candidate-{index}"),
+                        (sample() % 9) as f64,
+                        &[(sample() % 17) as f64],
+                    );
+                    candidate.blocked = sample().is_multiple_of(7);
+                    candidate
+                })
+                .collect();
+            let target = (sample() % 65) as f64;
+            let goals = [ResourceGoal {
+                resource: "memory".into(),
+                target,
+                weight: 1.0,
+            }];
+
+            for limit in 0..=count + 1 {
+                // Enumerate raw subsets without using the optimizer's ranking,
+                // eligibility, pruning, incumbent, or achievement helpers.
+                let mut optimum: Option<f64> = None;
+                for mask in 0..(1_u32 << count) {
+                    if mask.count_ones() as usize > limit {
+                        continue;
+                    }
+                    let mut loss = 0.0;
+                    let mut contribution = 0.0;
+                    let mut blocked = false;
+                    for (index, candidate) in candidates.iter().enumerate() {
+                        if mask & (1_u32 << index) != 0 {
+                            blocked |= candidate.blocked;
+                            loss += candidate.expected_loss;
+                            contribution += candidate.contributions[0];
+                        }
+                    }
+                    if !blocked && contribution >= target {
+                        optimum = Some(optimum.map_or(loss, |previous| previous.min(loss)));
+                    }
+                }
+
+                let result = optimize_ilp_with_limit(&candidates, &goals, limit);
+                assert_eq!(
+                    result.feasible,
+                    optimum.is_some(),
+                    "case={case} limit={limit}"
+                );
+                if let Some(loss) = optimum {
+                    assert_eq!(result.total_loss, loss, "case={case} limit={limit}");
+                }
+                assert!(result.selected.len() <= limit);
+                let mut ids = HashSet::new();
+                let mut measured = 0.0;
+                let mut actual_loss = 0.0;
+                for selected in &result.selected {
+                    assert!(ids.insert(selected.id.as_str()));
+                    let original = candidates
+                        .iter()
+                        .find(|candidate| candidate.id == selected.id)
+                        .unwrap();
+                    assert!(!original.blocked);
+                    measured += original.contributions[0];
+                    actual_loss += original.expected_loss;
+                }
+                assert_eq!(result.total_contributions, [measured]);
+                assert_eq!(result.total_loss, actual_loss);
+                assert_eq!(result.goal_achievement[0].met, measured >= target);
+                assert_eq!(
+                    result.goal_achievement[0].shortfall,
+                    (target - measured).max(0.0)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn limited_ilp_large_set_fallback_retains_a_sufficient_action() {
+        let mut candidates: Vec<_> = (0..ILP_CANDIDATE_LIMIT + 1)
+            .map(|index| goal_candidate(&format!("partial-{index}"), 1.0, &[60.0]))
+            .collect();
+        candidates.push(goal_candidate("sufficient", 5.0, &[100.0]));
+        let goals = [ResourceGoal {
+            resource: "memory".into(),
+            target: 100.0,
+            weight: 1.0,
+        }];
+        let result = optimize_ilp_with_limit(&candidates, &goals, 1);
+        assert!(result.feasible);
+        assert_eq!(selected_ids(&result), ["sufficient"]);
+        assert_eq!(result.total_loss, 5.0);
+        assert_eq!(result.total_contributions, [100.0]);
+        assert!(result.algorithm.contains("candidate_limit"));
+        assert!(result.algorithm.contains("optimum not proven"));
+        let search = result
+            .log_events
+            .iter()
+            .find_map(|event| event.search.as_ref())
+            .unwrap();
+        assert_eq!(search.visited_nodes, 0);
+        assert!(!search.optimum_proven);
+        assert!(result.alternatives.is_empty());
+        assert!(result.log_events.len() <= ILP_SEARCH_LOG_LIMIT + 4);
+    }
+
+    #[test]
+    fn limited_ilp_budget_retains_capacity_seed_when_efficiency_seed_cannot_fit() {
+        let mut candidates: Vec<_> = (0..50)
+            .map(|index| goal_candidate(&format!("partial-{index}"), 0.25, &[1.0]))
+            .collect();
+        candidates.push(goal_candidate("sufficient", 100.0, &[100.0]));
+        let goals = [ResourceGoal {
+            resource: "memory".into(),
+            target: 100.0,
+            weight: 1.0,
+        }];
+        let result = optimize_ilp_with_limit(&candidates, &goals, 25);
+        assert!(result.feasible);
+        assert_eq!(selected_ids(&result), ["sufficient"]);
+        assert_eq!(result.total_loss, 100.0);
+        assert_eq!(result.total_contributions, [100.0]);
+        assert!(result.algorithm.contains("node_budget_exhausted"));
+        let search = result
+            .log_events
+            .iter()
+            .find_map(|event| event.search.as_ref())
+            .unwrap();
+        assert_eq!(search.visited_nodes, ILP_NODE_BUDGET);
+        assert!(!search.optimum_proven);
+        assert!(result.log_events.len() <= ILP_SEARCH_LOG_LIMIT + 1);
+    }
 
     #[test]
     fn ilp_single_goal_basic() {
