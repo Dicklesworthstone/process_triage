@@ -1578,7 +1578,7 @@ struct AgentVerifyArgs {
     #[arg(long)]
     session: String,
 
-    /// Wait for process termination with timeout in seconds (default: 0 = no wait)
+    /// Wait for termination; with --check-respawn, observe after the full window (0 = no wait)
     #[arg(long, default_value = "0")]
     wait: u64,
 
@@ -42097,6 +42097,19 @@ fn output_apply_nothing(
 }
 
 fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
+    let verify_started = std::time::Instant::now();
+    let verify_deadline = match global.timeout {
+        Some(seconds) => match verify_started.checked_add(Duration::from_secs(seconds)) {
+            Some(deadline) => Some(deadline),
+            None => {
+                eprintln!("agent verify: --timeout exceeds the supported clock range");
+                return ExitCode::ArgsError;
+            }
+        },
+        None => None,
+    };
+    let deadline_expired =
+        || verify_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline);
     let store = match SessionStore::from_env() {
         Ok(store) => store,
         Err(e) => {
@@ -42210,32 +42223,68 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
 
     let requested_at = chrono::Utc::now();
 
-    // Wait for process termination if --wait is specified
+    // A dead target is the beginning of a possible supervisor restart delay,
+    // not evidence that the respawn observation window is complete. Only a
+    // successful executed kill creates such a window; recommendations, refused
+    // actions and interrupted executions cannot establish a completed kill.
     if args.wait > 0 {
         let wait_duration = std::time::Duration::from_secs(args.wait);
         let start = std::time::Instant::now();
         let target_identities: Vec<&ProcessIdentity> = executed_actions
             .iter()
-            .filter(|(action, _)| action.action == pt_core::decision::Action::Kill)
+            .filter(|(action, outcome)| {
+                action.action == pt_core::decision::Action::Kill && outcome.status == "success"
+            })
             .map(|(action, _)| &action.target)
             .collect();
 
-        while !target_identities.is_empty() && start.elapsed() < wait_duration {
-            let current = match quick_scan(&QuickScanOptions {
-                pids: target_identities
-                    .iter()
-                    .map(|identity| identity.pid.0)
-                    .collect(),
-                include_kernel_threads: false,
-                timeout: Some(Duration::from_secs(5)),
-                progress: None,
-            }) {
+        if args.check_respawn && !target_identities.is_empty() {
+            let remaining = verify_deadline.map_or(wait_duration, |deadline| {
+                wait_duration.min(deadline.saturating_duration_since(std::time::Instant::now()))
+            });
+            std::thread::sleep(remaining);
+        }
+
+        while !args.check_respawn
+            && !target_identities.is_empty()
+            && start.elapsed() < wait_duration
+        {
+            let remaining = wait_duration.saturating_sub(start.elapsed());
+            let current = match quick_scan_with_deadline(
+                &QuickScanOptions {
+                    pids: target_identities
+                        .iter()
+                        .map(|identity| identity.pid.0)
+                        .collect(),
+                    include_kernel_threads: false,
+                    timeout: Some(Duration::from_secs(5).min(remaining)),
+                    progress: None,
+                },
+                verify_deadline,
+            ) {
                 Ok(scan) => scan,
+                Err(pt_core::collect::QuickScanError::Timeout(_)) if deadline_expired() => {
+                    eprintln!("agent verify: operation timed out while waiting for targets");
+                    return ExitCode::TimeoutError;
+                }
+                Err(pt_core::collect::QuickScanError::Timeout(_))
+                    if start.elapsed() >= wait_duration =>
+                {
+                    break;
+                }
+                Err(pt_core::collect::QuickScanError::Timeout(_)) => {
+                    eprintln!("agent verify: target observation timed out");
+                    return ExitCode::TimeoutError;
+                }
                 Err(error) => {
                     eprintln!("agent verify: cannot inspect targets while waiting: {error}");
                     return ExitCode::InternalError;
                 }
             };
+            if deadline_expired() {
+                eprintln!("agent verify: operation timed out while waiting for targets");
+                return ExitCode::TimeoutError;
+            }
             if !current.metadata.warnings.is_empty() {
                 eprintln!(
                     "agent verify: incomplete target snapshot while waiting: {}",
@@ -42256,23 +42305,40 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
                 break;
             }
 
-            std::thread::sleep(std::time::Duration::from_millis(250));
+            let remaining = wait_duration.saturating_sub(start.elapsed());
+            let remaining = verify_deadline.map_or(remaining, |deadline| {
+                remaining.min(deadline.saturating_duration_since(std::time::Instant::now()))
+            });
+            std::thread::sleep(Duration::from_millis(250).min(remaining));
         }
+    }
+
+    if deadline_expired() {
+        eprintln!("agent verify: operation timed out before the final process observation");
+        return ExitCode::TimeoutError;
     }
 
     let scan_options = QuickScanOptions {
         pids: vec![],
         include_kernel_threads: false,
-        timeout: global.timeout.map(std::time::Duration::from_secs),
+        timeout: None,
         progress: None,
     };
-    let scan_result = match quick_scan(&scan_options) {
+    let scan_result = match quick_scan_with_deadline(&scan_options, verify_deadline) {
         Ok(result) => result,
+        Err(pt_core::collect::QuickScanError::Timeout(_)) => {
+            eprintln!("agent verify: operation timed out collecting the final process observation");
+            return ExitCode::TimeoutError;
+        }
         Err(e) => {
             eprintln!("agent verify: scan failed: {}", e);
             return ExitCode::InternalError;
         }
     };
+    if deadline_expired() {
+        eprintln!("agent verify: operation timed out collecting the final process observation");
+        return ExitCode::TimeoutError;
+    }
     if !scan_result.metadata.warnings.is_empty() {
         eprintln!(
             "agent verify: incomplete process snapshot: {}",
@@ -42336,6 +42402,10 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
             return ExitCode::InternalError;
         }
     };
+    if deadline_expired() {
+        eprintln!("agent verify: operation timed out checking action postconditions");
+        return ExitCode::TimeoutError;
+    }
     let completed_at = chrono::Utc::now();
     report.verification.completed_at = completed_at.to_rfc3339();
 
@@ -42350,6 +42420,10 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
     }
     let verify_path = verify_dir.join("verifications.json");
     let current_resource_observation = capture_resource_observation();
+    if deadline_expired() {
+        eprintln!("agent verify: operation timed out observing current resources");
+        return ExitCode::TimeoutError;
+    }
     let mut resource_runs = load_resource_runs(
         &verify_dir,
         &plan,
@@ -42358,6 +42432,10 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
         &current_resource_observation,
         resource_predictions.as_ref(),
     );
+    if deadline_expired() {
+        eprintln!("agent verify: operation timed out reading saved resource observations");
+        return ExitCode::TimeoutError;
+    }
     if let Some(error) = &resource_prediction_error {
         resource_runs
             .unavailable
@@ -42406,6 +42484,10 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
     verification_output["resource_observation_source"] = serde_json::json!("saved_apply_windows");
     verification_output["resource_observation_checked_at_ms"] =
         serde_json::json!(current_resource_observation.pressure.sampled_at_ms);
+    if deadline_expired() {
+        eprintln!("agent verify: operation timed out before saving the verification report");
+        return ExitCode::TimeoutError;
+    }
     if let Err(e) = pt_core::session::write_json_pretty(&verify_path, &verification_output) {
         eprintln!(
             "agent verify: failed to write {}: {}",
@@ -42456,6 +42538,11 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
         _ => ExitCode::Clean,
     };
 
+    if deadline_expired() {
+        eprintln!("agent verify: operation timed out saving verification results");
+        return ExitCode::TimeoutError;
+    }
+
     match global.format {
         OutputFormat::Json | OutputFormat::Toon => {
             // Extend report with respawn info if checked
@@ -42466,6 +42553,7 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
                         "respawn_check".to_string(),
                         serde_json::json!({
                             "enabled": true,
+                            "observation_source": "final_process_snapshot",
                             "respawned_count": respawned_count,
                             "unknown_count": unknown_respawn_count,
                             "warning": if respawned_count > 0 {

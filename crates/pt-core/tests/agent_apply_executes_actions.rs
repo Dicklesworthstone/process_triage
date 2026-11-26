@@ -6683,6 +6683,181 @@ mod live_agent_verify {
     }
 
     #[test]
+    fn agent_verify_wait_observes_delayed_respawn_and_honors_operation_timeout() {
+        let data_dir = TempDir::new().unwrap().keep();
+        let config_dir = TempDir::new().unwrap().keep();
+        let log_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-logs/e2e/agent_verify")
+            .join(format!("wait-{}", SessionId::new().0));
+        fs::create_dir_all(&log_dir).unwrap();
+        write_test_policy(&config_dir);
+        let policy_path = config_dir.join("policy.json");
+        let mut policy: Policy = serde_json::from_slice(&fs::read(&policy_path).unwrap()).unwrap();
+        policy.guardrails.protected_users.clear();
+        policy.guardrails.never_kill_ppid.clear();
+        policy.fdr_control.enabled = false;
+        policy.data_loss_gates.block_if_recent_io_seconds = Some(1);
+        fs::write(&policy_path, serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+
+        // A FIFO keeps the real supervisor from replacing the killed target
+        // until the timeout/no-wait checks have finished. The child then appears
+        // during verify's requested window, not before invoking the command.
+        let gate_path = data_dir.join("respawn-gate");
+        let gate_name = std::ffi::CString::new(gate_path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: the CString is a valid, NUL-terminated new fixture pathname.
+        assert_eq!(unsafe { libc::mkfifo(gate_name.as_ptr(), 0o600) }, 0);
+        let mut gate = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&gate_path)
+            .unwrap();
+        let quoted_gate = gate_path.to_str().unwrap().replace('\'', "'\\''");
+        let script = format!(
+            "sleep 1000 </dev/null >/dev/null 2>&1 & child=$!; \
+             printf '%s %s\\n' \"$$\" \"$child\"; exec >/dev/null; \
+             wait \"$child\"; read release < '{quoted_gate}'; sleep 1; \
+             sleep 1000 </dev/null >/dev/null 2>&1 & wait"
+        );
+        let (parent_pid, original_pid) = detached_child(&script);
+        let respawner = Respawner {
+            parent: BoundProcess::bind(live_identity(parent_pid)).expect("bind owned spawner"),
+            _initial_child: BoundProcess::bind(live_identity(original_pid))
+                .expect("bind owned child"),
+        };
+        let action = plan_action(Action::Kill, &live_identity(original_pid));
+        let session = session_with_plan(&data_dir, action);
+        let handle = SessionStore::at_data_dir(&data_dir)
+            .open(&SessionId::parse(&session).unwrap())
+            .unwrap();
+        let plan: Plan =
+            serde_json::from_slice(&fs::read(handle.dir.join("decision/plan.json")).unwrap())
+                .unwrap();
+
+        // A planned, unexecuted kill must not consume the requested window.
+        let unexecuted = run_step(
+            &log_dir,
+            "unexecuted_wait",
+            &[
+                "--format",
+                "json",
+                "--timeout",
+                "3",
+                "agent",
+                "verify",
+                "--session",
+                &session,
+                "--check-respawn",
+                "--wait",
+                "30",
+            ],
+            &data_dir,
+            &config_dir,
+            None,
+        );
+        assert_eq!(unexecuted.status.code(), Some(0), "{unexecuted:?}");
+        let execution = apply_owned(&log_dir, "kill", &plan, &data_dir, &config_dir);
+        assert!(state_of(original_pid).is_none_or(|state| state == 'Z'));
+
+        // Without a respawn window, an already-dead target still completes
+        // immediately. --wait 0 also retains its immediate-snapshot behavior.
+        for (step, extra) in [
+            ("termination_wait", vec!["--wait", "30"]),
+            ("respawn_no_wait", vec!["--check-respawn", "--wait", "0"]),
+        ] {
+            let mut args = vec![
+                "--format",
+                "json",
+                "--timeout",
+                "3",
+                "agent",
+                "verify",
+                "--session",
+                &session,
+            ];
+            args.extend(extra);
+            let output = run_step(&log_dir, step, &args, &data_dir, &config_dir, None);
+            assert_eq!(output.status.code(), Some(0), "{output:?}");
+        }
+
+        let started = std::time::Instant::now();
+        let timed_out = run_step(
+            &log_dir,
+            "respawn_wait_timeout",
+            &[
+                "--format",
+                "json",
+                "--timeout",
+                "1",
+                "agent",
+                "verify",
+                "--session",
+                &session,
+                "--check-respawn",
+                "--wait",
+                "30",
+            ],
+            &data_dir,
+            &config_dir,
+            None,
+        );
+        assert_eq!(timed_out.status.code(), Some(22), "{timed_out:?}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            timed_out.stdout.is_empty(),
+            "timeout cannot claim a clean respawn check"
+        );
+
+        gate.write_all(b"restart\n").unwrap();
+        let output = run_step(
+            &log_dir,
+            "delayed_respawn",
+            &[
+                "--format",
+                "json",
+                "--timeout",
+                "10",
+                "agent",
+                "verify",
+                "--session",
+                &session,
+                "--check-respawn",
+                "--wait",
+                "3",
+            ],
+            &data_dir,
+            &config_dir,
+            None,
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(3), "{report}");
+        let requested = chrono::DateTime::parse_from_rfc3339(
+            report["verification"]["requested_at"].as_str().unwrap(),
+        )
+        .unwrap();
+        let completed = chrono::DateTime::parse_from_rfc3339(
+            report["verification"]["completed_at"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert!((completed - requested).num_milliseconds() >= 3_000);
+        assert_eq!(report["respawn_check"]["respawned_count"], 1, "{report}");
+        assert_eq!(
+            report["respawn_check"]["observation_source"],
+            "final_process_snapshot"
+        );
+        let outcome = &report["action_outcomes"][0];
+        assert_eq!(outcome["target"]["pid"], original_pid);
+        assert_eq!(outcome["outcome"], "respawned");
+        assert_eq!(outcome["respawn_detected"]["parent_pid"], parent_pid);
+        assert_eq!(
+            outcome["respawn_detected"]["parent_start_id"],
+            respawner.parent.identity.start_id.0
+        );
+        let replacement_pid = outcome["respawn_detected"]["pid"].as_u64().unwrap() as u32;
+        assert_born_after_execution(&current_process(replacement_pid), &execution);
+        assert_eq!(report["respawn_history"]["new_events"], 1, "{report}");
+    }
+
+    #[test]
     fn actual_agent_verify_attributes_respawns_and_ignores_unexecuted_candidates() {
         let data_dir = TempDir::new().unwrap().keep();
         let config_dir = TempDir::new().unwrap().keep();
