@@ -202,8 +202,15 @@ fn observe_signal_target(
     }
 }
 
-/// Read a known state only for the complete recorded live incarnation. Undo
-/// callers decide which observed states they may safely restore.
+/// Observe the original child once, without waiting or signaling the parent.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn observe_zombie_reaped(
+    target: &pt_common::ProcessIdentity,
+) -> Result<bool, ActionError> {
+    SignalExpectation::Reaped.satisfied(observe_signal_target(target)?)
+}
+
+/// Read the state of the original incarnation for job-control restoration.
 #[cfg(target_os = "linux")]
 pub(crate) fn signal_state(target: &pt_common::ProcessIdentity) -> Result<char, ActionError> {
     match observe_signal_target(target)? {

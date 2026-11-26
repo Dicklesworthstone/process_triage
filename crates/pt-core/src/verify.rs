@@ -33,6 +33,10 @@ pub struct SavedActionOutcome {
     /// potentially edited plan and from zombie-parent reaping.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supervisor_restart: Option<crate::action::SystemdUserServiceBinding>,
+    /// Child incarnation whose parent was sent SIGCHLD. Historical journals
+    /// only recorded the parent and cannot establish which child was targeted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_zombie_target: Option<ProcessIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -188,6 +192,23 @@ pub enum ActionPostcondition {
 /// Controller observations bind both process identity and cgroup membership around
 /// their reads. Verifying a configured effect does not establish resource relief.
 pub fn observe_live_postcondition(action: &PlanAction) -> ActionPostcondition {
+    if action.action == Action::Restart
+        && action.routing == crate::plan::ActionRouting::ZombieToParent
+    {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(zombie) = &action.original_zombie_target {
+            return match crate::action::signal::observe_zombie_reaped(zombie) {
+                Ok(true) => ActionPostcondition::Satisfied {
+                    detail: format!("Recorded zombie {} is absent or its PID now has a different birth identity", zombie.start_id),
+                },
+                Ok(false) => ActionPostcondition::NotSatisfied {
+                    detail: format!("Recorded zombie {} is still present", zombie.start_id),
+                },
+                Err(error) => ActionPostcondition::Unavailable { reason: error.to_string() },
+            };
+        }
+        return ActionPostcondition::Unavailable { reason: "Cannot observe the recorded zombie incarnation on this platform or without a child identity".to_string() };
+    }
     #[cfg(target_os = "linux")]
     if action.action == Action::Pause {
         return crate::action::dispatch::observe_pause_postcondition(&action.target);
@@ -887,6 +908,7 @@ fn same_execution_attempt(started: &SavedActionOutcome, outcome: &SavedActionOut
         && started.action == outcome.action
         && started.target == outcome.target
         && started.supervisor_restart == outcome.supervisor_restart
+        && started.original_zombie_target == outcome.original_zombie_target
         && started.command == outcome.command
         && started.parent_pid == outcome.parent_pid
         && started.parent_identity == outcome.parent_identity
@@ -977,6 +999,16 @@ fn recorded_plan_actions<'a>(
         if action.blocked {
             return Err(VerifyError::InvalidOutcomes(format!(
                 "successful action {} contradicts the plan's blocked action",
+                outcome.action_id
+            )));
+        }
+        if action.routing == crate::plan::ActionRouting::ZombieToParent {
+            validate_zombie_execution(action, outcome)?;
+        } else if outcome.original_zombie_target.is_some()
+            || action.original_zombie_target.is_some()
+        {
+            return Err(VerifyError::InvalidOutcomes(format!(
+                "{} has a zombie identity without a zombie-to-parent route",
                 outcome.action_id
             )));
         }
@@ -1094,6 +1126,79 @@ fn recorded_plan_actions<'a>(
                 .map(|&outcome| (action, outcome))
         })
         .collect())
+}
+
+fn validate_zombie_execution(
+    action: &PlanAction,
+    outcome: &SavedActionOutcome,
+) -> Result<(), VerifyError> {
+    let invalid = || {
+        VerifyError::InvalidOutcomes(format!(
+            "{} has an invalid zombie-to-parent execution binding",
+            outcome.action_id
+        ))
+    };
+    let child = action.original_zombie_target.as_ref().ok_or_else(invalid)?;
+    if action.action != Action::Restart
+        || outcome.target.as_ref() != Some(&action.target)
+        || action.target.pid.0 <= 1
+        || child.pid.0 <= 1
+        || child.pid == action.target.pid
+        || outcome
+            .original_zombie_target
+            .as_ref()
+            .is_some_and(|recorded| recorded != child)
+    {
+        return Err(invalid());
+    }
+    // Old journals carry no executed child binding. Accept them for history,
+    // but never consult the plan alone for a reaping observation.
+    if outcome.original_zombie_target.is_some() {
+        let at = outcome.executed_at.ok_or_else(invalid)?;
+        let parent_birth = routed_process_birth(&action.target, at, cfg!(target_os = "macos"))
+            .ok_or_else(invalid)?;
+        let child_birth =
+            routed_process_birth(child, at, cfg!(target_os = "macos")).ok_or_else(invalid)?;
+        if parent_birth.0 != child_birth.0
+            || outcome
+                .execution_clock
+                .as_ref()
+                .is_some_and(|clock| child_birth.0 != clock.boot_id || child_birth.1 > clock.ticks)
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
+/// Whether a routed identity can be checked by the platform's live identity
+/// provider. The caller must still revalidate the birth and owner at admission.
+pub fn supports_zombie_route_identity(target: &ProcessIdentity, at: DateTime<Utc>) -> bool {
+    routed_process_birth(target, at, cfg!(target_os = "macos")).is_some()
+}
+
+fn routed_process_birth(
+    target: &ProcessIdentity,
+    at: DateTime<Utc>,
+    native_macos: bool,
+) -> Option<(&str, u64)> {
+    let mut parts = target.start_id.0.split(':');
+    let boot = parts.next()?;
+    let start = parts.next()?.parse::<u64>().ok()?;
+    let pid = parts.next()?.parse::<u32>().ok()?;
+    let known_boot = target.quality == pt_common::IdentityQuality::Full
+        && !matches!(boot, "" | "synthetic" | "unknown");
+    // With no boot ID, macOS quick scans encode both native microseconds and
+    // fallback ps seconds with "unknown". Refuse every possible fallback value
+    // up through admission and any birth after admission. The live provider
+    // compares the admitted value to the native process birth, exactly.
+    let native_birth = native_macos
+        && target.quality == pt_common::IdentityQuality::NoBootId
+        && boot == "unknown"
+        && start > u64::try_from(at.timestamp()).ok()?
+        && start <= u64::try_from(at.timestamp_micros()).ok()?;
+    ((known_boot || native_birth) && start > 0 && pid == target.pid.0 && parts.next().is_none())
+        .then_some((boot, start))
 }
 
 /// Find a replacement for one executed kill, using the same matcher in both
@@ -1349,6 +1454,18 @@ pub fn verify_plan_with_postconditions(
             )
         } else {
             match (action.action, current_target) {
+                (Action::Restart, _) if action.routing == crate::plan::ActionRouting::ZombieToParent => {
+                    if execution.original_zombie_target.is_none() {
+                        (VerifyOutcome::Unsupported, "zombie_execution_identity_missing", Some("The saved execution identifies the parent only".into()))
+                    } else {
+                        match observe(action) {
+                            ActionPostcondition::Satisfied { detail } => (VerifyOutcome::ConfirmedEffect, "original_zombie_reaped", Some(detail)),
+                            ActionPostcondition::NotSatisfied { detail } => (VerifyOutcome::EffectNotObserved, "original_zombie_still_present", Some(detail)),
+                            ActionPostcondition::Unavailable { reason } => (VerifyOutcome::Unsupported, "observation_unavailable", Some(reason)),
+                            _ => (VerifyOutcome::Unsupported, "observation_unavailable", Some("The observation does not establish the recorded child's state".into())),
+                        }
+                    }
+                }
                 (Action::Restart, _)
                     if action.routing == crate::plan::ActionRouting::Supervisor =>
                 {
@@ -1721,6 +1838,11 @@ pub fn verify_plan_with_postconditions(
                         Action::CapMemory => "exact_planned_memory_high_soft_cap",
                         Action::Quarantine => "nonempty_effective_cpu_confinement",
                         Action::Restart
+                            if action.routing == crate::plan::ActionRouting::ZombieToParent =>
+                        {
+                            "original_zombie_reaped"
+                        }
+                        Action::Restart
                             if action.routing == crate::plan::ActionRouting::Supervisor =>
                         {
                             "new_live_main_pid_and_invocation_in_bound_user_service"
@@ -1982,6 +2104,7 @@ mod tests {
             action: Some(action.action),
             target: Some(action.target.clone()),
             supervisor_restart: action.supervisor_restart.clone(),
+            original_zombie_target: action.original_zombie_target.clone(),
             command: Some("node app --port 3000".to_string()),
             parent_pid: Some(10),
             parent_identity: None,
@@ -2069,6 +2192,146 @@ mod tests {
             Some(predictions),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn zombie_verification_requires_the_executed_child_and_a_fresh_observation() {
+        let mut action = make_action(123, Action::Restart);
+        action.routing = crate::plan::ActionRouting::ZombieToParent;
+        let child = make_action(456, Action::Keep).target;
+        action.original_zombie_target = Some(child.clone());
+        let plan = make_plan(vec![action.clone()]);
+        let saved = execution(&action);
+        for (observed, expected) in [
+            (
+                ActionPostcondition::Satisfied {
+                    detail: "child incarnation disappeared".into(),
+                },
+                VerifyOutcome::ConfirmedEffect,
+            ),
+            (
+                ActionPostcondition::NotSatisfied {
+                    detail: "original zombie still present".into(),
+                },
+                VerifyOutcome::EffectNotObserved,
+            ),
+            (
+                ActionPostcondition::Unavailable {
+                    reason: "process table unavailable".into(),
+                },
+                VerifyOutcome::Unsupported,
+            ),
+        ] {
+            let report = verify_plan_with_postconditions(
+                &plan,
+                std::slice::from_ref(&saved),
+                &[],
+                DateTime::from_timestamp(30, 0).unwrap(),
+                DateTime::from_timestamp(31, 0).unwrap(),
+                |action| {
+                    assert_eq!(action.original_zombie_target.as_ref(), Some(&child));
+                    observed.clone()
+                },
+                None,
+            )
+            .unwrap();
+            let row = &report.action_outcomes[0];
+            assert_eq!(row.outcome, expected);
+            assert_eq!(row.expected.as_deref(), Some("original_zombie_reaped"));
+            assert!(row.respawn_detected.is_none() && row.expected_resources_freed.is_none());
+            assert!(report.resource_summary.is_none());
+        }
+        let mut legacy = serde_json::to_value(&saved).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("original_zombie_target");
+        let legacy = serde_json::from_value(legacy).unwrap();
+        let report = verify_plan_with_postconditions(
+            &plan,
+            &[legacy],
+            &[],
+            DateTime::from_timestamp(30, 0).unwrap(),
+            DateTime::from_timestamp(31, 0).unwrap(),
+            |_| panic!("an old journal cannot prove which child to inspect"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            report.action_outcomes[0].outcome,
+            VerifyOutcome::Unsupported
+        );
+        assert_eq!(
+            report.action_outcomes[0].actual.as_deref(),
+            Some("zombie_execution_identity_missing")
+        );
+
+        let mut started = saved.clone();
+        started.status = "execution_started".into();
+        for case in [
+            "different_child",
+            "child_removed",
+            "foreign_boot",
+            "post_execution_birth",
+            "same_pid",
+            "wrong_route",
+        ] {
+            let mut plan = plan.clone();
+            let mut terminal = saved.clone();
+            match case {
+                "different_child" => {
+                    terminal.original_zombie_target.as_mut().unwrap().sid = Some(99)
+                }
+                "child_removed" => terminal.original_zombie_target = None,
+                "wrong_route" => plan.actions[0].routing = crate::plan::ActionRouting::Direct,
+                _ => {
+                    let mut child = child.clone();
+                    match case {
+                        "foreign_boot" => child.start_id.0 = "other:500:456".into(),
+                        "post_execution_birth" => child.start_id.0 = "boot:1001:456".into(),
+                        "same_pid" => child = action.target.clone(),
+                        _ => unreachable!(),
+                    }
+                    plan.actions[0].original_zombie_target = Some(child.clone());
+                    terminal.original_zombie_target = Some(child);
+                }
+            }
+            let records = if case == "child_removed" {
+                vec![started.clone(), terminal]
+            } else {
+                vec![terminal]
+            };
+            assert!(
+                matches!(
+                    recorded_plan_actions(&plan, &records),
+                    Err(VerifyError::InvalidOutcomes(_))
+                ),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn zombie_route_accepts_native_macos_birth_without_admitting_ps_estimates() {
+        let at = DateTime::from_timestamp(1_800_000_001, 0).unwrap();
+        let mut child = make_action(456, Action::Keep).target;
+        child.quality = pt_common::IdentityQuality::NoBootId;
+        child.start_id.0 = "unknown:1800000000123456:456".into();
+        assert_eq!(
+            routed_process_birth(&child, at, true),
+            Some(("unknown", 1_800_000_000_123_456))
+        );
+        assert!(routed_process_birth(&child, at, false).is_none());
+        for id in [
+            "unknown:1800000000:456",
+            "synthetic:1800000000123456:456",
+            "unknown:1800000002000000:456",
+            "unknown:1800000000123456:457",
+            "boot:1800000000123456:456",
+        ] {
+            child.start_id.0 = id.into();
+            assert!(routed_process_birth(&child, at, true).is_none(), "{id}");
+        }
     }
 
     #[cfg(target_os = "linux")]

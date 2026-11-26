@@ -1287,6 +1287,7 @@ mod tests {
                 status: "success".to_string(),
                 action: Some(Action::Kill),
                 target: Some(action.target.clone()),
+                original_zombie_target: None,
                 command: Some(target.cmd),
                 parent_pid: Some(10),
                 parent_identity: full_process_identity(&parent),

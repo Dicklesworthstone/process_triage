@@ -4441,6 +4441,7 @@ int main(int argc, char **argv) {
                 status: "success".to_string(),
                 action: Some(Action::Kill),
                 target: Some(target),
+                original_zombie_target: None,
                 command: Some("sleep 600".to_string()),
                 parent_pid: Some(4000),
                 parent_identity: Some(parent_identity.clone()),

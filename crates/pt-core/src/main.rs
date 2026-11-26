@@ -5090,6 +5090,7 @@ fn capture_action_execution_evidence(
         "action": action.action,
         "target": action.target,
         "supervisor_restart": action.supervisor_restart,
+        "original_zombie_target": action.original_zombie_target,
         "command": process.cmd,
         "command_identity": process_identity_from_record(process),
         "command_comm": process.comm,
@@ -5105,9 +5106,43 @@ fn capture_current_action_execution_evidence(
     action: &pt_core::plan::PlanAction,
     deadline: Option<std::time::Instant>,
 ) -> Result<serde_json::Value, String> {
+    let mut pids = vec![action.target.pid.0];
+    let revalidate_route = |child: &ProcessIdentity| -> Result<(), String> {
+        let provider = LiveIdentityProvider::new();
+        for identity in [&action.target, child] {
+            if !pt_core::verify::supports_zombie_route_identity(identity, chrono::Utc::now())
+                || !provider
+                    .revalidate(identity)
+                    .map_err(|error| error.to_string())?
+            {
+                return Err(format!(
+                    "zombie route identity {} is no longer verifiable",
+                    identity.start_id
+                ));
+            }
+        }
+        Ok(())
+    };
+    if action.routing == pt_core::plan::ActionRouting::ZombieToParent {
+        let child = action
+            .original_zombie_target
+            .as_ref()
+            .ok_or("zombie route lacks its child identity")?;
+        if action.action != Action::Restart
+            || child.pid.0 <= 1
+            || action.target.pid.0 <= 1
+            || child.pid == action.target.pid
+        {
+            return Err("invalid zombie-to-parent execution route".into());
+        }
+        revalidate_route(child)?;
+        pids.push(child.pid.0);
+    } else if action.original_zombie_target.is_some() {
+        return Err("unexpected zombie identity on a different action route".into());
+    }
     let scan = quick_scan_with_deadline(
         &QuickScanOptions {
-            pids: vec![action.target.pid.0],
+            pids,
             include_kernel_threads: false,
             timeout: Some(Duration::from_secs(5)),
             progress: None,
@@ -5120,6 +5155,26 @@ fn capture_current_action_execution_evidence(
         .iter()
         .find(|process| process.pid == action.target.pid)
         .ok_or("target disappeared before execution")?;
+    if let Some(child) = &action.original_zombie_target {
+        // The provider brackets this scan, including the owner and any supplied
+        // group/session constraints. Historical plans may omit those constraints.
+        if !action
+            .target
+            .matches(&process_identity_from_record(process))
+            || matches!(
+                process.state,
+                ProcessState::Zombie | ProcessState::Dead | ProcessState::Unknown
+            )
+            || !scan.processes.iter().any(|record| {
+                record.state == ProcessState::Zombie
+                    && child.matches(&process_identity_from_record(record))
+                    && record.ppid == process.pid
+            })
+        {
+            return Err("the recorded zombie child is no longer bound to this parent".into());
+        }
+        revalidate_route(child)?;
+    }
     capture_action_execution_evidence(action, process, deadline)
 }
 
@@ -25923,6 +25978,7 @@ mod process_tree_safety_tests {
             action: Some(action.action),
             target: Some(action.target.clone()),
             supervisor_restart: None,
+            original_zombie_target: None,
             command: Some(process.cmd.clone()),
             parent_pid: Some(10),
             parent_identity: Some(process_identity_from_record(&parent)),
@@ -26026,6 +26082,7 @@ mod process_tree_safety_tests {
             status: "success".to_string(),
             action: Some(action.action),
             target: Some(action.target.clone()),
+            original_zombie_target: None,
             command: Some(target.cmd),
             parent_pid: Some(parent.pid.0),
             parent_identity: Some(process_identity_from_record(&parent)),

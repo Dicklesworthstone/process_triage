@@ -257,6 +257,7 @@ fn test_verify_plan_with_real_process_nomock() {
         status: "success".to_string(),
         action: Some(plan.actions[0].action),
         target: Some(plan.actions[0].target.clone()),
+        original_zombie_target: None,
         command: Some(record.cmd.clone()),
         parent_pid: Some(record.ppid.0),
         parent_identity: None,

@@ -5564,8 +5564,11 @@ fn agent_apply_zombie_route_reaps_via_sigchld() {
     let parent = ForeignTarget::spawn(&format!("python3 '{}'", script_path.display()));
     let zombie_pid = zombie_child_of(parent.pid);
     std::thread::sleep(Duration::from_millis(1500)); // handler installed
-    let parent_identity = live_identity(parent.pid);
-    let zombie_identity = live_identity(zombie_pid);
+    let mut parent_identity = live_identity(parent.pid);
+    let mut zombie_identity = live_identity(zombie_pid);
+    // Historical plans can omit group/session constraints independently.
+    parent_identity.pgid = None;
+    zombie_identity.sid = None;
     let target = format!("{}:{}", parent.pid, parent_identity.start_id.0);
 
     let s = session_with_plan(
@@ -5576,6 +5579,25 @@ fn agent_apply_zombie_route_reaps_via_sigchld() {
     assert_eq!(status, "success", "reaping parent: {json}");
     assert_ne!(state_of(zombie_pid), Some('Z'), "zombie reaped");
     assert!(parent.alive(), "the parent must not be harmed");
+    let (code, report) = recorded_action_command(
+        data_dir.path(),
+        config_dir.path(),
+        &s,
+        "verify-zombie",
+        &["--format", "json", "agent", "verify", "--session", &s],
+    );
+    assert_eq!(code, Some(0), "{report}");
+    let verified = &report["action_outcomes"][0];
+    assert_eq!(verified["target"]["pid"], parent.pid);
+    assert_eq!(verified["outcome"], "confirmed_effect", "{report}");
+    assert_eq!(verified["actual"], "original_zombie_reaped");
+    assert!(verified["note"]
+        .as_str()
+        .unwrap()
+        .contains(&zombie_identity.start_id.0));
+    assert!(verified["expected_resources_freed"].is_null());
+    assert!(report["resource_summary"].is_null());
+    assert!(parent.alive());
 }
 
 #[cfg(target_os = "linux")]

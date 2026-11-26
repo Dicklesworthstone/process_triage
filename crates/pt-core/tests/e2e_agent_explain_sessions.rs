@@ -1326,6 +1326,7 @@ fn verify_cli_confirms_fresh_all_thread_renice_without_claiming_resource_relief(
             status: "success".into(),
             action: Some(Action::Renice),
             target: Some(identity),
+            original_zombie_target: None,
             command: None,
             parent_pid: Some(std::process::id()),
             parent_identity: None,
