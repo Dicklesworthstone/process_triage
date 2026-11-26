@@ -6,7 +6,7 @@
 //! - Process group awareness
 //! - Outcome verification
 
-use super::executor::{ActionError, ActionRunner};
+use super::executor::{ActionDeadline, ActionError, ActionRunner};
 #[cfg(target_os = "linux")]
 use super::reversal::{PreparedReversal, ReversalJournal, ReversalStatus};
 use crate::decision::Action;
@@ -539,30 +539,6 @@ fn elapsed_millis(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-/// A phase budget from the approved plan. Elapsed time is measured monotonically;
-/// using a duration instead of adding to Instant also accepts large saved budgets
-/// without overflowing the platform's clock representation.
-struct SignalDeadline {
-    started: Instant,
-    budget: Duration,
-}
-
-impl SignalDeadline {
-    fn new(timeout_ms: u64) -> Self {
-        Self {
-            started: Instant::now(),
-            budget: Duration::from_millis(timeout_ms),
-        }
-    }
-
-    fn remaining(&self) -> Result<Duration, ActionError> {
-        self.budget
-            .checked_sub(self.started.elapsed())
-            .filter(|remaining| !remaining.is_zero())
-            .ok_or(ActionError::Timeout)
-    }
-}
-
 /// Signal action runner configuration.
 #[derive(Debug, Clone)]
 pub struct SignalConfig {
@@ -1019,7 +995,7 @@ impl SignalActionRunner {
     fn wait_for_term_grace(
         &self,
         action: &PlanAction,
-        deadline: &SignalDeadline,
+        deadline: &ActionDeadline,
         term_grace_ms: u64,
     ) -> Result<bool, ActionError> {
         let remaining = deadline.remaining()?;
@@ -1075,7 +1051,7 @@ impl SignalActionRunner {
     fn wait_for_term_or_escalation(
         &self,
         action: &PlanAction,
-        deadline: &SignalDeadline,
+        deadline: &ActionDeadline,
         use_group: bool,
         outcome: &mut SignalExecutionOutcome,
     ) -> Result<bool, ActionError> {
@@ -1107,7 +1083,7 @@ impl SignalActionRunner {
     /// Execute a pause action (SIGSTOP).
     #[cfg(unix)]
     fn execute_pause(&self, action: &PlanAction) -> Result<(), ActionError> {
-        let deadline = SignalDeadline::new(action.timeouts.execute_ms);
+        let deadline = ActionDeadline::new(action.timeouts.execute_ms);
         deadline.remaining()?;
         let pid = action.target.pid.0;
         let (target, use_group) = self.resolve_group_target(pid, action.target.pgid);
@@ -1147,7 +1123,7 @@ impl SignalActionRunner {
     fn execute_journaled_pause(
         &self,
         action: &PlanAction,
-        deadline: &SignalDeadline,
+        deadline: &ActionDeadline,
     ) -> Result<(), ActionError> {
         if self.verification_timeout(action).is_zero() {
             return Err(ActionError::Failed(
@@ -1194,7 +1170,7 @@ impl SignalActionRunner {
     fn apply_prepared_pause(
         &self,
         action: &PlanAction,
-        deadline: &SignalDeadline,
+        deadline: &ActionDeadline,
         pidfd: &PidFd,
         was_stopped: bool,
         receipt: &PreparedReversal,
@@ -1371,7 +1347,7 @@ impl SignalActionRunner {
         outcome: &mut SignalExecutionOutcome,
         term_started: &mut Option<Instant>,
     ) -> Result<(), ActionError> {
-        let deadline = SignalDeadline::new(action.timeouts.execute_ms);
+        let deadline = ActionDeadline::new(action.timeouts.execute_ms);
         deadline.remaining()?;
         let pid = action.target.pid.0;
         let (target, use_group) = self.resolve_group_target(pid, action.target.pgid);
@@ -1473,7 +1449,7 @@ impl SignalActionRunner {
         action
             .validate_signal_timing()
             .map_err(|reason| ActionError::Failed(reason.to_string()))?;
-        let deadline = SignalDeadline::new(action.timeouts.execute_ms);
+        let deadline = ActionDeadline::new(action.timeouts.execute_ms);
         deadline.remaining()?;
         #[cfg(target_os = "linux")]
         if let Some(pidfd) = self.pinned_pidfd(action)? {
@@ -1570,7 +1546,7 @@ impl SignalActionRunner {
     /// Execute a resume action (SIGCONT) from PlanAction.
     #[cfg(unix)]
     fn execute_resume(&self, action: &PlanAction) -> Result<(), ActionError> {
-        let deadline = SignalDeadline::new(action.timeouts.execute_ms);
+        let deadline = ActionDeadline::new(action.timeouts.execute_ms);
         deadline.remaining()?;
         let pid = action.target.pid.0;
         let (target, use_group) = self.resolve_group_target(pid, action.target.pgid);
@@ -2961,7 +2937,7 @@ mod tests {
                         )
                         .expect("external stop completed");
                 }
-                let deadline = SignalDeadline::new(if externally_stopped { 5_000 } else { 0 });
+                let deadline = ActionDeadline::new(if externally_stopped { 5_000 } else { 0 });
                 let error = runner
                     .apply_prepared_pause(&action, &deadline, &pidfd, false, &receipt)
                     .expect_err("pre-delivery refusal must abort an unsent pause");
@@ -3005,7 +2981,7 @@ mod tests {
             assert!(runner
                 .wait_for_term_grace(
                     &action,
-                    &SignalDeadline::new(100),
+                    &ActionDeadline::new(100),
                     runner.config.term_grace_ms,
                 )
                 .unwrap());
@@ -3602,7 +3578,7 @@ while :; do read -r line || :; done"#,
             assert!(!runner
                 .wait_for_term_or_escalation(
                     &action,
-                    &SignalDeadline::new(2_000),
+                    &ActionDeadline::new(2_000),
                     false,
                     &mut outcome,
                 )

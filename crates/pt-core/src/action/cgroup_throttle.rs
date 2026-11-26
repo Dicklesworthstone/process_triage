@@ -7,6 +7,8 @@
 //! - Hybrid v1 fallback with separate controller isolation checks
 //! - Explicit refusal when safe cgroup mutation is unavailable
 
+#[cfg(target_os = "linux")]
+use super::executor::ActionDeadline;
 use super::executor::{ActionError, ActionRunner};
 #[cfg(target_os = "linux")]
 use super::reversal::{PreparedReversal, ReversalJournal, ReversalStatus, ReversalValue};
@@ -405,7 +407,12 @@ impl CpuThrottleActionRunner {
 
     /// Execute a throttle action on a process.
     #[cfg(target_os = "linux")]
-    fn execute_throttle(&self, action: &PlanAction) -> Result<AppliedThrottle, ActionError> {
+    fn execute_throttle(
+        &self,
+        action: &PlanAction,
+        deadline: &ActionDeadline,
+    ) -> Result<AppliedThrottle, ActionError> {
+        deadline.check()?;
         self.config.validated_limit()?;
         let pid = action.target.pid.0;
         let checked_path = super::dispatch::ensure_cgroup_target(&action.target)?;
@@ -443,6 +450,7 @@ impl CpuThrottleActionRunner {
                 Some(ThrottleCgroup::open(path.clone(), directory)?)
             },
         };
+        deadline.check()?;
         if !scope.is_v2() {
             if let Some(journal) = &self.reversal_journal {
                 journal.record_unsupported(
@@ -454,7 +462,11 @@ impl CpuThrottleActionRunner {
         let (limit, reversal) = self.apply_throttle_with_reversal(
             &scope.controller().pinned_directory(),
             scope.is_v2(),
-            || self.revalidate_membership(action, &scope),
+            || {
+                deadline.check()?;
+                self.revalidate_membership(action, &scope)?;
+                deadline.check()
+            },
             |before, applied| match &self.reversal_journal {
                 Some(journal) if scope.is_v2() => journal
                     .prepare(
@@ -561,6 +573,7 @@ impl CpuThrottleActionRunner {
         // The durable before/applied values come from this exact observation,
         // followed by the existing final revalidation and concurrent-change check.
         let reversal = prepare(current, desired)?;
+        let mut written = false;
         let execution = (|| {
             revalidate()?;
             if read_cpu_limit(directory, is_v2)? != current {
@@ -580,6 +593,8 @@ impl CpuThrottleActionRunner {
                         desired.quota_us.to_string(),
                     )
                 };
+                // Controller reads and receipt persistence can consume the budget.
+                revalidate()?;
                 fs::write(&path, value).map_err(|error| {
                     if error.kind() == std::io::ErrorKind::PermissionDenied {
                         ActionError::PermissionDenied
@@ -587,6 +602,7 @@ impl CpuThrottleActionRunner {
                         ActionError::Failed(format!("cannot write {}: {error}", path.display()))
                     }
                 })?;
+                written = true;
             }
             revalidate()?;
             let observed = read_cpu_limit(directory, is_v2)?;
@@ -605,7 +621,16 @@ impl CpuThrottleActionRunner {
                 "CPU bandwidth cap verified"
             );
             Ok(observed)
-        })();
+        })()
+        .map_err(|error| {
+            if written && matches!(&error, ActionError::Timeout) {
+                ActionError::Failed(
+                    "CPU throttle timed out after the controller write; its effect may remain and was not rolled back".to_string(),
+                )
+            } else {
+                error
+            }
+        });
         let observed = match &reversal {
             Some(receipt) => receipt.finish(execution, ReversalStatus::Applied)?,
             None => execution?,
@@ -766,6 +791,7 @@ impl CpuThrottleActionRunner {
 #[cfg(target_os = "linux")]
 impl ActionRunner for CpuThrottleActionRunner {
     fn execute(&self, action: &PlanAction) -> Result<(), ActionError> {
+        let deadline = ActionDeadline::new(action.timeouts.execute_ms);
         let mut applied = self.applied.lock().map_err(|_| {
             ActionError::Failed("throttle execution record is unavailable".to_string())
         })?;
@@ -774,7 +800,7 @@ impl ActionRunner for CpuThrottleActionRunner {
         *applied = None;
         match action.action {
             Action::Throttle => {
-                *applied = Some(self.execute_throttle(action)?);
+                *applied = Some(self.execute_throttle(action, &deadline)?);
                 Ok(())
             }
             Action::Keep => Ok(()),
@@ -1167,6 +1193,52 @@ mod tests {
                 limit,
                 scope,
                 reversal: None,
+            }
+        }
+
+        #[test]
+        fn zero_execution_budget_refuses_throttle_before_live_probes() {
+            let runner = CpuThrottleActionRunner::with_defaults();
+            let mut action = throttle_action();
+            action.timeouts.execute_ms = 0;
+            assert!(matches!(runner.execute(&action), Err(ActionError::Timeout)));
+            assert!(runner.applied.lock().unwrap().is_none());
+        }
+
+        #[test]
+        fn throttle_timeout_preserves_unwritten_or_already_written_limits() {
+            let runner = CpuThrottleActionRunner::with_defaults();
+            for after_write in [false, true] {
+                let fixture = controller_fixture(true, "max", "100000");
+                let path = fixture.path().join("cpu.max");
+                let prepared = std::cell::Cell::new(false);
+                let result = runner.apply_throttle_with_reversal(
+                    fixture.path(),
+                    true,
+                    || {
+                        if prepared.get()
+                            && (!after_write
+                                || fs::read_to_string(&path).unwrap() == "25000 100000")
+                        {
+                            Err(ActionError::Timeout)
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    |_, _| {
+                        prepared.set(true);
+                        Ok(None)
+                    },
+                );
+                if after_write {
+                    let detail = result.unwrap_err().to_string();
+                    assert!(detail.contains("timed out after the controller write"));
+                    assert!(detail.contains("was not rolled back"));
+                    assert_eq!(fs::read_to_string(path).unwrap(), "25000 100000");
+                } else {
+                    assert!(matches!(result, Err(ActionError::Timeout)));
+                    assert_eq!(fs::read_to_string(path).unwrap(), "max 100000\n");
+                }
             }
         }
 
@@ -1734,12 +1806,13 @@ mod tests {
         #[test]
         fn throttle_requires_identity_before_mutation_and_before_success() {
             let runner = CpuThrottleActionRunner::with_defaults();
-            for failure_check in [1, 3] {
+            for after_write in [false, true] {
                 let fixture = controller_fixture(true, "max", "100000");
-                let checks = std::cell::Cell::new(0);
+                let path = fixture.path().join("cpu.max");
                 let result = runner.apply_throttle_at(fixture.path(), true, || {
-                    checks.set(checks.get() + 1);
-                    if checks.get() == failure_check {
+                    // Tie the injected identity change to the observable effect,
+                    // independent of the number of intervening pre-write guards.
+                    if !after_write || fs::read_to_string(&path).unwrap() == "25000 100000" {
                         Err(ActionError::IdentityMismatch)
                     } else {
                         Ok(())
@@ -1747,11 +1820,11 @@ mod tests {
                 });
                 assert!(matches!(result, Err(ActionError::IdentityMismatch)));
                 assert_eq!(
-                    fs::read_to_string(fixture.path().join("cpu.max")).unwrap(),
-                    if failure_check == 1 {
-                        "max 100000\n"
-                    } else {
+                    fs::read_to_string(path).unwrap(),
+                    if after_write {
                         "25000 100000"
+                    } else {
+                        "max 100000\n"
                     }
                 );
             }

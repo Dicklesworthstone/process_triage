@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(target_os = "linux")]
 use {
-    super::executor::ActionRunner,
+    super::executor::{ActionDeadline, ActionRunner},
     super::reversal::{PreparedReversal, ReversalJournal, ReversalStatus, ReversalValue},
     crate::decision::Action,
     crate::plan::{ActionRouting, PlanAction},
@@ -514,7 +514,12 @@ impl MemoryCapActionRunner {
         self
     }
 
-    fn execute_cap(&self, action: &PlanAction) -> Result<AppliedMemoryCap, ActionError> {
+    fn execute_cap(
+        &self,
+        action: &PlanAction,
+        deadline: &ActionDeadline,
+    ) -> Result<AppliedMemoryCap, ActionError> {
+        deadline.check()?;
         if action.action != Action::CapMemory
             || action.routing != ActionRouting::Direct
             || action.original_zombie_target.is_some()
@@ -541,10 +546,16 @@ impl MemoryCapActionRunner {
         let receipt = apply_at(
             &scope.pinned(),
             plan,
-            || scope.revalidate(&action.target, &plan.scope),
             || {
+                deadline.check()?;
+                scope.revalidate(&action.target, &plan.scope)?;
+                deadline.check()
+            },
+            || {
+                deadline.check()?;
                 ensure_cap_state(&action.target)?;
-                scope.revalidate(&action.target, &plan.scope)
+                scope.revalidate(&action.target, &plan.scope)?;
+                deadline.check()
             },
             || {
                 journal
@@ -589,11 +600,13 @@ fn apply_at(
     open_high(directory, false)?;
     before_write()?;
     let receipt = prepare()?;
+    let mut written = false;
     let execution = (|| {
         revalidate()?;
         validate_prewrite_controls(directory, plan)?;
         before_write()?;
         write_memory_high(directory, Some(plan.limit_bytes))?;
+        written = true;
         revalidate()?;
         for _ in 0..2 {
             if read_high(directory)? != Some(plan.limit_bytes) {
@@ -604,7 +617,16 @@ fn apply_at(
             revalidate()?;
         }
         Ok(())
-    })();
+    })()
+    .map_err(|error| {
+        if written && matches!(&error, ActionError::Timeout) {
+            failed(
+                "memory cap timed out after the controller write; its effect may remain and was not rolled back",
+            )
+        } else {
+            error
+        }
+    });
     match &receipt {
         Some(receipt) => receipt.finish(execution, ReversalStatus::Applied)?,
         None => execution?,
@@ -615,12 +637,13 @@ fn apply_at(
 #[cfg(target_os = "linux")]
 impl ActionRunner for MemoryCapActionRunner {
     fn execute(&self, action: &PlanAction) -> Result<(), ActionError> {
+        let deadline = ActionDeadline::new(action.timeouts.execute_ms);
         let mut applied = self
             .applied
             .lock()
             .map_err(|_| failed("memory cap execution record unavailable"))?;
         *applied = None;
-        *applied = Some(self.execute_cap(action)?);
+        *applied = Some(self.execute_cap(action, &deadline)?);
         Ok(())
     }
 
@@ -767,6 +790,70 @@ mod tests {
             fs::write(temp.path().join(name), value).unwrap();
         }
         temp
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn zero_execution_budget_refuses_memory_cap_before_live_probes() {
+        let plan = plan();
+        let action: PlanAction = serde_json::from_value(serde_json::json!({
+            "action_id": "test-memory-cap-deadline",
+            "target": plan.target,
+            "action": "cap_memory",
+            "order": 0,
+            "stage": 0,
+            "timeouts": {"preflight_ms": 1, "execute_ms": 0, "verify_ms": 1},
+            "pre_checks": [],
+            "rationale": {},
+            "on_success": [],
+            "on_failure": [],
+            "blocked": false,
+            "memory_cap": plan
+        }))
+        .unwrap();
+        let runner = MemoryCapActionRunner::with_defaults();
+        assert!(matches!(runner.execute(&action), Err(ActionError::Timeout)));
+        assert!(runner.applied.lock().unwrap().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn memory_cap_timeout_reports_a_retained_write_without_claiming_rollback() {
+        let plan = plan();
+        for after_write in [false, true] {
+            let temp = fixture(&plan);
+            let prepared = std::cell::Cell::new(false);
+            let result = apply_at(
+                temp.path(),
+                &plan,
+                || {
+                    if prepared.get() && (!after_write || read_high(temp.path()).unwrap().is_some())
+                    {
+                        Err(ActionError::Timeout)
+                    } else {
+                        Ok(())
+                    }
+                },
+                || Ok(()),
+                || {
+                    prepared.set(true);
+                    Ok(None)
+                },
+            );
+            if after_write {
+                let detail = result.unwrap_err().to_string();
+                assert!(detail.contains("timed out after the controller write"));
+                assert!(detail.contains("was not rolled back"));
+                assert_eq!(read_high(temp.path()).unwrap(), Some(plan.limit_bytes));
+            } else {
+                assert!(matches!(result, Err(ActionError::Timeout)));
+                assert_eq!(read_high(temp.path()).unwrap(), None);
+            }
+            assert_eq!(
+                fs::read_to_string(temp.path().join("memory.max")).unwrap(),
+                "max\n"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

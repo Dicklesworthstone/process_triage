@@ -10,6 +10,8 @@
 //! - No userspace signal handler required
 //! - Cleaner state management via cgroup.events
 
+#[cfg(target_os = "linux")]
+use super::executor::ActionDeadline;
 use super::executor::{ActionError, ActionRunner};
 #[cfg(target_os = "linux")]
 use super::reversal::{PreparedReversal, ReversalJournal, ReversalStatus, ReversalValue};
@@ -330,11 +332,13 @@ impl FreezeActionRunner {
 
     #[cfg(target_os = "linux")]
     fn execute_frozen_state(&self, action: &PlanAction, frozen: bool) -> Result<(), ActionError> {
+        let deadline = ActionDeadline::new(action.timeouts.execute_ms);
         let mut applied = self.applied.lock().map_err(|_| {
             ActionError::Failed("freezer execution record is unavailable".to_string())
         })?;
         // A failed attempt must not leave an earlier success available to verify.
         *applied = None;
+        deadline.check()?;
         let pid = action.target.pid.0;
         let checked_path = super::dispatch::ensure_cgroup_target(&action.target)?;
         let directory = PathBuf::from(format!("/sys/fs/cgroup{checked_path}"));
@@ -360,11 +364,13 @@ impl FreezeActionRunner {
             }
         }
 
+        deadline.check()?;
         let before = self
             .reversal_journal
             .as_ref()
             .map(|_| scope.observe(|| super::dispatch::ensure_cgroup_target(&action.target)))
             .transpose()?;
+        deadline.check()?;
         let reversal = match (&self.reversal_journal, before) {
             (Some(journal), Some(before)) => Some(
                 journal.prepare(
@@ -382,7 +388,9 @@ impl FreezeActionRunner {
             ),
             _ => None,
         };
+        let mut written = false;
         let execution = (|| {
+            deadline.check()?;
             scope.check_current_path(&super::dispatch::ensure_cgroup_target(&action.target)?)?;
             if let Some(before) = before {
                 if read_freezer_state(&scope.pinned_directory())?.requested != before.requested {
@@ -392,9 +400,22 @@ impl FreezeActionRunner {
                 }
             }
             // Write through the pinned directory, never a replacement at its old path.
+            deadline.check()?;
             self.write_freeze_state(&scope.pinned_directory().join("cgroup.freeze"), frozen)?;
-            scope.check_current_path(&super::dispatch::ensure_cgroup_target(&action.target)?)
-        })();
+            written = true;
+            deadline.check()?;
+            scope.check_current_path(&super::dispatch::ensure_cgroup_target(&action.target)?)?;
+            deadline.check()
+        })()
+        .map_err(|error| {
+            if written && matches!(&error, ActionError::Timeout) {
+                ActionError::Failed(
+                    "freezer execution timed out after the controller write; its effect may remain and was not rolled back".to_string(),
+                )
+            } else {
+                error
+            }
+        });
         match &reversal {
             Some(receipt) => receipt.finish(execution, ReversalStatus::Applied)?,
             None => execution?,
@@ -900,6 +921,17 @@ mod tests {
                 format!("populated 1\nfrozen {}\n", u8::from(frozen)),
             )
             .unwrap();
+        }
+
+        #[test]
+        fn zero_execution_budget_refuses_freeze_and_thaw_before_live_probes() {
+            for frozen in [false, true] {
+                let runner = FreezeActionRunner::with_defaults();
+                let mut action = freezer_action(frozen);
+                action.timeouts.execute_ms = 0;
+                assert!(matches!(runner.execute(&action), Err(ActionError::Timeout)));
+                assert!(runner.applied.lock().unwrap().is_none());
+            }
         }
 
         #[test]

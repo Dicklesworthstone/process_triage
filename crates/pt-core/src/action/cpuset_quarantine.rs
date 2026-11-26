@@ -24,6 +24,8 @@
 //! - Explicit reversal metadata restores the previous cpuset configuration;
 //!   a bare Unquarantine action cannot reconstruct it and is refused
 
+#[cfg(target_os = "linux")]
+use super::executor::ActionDeadline;
 use super::executor::{ActionError, ActionRunner};
 #[cfg(target_os = "linux")]
 use super::reversal::{PreparedReversal, ReversalJournal, ReversalStatus, ReversalValue};
@@ -349,10 +351,12 @@ impl CpusetQuarantineActionRunner {
     /// Execute a quarantine action on a process.
     #[cfg(target_os = "linux")]
     fn execute_quarantine(&self, action: &PlanAction) -> Result<(), ActionError> {
+        let deadline = ActionDeadline::new(action.timeouts.execute_ms);
         let mut applied = self.applied.lock().map_err(|_| {
             ActionError::Failed("quarantine execution record is unavailable".to_string())
         })?;
         *applied = None;
+        deadline.check()?;
         let pid = action.target.pid.0;
         let checked_path = super::dispatch::ensure_cgroup_target(&action.target)?;
         debug!(
@@ -410,7 +414,7 @@ impl CpusetQuarantineActionRunner {
                 Some(PinnedCpusetDirectory::open(controller_directory)?)
             },
         };
-        *applied = Some(self.apply_quarantine(action, scope)?);
+        *applied = Some(self.apply_quarantine(action, scope, &deadline)?);
         Ok(())
     }
 
@@ -420,8 +424,11 @@ impl CpusetQuarantineActionRunner {
         &self,
         action: &PlanAction,
         scope: CpusetScope,
+        deadline: &ActionDeadline,
     ) -> Result<AppliedQuarantine, ActionError> {
+        deadline.check()?;
         scope.revalidate(&action.target)?;
+        deadline.check()?;
         let directory = scope.directory();
         if !scope.is_v2 {
             if let Some(journal) = &self.reversal_journal {
@@ -434,7 +441,11 @@ impl CpusetQuarantineActionRunner {
         let (cpus, reversal) = self.apply_quarantine_with_reversal(
             &directory,
             scope.effective_name(),
-            || scope.revalidate(&action.target),
+            || {
+                deadline.check()?;
+                scope.revalidate(&action.target)?;
+                deadline.check()
+            },
             |previous, requested| match &self.reversal_journal {
                 Some(journal) if scope.is_v2 => journal
                     .prepare(
@@ -504,6 +515,7 @@ impl CpusetQuarantineActionRunner {
         )?;
         let requested = cpus.as_list();
         let reversal = prepare(&previous, &requested)?;
+        let mut written = false;
         let execution = (|| {
             revalidate()?;
             if read_cpuset_assignment(&cpus_path)? != previous
@@ -514,6 +526,8 @@ impl CpusetQuarantineActionRunner {
                 ));
             }
             if previous != requested {
+                // Recheck after reading controller state, immediately before mutation.
+                revalidate()?;
                 fs::write(&cpus_path, format!("{requested}\n")).map_err(|error| {
                     if error.kind() == std::io::ErrorKind::PermissionDenied {
                         ActionError::PermissionDenied
@@ -521,6 +535,7 @@ impl CpusetQuarantineActionRunner {
                         ActionError::Failed(format!("failed to write cpuset.cpus: {error}"))
                     }
                 })?;
+                written = true;
             }
             revalidate()?;
             verify_cpuset_files(directory, effective_name, &cpus)?;
@@ -531,7 +546,16 @@ impl CpusetQuarantineActionRunner {
                 "cpuset quarantine assignment written and observed"
             );
             Ok(())
-        })();
+        })()
+        .map_err(|error| {
+            if written && matches!(&error, ActionError::Timeout) {
+                ActionError::Failed(
+                    "cpuset quarantine timed out after the controller write; its effect may remain and was not rolled back".to_string(),
+                )
+            } else {
+                error
+            }
+        });
         match &reversal {
             Some(receipt) => receipt.finish(execution, ReversalStatus::Applied)?,
             None => execution?,
@@ -1402,6 +1426,54 @@ mod tests {
                 d_state_diagnostics: None,
                 supervisor_restart: None,
                 memory_cap: None,
+            }
+        }
+
+        #[test]
+        fn zero_execution_budget_refuses_quarantine_before_live_probes() {
+            let runner = CpusetQuarantineActionRunner::with_defaults();
+            let mut action = quarantine_action();
+            action.timeouts.execute_ms = 0;
+            assert!(matches!(runner.execute(&action), Err(ActionError::Timeout)));
+            assert!(runner.applied.lock().unwrap().is_none());
+        }
+
+        #[test]
+        fn quarantine_timeout_keeps_the_actual_controller_effect_visible() {
+            for after_write in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let requested = directory.path().join("cpuset.cpus");
+                fs::write(&requested, "\n").unwrap();
+                fs::write(directory.path().join("cpuset.cpus.effective"), "8-11\n").unwrap();
+                let prepared = Cell::new(false);
+                let result = CpusetQuarantineActionRunner::with_defaults()
+                    .apply_quarantine_with_reversal(
+                        directory.path(),
+                        "cpuset.cpus.effective",
+                        || {
+                            if prepared.get()
+                                && (!after_write
+                                    || fs::read_to_string(&requested).unwrap() == "8\n")
+                            {
+                                Err(ActionError::Timeout)
+                            } else {
+                                Ok(())
+                            }
+                        },
+                        |_, _| {
+                            prepared.set(true);
+                            Ok(None)
+                        },
+                    );
+                if after_write {
+                    let detail = result.unwrap_err().to_string();
+                    assert!(detail.contains("timed out after the controller write"));
+                    assert!(detail.contains("was not rolled back"));
+                    assert_eq!(fs::read_to_string(requested).unwrap(), "8\n");
+                } else {
+                    assert!(matches!(result, Err(ActionError::Timeout)));
+                    assert_eq!(fs::read_to_string(requested).unwrap(), "\n");
+                }
             }
         }
 

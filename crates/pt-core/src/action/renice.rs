@@ -6,6 +6,8 @@
 //! - Graceful handling of permission denied
 //! - Reversal metadata capture for undo operations
 
+#[cfg(unix)]
+use super::executor::ActionDeadline;
 use super::executor::{ActionError, ActionRunner};
 #[cfg(target_os = "linux")]
 use super::reversal::{PreparedReversal, ReversalJournal, ReversalStatus};
@@ -161,7 +163,12 @@ impl ReniceActionRunner {
 
     /// Set process priority using setpriority(2).
     #[cfg(unix)]
-    fn set_priority(&self, pid: u32, nice_value: i32) -> Result<(), ActionError> {
+    fn set_priority(
+        &self,
+        pid: u32,
+        nice_value: i32,
+        deadline: Option<&ActionDeadline>,
+    ) -> Result<(), ActionError> {
         // A zero ID means the caller, not an absent/invalid target.
         if pid == 0 || pid > i32::MAX as u32 {
             return Err(ActionError::Failed(
@@ -172,6 +179,11 @@ impl ReniceActionRunner {
             return Err(ActionError::Failed("invalid priority value".into()));
         }
         super::signal::ensure_action_pid_namespace()?;
+        // Namespace inspection can block; the caller's earlier check cannot
+        // authorize a new setpriority after that observation consumed the budget.
+        if let Some(deadline) = deadline {
+            deadline.check()?;
+        }
         // PRIO_PROCESS = 0
         let result =
             unsafe { libc::setpriority(libc::PRIO_PROCESS, pid as libc::id_t, nice_value) };
@@ -247,7 +259,7 @@ impl ReniceActionRunner {
     pub fn capture_reversal_metadata(&self, pid: u32) -> Option<ReniceReversalMetadata> {
         let target = process_priority::capture_identity(pid).ok()?;
         process_priority::capture(
-            &process_priority::LiveProcess(self),
+            &process_priority::LiveProcess(self, None),
             &target,
             self.effective_nice_value(),
         )
@@ -266,7 +278,7 @@ impl ReniceActionRunner {
         &self,
         metadata: &ReniceReversalMetadata,
     ) -> Result<(), ActionError> {
-        linux_threads::restore(&linux_threads::LiveTasks(self), metadata)
+        linux_threads::restore(&linux_threads::LiveTasks(self, None), metadata)
     }
 
     /// Durable receipts use stricter conditional restoration: a completed undo
@@ -277,7 +289,11 @@ impl ReniceActionRunner {
         metadata: &ReniceReversalMetadata,
         allow_write: bool,
     ) -> Result<bool, ActionError> {
-        linux_threads::restore_conditional(&linux_threads::LiveTasks(self), metadata, allow_write)
+        linux_threads::restore_conditional(
+            &linux_threads::LiveTasks(self, None),
+            metadata,
+            allow_write,
+        )
     }
 
     #[cfg(target_os = "linux")]
@@ -285,7 +301,7 @@ impl ReniceActionRunner {
         &self,
         metadata: &ReniceReversalMetadata,
     ) -> Result<(), ActionError> {
-        linux_threads::observe_captured(&linux_threads::LiveTasks(self), metadata, false)
+        linux_threads::observe_captured(&linux_threads::LiveTasks(self, None), metadata, false)
     }
 
     /// Restore the process-level priority on other Unix platforms.
@@ -294,7 +310,7 @@ impl ReniceActionRunner {
         &self,
         metadata: &ReniceReversalMetadata,
     ) -> Result<(), ActionError> {
-        process_priority::restore(&process_priority::LiveProcess(self), metadata)
+        process_priority::restore(&process_priority::LiveProcess(self, None), metadata)
     }
 
     #[cfg(not(unix))]
@@ -310,12 +326,15 @@ impl ReniceActionRunner {
     /// Linux nice values belong to threads, including threads other than the leader.
     #[cfg(target_os = "linux")]
     fn execute_renice(&self, action: &PlanAction) -> Result<(), ActionError> {
+        let deadline = ActionDeadline::new(action.timeouts.execute_ms);
         let mut applied = self
             .applied
             .lock()
             .map_err(|_| ActionError::Failed("renice execution record is unavailable".into()))?;
         *applied = None;
-        let ops = linux_threads::LiveTasks(self);
+        deadline.check()?;
+        let live = linux_threads::LiveTasks(self, Some(&deadline));
+        let ops = linux_threads::with_budget(&live, || deadline.check());
         let nice = self.effective_nice_value();
         if let Some(journal) = &self.reversal_journal {
             let metadata = linux_threads::capture_for_target(&ops, &action.target, nice)?;
@@ -342,11 +361,11 @@ impl ReniceActionRunner {
     /// Execute a process-level priority change on other Unix platforms.
     #[cfg(all(unix, not(target_os = "linux")))]
     fn execute_renice(&self, action: &PlanAction) -> Result<(), ActionError> {
-        process_priority::apply(
-            &process_priority::LiveProcess(self),
-            &action.target,
-            self.effective_nice_value(),
-        )
+        let deadline = ActionDeadline::new(action.timeouts.execute_ms);
+        deadline.check()?;
+        let live = process_priority::LiveProcess(self, Some(&deadline));
+        let ops = process_priority::with_budget(&live, || deadline.check());
+        process_priority::apply(&ops, &action.target, self.effective_nice_value())
     }
 
     #[cfg(target_os = "linux")]
@@ -367,7 +386,7 @@ impl ReniceActionRunner {
             }
             return applied.reversal.finish(
                 linux_threads::observe_captured(
-                    &linux_threads::LiveTasks(self),
+                    &linux_threads::LiveTasks(self, None),
                     &applied.metadata,
                     true,
                 ),
@@ -375,7 +394,7 @@ impl ReniceActionRunner {
             );
         }
         linux_threads::verify(
-            &linux_threads::LiveTasks(self),
+            &linux_threads::LiveTasks(self, None),
             &action.target,
             self.effective_nice_value(),
         )
@@ -385,7 +404,7 @@ impl ReniceActionRunner {
     #[cfg(all(unix, not(target_os = "linux")))]
     fn verify_renice(&self, action: &PlanAction) -> Result<(), ActionError> {
         process_priority::verify(
-            &process_priority::LiveProcess(self),
+            &process_priority::LiveProcess(self, None),
             &action.target,
             self.effective_nice_value(),
         )
@@ -429,8 +448,42 @@ mod process_priority {
         fn set(&self, pid: u32, nice: i32) -> Result<(), ActionError>;
     }
 
+    /// Budget every observation and final write without hiding an already
+    /// successful syscall from the caller's partial-effect accounting.
+    struct BudgetedProcess<'a, T, F> {
+        inner: &'a T,
+        check: F,
+    }
+
+    pub(super) fn with_budget<'a>(
+        inner: &'a impl ProcessOps,
+        check: impl Fn() -> Result<(), ActionError> + 'a,
+    ) -> impl ProcessOps + 'a {
+        BudgetedProcess { inner, check }
+    }
+
+    impl<T: ProcessOps, F: Fn() -> Result<(), ActionError>> ProcessOps for BudgetedProcess<'_, T, F> {
+        fn revalidate(&self, target: &ProcessIdentity) -> Result<(), ActionError> {
+            (self.check)()?;
+            self.inner.revalidate(target)?;
+            (self.check)()
+        }
+
+        fn read(&self, pid: u32) -> Result<i32, ActionError> {
+            (self.check)()?;
+            let value = self.inner.read(pid)?;
+            (self.check)()?;
+            Ok(value)
+        }
+
+        fn set(&self, pid: u32, nice: i32) -> Result<(), ActionError> {
+            (self.check)()?;
+            self.inner.set(pid, nice)
+        }
+    }
+
     #[cfg(not(target_os = "linux"))]
-    pub(super) struct LiveProcess<'a>(pub &'a ReniceActionRunner);
+    pub(super) struct LiveProcess<'a>(pub &'a ReniceActionRunner, pub Option<&'a ActionDeadline>);
 
     #[cfg(not(target_os = "linux"))]
     impl ProcessOps for LiveProcess<'_> {
@@ -460,7 +513,7 @@ mod process_priority {
         }
 
         fn set(&self, pid: u32, nice: i32) -> Result<(), ActionError> {
-            self.0.set_priority(pid, nice)
+            self.0.set_priority(pid, nice, self.1)
         }
     }
 
@@ -579,7 +632,16 @@ mod process_priority {
         }
         ops.revalidate(target)?;
         ops.set(target.pid.0, requested)?;
-        if observe(ops, target)? != requested {
+        let current = observe(ops, target).map_err(|error| {
+            if matches!(&error, ActionError::Timeout) {
+                ActionError::Failed(
+                    "renice timed out after the priority write; its effect may remain and was not rolled back".into(),
+                )
+            } else {
+                error
+            }
+        })?;
+        if current != requested {
             return Err(ActionError::Failed(
                 "original process priority differs from the applied renice value".into(),
             ));
@@ -746,6 +808,41 @@ mod process_priority {
         }
 
         #[test]
+        fn process_renice_budget_checks_preserve_actual_write_outcomes() {
+            let ops = FakeProcess::new(0, Fault::None);
+            let zero = ActionDeadline::new(0);
+            let bounded = with_budget(&ops, || zero.check());
+            assert!(matches!(
+                apply(&bounded, &FakeProcess::target(), 10),
+                Err(ActionError::Timeout)
+            ));
+            assert!(ops.writes.borrow().is_empty());
+            assert_eq!(ops.reads.get(), 0);
+
+            let bounded = with_budget(&ops, || {
+                if ops.writes.borrow().is_empty() {
+                    Ok(())
+                } else {
+                    Err(ActionError::Timeout)
+                }
+            });
+            let detail = apply(&bounded, &FakeProcess::target(), 10)
+                .unwrap_err()
+                .to_string();
+            assert!(detail.contains("timed out after the priority write"));
+            assert!(detail.contains("was not rolled back"));
+            assert_eq!(ops.nice.get(), 10);
+            assert_eq!(*ops.writes.borrow(), vec![(42, 10)]);
+
+            let positive = FakeProcess::new(0, Fault::None);
+            let deadline = ActionDeadline::new(u64::MAX);
+            let bounded = with_budget(&positive, || deadline.check());
+            apply(&bounded, &FakeProcess::target(), 10).unwrap();
+            verify(&bounded, &FakeProcess::target(), 10).unwrap();
+            assert_eq!(positive.nice.get(), 10);
+        }
+
+        #[test]
         fn process_renice_applies_only_lower_priorities_and_captures_actual_values() {
             for (previous, requested, applied, writes) in
                 [(0, 10, 10, 1), (15, 10, 15, 0), (-10, -5, -5, 1)]
@@ -891,7 +988,7 @@ mod process_priority {
             assert!(target.pgid.is_some());
             assert!(target.sid.is_some());
             assert!(saved.threads.is_empty());
-            let ops = LiveProcess(&runner);
+            let ops = LiveProcess(&runner, None);
 
             let mut stale = target.clone();
             stale.uid ^= 1;
@@ -950,7 +1047,49 @@ mod linux_threads {
         fn set(&self, tid: u32, nice: i32) -> Result<(), ActionError>;
     }
 
-    pub(super) struct LiveTasks<'a>(pub &'a ReniceActionRunner);
+    /// Every thread read and census shares one execution budget. Do not check
+    /// after a successful setpriority here: apply must first record the TID so
+    /// a later expiry cannot erase a partial write from its error or journal.
+    struct BudgetedTasks<'a, T, F> {
+        inner: &'a T,
+        check: F,
+    }
+
+    pub(super) fn with_budget<'a>(
+        inner: &'a impl TaskOps,
+        check: impl Fn() -> Result<(), ActionError> + 'a,
+    ) -> impl TaskOps + 'a {
+        BudgetedTasks { inner, check }
+    }
+
+    impl<T: TaskOps, F: Fn() -> Result<(), ActionError>> TaskOps for BudgetedTasks<'_, T, F> {
+        fn revalidate(&self, target: &ProcessIdentity) -> Result<(), ActionError> {
+            (self.check)()?;
+            self.inner.revalidate(target)?;
+            (self.check)()
+        }
+
+        fn tids(&self, pid: u32) -> Result<Vec<u32>, ActionError> {
+            (self.check)()?;
+            let tids = self.inner.tids(pid)?;
+            (self.check)()?;
+            Ok(tids)
+        }
+
+        fn read(&self, pid: u32, tid: u32) -> Result<Option<TaskPriority>, ActionError> {
+            (self.check)()?;
+            let task = self.inner.read(pid, tid)?;
+            (self.check)()?;
+            Ok(task)
+        }
+
+        fn set(&self, tid: u32, nice: i32) -> Result<(), ActionError> {
+            (self.check)()?;
+            self.inner.set(tid, nice)
+        }
+    }
+
+    pub(super) struct LiveTasks<'a>(pub &'a ReniceActionRunner, pub Option<&'a ActionDeadline>);
 
     impl TaskOps for LiveTasks<'_> {
         fn revalidate(&self, target: &ProcessIdentity) -> Result<(), ActionError> {
@@ -1021,7 +1160,7 @@ mod linux_threads {
         }
 
         fn set(&self, tid: u32, nice: i32) -> Result<(), ActionError> {
-            self.0.set_priority(tid, nice)
+            self.0.set_priority(tid, nice, self.1)
         }
     }
 
@@ -1224,7 +1363,7 @@ mod linux_threads {
         pid: u32,
     ) -> Result<ReniceReversalMetadata, ActionError> {
         super::super::signal::ensure_action_pid_namespace()?;
-        let ops = LiveTasks(runner);
+        let ops = LiveTasks(runner, None);
         let leader = ops.read(pid, pid)?.ok_or(ActionError::ProcessNotFound)?;
         let boot_id =
             std::fs::read_to_string("/proc/sys/kernel/random/boot_id").map_err(|error| {
@@ -1672,6 +1811,79 @@ mod linux_threads {
         }
 
         #[test]
+        fn renice_zero_budget_refuses_before_thread_observation_or_write() {
+            for journaled in [false, true] {
+                let ops = FakeTasks::new(&[(100, 0), (200, 0)]);
+                let saved = ops.saved(10);
+                let deadline = ActionDeadline::new(0);
+                let bounded = with_budget(&ops, || deadline.check());
+                let result = if journaled {
+                    apply_captured(&bounded, &saved)
+                } else {
+                    apply(&bounded, &FakeTasks::target(), 10)
+                };
+                assert!(matches!(result, Err(ActionError::Timeout)));
+                assert!(ops.writes.borrow().is_empty());
+                assert!(ops.reads.borrow().is_empty());
+                assert_eq!(ops.censuses.get(), 0);
+            }
+        }
+
+        #[test]
+        fn renice_budget_expiry_retains_partial_thread_effects() {
+            for journaled in [false, true] {
+                let ops = FakeTasks::new(&[(100, 0), (200, 0), (300, 0)]);
+                let saved = ops.saved(10);
+                let bounded = with_budget(&ops, || {
+                    if ops.writes.borrow().is_empty() {
+                        Ok(())
+                    } else {
+                        Err(ActionError::Timeout)
+                    }
+                });
+                let result = if journaled {
+                    apply_captured(&bounded, &saved)
+                } else {
+                    apply(&bounded, &FakeTasks::target(), 10)
+                };
+                let detail = result.unwrap_err().to_string();
+                assert!(detail.contains("timeout"));
+                assert!(detail.contains("1 thread priority write(s) already succeeded (TIDs 100)"));
+                assert!(detail.contains("changes were not rolled back"));
+                assert_eq!(*ops.writes.borrow(), vec![(100, 10)]);
+                assert_eq!(ops.tasks.borrow()[&100].nice, 10);
+                assert_eq!(ops.tasks.borrow()[&200].nice, 0);
+                assert_eq!(ops.tasks.borrow()[&300].nice, 0);
+            }
+        }
+
+        #[test]
+        fn renice_positive_budget_preserves_priority_and_identity_guards() {
+            for journaled in [false, true] {
+                let ops = FakeTasks::new(&[(100, 0), (200, 19)]);
+                let saved = ops.saved(10);
+                let deadline = ActionDeadline::new(u64::MAX);
+                let bounded = with_budget(&ops, || deadline.check());
+                if journaled {
+                    apply_captured(&bounded, &saved).unwrap();
+                    observe_captured(&bounded, &saved, true).unwrap();
+                } else {
+                    apply(&bounded, &FakeTasks::target(), 10).unwrap();
+                    verify(&bounded, &FakeTasks::target(), 10).unwrap();
+                }
+                assert_eq!(*ops.writes.borrow(), vec![(100, 10)]);
+                assert_eq!(ops.tasks.borrow()[&200].nice, 19);
+                let mut changed = FakeTasks::target();
+                changed.uid += 1;
+                assert!(matches!(
+                    apply(&bounded, &changed, 15),
+                    Err(ActionError::IdentityMismatch)
+                ));
+                assert_eq!(*ops.writes.borrow(), vec![(100, 10)]);
+            }
+        }
+
+        #[test]
         fn renice_rejects_thread_reuse_before_and_after_priority_write() {
             for read_number in [2, 3] {
                 let mut ops = FakeTasks::new(&[(100, 0), (200, 0)]);
@@ -1914,7 +2126,7 @@ mod linux_threads {
                     std::thread::spawn(move || {
                         let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
                         ReniceActionRunner::with_defaults()
-                            .set_priority(tid, nice)
+                            .set_priority(tid, nice, None)
                             .expect("owned worker priority");
                         ready_tx.send(()).unwrap();
                         loop {
@@ -1930,7 +2142,7 @@ mod linux_threads {
                 // Reproduce the former early-success bug: the leader is already
                 // niced, while workers still retain higher scheduling priority.
                 runner
-                    .set_priority(std::process::id(), target)
+                    .set_priority(std::process::id(), target, None)
                     .expect("owned leader priority");
                 println!("{READY}{target}");
                 std::io::stdout().flush().unwrap();
@@ -2205,6 +2417,34 @@ mod tests {
             assert!(nice.is_some());
         }
 
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn zero_execution_budget_preserves_a_real_childs_priorities() {
+            let child = Command::new("sleep").arg("60").spawn().unwrap();
+            let pid = child.id();
+            let _guard = ChildGuard(child);
+            let runner = ReniceActionRunner::with_defaults();
+            let before = runner.capture_reversal_metadata(pid).unwrap();
+            let action: PlanAction = serde_json::from_value(serde_json::json!({
+                "action_id": "zero-budget-renice",
+                "target": before.identity,
+                "action": "renice",
+                "order": 0,
+                "stage": 0,
+                "timeouts": {"preflight_ms": 1, "execute_ms": 0, "verify_ms": 1},
+                "pre_checks": [],
+                "rationale": {},
+                "on_success": [],
+                "on_failure": [],
+                "blocked": false
+            }))
+            .unwrap();
+            assert!(matches!(runner.execute(&action), Err(ActionError::Timeout)));
+            let after = runner.capture_reversal_metadata(pid).unwrap();
+            assert_eq!(after.identity, before.identity);
+            assert_eq!(after.threads, before.threads);
+        }
+
         #[test]
         fn can_renice_child_process() {
             // Spawn a sleep process
@@ -2219,7 +2459,7 @@ mod tests {
 
             // Renice it - this may fail with PermissionDenied in some environments
             // (e.g., containers, certain security profiles, or systems with strict resource limits)
-            let renice_result = runner.set_priority(pid, 15);
+            let renice_result = runner.set_priority(pid, 15, None);
             match &renice_result {
                 Ok(_) => {
                     // Verify the new nice value
@@ -2245,7 +2485,7 @@ mod tests {
         #[test]
         fn renice_nonexistent_process_fails() {
             let runner = ReniceActionRunner::with_defaults();
-            let result = runner.set_priority(999_999_999, 10);
+            let result = runner.set_priority(999_999_999, 10, None);
             assert!(result.is_err());
         }
 

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 /// Errors during plan execution.
@@ -33,6 +33,35 @@ pub enum ActionError {
     Timeout,
     #[error("action failed: {0}")]
     Failed(String),
+}
+
+/// A phase budget from the approved plan, measured with a monotonic clock.
+/// Keep a duration instead of adding to `Instant`, so even the largest saved
+/// budget cannot overflow the platform's clock representation. Callers check
+/// again immediately before mutation; an expired budget never undoes an effect.
+pub(crate) struct ActionDeadline {
+    started: Instant,
+    budget: Duration,
+}
+
+impl ActionDeadline {
+    pub(crate) fn new(timeout_ms: u64) -> Self {
+        Self {
+            started: Instant::now(),
+            budget: Duration::from_millis(timeout_ms),
+        }
+    }
+
+    pub(crate) fn remaining(&self) -> Result<Duration, ActionError> {
+        self.budget
+            .checked_sub(self.started.elapsed())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(ActionError::Timeout)
+    }
+
+    pub(crate) fn check(&self) -> Result<(), ActionError> {
+        self.remaining().map(|_| ())
+    }
 }
 
 /// Status of a single action.
@@ -436,6 +465,22 @@ mod tests {
             generated_at: Some("2026-01-15T12:00:00Z".to_string()),
         };
         crate::plan::generate_plan(&bundle)
+    }
+
+    #[test]
+    fn action_deadline_refuses_zero_and_elapsed_budgets_without_clock_overflow() {
+        assert!(matches!(
+            ActionDeadline::new(0).check(),
+            Err(ActionError::Timeout)
+        ));
+        let expired = ActionDeadline {
+            started: Instant::now() - Duration::from_secs(1),
+            budget: Duration::from_millis(1),
+        };
+        assert!(matches!(expired.remaining(), Err(ActionError::Timeout)));
+        let large = ActionDeadline::new(u64::MAX);
+        assert!(large.check().is_ok());
+        assert!(large.remaining().unwrap() <= Duration::from_millis(u64::MAX));
     }
 
     #[test]
