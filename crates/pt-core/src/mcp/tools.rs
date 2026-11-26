@@ -319,6 +319,9 @@ impl Evaluator {
                 .get(&process.pid.0)
                 .map(|record| {
                     let complete = record.network_unavailable.is_empty();
+                    let queue_observed = record.network.as_ref().is_some_and(|network| {
+                        complete || network.tcp_data_connections().next().is_some()
+                    });
                     serde_json::json!({
                         "start_id": record.start_id,
                         "source": record.source,
@@ -331,9 +334,9 @@ impl Evaluator {
                             "listening_ports": network.listen_ports,
                             "rx_queue_bytes": complete.then(|| network.total_rx_queue()),
                             "tx_queue_bytes": complete.then(|| network.total_tx_queue()),
-                            "observed_rx_queue_bytes": (!network.tcp_connections.is_empty() || complete)
+                            "observed_rx_queue_bytes": queue_observed
                                 .then(|| network.total_rx_queue()),
-                            "observed_tx_queue_bytes": (!network.tcp_connections.is_empty() || complete)
+                            "observed_tx_queue_bytes": queue_observed
                                 .then(|| network.total_tx_queue()),
                             "queue_saturated": network.observed_queue_saturation(),
                         })),
@@ -2313,7 +2316,9 @@ mod tests {
             assert_eq!(deep["network"]["observed_rx_queue_bytes"], 8192);
             assert_eq!(deep["network"]["observed_socket_counts"]["tcp"], 1);
         }
-        record.network = Some(Default::default());
+        // One observed listener with 8192 pending accepts, plus an unresolved
+        // socket. No data queue or process-wide byte total can be inferred.
+        record.network.as_mut().unwrap().tcp_connections[0].state = TcpState::Listen;
         evaluator.deep_records.insert(process.pid.0, record);
         assert_eq!(evaluator.evidence(&process).queue_saturated, None);
         assert!(evaluator.deep_evidence(&process)["network"]["observed_rx_queue_bytes"].is_null());

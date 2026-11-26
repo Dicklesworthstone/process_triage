@@ -7810,7 +7810,8 @@ fn collect_deep_observations_with(
             .network
             .as_ref()
             .filter(|info| {
-                record.network_unavailable.is_empty() || !info.tcp_connections.is_empty()
+                record.network_unavailable.is_empty()
+                    || info.tcp_data_connections().next().is_some()
             })
             .map(observed_queue_metrics);
         let workspace_context = deep_workspace_context(&record);
@@ -8222,7 +8223,9 @@ mod planning_probe_tests {
         let selected = HashSet::from([71]);
         for has_connection in [true, false] {
             if !has_connection {
-                record.network.as_mut().unwrap().tcp_connections.clear();
+                // This receive count belongs to the accept queue. The unresolved
+                // socket may hold data, so the process byte totals are unknown.
+                record.network.as_mut().unwrap().tcp_connections[0].state = TcpState::Listen;
             }
             let run = collect_deep_observations_with(
                 &[&process],
@@ -8834,8 +8837,7 @@ fn observed_queue_metrics(info: &pt_core::collect::NetworkInfo) -> QueueMetrics 
     let total_rx = info.total_rx_queue();
     let total_tx = info.total_tx_queue();
     let backlog_sockets = info
-        .tcp_connections
-        .iter()
+        .tcp_data_connections()
         .filter(|conn| conn.rx_queue > 0 || conn.tx_queue > 0)
         .count();
 
@@ -31894,8 +31896,9 @@ fn snapshot_network_observation(
     let observed_socket_count =
         counts.tcp + counts.tcp6 + counts.udp + counts.udp6 + counts.unix + counts.raw;
     let complete = unavailable.is_empty();
-    let rx_queue_bytes = info.total_rx_queue();
-    let tx_queue_bytes = info.total_tx_queue();
+    let queue_observed = complete || info.tcp_data_connections().next().is_some();
+    let rx_queue_bytes = queue_observed.then(|| info.total_rx_queue());
+    let tx_queue_bytes = queue_observed.then(|| info.total_tx_queue());
     let observed_listener_count = info.listen_ports.len();
     let omitted = serde_json::json!({
         "listen_ports": info.listen_ports.len().saturating_sub(SNAPSHOT_NETWORK_MAX_ENDPOINTS),
@@ -31992,6 +31995,8 @@ mod snapshot_network_tests {
         assert_eq!(observed["observed_socket_count"], 1);
         assert_eq!(observed["observed_socket_counts"]["tcp"], 1);
         assert_eq!(observed["listen_ports"][0]["port"], 8080);
+        assert!(observed["observed_tcp_rx_queue_bytes"].is_null());
+        assert!(observed["observed_tcp_tx_queue_bytes"].is_null());
         assert_eq!(observed["unavailable"].as_array().unwrap().len(), 1);
     }
 

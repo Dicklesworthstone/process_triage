@@ -73,29 +73,30 @@ pub struct NetworkObservation {
 }
 
 impl NetworkInfo {
-    /// Total receive queue depth across all TCP connections (bytes).
-    ///
-    /// A large aggregate rx_queue signals that the process is not draining
-    /// incoming data — a hallmark of stalled / useful-bad behaviour.
+    /// TCP rows whose kernel queue counters describe stream data. Linux uses
+    /// the LISTEN receive counter for the number of pending accepts on both
+    /// IPv4 and IPv6. Keep those raw rows for listener diagnostics.
+    pub fn tcp_data_connections(&self) -> impl Iterator<Item = &TcpConnection> {
+        self.tcp_connections.iter().filter(|c| !c.state.is_listen())
+    }
+
+    /// Observed receive queue bytes across non-listening TCP sockets.
     pub fn total_rx_queue(&self) -> u64 {
-        self.tcp_connections
-            .iter()
+        self.tcp_data_connections()
             .map(|c| u64::from(c.rx_queue))
             .sum()
     }
 
-    /// Total transmit queue depth across all TCP connections (bytes).
+    /// Observed transmit queue bytes across non-listening TCP sockets.
     pub fn total_tx_queue(&self) -> u64 {
-        self.tcp_connections
-            .iter()
+        self.tcp_data_connections()
             .map(|c| u64::from(c.tx_queue))
             .sum()
     }
 
-    /// Whether any socket has a saturated queue (rx_queue > threshold bytes).
+    /// Whether any observed TCP data queue exceeds the threshold in bytes.
     pub fn has_saturated_queue(&self, threshold: u32) -> bool {
-        self.tcp_connections
-            .iter()
+        self.tcp_data_connections()
             .any(|c| c.rx_queue > threshold || c.tx_queue > threshold)
     }
 
@@ -654,10 +655,10 @@ pub struct TcpConnection {
     pub inode: u64,
     /// IPv6 connection.
     pub is_ipv6: bool,
-    /// Transmit queue size (bytes pending in kernel send buffer).
+    /// Raw Linux transmit queue. Byte aggregates use only non-listening sockets.
     #[serde(default)]
     pub tx_queue: u32,
-    /// Receive queue size (bytes pending in kernel receive buffer).
+    /// Raw Linux receive queue: pending accepts for LISTEN, queued bytes otherwise.
     #[serde(default)]
     pub rx_queue: u32,
 }
@@ -2018,6 +2019,37 @@ mod tests {
         assert_eq!(connections.len(), 1);
         assert_eq!(connections[0].tx_queue, 16);
         assert_eq!(connections[0].rx_queue, 32);
+    }
+
+    #[test]
+    fn listener_accept_counts_never_contribute_tcp_data_bytes() {
+        for (ipv6, address) in [
+            (false, "0100007F"),
+            (true, "00000000000000000000000001000000"),
+        ] {
+            let table = format!(
+                "sl local_address rem_address st tx_queue:rx_queue tr tm retrnsmt uid timeout inode\n\
+                 0: {address}:1F90 {address}:0000 0A 00000000:00002000 00:00000000 00000000 1000 0 42\n\
+                 1: {address}:1F90 {address}:1388 01 00000010:00000020 00:00000000 00000000 1000 0 43\n"
+            );
+            let mut info = NetworkInfo {
+                tcp_connections: parse_proc_net_tcp_content(&table, ipv6),
+                ..Default::default()
+            };
+            assert_eq!(info.tcp_connections.len(), 2);
+            assert_eq!(info.tcp_connections[0].state, TcpState::Listen);
+            let raw = serde_json::to_value(&info.tcp_connections[0]).unwrap();
+            assert_eq!(raw["rx_queue"], 8192);
+            assert_eq!(info.total_rx_queue(), 32);
+            assert_eq!(info.total_tx_queue(), 16);
+            assert_eq!(info.observed_queue_saturation(), None);
+            info.tcp_connections[1].rx_queue = 8192;
+            assert_eq!(info.observed_queue_saturation(), Some(true));
+            info.tcp_connections.truncate(1);
+            assert_eq!(info.total_rx_queue(), 0);
+            assert_eq!(info.total_tx_queue(), 0);
+            assert_eq!(info.observed_queue_saturation(), None);
+        }
     }
 
     #[test]
