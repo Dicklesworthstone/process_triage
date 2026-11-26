@@ -9484,6 +9484,7 @@ fn build_tui_rows(
                 "agent_liveness": advice.agent_liveness,
                 "workspace_context": deep.and_then(|deep| deep.workspace_context),
                 "work": scorer.workload_diagnosis_for(proc),
+                "pipe_liveness": scorer.pipe_liveness_for(proc),
                 "supervisor_restart": scorer.supervisor_restart_for(proc),
                 "supervisor_restart_unavailable": scorer.supervisor_restart_unavailable_for(proc),
                 "memory_cap": memory_cap,
@@ -33216,6 +33217,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                 "agent_liveness": advice.agent_liveness,
                 "respawn_history": score.respawn_history,
                 "work": score.work,
+                "pipe_liveness": score.pipe_liveness,
                 "supervisor_restart": score.supervisor_restart,
                 "supervisor_restart_unavailable": score.supervisor_restart_unavailable,
                 "memory_cap": memory_cap,
@@ -34959,6 +34961,9 @@ fn collect_planning_activity(
     );
     system["respawn_history"] = collect_planning_respawn_history(scorer, population);
     system["workloads"] = collect_planning_workloads(scorer, population, census_complete);
+    // Observe pipe peers after the host/process rate window has closed. The
+    // bounded descriptor census must not lengthen the CPU accounting interval.
+    scorer.collect_pipe_liveness(population, census_complete);
     (system, cgroup_cpu)
 }
 
@@ -37131,6 +37136,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             "activity": activity,
             "respawn_history": scorer.respawn_history_for(proc),
             "work": scorer.workload_diagnosis_for(proc),
+            "pipe_liveness": scorer.pipe_liveness_for(proc),
             "supervisor_restart": scorer.supervisor_restart_for(proc),
             "supervisor_restart_unavailable": scorer.supervisor_restart_unavailable_for(proc),
             "memory_cap": memory_cap,
@@ -38786,6 +38792,10 @@ fn collect_explain_provenance(
         &population.processes.iter().collect::<Vec<_>>(),
         Duration::from_millis(window_ms),
     );
+    scorer.collect_pipe_liveness(
+        &population.processes,
+        population.metadata.warnings.is_empty(),
+    );
     scorer.prepare_agent_activity(
         &population.processes,
         population.metadata.warnings.is_empty(),
@@ -38869,6 +38879,7 @@ fn build_process_explanation(
         "activity": activity,
         "respawn_history": score.respawn_history,
         "work": score.work,
+        "pipe_liveness": score.pipe_liveness,
         "supervisor_restart": score.supervisor_restart,
         "supervisor_restart_unavailable": score.supervisor_restart_unavailable,
         "classification": ledger.classification.label(),
@@ -47384,6 +47395,7 @@ fn evaluate_watch_candidate(
             "activity": score.activity,
             "respawn_history": score.respawn_history,
             "work": score.work,
+            "pipe_liveness": score.pipe_liveness,
             "supervisor_restart": score.supervisor_restart,
             "supervisor_restart_unavailable": score.supervisor_restart_unavailable,
             "memory_cap": memory_cap,

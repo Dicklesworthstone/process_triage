@@ -283,6 +283,9 @@ pub struct ProcessScore<'a> {
     /// Identity-bound duplicate/competing-work diagnosis. This informs review
     /// and preservation of useful work, never the abandonment posterior.
     pub work: Option<ProcessWorkDiagnosis>,
+    /// Observed pipe peers and a bounded path to recent downstream activity.
+    /// This is a preservation signal, never an abandonment likelihood.
+    pub pipe_liveness: Option<PipeLivenessEvidence>,
     /// A separately observed service route; it never changes class probabilities.
     pub supervisor_restart: Option<SystemdUserServiceBinding>,
     pub supervisor_restart_unavailable: Option<String>,
@@ -329,6 +332,9 @@ pub struct ScoringObservations {
     /// that the process was the only build of its workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work: Option<ProcessWorkDiagnosis>,
+    /// Older recordings have no descriptor census; absence remains unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipe_liveness: Option<PipeLivenessEvidence>,
     #[serde(deserialize_with = "Option::deserialize")]
     pub supervisor_restart: Option<SystemdUserServiceBinding>,
     #[serde(deserialize_with = "Option::deserialize")]
@@ -358,6 +364,232 @@ impl ScoringObservations {
                 .work
                 .as_ref()
                 .is_none_or(|work| work.matches_record(process))
+            && self
+                .pipe_liveness
+                .as_ref()
+                .is_none_or(|pipes| pipes.matches_record(process))
+    }
+}
+
+/// One verified descriptor relationship, oriented from writer to reader.
+/// Holding a read endpoint does not establish that this pipe was read recently.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PipeLivenessHop {
+    pub writer: pt_common::ProcessIdentity,
+    pub writer_fd: u32,
+    pub reader: pt_common::ProcessIdentity,
+    pub reader_fd: u32,
+    pub inode: u64,
+}
+
+/// Captured pipe observations for one incarnation. Positive paths can justify
+/// retaining a producer even when the census is partial. Missing paths cannot
+/// establish abandonment, inactivity, or the absence of other consumers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipeLivenessEvidence {
+    pub identity: pt_common::ProcessIdentity,
+    pub identity_verified: bool,
+    pub readers: Vec<PipeLivenessHop>,
+    pub writers: Vec<PipeLivenessHop>,
+    /// A shortest observed stdout/stderr path to a distinct active consumer.
+    pub path: Vec<PipeLivenessHop>,
+    pub active_consumer: Option<ProcessActivity>,
+    pub census_complete: bool,
+    pub collection_complete: bool,
+    pub scope: String,
+    pub unavailable: Vec<String>,
+}
+
+const PIPE_LIVENESS_MAX_HOPS: usize = 32;
+const PIPE_LIVENESS_SCOPE: &str = "linux_procfs_leader_pipe_peers";
+
+fn pipe_identity_parts(identity: &pt_common::ProcessIdentity) -> Option<(&str, u64)> {
+    if identity.quality != pt_common::IdentityQuality::Full || identity.pid.0 == 0 {
+        return None;
+    }
+    let mut parts = identity.start_id.0.split(':');
+    let boot = parts
+        .next()
+        .filter(|boot| !boot.is_empty() && !matches!(*boot, "unknown" | "synthetic"))?;
+    let ticks = parts.next()?.parse::<u64>().ok()?;
+    let pid = parts.next()?.parse::<u32>().ok()?;
+    (parts.next().is_none() && pid == identity.pid.0).then_some((boot, ticks))
+}
+
+fn pipe_record_identity(process: &ProcessRecord) -> Option<pt_common::ProcessIdentity> {
+    let identity = pt_common::ProcessIdentity::full(
+        process.pid.0,
+        process.start_id.clone(),
+        process.uid,
+        process.pgid,
+        process.sid,
+        pt_common::IdentityQuality::Full,
+    );
+    pipe_identity_parts(&identity)?;
+    Some(identity)
+}
+
+/// Admit only positive, completed measurements. Native-ps averages and unknown
+/// or contradictory samples never become evidence of an active pipe consumer.
+fn pipe_consumer_activity_observed(activity: &ProcessActivity) -> bool {
+    if activity.source != "procfs_window" || activity.requested_window_ms == 0 {
+        return false;
+    }
+    let completed = |seconds: Option<f64>| {
+        seconds.is_some_and(|seconds| {
+            seconds.is_finite()
+                && seconds > 0.0
+                && seconds >= activity.requested_window_ms as f64 / 1000.0
+        })
+    };
+    let cpu = activity.cpu_error.is_none()
+        && completed(activity.cpu_window_seconds)
+        && activity.cpu_ticks.is_some_and(|ticks| ticks > 0)
+        && activity
+            .cpu_percent
+            .is_some_and(|percent| percent.is_finite() && percent > 0.0);
+    let io = activity.io_error.is_none()
+        && completed(activity.io_window_seconds)
+        && activity.io_active == Some(true)
+        && activity
+            .io_read_bytes
+            .zip(activity.io_write_bytes)
+            .is_some_and(|(read, write)| read > 0 || write > 0)
+        && activity
+            .read_bytes_per_second
+            .zip(activity.write_bytes_per_second)
+            .is_some_and(|(read, write)| {
+                read.is_finite()
+                    && read >= 0.0
+                    && write.is_finite()
+                    && write >= 0.0
+                    && (read > 0.0 || write > 0.0)
+            });
+    cpu || io
+}
+
+#[cfg(target_os = "linux")]
+fn pipe_population(
+    population: &[ProcessRecord],
+) -> BTreeMap<crate::collect::pipe_liveness::PipeProcessIdentity, &ProcessRecord> {
+    let mut unique = BTreeMap::new();
+    for process in population {
+        unique
+            .entry(process.pid.0)
+            .and_modify(|record| *record = None)
+            .or_insert(Some(process));
+    }
+    unique
+        .values()
+        .filter_map(|process| *process)
+        .filter(|process| {
+            !matches!(
+                process.state,
+                crate::collect::ProcessState::Zombie
+                    | crate::collect::ProcessState::Dead
+                    | crate::collect::ProcessState::Unknown
+            )
+        })
+        .filter_map(|process| {
+            let identity = pipe_record_identity(process)?;
+            let (_, start_ticks) = pipe_identity_parts(&identity)?;
+            Some((
+                crate::collect::pipe_liveness::PipeProcessIdentity {
+                    pid: process.pid.0,
+                    start_ticks,
+                    uid: process.uid,
+                },
+                process,
+            ))
+        })
+        .collect()
+}
+
+impl PipeLivenessEvidence {
+    pub fn matches_record(&self, process: &ProcessRecord) -> bool {
+        !matches!(
+            process.state,
+            crate::collect::ProcessState::Zombie
+                | crate::collect::ProcessState::Dead
+                | crate::collect::ProcessState::Unknown
+        ) && pipe_record_identity(process).as_ref() == Some(&self.identity)
+            && self.valid_observation()
+    }
+
+    fn valid_observation(&self) -> bool {
+        let Some((boot, _)) = pipe_identity_parts(&self.identity) else {
+            return false;
+        };
+        if self.scope != PIPE_LIVENESS_SCOPE {
+            return false;
+        }
+        let valid_hop = |hop: &PipeLivenessHop| {
+            hop.inode > 0
+                && hop.writer.pid != hop.reader.pid
+                && pipe_identity_parts(&hop.writer).is_some_and(|parts| parts.0 == boot)
+                && pipe_identity_parts(&hop.reader).is_some_and(|parts| parts.0 == boot)
+        };
+        if self
+            .readers
+            .iter()
+            .any(|hop| !valid_hop(hop) || hop.writer != self.identity)
+            || self
+                .writers
+                .iter()
+                .any(|hop| !valid_hop(hop) || hop.reader != self.identity)
+        {
+            return false;
+        }
+        if !self.identity_verified
+            && (!self.readers.is_empty() || !self.writers.is_empty() || !self.path.is_empty())
+        {
+            return false;
+        }
+        if self.path.is_empty() {
+            return self.active_consumer.is_none();
+        }
+        if self.path.len() > PIPE_LIVENESS_MAX_HOPS || !self.identity_verified {
+            return false;
+        }
+        let mut previous = &self.identity;
+        let mut seen = std::collections::BTreeSet::from([self.identity.pid.0]);
+        for hop in &self.path {
+            if !valid_hop(hop)
+                || hop.writer != *previous
+                || !matches!(hop.writer_fd, 1 | 2)
+                || !seen.insert(hop.reader.pid.0)
+            {
+                return false;
+            }
+            previous = &hop.reader;
+        }
+        self.readers.contains(&self.path[0])
+            && self.active_consumer.as_ref().is_some_and(|activity| {
+                activity.pid == previous.pid.0
+                    && activity.start_id == previous.start_id
+                    && activity.uid == previous.uid
+                    && pipe_consumer_activity_observed(activity)
+            })
+    }
+
+    pub fn preserves_active_consumer(&self) -> bool {
+        !self.path.is_empty() && self.valid_observation()
+    }
+
+    pub fn observation_summary(&self) -> Option<String> {
+        if !self.preserves_active_consumer() {
+            return None;
+        }
+        let consumer = self.path.last()?.reader.pid.0;
+        Some(format!(
+            "Observed stdout/stderr pipe path to process {consumer} with activity in the shared sample through {} verified pipe link(s); process activity does not prove traffic on this pipe",
+            self.path.len(),
+        ))
+    }
+
+    pub fn review_reason(&self) -> Option<String> {
+        self.observation_summary()
+            .map(|summary| format!("{summary}; preserve the producer for review"))
     }
 }
 
@@ -375,6 +607,7 @@ pub struct Scorer {
     agent_session_window_seconds: u64,
     respawn_history: BTreeMap<u32, (pt_common::StartId, u32, RespawnLoopSummary)>,
     work: Option<DuplicateWorkSnapshot>,
+    pipe_liveness: BTreeMap<u32, PipeLivenessEvidence>,
     supervisor_restarts: BTreeMap<u32, SupervisorRestartObservation>,
     #[cfg(target_os = "linux")]
     provenance: Option<ProvenanceInferenceBundle>,
@@ -853,6 +1086,7 @@ impl Scorer {
                 crate::config::policy::DEFAULT_AGENT_SESSION_WINDOW_SECONDS,
             respawn_history: BTreeMap::new(),
             work: None,
+            pipe_liveness: BTreeMap::new(),
             supervisor_restarts: BTreeMap::new(),
             #[cfg(target_os = "linux")]
             provenance: None,
@@ -1110,6 +1344,7 @@ impl Scorer {
     pub fn collect_activity(&mut self, processes: &[&ProcessRecord], window: Duration) {
         self.activity.clear();
         self.agent_activity.clear();
+        self.pipe_liveness.clear();
         self.activity_window = (!window.is_zero()).then_some(window);
         if window.is_zero() || processes.is_empty() {
             return;
@@ -1138,6 +1373,178 @@ impl Scorer {
                 })
                 .collect();
         }
+    }
+
+    /// Observe pipe peers after the shared activity window has ended, so procfs
+    /// traversal cannot inflate its CPU/I/O denominators. Never age-filter the
+    /// population: a young or protected consumer still depends on its producer.
+    pub fn collect_pipe_liveness(
+        &mut self,
+        population: &[ProcessRecord],
+        census_complete: bool,
+    ) {
+        self.pipe_liveness.clear();
+        #[cfg(target_os = "linux")]
+        {
+            let eligible = pipe_population(population);
+            let identities: Vec<_> = eligible.keys().copied().collect();
+            let snapshot = crate::collect::pipe_liveness::collect_pipe_liveness(
+                &identities,
+                &crate::collect::pipe_liveness::PipeCollectionLimits::default(),
+            );
+            self.prepare_pipe_liveness(&eligible, census_complete, &snapshot);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (population, census_complete);
+    }
+
+    /// Build serializable evidence only from this collection and the shared,
+    /// identity-bound sample. This pure adapter is also used by fixture tests.
+    #[cfg(target_os = "linux")]
+    fn prepare_pipe_liveness(
+        &mut self,
+        eligible: &BTreeMap<
+            crate::collect::pipe_liveness::PipeProcessIdentity,
+            &ProcessRecord,
+        >,
+        census_complete: bool,
+        snapshot: &crate::collect::pipe_liveness::PipeLivenessSnapshot,
+    ) {
+        use crate::collect::pipe_liveness::PipeProcessIdentity;
+        self.pipe_liveness.clear();
+        let verified_identity = |key: &PipeProcessIdentity| {
+            let process = eligible.get(key)?;
+            let identity = pipe_record_identity(process)?;
+            let (boot, _) = pipe_identity_parts(&identity)?;
+            let observed = snapshot.processes.get(&key.pid)?;
+            (snapshot.boot_id.as_deref() == Some(boot)
+                && observed.identity == *key
+                && observed.identity_verified)
+                .then_some(identity)
+        };
+        let activity_samples = &self.activity;
+        let sampling_window = self.activity_window;
+        let valid_sample = |key: &PipeProcessIdentity| {
+            verified_identity(key)?;
+            let process = eligible.get(key)?;
+            let activity = activity_samples.get(&key.pid)?;
+            let window_ms = sampling_window?.as_millis();
+            (window_ms > 0
+                && u128::from(activity.requested_window_ms) == window_ms
+                && activity.matches_record(process)
+                && pipe_consumer_activity_observed(activity))
+                .then_some(activity)
+        };
+        let active = eligible
+            .keys()
+            .copied()
+            .filter(|key| valid_sample(key).is_some())
+            .collect();
+        let paths = snapshot.active_downstream_paths(&active, PIPE_LIVENESS_MAX_HOPS);
+        let output_hop =
+            |writer: &PipeProcessIdentity, peer: &crate::collect::pipe_liveness::PipePeer| {
+                Some(PipeLivenessHop {
+                    writer: verified_identity(writer)?,
+                    writer_fd: peer.local_fd,
+                    reader: verified_identity(&peer.identity)?,
+                    reader_fd: peer.peer_fd,
+                    inode: peer.inode,
+                })
+            };
+        for (key, process) in eligible {
+            let Some(identity) = pipe_record_identity(process) else {
+                continue;
+            };
+            let observed = snapshot
+                .processes
+                .get(&key.pid)
+                .filter(|observed| observed.identity == *key);
+            let identity_verified = verified_identity(key).is_some();
+            let mut unavailable: Vec<_> = snapshot.unavailable.iter().take(8).cloned().collect();
+            if let Some(observed) = observed {
+                unavailable.extend(observed.unavailable.iter().take(8).cloned());
+            }
+            if !identity_verified {
+                unavailable.push(
+                    "The current boot and process incarnation were not verified; pipe peers remain unknown"
+                        .to_string(),
+                );
+            }
+            if !census_complete {
+                unavailable.push(
+                    "The process census is incomplete; unobserved consumers remain unknown"
+                        .to_string(),
+                );
+            }
+            if sampling_window.is_none() {
+                unavailable.push(
+                    "No shared activity window was requested; downstream activity remains unknown"
+                        .to_string(),
+                );
+            }
+            let readers: Vec<_> = observed
+                .into_iter()
+                .flat_map(|observed| &observed.readers)
+                .filter_map(|peer| output_hop(key, peer))
+                .collect();
+            let writers: Vec<_> = observed
+                .into_iter()
+                .flat_map(|observed| &observed.writers)
+                .filter_map(|peer| {
+                    Some(PipeLivenessHop {
+                        writer: verified_identity(&peer.identity)?,
+                        writer_fd: peer.peer_fd,
+                        reader: verified_identity(key)?,
+                        reader_fd: peer.local_fd,
+                        inode: peer.inode,
+                    })
+                })
+                .collect();
+            let mut writer = *key;
+            let path = paths.get(key).and_then(|peers| {
+                peers
+                    .iter()
+                    .map(|peer| {
+                        let hop = output_hop(&writer, peer)?;
+                        writer = peer.identity;
+                        Some(hop)
+                    })
+                    .collect::<Option<Vec<_>>>()
+            });
+            let active_consumer = path
+                .as_ref()
+                .filter(|path| !path.is_empty())
+                .and_then(|_| valid_sample(&writer))
+                .cloned();
+            let evidence = PipeLivenessEvidence {
+                identity,
+                identity_verified,
+                readers,
+                writers,
+                path: if active_consumer.is_some() {
+                    path.unwrap_or_default()
+                } else {
+                    Vec::new()
+                },
+                active_consumer,
+                census_complete,
+                collection_complete: snapshot.complete
+                    && observed.is_some_and(|observed| observed.complete)
+                    && identity_verified,
+                scope: PIPE_LIVENESS_SCOPE.to_string(),
+                unavailable,
+            };
+            if evidence.matches_record(process) {
+                self.pipe_liveness.insert(key.pid, evidence);
+            }
+        }
+    }
+
+    /// A stale cached observation cannot protect a replacement process.
+    pub fn pipe_liveness_for(&self, process: &ProcessRecord) -> Option<&PipeLivenessEvidence> {
+        self.pipe_liveness
+            .get(&process.pid.0)
+            .filter(|evidence| evidence.matches_record(process))
     }
 
     /// Return activity only for this incarnation. An enabled window with a
@@ -1492,6 +1899,7 @@ impl Scorer {
             agent_activity: self.agent_activity_for(process).cloned(),
             respawn_history: self.respawn_history_for(process).cloned(),
             work: self.workload_diagnosis_for(process),
+            pipe_liveness: self.pipe_liveness_for(process).cloned(),
             supervisor_restart: self.supervisor_restart_for(process).cloned(),
             supervisor_restart_unavailable: self
                 .supervisor_restart_unavailable_for(process)
@@ -1555,6 +1963,7 @@ impl Scorer {
         }
         let respawn_history = observations.respawn_history;
         let work = observations.work;
+        let pipe_liveness = observations.pipe_liveness;
         if let Some(activity) = &activity {
             let (state, _) = proc.decision_state(Some(activity));
             if state != proc.state {
@@ -1855,6 +2264,14 @@ impl Scorer {
             }
         }
 
+        if let Some(reason) = pipe_liveness
+            .as_ref()
+            .and_then(|pipes| pipes.observation_summary())
+        {
+            ledger.top_evidence.push(reason.clone());
+            ledger.why_summary.push_str(&format!(" {reason}"));
+        }
+
         if let Some(liveness) = assess_agent_liveness(
             proc,
             agent_activity.as_ref(),
@@ -1881,6 +2298,7 @@ impl Scorer {
             learned_prior,
             respawn_history,
             work,
+            pipe_liveness,
             supervisor_restart: observations.supervisor_restart,
             supervisor_restart_unavailable: observations.supervisor_restart_unavailable,
             fast_path_used: false,
@@ -4701,6 +5119,297 @@ int main(int argc, char **argv) {
         activity.cpu_error = None;
         activity.io_error = None;
         activity
+    }
+
+    fn pipe_evidence_fixture(
+        producer: &ProcessRecord,
+        consumer: &ProcessRecord,
+    ) -> PipeLivenessEvidence {
+        let hop = PipeLivenessHop {
+            writer: pipe_record_identity(producer).unwrap(),
+            writer_fd: 1,
+            reader: pipe_record_identity(consumer).unwrap(),
+            reader_fd: 0,
+            inode: 9001,
+        };
+        let mut activity = sampled_idle(consumer);
+        activity.cpu_ticks = Some(2);
+        activity.cpu_percent = Some(4.0);
+        PipeLivenessEvidence {
+            identity: hop.writer.clone(),
+            identity_verified: true,
+            readers: vec![hop.clone()],
+            writers: Vec::new(),
+            path: vec![hop],
+            active_consumer: Some(activity),
+            census_complete: true,
+            collection_complete: true,
+            scope: PIPE_LIVENESS_SCOPE.to_string(),
+            unavailable: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn pipe_liveness_is_preservation_advice_and_round_trips_without_changing_posterior() {
+        let producer = record(6101, "producer", "producer", FOUR_DAYS);
+        let consumer = record(6102, "consumer", "consumer", Duration::from_secs(10));
+        let reference = scorer(SignatureDatabase::new());
+        let evidence = reference.snapshot_evidence(&producer);
+        let expected = reference
+            .score_with_desktop(&producer, evidence.clone(), None)
+            .unwrap();
+        let mut measured = reference.clone();
+        let mut pipes = pipe_evidence_fixture(&producer, &consumer);
+        // A positive path survives a partial census. Partiality never licenses
+        // a negative claim about unobserved readers or inactive consumers.
+        pipes.census_complete = false;
+        pipes.collection_complete = false;
+        measured.pipe_liveness.insert(producer.pid.0, pipes);
+        let observed = measured.recorded_observations(&producer, None);
+        let serialized = serde_json::to_value(&observed).unwrap();
+        let captured: ScoringObservations = serde_json::from_value(serialized.clone()).unwrap();
+        let actual = reference
+            .score_recorded(&producer, evidence.clone(), captured)
+            .unwrap();
+        assert_eq!(actual.posterior.posterior, expected.posterior.posterior);
+        assert_eq!(
+            serde_json::to_value(&actual.posterior.evidence_terms).unwrap(),
+            serde_json::to_value(&expected.posterior.evidence_terms).unwrap()
+        );
+        assert!(actual.pipe_liveness.unwrap().preserves_active_consumer());
+        assert!(actual.ledger.top_evidence.iter().any(|line| {
+            line.contains("6102") && line.contains("does not prove traffic")
+        }));
+        assert!(reference.pipe_liveness_for(&producer).is_none());
+
+        let mut older = serialized;
+        older.as_object_mut().unwrap().remove("pipe_liveness");
+        let older: ScoringObservations = serde_json::from_value(older).unwrap();
+        assert!(older.pipe_liveness.is_none());
+        let replayed = reference.score_recorded(&producer, evidence, older).unwrap();
+        assert_eq!(replayed.posterior.posterior, expected.posterior.posterior);
+    }
+
+    #[test]
+    fn pipe_liveness_cache_rejects_replaced_identity_and_clears_on_new_window() {
+        let producer = record(6101, "producer", "producer", FOUR_DAYS);
+        let consumer = record(6102, "consumer", "consumer", FOUR_DAYS);
+        let mut measured = scorer(SignatureDatabase::new());
+        measured.pipe_liveness.insert(
+            producer.pid.0,
+            pipe_evidence_fixture(&producer, &consumer),
+        );
+        assert!(measured.pipe_liveness_for(&producer).is_some());
+        for field in ["start", "uid", "pgid", "sid"] {
+            let mut changed = producer.clone();
+            match field {
+                "start" => changed.start_id = StartId::from_linux("test-boot-id", 999, 6101),
+                "uid" => changed.uid += 1,
+                "pgid" => changed.pgid = Some(99),
+                "sid" => changed.sid = Some(99),
+                _ => unreachable!(),
+            }
+            assert!(measured.pipe_liveness_for(&changed).is_none(), "{field}");
+        }
+        measured.collect_activity(&[], Duration::ZERO);
+        assert!(measured.pipe_liveness_for(&producer).is_none());
+        measured.pipe_liveness.insert(
+            producer.pid.0,
+            pipe_evidence_fixture(&producer, &consumer),
+        );
+        measured.collect_activity(&[], Duration::from_millis(500));
+        assert!(measured.pipe_liveness_for(&producer).is_none());
+    }
+
+    #[test]
+    fn pipe_liveness_rejects_malformed_paths_and_unverified_activity_in_replay() {
+        let producer = record(6101, "producer", "producer", FOUR_DAYS);
+        let consumer = record(6102, "consumer", "consumer", FOUR_DAYS);
+        let reference = scorer(SignatureDatabase::new());
+        for mutation in 0..11 {
+            let mut pipes = pipe_evidence_fixture(&producer, &consumer);
+            match mutation {
+                0 => pipes.identity_verified = false,
+                1 => pipes.path[0].writer_fd = 0,
+                2 => pipes.path[0].inode = 0,
+                3 => pipes.path[0].reader = pipes.identity.clone(),
+                4 => {
+                    pipes.path[0].reader.start_id =
+                        StartId::from_linux("other-boot", 1_234_567_890, 6102);
+                }
+                5 => pipes.active_consumer.as_mut().unwrap().uid += 1,
+                6 => {
+                    pipes.active_consumer.as_mut().unwrap().source =
+                        "ps_lifetime_fallback".to_string();
+                }
+                7 => pipes.active_consumer.as_mut().unwrap().requested_window_ms = 0,
+                8 => pipes.active_consumer.as_mut().unwrap().cpu_ticks = Some(0),
+                9 => pipes.active_consumer.as_mut().unwrap().cpu_window_seconds = Some(0.1),
+                10 => {
+                    pipes.active_consumer.as_mut().unwrap().cpu_error =
+                        Some("counter identity changed".to_string());
+                }
+                _ => unreachable!(),
+            }
+            assert!(!pipes.preserves_active_consumer(), "mutation {mutation}");
+            let mut observed = reference.recorded_observations(&producer, None);
+            observed.pipe_liveness = Some(pipes);
+            assert!(reference
+                .score_recorded(&producer, reference.snapshot_evidence(&producer), observed)
+                .is_none(), "mutation {mutation}");
+        }
+    }
+
+    #[test]
+    fn pipe_liveness_requires_positive_completed_cpu_or_storage_measurements() {
+        let consumer = record(6102, "consumer", "consumer", FOUR_DAYS);
+        let mut sample = sampled_idle(&consumer);
+        assert!(!pipe_consumer_activity_observed(&sample));
+        sample.io_active = Some(true);
+        assert!(!pipe_consumer_activity_observed(&sample));
+        sample.io_read_bytes = Some(1024);
+        sample.read_bytes_per_second = Some(2048.0);
+        assert!(pipe_consumer_activity_observed(&sample));
+        for value in [None, Some(0.0), Some(0.1), Some(f64::NAN), Some(f64::INFINITY)] {
+            let mut invalid = sample.clone();
+            invalid.io_window_seconds = value;
+            assert!(!pipe_consumer_activity_observed(&invalid));
+        }
+        sample.io_error = Some("unavailable".to_string());
+        assert!(!pipe_consumer_activity_observed(&sample));
+        sample.cpu_ticks = Some(1);
+        sample.cpu_percent = Some(2.0);
+        assert!(pipe_consumer_activity_observed(&sample));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pipe_population_excludes_ambiguous_dead_and_weak_identities() {
+        let live = record(6101, "producer", "producer", FOUR_DAYS);
+        let mut dead = record(6102, "dead", "dead", FOUR_DAYS);
+        dead.state = ProcessState::Zombie;
+        let mut weak = record(6103, "weak", "weak", FOUR_DAYS);
+        weak.start_id = StartId::from_linux("unknown", 123, 6103);
+        let mut unknown = record(6104, "unknown", "unknown", FOUR_DAYS);
+        unknown.state = ProcessState::Unknown;
+        let population = [live.clone(), dead, weak, unknown];
+        let eligible = pipe_population(&population);
+        assert_eq!(eligible.len(), 1);
+        assert_eq!(eligible.keys().next().unwrap().pid, live.pid.0);
+        assert!(pipe_population(&[live.clone(), live]).is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pipe_snapshot_adapter_reaches_young_consumers_and_keeps_unknown_activity_unknown() {
+        use crate::collect::pipe_liveness::{
+            PipeAccess, PipeEndpoint, PipeLivenessSnapshot, PipePeer, ProcessPipeLiveness,
+        };
+        let population = [
+            record(6101, "producer", "producer", FOUR_DAYS),
+            record(6102, "filter", "filter", FOUR_DAYS),
+            record(6103, "consumer", "consumer", Duration::from_secs(10)),
+        ];
+        let eligible = pipe_population(&population);
+        let keys: Vec<_> = eligible.keys().copied().collect();
+        let mut snapshot = PipeLivenessSnapshot {
+            boot_id: Some("test-boot-id".to_string()),
+            processes: keys
+                .iter()
+                .map(|&identity| {
+                    (
+                        identity.pid,
+                        ProcessPipeLiveness {
+                            identity,
+                            identity_verified: true,
+                            endpoints: Vec::new(),
+                            readers: Vec::new(),
+                            writers: Vec::new(),
+                            complete: true,
+                            unavailable: Vec::new(),
+                        },
+                    )
+                })
+                .collect(),
+            complete: true,
+            unavailable: Vec::new(),
+            descriptors_inspected: 8,
+            elapsed: Duration::from_millis(1),
+        };
+        for (index, pair) in keys.windows(2).enumerate() {
+            let inode = 9001 + index as u64;
+            let writer = snapshot.processes.get_mut(&pair[0].pid).unwrap();
+            writer.endpoints.push(PipeEndpoint {
+                fd: 1,
+                inode,
+                access: PipeAccess::Write,
+            });
+            writer.readers.push(PipePeer {
+                identity: pair[1],
+                local_fd: 1,
+                peer_fd: 0,
+                inode,
+            });
+            let reader = snapshot.processes.get_mut(&pair[1].pid).unwrap();
+            reader.endpoints.push(PipeEndpoint {
+                fd: 0,
+                inode,
+                access: PipeAccess::Read,
+            });
+            reader.writers.push(PipePeer {
+                identity: pair[0],
+                local_fd: 0,
+                peer_fd: 1,
+                inode,
+            });
+        }
+        let mut activity = sampled_idle(&population[2]);
+        activity.cpu_ticks = Some(2);
+        activity.cpu_percent = Some(4.0);
+        let mut measured = scorer(SignatureDatabase::new());
+        measured.activity_window = Some(Duration::from_millis(500));
+        measured.activity.insert(6103, activity.clone());
+        measured.prepare_pipe_liveness(&eligible, false, &snapshot);
+        let producer = measured.pipe_liveness_for(&population[0]).unwrap();
+        assert!(producer.preserves_active_consumer());
+        assert_eq!(producer.path.len(), 2);
+        assert_eq!(producer.active_consumer.as_ref().unwrap().pid, 6103);
+        assert!(!producer.census_complete);
+        assert!(measured
+            .pipe_liveness_for(&population[1])
+            .unwrap()
+            .preserves_active_consumer());
+        assert!(!measured
+            .pipe_liveness_for(&population[2])
+            .unwrap()
+            .preserves_active_consumer());
+
+        for mutation in 0..5 {
+            let mut changed = activity.clone();
+            let mut observation = snapshot.clone();
+            match mutation {
+                0 => changed.source = "ps_lifetime_fallback".to_string(),
+                1 => changed.start_id = StartId::from_linux("test-boot-id", 999, 6103),
+                2 => changed.requested_window_ms = 1000,
+                3 => observation.boot_id = Some("different-boot".to_string()),
+                4 => {
+                    observation.processes.get_mut(&6103).unwrap().identity_verified = false;
+                }
+                _ => unreachable!(),
+            }
+            measured.activity.insert(6103, changed);
+            measured.prepare_pipe_liveness(&eligible, true, &observation);
+            assert!(!measured
+                .pipe_liveness_for(&population[0])
+                .unwrap()
+                .preserves_active_consumer(), "mutation {mutation}");
+        }
+        measured.activity.clear();
+        measured.prepare_pipe_liveness(&eligible, true, &snapshot);
+        let unknown = measured.pipe_liveness_for(&population[0]).unwrap();
+        assert_eq!(unknown.readers.len(), 1);
+        assert!(unknown.path.is_empty());
+        assert!(unknown.active_consumer.is_none());
     }
 
     fn configured_signature_scorer(priors: SignaturePriors) -> Scorer {
