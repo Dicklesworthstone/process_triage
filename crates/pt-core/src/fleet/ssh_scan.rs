@@ -15,7 +15,8 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::collect::pressure::{
-    FileHandles, LoadAvg, MemInfo, PressureSnapshot, PsiLine, PsiResource, Unavailable, VmStat,
+    FileHandles, LoadAvg, MemInfo, PressureSnapshot, PressureWindow, PsiLine, PsiResource,
+    StallFractions, Unavailable, VmStat,
 };
 use crate::decision::pressure_regime::{assess, PressureThresholds, ProcessCensus, Severity};
 use crate::session::fleet::{HostHealth, HostHealthStatus, PressureCoverage};
@@ -471,7 +472,184 @@ fn remote_psi(
     (some.is_some() || full.is_some()).then_some(PsiResource { some, full })
 }
 
-/// Recompute snapshot health from remote measurements, never from the remote
+/// Accept a measured rate only with its matching remote cumulative endpoint.
+/// The start counter is not transmitted, but a nonnegative delta cannot exceed
+/// the ending counter. Allow only floating-point roundoff in that comparison.
+fn remote_window_counter_rate(
+    value: Option<&serde_json::Value>,
+    source: &str,
+    elapsed: f64,
+    end_counter: Option<u64>,
+    unavailable: &mut Vec<Unavailable>,
+) -> Option<f64> {
+    let value = remote_sensor::<f64>(value, source, end_counter.is_some(), unavailable)?;
+    let delta = value * elapsed;
+    let reason = if !value.is_finite() || value < 0.0 {
+        Some("window measurement must be finite and nonnegative")
+    } else if let Some(counter) = end_counter {
+        let maximum = counter as f64;
+        let tolerance = maximum.max(1.0) * f64::EPSILON * 8.0;
+        if !delta.is_finite() || delta > maximum + tolerance {
+            Some("window delta exceeds its ending cumulative counter")
+        } else {
+            None
+        }
+    } else {
+        Some("ending cumulative counter unavailable for window measurement")
+    };
+    if let Some(reason) = reason {
+        unavailable.push(Unavailable {
+            source: source.to_string(),
+            reason: reason.to_string(),
+        });
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn remote_window_stalls(
+    value: Option<&serde_json::Value>,
+    name: &str,
+    endpoint: Option<PsiResource>,
+    seconds: f64,
+    unavailable: &mut Vec<Unavailable>,
+) -> Option<StallFractions> {
+    let source = format!("system_state.pressure_window.{name}");
+    let raw = remote_sensor::<serde_json::Map<String, serde_json::Value>>(
+        value,
+        &source,
+        endpoint.is_some(),
+        unavailable,
+    )?;
+    let mut fraction = |name: &str, line: Option<PsiLine>| {
+        let source = format!("{source}.{name}");
+        let fraction = remote_window_counter_rate(
+            raw.get(name),
+            &source,
+            seconds * 1e6,
+            line.map(|line| line.total_us),
+            unavailable,
+        )?;
+        if fraction <= 1.0 {
+            Some(fraction)
+        } else {
+            unavailable.push(Unavailable {
+                source,
+                reason: "PSI window fraction must be between zero and one".to_string(),
+            });
+            None
+        }
+    };
+    let some = fraction("some", endpoint.and_then(|resource| resource.some));
+    let mut full = fraction("full", endpoint.and_then(|resource| resource.full));
+    if some.zip(full).is_some_and(|(some, full)| full > some) {
+        full = None;
+        unavailable.push(Unavailable {
+            source: format!("{source}.full"),
+            reason: "full-stall fraction exceeds the some-stall fraction".to_string(),
+        });
+    }
+    (some.is_some() || full.is_some()).then_some(StallFractions { some, full })
+}
+
+/// Parse optional host-measured intervals without trusting the remote diagnosis.
+/// One bad channel leaves independently valid channels available. No interval
+/// is inferred from controller time, SSH duration, or cumulative counters alone.
+fn remote_pressure_window(
+    value: Option<&serde_json::Value>,
+    snapshot: &PressureSnapshot,
+    unavailable: &mut Vec<Unavailable>,
+) -> Option<PressureWindow> {
+    let raw = remote_sensor::<serde_json::Map<String, serde_json::Value>>(
+        value,
+        "system_state.pressure_window",
+        false,
+        unavailable,
+    )?;
+    if snapshot.unavailable.iter().any(|issue| {
+        issue.source == "pressure_window"
+            || issue.source.starts_with("system_state.pressure_window")
+    }) {
+        unavailable.push(Unavailable {
+            source: "system_state.pressure_window".to_string(),
+            reason: "remote host reported the pressure window unavailable".to_string(),
+        });
+        return None;
+    }
+    let seconds = remote_sensor::<f64>(
+        raw.get("seconds"),
+        "system_state.pressure_window.seconds",
+        true,
+        unavailable,
+    )?;
+    if !seconds.is_finite() || seconds <= 0.0 {
+        unavailable.push(Unavailable {
+            source: "system_state.pressure_window.seconds".to_string(),
+            reason: "measured interval must be finite and positive".to_string(),
+        });
+        return None;
+    }
+    let cpu = remote_window_stalls(raw.get("cpu"), "cpu", snapshot.cpu, seconds, unavailable);
+    let memory = remote_window_stalls(
+        raw.get("memory"),
+        "memory",
+        snapshot.memory,
+        seconds,
+        unavailable,
+    );
+    let io = remote_window_stalls(raw.get("io"), "io", snapshot.io, seconds, unavailable);
+    let vm = snapshot.vmstat;
+    let mut rate = |name: &str, counter: Option<u64>| {
+        remote_window_counter_rate(
+            raw.get(name),
+            &format!("system_state.pressure_window.{name}"),
+            seconds,
+            counter,
+            unavailable,
+        )
+    };
+    let swap_in_per_s = rate("swap_in_per_s", vm.and_then(|vm| vm.pswpin));
+    let swap_out_per_s = rate("swap_out_per_s", vm.and_then(|vm| vm.pswpout));
+    let major_faults_per_s = rate("major_faults_per_s", vm.and_then(|vm| vm.pgmajfault));
+    let direct_reclaim_scans_per_s = rate(
+        "direct_reclaim_scans_per_s",
+        vm.and_then(|vm| vm.pgscan_direct),
+    );
+    let alloc_stalls_per_s = rate("alloc_stalls_per_s", vm.and_then(|vm| vm.allocstall));
+    let oom_total = vm.and_then(|vm| vm.oom_kill);
+    let oom_kills = remote_sensor::<u64>(
+        raw.get("oom_kills"),
+        "system_state.pressure_window.oom_kills",
+        oom_total.is_some(),
+        unavailable,
+    )
+    .filter(|delta| {
+        if oom_total.is_some_and(|total| *delta <= total) {
+            true
+        } else {
+            unavailable.push(Unavailable {
+                source: "system_state.pressure_window.oom_kills".to_string(),
+                reason: "OOM delta has no matching ending counter or exceeds it".to_string(),
+            });
+            false
+        }
+    });
+    Some(PressureWindow {
+        seconds,
+        cpu,
+        memory,
+        io,
+        swap_in_per_s,
+        swap_out_per_s,
+        major_faults_per_s,
+        direct_reclaim_scans_per_s,
+        alloc_stalls_per_s,
+        oom_kills,
+    })
+}
+
+/// Recompute host health from remote measurements, never from the remote
 /// `assessment` or a claimed severity. No local host readings fill remote gaps.
 pub(super) fn remote_health(
     system_state: Option<&serde_json::Value>,
@@ -632,7 +810,6 @@ pub(super) fn remote_health(
 
     // Optional fields may be absent, but an explicit remote evidence failure
     // cannot earn an all-clear even if that host also supplies fallback numbers.
-    let complete = unavailable.is_empty() && reported_unavailable.is_empty();
     unavailable.extend(reported_unavailable);
     let mut snapshot = PressureSnapshot {
         sampled_at_ms,
@@ -687,6 +864,13 @@ pub(super) fn remote_health(
             _ => {}
         }
     }
+    let pressure_window = remote_pressure_window(
+        system_state.get("pressure_window"),
+        &snapshot,
+        &mut unavailable,
+    );
+    let complete = unavailable.is_empty();
+    snapshot.unavailable = unavailable.clone();
     let observed = snapshot.cpu.and_then(|resource| resource.some).is_some()
         || snapshot.memory.and_then(|resource| resource.some).is_some()
         || snapshot.io.and_then(|resource| resource.some).is_some()
@@ -697,11 +881,15 @@ pub(super) fn remote_health(
                 || memory.macos_pressure.is_some()
         })
         || snapshot.file_handles.is_some()
+        || pressure_window.as_ref().is_some_and(|window| {
+            window.oom_kills.is_some()
+                || (window.swap_in_per_s.is_some() && window.swap_out_per_s.is_some())
+        })
         || census.is_some();
     let assessment = observed.then(|| {
         assess(
             &snapshot,
-            None,
+            pressure_window.as_ref(),
             census.as_ref(),
             &PressureThresholds::default(),
         )
@@ -723,6 +911,7 @@ pub(super) fn remote_health(
         status,
         coverage,
         pressure: Some(snapshot),
+        pressure_window,
         census,
         assessment,
         unavailable,
@@ -1776,6 +1965,161 @@ mod tests {
             duration_ms: 10,
             provenance: None,
         }
+    }
+
+    fn measured_pressure_plan(hostname: &str) -> serde_json::Value {
+        let mut document = pressure_plan(hostname, 0.0, 0.0);
+        let before: PressureSnapshot =
+            serde_json::from_value(document["system_state"]["pressure"].clone()).unwrap();
+        let mut after = before.clone();
+        after.sampled_at_ms += 500;
+        after.cpu.as_mut().unwrap().some.as_mut().unwrap().total_us += 200_000;
+        let vm = after.vmstat.as_mut().unwrap();
+        vm.pswpin = Some(vm.pswpin.unwrap() + 3000);
+        vm.pswpout = Some(vm.pswpout.unwrap() + 3000);
+        vm.oom_kill = Some(vm.oom_kill.unwrap() + 2);
+        let window = crate::collect::pressure::pressure_window_with_elapsed(
+            &before,
+            &after,
+            Duration::from_millis(500),
+        )
+        .unwrap();
+        document["system_state"]["pressure"] = serde_json::to_value(after).unwrap();
+        document["system_state"]["pressure_window"] = serde_json::to_value(window).unwrap();
+        document["system_state"]["assessment"] = serde_json::json!({"worst": "ok", "regimes": []});
+        document
+    }
+
+    #[test]
+    fn fleet_plan_health_retains_measured_psi_swap_and_oom_window() {
+        use crate::decision::pressure_regime::RegimeKind;
+        use crate::session::fleet::{create_fleet_session, FleetSession};
+
+        let document = measured_pressure_plan("window.local");
+        let input = scan_result_to_host_input(&scan_from_document("window", &document));
+        assert_eq!(input.health.status, HostHealthStatus::Crit);
+        assert_eq!(input.health.coverage, PressureCoverage::Complete);
+        let window = input.health.pressure_window.unwrap();
+        assert_eq!(window.seconds, 0.5);
+        assert_eq!(window.cpu.unwrap().some, Some(0.4));
+        assert_eq!(window.swap_in_per_s, Some(6000.0));
+        assert_eq!(window.swap_out_per_s, Some(6000.0));
+        assert_eq!(window.oom_kills, Some(2));
+        let assessment = input.health.assessment.as_ref().unwrap();
+        assert_eq!(assessment.cpu_some, Some(40.0));
+        for kind in [
+            RegimeKind::CpuContention,
+            RegimeKind::SwapThrash,
+            RegimeKind::OomKills,
+        ] {
+            assert!(assessment
+                .regimes
+                .iter()
+                .any(|regime| regime.kind == kind && regime.severity == Severity::Crit));
+        }
+        assert_eq!(input.candidates[0].recommended_action, "restart");
+        assert_eq!(input.candidates[1].recommended_action, "keep");
+        assert_eq!(input.system_state.as_ref(), Some(&document["system_state"]));
+        let fleet = create_fleet_session("window", None, &[input], 0.05);
+        assert_eq!(fleet.aggregate.health.as_ref().unwrap().critical_hosts, 1);
+        let restored: FleetSession =
+            serde_json::from_str(&serde_json::to_string(&fleet).unwrap()).unwrap();
+        assert_eq!(restored.hosts[0].health, fleet.hosts[0].health);
+
+        let mut snapshot_only = document;
+        snapshot_only["system_state"]["pressure_window"] = serde_json::Value::Null;
+        let input = scan_result_to_host_input(&scan_from_document("window", &snapshot_only));
+        assert!(input.health.pressure_window.is_none());
+        assert_eq!(input.health.status, HostHealthStatus::Ok);
+        assert!(input.health.assessment.unwrap().regimes.is_empty());
+    }
+
+    #[test]
+    fn fleet_invalid_pressure_interval_cannot_invent_recent_incidents() {
+        for bad in [
+            serde_json::json!(0.0),
+            serde_json::json!(-0.5),
+            serde_json::json!("unknown"),
+            serde_json::Value::Null,
+        ] {
+            let mut document = measured_pressure_plan("bad-window.local");
+            document["system_state"]["pressure_window"]["seconds"] = bad;
+            let input = scan_result_to_host_input(&scan_from_document("host", &document));
+            assert!(input.health.pressure_window.is_none());
+            assert_eq!(input.health.status, HostHealthStatus::Unknown);
+            assert_eq!(input.health.coverage, PressureCoverage::Partial);
+            assert!(input.health.assessment.as_ref().unwrap().regimes.is_empty());
+            assert!(input
+                .health
+                .unavailable
+                .iter()
+                .any(|issue| issue.source == "system_state.pressure_window.seconds"));
+            assert_eq!(input.candidates.len(), 2);
+            assert_eq!(input.system_state.as_ref(), Some(&document["system_state"]));
+        }
+    }
+
+    #[test]
+    fn fleet_bad_window_channels_preserve_independent_measurements() {
+        for (field, bad) in [
+            ("/cpu", serde_json::json!("unreadable")),
+            ("/cpu/some", serde_json::json!(1.5)),
+            ("/swap_in_per_s", serde_json::json!(-1.0)),
+            ("/swap_in_per_s", serde_json::json!(7000.0)),
+            ("/swap_out_per_s", serde_json::Value::Null),
+            ("/major_faults_per_s", serde_json::json!(1.0)),
+            ("/oom_kills", serde_json::json!(13)),
+        ] {
+            let mut document = measured_pressure_plan("partial-window.local");
+            *document["system_state"]["pressure_window"]
+                .pointer_mut(field)
+                .unwrap() = bad;
+            let input = scan_result_to_host_input(&scan_from_document("host", &document));
+            assert_eq!(input.health.status, HostHealthStatus::Crit, "{field}");
+            assert_eq!(input.health.coverage, PressureCoverage::Partial, "{field}");
+            let window = input.health.pressure_window.unwrap();
+            assert_eq!(window.seconds, 0.5);
+            let checked = serde_json::to_value(window).unwrap();
+            assert!(checked.pointer(field).is_none_or(serde_json::Value::is_null));
+            if field != "/oom_kills" {
+                assert_eq!(window.oom_kills, Some(2));
+            } else {
+                assert_eq!(window.cpu.unwrap().some, Some(0.4));
+                assert_eq!(window.swap_in_per_s, Some(6000.0));
+            }
+            let suffix = field.trim_start_matches('/').replace('/', ".");
+            assert!(input
+                .health
+                .unavailable
+                .iter()
+                .any(|issue| issue.source.ends_with(&suffix)));
+            assert_eq!(input.system_state.as_ref(), Some(&document["system_state"]));
+        }
+    }
+
+    #[test]
+    fn fleet_failed_window_sources_cannot_supply_fallback_measurements() {
+        let mut document = measured_pressure_plan("unreadable-vm.local");
+        document["system_state"]["pressure"]["unavailable"] = serde_json::json!([
+            {"source": "/proc/vmstat", "reason": "endpoint unreadable"}
+        ]);
+        let input = scan_result_to_host_input(&scan_from_document("host", &document));
+        let window = input.health.pressure_window.unwrap();
+        assert_eq!(window.cpu.unwrap().some, Some(0.4));
+        assert!(window.swap_in_per_s.is_none());
+        assert!(window.swap_out_per_s.is_none());
+        assert!(window.oom_kills.is_none());
+        assert_eq!(input.health.status, HostHealthStatus::Crit);
+        assert_eq!(input.health.coverage, PressureCoverage::Partial);
+
+        document["system_state"]["pressure"]["unavailable"] = serde_json::json!([
+            {"source": "pressure_window", "reason": "sampling deadline"}
+        ]);
+        let input = scan_result_to_host_input(&scan_from_document("host", &document));
+        assert!(input.health.pressure_window.is_none());
+        assert_eq!(input.health.status, HostHealthStatus::Unknown);
+        assert_eq!(input.health.coverage, PressureCoverage::Partial);
+        assert!(input.health.assessment.unwrap().regimes.is_empty());
     }
 
     #[test]

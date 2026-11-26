@@ -14,7 +14,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-use crate::collect::pressure::{PressureSnapshot, Unavailable};
+use crate::collect::pressure::{PressureSnapshot, PressureWindow, Unavailable};
 use crate::decision::pressure_regime::{PressureAssessment, ProcessCensus, Severity};
 use crate::decision::{select_fdr, FdrCandidate, FdrMethod, TargetIdentity};
 
@@ -84,8 +84,9 @@ pub enum HostHealthStatus {
     Crit,
 }
 
-/// Coverage of the point-in-time pressure checks. A single snapshot cannot measure
-/// swap throughput or new OOM kills; those require two observations on that host.
+/// Coverage of the reported pressure checks. An absent optional window covers
+/// snapshot checks only; swap throughput and recent OOM kills remain unknown.
+/// A supplied window with missing or invalid measurements reduces coverage.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PressureCoverage {
@@ -107,6 +108,10 @@ pub struct HostHealth {
     pub coverage: PressureCoverage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pressure: Option<PressureSnapshot>,
+    /// Validated rates measured on this host, ending at `pressure`.
+    /// Absent for snapshot-only reports; no local clock or counter is substituted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pressure_window: Option<PressureWindow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub census: Option<ProcessCensus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -121,6 +126,7 @@ impl Default for HostHealth {
             status: HostHealthStatus::Unknown,
             coverage: PressureCoverage::Unavailable,
             pressure: None,
+            pressure_window: None,
             census: None,
             assessment: None,
             unavailable: vec![Unavailable {

@@ -711,6 +711,57 @@ mod tests {
     }
 
     #[test]
+    fn health_snapshot_envelope_preserves_recent_swap_and_oom_incidents() {
+        use crate::collect::pressure::{pressure_window_with_elapsed, PressureSnapshot, VmStat};
+        use crate::decision::pressure_regime::RegimeKind;
+
+        let mut document = snapshot(0.0);
+        let mut before: PressureSnapshot =
+            serde_json::from_value(document["system_state"]["pressure"].clone()).unwrap();
+        before.vmstat = Some(VmStat {
+            pswpin: Some(0),
+            pswpout: Some(0),
+            oom_kill: Some(0),
+            ..VmStat::default()
+        });
+        let mut after = before.clone();
+        after.sampled_at_ms += 500;
+        after.vmstat = Some(VmStat {
+            pswpin: Some(3000),
+            pswpout: Some(3000),
+            oom_kill: Some(1),
+            ..VmStat::default()
+        });
+        document["system_state"]["pressure_window"] = serde_json::to_value(
+            pressure_window_with_elapsed(&before, &after, Duration::from_millis(500)).unwrap(),
+        )
+        .unwrap();
+        document["system_state"]["pressure"] = serde_json::to_value(after).unwrap();
+        document["minimal"] = json!(true);
+        document["activity_window_ms"] = json!(500);
+        let result = parse_output("ssh-alias", InspectionKind::Health, &output(&document, 0));
+        assert_eq!(result.status, InspectionStatus::Completed);
+        assert_eq!(result.observed_status, HostHealthStatus::Crit);
+        assert_eq!(result.coverage, PressureCoverage::Complete);
+        let health = result.health.unwrap();
+        let window = health.pressure_window.unwrap();
+        assert_eq!(window.seconds, 0.5);
+        assert_eq!(window.oom_kills, Some(1));
+        assert_eq!(window.swap_in_per_s, Some(6000.0));
+        let regimes = health.assessment.unwrap().regimes;
+        assert!(regimes.iter().any(|regime| regime.kind == RegimeKind::OomKills));
+        assert!(regimes.iter().any(|regime| regime.kind == RegimeKind::SwapThrash));
+        assert_eq!(result.system_state.as_ref(), Some(&document["system_state"]));
+
+        document["system_state"]["pressure_window"]["seconds"] = json!(0);
+        let invalid = parse_output("ssh-alias", InspectionKind::Health, &output(&document, 0));
+        assert_eq!(invalid.status, InspectionStatus::Completed);
+        assert_eq!(invalid.observed_status, HostHealthStatus::Unknown);
+        assert_eq!(invalid.coverage, PressureCoverage::Partial);
+        assert!(invalid.health.unwrap().pressure_window.is_none());
+    }
+
+    #[test]
     fn health_recomputes_pressure_and_preserves_remote_attribution() {
         let document = snapshot(45.0);
         let result = parse_output("ssh-alias", InspectionKind::Health, &output(&document, 0));
