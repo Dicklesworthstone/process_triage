@@ -35,6 +35,8 @@ struct Observation {
     status: HostApplyStatus,
     attempted: bool,
     successful_actions: usize,
+    #[serde(default)]
+    already_completed_actions: usize,
     kill_signals_delivered: usize,
 }
 
@@ -47,8 +49,14 @@ enum Event {
         created_at: String,
         hosts: Vec<IntentHost>,
     },
-    HostResult { attempt_id: String, result: Observation },
-    Finished { attempt_id: String, report: FinalReport },
+    HostResult {
+        attempt_id: String,
+        result: Observation,
+    },
+    Finished {
+        attempt_id: String,
+        report: FinalReport,
+    },
 }
 
 #[derive(Deserialize)]
@@ -64,6 +72,7 @@ pub struct HostStatus {
     pub status: HostApplyStatus,
     pub attempted: Option<bool>,
     pub successful_actions: Option<usize>,
+    pub already_completed_actions: Option<usize>,
     pub kill_signals_delivered: Option<usize>,
 }
 
@@ -80,21 +89,40 @@ fn record_matches(request: Option<&Request>, result: &Observation) -> bool {
     let actions = request.map_or(&[][..], |r| r.actions.as_slice());
     let targets = request.map_or(&[][..], |r| r.targets.as_slice());
     let approved_kills = actions.iter().filter(|a| a.action == Action::Kill).count();
-    let has_effect = result.successful_actions > 0 || result.kill_signals_delivered > 0;
+    let has_new_effect = result.successful_actions > 0 || result.kill_signals_delivered > 0;
+    let has_effect = has_new_effect || result.already_completed_actions > 0;
     result.binding.as_ref() == request.map(|r| &r.binding)
         && result.selected_targets.as_slice() == targets
         && result.successful_actions <= actions.len()
+        && result.already_completed_actions
+            <= actions.len().saturating_sub(result.successful_actions)
         && result.kill_signals_delivered <= approved_kills
+        && result.kill_signals_delivered
+            <= actions
+                .len()
+                .saturating_sub(result.already_completed_actions)
         && (!has_effect || result.attempted && !targets.is_empty())
         && match result.status {
             HostApplyStatus::Preview => false,
-            HostApplyStatus::Applied => has_effect && result.successful_actions == actions.len(),
+            HostApplyStatus::Applied => {
+                result.successful_actions > 0
+                    && result.already_completed_actions
+                        == actions.len().saturating_sub(result.successful_actions)
+            }
+            HostApplyStatus::AlreadyApplied => {
+                result.attempted
+                    && !actions.is_empty()
+                    && result.already_completed_actions == actions.len()
+                    && !has_new_effect
+            }
             HostApplyStatus::Partial => has_effect,
-            HostApplyStatus::Unknown => result.attempted && !has_effect,
+            // A malformed new receipt cannot erase independently validated
+            // history, but it cannot establish a new effect either.
+            HostApplyStatus::Unknown => result.attempted && !has_new_effect,
             HostApplyStatus::NotStarted => !result.attempted && !has_effect,
-            HostApplyStatus::NoActions => request.is_some()
-                && result.attempted != targets.is_empty()
-                && !has_effect,
+            HostApplyStatus::NoActions => {
+                request.is_some() && result.attempted != targets.is_empty() && !has_effect
+            }
             HostApplyStatus::Blocked => !has_effect,
         }
 }
@@ -151,11 +179,16 @@ fn read_attempt(path: &Path, attempt_id: &str, session: &str) -> AttemptStatus {
         }
         let mut reader = BufReader::new(file);
         while !reader.fill_buf().map_err(|e| e.to_string())?.is_empty() {
-            let mut line = ReceiptLine { reader: &mut reader, terminated: false };
+            let mut line = ReceiptLine {
+                reader: &mut reader,
+                terminated: false,
+            };
             let event = serde_json::from_reader::<_, Event>(BufReader::new(&mut line));
             if attempt.finished {
                 match event {
-                    Ok(Event::HostResult { result, .. }) if line.terminated && seen.contains_key(&result.host) => {
+                    Ok(Event::HostResult { result, .. })
+                        if line.terminated && seen.contains_key(&result.host) =>
+                    {
                         seen.remove(&result.host);
                     }
                     _ => seen.clear(),
@@ -167,20 +200,34 @@ fn read_attempt(path: &Path, attempt_id: &str, session: &str) -> AttemptStatus {
                 return Err("incomplete final receipt record".into());
             }
             match event {
-                Event::Intent { attempt_id: id, fleet_session_id, created_at, hosts }
-                    if id == attempt_id && fleet_session_id == session && attempt.created_at.is_none() => {
+                Event::Intent {
+                    attempt_id: id,
+                    fleet_session_id,
+                    created_at,
+                    hosts,
+                } if id == attempt_id
+                    && fleet_session_id == session
+                    && attempt.created_at.is_none() =>
+                {
                     let mut names = BTreeMap::new();
                     for h in hosts {
-                        if h.host.is_empty() || h.request.as_ref().is_some_and(|r| r.host != h.host)
-                            || names.insert(h.host, h.request).is_some() {
+                        if h.host.is_empty()
+                            || h.request.as_ref().is_some_and(|r| r.host != h.host)
+                            || names.insert(h.host, h.request).is_some()
+                        {
                             return Err("duplicate or mismatched host in execution intent".into());
                         }
                     }
                     expected = names;
                     attempt.created_at = Some(created_at);
                 }
-                Event::HostResult { attempt_id: id, result } if id == attempt_id && attempt.created_at.is_some() => {
-                    if !expected.get(&result.host).is_some_and(|r| record_matches(r.as_ref(), &result))
+                Event::HostResult {
+                    attempt_id: id,
+                    result,
+                } if id == attempt_id && attempt.created_at.is_some() => {
+                    if !expected
+                        .get(&result.host)
+                        .is_some_and(|r| record_matches(r.as_ref(), &result))
                         || seen.contains_key(&result.host)
                     {
                         seen.remove(&result.host);
@@ -188,26 +235,42 @@ fn read_attempt(path: &Path, attempt_id: &str, session: &str) -> AttemptStatus {
                     }
                     seen.insert(result.host.clone(), result);
                 }
-                Event::Finished { attempt_id: id, report } if id == attempt_id && attempt.created_at.is_some() => {
+                Event::Finished {
+                    attempt_id: id,
+                    report,
+                } if id == attempt_id && attempt.created_at.is_some() => {
                     let mut terminal = BTreeMap::new();
                     for result in report.hosts {
-                        if !expected.get(&result.host).is_some_and(|r| record_matches(r.as_ref(), &result))
-                            || seen.get(&result.host).is_some_and(|earlier| earlier != &result)
-                            || terminal.contains_key(&result.host) {
+                        if !expected
+                            .get(&result.host)
+                            .is_some_and(|r| record_matches(r.as_ref(), &result))
+                            || seen
+                                .get(&result.host)
+                                .is_some_and(|earlier| earlier != &result)
+                            || terminal.contains_key(&result.host)
+                        {
                             seen.remove(&result.host);
                             return Err("inconsistent final host report".into());
                         }
                         terminal.insert(result.host.clone(), result);
                     }
-                    if terminal.len() != expected.len() { return Err("final report omitted an intended host".into()); }
+                    if terminal.len() != expected.len() {
+                        return Err("final report omitted an intended host".into());
+                    }
                     seen = terminal;
                     attempt.finished = true;
                     attempt.receipt_error = report.persistence_error;
                 }
-                _ => return Err("mismatched execution attempt, fleet session, or record order".into()),
+                _ => {
+                    return Err(
+                        "mismatched execution attempt, fleet session, or record order".into(),
+                    )
+                }
             }
         }
-        if attempt.created_at.is_none() { return Err("missing execution intent".into()); }
+        if attempt.created_at.is_none() {
+            return Err("missing execution intent".into());
+        }
         Ok(())
     })();
     if let Err(error) = read {
@@ -221,6 +284,7 @@ fn read_attempt(path: &Path, attempt_id: &str, session: &str) -> AttemptStatus {
             status: result.map_or(HostApplyStatus::Unknown, |r| r.status),
             attempted: result.map(|r| r.attempted),
             successful_actions: result.map(|r| r.successful_actions),
+            already_completed_actions: result.map(|r| r.already_completed_actions),
             kill_signals_delivered: result.map(|r| r.kill_signals_delivered),
             host,
         });
@@ -233,7 +297,8 @@ pub fn apply_history(dir: &Path, session: &str) -> io::Result<Vec<AttemptStatus>
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name();
-        let Some(id) = name.to_str()
+        let Some(id) = name
+            .to_str()
             .and_then(|s| s.strip_prefix("fleet-apply-"))
             .and_then(|s| s.strip_suffix(".jsonl"))
         else {
@@ -242,7 +307,9 @@ pub fn apply_history(dir: &Path, session: &str) -> io::Result<Vec<AttemptStatus>
         attempts.push(read_attempt(&entry.path(), id, session));
     }
     attempts.sort_by(|a, b| {
-        a.created_at.cmp(&b.created_at).then_with(|| a.attempt_id.cmp(&b.attempt_id))
+        a.created_at
+            .cmp(&b.created_at)
+            .then_with(|| a.attempt_id.cmp(&b.attempt_id))
     });
     Ok(attempts)
 }
@@ -280,16 +347,107 @@ mod tests {
     fn replay(events: &[Value], suffix: &[u8]) -> AttemptStatus {
         let dir = tempfile::tempdir().unwrap();
         let mut f = fs::File::create(dir.path().join("fleet-apply-one.jsonl")).unwrap();
-        for e in events { writeln!(f, "{e}").unwrap(); }
+        for e in events {
+            writeln!(f, "{e}").unwrap();
+        }
         f.write_all(suffix).unwrap();
         apply_history(dir.path(), "session").unwrap().pop().unwrap()
+    }
+
+    #[test]
+    fn durable_resume_status_separates_previous_completion_from_new_execution() {
+        let mut start = intent();
+        start["hosts"][0]["request"]["actions"] = json!([
+            {"action": "renice"}, {"action": "renice"}
+        ]);
+        let mut resumed = observation("a", "applied", 1, 0);
+        resumed["already_completed_actions"] = json!(1);
+        let mut completed = observation("b", "already_applied", 0, 0);
+        completed["already_completed_actions"] = json!(1);
+        let end = json!({
+            "event": "finished", "attempt_id": "one",
+            "report": {"hosts": [resumed, completed], "persistence_error": null}
+        });
+        let status = replay(&[start, result(&resumed), end], &[]);
+        assert!(status.finished, "{status:?}");
+        assert!(status.receipt_error.is_none());
+        assert_eq!(status.hosts[0].status, HostApplyStatus::Applied);
+        assert_eq!(status.hosts[0].successful_actions, Some(1));
+        assert_eq!(status.hosts[0].already_completed_actions, Some(1));
+        assert_eq!(status.hosts[0].kill_signals_delivered, Some(0));
+        assert_eq!(status.hosts[1].status, HostApplyStatus::AlreadyApplied);
+        assert_eq!(status.hosts[1].successful_actions, Some(0));
+        assert_eq!(status.hosts[1].already_completed_actions, Some(1));
+        assert_eq!(status.hosts[1].kill_signals_delivered, Some(0));
+    }
+
+    #[test]
+    fn durable_history_survives_unknown_current_receipts_without_fabricating_new_effects() {
+        let mut start = intent();
+        start["hosts"][0]["request"]["actions"] = json!([
+            {"action": "pause"}, {"action": "kill"}
+        ]);
+        for state in ["partial", "unknown"] {
+            let mut host = observation("a", state, 0, 0);
+            host["already_completed_actions"] = json!(1);
+            let status = replay(&[start.clone(), result(&host)], &[]);
+            assert!(status.receipt_error.is_none(), "{status:?}");
+            assert_eq!(status.hosts[0].already_completed_actions, Some(1));
+            assert_eq!(status.hosts[0].successful_actions, Some(0));
+        }
+        // An earlier pause does not consume the approved kill count.
+        let mut mixed = observation("a", "applied", 1, 1);
+        mixed["already_completed_actions"] = json!(1);
+        let status = replay(&[start, result(&mixed)], &[]);
+        assert!(status.receipt_error.is_none(), "{status:?}");
+        assert_eq!(status.hosts[0].status, HostApplyStatus::Applied);
+        assert_eq!(status.hosts[0].already_completed_actions, Some(1));
+        assert_eq!(status.hosts[0].kill_signals_delivered, Some(1));
+    }
+
+    #[test]
+    fn impossible_resume_counts_do_not_confirm_durable_completion() {
+        for (status, successes, historical, signals, attempted) in [
+            ("applied", 1, 1, 0, true),
+            ("applied", 0, 1, 0, true),
+            ("already_applied", 1, 0, 0, true),
+            ("already_applied", 0, 0, 0, true),
+            ("already_applied", 0, 1, 1, true),
+            ("already_applied", 0, 1, 0, false),
+            ("no_actions", 0, 1, 0, true),
+            ("blocked", 0, 1, 0, true),
+            ("unknown", 0, usize::MAX, 0, true),
+            ("partial", usize::MAX, usize::MAX, usize::MAX, true),
+        ] {
+            let mut host = observation("a", status, successes, signals);
+            host["already_completed_actions"] = json!(historical);
+            host["attempted"] = json!(attempted);
+            let replayed = replay(&[intent(), result(&host)], &[]);
+            assert!(replayed.receipt_error.is_some(), "{host}: {replayed:?}");
+            assert_eq!(replayed.hosts[0].status, HostApplyStatus::Unknown);
+            assert_eq!(replayed.hosts[0].successful_actions, None);
+            assert_eq!(replayed.hosts[0].already_completed_actions, None);
+            assert_eq!(replayed.hosts[0].kill_signals_delivered, None);
+        }
+    }
+
+    #[test]
+    fn legacy_observations_default_only_present_history_counts_to_zero() {
+        let old = observation("a", "applied", 1, 1);
+        assert!(old.get("already_completed_actions").is_none());
+        let status = replay(&[intent(), result(&old)], &[]);
+        assert!(status.receipt_error.is_none());
+        assert_eq!(status.hosts[0].already_completed_actions, Some(0));
+        assert_eq!(status.hosts[0].successful_actions, Some(1));
+        assert_eq!(status.hosts[1].already_completed_actions, None);
+        assert_eq!(status.hosts[1].successful_actions, None);
     }
 
     #[test]
     fn interrupted_dispatch_keeps_acknowledged_host_and_leaves_other_counts_unknown() {
         let host = observation("a", "partial", 0, 1);
         for tail in [&[][..], &b"{\"event\": "[..]] {
-            let status = replay(&[intent(),result(&host)], tail);
+            let status = replay(&[intent(), result(&host)], tail);
             assert!(!status.finished);
             assert_eq!(status.receipt_error.is_some(), !tail.is_empty());
             assert_eq!(status.hosts[0].status, HostApplyStatus::Partial);
@@ -302,9 +460,12 @@ mod tests {
 
     #[test]
     fn final_report_can_recover_lost_host_rows_and_remote_no_actions() {
-        let hosts = [observation("a", "applied", 1, 1),observation("b", "no_actions", 0, 0)];
+        let hosts = [
+            observation("a", "applied", 1, 1),
+            observation("b", "no_actions", 0, 0),
+        ];
         let end = json!({"event": "finished", "attempt_id": "one", "report":{"hosts":hosts, "persistence_error": "write failed"}});
-        let status = replay(&[intent(), result(&hosts[0]),end], &[]);
+        let status = replay(&[intent(), result(&hosts[0]), end], &[]);
         assert!(status.finished);
         assert_eq!(status.receipt_error.as_deref(), Some("write failed"));
         assert_eq!(status.hosts[1].attempted, Some(true));
@@ -315,11 +476,17 @@ mod tests {
     fn streamed_records_stop_at_the_newline_including_across_buffer_boundaries() {
         let input = b"{\"long\":\"abcdefghijk\"}\n{}";
         let mut reader = BufReader::with_capacity(3, &input[..]);
-        let mut record = ReceiptLine { reader: &mut reader, terminated: false };
+        let mut record = ReceiptLine {
+            reader: &mut reader,
+            terminated: false,
+        };
         let parsed: Value = serde_json::from_reader(&mut record).unwrap();
         assert_eq!(parsed["long"], "abcdefghijk");
         assert!(record.terminated);
-        let mut last = ReceiptLine { reader: &mut reader, terminated: false };
+        let mut last = ReceiptLine {
+            reader: &mut reader,
+            terminated: false,
+        };
         let parsed: Value = serde_json::from_reader(&mut last).unwrap();
         assert_eq!(parsed, json!({}));
         assert!(!last.terminated);
@@ -362,7 +529,10 @@ mod tests {
         let good = observation("a", "applied", 1, 1);
         let mut wrong = good.clone();
         wrong["binding"]["plan_sha256"] = json!("other");
-        for events in [vec![intent(),result(&wrong)], vec![intent(),result(&good),result(&wrong)]] {
+        for events in [
+            vec![intent(), result(&wrong)],
+            vec![intent(), result(&good), result(&wrong)],
+        ] {
             let status = replay(&events, &[]);
             assert!(status.receipt_error.is_some());
             assert_eq!(status.hosts[0].status, HostApplyStatus::Unknown);

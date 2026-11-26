@@ -1019,8 +1019,7 @@ pub fn optimize_ilp_with_limit(
     let n = ordered.len();
     // Clamp before sizing the table: the unconstrained API passes usize::MAX.
     let max_actions = max_actions.min(n);
-    let mut suffix_capacity =
-        vec![vec![vec![0.0_f64; max_actions + 1]; n + 1]; goals.len()];
+    let mut suffix_capacity = vec![vec![vec![0.0_f64; max_actions + 1]; n + 1]; goals.len()];
     for (goal_index, capacity) in suffix_capacity.iter_mut().enumerate() {
         for i in (0..n).rev() {
             for slots in 1..=max_actions {
@@ -1028,8 +1027,7 @@ pub fn optimize_ilp_with_limit(
                 // maximizing subset need not also maximize the other resources.
                 // Upward rounding prevents numerical underestimation.
                 let with_candidate =
-                    (ordered[i].contributions[goal_index] + capacity[i + 1][slots - 1])
-                        .next_up();
+                    (ordered[i].contributions[goal_index] + capacity[i + 1][slots - 1]).next_up();
                 capacity[i][slots] = capacity[i + 1][slots].max(with_candidate);
             }
         }
@@ -3025,7 +3023,6 @@ mod tests {
         assert!(result.log_events.len() <= ILP_SEARCH_LOG_LIMIT + 1);
     }
 
-
     #[test]
     fn combined_goal_search_replaces_a_greedy_dead_end_with_a_feasible_cover() {
         for memory_scale in [1.0, 1024.0] {
@@ -3055,12 +3052,14 @@ mod tests {
                 assert_eq!(result.total_loss, 4.0);
                 assert_eq!(result.total_contributions, [10.0 * memory_scale, 10.0]);
                 assert!(result.goal_achievement.iter().all(|goal| goal.met));
-                assert!(result
-                    .log_events
-                    .iter()
-                    .find_map(|event| event.search.as_ref())
-                    .unwrap()
-                    .optimum_proven);
+                assert!(
+                    result
+                        .log_events
+                        .iter()
+                        .find_map(|event| event.search.as_ref())
+                        .unwrap()
+                        .optimum_proven
+                );
 
                 // Replanning must not fall back to the old multi-goal greedy
                 // path, which spends five loss units on all three candidates.
@@ -3137,7 +3136,10 @@ mod tests {
                         }
                     }
                     if !blocked
-                        && totals.iter().zip(&goals).all(|(total, goal)| *total >= goal.target)
+                        && totals
+                            .iter()
+                            .zip(&goals)
+                            .all(|(total, goal)| *total >= goal.target)
                     {
                         optimum = Some(optimum.map_or(loss, |previous| previous.min(loss)));
                     }
@@ -3247,14 +3249,20 @@ mod tests {
         let result = optimize_ilp_with_limit(&candidates, &goals, 2);
         assert!(result.feasible);
         assert_eq!(result.selected.len(), 2);
-        assert!(result.selected.iter().any(|action| action.id == "finite-complement"));
+        assert!(result
+            .selected
+            .iter()
+            .any(|action| action.id == "finite-complement"));
         assert!(result
             .selected
             .iter()
             .all(|action| action.id != "protected" && action.id != "invalid"));
         assert_eq!(result.total_loss, 5.0);
         assert_eq!(result.total_contributions, [2.0, f64::MAX]);
-        assert!(result.total_contributions.iter().all(|total| total.is_finite()));
+        assert!(result
+            .total_contributions
+            .iter()
+            .all(|total| total.is_finite()));
     }
 
     #[test]
@@ -3318,7 +3326,11 @@ mod tests {
         let search = event.search.as_ref().unwrap();
         assert_eq!(search.visited_nodes, ILP_NODE_BUDGET);
         assert!(!search.optimum_proven);
-        assert!(event.note.as_deref().unwrap().contains("feasibility and optimum not proven"));
+        assert!(event
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("feasibility and optimum not proven"));
         assert!(!result
             .log_events
             .iter()
@@ -3550,12 +3562,14 @@ mod tests {
         assert_eq!(selected_ids(&result), ["a"]);
         assert_eq!(result.total_loss, 0.5);
         assert_eq!(result.total_contributions, [200.0, 80.0]);
-        assert!(result
-            .log_events
-            .iter()
-            .find_map(|event| event.search.as_ref())
-            .unwrap()
-            .optimum_proven);
+        assert!(
+            result
+                .log_events
+                .iter()
+                .find_map(|event| event.search.as_ref())
+                .unwrap()
+                .optimum_proven
+        );
     }
 
     #[test]

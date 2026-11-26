@@ -2307,7 +2307,17 @@ finally:
     assert_eq!(resume_result["session_id"], session);
     assert_eq!(resume_result["note"], "nothing_to_do");
     assert_eq!(resume_result["summary"]["attempted"], 0);
+    assert_eq!(resume_result["summary"]["resumed_skipped"], 1);
+    assert_eq!(resume_result["resumed"], true);
+    assert_eq!(
+        resume_result["resume_evidence_scope"],
+        "historical_execution_completion_not_current_postcondition"
+    );
     assert!(resume_result["outcomes"].as_array().unwrap().is_empty());
+    let resumed_outcomes = resume_result["resumed_outcomes"].as_array().unwrap();
+    assert_eq!(resumed_outcomes.len(), 1);
+    let resume_validated_at: chrono::DateTime<chrono::Utc> =
+        serde_json::from_value(resume_result["resume_validated_at"].clone()).unwrap();
     assert_resume_unchanged(&persisted, &original_outcomes);
 
     let saved_outcomes: Vec<Value> = std::str::from_utf8(&original_outcomes)
@@ -2324,6 +2334,59 @@ finally:
         saved_outcomes[successful_index]["target"],
         serde_json::to_value(&identity).unwrap()
     );
+    let historical: pt_core::verify::SavedActionOutcome =
+        serde_json::from_value(saved_outcomes[successful_index].clone()).unwrap();
+    assert_eq!(
+        resumed_outcomes[0],
+        serde_json::to_value(&historical).unwrap()
+    );
+    assert!(historical.executed_at.unwrap() <= resume_validated_at);
+    assert_eq!(
+        resumed_outcomes[0]["executed_at"],
+        saved_outcomes[successful_index]["executed_at"]
+    );
+    assert_eq!(
+        resumed_outcomes[0]["execution_clock"],
+        saved_outcomes[successful_index]["execution_clock"]
+    );
+
+    // An exact-target retry must retain the receipt even when the live age
+    // filter removes the completed process (or it has left the table entirely).
+    let exact_target = format!("{pid}:{}", identity.start_id.0);
+    let filtered_resume_args = apply_fixture_args(&[
+        "--format",
+        "json",
+        "agent",
+        "apply",
+        "--session",
+        session,
+        "--resume",
+        "--yes",
+        "--min-age",
+        "86400",
+        "--targets",
+        &exact_target,
+    ]);
+    let filtered_resume = run_step(
+        &log_dir,
+        "resume_completed_exact_target_after_age_filter",
+        &filtered_resume_args,
+        &data_dir,
+        &config_dir,
+        30,
+    );
+    assert_eq!(
+        filtered_resume.status.code(),
+        Some(pt_core::exit_codes::ExitCode::Clean.as_i32()),
+        "{filtered_resume:?}"
+    );
+    let filtered_result: Value = serde_json::from_slice(&filtered_resume.stdout).unwrap();
+    assert_eq!(filtered_result["summary"]["attempted"], 0);
+    assert_eq!(filtered_result["summary"]["resumed_skipped"], 1);
+    assert!(filtered_result["outcomes"].as_array().unwrap().is_empty());
+    assert_eq!(filtered_result["resumed_outcomes"][0], resumed_outcomes[0]);
+    assert_resume_unchanged(&persisted, &original_outcomes);
+
     let mut start_parts = identity.start_id.0.rsplitn(3, ':');
     assert_eq!(start_parts.next().unwrap().parse::<u32>().unwrap(), pid);
     let wrong_birth = start_parts
@@ -3796,9 +3859,13 @@ fn agent_apply_resume_preserves_the_confirmed_selection_across_pid_reuse() {
     outside.action_id = "outside".into();
     let session = session_with_actions(data.path(), vec![completed, pending, outside]);
     let handle = SessionStore::at_data_dir(data.path())
-        .open(&SessionId::parse(&session).unwrap()).unwrap();
+        .open(&SessionId::parse(&session).unwrap())
+        .unwrap();
     let scope = handle.dir.join("action/apply_scope.json");
-    let selected = format!("{}:{},{}:{}", first.pid, first_id.start_id.0, other.pid, previous.start_id.0);
+    let selected = format!(
+        "{}:{},{}:{}",
+        first.pid, first_id.start_id.0, other.pid, previous.start_id.0
+    );
     let other_target = format!("{}:{}", other.pid, other_id.start_id.0);
     let run = |label: &str, preview: bool, flags: &[&str]| {
         let mut args = vec!["--format", "json"];
@@ -3811,27 +3878,70 @@ fn agent_apply_resume_preserves_the_confirmed_selection_across_pid_reuse() {
     };
 
     run("preview", true, &["--targets", &selected]);
-    assert!(!scope.exists(), "a preview must not grant authority to resume");
-    let result = run("confirm", false, &["--targets", &selected, "--yes", "--max-kills", "2"]);
-    assert!(result["outcomes"].as_array().unwrap().iter()
-        .any(|row| row["action_id"] == "approved-completed" && row["status"] == "success"), "{result}");
+    assert!(
+        !scope.exists(),
+        "a preview must not grant authority to resume"
+    );
+    let result = run(
+        "confirm",
+        false,
+        &["--targets", &selected, "--yes", "--max-kills", "2"],
+    );
+    assert!(
+        result["outcomes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["action_id"] == "approved-completed" && row["status"] == "success"),
+        "{result}"
+    );
     let bytes = fs::read(&scope).unwrap();
     let approval: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(approval["action_ids"], serde_json::json!(["approved-completed", "approved-stale"]));
+    assert_eq!(
+        approval["action_ids"],
+        serde_json::json!(["approved-completed", "approved-stale"])
+    );
     assert_eq!(approval["limits"]["max_kills"], 2);
-    let status_args = ["--format", "json", "agent", "sessions", "--session", &session];
-    let (_, status) = recorded_action_command(data.path(), config.path(), &session, "status", &status_args);
+    let status_args = [
+        "--format",
+        "json",
+        "agent",
+        "sessions",
+        "--session",
+        &session,
+    ];
+    let (_, status) =
+        recorded_action_command(data.path(), config.path(), &session, "status", &status_args);
     assert_eq!(status["progress"]["pending_actions"], 2, "{status}");
-    assert_eq!(status["progress"]["approved_pending_actions"], 1, "{status}");
-    assert!(status["resume_command"].as_str().unwrap().ends_with("--resume"), "{status}");
+    assert_eq!(
+        status["progress"]["approved_pending_actions"], 1,
+        "{status}"
+    );
+    assert!(
+        status["resume_command"]
+            .as_str()
+            .unwrap()
+            .ends_with("--resume"),
+        "{status}"
+    );
     for flags in [vec!["--resume"], vec!["--resume", "--recommended"]] {
         let pending = run("resume-preview", true, &flags);
         let rows = pending["outcomes"].as_array().unwrap();
         assert_eq!(rows.len(), 1, "{pending}");
         assert_eq!(rows[0]["action_id"], "approved-stale", "{pending}");
     }
-    assert_eq!(run("widen", true, &["--resume", "--targets", &other_target])["error"], "apply_scope_refused");
-    assert_eq!(run("ambiguous", true, &["--resume", "--pids", &other.pid.to_string()])["error"], "apply_scope_refused");
+    assert_eq!(
+        run("widen", true, &["--resume", "--targets", &other_target])["error"],
+        "apply_scope_refused"
+    );
+    assert_eq!(
+        run(
+            "ambiguous",
+            true,
+            &["--resume", "--pids", &other.pid.to_string()]
+        )["error"],
+        "apply_scope_refused"
+    );
     assert_eq!(fs::read(&scope).unwrap(), bytes);
     assert_eq!(nice_of(other.pid).unwrap(), other_nice);
 
@@ -3841,7 +3951,10 @@ fn agent_apply_resume_preserves_the_confirmed_selection_across_pid_reuse() {
     let mut altered: Value = serde_json::from_slice(&original).unwrap();
     altered["actions"][2]["target"]["start_id"] = serde_json::json!(previous.start_id.0);
     fs::write(&path, serde_json::to_vec(&altered).unwrap()).unwrap();
-    assert_eq!(run("changed-plan", true, &["--resume"])["error"], "apply_scope_refused");
+    assert_eq!(
+        run("changed-plan", true, &["--resume"])["error"],
+        "apply_scope_refused"
+    );
     fs::write(path, original).unwrap();
 
     // Older sessions may have valid terminal outcomes but no record of whether
@@ -3850,21 +3963,65 @@ fn agent_apply_resume_preserves_the_confirmed_selection_across_pid_reuse() {
     for flags in [vec!["--resume"], vec!["--resume", "--recommended"]] {
         assert_eq!(run("legacy", true, &flags)["error"], "apply_scope_refused");
     }
-    let exact = run("legacy-exact", true, &["--resume", "--targets", &other_target]);
+    let exact = run(
+        "legacy-exact",
+        true,
+        &["--resume", "--targets", &other_target],
+    );
     assert_eq!(exact["outcomes"][0]["action_id"], "outside", "{exact}");
     assert!(!scope.exists());
 
     // A deliberate fresh approval can select a full plan. Its following bare
     // resume skips successful rows and keeps the unfinished identity in scope.
     let full = run("fresh-full", false, &["--recommended", "--yes"]);
-    assert!(full["outcomes"].as_array().unwrap().iter()
-        .any(|row| row["action_id"] == "outside" && row["status"] == "success"), "{full}");
+    assert!(
+        full["outcomes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["action_id"] == "outside" && row["status"] == "success"),
+        "{full}"
+    );
     let full_scope: Value = serde_json::from_slice(&fs::read(&scope).unwrap()).unwrap();
     assert_eq!(full_scope["action_ids"].as_array().unwrap().len(), 3);
     let remaining = run("full-resume", true, &["--resume"]);
     let rows = remaining["outcomes"].as_array().unwrap();
     assert_eq!(rows.len(), 1, "{remaining}");
     assert_eq!(rows[0]["action_id"], "approved-stale", "{remaining}");
+    let previous_ids: Vec<_> = remaining["resumed_outcomes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|outcome| outcome["action_id"].as_str().unwrap())
+        .collect();
+    assert!(previous_ids.contains(&"approved-completed"), "{remaining}");
+    assert!(previous_ids.contains(&"outside"), "{remaining}");
+
+    // Confirm a narrower approval through the actual producer. A later bare
+    // resume must not report successful history outside that saved action scope,
+    // even when one of those successes shares the stale target's numeric PID.
+    let stale_target = format!("{}:{}", other.pid, previous.start_id.0);
+    let priority_after_full = nice_of(other.pid).unwrap();
+    run(
+        "fresh-narrow",
+        false,
+        &["--targets", &stale_target, "--yes"],
+    );
+    let narrowed: Value = serde_json::from_slice(&fs::read(&scope).unwrap()).unwrap();
+    assert_eq!(
+        narrowed["action_ids"],
+        serde_json::json!(["approved-stale"])
+    );
+    let scoped = run("narrow-history-resume", true, &["--resume"]);
+    assert!(
+        scoped["resumed_outcomes"].as_array().unwrap().is_empty(),
+        "{scoped}"
+    );
+    assert_eq!(scoped["summary"]["resumed_skipped"], 0);
+    let rows = scoped["outcomes"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{scoped}");
+    assert_eq!(rows[0]["action_id"], "approved-stale", "{scoped}");
+    assert_eq!(nice_of(other.pid).unwrap(), priority_after_full);
 }
 
 #[test]

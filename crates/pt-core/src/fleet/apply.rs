@@ -634,6 +634,9 @@ pub enum HostApplyStatus {
     Preview,
     NoActions,
     Applied,
+    /// All selected actions have durable historical completion receipts. This
+    /// does not verify their current postconditions; an undo may have followed.
+    AlreadyApplied,
     Partial,
     Blocked,
     Unknown,
@@ -657,6 +660,8 @@ pub struct HostApplyResult {
     pub status: HostApplyStatus,
     pub attempted: bool,
     pub successful_actions: usize,
+    #[serde(default)]
+    pub already_completed_actions: usize,
     pub kill_signals_delivered: usize,
     pub exit_code: Option<i32>,
     pub duration_ms: u64,
@@ -680,6 +685,7 @@ impl HostApplyResult {
             status,
             attempted: false,
             successful_actions: 0,
+            already_completed_actions: 0,
             kill_signals_delivered: 0,
             exit_code: None,
             duration_ms: 0,
@@ -766,6 +772,73 @@ pub fn remote_apply_args(
     )
 }
 
+/// Reconcile the host's durable successes without charging them to this attempt.
+/// The host clock validates original execution timestamps; its current process
+/// state is deliberately not inferred from historical completion receipts.
+fn resumed_completion_ids(
+    request: &HostApplyRequest,
+    document: &Value,
+) -> Result<HashSet<String>, String> {
+    let Some(value) = document.get("resumed_outcomes") else {
+        return Ok(HashSet::new());
+    };
+    let saved: Vec<crate::verify::SavedActionOutcome> = serde_json::from_value(value.clone())
+        .map_err(|error| format!("invalid resumed action receipts: {error}"))?;
+    if saved.is_empty() {
+        return Ok(HashSet::new());
+    }
+    if document["resumed"] != true {
+        return Err("historical action receipts are not identified as a resumed execution".into());
+    }
+    let validated_at: chrono::DateTime<chrono::Utc> =
+        serde_json::from_value(document["resume_validated_at"].clone()).map_err(|error| {
+            format!("missing or invalid remote resume validation time: {error}")
+        })?;
+    let mut completed = HashSet::new();
+    for outcome in &saved {
+        if outcome.status != "success" || !completed.insert(outcome.action_id.clone()) {
+            return Err("resumed action receipts contain a non-success or duplicate action".into());
+        }
+    }
+    // Retained fleet requests have no authenticated remote OS field. Require
+    // boot-clock evidence for historical kills on every coordinator platform;
+    // a clockless remote kill remains unknown rather than inheriting this
+    // coordinator's native platform rules. Direct reversible receipts are
+    // portable. Routed restart/zombie receipts are outside fleet approval.
+    for outcome in &saved {
+        let action = request
+            .actions
+            .iter()
+            .find(|action| action.action_id == outcome.action_id)
+            .ok_or("resumed receipt is outside the approved action selection")?;
+        if action.routing != ActionRouting::Direct
+            || action.original_zombie_target.is_some()
+            || action.supervisor_restart.is_some()
+        {
+            return Err("historical routed actions are unsupported by fleet execution".into());
+        }
+        if action.action == Action::Kill && outcome.execution_clock.is_none() {
+            return Err(
+                "historical remote kill lacks portable boot-clock evidence; completion remains unknown"
+                    .into(),
+            );
+        }
+    }
+    let validated =
+        crate::verify::executed_action_outcomes_at(&request.actions, &saved, validated_at)
+            .map_err(|error| {
+                format!("resumed completion is not bound to approved actions: {error}")
+            })?;
+    if validated.len() != saved.len()
+        || validated
+            .iter()
+            .any(|(action, outcome)| outcome.target.as_ref() != Some(&action.target))
+    {
+        return Err("resumed completion differs from the complete approved identity".into());
+    }
+    Ok(completed)
+}
+
 fn interpret_remote_result(prepared: &PreparedHostApply, output: ToolOutput) -> HostApplyResult {
     let mut result = HostApplyResult::new(prepared, HostApplyStatus::Unknown);
     result.attempted = true;
@@ -821,12 +894,44 @@ fn interpret_remote_result(prepared: &PreparedHostApply, output: ToolOutput) -> 
         );
         return result;
     }
+    if output.exit_code == Some(4)
+        && document["status"] == "blocked"
+        && document["error"] == "incomplete_execution"
+    {
+        // An incomplete journal overrides attached receipts: the host cannot
+        // attest to which admitted actions were ultimately completed.
+        result.error = Some(format!(
+            "remote apply refused uncertain replay; earlier action completion is unknown: {}",
+            document["message"]
+                .as_str()
+                .unwrap_or("incomplete execution history")
+        ));
+        return result;
+    }
     let Some(outcomes) = document["outcomes"].as_array() else {
         result.error = Some("remote response has no action outcomes; completion is unknown".into());
         return result;
     };
+    let completed = match resumed_completion_ids(request, &document) {
+        Ok(completed) => completed,
+        Err(error) => {
+            result.error = Some(error);
+            return result;
+        }
+    };
+    result.already_completed_actions = completed.len();
     if outcomes.is_empty() && output.exit_code == Some(0) && document["note"] == "nothing_to_do" {
-        result.status = HostApplyStatus::NoActions;
+        result.status = if completed.is_empty() {
+            HostApplyStatus::NoActions
+        } else if completed.len() == request.actions.len() {
+            HostApplyStatus::AlreadyApplied
+        } else {
+            result.error = Some(
+                "remote no-op retained only part of the approved completion history; remaining actions are unknown"
+                    .into(),
+            );
+            HostApplyStatus::Partial
+        };
         return result;
     }
     if outcomes.is_empty()
@@ -834,22 +939,15 @@ fn interpret_remote_result(prepared: &PreparedHostApply, output: ToolOutput) -> 
         && document["status"] == "blocked"
         && document["error"].is_string()
     {
-        if document["error"] == "incomplete_execution" {
-            // Refusing a replay proves no new admission, but does not resolve
-            // actions admitted before the remote journal became incomplete.
-            result.error = Some(format!(
-                "remote apply refused uncertain replay; earlier action completion is unknown: {}",
-                document["message"]
-                    .as_str()
-                    .unwrap_or("incomplete execution history")
-            ));
+        result.status = if completed.is_empty() {
+            HostApplyStatus::Blocked
         } else {
-            result.status = HostApplyStatus::Blocked;
-            result.error = Some(format!(
-                "remote apply refused execution: {}",
-                document["error"].as_str().unwrap()
-            ));
-        }
+            HostApplyStatus::Partial
+        };
+        result.error = Some(format!(
+            "remote apply refused execution: {}",
+            document["error"].as_str().unwrap()
+        ));
         return result;
     }
     let actions: HashMap<&str, &PlanAction> = request
@@ -857,7 +955,7 @@ fn interpret_remote_result(prepared: &PreparedHostApply, output: ToolOutput) -> 
         .iter()
         .map(|action| (action.action_id.as_str(), action))
         .collect();
-    let mut seen = HashSet::new();
+    let mut seen: HashSet<&str> = completed.iter().map(String::as_str).collect();
     let mut successes = 0;
     let mut delivered = 0;
     let mut refused = 0;
@@ -907,15 +1005,19 @@ fn interpret_remote_result(prepared: &PreparedHostApply, output: ToolOutput) -> 
     }
     result.successful_actions = successes;
     result.kill_signals_delivered = delivered;
-    result.status = if successes == actions.len() && output.exit_code == Some(2) {
+    result.status = if successes > 0
+        && successes == actions.len().saturating_sub(completed.len())
+        && output.exit_code == Some(2)
+    {
         HostApplyStatus::Applied
-    } else if !outcomes.is_empty()
+    } else if completed.is_empty()
+        && !outcomes.is_empty()
         && seen.len() == actions.len()
         && refused == outcomes.len()
         && delivered == 0
     {
         HostApplyStatus::Blocked
-    } else if successes > 0 || delivered > 0 {
+    } else if successes > 0 || delivered > 0 || !completed.is_empty() {
         HostApplyStatus::Partial
     } else {
         HostApplyStatus::Unknown
@@ -1333,6 +1435,336 @@ mod tests {
             duration: Duration::from_millis(12),
             timed_out: false,
         }
+    }
+
+    fn historical_outcome(action: &PlanAction, executed_at: &str) -> Value {
+        let mut receipt = serde_json::json!({
+            "action_id": action.action_id,
+            "pid": action.target.pid.0,
+            "status": "success",
+            "action": action.action,
+            "target": action.target,
+            "executed_at": executed_at,
+        });
+        if action.action == Action::Kill {
+            let mut birth = action.target.start_id.0.rsplitn(3, ':');
+            let _pid = birth.next().unwrap();
+            let ticks = birth.next().unwrap().parse::<u64>().unwrap();
+            let boot = birth.next().unwrap();
+            receipt["command"] = serde_json::json!("fixture-worker");
+            receipt["parent_pid"] = serde_json::json!(20);
+            receipt["execution_clock"] = serde_json::json!({
+                "boot_id": boot, "ticks": ticks + 1,
+            });
+        }
+        receipt
+    }
+
+    fn resumed_output(
+        request: &HostApplyRequest,
+        previous: &[usize],
+        current: &[usize],
+        status: &str,
+        exit_code: i32,
+    ) -> ToolOutput {
+        let mut output = result_output(request, status, exit_code);
+        let mut document: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let outcomes = document["outcomes"].as_array().unwrap();
+        let selected: Vec<_> = current
+            .iter()
+            .map(|&index| outcomes[index].clone())
+            .collect();
+        document["outcomes"] = serde_json::json!(selected);
+        document["resumed"] = serde_json::json!(true);
+        document["resume_validated_at"] = serde_json::json!("2026-11-05T12:02:00Z");
+        document["resumed_outcomes"] = serde_json::json!(previous
+            .iter()
+            .map(|&index| historical_outcome(&request.actions[index], "2026-11-05T12:01:00Z"))
+            .collect::<Vec<_>>());
+        if current.is_empty() {
+            document["note"] = serde_json::json!("nothing_to_do");
+        }
+        output.stdout = serde_json::to_vec(&document).unwrap();
+        output
+    }
+
+    #[test]
+    fn resume_reconciles_prior_and_new_successes_through_confirmed_fleet_dispatch() {
+        for action in [Action::Renice, Action::Kill] {
+            let document = if action == Action::Kill {
+                remote_document("alpha", &[(101, 0.999), (102, 0.999)])
+            } else {
+                remote_relief_document("alpha", &[(101, action), (102, action)])
+            };
+            let fleet = retained_fleet(vec![("alpha", document)]);
+            let prepared = prepare_fleet_apply(&fleet).unwrap();
+            let calls = AtomicUsize::new(0);
+            let mut receipts = Vec::new();
+            let report = execute_fleet_apply_with(
+                &prepared,
+                &fleet.execution.as_ref().unwrap().transport,
+                &config(),
+                |request, args, _| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    assert!(args
+                        .last()
+                        .unwrap()
+                        .contains("--yes --resume --abort-on-unknown"));
+                    Ok(resumed_output(request, &[0], &[1], "success", 2))
+                },
+                |host| {
+                    receipts.push(host.clone());
+                    Ok(())
+                },
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let host = &report.hosts[0];
+            assert_eq!(host.status, HostApplyStatus::Applied, "{host:?}");
+            assert_eq!(host.successful_actions, 1);
+            assert_eq!(host.already_completed_actions, 1);
+            assert_eq!(
+                host.kill_signals_delivered,
+                usize::from(action == Action::Kill)
+            );
+            assert_eq!(receipts.len(), 1);
+            let persisted: HostApplyResult =
+                serde_json::from_value(serde_json::to_value(&receipts[0]).unwrap()).unwrap();
+            assert_eq!(persisted.status, HostApplyStatus::Applied);
+            assert_eq!(persisted.successful_actions, 1);
+            assert_eq!(persisted.already_completed_actions, 1);
+        }
+    }
+
+    #[test]
+    fn all_completed_resume_keeps_original_receipts_without_new_execution_credit() {
+        let fleet = retained_fleet(vec![(
+            "alpha",
+            remote_document("alpha", &[(101, 0.999), (102, 0.999)]),
+        )]);
+        let prepared = prepare_fleet_apply(&fleet).unwrap();
+        let request = prepared[0].request.as_ref().unwrap();
+        let output = resumed_output(request, &[0, 1], &[], "success", 0);
+        let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+        for _ in 0..2 {
+            let result = interpret_remote_result(&prepared[0], output.clone());
+            assert_eq!(result.status, HostApplyStatus::AlreadyApplied, "{result:?}");
+            assert!(!result.status.is_failure());
+            assert_eq!(result.successful_actions, 0);
+            assert_eq!(result.already_completed_actions, 2);
+            assert_eq!(result.kill_signals_delivered, 0);
+            let response = result.remote_response.as_ref().unwrap();
+            assert_eq!(response["resumed_outcomes"], document["resumed_outcomes"]);
+            assert_eq!(
+                response["resumed_outcomes"][0]["executed_at"],
+                "2026-11-05T12:01:00Z"
+            );
+        }
+    }
+
+    #[test]
+    fn historical_success_does_not_hide_missing_or_refused_remaining_actions() {
+        let fleet = retained_fleet(vec![(
+            "alpha",
+            remote_relief_document("alpha", &[(101, Action::Renice), (102, Action::Renice)]),
+        )]);
+        let prepared = prepare_fleet_apply(&fleet).unwrap();
+        let request = prepared[0].request.as_ref().unwrap();
+        for output in [
+            resumed_output(request, &[0], &[1], "blocked_by_policy", 4),
+            resumed_output(request, &[0], &[], "success", 0),
+        ] {
+            let result = interpret_remote_result(&prepared[0], output);
+            assert_eq!(result.status, HostApplyStatus::Partial, "{result:?}");
+            assert_eq!(result.successful_actions, 0);
+            assert_eq!(result.already_completed_actions, 1);
+            assert_eq!(result.kill_signals_delivered, 0);
+            assert!(result.error.is_some());
+        }
+
+        let mut refused = resumed_output(request, &[0], &[], "success", 4);
+        let mut document: Value = serde_json::from_slice(&refused.stdout).unwrap();
+        document["status"] = serde_json::json!("blocked");
+        document["error"] = serde_json::json!("policy_refusal");
+        refused.stdout = serde_json::to_vec(&document).unwrap();
+        let result = interpret_remote_result(&prepared[0], refused.clone());
+        assert_eq!(result.status, HostApplyStatus::Partial);
+        assert_eq!(result.already_completed_actions, 1);
+
+        // An unresolved journal overrides even otherwise well-formed historical
+        // receipts, including a response that also carries current outcomes.
+        document["error"] = serde_json::json!("incomplete_execution");
+        document["outcomes"] = serde_json::json!([
+            {"action_id": request.actions[1].action_id, "pid": 102, "status": "blocked_by_policy"}
+        ]);
+        refused.stdout = serde_json::to_vec(&document).unwrap();
+        let result = interpret_remote_result(&prepared[0], refused);
+        assert_eq!(result.status, HostApplyStatus::Unknown);
+        assert_eq!(result.already_completed_actions, 0);
+        assert_eq!(result.successful_actions, 0);
+    }
+
+    #[test]
+    fn historical_receipts_reject_tampered_bindings_and_incomplete_execution_evidence() {
+        let fleet = retained_fleet(vec![("alpha", remote_document("alpha", &[(101, 0.999)]))]);
+        let prepared = prepare_fleet_apply(&fleet).unwrap();
+        let request = prepared[0].request.as_ref().unwrap();
+        let original = resumed_output(request, &[0], &[], "success", 0);
+        for mutation in [
+            "action_id",
+            "pid",
+            "uid",
+            "pgid",
+            "start_id",
+            "action",
+            "status",
+            "duplicate",
+            "route",
+            "clock_boot",
+            "clock_before_birth",
+            "command",
+            "parent_pid",
+            "executed_at",
+            "future_execution",
+            "missing_validation",
+            "invalid_validation",
+            "not_resumed",
+            "not_array",
+            "null_history",
+        ] {
+            let mut output = original.clone();
+            let mut document: Value = serde_json::from_slice(&output.stdout).unwrap();
+            match mutation {
+                "action_id" => {
+                    document["resumed_outcomes"][0]["action_id"] = serde_json::json!("other")
+                }
+                "pid" => document["resumed_outcomes"][0]["pid"] = serde_json::json!(999),
+                "uid" => document["resumed_outcomes"][0]["target"]["uid"] = serde_json::json!(1001),
+                "pgid" => {
+                    document["resumed_outcomes"][0]["target"]["pgid"] = serde_json::json!(999)
+                }
+                "start_id" => {
+                    document["resumed_outcomes"][0]["target"]["start_id"] =
+                        serde_json::json!("fixture-boot:43:101")
+                }
+                "action" => document["resumed_outcomes"][0]["action"] = serde_json::json!("pause"),
+                "status" => document["resumed_outcomes"][0]["status"] = serde_json::json!("failed"),
+                "duplicate" => {
+                    let duplicate = document["resumed_outcomes"][0].clone();
+                    document["resumed_outcomes"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(duplicate);
+                }
+                "route" => {
+                    document["resumed_outcomes"][0]["original_zombie_target"] =
+                        serde_json::json!(request.actions[0].target)
+                }
+                "clock_boot" => {
+                    document["resumed_outcomes"][0]["execution_clock"]["boot_id"] =
+                        serde_json::json!("other")
+                }
+                "clock_before_birth" => {
+                    document["resumed_outcomes"][0]["execution_clock"]["ticks"] =
+                        serde_json::json!(41)
+                }
+                "command" => document["resumed_outcomes"][0]["command"] = Value::Null,
+                "parent_pid" => {
+                    document["resumed_outcomes"][0]["parent_pid"] = serde_json::json!(0)
+                }
+                "executed_at" => document["resumed_outcomes"][0]["executed_at"] = Value::Null,
+                "future_execution" => {
+                    document["resumed_outcomes"][0]["executed_at"] =
+                        serde_json::json!("2026-11-05T12:02:01Z")
+                }
+                "missing_validation" => {
+                    document
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("resume_validated_at");
+                }
+                "invalid_validation" => {
+                    document["resume_validated_at"] = serde_json::json!("not a timestamp")
+                }
+                "not_resumed" => document["resumed"] = serde_json::json!(false),
+                "not_array" => {
+                    document["resumed_outcomes"] = serde_json::json!({"action_id": "kill-101"})
+                }
+                "null_history" => document["resumed_outcomes"] = Value::Null,
+                _ => unreachable!(),
+            }
+            output.stdout = serde_json::to_vec(&document).unwrap();
+            let result = interpret_remote_result(&prepared[0], output);
+            assert_eq!(
+                result.status,
+                HostApplyStatus::Unknown,
+                "{mutation}: {result:?}"
+            );
+            assert_eq!(result.already_completed_actions, 0, "{mutation}");
+            assert_eq!(result.successful_actions, 0, "{mutation}");
+            assert_eq!(result.kill_signals_delivered, 0, "{mutation}");
+        }
+
+        let result = interpret_remote_result(
+            &prepared[0],
+            resumed_output(request, &[0], &[0], "success", 2),
+        );
+        assert_eq!(result.status, HostApplyStatus::Unknown);
+        assert_eq!(result.already_completed_actions, 1);
+        assert_eq!(result.successful_actions, 0);
+        assert_eq!(result.kill_signals_delivered, 0);
+        assert!(result.error.unwrap().contains("duplicate action"));
+    }
+
+    #[test]
+    fn historical_receipts_use_the_remote_validation_clock_in_both_skew_directions() {
+        let fleet = retained_fleet(vec![(
+            "alpha",
+            remote_relief_document("alpha", &[(101, Action::Renice)]),
+        )]);
+        let prepared = prepare_fleet_apply(&fleet).unwrap();
+        let request = prepared[0].request.as_ref().unwrap();
+        for (executed_at, validated_at) in [
+            ("2036-11-05T12:01:00Z", "2036-11-05T12:02:00Z"),
+            ("2020-11-05T12:01:00Z", "2020-11-05T12:02:00Z"),
+        ] {
+            let mut output = resumed_output(request, &[0], &[], "success", 0);
+            let mut document: Value = serde_json::from_slice(&output.stdout).unwrap();
+            document["resumed_outcomes"][0]["executed_at"] = serde_json::json!(executed_at);
+            document["resume_validated_at"] = serde_json::json!(validated_at);
+            output.stdout = serde_json::to_vec(&document).unwrap();
+            let result = interpret_remote_result(&prepared[0], output);
+            assert_eq!(result.status, HostApplyStatus::AlreadyApplied, "{result:?}");
+            assert_eq!(result.already_completed_actions, 1);
+            assert_eq!(result.successful_actions, 0);
+        }
+    }
+
+    #[test]
+    fn clockless_historical_kills_stay_unknown_without_a_bound_remote_platform() {
+        let fleet = retained_fleet(vec![("alpha", remote_document("alpha", &[(101, 0.999)]))]);
+        let prepared = prepare_fleet_apply(&fleet).unwrap();
+        let request = prepared[0].request.as_ref().unwrap();
+        let mut output = resumed_output(request, &[0], &[], "success", 0);
+        let mut document: Value = serde_json::from_slice(&output.stdout).unwrap();
+        document["resumed_outcomes"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("execution_clock");
+        output.stdout = serde_json::to_vec(&document).unwrap();
+        let result = interpret_remote_result(&prepared[0], output);
+        // A macOS host can legitimately produce a clockless kill receipt. The
+        // retained plan has no OS binding, so this history remains unsupported
+        // rather than being interpreted using the coordinator's own platform.
+        assert_eq!(result.status, HostApplyStatus::Unknown);
+        assert_eq!(result.already_completed_actions, 0);
+        assert!(result
+            .error
+            .unwrap()
+            .contains("portable boot-clock evidence"));
+        let current = interpret_remote_result(&prepared[0], result_output(request, "success", 2));
+        assert_eq!(current.status, HostApplyStatus::Applied);
+        assert_eq!(current.successful_actions, 1);
+        assert_eq!(current.already_completed_actions, 0);
     }
 
     #[test]

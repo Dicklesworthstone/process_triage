@@ -852,8 +852,20 @@ pub fn executed_plan_actions<'a>(
     plan: &'a Plan,
     saved: &'a [SavedActionOutcome],
 ) -> Result<Vec<(&'a PlanAction, &'a SavedActionOutcome)>, VerifyError> {
-    let recorded = recorded_plan_actions(plan, saved)?;
-    validate_execution_timestamps(saved, Utc::now())?;
+    executed_action_outcomes_at(&plan.actions, saved, Utc::now())
+}
+
+/// Bind successful receipts to an exact approved action set using the clock of
+/// the host that validated them. Remote completion must not depend on clock
+/// agreement with its coordinator. This proves historical execution, not a
+/// freshly observed postcondition or a new execution in the current attempt.
+pub fn executed_action_outcomes_at<'a>(
+    actions: &'a [PlanAction],
+    saved: &'a [SavedActionOutcome],
+    validated_at: DateTime<Utc>,
+) -> Result<Vec<(&'a PlanAction, &'a SavedActionOutcome)>, VerifyError> {
+    let recorded = recorded_action_outcomes(actions, saved)?;
+    validate_execution_timestamps(saved, validated_at)?;
     Ok(recorded
         .into_iter()
         .filter(|(_, outcome)| outcome.status == "success")
@@ -943,8 +955,14 @@ fn recorded_plan_actions<'a>(
     plan: &'a Plan,
     saved: &'a [SavedActionOutcome],
 ) -> Result<Vec<(&'a PlanAction, &'a SavedActionOutcome)>, VerifyError> {
-    let actions: HashMap<_, _> = plan
-        .actions
+    recorded_action_outcomes(&plan.actions, saved)
+}
+
+fn recorded_action_outcomes<'a>(
+    plan_actions: &'a [PlanAction],
+    saved: &'a [SavedActionOutcome],
+) -> Result<Vec<(&'a PlanAction, &'a SavedActionOutcome)>, VerifyError> {
+    let actions: HashMap<_, _> = plan_actions
         .iter()
         .map(|action| (action.action_id.as_str(), action))
         .collect();
@@ -1138,8 +1156,7 @@ fn recorded_plan_actions<'a>(
             latest.insert(&outcome.action_id, outcome);
         }
     }
-    Ok(plan
-        .actions
+    Ok(plan_actions
         .iter()
         .filter_map(|action| {
             latest

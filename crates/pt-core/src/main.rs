@@ -111,14 +111,12 @@ use pt_core::verify::resource_prediction::{
     RESOURCE_PREDICTION_SCHEMA_VERSION,
 };
 use pt_core::verify::{
-    executed_plan_actions, observe_live_postcondition,
-    parse_action_outcomes, parse_agent_plan, validate_execution_replay,
-    verify_plan_with_postconditions, VerifyOutcome,
+    executed_plan_actions, observe_live_postcondition, parse_action_outcomes, parse_agent_plan,
+    validate_execution_replay, verify_plan_with_postconditions, VerifyOutcome,
 };
 use pt_telemetry::retention::{RetentionConfig, RetentionEnforcer, RetentionError};
 use pt_telemetry::shadow::{Observation, ShadowStorage, ShadowStorageConfig};
 use pt_telemetry::writer::default_telemetry_dir;
-#[cfg(feature = "daemon")]
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -4008,6 +4006,42 @@ mod canonical_plan_write_tests {
         update_canonical_session_plan(&handle, |_| Ok("2".into())).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"2");
         assert_eq!(std::io::read_to_string(reader).unwrap(), "1");
+    }
+
+    #[test]
+    fn no_op_resume_rechecks_exact_plan_and_journal_under_the_execution_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let handle = session(directory.path());
+        let original = b"{\"plan_id\":\"original\"}";
+        let outcomes = b"{\"status\":\"success\"}\n";
+        let plan_path = handle.dir.join("decision/plan.json");
+        let action_dir = handle.dir.join("action");
+        fs::create_dir_all(&action_dir).unwrap();
+        let journal_path = action_dir.join("outcomes.jsonl");
+        fs::write(&plan_path, original).unwrap();
+        fs::write(&journal_path, outcomes).unwrap();
+
+        let lock = lock_apply_completion_snapshot(&handle, original, Some(outcomes)).unwrap();
+        assert!(
+            GlobalLock::try_acquire(&directory.path().join(".execution-policy-lock"))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(fs::read(&plan_path).unwrap(), original);
+        assert_eq!(fs::read(&journal_path).unwrap(), outcomes);
+        assert!(!directory.path().join("rate_limit.json").exists());
+        drop(lock);
+
+        fs::write(&plan_path, b"{\"plan_id\":\"changed\"}").unwrap();
+        assert!(lock_apply_completion_snapshot(&handle, original, Some(outcomes)).is_err());
+        fs::write(&plan_path, original).unwrap();
+        fs::write(&journal_path, b"{\"status\":\"execution_started\"}\n").unwrap();
+        assert!(lock_apply_completion_snapshot(&handle, original, Some(outcomes)).is_err());
+
+        fs::write(&journal_path, b"").unwrap();
+        handle.update_state(SessionState::Executing).unwrap();
+        assert!(lock_apply_completion_snapshot(&handle, original, Some(b"")).is_err());
+        assert!(!directory.path().join("rate_limit.json").exists());
     }
 
     #[test]
@@ -12088,15 +12122,9 @@ mod executable_goal_tests {
 
         // PID 100 makes cheap progress on both goals, but consumes a slot that
         // the complete memory/CPU cover needs. The plan must search beyond it.
-        let bounded = build_goal_plan_from_candidates(
-            goal_text,
-            &goal,
-            100.0,
-            &candidates,
-            &resources,
-            2,
-        )
-        .unwrap();
+        let bounded =
+            build_goal_plan_from_candidates(goal_text, &goal, 100.0, &candidates, &resources, 2)
+                .unwrap();
         assert!(bounded.result.feasible);
         let mut selected = bounded.selected_pids.clone();
         selected.sort_unstable();
@@ -12105,15 +12133,9 @@ mod executable_goal_tests {
         assert_eq!(bounded.result.total_contributions, [10.0, 10.0]);
         assert!(bounded.result.goal_achievement.iter().all(|goal| goal.met));
 
-        let insufficient = build_goal_plan_from_candidates(
-            goal_text,
-            &goal,
-            100.0,
-            &candidates,
-            &resources,
-            1,
-        )
-        .unwrap();
+        let insufficient =
+            build_goal_plan_from_candidates(goal_text, &goal, 100.0, &candidates, &resources, 1)
+                .unwrap();
         assert!(!insufficient.result.feasible);
         assert!(insufficient.selected_pids.len() <= 1);
 
@@ -17179,6 +17201,11 @@ fn run_agent_fleet_apply(global: &GlobalOpts, args: &AgentFleetApplyArgs) -> Exi
         .iter()
         .map(|host| host.successful_actions)
         .sum();
+    let already_completed_actions: usize = report
+        .hosts
+        .iter()
+        .map(|host| host.already_completed_actions)
+        .sum();
     let kill_signals_delivered: usize = report
         .hosts
         .iter()
@@ -17188,12 +17215,14 @@ fn run_agent_fleet_apply(global: &GlobalOpts, args: &AgentFleetApplyArgs) -> Exi
         "preview"
     } else if unknown {
         "unknown"
-    } else if failed && successful_actions > 0 {
+    } else if failed && (successful_actions > 0 || already_completed_actions > 0) {
         "partial"
     } else if failed {
         "blocked"
     } else if successful_actions > 0 {
         "applied"
+    } else if already_completed_actions > 0 {
+        "already_applied"
     } else {
         "no_actions"
     };
@@ -17213,6 +17242,7 @@ fn run_agent_fleet_apply(global: &GlobalOpts, args: &AgentFleetApplyArgs) -> Exi
             "hosts": report.hosts.len(),
             "attempted_hosts": attempted_hosts,
             "successful_actions": successful_actions,
+            "already_completed_actions": already_completed_actions,
             "kill_signals_delivered": kill_signals_delivered,
         },
         "hosts": report.hosts,
@@ -17227,7 +17257,7 @@ fn run_agent_fleet_apply(global: &GlobalOpts, args: &AgentFleetApplyArgs) -> Exi
             "limitation": "Bound on recorded posterior risk, not a frequentist guarantee or confirmation of which remote actions completed.",
         },
         "note": if executing {
-            "Remote outcomes are reported only from bound receipts. Missing or timed-out responses have unknown completion; inspect the remote session before retrying. Every approved target independently meets the fleet posterior-risk limit, so any execution subset retains that recorded model-based ceiling; actual false discoveries are not measured by this estimate."
+            "Remote outcomes are reported only from bound receipts. Already-completed actions attest to historical execution, not a freshly verified current postcondition; they are not counted as new actions or kill signals. Missing or timed-out responses have unknown completion; inspect the remote session before retrying. Every approved target independently meets the fleet posterior-risk limit, so any execution subset retains that recorded model-based ceiling; actual false discoveries are not measured by this estimate."
         } else {
             "Local preview only; no SSH command was started. Use --confirm to apply this exact selection."
         },
@@ -17245,11 +17275,12 @@ fn run_agent_fleet_apply(global: &GlobalOpts, args: &AgentFleetApplyArgs) -> Exi
             println!("Status: {status}; {attempted_hosts} host commands started");
             for host in &report.hosts {
                 println!(
-                    "  {}: {:?}, {} selected, {} successful actions{}",
+                    "  {}: {:?}, {} selected, {} new successful actions, {} already completed actions{}",
                     host.host,
                     host.status,
                     host.selected_targets.len(),
                     host.successful_actions,
+                    host.already_completed_actions,
                     host.error
                         .as_ref()
                         .map(|error| format!("; {error}"))
@@ -17266,7 +17297,7 @@ fn run_agent_fleet_apply(global: &GlobalOpts, args: &AgentFleetApplyArgs) -> Exi
     }
     if report.persistence_error.is_some() {
         ExitCode::IoError
-    } else if failed && (successful_actions > 0 || unknown) {
+    } else if failed && (successful_actions > 0 || already_completed_actions > 0 || unknown) {
         ExitCode::PartialFail
     } else if failed {
         ExitCode::PolicyBlocked
@@ -17868,11 +17899,20 @@ fn run_agent_fleet_status(global: &GlobalOpts, args: &AgentFleetStatusArgs) -> E
         Err(e) => return output_agent_error(global, "fleet status", &e),
     };
 
-    let attempts = match pt_core::fleet::receipts::apply_history(&session_dir, &fleet.fleet_session_id) {
-        Ok(attempts) => attempts,
-        Err(error) => return output_agent_error(global, "fleet status", &format!("read apply receipts: {error}")),
-    };
-    let receipt_errors = attempts.iter().any(|attempt| attempt.receipt_error.is_some());
+    let attempts =
+        match pt_core::fleet::receipts::apply_history(&session_dir, &fleet.fleet_session_id) {
+            Ok(attempts) => attempts,
+            Err(error) => {
+                return output_agent_error(
+                    global,
+                    "fleet status",
+                    &format!("read apply receipts: {error}"),
+                )
+            }
+        };
+    let receipt_errors = attempts
+        .iter()
+        .any(|attempt| attempt.receipt_error.is_some());
     let response = serde_json::json!({
         "apply_attempts": attempts,
         "schema_version": SCHEMA_VERSION,
@@ -17925,15 +17965,29 @@ fn run_agent_fleet_status(global: &GlobalOpts, args: &AgentFleetStatusArgs) -> E
             println!("Candidates: {}", fleet.aggregate.total_candidates);
             println!("Recorded apply attempts: {}", attempts.len());
             for attempt in &attempts {
-                let state = if attempt.finished { "finished" } else { "incomplete" };
+                let state = if attempt.finished {
+                    "finished"
+                } else {
+                    "incomplete"
+                };
                 println!("  {} ({state})", attempt.attempt_id);
                 if let Some(error) = &attempt.receipt_error {
                     println!("    receipt error: {error}");
                 }
                 for host in &attempt.hosts {
-                    let successes = host.successful_actions.map(|n| n.to_string()).unwrap_or_else(|| "unknown".into());
-                    let signals = host.kill_signals_delivered.map(|n| n.to_string()).unwrap_or_else(|| "unknown".into());
-                    println!("    {}: {:?}, confirmed actions {successes}, confirmed kill signals {signals}, remote session {}",
+                    let successes = host
+                        .successful_actions
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "unknown".into());
+                    let completed = host
+                        .already_completed_actions
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "unknown".into());
+                    let signals = host
+                        .kill_signals_delivered
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "unknown".into());
+                    println!("    {}: {:?}, new successful actions {successes}, already completed actions {completed}, new kill signals {signals}, remote session {}",
                         host.host, host.status, host.remote_session_id.as_deref().unwrap_or("unavailable"));
                 }
             }
@@ -17962,7 +18016,11 @@ fn run_agent_fleet_status(global: &GlobalOpts, args: &AgentFleetStatusArgs) -> E
         }
     }
 
-    if receipt_errors { ExitCode::PartialFail } else { ExitCode::Clean }
+    if receipt_errors {
+        ExitCode::PartialFail
+    } else {
+        ExitCode::Clean
+    }
 }
 
 fn run_agent_fleet_transfer(global: &GlobalOpts, args: &AgentFleetTransferArgs) -> ExitCode {
@@ -33767,10 +33825,21 @@ mod planning_pressure_tests {
         let diag = wait.diagnostics().unwrap();
         assert_eq!(diag.wchan.as_deref(), Some("io_schedule"));
         assert!(diag.io_read_bytes.is_none() && diag.d_state_duration_ms.is_none());
-        let mask = ActionFeasibility::from_process_state(false, wait.state.is_disksleep(), wait.wchan.as_deref());
+        let mask = ActionFeasibility::from_process_state(
+            false,
+            wait.state.is_disksleep(),
+            wait.wchan.as_deref(),
+        );
         assert!(!mask.is_allowed(Action::Kill));
-        assert!(mask.disabled.iter().any(|rule| rule.reason.contains("io_schedule")));
-        for nonterminal in [ProcessState::Stopped, ProcessState::Idle, ProcessState::Unknown] {
+        assert!(mask
+            .disabled
+            .iter()
+            .any(|rule| rule.reason.contains("io_schedule")));
+        for nonterminal in [
+            ProcessState::Stopped,
+            ProcessState::Idle,
+            ProcessState::Unknown,
+        ] {
             proc.state = nonterminal;
             let wait = PlanningWaitState::from_activity(&proc, Some(&sample));
             assert_eq!(wait.state, ProcessState::DiskSleep);
@@ -33784,9 +33853,15 @@ mod planning_pressure_tests {
         }
         proc.state = ProcessState::Running;
         sample.uid += 1;
-        assert_eq!(PlanningWaitState::from_activity(&proc, Some(&sample)).state, ProcessState::Running);
+        assert_eq!(
+            PlanningWaitState::from_activity(&proc, Some(&sample)).state,
+            ProcessState::Running
+        );
         proc.state = ProcessState::DiskSleep;
-        assert_eq!(PlanningWaitState::from_activity(&proc, None).state, ProcessState::DiskSleep);
+        assert_eq!(
+            PlanningWaitState::from_activity(&proc, None).state,
+            ProcessState::DiskSleep
+        );
     }
 
     #[cfg(feature = "ui")]
@@ -35291,7 +35366,10 @@ struct PlanningWaitState {
 }
 
 impl PlanningWaitState {
-    fn from_activity(proc: &ProcessRecord, activity: Option<&pt_core::collect::ProcessActivity>) -> Self {
+    fn from_activity(
+        proc: &ProcessRecord,
+        activity: Option<&pt_core::collect::ProcessActivity>,
+    ) -> Self {
         let (state, wchan) = proc.decision_state(activity);
         Self {
             state,
@@ -39596,22 +39674,42 @@ impl ApplyScopeLimits {
 
     fn constrain(&self, args: &mut AgentApplyArgs) -> Result<(), String> {
         args.min_age = args.min_age.into_iter().chain(self.min_age).max();
-        args.min_posterior = args.min_posterior.into_iter().chain(self.min_posterior).reduce(f64::max);
-        args.max_blast_radius = args.max_blast_radius.into_iter().chain(self.max_blast_radius).reduce(f64::min);
-        args.max_total_blast_radius = args.max_total_blast_radius.into_iter().chain(self.max_total_blast_radius).reduce(f64::min);
+        args.min_posterior = args
+            .min_posterior
+            .into_iter()
+            .chain(self.min_posterior)
+            .reduce(f64::max);
+        args.max_blast_radius = args
+            .max_blast_radius
+            .into_iter()
+            .chain(self.max_blast_radius)
+            .reduce(f64::min);
+        args.max_total_blast_radius = args
+            .max_total_blast_radius
+            .into_iter()
+            .chain(self.max_total_blast_radius)
+            .reduce(f64::min);
         args.max_kills = args.max_kills.into_iter().chain(self.max_kills).min();
         args.require_known_signature |= self.require_known_signature;
         args.abort_on_unknown |= self.abort_on_unknown;
         if args.only_categories.is_empty() {
             args.only_categories.clone_from(&self.only_categories);
         } else if !self.only_categories.is_empty() {
-            args.only_categories.retain(|category| self.only_categories.iter().any(|saved| saved.eq_ignore_ascii_case(category)));
+            args.only_categories.retain(|category| {
+                self.only_categories
+                    .iter()
+                    .any(|saved| saved.eq_ignore_ascii_case(category))
+            });
             if args.only_categories.is_empty() {
                 return Err("the requested categories do not overlap the saved approval".into());
             }
         }
         for excluded in &self.exclude_categories {
-            if !args.exclude_categories.iter().any(|item| item.eq_ignore_ascii_case(excluded)) {
+            if !args
+                .exclude_categories
+                .iter()
+                .any(|item| item.eq_ignore_ascii_case(excluded))
+            {
                 args.exclude_categories.push(excluded.clone());
             }
         }
@@ -39628,13 +39726,24 @@ fn read_apply_scope(
     let Some(bytes) = bytes else { return Ok(None) };
     let scope: ApplyScope = serde_json::from_slice(bytes)
         .map_err(|error| format!("cannot decode saved apply scope: {error}"))?;
-    if scope.version != 1 || scope.session_id != plan.session_id || scope.host_id != host_id
+    if scope.version != 1
+        || scope.session_id != plan.session_id
+        || scope.host_id != host_id
         || scope.plan_sha256 != format!("{:x}", Sha256::digest(plan_content.as_bytes()))
     {
         return Err("saved apply approval does not match this session, host and exact plan".into());
     }
-    let valid_ids: HashSet<&str> = plan.actions.iter().map(|action| action.action_id.as_str()).collect();
-    if scope.action_ids.is_empty() || scope.action_ids.iter().any(|id| !valid_ids.contains(id.as_str())) {
+    let valid_ids: HashSet<&str> = plan
+        .actions
+        .iter()
+        .map(|action| action.action_id.as_str())
+        .collect();
+    if scope.action_ids.is_empty()
+        || scope
+            .action_ids
+            .iter()
+            .any(|id| !valid_ids.contains(id.as_str()))
+    {
         return Err("saved apply scope contains no actions or references an unknown action".into());
     }
     Ok(Some(scope))
@@ -39890,24 +39999,34 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             &error.to_string(),
         );
     }
-    let completed_action_ids: HashSet<String> = if args.resume {
-        match executed_plan_actions(&plan, &saved_outcomes) {
-            Ok(executed) => executed
-                .into_iter()
-                .map(|(action, _)| action.action_id.clone())
-                .collect(),
+    // Preserve completion for the original selection before live/minimum-age
+    // filtering: a successfully killed process is expected to be absent now.
+    let resume_validated_at = args.resume.then(chrono::Utc::now);
+    let mut resumed_outcomes = if let Some(validated_at) = resume_validated_at {
+        match resumed_action_outcomes(
+            &plan,
+            &saved_outcomes,
+            &target_pids,
+            selected_identities.as_ref(),
+            validated_at,
+        ) {
+            Ok(outcomes) => outcomes,
             Err(error) => {
                 return output_apply_incomplete_execution(
                     global,
                     &sid,
                     execution_binding.as_ref(),
-                    &error.to_string(),
+                    &error,
                 );
             }
         }
     } else {
-        HashSet::new()
+        Vec::new()
     };
+    let mut completed_action_ids: HashSet<String> = resumed_outcomes
+        .iter()
+        .map(|outcome| outcome.action_id.clone())
+        .collect();
     // Compare these exact bytes again under the execution lock for every apply,
     // since a concurrent executor can introduce an unresolved admission too.
     let outcomes_snapshot = saved_content.map(String::into_bytes);
@@ -39929,26 +40048,45 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
 
     let refuse_scope = |reason: String| {
         eprintln!("agent apply: {reason}");
-        println!("{}", format_structured_output(global, apply_refusal_document(
-            &sid, "apply_scope_refused", &reason, execution_binding.as_ref(),
-        )));
+        println!(
+            "{}",
+            format_structured_output(
+                global,
+                apply_refusal_document(
+                    &sid,
+                    "apply_scope_refused",
+                    &reason,
+                    execution_binding.as_ref(),
+                )
+            )
+        );
         ExitCode::PolicyBlocked
     };
     let scope_path = handle.dir.join(APPLY_SCOPE_FILE);
     let scope_snapshot = match pt_core::session::read_jsonl(&scope_path) {
         Ok(bytes) => bytes,
-        Err(error) => return refuse_scope(format!("cannot inspect the saved apply scope: {error}")),
+        Err(error) => {
+            return refuse_scope(format!("cannot inspect the saved apply scope: {error}"))
+        }
     };
     let host_id = pt_core::logging::get_host_id();
-    let prior_scope = match read_apply_scope(scope_snapshot.as_deref(), &plan, &plan_content, &host_id) {
-        Ok(scope) => scope,
-        Err(error) => return refuse_scope(error),
-    };
+    let prior_scope =
+        match read_apply_scope(scope_snapshot.as_deref(), &plan, &plan_content, &host_id) {
+            Ok(scope) => scope,
+            Err(error) => return refuse_scope(error),
+        };
     if !args.pids.is_empty() {
         let mut identities = HashMap::new();
-        for action in plan.actions.iter().filter(|action| selected_ids.contains(&action.action_id)) {
+        for action in plan
+            .actions
+            .iter()
+            .filter(|action| selected_ids.contains(&action.action_id))
+        {
             let identity = (&action.target.start_id, &action.target.uid);
-            if identities.insert(action.target.pid.0, identity).is_some_and(|previous| previous != identity) {
+            if identities
+                .insert(action.target.pid.0, identity)
+                .is_some_and(|previous| previous != identity)
+            {
                 return refuse_scope("a requested PID has multiple identities in the plan; select its exact --targets identity".into());
             }
         }
@@ -39966,12 +40104,16 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             }
         } else {
             let pending = plan.actions.iter().any(|action| {
-                !action.blocked && action.action != Action::Keep
+                !action.blocked
+                    && action.action != Action::Keep
                     && selected_ids.contains(&action.action_id)
                     && !completed_action_ids.contains(&action.action_id)
             });
-            let previous_execution = saved_outcomes.iter().any(|outcome| !matches!(outcome.status.as_str(), "dry_run" | "shadow"));
-            if pending && args.targets.is_empty()
+            let previous_execution = saved_outcomes
+                .iter()
+                .any(|outcome| !matches!(outcome.status.as_str(), "dry_run" | "shadow"));
+            if pending
+                && args.targets.is_empty()
                 && (previous_execution || (!args.recommended && args.pids.is_empty()))
             {
                 return refuse_scope("no recorded apply scope proves which remaining targets were approved; inspect the plan and specify exact --targets identities".into());
@@ -39987,7 +40129,14 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         }
         Ok(())
     };
-    target_pids = plan.actions.iter()
+    // A saved approval can narrow --resume after the initial journal replay.
+    // Keep historical evidence inside that final action scope, before any live
+    // census removes completed processes from the current target list.
+    resumed_outcomes.retain(|outcome| selected_ids.contains(&outcome.action_id));
+    completed_action_ids.retain(|id| selected_ids.contains(id));
+    target_pids = plan
+        .actions
+        .iter()
         .filter(|action| selected_ids.contains(&action.action_id))
         .map(|action| action.target.pid.0)
         .collect();
@@ -40079,16 +40228,14 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             .map(|proc| proc.pid.0)
             .collect();
         target_pids.retain(|pid| eligible.contains(pid));
-        let eligible_ids: HashSet<&str> = plan.actions.iter()
+        let eligible_ids: HashSet<&str> = plan
+            .actions
+            .iter()
             .filter(|action| eligible.contains(&action.target.pid.0))
             .map(|action| action.action_id.as_str())
             .collect();
-        selected_ids.retain(|id| completed_action_ids.contains(id) || eligible_ids.contains(id.as_str()));
-    }
-
-    if target_pids.is_empty() {
-        output_apply_nothing(global, &sid, execution_binding.as_ref());
-        return ExitCode::Clean;
+        selected_ids
+            .retain(|id| completed_action_ids.contains(id) || eligible_ids.contains(id.as_str()));
     }
 
     // Filter out completed actions using earlier declaration for --resume mode
@@ -40100,7 +40247,37 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         .filter(|a| !completed_action_ids.contains(&a.action_id))
         .collect();
     if actions_to_apply.is_empty() {
-        output_apply_nothing(global, &sid, execution_binding.as_ref());
+        let _completion_lock = if resumed_outcomes.is_empty() {
+            None
+        } else {
+            match lock_apply_completion_snapshot(
+                &handle,
+                plan_content.as_bytes(),
+                outcomes_snapshot.as_deref(),
+            ) {
+                Ok(lock) => Some(lock),
+                Err(error) => {
+                    return output_apply_incomplete_execution(
+                        global,
+                        &sid,
+                        execution_binding.as_ref(),
+                        &error,
+                    );
+                }
+            }
+        };
+        if _completion_lock.is_some() {
+            if let Err(error) = check_scope_snapshot() {
+                return refuse_scope(error);
+            }
+        }
+        output_apply_nothing(
+            global,
+            &sid,
+            execution_binding.as_ref(),
+            &resumed_outcomes,
+            resume_validated_at,
+        );
         return ExitCode::Clean;
     }
 
@@ -40424,7 +40601,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     let mut skipped = 0usize;
     let mut blocked_by_constraints = 0usize;
     let mut blocked_by_prechecks = 0usize;
-    let mut resumed_skipped = 0usize;
+    let mut resumed_skipped = resumed_outcomes.len();
     let mut operation_timed_out = false;
 
     if deadline_expired() {
@@ -42286,6 +42463,9 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             "resumed_skipped": resumed_skipped
         },
         "outcomes": outcomes,
+        "resumed_outcomes": resumed_outcomes,
+        "resume_validated_at": resume_validated_at,
+        "resume_evidence_scope": "historical_execution_completion_not_current_postcondition",
         "max_parallel_kills": max_parallel_kills,
         "operation_timed_out": operation_timed_out,
         "timeout_seconds": global.timeout,
@@ -42593,7 +42773,9 @@ fn apply_refusal_document(
         | "preview_budget_unavailable"
         | "outcome_journal_unavailable"
         | "incomplete_execution" => FailureCategory::EvidenceUnavailable,
-        "confirmation_required" | "robot_mode_disabled" | "apply_scope_refused" => FailureCategory::PolicyBlocked,
+        "confirmation_required" | "robot_mode_disabled" | "apply_scope_refused" => {
+            FailureCategory::PolicyBlocked
+        }
         _ => FailureCategory::UnexpectedError,
     };
     insert_apply_failure_recovery(sid, None, category, &mut result);
@@ -42606,12 +42788,181 @@ fn apply_refusal_document(
     result
 }
 
+/// Retain historical completion only for the original requested identities.
+/// Completed kills may have disappeared before the live minimum-age census;
+/// that census cannot erase their durable execution evidence.
+fn resumed_action_outcomes(
+    plan: &Plan,
+    saved: &[pt_core::verify::SavedActionOutcome],
+    target_pids: &[u32],
+    selected_identities: Option<&HashSet<(u32, String)>>,
+    validated_at: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<pt_core::verify::SavedActionOutcome>, String> {
+    validate_execution_replay(plan, saved).map_err(|error| error.to_string())?;
+    let executed = pt_core::verify::executed_action_outcomes_at(&plan.actions, saved, validated_at)
+        .map_err(|error| error.to_string())?;
+    let mut resumed = Vec::new();
+    for (action, outcome) in executed {
+        if !target_pids.contains(&action.target.pid.0)
+            || selected_identities.is_some_and(|identities| {
+                !identities.contains(&(action.target.pid.0, action.target.start_id.0.clone()))
+            })
+        {
+            continue;
+        }
+        if outcome.target.as_ref() != Some(&action.target) {
+            return Err(format!(
+                "{} historical completion differs from the complete approved identity",
+                action.action_id
+            ));
+        }
+        resumed.push(outcome.clone());
+    }
+    Ok(resumed)
+}
+
+/// A no-op resume still attests to a canonical plan and a complete journal.
+/// Serialize its readback with execution, undo, retention and plan publication,
+/// without loading or charging the kill budget or appending any action record.
+fn lock_apply_completion_snapshot(
+    handle: &SessionHandle,
+    plan_content: &[u8],
+    outcomes_snapshot: Option<&[u8]>,
+) -> Result<GlobalLock, String> {
+    let lock = lock_canonical_session_plan(handle)?;
+    let current_plan = fs::read(handle.dir.join("decision/plan.json"))
+        .map_err(|error| format!("cannot revalidate resumed plan: {error}"))?;
+    if current_plan != plan_content {
+        return Err(
+            "canonical plan changed before resumed completion could be acknowledged".into(),
+        );
+    }
+    let current_outcomes = pt_core::session::read_jsonl(&handle.dir.join("action/outcomes.jsonl"))
+        .map_err(|error| format!("cannot revalidate resumed execution history: {error}"))?;
+    if current_outcomes.as_deref() != outcomes_snapshot {
+        return Err(
+            "execution history changed before resumed completion could be acknowledged".into(),
+        );
+    }
+    if execution_history_is_missing(handle, current_outcomes.as_deref())? {
+        return Err("resumed execution history is missing; completion remains unknown".into());
+    }
+    Ok(lock)
+}
+
+#[cfg(test)]
+mod apply_resume_receipt_tests {
+    use super::*;
+    use pt_core::verify::SavedActionOutcome;
+
+    fn action(id: &str, pid: u32, birth: u64) -> PlanAction {
+        let target = ProcessIdentity::full(
+            pid,
+            pt_common::StartId::from_linux("resume-boot", birth, pid),
+            1000,
+            Some(50),
+            Some(40),
+            pt_common::IdentityQuality::Full,
+        );
+        serde_json::from_value(serde_json::json!({
+            "action_id": id, "target": target, "action": "renice",
+            "order": 0, "stage": 0, "timeouts": pt_core::plan::ActionTimeouts::default(),
+            "pre_checks": [], "rationale": {}, "on_success": [], "on_failure": [],
+            "blocked": false
+        }))
+        .unwrap()
+    }
+
+    fn plan(actions: &[PlanAction]) -> Plan {
+        serde_json::from_value(serde_json::json!({
+            "session_id": "pt-20261105-120000-abcd",
+            "plan_id": "resume-fixture",
+            "pt_version": env!("CARGO_PKG_VERSION"),
+            "generated_at": "2026-11-05T12:00:00Z",
+            "policy_id": null,
+            "policy_version": "1.0.0",
+            "actions": actions,
+            "pre_toggled": [],
+            "gates_summary": {
+                "total_candidates": actions.len(),
+                "blocked_candidates": 0,
+                "pre_toggled_actions": 0
+            }
+        }))
+        .unwrap()
+    }
+
+    fn completed(action: &PlanAction) -> SavedActionOutcome {
+        serde_json::from_value(serde_json::json!({
+            "action_id": action.action_id,
+            "pid": action.target.pid.0,
+            "action": action.action,
+            "target": action.target,
+            "status": "success",
+            "executed_at": "2026-11-05T12:01:00Z",
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn resume_history_preserves_the_original_exact_selection_and_latest_result() {
+        let actions = [
+            action("old", 101, 40),
+            action("new", 101, 80),
+            action("other", 102, 40),
+        ];
+        let plan = plan(&actions);
+        let mut saved: Vec<_> = actions.iter().map(completed).collect();
+        let selected = HashSet::from([(101, actions[0].target.start_id.0.clone())]);
+        let at = chrono::DateTime::parse_from_rfc3339("2026-11-05T12:02:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let resumed = resumed_action_outcomes(&plan, &saved, &[101], Some(&selected), at).unwrap();
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(resumed[0].action_id, "old");
+        assert_eq!(resumed[0].target, saved[0].target);
+        assert_eq!(resumed[0].executed_at, saved[0].executed_at);
+        assert_eq!(
+            resumed_action_outcomes(&plan, &saved, &[101], None, at)
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let mut failed = saved[0].clone();
+        failed.status = "failed".into();
+        failed.executed_at = Some(at);
+        saved.push(failed);
+        assert!(
+            resumed_action_outcomes(&plan, &saved, &[101], Some(&selected), at)
+                .unwrap()
+                .is_empty()
+        );
+
+        saved.pop();
+        saved[0].target.as_mut().unwrap().pgid = Some(999);
+        assert!(resumed_action_outcomes(&plan, &saved, &[101], Some(&selected), at).is_err());
+    }
+}
+
 fn output_apply_nothing(
     global: &GlobalOpts,
     sid: &SessionId,
     binding: Option<&ApplyBindingReceipt>,
+    resumed_outcomes: &[pt_core::verify::SavedActionOutcome],
+    resume_validated_at: Option<chrono::DateTime<chrono::Utc>>,
 ) {
-    let mut result = serde_json::json!({"session_id": sid.0, "mode": "robot_apply", "note": "nothing_to_do", "summary": {"attempted": 0}, "outcomes": []});
+    let mut result = serde_json::json!({
+        "session_id": sid.0,
+        "mode": "robot_apply",
+        "note": "nothing_to_do",
+        "summary": {"attempted": 0, "resumed_skipped": resumed_outcomes.len()},
+        "outcomes": [],
+        "resumed": resume_validated_at.is_some(),
+        "resumed_outcomes": resumed_outcomes,
+        "resume_validated_at": resume_validated_at,
+        "resume_evidence_scope": "historical_execution_completion_not_current_postcondition",
+    });
     if let Some(binding) = binding {
         result["execution_binding"] = serde_json::json!(binding);
     }
@@ -42619,7 +42970,13 @@ fn output_apply_nothing(
         OutputFormat::Json | OutputFormat::Toon => {
             println!("{}", format_structured_output(global, result));
         }
-        _ => println!("[{}] apply: nothing to do", sid),
+        OutputFormat::Jsonl => println!("{}", global.process_output_value(result)),
+        OutputFormat::Exitcode => {}
+        _ => println!(
+            "[{}] apply: nothing to do; {} previously completed actions",
+            sid,
+            resumed_outcomes.len()
+        ),
     }
 }
 
@@ -49667,8 +50024,14 @@ fn run_agent_session_status(
             .state_history
             .iter()
             .any(|transition| transition.state == SessionState::Executing);
-    let apply_phase = matches!(manifest.state, SessionState::Planned | SessionState::Executing)
-        || (entered_execution && matches!(manifest.state, SessionState::Completed | SessionState::Failed));
+    let apply_phase = matches!(
+        manifest.state,
+        SessionState::Planned | SessionState::Executing
+    ) || (entered_execution
+        && matches!(
+            manifest.state,
+            SessionState::Completed | SessionState::Failed
+        ));
     let outcomes_path = handle.dir.join("action").join("outcomes.jsonl");
     let plan_path = handle.dir.join("decision").join("plan.json");
     let plan_content = match std::fs::read_to_string(&plan_path) {
@@ -49739,7 +50102,9 @@ fn run_agent_session_status(
             .map_err(|error| error.to_string())?;
         completed_actions = progress.successful;
         failed_actions = progress.failed;
-        progress.ensure_resolved().map_err(|error| error.to_string())?;
+        progress
+            .ensure_resolved()
+            .map_err(|error| error.to_string())?;
         if apply_phase && total_actions > ineligible_actions + completed_actions {
             let scope = pt_core::session::read_jsonl(&handle.dir.join(APPLY_SCOPE_FILE))
                 .map_err(|error| error.to_string())
@@ -49763,7 +50128,8 @@ fn run_agent_session_status(
         }
         Ok(())
     })();
-    let execution_uncertain = replay_state.is_err() && (entered_execution || !outcome_records.is_empty());
+    let execution_uncertain =
+        replay_state.is_err() && (entered_execution || !outcome_records.is_empty());
     let resume_refusal_reason = replay_state.err().or(scope_refusal);
     let pending_actions = total_actions.saturating_sub(ineligible_actions + completed_actions);
     let resumable = manifest.mode != SessionMode::DaemonAlert
