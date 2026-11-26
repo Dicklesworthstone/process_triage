@@ -208,6 +208,11 @@ pub struct DeepScanRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network: Option<NetworkInfo>,
 
+    /// Gaps in socket attribution. When nonempty, the counts and queues in
+    /// `network` describe only the sockets we could resolve.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub network_unavailable: Vec<String>,
+
     /// Environment variables (if requested and accessible).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub environ: Option<std::collections::HashMap<String, String>>,
@@ -225,6 +230,52 @@ pub struct DeepScanRecord {
 }
 
 impl DeepScanRecord {
+    fn collect_network(&mut self, snapshot: &NetworkSnapshot) {
+        match snapshot.observe_identity(&self.to_identity()) {
+            Ok(observation) => {
+                self.network = Some(observation.info);
+                self.network_unavailable = observation.unavailable;
+            }
+            Err(error) => {
+                self.network = None;
+                self.network_unavailable = vec![error.to_string()];
+            }
+        }
+    }
+
+    /// Complete, partially attributed, or unavailable socket inventory.
+    /// Legacy records only retained complete network-table observations.
+    pub fn network_coverage(&self) -> &'static str {
+        match &self.network {
+            None => "unavailable",
+            Some(_) if self.network_unavailable.is_empty() => "complete",
+            Some(_) => "partial",
+        }
+    }
+
+    /// Positive socket ownership evidence. An empty observation cannot prove
+    /// inactivity, even when every descriptor was attributed.
+    pub fn observed_socket_presence(&self) -> Option<bool> {
+        let observed = self.network.as_ref().is_some_and(|network| {
+            let counts = &network.socket_counts;
+            [
+                counts.tcp,
+                counts.tcp6,
+                counts.udp,
+                counts.udp6,
+                counts.unix,
+                counts.raw,
+            ]
+            .iter()
+            .any(|count| *count > 0)
+                || !network.listen_ports.is_empty()
+                || !network.tcp_connections.is_empty()
+                || !network.udp_sockets.is_empty()
+                || !network.unix_sockets.is_empty()
+        }) || self.fd.as_ref().is_some_and(|fd| fd.sockets > 0);
+        observed.then_some(true)
+    }
+
     /// Extract a ProcessIdentity for revalidation during action execution.
     ///
     /// The ProcessIdentity captures the essential fields needed to verify
@@ -1322,9 +1373,7 @@ fn parse_probed_process(
     let fd = parse_fd(pid); // fd is a directory, still sync for now
     let local_resource_evidence = collect_local_resource_evidence(pid, fd.as_ref());
     let wchan = parse_wchan(pid); // wchan might be better probed but keep sync for now
-    let network = network_snapshot.get_process_info(pid);
-
-    Ok(DeepScanRecord {
+    let mut record = DeepScanRecord {
         pid: ProcessId(pid),
         ppid: ProcessId(stat_info.ppid),
         uid,
@@ -1347,12 +1396,15 @@ fn parse_probed_process(
         workspace: None,
         cgroup,
         wchan,
-        network,
+        network: None,
+        network_unavailable: Vec::new(),
         environ,
         starttime: stat_info.starttime,
         source: "deep_scan".to_string(),
         identity_quality,
-    })
+    };
+    record.collect_network(network_snapshot);
+    Ok(record)
 }
 
 /// List all PIDs from /proc.
@@ -1448,7 +1500,6 @@ fn scan_process(
     let local_resource_evidence = collect_local_resource_evidence(pid, fd.as_ref());
     let cgroup = parse_cgroup(pid);
     let wchan = parse_wchan(pid);
-    let network = network_snapshot.get_process_info(pid);
 
     // Collect environment variables if requested (may contain sensitive data)
     let environ = if include_environ {
@@ -1457,7 +1508,7 @@ fn scan_process(
         None
     };
 
-    Ok(DeepScanRecord {
+    let mut record = DeepScanRecord {
         pid: ProcessId(pid),
         ppid: ProcessId(stat_info.ppid),
         uid,
@@ -1480,12 +1531,15 @@ fn scan_process(
         workspace: None,
         cgroup,
         wchan,
-        network,
+        network: None,
+        network_unavailable: Vec::new(),
         environ,
         starttime: stat_info.starttime,
         source: "deep_scan".to_string(),
         identity_quality,
-    })
+    };
+    record.collect_network(network_snapshot);
+    Ok(record)
 }
 
 /// Compute start_id from available information.
@@ -1523,6 +1577,7 @@ mod tests {
             cgroup: None,
             wchan: None,
             network: None,
+            network_unavailable: Vec::new(),
             environ: None,
             starttime: 12345,
             source: "protocol-fixture".into(),

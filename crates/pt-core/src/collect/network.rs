@@ -98,6 +98,12 @@ impl NetworkInfo {
             .iter()
             .any(|c| c.rx_queue > threshold || c.tx_queue > threshold)
     }
+
+    /// A large observed TCP queue supports a positive backlog signal. A
+    /// single observation cannot establish spare capacity or throughput.
+    pub fn observed_queue_saturation(&self) -> Option<bool> {
+        self.has_saturated_queue(4096).then_some(true)
+    }
 }
 
 #[derive(Debug, Default)]

@@ -299,7 +299,12 @@ impl Evaluator {
             net: self
                 .deep_records
                 .get(&process.pid.0)
-                .and_then(deep_socket_presence),
+                .and_then(DeepScanRecord::observed_socket_presence),
+            queue_saturated: self
+                .deep_records
+                .get(&process.pid.0)
+                .and_then(|record| record.network.as_ref())
+                .and_then(|network| network.observed_queue_saturation()),
             // /proc/PID/io is cumulative. A single deep scan cannot establish
             // current I/O activity or a queue service rate.
             ..evidence
@@ -313,15 +318,24 @@ impl Evaluator {
             self.deep_records
                 .get(&process.pid.0)
                 .map(|record| {
+                    let complete = record.network_unavailable.is_empty();
                     serde_json::json!({
                         "start_id": record.start_id,
                         "source": record.source,
-                        "has_network_sockets": deep_socket_presence(record),
+                        "has_network_sockets": record.observed_socket_presence(),
+                        "network_coverage": record.network_coverage(),
+                        "network_unavailable": record.network_unavailable,
                         "network": record.network.as_ref().map(|network| serde_json::json!({
-                            "socket_counts": network.socket_counts,
+                            "socket_counts": complete.then_some(&network.socket_counts),
+                            "observed_socket_counts": network.socket_counts,
                             "listening_ports": network.listen_ports,
-                            "rx_queue_bytes": network.total_rx_queue(),
-                            "tx_queue_bytes": network.total_tx_queue(),
+                            "rx_queue_bytes": complete.then(|| network.total_rx_queue()),
+                            "tx_queue_bytes": complete.then(|| network.total_tx_queue()),
+                            "observed_rx_queue_bytes": (!network.tcp_connections.is_empty() || complete)
+                                .then(|| network.total_rx_queue()),
+                            "observed_tx_queue_bytes": (!network.tcp_connections.is_empty() || complete)
+                                .then(|| network.total_tx_queue()),
+                            "queue_saturated": network.observed_queue_saturation(),
                         })),
                         "io_counters": record.io,
                         "io_activity": self
@@ -394,34 +408,6 @@ fn match_deep_records(
         }
     }
     (matched, identity_mismatches)
-}
-
-/// Socket presence is evidence of a network resource, not measured traffic.
-/// Empty socket/FD tables cannot prove absence in another namespace or when
-/// descriptor iteration was incomplete. The collector does not yet preserve
-/// every directory-read error, so only positive observations affect inference.
-#[cfg(target_os = "linux")]
-fn deep_socket_presence(record: &DeepScanRecord) -> Option<bool> {
-    if record.network.as_ref().is_some_and(|network| {
-        let counts = &network.socket_counts;
-        [
-            counts.tcp,
-            counts.tcp6,
-            counts.udp,
-            counts.udp6,
-            counts.unix,
-            counts.raw,
-        ]
-        .iter()
-        .any(|count| *count > 0)
-            || !network.listen_ports.is_empty()
-            || !network.tcp_connections.is_empty()
-            || !network.udp_sockets.is_empty()
-            || !network.unix_sockets.is_empty()
-    }) {
-        return Some(true);
-    }
-    record.fd.as_ref().filter(|fd| fd.sockets > 0).map(|_| true)
 }
 
 fn top_signature(process: &ProcessRecord, db: &SignatureDatabase) -> Option<String> {
@@ -2195,6 +2181,7 @@ mod tests {
                 },
                 ..Default::default()
             }),
+            network_unavailable: Vec::new(),
             environ: None,
             starttime: 1234567890,
             source: "deep_scan".to_string(),
@@ -2277,29 +2264,86 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn deep_network_partial_queues_preserve_positive_evidence_and_withhold_totals() {
+        use crate::collect::{TcpConnection, TcpState};
+
+        let process = protection_test_scan().processes.pop().unwrap();
+        let mut record = deep_test_record(&process);
+        record
+            .network
+            .as_mut()
+            .unwrap()
+            .tcp_connections
+            .push(TcpConnection {
+                local_addr: "127.0.0.1".into(),
+                local_port: 8000,
+                remote_addr: "127.0.0.1".into(),
+                remote_port: 40000,
+                state: TcpState::Established,
+                inode: 41,
+                is_ipv6: false,
+                tx_queue: 16,
+                rx_queue: 8192,
+            });
+        let mut evaluator =
+            protection_test_evaluator(ProtectedFilter::new(&[], &[], &[], &[]).unwrap());
+        for complete in [true, false] {
+            if !complete {
+                record
+                    .network_unavailable
+                    .push("unresolved socket inode".into());
+            }
+            evaluator.deep_records.insert(process.pid.0, record.clone());
+            let evidence = evaluator.evidence(&process);
+            assert_eq!(evidence.net, Some(true));
+            assert_eq!(evidence.queue_saturated, Some(true));
+            let deep = evaluator.deep_evidence(&process);
+            assert_eq!(
+                deep["network_coverage"],
+                if complete { "complete" } else { "partial" }
+            );
+            assert_eq!(
+                deep["network"]["rx_queue_bytes"].as_u64(),
+                complete.then_some(8192)
+            );
+            assert_eq!(
+                deep["network"]["socket_counts"]["tcp"].as_u64(),
+                complete.then_some(1)
+            );
+            assert_eq!(deep["network"]["observed_rx_queue_bytes"], 8192);
+            assert_eq!(deep["network"]["observed_socket_counts"]["tcp"], 1);
+        }
+        record.network = Some(Default::default());
+        evaluator.deep_records.insert(process.pid.0, record);
+        assert_eq!(evaluator.evidence(&process).queue_saturated, None);
+        assert!(evaluator.deep_evidence(&process)["network"]["observed_rx_queue_bytes"].is_null());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn deep_socket_absence_remains_unknown_without_collection_completeness() {
         let process = protection_test_scan().processes.pop().unwrap();
         let mut record = deep_test_record(&process);
         record.network = Some(crate::collect::NetworkInfo::default());
-        assert_eq!(deep_socket_presence(&record), None);
+        assert_eq!(record.observed_socket_presence(), None);
 
         record.fd = Some(crate::collect::FdInfo {
             count: 2,
             by_type: HashMap::from([("file".to_string(), 1)]),
             ..Default::default()
         });
-        assert_eq!(deep_socket_presence(&record), None);
+        assert_eq!(record.observed_socket_presence(), None);
         record
             .fd
             .as_mut()
             .unwrap()
             .by_type
             .insert("file".to_string(), 2);
-        assert_eq!(deep_socket_presence(&record), None);
+        assert_eq!(record.observed_socket_presence(), None);
         record.fd.as_mut().unwrap().truncated = true;
-        assert_eq!(deep_socket_presence(&record), None);
+        assert_eq!(record.observed_socket_presence(), None);
         record.fd.as_mut().unwrap().sockets = 1;
-        assert_eq!(deep_socket_presence(&record), Some(true));
+        assert_eq!(record.observed_socket_presence(), Some(true));
     }
 
     #[cfg(target_os = "linux")]

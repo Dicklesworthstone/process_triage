@@ -66,7 +66,7 @@ struct NamespaceListener {
 }
 
 impl NamespaceListener {
-    fn spawn(isolated: bool, port: u16) -> Self {
+    fn spawn(isolated: bool, port: u16, unbound_udp: bool) -> Self {
         let executable = std::env::current_exe().expect("current test executable");
         let mut command = if isolated {
             let mut command = Command::new("unshare");
@@ -86,6 +86,10 @@ impl NamespaceListener {
                 "--test-threads=1",
             ])
             .env("PT_NETWORK_NAMESPACE_LISTENER", port.to_string())
+            .env(
+                "PT_NETWORK_UNBOUND_UDP",
+                if unbound_udp { "1" } else { "0" },
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -154,6 +158,19 @@ fn namespace_listener_child() {
     };
     let listener = std::net::TcpListener::bind(("0.0.0.0", port.parse::<u16>().unwrap()))
         .expect("listen inside the selected network namespace");
+    // An unbound Internet socket owns an inode but has no row in /proc/net/udp.
+    let _udp = (std::env::var("PT_NETWORK_UNBOUND_UDP").as_deref() == Ok("1")).then(|| {
+        use std::os::fd::FromRawFd;
+        // SAFETY: socket takes scalar arguments, and the newly created fd
+        // transfers to exactly one UdpSocket for the lifetime of the fixture.
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+        assert!(
+            fd >= 0,
+            "create unbound UDP socket: {}",
+            std::io::Error::last_os_error()
+        );
+        unsafe { std::net::UdpSocket::from_raw_fd(fd) }
+    });
     println!(
         "\nPT_NETWORK_READY {} {}",
         std::process::id(),
@@ -184,7 +201,7 @@ fn live_cached_network_preserves_listener_when_new_socket_is_unattributed() {
     if skip_if_proc_unavailable() {
         return;
     }
-    let mut target = NamespaceListener::spawn(false, 0);
+    let mut target = NamespaceListener::spawn(false, 0, false);
     assert_eq!(target.pid, target.child.id());
     let before = pt_core::collect::proc_parsers::read_required_proc_stat(target.pid)
         .expect("owned child birth identity");
@@ -297,6 +314,39 @@ fn live_cached_network_preserves_listener_when_new_socket_is_unattributed() {
 }
 
 #[test]
+fn live_deep_scan_preserves_partial_network_for_an_owned_listener() {
+    use pt_core::collect::{deep_scan, DeepScanOptions};
+
+    if skip_if_proc_unavailable() {
+        return;
+    }
+    let target = NamespaceListener::spawn(false, 0, true);
+    for use_wait_free in [false, true] {
+        let result = deep_scan(&DeepScanOptions {
+            pids: vec![target.pid],
+            use_wait_free,
+            ..Default::default()
+        })
+        .expect("scan owned listener and unbound UDP socket");
+        let [record] = result.processes.as_slice() else {
+            panic!("owned process missing")
+        };
+        assert_eq!(record.network_coverage(), "partial");
+        assert_eq!(record.observed_socket_presence(), Some(true));
+        assert!(record
+            .network_unavailable
+            .iter()
+            .any(|reason| reason.contains("socket inode")));
+        let network = record.network.as_ref().unwrap();
+        assert!(network
+            .listen_ports
+            .iter()
+            .any(|port| port.port == target.port));
+        assert_eq!(network.observed_queue_saturation(), None);
+    }
+}
+
+#[test]
 fn live_snapshot_observes_private_namespaces_without_false_port_conflicts() {
     let capability = Command::new("unshare")
         .args(["--user", "--map-root-user", "--net", "true"])
@@ -315,8 +365,8 @@ fn live_snapshot_observes_private_namespaces_without_false_port_conflicts() {
             return;
         }
     }
-    let host = NamespaceListener::spawn(false, 0);
-    let private = NamespaceListener::spawn(true, host.port);
+    let host = NamespaceListener::spawn(false, 0, false);
+    let private = NamespaceListener::spawn(true, host.port, false);
     let snapshot = NetworkSnapshot::collect();
     let host_info = snapshot
         .get_process_info_checked(host.pid)

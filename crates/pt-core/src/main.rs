@@ -7352,17 +7352,16 @@ fn precheck_label(check: &pt_core::plan::PreCheck) -> &'static str {
 
 /// Deep-scan evidence per pid (network, I/O, socket queues), used by the TUI and by
 /// `agent plan --deep`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct DeepSignals {
     net_active: Option<bool>,
+    network_coverage: &'static str,
+    network_unavailable: Vec<String>,
     io_active: Option<bool>,
     queue_saturated: Option<bool>,
     workspace_context: Option<DeepWorkspaceContext>,
-    #[cfg(feature = "ui")]
     queue_rx_bytes: Option<u64>,
-    #[cfg(feature = "ui")]
     queue_tx_bytes: Option<u64>,
-    #[cfg(feature = "ui")]
     queue_backlog_sockets: Option<usize>,
 }
 
@@ -7679,6 +7678,11 @@ fn candidate_deep_probe_report(
         "record_observed": signals.is_some(),
         "collection_status": report.status,
         "net_active": signals.and_then(|signals| signals.net_active),
+        "network_coverage": signals.map(|signals| signals.network_coverage),
+        "network_unavailable": signals.map(|signals| &signals.network_unavailable),
+        "observed_tcp_rx_queue_bytes": signals.and_then(|signals| signals.queue_rx_bytes),
+        "observed_tcp_tx_queue_bytes": signals.and_then(|signals| signals.queue_tx_bytes),
+        "observed_tcp_backlog_sockets": signals.and_then(|signals| signals.queue_backlog_sockets),
         "io_active": signals.and_then(|signals| signals.io_active),
         "queue_saturated": signals.and_then(|signals| signals.queue_saturated),
         "workspace_context": signals.and_then(|signals| signals.workspace_context),
@@ -7799,27 +7803,15 @@ fn collect_deep_observations_with(
         let io_active = scorer
             .activity_for(process)
             .and_then(|activity| activity.io_active);
-        let has_network = record.fd.as_ref().is_some_and(|fd| fd.sockets > 0)
-            || record.network.as_ref().is_some_and(|info| {
-                let counts = &info.socket_counts;
-                [
-                    counts.tcp,
-                    counts.tcp6,
-                    counts.udp,
-                    counts.udp6,
-                    counts.unix,
-                    counts.raw,
-                ]
-                .iter()
-                .any(|count| *count > 0)
-                    || !info.listen_ports.is_empty()
-                    || !info.tcp_connections.is_empty()
-                    || !info.udp_sockets.is_empty()
-                    || !info.unix_sockets.is_empty()
-            });
-        // Missing or empty socket tables never establish inactivity.
-        let net_active = has_network.then_some(true);
-        let queue_metrics = record.network.as_ref().map(observed_queue_metrics);
+        let net_active = record.observed_socket_presence();
+        let network_coverage = record.network_coverage();
+        let queue_metrics = record
+            .network
+            .as_ref()
+            .filter(|info| {
+                record.network_unavailable.is_empty() || !info.tcp_connections.is_empty()
+            })
+            .map(observed_queue_metrics);
         let workspace_context = deep_workspace_context(&record);
 
         if let Some(gpu) = record.gpu {
@@ -7837,14 +7829,13 @@ fn collect_deep_observations_with(
             record.pid.0,
             DeepSignals {
                 net_active,
+                network_coverage,
+                network_unavailable: record.network_unavailable,
                 io_active,
                 queue_saturated: queue_metrics.and_then(|metrics| metrics.saturated),
                 workspace_context,
-                #[cfg(feature = "ui")]
                 queue_rx_bytes: queue_metrics.map(|metrics| metrics.rx_bytes),
-                #[cfg(feature = "ui")]
                 queue_tx_bytes: queue_metrics.map(|metrics| metrics.tx_bytes),
-                #[cfg(feature = "ui")]
                 queue_backlog_sockets: queue_metrics.map(|metrics| metrics.backlog_sockets),
             },
         );
@@ -8086,6 +8077,7 @@ mod planning_probe_tests {
             cgroup: None,
             wchan: None,
             network: None,
+            network_unavailable: Vec::new(),
             environ: None,
             starttime: 12345,
             source: "protocol-fixture".into(),
@@ -8199,6 +8191,66 @@ mod planning_probe_tests {
         assert_eq!(candidate["record_observed"], true);
         for field in ["net_active", "io_active", "queue_saturated"] {
             assert!(candidate[field].is_null(), "{field}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn plan_retains_attributed_backlog_alongside_unresolved_socket_evidence() {
+        use pt_core::collect::{NetworkInfo, TcpConnection, TcpState};
+
+        let process = process(71);
+        let mut record = record(&process);
+        record.network = Some(NetworkInfo {
+            tcp_connections: vec![TcpConnection {
+                local_addr: "127.0.0.1".into(),
+                local_port: 8000,
+                remote_addr: "127.0.0.1".into(),
+                remote_port: 41000,
+                state: TcpState::Established,
+                inode: 42,
+                is_ipv6: false,
+                tx_queue: 12,
+                rx_queue: 8192,
+            }],
+            ..Default::default()
+        });
+        record
+            .network_unavailable
+            .push("unattributed socket inode".into());
+        let selected = HashSet::from([71]);
+        for has_connection in [true, false] {
+            if !has_connection {
+                record.network.as_mut().unwrap().tcp_connections.clear();
+            }
+            let run = collect_deep_observations_with(
+                &[&process],
+                &scorer(),
+                Duration::from_secs(3),
+                true,
+                |_, _| Ok(result(vec![record.clone()], 1, 0, true)),
+                |_| true,
+            );
+            let candidate = candidate_deep_probe_report(
+                71,
+                &selected,
+                run.observations.as_ref(),
+                &run.report,
+                None,
+            );
+            assert_eq!(candidate["network_coverage"], "partial");
+            assert_eq!(
+                candidate["network_unavailable"][0],
+                "unattributed socket inode"
+            );
+            assert_eq!(
+                candidate["queue_saturated"].as_bool(),
+                has_connection.then_some(true)
+            );
+            assert_eq!(
+                candidate["observed_tcp_rx_queue_bytes"].as_u64(),
+                has_connection.then_some(8192)
+            );
         }
     }
 
@@ -8767,28 +8819,19 @@ mod gpu_observation_tests {
 }
 
 // Linux-only: built from /proc/net socket data (the only caller is Linux-gated too).
-// Keep observed queue facts in lean unit tests as well as the UI.
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy)]
 struct QueueMetrics {
     saturated: Option<bool>,
-    #[cfg(any(feature = "ui", test))]
     rx_bytes: u64,
-    #[cfg(any(feature = "ui", test))]
     tx_bytes: u64,
-    #[cfg(any(feature = "ui", test))]
     backlog_sockets: usize,
 }
 
 #[cfg(target_os = "linux")]
 fn observed_queue_metrics(info: &pt_core::collect::NetworkInfo) -> QueueMetrics {
-    const QUEUE_SATURATION_THRESHOLD: u32 = 4096;
-
-    #[cfg(any(feature = "ui", test))]
     let total_rx = info.total_rx_queue();
-    #[cfg(any(feature = "ui", test))]
     let total_tx = info.total_tx_queue();
-    #[cfg(any(feature = "ui", test))]
     let backlog_sockets = info
         .tcp_connections
         .iter()
@@ -8799,17 +8842,12 @@ fn observed_queue_metrics(info: &pt_core::collect::NetworkInfo) -> QueueMetrics 
     // probability. Storage I/O activity and UNIX socket reference counts do not
     // measure socket throughput either. Retain only positive observed pressure;
     // absent or small queues are not proof that the process is clear or idle.
-    let saturated = info
-        .has_saturated_queue(QUEUE_SATURATION_THRESHOLD)
-        .then_some(true);
+    let saturated = info.observed_queue_saturation();
 
     QueueMetrics {
         saturated,
-        #[cfg(any(feature = "ui", test))]
         rx_bytes: total_rx,
-        #[cfg(any(feature = "ui", test))]
         tx_bytes: total_tx,
-        #[cfg(any(feature = "ui", test))]
         backlog_sockets,
     }
 }
@@ -9081,7 +9119,7 @@ fn build_tui_rows(
             continue;
         }
 
-        let deep = deep_signals.and_then(|m| m.get(&proc.pid.0).copied());
+        let deep = deep_signals.and_then(|m| m.get(&proc.pid.0));
         let probe = probe_advice.and_then(|m| m.get(&proc.pid.0));
         let evidence = Evidence {
             net: deep.and_then(|d| d.net_active),
@@ -35766,9 +35804,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         processed = processed.saturating_add(1);
 
         // Build evidence from process record, plus deep signals when requested
-        let deep = deep_signals
-            .as_ref()
-            .and_then(|m| m.get(&proc.pid.0).copied());
+        let deep = deep_signals.as_ref().and_then(|m| m.get(&proc.pid.0));
         let evidence = Evidence {
             net: deep.and_then(|d| d.net_active),
             io_active: deep.and_then(|d| d.io_active),
