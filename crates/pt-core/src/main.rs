@@ -35854,6 +35854,14 @@ fn candidate_recommendation(
         action = "review";
         rationale = format!("{reason}; {rationale}");
     }
+    if let Some(reason) = pipe_consumer_preservation_refusal(
+        score.pipe_liveness.as_ref(),
+        action,
+        policy.guardrails.builtin_protection,
+    ) {
+        action = "review";
+        rationale = format!("{reason}; {rationale}");
+    }
     CandidateRecommendation {
         action,
         rationale,
@@ -35862,6 +35870,32 @@ fn candidate_recommendation(
         fuse_server,
         fuse_mounts,
     }
+}
+
+/// A verified pipe path to recent work is a reason to retain a pipeline for
+/// review. It is not a claim that those CPU or storage bytes traversed the pipe,
+/// and absent peers or activity never constitute evidence of abandonment.
+fn pipe_consumer_preservation_refusal(
+    evidence: Option<&pt_core::scoring::PipeLivenessEvidence>,
+    action: &str,
+    builtin_protection: bool,
+) -> Option<String> {
+    if !builtin_protection
+        || !matches!(
+            action,
+            "kill"
+                | "restart"
+                | "pause"
+                | "freeze"
+                | "renice"
+                | "throttle"
+                | "cap_memory"
+                | "quarantine"
+        )
+    {
+        return None;
+    }
+    evidence.and_then(pt_core::scoring::PipeLivenessEvidence::review_reason)
 }
 
 /// A duplicate group is not permission to disrupt its retained build or a
@@ -47924,6 +47958,217 @@ impl WatchWorkloadState {
             "pressure_assessment": system["assessment"],
             "automatic_action_authorized": false,
         }))
+    }
+}
+
+#[cfg(test)]
+mod pipe_consumer_safety_tests {
+    use super::*;
+    use pt_common::{ProcessId, StartId};
+    use pt_core::collect::ProcessActivity;
+    use pt_core::decision::decide_action;
+    use pt_core::inference::ClassScores;
+    use pt_core::scoring::{PipeLivenessEvidence, PipeLivenessHop};
+
+    fn process(pid: u32, ppid: u32) -> ProcessRecord {
+        ProcessRecord {
+            pid: ProcessId(pid),
+            ppid: ProcessId(ppid),
+            uid: 1000,
+            user: "pipeline-user".to_string(),
+            pgid: Some(40),
+            sid: Some(40),
+            start_id: StartId::from_linux("pipe-test-boot", u64::from(pid) + 100, pid),
+            comm: "pipeline-stage".to_string(),
+            cmd: "pipeline-stage --stream".to_string(),
+            state: ProcessState::Sleeping,
+            cpu_percent: 0.0,
+            rss_bytes: 1024 * 1024,
+            vsz_bytes: 2 * 1024 * 1024,
+            tty: None,
+            start_time_unix: 1,
+            elapsed: Duration::from_secs(7200),
+            source: "pipe-safety-test".to_string(),
+            container_info: None,
+        }
+    }
+
+    fn observation(producer: &ProcessRecord, consumer: &ProcessRecord) -> PipeLivenessEvidence {
+        let hop = PipeLivenessHop {
+            writer: process_identity_from_record(producer),
+            writer_fd: 1,
+            reader: process_identity_from_record(consumer),
+            reader_fd: 0,
+            inode: 9001,
+        };
+        let activity = ProcessActivity {
+            pid: consumer.pid.0,
+            start_id: consumer.start_id.clone(),
+            uid: consumer.uid,
+            source: "procfs_window".to_string(),
+            requested_window_ms: 500,
+            cpu_percent: Some(4.0),
+            cpu_ticks: Some(2),
+            cpu_window_seconds: Some(0.5),
+            cpu_occupancy: None,
+            io_window_seconds: None,
+            io_read_bytes: None,
+            io_write_bytes: None,
+            read_bytes_per_second: None,
+            write_bytes_per_second: None,
+            io_active: None,
+            cpu_error: None,
+            io_error: Some("storage I/O was not observed".to_string()),
+            pressure: None,
+        };
+        PipeLivenessEvidence {
+            identity: hop.writer.clone(),
+            identity_verified: true,
+            readers: vec![hop.clone()],
+            writers: Vec::new(),
+            path: vec![hop],
+            active_consumer: Some(activity),
+            census_complete: true,
+            collection_complete: true,
+            scope: "linux_procfs_leader_pipe_peers".to_string(),
+            unavailable: Vec::new(),
+        }
+    }
+
+    fn decision_input(process: &ProcessRecord) -> DecisionCandidate {
+        let posterior = ClassScores {
+            useful: 0.001,
+            useful_bad: 0.0,
+            abandoned: 0.999,
+            zombie: 0.0,
+        };
+        let decision = decide_action(
+            &posterior,
+            &pt_core::config::Policy::default(),
+            &ActionFeasibility::allow_all(),
+        )
+        .unwrap();
+        assert_eq!(decision.optimal_action, Action::Kill);
+        DecisionCandidate {
+            identity: process_identity_from_record(process),
+            ppid: Some(process.ppid.0),
+            decision,
+            blocked_reasons: Vec::new(),
+            stage_pause_before_kill: false,
+            process_state: Some(process.state),
+            parent_identity: None,
+            d_state_diagnostics: None,
+            supervisor_restart: None,
+            memory_cap: None,
+        }
+    }
+
+    #[test]
+    fn active_pipe_peer_holds_disruptive_actions_but_preserves_recovery() {
+        let producer = process(41, 40);
+        let evidence = observation(&producer, &process(42, 1));
+        for action in [
+            "kill",
+            "restart",
+            "pause",
+            "freeze",
+            "renice",
+            "throttle",
+            "cap_memory",
+            "quarantine",
+        ] {
+            assert!(
+                pipe_consumer_preservation_refusal(Some(&evidence), action, true).is_some(),
+                "{action}"
+            );
+        }
+        for action in ["keep", "review", "resume", "unfreeze", "unquarantine"] {
+            assert!(pipe_consumer_preservation_refusal(Some(&evidence), action, true).is_none());
+        }
+        assert!(pipe_consumer_preservation_refusal(Some(&evidence), "kill", false).is_none());
+        assert!(pipe_consumer_preservation_refusal(None, "kill", true).is_none());
+
+        // Missing peers or an idle endpoint cannot be promoted into a positive
+        // observation merely because a pipe exists.
+        let mut unknown = evidence.clone();
+        unknown.active_consumer = None;
+        assert!(pipe_consumer_preservation_refusal(Some(&unknown), "kill", true).is_none());
+        let mut idle = evidence.clone();
+        let activity = idle.active_consumer.as_mut().unwrap();
+        activity.cpu_ticks = Some(0);
+        activity.cpu_percent = Some(0.0);
+        assert!(pipe_consumer_preservation_refusal(Some(&idle), "kill", true).is_none());
+
+        // Lifetime CPU and another incarnation's work do not verify the peer.
+        let mut lifetime = evidence.clone();
+        lifetime.active_consumer.as_mut().unwrap().source = "ps_lifetime_fallback".to_string();
+        assert!(pipe_consumer_preservation_refusal(Some(&lifetime), "kill", true).is_none());
+        let mut reused = evidence;
+        reused.active_consumer.as_mut().unwrap().start_id =
+            StartId::from_linux("pipe-test-boot", 9999, 42);
+        assert!(pipe_consumer_preservation_refusal(Some(&reused), "kill", true).is_none());
+    }
+
+    #[test]
+    fn pipeline_review_propagates_to_parent_and_removes_executable_kills() {
+        let parent = process(40, 1);
+        let producer = process(41, 40);
+        let consumer = process(42, 1);
+        let evidence = observation(&producer, &consumer);
+        let population = vec![parent.clone(), producer.clone(), consumer];
+        let policy = pt_core::config::Policy::default();
+        let inputs = HashMap::from([
+            (40, decision_input(&parent)),
+            (41, decision_input(&producer)),
+        ]);
+        let mut candidates = vec![
+            serde_json::json!({"pid": 40, "recommended_action": "kill"}),
+            serde_json::json!({"pid": 41, "recommended_action": "kill"}),
+        ];
+
+        // The same high-abandonment inputs really do produce kill actions
+        // without the positive consumer observation.
+        let baseline = build_agent_action_plan(
+            &SessionId::new(),
+            &policy,
+            &candidates,
+            &inputs,
+            "2026-11-26T12:00:00Z".to_string(),
+        );
+        assert!(baseline.actions.iter().any(|action| action.action == Action::Kill));
+
+        let reason =
+            pipe_consumer_preservation_refusal(Some(&evidence), "kill", true).unwrap();
+        candidates[1]["recommended_action"] = serde_json::json!("review");
+        candidates[1]["action_rationale"] = serde_json::json!(reason);
+        candidates[1]["pipe_liveness"] = serde_json::to_value(&evidence).unwrap();
+        let changed = apply_process_tree_safety(
+            &mut candidates.iter_mut().collect::<Vec<_>>(),
+            &population,
+            true,
+        );
+        assert_eq!(changed, 1);
+        assert_eq!(candidates[0]["recommended_action"], "review");
+        assert_eq!(candidates[0]["tree_safety"]["rule"], "live_child");
+        assert!(candidates.iter().all(|candidate| candidate["recommended_action"] == "review"));
+        let reviewed = build_agent_action_plan(
+            &SessionId::new(),
+            &policy,
+            &candidates,
+            &inputs,
+            "2026-11-26T12:00:00Z".to_string(),
+        );
+        assert!(reviewed.actions.iter().all(|action| action.action == Action::Keep));
+
+        // Partial census coverage cannot negate an already verified positive
+        // path, and does not itself manufacture a path or an active peer.
+        let mut partial = evidence;
+        partial.census_complete = false;
+        partial.collection_complete = false;
+        partial.unavailable.push("another process was unreadable".to_string());
+        assert!(pipe_consumer_preservation_refusal(Some(&partial), "kill", true).is_some());
+        partial.path.clear();
+        assert!(pipe_consumer_preservation_refusal(Some(&partial), "kill", true).is_none());
     }
 }
 

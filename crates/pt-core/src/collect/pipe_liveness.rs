@@ -787,12 +787,25 @@ mod linux {
         'pipes: for (&inode, holders) in &pipes {
             // Partition once. Re-filtering a reader-less pipe for every writer
             // would otherwise be quadratic without consuming the pair budget.
-            let readers: Vec<_> = holders
-                .iter()
-                .copied()
-                .filter(|(_, endpoint)| endpoint.access.reads())
-                .collect();
-            for &(writer, output) in holders.iter().filter(|(_, endpoint)| endpoint.access.writes()) {
+            let mut readers = Vec::new();
+            let mut writers = Vec::new();
+            for &(identity, endpoint) in holders {
+                if let Err(reason) = budget.check() {
+                    snapshot.incomplete(reason);
+                    break 'pipes;
+                }
+                if endpoint.access.reads() {
+                    readers.push((identity, endpoint));
+                }
+                if endpoint.access.writes() {
+                    writers.push((identity, endpoint));
+                }
+            }
+            for &(writer, output) in &writers {
+                if let Err(reason) = budget.check() {
+                    snapshot.incomplete(reason);
+                    break 'pipes;
+                }
                 for &(reader, input) in &readers {
                     if let Err(reason) = budget.check() {
                         snapshot.incomplete(reason);

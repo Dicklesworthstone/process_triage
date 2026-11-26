@@ -1154,6 +1154,32 @@ and I/O pressure, not evidence that either build is abandoned. The detector does
 not infer arbitrary Cargo configuration or rewrite build commands. Unsupported,
 unreadable, ambiguous, and over-budget observations remain unknown.
 
+#### Pipe-connected work
+
+On Linux, planning scans collect a bounded census of anonymous-pipe endpoints
+after the shared CPU/I/O sampling window. Young and protected processes remain
+in that census because they can consume the output of an older candidate.
+Each candidate's `pipe_liveness` records verified reader and writer identities,
+descriptor numbers, pipe inodes, collection coverage, and any unavailable
+observations. These observations also appear in snapshot, watch, and explain
+output; captured replay evidence is evaluated without inspecting live processes.
+
+With built-in protection enabled, a verified stdout/stderr path to a process
+with positive measured activity changes disruptive advice to review. This
+covers termination, restart, pause, freeze, renice, throttling, memory caps, and
+quarantine. Paths can span multiple pipeline stages, and the ordinary process
+tree checks then retain parents of stages held for review. Keep and recovery
+actions remain available.
+
+A readable endpoint proves that the other process holds the pipe, and the rate
+sample proves recent CPU or storage activity. Neither proves traffic on that
+particular pipe. These facts do not change the abandonment posterior. Missing,
+unreadable, replaced, or over-budget observations stay unknown; an empty peer
+list never proves abandonment. Collection checks process births, ownership,
+boot identity, and endpoint stability, but remains a bounded observation rather
+than an atomic kernel snapshot. Named FIFOs, socketpairs, and thread-specific
+unshared descriptor tables are outside this collector's scope.
+
 #### Resource trends from saved observations
 
 `pt agent plan --include-predictions` estimates RSS and windowed CPU trends from
