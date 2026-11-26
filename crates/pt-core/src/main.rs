@@ -1438,10 +1438,7 @@ struct AgentExplainArgs {
 use pt_core::action::{ActionRunner, IdentityProvider, LiveIdentityProvider};
 use pt_core::decision::{
     goal_contribution::GoalResourceSnapshot,
-    goal_optimizer::{
-        optimize_greedy_with_limit, optimize_ilp_with_limit, OptCandidate, OptimizationResult,
-        ResourceGoal,
-    },
+    goal_optimizer::{optimize_ilp_with_limit, OptCandidate, OptimizationResult, ResourceGoal},
     goal_parser::{parse_goal, Comparator, Goal, Metric, ResourceTarget},
     relief::{select_relief_plan, ReliefGoal, ReliefPlan},
     ConstraintChecker, RobotCandidate, RuntimeRobotConstraints,
@@ -10883,11 +10880,7 @@ fn build_goal_plan_from_candidates(
     warnings.append(&mut w);
 
     let opt_candidates = build_opt_candidates_for_goals(candidates, &goals, resources);
-    let result = if goals.len() == 1 {
-        optimize_ilp_with_limit(&opt_candidates, &goals, max_actions)
-    } else {
-        optimize_greedy_with_limit(&opt_candidates, &goals, max_actions)
-    };
+    let result = optimize_ilp_with_limit(&opt_candidates, &goals, max_actions);
 
     let selected_pids = result
         .selected
@@ -11938,6 +11931,87 @@ mod executable_goal_tests {
             } else {
                 assert_eq!(output.goals.len(), 2);
             }
+        }
+    }
+
+    #[test]
+    fn combined_goal_search_replaces_a_greedy_dead_end_with_an_executable_cover() {
+        let goal_text = "free 10MB RAM AND CPU < 90%";
+        let goal = parse_goal(goal_text).unwrap();
+        let (mut candidates, mut plan) = fixture(&[(100, 9, 9.0), (200, 10, 0.0), (300, 0, 10.0)]);
+        for ((candidate, action), loss) in candidates
+            .iter_mut()
+            .zip(&mut plan.actions)
+            .zip([1.0, 2.0, 2.0])
+        {
+            candidate["expected_loss"] = serde_json::json!([{"action": "kill", "loss": loss}]);
+            action.rationale.expected_loss = Some(loss);
+        }
+        let resources = memory_resources(&plan, &[(100, 9 * MIB), (200, 10 * MIB), (300, 0)]);
+
+        // PID 100 makes cheap progress on both goals, but consumes a slot that
+        // the complete memory/CPU cover needs. The plan must search beyond it.
+        let bounded = build_goal_plan_from_candidates(
+            goal_text,
+            &goal,
+            100.0,
+            &candidates,
+            &resources,
+            2,
+        )
+        .unwrap();
+        assert!(bounded.result.feasible);
+        let mut selected = bounded.selected_pids.clone();
+        selected.sort_unstable();
+        assert_eq!(selected, [200, 300]);
+        assert_eq!(bounded.result.total_loss, 4.0);
+        assert_eq!(bounded.result.total_contributions, [10.0, 10.0]);
+        assert!(bounded.result.goal_achievement.iter().all(|goal| goal.met));
+
+        let insufficient = build_goal_plan_from_candidates(
+            goal_text,
+            &goal,
+            100.0,
+            &candidates,
+            &resources,
+            1,
+        )
+        .unwrap();
+        assert!(!insufficient.result.feasible);
+        assert!(insufficient.selected_pids.len() <= 1);
+
+        // Exercise the same final reconciliation used by agent/TUI planning;
+        // serialization must retain exactly the two identity-bound actions.
+        let expected_targets: Vec<_> = plan.actions[1..]
+            .iter()
+            .map(|action| action.target.clone())
+            .collect();
+        let finalized = finalize_goal_action_plan(
+            Some(&goal),
+            100.0,
+            &mut candidates,
+            &mut plan,
+            &resources,
+            &[],
+            false,
+        )
+        .unwrap();
+        assert!(finalized.result.feasible);
+        let saved: Plan = serde_json::from_value(serde_json::to_value(&plan).unwrap()).unwrap();
+        assert_eq!(
+            saved
+                .actions
+                .iter()
+                .map(|action| action.target.clone())
+                .collect::<Vec<_>>(),
+            expected_targets
+        );
+        assert_eq!(saved.pre_toggled, ["kill-200", "kill-300"]);
+        assert_eq!(candidates[0]["goal_selected"], false);
+        assert_eq!(candidates[0]["plan_action_ids"], serde_json::json!([]));
+        for candidate in &candidates[1..] {
+            assert_eq!(candidate["goal_selected"], true);
+            assert_eq!(candidate["plan_action_ids"].as_array().unwrap().len(), 1);
         }
     }
 

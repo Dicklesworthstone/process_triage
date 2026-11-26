@@ -869,6 +869,9 @@ pub fn optimize_dp(
 
 const ILP_NODE_BUDGET: usize = 25_000;
 const ILP_CANDIDATE_LIMIT: usize = 64;
+// Bound the remaining-capacity table and the work per search node as well as
+// recursion depth. At the limits it contains 16 * 65 * 65 f64 cells.
+const ILP_GOAL_LIMIT: usize = 16;
 const ILP_SEARCH_LOG_LIMIT: usize = 128;
 // Optional Pareto alternatives enumerate subsets and compare them pairwise.
 // Eight candidates bound this at 255 subsets and fewer than 65,025 comparisons.
@@ -924,12 +927,13 @@ fn ilp_greedy_fallback(
     result
 }
 
-/// Bounded branch-and-bound optimization for a single goal.
+/// Bounded branch-and-bound optimization for simultaneous resource goals.
 ///
 /// Uses constraint propagation to prune infeasible branches: if the remaining
-/// maximum possible contribution cannot reach the target, the branch is cut.
-/// A deterministic node budget bounds work and diagnostic volume. At most 64
-/// candidate decisions may be recursive; larger sets use greedy selection.
+/// maximum possible contribution cannot reach any required target, the branch
+/// is cut. A deterministic node budget bounds work and diagnostic volume.
+/// At most 64 candidates and 16 goals enter exact search; larger inputs use
+/// greedy selection without claiming infeasibility or optimality is proven.
 /// Budget exhaustion retains a feasible incumbent without claiming optimality.
 pub fn optimize_ilp(candidates: &[OptCandidate], goals: &[ResourceGoal]) -> OptimizationResult {
     optimize_ilp_with_limit(candidates, goals, usize::MAX)
@@ -940,7 +944,8 @@ pub fn optimize_ilp(candidates: &[OptCandidate], goals: &[ResourceGoal]) -> Opti
 /// The incumbent, remaining-capacity bound, search, and greedy fallback all
 /// respect `max_actions`. A capacity-ordered seed keeps a large contribution
 /// from being hidden behind cheaper partial contributors when work is bounded.
-/// Single-goal optimality is reported only if the bounded search completes.
+/// Every target is a constraint, including targets whose ranking weight is zero.
+/// Optimality is reported only if the bounded search completes.
 pub fn optimize_ilp_with_limit(
     candidates: &[OptCandidate],
     goals: &[ResourceGoal],
@@ -955,7 +960,7 @@ pub fn optimize_ilp_with_limit(
     ));
     log_events.push(start_event);
 
-    if goals.len() != 1 || candidates.is_empty() || !valid_goal_inputs(goals) {
+    if goals.is_empty() || candidates.is_empty() || !valid_goal_inputs(goals) {
         return ilp_greedy_fallback(candidates, goals, max_actions, "unsupported", log_events);
     }
 
@@ -974,8 +979,9 @@ pub fn optimize_ilp_with_limit(
             !c.blocked
                 && valid_candidate_inputs(c, goals.len())
                 && c.contributions
-                    .first()
-                    .is_some_and(|contribution| *contribution > 0.0)
+                    .iter()
+                    .zip(goals)
+                    .any(|(contribution, goal)| *contribution > 0.0 && goal.target > 0.0)
         })
         .collect();
 
@@ -996,47 +1002,77 @@ pub fn optimize_ilp_with_limit(
         );
     }
 
-    let target = goals[0].target;
+    if goals.len() > ILP_GOAL_LIMIT {
+        let mut event = OptimizationLogEvent::new("search_budget_exhausted", "ilp_branch_bound");
+        event.note = Some(format!(
+            "goal_limit: {} goals exceed {ILP_GOAL_LIMIT}; recursive search not entered",
+            goals.len()
+        ));
+        event.search = Some(IlpSearchBudget::default().summary(eligible.len(), false));
+        log_events.push(event);
+        return ilp_greedy_fallback(candidates, goals, max_actions, "goal_limit", log_events);
+    }
+
     let mut ordered = eligible;
     ordered.sort_by_cached_key(|candidate| std::cmp::Reverse(pareto_efficiency(candidate, goals)));
 
     let n = ordered.len();
     // Clamp before sizing the table: the unconstrained API passes usize::MAX.
     let max_actions = max_actions.min(n);
-    let mut suffix_capacity = vec![vec![0.0_f64; max_actions + 1]; n + 1];
-    for i in (0..n).rev() {
-        for slots in 1..=max_actions {
-            // Round up so floating-point addition cannot underestimate the
-            // maximum attainable contribution and prune a feasible branch.
-            let with_candidate =
-                (ordered[i].contributions[0] + suffix_capacity[i + 1][slots - 1]).next_up();
-            suffix_capacity[i][slots] = suffix_capacity[i + 1][slots].max(with_candidate);
+    let mut suffix_capacity =
+        vec![vec![vec![0.0_f64; max_actions + 1]; n + 1]; goals.len()];
+    for (goal_index, capacity) in suffix_capacity.iter_mut().enumerate() {
+        for i in (0..n).rev() {
+            for slots in 1..=max_actions {
+                // Each resource gets an independent optimistic bound. Its
+                // maximizing subset need not also maximize the other resources.
+                // Upward rounding prevents numerical underestimation.
+                let with_candidate =
+                    (ordered[i].contributions[goal_index] + capacity[i + 1][slots - 1])
+                        .next_up();
+                capacity[i][slots] = capacity[i + 1][slots].max(with_candidate);
+            }
         }
     }
 
     fn feasible_seed(
         ordered: &[&OptCandidate],
         indices: impl IntoIterator<Item = usize>,
-        target: f64,
+        goals: &[ResourceGoal],
         max_actions: usize,
     ) -> (f64, Vec<usize>) {
         let mut loss = 0.0;
-        let mut contribution = 0.0;
+        let mut contributions = vec![0.0; goals.len()];
         let mut selection = Vec::new();
         for idx in indices {
-            if contribution >= target || selection.len() >= max_actions {
+            if contributions
+                .iter()
+                .zip(goals)
+                .all(|(total, goal)| *total >= goal.target)
+                || selection.len() >= max_actions
+            {
                 break;
             }
             let next_loss = loss + ordered[idx].expected_loss;
-            let next_contribution = contribution + ordered[idx].contributions[0];
-            if !next_loss.is_finite() || !next_contribution.is_finite() {
+            if !next_loss.is_finite()
+                || contributions
+                    .iter()
+                    .zip(&ordered[idx].contributions)
+                    .any(|(total, contribution)| !(*total + contribution).is_finite())
+            {
                 continue;
             }
             loss = next_loss;
-            contribution = next_contribution;
+            for (total, contribution) in contributions.iter_mut().zip(&ordered[idx].contributions) {
+                *total += contribution;
+            }
             selection.push(idx);
         }
-        if contribution >= target {
+        if contributions
+            .iter()
+            .zip(goals)
+            .all(|(total, goal)| *total >= goal.target)
+        {
             (loss, selection)
         } else {
             (f64::INFINITY, Vec::new())
@@ -1044,26 +1080,31 @@ pub fn optimize_ilp_with_limit(
     }
 
     // An efficiency seed may spend all slots without meeting the target.
-    // Also try the largest contributors so the search starts with a feasible
-    // bounded incumbent whenever their aggregate is finite and sufficient.
-    let (mut best_loss, mut best_selection) = feasible_seed(&ordered, 0..n, target, max_actions);
+    // Also try the largest contributors to each resource. A seed is accepted
+    // only when it meets all goals; no resource or zero-weight goal is optional.
+    let (mut best_loss, mut best_selection) = feasible_seed(&ordered, 0..n, goals, max_actions);
     if max_actions < n {
-        let mut by_capacity: Vec<usize> = (0..n).collect();
-        by_capacity.sort_by(|&a, &b| {
-            ordered[b].contributions[0]
-                .total_cmp(&ordered[a].contributions[0])
-                .then_with(|| {
-                    ordered[a]
-                        .expected_loss
-                        .total_cmp(&ordered[b].expected_loss)
-                })
-                .then_with(|| a.cmp(&b))
-        });
-        let (capacity_loss, capacity_selection) =
-            feasible_seed(&ordered, by_capacity, target, max_actions);
-        if capacity_loss < best_loss {
-            best_loss = capacity_loss;
-            best_selection = capacity_selection;
+        for (goal_index, goal) in goals.iter().enumerate() {
+            if goal.target == 0.0 {
+                continue;
+            }
+            let mut by_capacity: Vec<usize> = (0..n).collect();
+            by_capacity.sort_by(|&a, &b| {
+                ordered[b].contributions[goal_index]
+                    .total_cmp(&ordered[a].contributions[goal_index])
+                    .then_with(|| {
+                        ordered[a]
+                            .expected_loss
+                            .total_cmp(&ordered[b].expected_loss)
+                    })
+                    .then_with(|| a.cmp(&b))
+            });
+            let (capacity_loss, capacity_selection) =
+                feasible_seed(&ordered, by_capacity, goals, max_actions);
+            if capacity_loss < best_loss {
+                best_loss = capacity_loss;
+                best_selection = capacity_selection;
+            }
         }
     }
     let mut current: Vec<usize> = Vec::new();
@@ -1073,11 +1114,11 @@ pub fn optimize_ilp_with_limit(
     fn dfs(
         idx: usize,
         ordered: &[&OptCandidate],
-        target: f64,
-        suffix_capacity: &[Vec<f64>],
+        goals: &[ResourceGoal],
+        suffix_capacity: &[Vec<Vec<f64>>],
         max_actions: usize,
         current_loss: f64,
-        current_contrib: f64,
+        current_contrib: &[f64],
         current: &mut Vec<usize>,
         best_loss: &mut f64,
         best_selection: &mut Vec<usize>,
@@ -1087,14 +1128,22 @@ pub fn optimize_ilp_with_limit(
         if !budget.enter_node() {
             return;
         }
-        if current_contrib >= target {
+        if current_contrib
+            .iter()
+            .zip(goals)
+            .all(|(total, goal)| *total >= goal.target)
+        {
             if current_loss < *best_loss {
                 *best_loss = current_loss;
                 *best_selection = current.clone();
                 let mut event = OptimizationLogEvent::new("objective_improved", "ilp_branch_bound");
                 event.total_loss = Some(current_loss);
-                event.current_contribution = Some(current_contrib);
-                event.target = Some(target);
+                if goals.len() == 1 {
+                    event.current_contribution = Some(current_contrib[0]);
+                    event.target = Some(goals[0].target);
+                } else {
+                    event.total_contributions = current_contrib.to_vec();
+                }
                 budget.record(log_events, event);
             }
             return;
@@ -1108,25 +1157,40 @@ pub fn optimize_ilp_with_limit(
             return;
         }
 
-        let remaining_max = suffix_capacity[idx][max_actions - current.len()];
-        if (current_contrib + remaining_max).next_up() < target {
-            let mut event = OptimizationLogEvent::new("constraint_prune", "ilp_branch_bound");
-            event.current_contribution = Some(current_contrib);
-            event.remaining_max = Some(remaining_max);
-            event.target = Some(target);
-            budget.record(log_events, event);
-            return;
+        let remaining_slots = max_actions - current.len();
+        for (goal_index, goal) in goals.iter().enumerate() {
+            let remaining_max = suffix_capacity[goal_index][idx][remaining_slots];
+            if (current_contrib[goal_index] + remaining_max).next_up() < goal.target {
+                let mut event = OptimizationLogEvent::new("constraint_prune", "ilp_branch_bound");
+                event.current_contribution = Some(current_contrib[goal_index]);
+                event.remaining_max = Some(remaining_max);
+                event.target = Some(goal.target);
+                if goals.len() > 1 {
+                    event.note = Some(format!(
+                        "resource={} remaining_action_slots={remaining_slots}",
+                        goal.resource
+                    ));
+                }
+                budget.record(log_events, event);
+                return;
+            }
         }
 
         // Include only actions whose reported aggregate remains finite.
         let next_loss = current_loss + ordered[idx].expected_loss;
-        let next_contrib = current_contrib + ordered[idx].contributions[0];
-        if next_loss.is_finite() && next_contrib.is_finite() {
+        // The goal limit bounds this stack buffer; no per-node allocation is
+        // needed, and the single-goal path retains its bounded search cost.
+        let mut next_contrib = [0.0; ILP_GOAL_LIMIT];
+        for (goal_index, total) in current_contrib.iter().enumerate() {
+            next_contrib[goal_index] = total + ordered[idx].contributions[goal_index];
+        }
+        let next_contrib = &next_contrib[..goals.len()];
+        if next_loss.is_finite() && next_contrib.iter().all(|total| total.is_finite()) {
             current.push(idx);
             dfs(
                 idx + 1,
                 ordered,
-                target,
+                goals,
                 suffix_capacity,
                 max_actions,
                 next_loss,
@@ -1147,7 +1211,7 @@ pub fn optimize_ilp_with_limit(
         dfs(
             idx + 1,
             ordered,
-            target,
+            goals,
             suffix_capacity,
             max_actions,
             current_loss,
@@ -1160,14 +1224,15 @@ pub fn optimize_ilp_with_limit(
         );
     }
 
+    let initial_contributions = [0.0; ILP_GOAL_LIMIT];
     dfs(
         0,
         &ordered,
-        target,
+        goals,
         &suffix_capacity,
         max_actions,
         0.0,
-        0.0,
+        &initial_contributions[..goals.len()],
         &mut current,
         &mut best_loss,
         &mut best_selection,
@@ -1185,16 +1250,29 @@ pub fn optimize_ilp_with_limit(
     );
     summary.search = Some(budget.summary(n, !budget.exhausted && best_loss.is_finite()));
     if budget.exhausted {
-        summary.note =
-            Some("node_budget: retaining best feasible incumbent; optimum not proven".to_string());
+        summary.note = Some(if best_loss.is_finite() {
+            "node_budget: retaining best feasible incumbent; optimum not proven".to_string()
+        } else {
+            "node_budget: feasible incumbent not found; feasibility and optimum not proven"
+                .to_string()
+        });
     }
     log_events.push(summary);
 
     if best_loss == f64::INFINITY {
         let mut event = OptimizationLogEvent::new("constraint_violation", "ilp_branch_bound");
-        event.note = Some("ilp_infeasible".to_string());
+        let reason = if budget.exhausted {
+            "node_budget_exhausted"
+        } else {
+            "infeasible"
+        };
+        event.note = Some(if budget.exhausted {
+            "no feasible incumbent found before the search budget expired".to_string()
+        } else {
+            "ilp_infeasible".to_string()
+        });
         log_events.push(event);
-        return ilp_greedy_fallback(candidates, goals, max_actions, "infeasible", log_events);
+        return ilp_greedy_fallback(candidates, goals, max_actions, reason, log_events);
     }
 
     let selected: Vec<SelectedAction> = best_selection
@@ -1209,22 +1287,16 @@ pub fn optimize_ilp_with_limit(
         })
         .collect();
 
-    let total_contributions = vec![selected.iter().map(|s| s.contributions[0]).sum()];
-    let achieved = total_contributions[0];
-    let goal_achievement = vec![GoalAchievement {
-        resource: goals[0].resource.clone(),
-        target,
-        achieved,
-        shortfall: (target - achieved).max(0.0),
-        met: achieved >= target,
-    }];
+    let total_contributions = total_contributions_from_actions(&selected, goals.len());
+    let goal_achievement = compute_goal_achievements(goals, &total_contributions);
+    let feasible = goal_achievement.iter().all(|goal| goal.met);
 
     OptimizationResult {
         selected,
         total_loss: best_loss,
         total_contributions,
         goal_achievement,
-        feasible: achieved >= target,
+        feasible,
         algorithm: if budget.exhausted {
             "ilp_branch_bound (node_budget_exhausted, best feasible incumbent; optimum not proven)"
                 .to_string()
@@ -1301,11 +1373,7 @@ pub fn reoptimize_on_change(
         };
     }
 
-    let mut result = if goals.len() == 1 {
-        optimize_ilp(new_candidates, goals)
-    } else {
-        optimize_greedy(new_candidates, goals)
-    };
+    let mut result = optimize_ilp(new_candidates, goals);
 
     let mut event = OptimizationLogEvent::new("reoptimized", "reopt");
     event.note = Some(reopt_reason.clone());
@@ -2957,6 +3025,307 @@ mod tests {
         assert!(result.log_events.len() <= ILP_SEARCH_LOG_LIMIT + 1);
     }
 
+
+    #[test]
+    fn combined_goal_search_replaces_a_greedy_dead_end_with_a_feasible_cover() {
+        for memory_scale in [1.0, 1024.0] {
+            for cpu_weight in [0.0, 1.0, 1000.0] {
+                let candidates = [
+                    goal_candidate("partial-both", 1.0, &[9.0 * memory_scale, 9.0]),
+                    goal_candidate("memory-holder", 2.0, &[10.0 * memory_scale, 0.0]),
+                    goal_candidate("cpu-holder", 2.0, &[0.0, 10.0]),
+                ];
+                let goals = [
+                    ResourceGoal {
+                        resource: "memory".into(),
+                        target: 10.0 * memory_scale,
+                        weight: 1.0,
+                    },
+                    ResourceGoal {
+                        resource: "cpu".into(),
+                        target: 10.0,
+                        weight: cpu_weight,
+                    },
+                ];
+                let result = optimize_ilp_with_limit(&candidates, &goals, 2);
+                assert!(result.feasible, "{result:?}");
+                let mut ids = selected_ids(&result);
+                ids.sort_unstable();
+                assert_eq!(ids, ["cpu-holder", "memory-holder"]);
+                assert_eq!(result.total_loss, 4.0);
+                assert_eq!(result.total_contributions, [10.0 * memory_scale, 10.0]);
+                assert!(result.goal_achievement.iter().all(|goal| goal.met));
+                assert!(result
+                    .log_events
+                    .iter()
+                    .find_map(|event| event.search.as_ref())
+                    .unwrap()
+                    .optimum_proven);
+
+                // Replanning must not fall back to the old multi-goal greedy
+                // path, which spends five loss units on all three candidates.
+                let previous = optimize_ilp(&[], &goals);
+                let updated = reoptimize_on_change(&previous, &[], &candidates, &goals);
+                assert!(updated.reoptimized);
+                assert!(updated.result.feasible);
+                assert_eq!(updated.result.total_loss, 4.0);
+                assert_eq!(updated.result.selected.len(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn multigoal_ilp_matches_an_independent_exhaustive_subset_oracle() {
+        let mut state = 0x9f62_0d71_aa35_4be8_u64;
+        let mut sample = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            state >> 32
+        };
+        let mut feasible_cases = 0;
+        let mut infeasible_cases = 0;
+        for case in 0..48 {
+            let count = 3 + (sample() % 5) as usize;
+            let dimensions = 2 + (sample() % 3) as usize;
+            let candidates: Vec<_> = (0..count)
+                .map(|index| {
+                    let contributions: Vec<_> =
+                        (0..dimensions).map(|_| (sample() % 12) as f64).collect();
+                    let mut candidate = goal_candidate(
+                        &format!("case-{case}-candidate-{index}"),
+                        (sample() % 9) as f64,
+                        &contributions,
+                    );
+                    candidate.blocked = sample().is_multiple_of(7);
+                    candidate
+                })
+                .collect();
+            let goals: Vec<_> = (0..dimensions)
+                .map(|dimension| {
+                    let available: u64 = candidates
+                        .iter()
+                        .filter(|candidate| !candidate.blocked)
+                        .map(|candidate| candidate.contributions[dimension] as u64)
+                        .sum();
+                    ResourceGoal {
+                        resource: format!("resource-{dimension}"),
+                        target: (sample() % (available + 5)) as f64,
+                        weight: (sample() % 4) as f64,
+                    }
+                })
+                .collect();
+
+            for limit in 0..=count + 1 {
+                // Independent enumeration over raw input records: no optimizer
+                // eligibility, ranking, bounds, seed or achievement helper.
+                let mut optimum: Option<f64> = None;
+                for mask in 0..(1_u32 << count) {
+                    if mask.count_ones() as usize > limit {
+                        continue;
+                    }
+                    let mut totals = vec![0.0; dimensions];
+                    let mut loss = 0.0;
+                    let mut blocked = false;
+                    for (index, candidate) in candidates.iter().enumerate() {
+                        if mask & (1_u32 << index) != 0 {
+                            blocked |= candidate.blocked;
+                            loss += candidate.expected_loss;
+                            for (total, contribution) in
+                                totals.iter_mut().zip(&candidate.contributions)
+                            {
+                                *total += contribution;
+                            }
+                        }
+                    }
+                    if !blocked
+                        && totals.iter().zip(&goals).all(|(total, goal)| *total >= goal.target)
+                    {
+                        optimum = Some(optimum.map_or(loss, |previous| previous.min(loss)));
+                    }
+                }
+
+                let result = optimize_ilp_with_limit(&candidates, &goals, limit);
+                assert_eq!(
+                    result.feasible,
+                    optimum.is_some(),
+                    "case={case} limit={limit}"
+                );
+                if let Some(loss) = optimum {
+                    feasible_cases += 1;
+                    assert_eq!(result.total_loss, loss, "case={case} limit={limit}");
+                } else {
+                    infeasible_cases += 1;
+                }
+                assert!(result.selected.len() <= limit);
+                let mut ids = HashSet::new();
+                let mut measured = vec![0.0; dimensions];
+                let mut actual_loss = 0.0;
+                for selected in &result.selected {
+                    assert!(ids.insert(selected.id.as_str()));
+                    let original = candidates
+                        .iter()
+                        .find(|candidate| candidate.id == selected.id)
+                        .unwrap();
+                    assert!(!original.blocked);
+                    actual_loss += original.expected_loss;
+                    for (total, contribution) in measured.iter_mut().zip(&original.contributions) {
+                        *total += contribution;
+                    }
+                }
+                assert_eq!(result.total_loss, actual_loss);
+                assert_eq!(result.total_contributions, measured);
+                assert_eq!(result.goal_achievement.len(), dimensions);
+                for ((achievement, goal), measured) in
+                    result.goal_achievement.iter().zip(&goals).zip(measured)
+                {
+                    assert_eq!(achievement.achieved, measured);
+                    assert_eq!(achievement.met, measured >= goal.target);
+                    assert_eq!(achievement.shortfall, (goal.target - measured).max(0.0));
+                }
+            }
+        }
+        assert!(feasible_cases > 0);
+        assert!(infeasible_cases > 0);
+    }
+
+    #[test]
+    fn multigoal_dimension_limit_uses_a_capped_nonrecursive_fallback() {
+        let goals: Vec<_> = (0..ILP_GOAL_LIMIT + 1)
+            .map(|dimension| ResourceGoal {
+                resource: format!("resource-{dimension}"),
+                target: 1.0,
+                weight: 1.0,
+            })
+            .collect();
+        let candidates = [
+            goal_candidate("partial", 1.0, &vec![0.5; goals.len()]),
+            goal_candidate("sufficient", 3.0, &vec![1.0; goals.len()]),
+        ];
+        for limit in [0, 1, usize::MAX] {
+            let result = optimize_ilp_with_limit(&candidates, &goals, limit);
+            assert_eq!(result.feasible, limit > 0);
+            assert!(result.selected.len() <= limit);
+            if limit == 1 {
+                assert_eq!(selected_ids(&result), ["sufficient"]);
+                assert_eq!(result.total_loss, 3.0);
+            }
+            assert!(result.algorithm.contains("goal_limit"));
+            assert!(result.algorithm.contains("optimum not proven"));
+            let search = result
+                .log_events
+                .iter()
+                .find_map(|event| event.search.as_ref())
+                .unwrap();
+            assert_eq!(search.visited_nodes, 0);
+            assert!(!search.optimum_proven);
+            assert!(result.alternatives.is_empty());
+        }
+    }
+
+    #[test]
+    fn multigoal_search_rejects_nonfinite_secondary_totals_and_blocked_holders() {
+        let mut protected = goal_candidate("protected", 0.0, &[2.0, 1.0]);
+        protected.blocked = true;
+        let candidates = [
+            protected,
+            goal_candidate("invalid", 0.0, &[2.0, f64::NAN]),
+            goal_candidate("large-a", 1.0, &[1.0, f64::MAX]),
+            goal_candidate("large-b", 1.0, &[1.0, f64::MAX]),
+            goal_candidate("finite-complement", 4.0, &[1.0, 0.0]),
+        ];
+        let goals = [
+            ResourceGoal {
+                resource: "memory".into(),
+                target: 2.0,
+                weight: 1.0,
+            },
+            ResourceGoal {
+                resource: "cpu".into(),
+                target: 1.0,
+                weight: 0.0,
+            },
+        ];
+        let result = optimize_ilp_with_limit(&candidates, &goals, 2);
+        assert!(result.feasible);
+        assert_eq!(result.selected.len(), 2);
+        assert!(result.selected.iter().any(|action| action.id == "finite-complement"));
+        assert!(result
+            .selected
+            .iter()
+            .all(|action| action.id != "protected" && action.id != "invalid"));
+        assert_eq!(result.total_loss, 5.0);
+        assert_eq!(result.total_contributions, [2.0, f64::MAX]);
+        assert!(result.total_contributions.iter().all(|total| total.is_finite()));
+    }
+
+    #[test]
+    fn multigoal_work_budget_retains_a_feasible_incumbent_without_proving_optimality() {
+        let candidates: Vec<_> = (0..50)
+            .map(|index| goal_candidate(&format!("candidate-{index}"), 1.0, &[1.0, 1.0]))
+            .collect();
+        let goals: Vec<_> = ["memory", "cpu"]
+            .into_iter()
+            .map(|resource| ResourceGoal {
+                resource: resource.into(),
+                target: 25.0,
+                weight: 1.0,
+            })
+            .collect();
+        let result = optimize_ilp_with_limit(&candidates, &goals, 25);
+        assert!(result.feasible);
+        assert_eq!(result.selected.len(), 25);
+        assert_eq!(result.total_loss, 25.0);
+        assert_eq!(result.total_contributions, [25.0, 25.0]);
+        assert!(result.algorithm.contains("node_budget_exhausted"));
+        let search = result
+            .log_events
+            .iter()
+            .find_map(|event| event.search.as_ref())
+            .unwrap();
+        assert_eq!(search.visited_nodes, ILP_NODE_BUDGET);
+        assert!(!search.optimum_proven);
+        assert!(result.log_events.len() <= ILP_SEARCH_LOG_LIMIT + 1);
+    }
+
+    #[test]
+    fn multigoal_budget_without_an_incumbent_does_not_claim_proven_infeasibility() {
+        // Both resources can individually reach 70 with at most 25 actions,
+        // but their disjoint holders need 18 + 18 actions together. Independent
+        // resource bounds admit enough branches to exhaust the work budget.
+        let candidates: Vec<_> = (0..50)
+            .map(|index| {
+                let contribution = if index < 25 { [4.0, 0.0] } else { [0.0, 4.0] };
+                goal_candidate(&format!("candidate-{index}"), 1.0, &contribution)
+            })
+            .collect();
+        let goals: Vec<_> = ["memory", "cpu"]
+            .into_iter()
+            .map(|resource| ResourceGoal {
+                resource: resource.into(),
+                target: 70.0,
+                weight: 1.0,
+            })
+            .collect();
+        let result = optimize_ilp_with_limit(&candidates, &goals, 25);
+        assert!(!result.feasible);
+        assert!(result.selected.len() <= 25);
+        assert!(result.algorithm.contains("node_budget_exhausted"));
+        assert!(!result.algorithm.contains("infeasible"));
+        let event = result
+            .log_events
+            .iter()
+            .find(|event| event.event == "search_budget_exhausted")
+            .unwrap();
+        let search = event.search.as_ref().unwrap();
+        assert_eq!(search.visited_nodes, ILP_NODE_BUDGET);
+        assert!(!search.optimum_proven);
+        assert!(event.note.as_deref().unwrap().contains("feasibility and optimum not proven"));
+        assert!(!result
+            .log_events
+            .iter()
+            .any(|event| event.note.as_deref() == Some("ilp_infeasible")));
+        assert!(result.log_events.len() <= 2 * ILP_SEARCH_LOG_LIMIT + 4);
+    }
+
     #[test]
     fn ilp_single_goal_basic() {
         let candidates = vec![
@@ -3155,7 +3524,7 @@ mod tests {
     }
 
     #[test]
-    fn ilp_multi_goal_falls_back_to_greedy() {
+    fn ilp_multi_goal_finds_and_proves_a_joint_solution() {
         let candidates = vec![OptCandidate {
             id: "a".to_string(),
             expected_loss: 0.5,
@@ -3176,7 +3545,17 @@ mod tests {
             },
         ];
         let result = optimize_ilp(&candidates, &goals);
-        assert!(result.algorithm.contains("greedy fallback"));
+        assert_eq!(result.algorithm, "ilp_branch_bound");
+        assert!(result.feasible);
+        assert_eq!(selected_ids(&result), ["a"]);
+        assert_eq!(result.total_loss, 0.5);
+        assert_eq!(result.total_contributions, [200.0, 80.0]);
+        assert!(result
+            .log_events
+            .iter()
+            .find_map(|event| event.search.as_ref())
+            .unwrap()
+            .optimum_proven);
     }
 
     #[test]
