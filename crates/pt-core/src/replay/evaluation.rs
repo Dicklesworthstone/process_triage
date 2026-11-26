@@ -30,6 +30,7 @@ use thiserror::Error;
 const REVIEW_SCHEMA_VERSION: &str = "1.0.0";
 const EVALUATION_SCHEMA_VERSION: &str = "1.0.0";
 const REFIT_SCHEMA_VERSION: &str = "1.0.0";
+const REFIT_LOSS_TOLERANCE: f64 = 1e-12;
 const BINARY_PRIOR_PATH: &str = "class_mass.abandoned_or_zombie";
 const MIN_REFIT_LABELS: usize = 20;
 
@@ -529,7 +530,116 @@ pub struct ReplayRefitArtifacts {
     pub version_id: String,
 }
 
-fn configuration_fingerprint(
+/// Limits for offline binary prior-mass calibration. The search never changes
+/// feature distributions, the policy, signatures, or learned human verdicts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PriorRefitOptions {
+    /// Maximum relative change of every individual class prior, at most 50%.
+    pub max_change_fraction: f64,
+    /// Odd number of equally spaced grid points, including the incumbent.
+    pub grid_points: usize,
+    /// Required independently reviewed, scored identities of each binary class.
+    pub min_labels_per_class: usize,
+    /// Descriptive probability threshold, not a final action or kill decision.
+    pub probability_threshold: f64,
+}
+
+impl Default for PriorRefitOptions {
+    fn default() -> Self {
+        Self {
+            max_change_fraction: 0.2,
+            grid_points: 21,
+            min_labels_per_class: MIN_LABELS_PER_CLASS,
+            probability_threshold: 0.5,
+        }
+    }
+}
+
+impl PriorRefitOptions {
+    fn validate(&self) -> Result<(), ReplayEvaluationError> {
+        if !self.max_change_fraction.is_finite()
+            || !(0.0..=0.5).contains(&self.max_change_fraction)
+            || !(3..=101).contains(&self.grid_points)
+            || self.grid_points.is_multiple_of(2)
+            || self.min_labels_per_class < MIN_LABELS_PER_CLASS
+            || !self.probability_threshold.is_finite()
+            || !(0.0 < self.probability_threshold && self.probability_threshold < 1.0)
+        {
+            return Err(ReplayEvaluationError::InvalidEvaluation(format!(
+                "refit requires max_change_fraction in [0, 0.5], an odd grid_points in [3, 101], at least {MIN_LABELS_PER_CLASS} labels per class, and probability_threshold in (0, 1)"
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PriorRefitStatus {
+    Improved,
+    Unchanged,
+    Rejected,
+}
+
+/// Countermetrics over every recorded identity, including rows outside the
+/// probability metric sample. A high useful score is not an executed false kill.
+#[derive(Debug, Clone, Serialize)]
+pub struct PriorRefitSafeguards {
+    pub probability_threshold: f64,
+    pub status_changes: usize,
+    pub protected_status_changes: usize,
+    pub protected_useful_status_changes: usize,
+    pub baseline_useful_at_or_above_threshold: usize,
+    pub candidate_useful_at_or_above_threshold: usize,
+    /// A newly high-scoring useful identity cannot be offset by improving another.
+    pub newly_high_scoring_useful: usize,
+    pub passed: bool,
+}
+
+/// One candidate evaluated only against training labels. Losses use exactly the
+/// incumbent's reviewed scoring population; coverage changes make it ineligible.
+#[derive(Debug, Clone, Serialize)]
+pub struct PriorRefitTrial {
+    pub prior_mass: f64,
+    pub configuration_sha256: String,
+    pub log_loss: Option<f64>,
+    pub brier_score: Option<f64>,
+    pub paired_count: usize,
+    pub eligible: bool,
+    pub reasons: Vec<String>,
+    pub safeguards: PriorRefitSafeguards,
+}
+
+/// An ordinary loadable candidate plus the evidence for retaining or rejecting
+/// it. `accepted` is an offline assessment; it never activates this candidate.
+#[derive(Debug, Clone, Serialize)]
+pub struct PriorRefitReport {
+    pub schema_version: String,
+    pub engine_version: &'static str,
+    pub method: &'static str,
+    pub evaluated_at: String,
+    pub options: PriorRefitOptions,
+    pub status: PriorRefitStatus,
+    pub accepted: bool,
+    pub reasons: Vec<String>,
+    pub incumbent_prior_mass: f64,
+    pub candidate_prior_mass: f64,
+    pub minimum_prior_mass: f64,
+    pub maximum_prior_mass: f64,
+    pub incumbent_configuration_sha256: String,
+    pub candidate_configuration_sha256: String,
+    pub incumbent_priors: Priors,
+    pub candidate_priors: Priors,
+    pub training_search: Vec<PriorRefitTrial>,
+    pub training: PairedEvaluationReport,
+    pub holdout: PairedEvaluationReport,
+    pub training_safeguards: PriorRefitSafeguards,
+    pub holdout_safeguards: PriorRefitSafeguards,
+    pub limitations: Vec<String>,
+}
+
+pub(super) fn configuration_fingerprint(
     scorer: &Scorer,
     policy: &Policy,
 ) -> Result<String, ReplayEvaluationError> {
@@ -616,10 +726,29 @@ pub fn evaluate_pair(
     candidate_scorer: &Scorer,
     candidate_policy: &Policy,
 ) -> Result<PairedEvaluationReport, ReplayEvaluationError> {
+    evaluate_pair_at(
+        snapshot,
+        labels,
+        baseline_scorer,
+        baseline_policy,
+        candidate_scorer,
+        candidate_policy,
+        Utc::now(),
+    )
+}
+
+fn evaluate_pair_at(
+    snapshot: &ReplaySnapshot,
+    labels: &ReviewLabels,
+    baseline_scorer: &Scorer,
+    baseline_policy: &Policy,
+    candidate_scorer: &Scorer,
+    candidate_policy: &Policy,
+    evaluated_at: DateTime<Utc>,
+) -> Result<PairedEvaluationReport, ReplayEvaluationError> {
     let by_pid = validate_labels(snapshot, labels)?;
     let baseline_fingerprint = configuration_fingerprint(baseline_scorer, baseline_policy)?;
     let candidate_fingerprint = configuration_fingerprint(candidate_scorer, candidate_policy)?;
-    let evaluated_at = Utc::now();
     let baseline_scorer = baseline_scorer.clone().with_evaluation_time(evaluated_at);
     let candidate_scorer = candidate_scorer.clone().with_evaluation_time(evaluated_at);
     let baseline = replay_scores(snapshot, &baseline_scorer, baseline_policy)?;
@@ -1175,6 +1304,421 @@ pub fn write_refit_artifacts(
     )))
 }
 
+fn refit_birth_identities(
+    snapshot: &ReplaySnapshot,
+    labels: &ReviewLabels,
+    split: ReviewSplit,
+) -> Result<HashSet<(String, u64, u32)>, ReplayEvaluationError> {
+    validate_labels(snapshot, labels)?;
+    if labels.split != split {
+        return Err(ReplayEvaluationError::InvalidReview(format!(
+            "refit requires a {split:?} review for capture {}",
+            snapshot.name
+        )));
+    }
+    let boot_id = snapshot
+        .context
+        .boot_id
+        .as_deref()
+        .filter(|boot| !boot.trim().is_empty() && !matches!(*boot, "unknown" | "synthetic"))
+        .ok_or_else(|| {
+            ReplayEvaluationError::InvalidEvaluation(
+                "refit requires a recorded boot ID; weak identities cannot establish holdout separation"
+                    .to_string(),
+            )
+        })?;
+    let context = snapshot.scoring_context.as_ref().ok_or_else(|| {
+        ReplayEvaluationError::InvalidEvaluation(
+            "refit requires complete captured scoring observations".to_string(),
+        )
+    })?;
+    let mut births = HashSet::new();
+    for process in &snapshot.processes {
+        let invalid = || {
+            ReplayEvaluationError::InvalidEvaluation(format!(
+                "refit requires a full boot-bound identity matching the capture for PID {}",
+                process.pid.0
+            ))
+        };
+        let input = context.processes.get(&process.pid.0).ok_or_else(invalid)?;
+        let mut parts = process.start_id.0.split(':');
+        let (Some(boot), Some(start), Some(pid), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err(invalid());
+        };
+        let started = start.parse::<u64>().map_err(|_| invalid())?;
+        let pid = pid.parse::<u32>().map_err(|_| invalid())?;
+        if boot != boot_id
+            || pid != process.pid.0
+            || input.identity.quality != pt_common::IdentityQuality::Full
+            || input.identity.pid != process.pid
+            || input.identity.start_id != process.start_id
+        {
+            return Err(invalid());
+        }
+        // Deliberately omit UID, command text and declared host_id. Exec, setuid,
+        // or editing a review's host name cannot turn one birth into two samples.
+        if !births.insert((boot.to_string(), started, pid)) {
+            return Err(ReplayEvaluationError::InvalidEvaluation(
+                "refit capture contains a duplicate process birth".to_string(),
+            ));
+        }
+    }
+    Ok(births)
+}
+
+fn validated_prior_mass(priors: &Priors) -> Result<f64, ReplayEvaluationError> {
+    crate::config::validation::validate_priors(priors).map_err(|error| {
+        ReplayEvaluationError::InvalidEvaluation(format!("invalid refit priors: {error}"))
+    })?;
+    if priors.schema_version != crate::config::CONFIG_SCHEMA_VERSION {
+        return Err(ReplayEvaluationError::InvalidEvaluation(
+            "refit priors must use the current configuration schema".to_string(),
+        ));
+    }
+    let probabilities = [
+        priors.classes.useful.prior_prob,
+        priors.classes.useful_bad.prior_prob,
+        priors.classes.abandoned.prior_prob,
+        priors.classes.zombie.prior_prob,
+    ];
+    if probabilities
+        .iter()
+        .any(|probability| !probability.is_finite() || *probability <= 0.0)
+        || (probabilities.iter().sum::<f64>() - 1.0).abs() > 1e-10
+    {
+        return Err(ReplayEvaluationError::InvalidEvaluation(
+            "refit requires four finite positive class priors summing to one".to_string(),
+        ));
+    }
+    Ok(priors.classes.abandoned.prior_prob + priors.classes.zombie.prior_prob)
+}
+
+fn priors_at_mass(priors: &Priors, mass: f64) -> Result<Priors, ReplayEvaluationError> {
+    let old_mass = validated_prior_mass(priors)?;
+    if mass == old_mass {
+        return Ok(priors.clone());
+    }
+    if !mass.is_finite() || !(0.0 < mass && mass < 1.0) {
+        return Err(ReplayEvaluationError::InvalidEvaluation(
+            "candidate prior mass must be finite and strictly between zero and one".to_string(),
+        ));
+    }
+    let other_mass = priors.classes.useful.prior_prob + priors.classes.useful_bad.prior_prob;
+    let mut candidate = priors.clone();
+    candidate.classes.abandoned.prior_prob *= mass / old_mass;
+    candidate.classes.zombie.prior_prob *= mass / old_mass;
+    candidate.classes.useful.prior_prob *= (1.0 - mass) / other_mass;
+    candidate.classes.useful_bad.prior_prob *= (1.0 - mass) / other_mass;
+    validated_prior_mass(&candidate)?;
+    Ok(candidate)
+}
+
+fn refit_safeguards(
+    report: &PairedEvaluationReport,
+    probability_threshold: f64,
+) -> PriorRefitSafeguards {
+    let mut result = PriorRefitSafeguards {
+        probability_threshold,
+        status_changes: 0,
+        protected_status_changes: 0,
+        protected_useful_status_changes: 0,
+        baseline_useful_at_or_above_threshold: 0,
+        candidate_useful_at_or_above_threshold: 0,
+        newly_high_scoring_useful: 0,
+        passed: false,
+    };
+    for process in &report.processes {
+        let status_changed = process.baseline_status != process.candidate_status;
+        result.status_changes += usize::from(status_changed);
+        let protection_changed = (process.baseline_status == ReplayScoreStatus::Protected)
+            != (process.candidate_status == ReplayScoreStatus::Protected);
+        result.protected_status_changes += usize::from(protection_changed);
+        if process.verdict != Some(ReviewVerdict::Useful) {
+            continue;
+        }
+        result.protected_useful_status_changes += usize::from(protection_changed);
+        let baseline_high = process
+            .baseline_probability
+            .is_some_and(|probability| probability >= probability_threshold);
+        let candidate_high = process
+            .candidate_probability
+            .is_some_and(|probability| probability >= probability_threshold);
+        result.baseline_useful_at_or_above_threshold += usize::from(baseline_high);
+        result.candidate_useful_at_or_above_threshold += usize::from(candidate_high);
+        result.newly_high_scoring_useful += usize::from(candidate_high && !baseline_high);
+    }
+    result.passed = result.status_changes == 0
+        && result.protected_status_changes == 0
+        && result.newly_high_scoring_useful == 0
+        && result.candidate_useful_at_or_above_threshold
+            <= result.baseline_useful_at_or_above_threshold;
+    result
+}
+
+fn require_refit_baseline_support(
+    report: &PairedEvaluationReport,
+    options: &PriorRefitOptions,
+    split: &str,
+) -> Result<(), ReplayEvaluationError> {
+    let count = |verdict| {
+        report
+            .processes
+            .iter()
+            .filter(|process| {
+                process.verdict == Some(verdict)
+                    && process.baseline_status == ReplayScoreStatus::Scored
+            })
+            .count()
+    };
+    let useful = count(ReviewVerdict::Useful);
+    let abandoned = count(ReviewVerdict::Abandoned);
+    if useful < options.min_labels_per_class || abandoned < options.min_labels_per_class {
+        return Err(ReplayEvaluationError::InvalidEvaluation(format!(
+            "refit {split} requires at least {} independently reviewed identities of each class scored by the incumbent; found {useful} useful and {abandoned} abandoned",
+            options.min_labels_per_class
+        )));
+    }
+    Ok(())
+}
+
+fn refit_comparison_reasons(
+    report: &PairedEvaluationReport,
+    safeguards: &PriorRefitSafeguards,
+    options: &PriorRefitOptions,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if report.coverage.paired_useful_count < options.min_labels_per_class
+        || report.coverage.paired_abandoned_count < options.min_labels_per_class
+        || report.paired_metrics.is_none()
+    {
+        reasons.push("insufficient paired class support for candidate comparison".to_string());
+    }
+    if safeguards.status_changes > 0 {
+        reasons.push(format!(
+            "candidate changed scoring coverage or status for {} recorded identities",
+            safeguards.status_changes
+        ));
+    }
+    if safeguards.protected_status_changes > 0 {
+        reasons.push(format!(
+            "candidate changed protection status for {} identities ({} reviewed useful)",
+            safeguards.protected_status_changes, safeguards.protected_useful_status_changes
+        ));
+    }
+    if safeguards.newly_high_scoring_useful > 0 {
+        reasons.push(format!(
+            "candidate newly placed {} reviewed useful identities at or above probability {:.3}",
+            safeguards.newly_high_scoring_useful, safeguards.probability_threshold
+        ));
+    }
+    reasons
+}
+
+fn refit_trial(
+    mass: f64,
+    report: &PairedEvaluationReport,
+    options: &PriorRefitOptions,
+) -> PriorRefitTrial {
+    let safeguards = refit_safeguards(report, options.probability_threshold);
+    let reasons = refit_comparison_reasons(report, &safeguards, options);
+    PriorRefitTrial {
+        prior_mass: mass,
+        configuration_sha256: report.candidate.configuration_sha256.clone(),
+        log_loss: report
+            .paired_metrics
+            .as_ref()
+            .map(|metrics| metrics.candidate.log_loss),
+        brier_score: report
+            .paired_metrics
+            .as_ref()
+            .map(|metrics| metrics.candidate.brier_score),
+        paired_count: report.coverage.paired_count,
+        eligible: reasons.is_empty() && safeguards.passed,
+        reasons,
+        safeguards,
+    }
+}
+
+/// Fit only P(abandoned or zombie), preserving the incumbent's within-group
+/// four-class ratios. Every candidate uses the production scorer on training
+/// data; the selected candidate is evaluated on holdout exactly once. All model
+/// inputs and the learned-verdict decay clock remain fixed for the whole search.
+///
+/// Captures must have disjoint, full boot-bound process identities. Labels must
+/// be independent reviews bound to those captures. This function writes no files
+/// and returns rejected candidates as well as improvements for honest reporting.
+pub fn refit_prior_mass(
+    training_snapshot: &ReplaySnapshot,
+    training_labels: &ReviewLabels,
+    holdout_snapshot: &ReplaySnapshot,
+    holdout_labels: &ReviewLabels,
+    incumbent: &Scorer,
+    policy: &Policy,
+    options: &PriorRefitOptions,
+) -> Result<PriorRefitReport, ReplayEvaluationError> {
+    options.validate()?;
+    let old_mass = validated_prior_mass(&incumbent.priors)?;
+    let training_births =
+        refit_birth_identities(training_snapshot, training_labels, ReviewSplit::Training)?;
+    let holdout_births =
+        refit_birth_identities(holdout_snapshot, holdout_labels, ReviewSplit::Holdout)?;
+    if training_labels.snapshot_sha256 == holdout_labels.snapshot_sha256 {
+        return Err(ReplayEvaluationError::InvalidEvaluation(
+            "refit training and holdout must not reuse the same capture".to_string(),
+        ));
+    }
+    if !training_births.is_disjoint(&holdout_births) {
+        return Err(ReplayEvaluationError::InvalidEvaluation(
+            "refit training and holdout censuses share a process incarnation".to_string(),
+        ));
+    }
+
+    let evaluated_at = Utc::now();
+    let incumbent = incumbent.clone().with_evaluation_time(evaluated_at);
+    let mut selected = incumbent.clone();
+    let mut selected_mass = old_mass;
+    let mut training = evaluate_pair_at(
+        training_snapshot,
+        training_labels,
+        &incumbent,
+        policy,
+        &incumbent,
+        policy,
+        evaluated_at,
+    )?;
+    require_refit_baseline_support(&training, options, "training")?;
+    let initial = refit_trial(old_mass, &training, options);
+    let mut best_loss = initial.log_loss.ok_or_else(|| {
+        ReplayEvaluationError::InvalidEvaluation(
+            "incumbent training probability metrics are unavailable".to_string(),
+        )
+    })?;
+    let mut training_search = vec![initial];
+
+    // Moving either group by this radius changes every member by at most the
+    // requested fraction, including when the useful group is the smaller one.
+    let other_mass = incumbent.priors.classes.useful.prior_prob
+        + incumbent.priors.classes.useful_bad.prior_prob;
+    let radius = options.max_change_fraction * old_mass.min(other_mass);
+    let midpoint = options.grid_points / 2;
+    for index in 0..options.grid_points {
+        let fraction = (index as f64 - midpoint as f64) / midpoint as f64;
+        let mass = old_mass + fraction * radius;
+        if mass == old_mass {
+            continue;
+        }
+        let mut candidate = incumbent.clone();
+        candidate.priors = priors_at_mass(&incumbent.priors, mass)?;
+        let comparison = evaluate_pair_at(
+            training_snapshot,
+            training_labels,
+            &incumbent,
+            policy,
+            &candidate,
+            policy,
+            evaluated_at,
+        )?;
+        let trial = refit_trial(mass, &comparison, options);
+        if trial.eligible {
+            if let Some(loss) = trial.log_loss {
+                // Retain the incumbent on numerical ties; a later tie is never
+                // broken using held-out labels or a second holdout evaluation.
+                if loss < best_loss - REFIT_LOSS_TOLERANCE {
+                    best_loss = loss;
+                    selected = candidate;
+                    selected_mass = mass;
+                    training = comparison;
+                }
+            }
+        }
+        training_search.push(trial);
+    }
+
+    let holdout = evaluate_pair_at(
+        holdout_snapshot,
+        holdout_labels,
+        &incumbent,
+        policy,
+        &selected,
+        policy,
+        evaluated_at,
+    )?;
+    require_refit_baseline_support(&holdout, options, "holdout")?;
+    let training_safeguards = refit_safeguards(&training, options.probability_threshold);
+    let holdout_safeguards = refit_safeguards(&holdout, options.probability_threshold);
+    let mut reasons = refit_comparison_reasons(&holdout, &holdout_safeguards, options);
+    let changed = selected_mass != old_mass;
+    let heldout_improved = holdout.paired_metrics.as_ref().is_some_and(|metrics| {
+        metrics.candidate_minus_baseline.log_loss < -REFIT_LOSS_TOLERANCE
+    });
+    if !changed {
+        reasons.push(
+            "no eligible grid candidate improved training log loss; the incumbent is retained"
+                .to_string(),
+        );
+    } else if !heldout_improved {
+        reasons.push(
+            "the training-selected candidate did not strictly improve held-out log loss"
+                .to_string(),
+        );
+    }
+    let accepted = changed
+        && heldout_improved
+        && reasons.is_empty()
+        && training_safeguards.passed
+        && holdout_safeguards.passed;
+    let status = if accepted {
+        reasons.push(
+            "the training-selected candidate improved held-out log loss with unchanged coverage and no newly high-scoring reviewed useful identities; no model was activated"
+                .to_string(),
+        );
+        PriorRefitStatus::Improved
+    } else if changed {
+        PriorRefitStatus::Rejected
+    } else {
+        PriorRefitStatus::Unchanged
+    };
+    Ok(PriorRefitReport {
+        schema_version: REFIT_SCHEMA_VERSION.to_string(),
+        engine_version: env!("CARGO_PKG_VERSION"),
+        method: "bounded_binary_prior_mass_grid",
+        evaluated_at: evaluated_at.to_rfc3339(),
+        options: options.clone(),
+        status,
+        accepted,
+        reasons,
+        incumbent_prior_mass: old_mass,
+        candidate_prior_mass: selected_mass,
+        minimum_prior_mass: old_mass - radius,
+        maximum_prior_mass: old_mass + radius,
+        incumbent_configuration_sha256: training.baseline.configuration_sha256.clone(),
+        candidate_configuration_sha256: training.candidate.configuration_sha256.clone(),
+        incumbent_priors: incumbent.priors,
+        candidate_priors: selected.priors,
+        training_search,
+        training,
+        holdout,
+        training_safeguards,
+        holdout_safeguards,
+        limitations: vec![
+            "Binary labels fit only the total prior mass of abandoned or zombie. They do not identify all four classes, fit feature distributions, or implement full empirical-Bayes hyperparameter estimation."
+                .to_string(),
+            "Acceptance describes paired probabilities on this held-out capture, not final action decisions, a false-kill bound, fleet generalization, or an FDR guarantee."
+                .to_string(),
+            "All capture rows retain their status. Unknown labels and unscored identities remain outside probability losses; the reviewed sample may not represent the deployment population."
+                .to_string(),
+            "Boot-bound identities prevent reuse across these two captures. Independence of human judgments and exclusion from earlier learned verdicts, signatures, or previous fitting runs remain operator responsibilities."
+                .to_string(),
+            "The prior, policy, signatures, and decision memory are frozen at the reported evaluation time. Repeating the search using holdout feedback invalidates its role as unseen data."
+                .to_string(),
+            "Improvement requires more than 1e-12 log-loss reduction; numerical ties retain the incumbent. No configuration or process was changed by this computation."
+                .to_string(),
+        ],
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1188,7 +1732,7 @@ mod tests {
     };
     use crate::supervision::signature::{SignatureDatabase, SupervisorSignature};
     use crate::supervision::SupervisorCategory;
-    use pt_common::{IdentityQuality, ProcessIdentity};
+    use pt_common::{IdentityQuality, ProcessIdentity, StartId};
     use std::collections::{BTreeSet, HashMap};
     use std::path::PathBuf;
 
@@ -1236,6 +1780,77 @@ mod tests {
             .collect::<Vec<_>>();
         let scan = MockScanBuilder::new()
             .platform(std::env::consts::OS)
+            .with_processes(processes)
+            .build();
+        let mut snapshot = record_snapshot(&scan, Some("evaluation-contract-fixture")).unwrap();
+        let inputs = snapshot
+            .processes
+            .iter()
+            .map(|process| {
+                let observations = scorer.recorded_observations(process, None);
+                #[cfg(target_os = "linux")]
+                let observations = {
+                    let mut observations = observations;
+                    observations.provenance = Some(crate::scoring::derive_provenance_adjustment(
+                        process.pid.0,
+                        &crate::scoring::ProvenanceInferenceBundle {
+                            resource_graph: crate::collect::SharedResourceGraph::default(),
+                            lineages: HashMap::new(),
+                            children: HashMap::new(),
+                            ..Default::default()
+                        },
+                    ));
+                    observations
+                };
+                (
+                    process.pid.0,
+                    ReplayProcessInputs {
+                        identity: ProcessIdentity::full(
+                            process.pid.0,
+                            process.start_id.clone(),
+                            process.uid,
+                            process.pgid,
+                            process.sid,
+                            IdentityQuality::Full,
+                        ),
+                        cgroup_role: Some(CgroupRole::LoginSession),
+                        observations: Some(observations),
+                        unavailable_reason: None,
+                    },
+                )
+            })
+            .collect();
+        snapshot.scoring_context = Some(ReplayScoringContext {
+            schema_version: 1,
+            platform: std::env::consts::OS.to_string(),
+            requested_window_ms: 0,
+            invoker_chain: BTreeSet::new(),
+            processes: inputs,
+        });
+        snapshot
+    }
+
+    fn snapshot_with_boot(count: u32, boot_id: &str) -> ReplaySnapshot {
+        let scorer = scorer();
+        let processes = (100..100 + count)
+            .map(|pid| {
+                MockProcessBuilder::new()
+                    .pid(pid)
+                    .start_id(StartId::from_linux(boot_id, 1234567890, pid))
+                    .ppid(7)
+                    .pgid(pid)
+                    .sid(pid)
+                    .uid(1000)
+                    .user("alice")
+                    .comm("worker")
+                    .cmd("worker --job")
+                    .elapsed_secs(7200)
+                    .build()
+            })
+            .collect::<Vec<_>>();
+        let scan = MockScanBuilder::new()
+            .platform(std::env::consts::OS)
+            .boot_id(boot_id)
             .with_processes(processes)
             .build();
         let mut snapshot = record_snapshot(&scan, Some("evaluation-contract-fixture")).unwrap();
@@ -1343,6 +1958,43 @@ mod tests {
             (&mut model.priors.classes.zombie, 0.05),
         ] {
             *class = common.clone();
+            class.prior_prob = probability;
+        }
+        model.priors.state_flags = None;
+        model.priors.command_categories = None;
+        model
+    }
+
+    fn bounded_refit_labels(
+        snapshot: &ReplaySnapshot,
+        split: ReviewSplit,
+        useful_count: usize,
+    ) -> ReviewLabels {
+        let mut labels = make_review_template(snapshot, "declared-cohort", split).unwrap();
+        for (index, process) in labels.processes.iter_mut().enumerate() {
+            review(
+                process,
+                if index < useful_count {
+                    ReviewVerdict::Useful
+                } else {
+                    ReviewVerdict::Abandoned
+                },
+            );
+        }
+        labels
+    }
+
+    /// Equal feature likelihoods give the independent arithmetic oracle P=q.
+    fn neutral_refit_scorer(mass: f64) -> Scorer {
+        let mut model = scorer();
+        let params = model.priors.classes.useful.clone();
+        for (class, probability) in [
+            (&mut model.priors.classes.useful, 0.75 * (1.0 - mass)),
+            (&mut model.priors.classes.useful_bad, 0.25 * (1.0 - mass)),
+            (&mut model.priors.classes.abandoned, 0.75 * mass),
+            (&mut model.priors.classes.zombie, 0.25 * mass),
+        ] {
+            *class = params.clone();
             class.prior_prob = probability;
         }
         model.priors.state_flags = None;
@@ -2259,5 +2911,376 @@ mod tests {
             configuration_fingerprint(&changed, &policy).unwrap(),
             fingerprint
         );
+    }
+
+    #[test]
+    fn refit_improvement_uses_production_scores_and_exports_only_bounded_prior_changes() {
+        let training = snapshot_with_boot(20, "training-boot");
+        let holdout = snapshot_with_boot(20, "holdout-boot");
+        let training_labels = bounded_refit_labels(&training, ReviewSplit::Training, 10);
+        let holdout_labels = bounded_refit_labels(&holdout, ReviewSplit::Holdout, 10);
+        let model = neutral_refit_scorer(0.2);
+        let original = serde_json::to_value(&model.priors).unwrap();
+        let options = PriorRefitOptions::default();
+        let report = refit_prior_mass(
+            &training,
+            &training_labels,
+            &holdout,
+            &holdout_labels,
+            &model,
+            &policy(),
+            &options,
+        )
+        .unwrap();
+        assert!(report.accepted, "{:?}", report.reasons);
+        assert_eq!(report.status, PriorRefitStatus::Improved);
+        assert!((report.candidate_prior_mass - 0.24).abs() < 1e-12);
+        assert_eq!(report.training_search.len(), options.grid_points);
+        let metrics = report.holdout.paired_metrics.as_ref().unwrap();
+        let loss = |probability: f64| -0.5 * (probability.ln() + (1.0 - probability).ln());
+        assert!((metrics.baseline.log_loss - loss(0.2)).abs() < 1e-12);
+        assert!((metrics.candidate.log_loss - loss(0.24)).abs() < 1e-12);
+        assert_eq!(metrics.sample_count, 20);
+        for process in &report.holdout.processes {
+            assert!((process.baseline_probability.unwrap() - 0.2).abs() < 1e-12);
+            assert!((process.candidate_probability.unwrap() - 0.24).abs() < 1e-12);
+        }
+        for comparison in [&report.training, &report.holdout] {
+            assert_eq!(comparison.evaluated_at, report.evaluated_at);
+            assert_eq!(comparison.baseline.evaluated_at, report.evaluated_at);
+            assert_eq!(comparison.candidate.evaluated_at, report.evaluated_at);
+            assert_eq!(
+                comparison.baseline.configuration_sha256,
+                report.incumbent_configuration_sha256
+            );
+            assert_eq!(
+                comparison.candidate.configuration_sha256,
+                report.candidate_configuration_sha256
+            );
+        }
+        let mut candidate = serde_json::to_value(&report.candidate_priors).unwrap();
+        let mut total = 0.0;
+        for class in ["useful", "useful_bad", "abandoned", "zombie"] {
+            let before = original["classes"][class]["prior_prob"].as_f64().unwrap();
+            let after = candidate["classes"][class]["prior_prob"].as_f64().unwrap();
+            assert!((after - before).abs() <= options.max_change_fraction * before + 1e-12);
+            total += after;
+            candidate["classes"][class]["prior_prob"] =
+                original["classes"][class]["prior_prob"].clone();
+        }
+        assert!((total - 1.0).abs() < 1e-12);
+        assert_eq!(
+            candidate, original,
+            "all non-probability parameters stay fixed"
+        );
+        assert!(
+            (report.candidate_priors.classes.useful.prior_prob
+                / report.candidate_priors.classes.useful_bad.prior_prob
+                - 3.0)
+                .abs()
+                < 1e-12
+        );
+        assert!(
+            (report.candidate_priors.classes.abandoned.prior_prob
+                / report.candidate_priors.classes.zombie.prior_prob
+                - 3.0)
+                .abs()
+                < 1e-12
+        );
+        let restored: Priors =
+            serde_json::from_slice(&serde_json::to_vec(&report.candidate_priors).unwrap()).unwrap();
+        crate::config::validation::validate_priors(&restored).unwrap();
+        assert_eq!(serde_json::to_value(&model.priors).unwrap(), original);
+    }
+
+    #[test]
+    fn refit_reports_holdout_loss_without_using_holdout_labels_for_selection() {
+        let training = snapshot_with_boot(30, "training-boot");
+        let holdout = snapshot_with_boot(30, "holdout-boot");
+        let training_labels = bounded_refit_labels(&training, ReviewSplit::Training, 15);
+        let model = neutral_refit_scorer(0.2);
+        let fit = |useful_count| {
+            refit_prior_mass(
+                &training,
+                &training_labels,
+                &holdout,
+                &bounded_refit_labels(&holdout, ReviewSplit::Holdout, useful_count),
+                &model,
+                &policy(),
+                &PriorRefitOptions::default(),
+            )
+            .unwrap()
+        };
+        let improvement = fit(15);
+        let loss = fit(25);
+        assert!(improvement.accepted);
+        assert!(!loss.accepted);
+        assert_eq!(loss.status, PriorRefitStatus::Rejected);
+        assert!(
+            loss.holdout
+                .paired_metrics
+                .as_ref()
+                .unwrap()
+                .candidate_minus_baseline
+                .log_loss
+                > 0.0
+        );
+        assert_eq!(loss.candidate_prior_mass, improvement.candidate_prior_mass);
+        assert_eq!(
+            serde_json::to_value(&loss.candidate_priors).unwrap(),
+            serde_json::to_value(&improvement.candidate_priors).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&loss.training_search).unwrap(),
+            serde_json::to_value(&improvement.training_search).unwrap()
+        );
+        assert!(loss
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("held-out log loss")));
+    }
+
+    #[test]
+    fn refit_keeps_incumbent_when_training_is_optimal_or_change_is_disabled() {
+        let training = snapshot_with_boot(20, "training-boot");
+        let holdout = snapshot_with_boot(20, "holdout-boot");
+        for (mass, max_change) in [(0.5, 0.2), (0.2, 0.0)] {
+            let model = neutral_refit_scorer(mass);
+            let report = refit_prior_mass(
+                &training,
+                &bounded_refit_labels(&training, ReviewSplit::Training, 10),
+                &holdout,
+                &bounded_refit_labels(&holdout, ReviewSplit::Holdout, 10),
+                &model,
+                &policy(),
+                &PriorRefitOptions {
+                    max_change_fraction: max_change,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(report.status, PriorRefitStatus::Unchanged);
+            assert!(!report.accepted);
+            assert_eq!(report.candidate_prior_mass, report.incumbent_prior_mass);
+            assert_eq!(
+                report.candidate_configuration_sha256,
+                report.incumbent_configuration_sha256
+            );
+            assert_eq!(
+                serde_json::to_value(&report.candidate_priors).unwrap(),
+                serde_json::to_value(&model.priors).unwrap()
+            );
+            assert_eq!(
+                report
+                    .holdout
+                    .paired_metrics
+                    .unwrap()
+                    .candidate_minus_baseline
+                    .log_loss,
+                0.0
+            );
+        }
+    }
+
+    #[test]
+    fn refit_rejects_new_high_useful_scores_even_when_heldout_log_loss_improves() {
+        let training = snapshot_with_boot(20, "training-boot");
+        let mut holdout = snapshot_with_boot(20, "holdout-boot");
+        holdout.deep_signals.insert(
+            100,
+            DeepSignalRecord {
+                net_active: Some(true),
+                io_active: None,
+            },
+        );
+        let mut model = neutral_refit_scorer(0.2);
+        // The tempered network Bayes factor is sqrt((49/64)/(1/16))=3.5.
+        // That useful holdout row moves from 7/15 to 21/40, crossing 0.5.
+        for class in [
+            &mut model.priors.classes.useful,
+            &mut model.priors.classes.useful_bad,
+        ] {
+            class.net_beta = crate::config::priors::BetaParams::new(1.0, 15.0);
+        }
+        for class in [
+            &mut model.priors.classes.abandoned,
+            &mut model.priors.classes.zombie,
+        ] {
+            class.net_beta = crate::config::priors::BetaParams::new(49.0, 15.0);
+        }
+        let report = refit_prior_mass(
+            &training,
+            &bounded_refit_labels(&training, ReviewSplit::Training, 10),
+            &holdout,
+            &bounded_refit_labels(&holdout, ReviewSplit::Holdout, 10),
+            &model,
+            &policy(),
+            &PriorRefitOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(report.status, PriorRefitStatus::Rejected);
+        assert!(!report.accepted);
+        assert!(
+            report
+                .holdout
+                .paired_metrics
+                .as_ref()
+                .unwrap()
+                .candidate_minus_baseline
+                .log_loss
+                < 0.0
+        );
+        assert_eq!(report.holdout_safeguards.newly_high_scoring_useful, 1);
+        let useful = &report.holdout.processes[0];
+        assert!((useful.baseline_probability.unwrap() - 7.0 / 15.0).abs() < 1e-12);
+        assert!((useful.candidate_probability.unwrap() - 21.0 / 40.0).abs() < 1e-12);
+        assert!(report
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("reviewed useful")));
+    }
+
+    #[test]
+    fn refit_rejects_capture_leakage_weak_identity_and_wrong_split() {
+        let training = snapshot_with_boot(20, "training-boot");
+        let holdout = snapshot_with_boot(20, "holdout-boot");
+        let training_labels = bounded_refit_labels(&training, ReviewSplit::Training, 10);
+        let model = neutral_refit_scorer(0.2);
+        let fit = |capture: &ReplaySnapshot, labels: &ReviewLabels| {
+            refit_prior_mass(
+                &training,
+                &training_labels,
+                capture,
+                labels,
+                &model,
+                &policy(),
+                &PriorRefitOptions::default(),
+            )
+        };
+        let duplicate_labels = bounded_refit_labels(&training, ReviewSplit::Holdout, 10);
+        assert!(fit(&training, &duplicate_labels)
+            .unwrap_err()
+            .to_string()
+            .contains("same capture"));
+
+        let mut repeated = training.clone();
+        repeated.name = "different-name-same-processes".to_string();
+        let mut repeated_labels = bounded_refit_labels(&repeated, ReviewSplit::Holdout, 10);
+        repeated_labels.host_id = "renamed-host".to_string();
+        assert!(fit(&repeated, &repeated_labels)
+            .unwrap_err()
+            .to_string()
+            .contains("share a process incarnation"));
+
+        let wrong_split = bounded_refit_labels(&holdout, ReviewSplit::Training, 10);
+        assert!(fit(&holdout, &wrong_split).is_err());
+        let mut stale = bounded_refit_labels(&holdout, ReviewSplit::Holdout, 10);
+        stale.snapshot_sha256 = training_labels.snapshot_sha256.clone();
+        assert!(fit(&holdout, &stale).is_err());
+
+        for boot in [None, Some("unknown"), Some("different-boot")] {
+            let mut weak = holdout.clone();
+            weak.context.boot_id = boot.map(String::from);
+            assert!(fit(&weak, &bounded_refit_labels(&weak, ReviewSplit::Holdout, 10)).is_err());
+        }
+        let mut weak = holdout;
+        weak.scoring_context
+            .as_mut()
+            .unwrap()
+            .processes
+            .get_mut(&100)
+            .unwrap()
+            .identity
+            .quality = IdentityQuality::NoBootId;
+        assert!(fit(&weak, &bounded_refit_labels(&weak, ReviewSplit::Holdout, 10)).is_err());
+    }
+
+    #[test]
+    fn refit_requires_scored_class_support_and_valid_bounded_options() {
+        let training = snapshot_with_boot(10, "training-boot");
+        let holdout = snapshot_with_boot(10, "holdout-boot");
+        let model = neutral_refit_scorer(0.2);
+        let fit = |useful_count, options: &PriorRefitOptions, selected_policy: &Policy| {
+            refit_prior_mass(
+                &training,
+                &bounded_refit_labels(&training, ReviewSplit::Training, useful_count),
+                &holdout,
+                &bounded_refit_labels(&holdout, ReviewSplit::Holdout, 5),
+                &model,
+                selected_policy,
+                options,
+            )
+        };
+        assert!(fit(6, &PriorRefitOptions::default(), &policy()).is_err());
+        let mut protected = policy();
+        protected.guardrails.never_kill_pid.push(100);
+        assert!(fit(5, &PriorRefitOptions::default(), &protected).is_err());
+        for maximum in [f64::NAN, f64::INFINITY, -0.1, 0.51] {
+            assert!(fit(
+                5,
+                &PriorRefitOptions {
+                    max_change_fraction: maximum,
+                    ..Default::default()
+                },
+                &policy()
+            )
+            .is_err());
+        }
+        for grid in [0, 1, 2, 20, 103] {
+            assert!(fit(
+                5,
+                &PriorRefitOptions {
+                    grid_points: grid,
+                    ..Default::default()
+                },
+                &policy()
+            )
+            .is_err());
+        }
+        for minimum in [0, 4, 6] {
+            assert!(fit(
+                5,
+                &PriorRefitOptions {
+                    min_labels_per_class: minimum,
+                    ..Default::default()
+                },
+                &policy()
+            )
+            .is_err());
+        }
+        for threshold in [f64::NAN, 0.0, 1.0] {
+            assert!(fit(
+                5,
+                &PriorRefitOptions {
+                    probability_threshold: threshold,
+                    ..Default::default()
+                },
+                &policy()
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn refit_safeguards_preserve_protected_and_unreviewed_coverage() {
+        let snapshot = snapshot(22);
+        let mut labels = bounded_refit_labels(&snapshot, ReviewSplit::Holdout, 10);
+        labels.processes[21] = ProcessReview::unreviewed(&snapshot.processes[21]);
+        let model = neutral_refit_scorer(0.2);
+        let mut policy = policy();
+        policy.guardrails.never_kill_pid.push(100);
+        let mut report =
+            evaluate_pair(&snapshot, &labels, &model, &policy, &model, &policy).unwrap();
+        assert!(refit_safeguards(&report, 0.5).passed);
+        report.processes[0].candidate_status = ReplayScoreStatus::Scored;
+        report.processes[0].candidate_probability = Some(0.8);
+        report.processes[21].candidate_status = ReplayScoreStatus::Unavailable;
+        report.processes[21].candidate_probability = None;
+        let safeguards = refit_safeguards(&report, 0.5);
+        assert!(!safeguards.passed);
+        assert_eq!(safeguards.status_changes, 2);
+        assert_eq!(safeguards.protected_status_changes, 1);
+        assert_eq!(safeguards.protected_useful_status_changes, 1);
+        assert_eq!(safeguards.newly_high_scoring_useful, 1);
     }
 }

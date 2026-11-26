@@ -390,6 +390,75 @@ pt shadow report -f md            # ASCII calibration report
 pt shadow stop                    # Stop observer
 ```
 
+### 5. Fit and Evaluate Reviewed Captures
+
+`pt replay refit --method score-grid` connects independent review to a bounded,
+offline model update. The default `counts` method retains its reviewed-label
+prevalence fit and priors-only output; `score-grid` optimizes production-score
+log loss and saves complete frozen configurations as described below.
+Record a training capture and a separate holdout capture with
+`pt scan --record-replay <path>`. The complete captures must have disjoint,
+boot-bound process identities: ordinary repeated scans of the same boot share
+processes and are refused. Use independent hosts or boots, retain every census
+row, and keep the holdout out of earlier fitting and learned verdicts.
+
+```bash
+pt replay label-template --snapshot training.json --output training-labels.json \
+  --host-id training-host --split training
+pt replay label-template --snapshot holdout.json --output holdout-labels.json \
+  --host-id holdout-host --split holdout
+
+# Independently review the templates before fitting. Keep unknown verdicts null.
+pt --config ./current-config replay refit --method score-grid \
+  --training-snapshot training.json --training-labels training-labels.json \
+  --holdout-snapshot holdout.json --holdout-labels holdout-labels.json \
+  --output ./model-version-001 --format json
+```
+
+For each reviewed row, provide `verdict` (`useful` or `abandoned`), `reviewer`,
+`reviewed_at` and `rationale`. Here `useful` includes useful-but-bad work, and
+`abandoned` includes zombies. Each split needs at least five reviewed identities
+of each class that the incumbent can score. Labels bind to the capture digest
+and exact process identities; missing rows, changed captures, reused births and
+incorrect split declarations fail validation. A host name or reviewer field
+does not itself prove independence.
+
+The fit changes only the combined prior probability of abandonment or zombie
+state, preserving the ratios within the four classes and all feature
+distributions. By default it searches 21 training candidates, limiting each
+class prior's relative change to 20%. `--max-change-fraction` accepts 0 through
+0.5, and `--grid-points` accepts odd values from 3 through 101. Every candidate
+uses the production scorer with the same policy, signatures, learned decisions
+and evaluation time. The selected candidate is checked once on holdout; it is
+accepted only with lower holdout log loss, unchanged scoring coverage and no
+newly high-scoring reviewed useful identity at the fixed probability threshold
+of 0.5. The report includes Brier score, calibration error, coverage and rejection
+reasons. These are probability checks, not a false-kill or fleet FDR guarantee.
+
+For `score-grid`, the new private output directory contains `candidate/` and
+`incumbent/`, each
+with ordinary loadable priors, policy, signatures and decision memory, plus
+`report.json` and the evaluated bundled-signature snapshot. Both configurations
+are reloaded and their fingerprints checked before the report is written.
+Existing output paths and symlinks are refused. Rejected and unchanged results
+are retained for inspection; **the active configuration is never changed**.
+Use a new version directory for each run, and do not treat a missing or incomplete
+report as a completed artifact. Captures, reviews and model files contain private
+process information; new files use mode `0600` and directories `0700` on Unix.
+
+You can inspect the saved candidate through the existing comparison command:
+
+```bash
+pt --config ./model-version-001/candidate replay evaluate \
+  --snapshot holdout.json --labels holdout-labels.json \
+  --baseline-config ./model-version-001/incumbent --format json
+```
+
+The original report preserves the fit's single frozen evaluation time. A later
+comparison uses a new evaluation time, so learned-verdict decay may differ.
+Keep the same engine build when reproducing the saved model, and reserve new
+holdout data before tuning again in response to a rejected candidate.
+
 ---
 
 ## Command Reference
@@ -414,6 +483,9 @@ pt shadow stop                    # Stop observer
 | `pt bundle create` | Export session bundle | `pt bundle create --session <id> --output out.ptb` |
 | `pt report` | HTML report from session | `pt report --session <id> --output report.html` |
 | `pt shadow start` | Start calibration observer | `pt shadow start` |
+| `pt replay label-template` | Create a private, complete review census | `pt replay label-template --snapshot capture.json --output labels.json --host-id host-a` |
+| `pt replay evaluate` | Compare two configurations on one reviewed capture | `pt replay evaluate --snapshot capture.json --labels labels.json --baseline-config ./incumbent` |
+| `pt replay refit` | Fit priors by label counts or bounded score optimization | `pt replay refit --help` |
 | `pt doctor` | Read-only host hygiene audit (prints fixes, never runs them) | `pt doctor --format md` |
 | `pt config validate` | Validate config files | `pt-core config validate policy.json` |
 | `pt --version` | Show version | `pt --version` |

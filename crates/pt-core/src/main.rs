@@ -586,13 +586,22 @@ enum ReplayCommands {
         #[arg(long, value_name = "PATH")]
         training_labels: PathBuf,
         /// Separate holdout capture; its labels never participate in fitting
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, visible_alias = "holdout-snapshot", value_name = "PATH")]
         snapshot: PathBuf,
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, visible_alias = "holdout-labels", value_name = "PATH")]
         labels: PathBuf,
-        /// New private directory for priors.json and refit.json; existing paths are refused
+        /// New private output directory; existing paths are refused
         #[arg(long, value_name = "DIR")]
         output: PathBuf,
+        /// Counts fits label prevalence; score-grid optimizes production-score log loss
+        #[arg(long, default_value = "counts", value_parser = ["counts", "score-grid"])]
+        method: String,
+        /// Score-grid only: maximum relative class-prior change (default 0.2; at most 0.5)
+        #[arg(long)]
+        max_change_fraction: Option<f64>,
+        /// Score-grid only: odd number of candidates (default 21; 3 through 101)
+        #[arg(long, value_parser = clap::value_parser!(u32).range(3..=101))]
+        grid_points: Option<u32>,
     },
 }
 
@@ -10011,6 +10020,21 @@ fn replay_evaluation_error(error: pt_core::replay::ReplayEvaluationError) -> Exi
 }
 
 fn run_replay(global: &GlobalOpts, args: &ReplayArgs) -> ExitCode {
+    if let ReplayCommands::Refit {
+        method,
+        max_change_fraction,
+        grid_points,
+        ..
+    } = &args.command
+    {
+        if method == "score-grid" {
+            return run_score_grid_refit(global, &args.command);
+        }
+        if max_change_fraction.is_some() || grid_points.is_some() {
+            eprintln!("replay: --max-change-fraction and --grid-points require --method score-grid");
+            return ExitCode::ArgsError;
+        }
+    }
     use pt_core::replay::evaluation::{
         refit_and_evaluate, write_refit_artifacts, ReplayRefitConfig,
     };
@@ -10279,6 +10303,139 @@ fn run_replay(global: &GlobalOpts, args: &ReplayArgs) -> ExitCode {
             )
         }
     };
+    output_replay_result(global, output, &summary)
+}
+
+fn run_score_grid_refit(global: &GlobalOpts, args: &ReplayCommands) -> ExitCode {
+    use pt_core::replay::{
+        read_review_labels, refit_prior_mass, save_prior_refit_artifact, PriorRefitOptions,
+    };
+
+    let ReplayCommands::Refit {
+        training_snapshot,
+        training_labels,
+        snapshot,
+        labels,
+        output,
+        max_change_fraction,
+        grid_points,
+        ..
+    } = args
+    else {
+        eprintln!("replay: score-grid dispatch requires refit arguments");
+        return ExitCode::InternalError;
+    };
+    if let Some(path) = global
+        .config
+        .as_ref()
+        .filter(|path| !Path::new(path).is_dir())
+    {
+        eprintln!("replay: incumbent configuration directory is inaccessible: {path}");
+        return ExitCode::ArgsError;
+    }
+    match std::fs::symlink_metadata(output) {
+        Ok(_) => {
+            eprintln!(
+                "replay: refit output already exists; choose a new version directory: {}",
+                output.display()
+            );
+            return ExitCode::IoError;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return replay_evaluation_error(error.into()),
+    }
+    let training_snapshot = match pt_core::replay::load_snapshot(training_snapshot) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return replay_evaluation_error(error.into()),
+    };
+    let training_labels = match read_review_labels(training_labels) {
+        Ok(labels) => labels,
+        Err(error) => return replay_evaluation_error(error),
+    };
+    let holdout_snapshot = match pt_core::replay::load_snapshot(snapshot) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return replay_evaluation_error(error.into()),
+    };
+    let holdout_labels = match read_review_labels(labels) {
+        Ok(labels) => labels,
+        Err(error) => return replay_evaluation_error(error),
+    };
+    let config = match load_config(&ConfigOptions {
+        config_dir: global.config.as_ref().map(PathBuf::from),
+        ..Default::default()
+    }) {
+        Ok(config) => config,
+        Err(error) => return output_config_error(global, &error),
+    };
+    let incumbent = match configured_scorer(&config) {
+        Ok(scorer) => scorer,
+        Err(error) => return output_config_error(global, &error),
+    };
+    let options = PriorRefitOptions {
+        max_change_fraction: max_change_fraction.unwrap_or(0.2),
+        grid_points: grid_points.unwrap_or(21) as usize,
+        ..Default::default()
+    };
+    let report = match refit_prior_mass(
+        &training_snapshot,
+        &training_labels,
+        &holdout_snapshot,
+        &holdout_labels,
+        &incumbent,
+        &config.policy,
+        &options,
+    ) {
+        Ok(report) => report,
+        Err(error) => return replay_evaluation_error(error),
+    };
+    let artifact = match save_prior_refit_artifact(output, &report, &incumbent, &config.policy) {
+        Ok(artifact) => artifact,
+        Err(error) => return replay_evaluation_error(error),
+    };
+    let mut summary = format!(
+        "Offline prior refit: {:?}; accepted: {}.\n\
+         Abandoned-or-zombie prior mass: {:.6} -> {:.6}.\n\
+         Saved private model version to {}. No active configuration was changed.",
+        report.status,
+        report.accepted,
+        report.incumbent_prior_mass,
+        report.candidate_prior_mass,
+        artifact.directory.display()
+    );
+    if let Some(metrics) = &report.holdout.paired_metrics {
+        summary.push_str(&format!(
+            "\nHoldout log loss: {:.6} -> {:.6}; Brier: {:.6} -> {:.6}; paired identities: {}.",
+            metrics.baseline.log_loss,
+            metrics.candidate.log_loss,
+            metrics.baseline.brier_score,
+            metrics.candidate.brier_score,
+            metrics.sample_count
+        ));
+    }
+    for reason in report.reasons.iter().chain(report.limitations.iter()) {
+        summary.push_str(&format!("\n- {reason}"));
+    }
+    output_replay_result(
+        global,
+        serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "command": "replay refit",
+            "method": "score-grid",
+            "activated": false,
+            "artifact_scope": "frozen_configuration_pair",
+            "incumbent_config": config.config_dir,
+            "artifact": artifact,
+            "refit": report,
+        }),
+        &summary,
+    )
+}
+
+fn output_replay_result(
+    global: &GlobalOpts,
+    output: serde_json::Value,
+    summary: &str,
+) -> ExitCode {
     match global.format {
         OutputFormat::Json | OutputFormat::Toon => {
             println!("{}", format_structured_output(global, output));

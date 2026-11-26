@@ -37,15 +37,19 @@ mod replay_recording {
         }
 
         fn command(&self) -> Command {
+            self.command_with_config(&self.config)
+        }
+
+        fn command_with_config(&self, config: &std::path::Path) -> Command {
             let mut command = pt_core();
             command
                 .env_remove("PT_CONFIG_DIR")
                 .env_remove("PT_SKIP_GLOBAL_LOCK")
-                .env("PROCESS_TRIAGE_CONFIG", &self.config)
+                .env("PROCESS_TRIAGE_CONFIG", config)
                 .env("PROCESS_TRIAGE_DATA", &self.data)
                 .env("PROCESS_TRIAGE_RETENTION", "off")
                 .arg("--config")
-                .arg(&self.config)
+                .arg(config)
                 .timeout(std::time::Duration::from_secs(120));
             command
         }
@@ -838,6 +842,476 @@ mod replay_recording {
             ));
         assert_eq!(std::fs::read(&signatures_path).unwrap(), corrupt_signatures);
         assert_eq!(std::fs::read(&labels_path).unwrap(), original);
+    }
+
+    mod prior_refit {
+        use super::*;
+        use pt_core::collect::cgroup::CgroupRole;
+        use pt_core::collect::{ProcessRecord, ProcessState, ScanMetadata, ScanResult};
+        use pt_core::config::{Policy, Priors};
+        use pt_core::decision::decision_store::{DecisionStore, Verdict};
+        use pt_core::inference::FastPathConfig;
+        use pt_core::replay::{
+            make_review_template, record_snapshot, ReplayProcessInputs, ReplayScoringContext,
+            ReviewSplit, ReviewVerdict,
+        };
+        use pt_core::scoring::Scorer;
+        use pt_core::supervision::pattern_persistence::DisabledPatterns;
+        use pt_core::supervision::signature::{
+            SignatureDatabase, SignatureSchema, SupervisorSignature,
+        };
+        use pt_core::supervision::SupervisorCategory;
+        use pt_common::{IdentityQuality, ProcessId, ProcessIdentity, StartId};
+        use std::collections::BTreeSet;
+        use std::path::{Path, PathBuf};
+
+        const TRAINING_BOOT: &str = "11111111-1111-4111-8111-111111111111";
+        const HOLDOUT_BOOT: &str = "22222222-2222-4222-8222-222222222222";
+
+        struct ReviewedCapture {
+            snapshot: PathBuf,
+            labels: PathBuf,
+        }
+
+        // Synthetic observations and labels exercise the CLI contract and
+        // independent probability arithmetic only; they are not fleet evidence.
+        fn capture(
+            case: &CaptureCase,
+            name: &str,
+            boot: &str,
+            split: ReviewSplit,
+            count: u32,
+            useful_count: usize,
+        ) -> ReviewedCapture {
+            let scorer = Scorer::new(
+                Priors::default(),
+                DecisionStore::default(),
+                SignatureDatabase::new(),
+                FastPathConfig::disabled(),
+            );
+            let captured_at = chrono::Utc::now();
+            let processes: Vec<_> = (100..100 + count)
+                .map(|pid| ProcessRecord {
+                    pid: ProcessId(pid),
+                    ppid: ProcessId(7),
+                    pgid: Some(pid),
+                    sid: Some(pid),
+                    uid: 1000,
+                    user: "contract-reviewer".to_string(),
+                    comm: "__pt_refit_contract__".to_string(),
+                    cmd: "__pt_refit_contract__ --synthetic".to_string(),
+                    start_id: StartId::from_linux(boot, 1000 + u64::from(pid), pid),
+                    state: ProcessState::Sleeping,
+                    cpu_percent: 0.0,
+                    rss_bytes: 10 * 1024 * 1024,
+                    vsz_bytes: 50 * 1024 * 1024,
+                    tty: None,
+                    start_time_unix: captured_at.timestamp() - 7200,
+                    elapsed: std::time::Duration::from_secs(7200),
+                    source: "synthetic-cli-contract".to_string(),
+                    container_info: None,
+                })
+                .collect();
+            let scan = ScanResult {
+                metadata: ScanMetadata {
+                    scan_type: "synthetic-cli-contract".to_string(),
+                    platform: std::env::consts::OS.to_string(),
+                    boot_id: Some(boot.to_string()),
+                    started_at: captured_at.to_rfc3339(),
+                    duration_ms: 0,
+                    process_count: processes.len(),
+                    warnings: Vec::new(),
+                },
+                processes,
+            };
+            let mut snapshot = record_snapshot(&scan, Some(name)).unwrap();
+            let inputs = snapshot
+                .processes
+                .iter()
+                .map(|process| {
+                    let observations = scorer.recorded_observations(process, None);
+                    #[cfg(target_os = "linux")]
+                    let observations = {
+                        let mut observations = observations;
+                        observations.provenance =
+                            Some(pt_core::scoring::derive_provenance_adjustment(
+                                process.pid.0,
+                                &pt_core::scoring::ProvenanceInferenceBundle::default(),
+                            ));
+                        observations
+                    };
+                    (
+                        process.pid.0,
+                        ReplayProcessInputs {
+                            identity: ProcessIdentity::full(
+                                process.pid.0,
+                                process.start_id.clone(),
+                                process.uid,
+                                process.pgid,
+                                process.sid,
+                                IdentityQuality::Full,
+                            ),
+                            cgroup_role: Some(CgroupRole::LoginSession),
+                            observations: Some(observations),
+                            unavailable_reason: None,
+                        },
+                    )
+                })
+                .collect();
+            snapshot.scoring_context = Some(ReplayScoringContext {
+                schema_version: 1,
+                platform: std::env::consts::OS.to_string(),
+                requested_window_ms: 0,
+                invoker_chain: BTreeSet::new(),
+                processes: inputs,
+            });
+            let mut labels = make_review_template(&snapshot, name, split).unwrap();
+            for (index, process) in labels.processes.iter_mut().enumerate() {
+                process.verdict = Some(if index < useful_count {
+                    ReviewVerdict::Useful
+                } else {
+                    ReviewVerdict::Abandoned
+                });
+                process.reviewer = Some("synthetic-contract-reviewer".to_string());
+                process.reviewed_at = Some("2026-11-09T00:00:00Z".to_string());
+                process.rationale = Some("Synthetic CLI contract label, not fleet evidence".into());
+            }
+            let capture = ReviewedCapture {
+                snapshot: case.root.join(format!("{name}-snapshot.json")),
+                labels: case.root.join(format!("{name}-labels.json")),
+            };
+            snapshot.save_new_private(&capture.snapshot).unwrap();
+            labels.save_new_private(&capture.labels).unwrap();
+            capture
+        }
+
+        fn configure_neutral_likelihoods(case: &CaptureCase) {
+            let mut policy = Policy::default();
+            policy.guardrails.min_process_age_seconds = 0;
+            policy.guardrails.builtin_protection = false;
+            policy.guardrails.protected_users.clear();
+            policy.guardrails.protected_patterns.clear();
+            policy.guardrails.never_kill_pid.clear();
+            policy.guardrails.never_kill_ppid.clear();
+            policy.signature_fast_path.enabled = false;
+            case.write_policy(&policy);
+
+            // Equal likelihoods make P(abandoned or zombie) equal the prior
+            // mass, giving a known optimum without relying on model heuristics.
+            let mut priors = Priors::default();
+            // Categorical likelihoods are stored outside the class parameters.
+            priors.state_flags = None;
+            priors.command_categories = None;
+            let parameters = priors.classes.useful.clone();
+            for (class, probability) in [
+                (&mut priors.classes.useful, 0.6),
+                (&mut priors.classes.useful_bad, 0.2),
+                (&mut priors.classes.abandoned, 0.15),
+                (&mut priors.classes.zombie, 0.05),
+            ] {
+                *class = parameters.clone();
+                class.prior_prob = probability;
+            }
+            std::fs::write(
+                case.config.join("priors.json"),
+                serde_json::to_vec_pretty(&priors).unwrap(),
+            )
+            .unwrap();
+
+            // Frozen versions must preserve the loaded overlays and learning,
+            // even though these unrelated patterns cannot affect this cohort.
+            let mut signatures = SignatureSchema::new();
+            signatures.add(
+                SupervisorSignature::new("refit-export-contract", SupervisorCategory::Agent)
+                    .with_process_patterns(vec![r"^__pt_export_unrelated__$"]),
+            );
+            std::fs::write(
+                case.config.join("signatures.json"),
+                serde_json::to_vec_pretty(&signatures).unwrap(),
+            )
+            .unwrap();
+            let mut disabled = DisabledPatterns::default();
+            disabled.disabled.insert("claude".to_string());
+            assert!(SignatureDatabase::with_defaults()
+                .signatures()
+                .iter()
+                .any(|signature| signature.name == "claude"));
+            std::fs::create_dir(case.config.join("patterns")).unwrap();
+            std::fs::write(
+                case.config.join("patterns/disabled.json"),
+                serde_json::to_vec_pretty(&disabled).unwrap(),
+            )
+            .unwrap();
+            let mut decisions = DecisionStore::load(&case.config).unwrap();
+            decisions.record(
+                "__pt_export_unrelated__",
+                "__pt_export_unrelated__ --retained",
+                Verdict::Spare,
+            );
+            decisions.save().unwrap();
+            assert!(!decisions.is_empty());
+            assert!(decisions
+                .learned_prior(
+                    "__pt_refit_contract__",
+                    "__pt_refit_contract__ --synthetic",
+                    &priors,
+                )
+                .is_none());
+        }
+
+        fn refit_command(
+            case: &CaptureCase,
+            training: &ReviewedCapture,
+            holdout: &ReviewedCapture,
+            output: &Path,
+        ) -> Command {
+            let mut command = case.command();
+            command
+                .args([
+                    "replay",
+                    "refit",
+                    "--method",
+                    "score-grid",
+                    "--training-snapshot",
+                ])
+                .arg(&training.snapshot)
+                .arg("--training-labels")
+                .arg(&training.labels)
+                .arg("--holdout-snapshot")
+                .arg(&holdout.snapshot)
+                .arg("--holdout-labels")
+                .arg(&holdout.labels)
+                .arg("--output")
+                .arg(output)
+                .args(["--max-change-fraction", "0.2", "--grid-points", "21"])
+                .args(["--format", "json"]);
+            command
+        }
+
+        #[cfg(unix)]
+        fn assert_private_tree(path: &Path) {
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = std::fs::symlink_metadata(path).unwrap();
+            assert!(metadata.is_file() || metadata.is_dir(), "{}", path.display());
+            assert_eq!(metadata.permissions().mode() & 0o077, 0, "{}", path.display());
+            if metadata.is_dir() {
+                for entry in std::fs::read_dir(path).unwrap() {
+                    assert_private_tree(&entry.unwrap().path());
+                }
+            }
+        }
+
+        #[test]
+        fn refit_cli_saves_loadable_accepted_and_rejected_versions_without_activation() {
+            for (holdout_count, useful_count, accepted) in [(10, 5, true), (40, 35, false)] {
+                let case = CaptureCase::new();
+                configure_neutral_likelihoods(&case);
+                let training = capture(
+                    &case,
+                    "training",
+                    TRAINING_BOOT,
+                    ReviewSplit::Training,
+                    10,
+                    5,
+                );
+                let holdout = capture(
+                    &case,
+                    "holdout",
+                    HOLDOUT_BOOT,
+                    ReviewSplit::Holdout,
+                    holdout_count,
+                    useful_count,
+                );
+                let input_paths = [
+                    case.config.join("priors.json"),
+                    case.config.join("policy.json"),
+                    case.config.join("signatures.json"),
+                    case.config.join("decisions.json"),
+                    case.config.join("patterns/disabled.json"),
+                    training.snapshot.clone(),
+                    training.labels.clone(),
+                    holdout.snapshot.clone(),
+                    holdout.labels.clone(),
+                ];
+                let originals: Vec<_> = input_paths
+                    .iter()
+                    .map(|path| (path, std::fs::read(path).unwrap()))
+                    .collect();
+                let version = case.root.join("version-001");
+                let stdout = refit_command(&case, &training, &holdout, &version)
+                    .assert()
+                    .success()
+                    .get_output()
+                    .stdout
+                    .clone();
+                let output: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+                assert_eq!(output["command"], "replay refit");
+                let report = &output["refit"];
+                assert_eq!(report["accepted"], accepted, "{report}");
+                assert_eq!(
+                    report["status"],
+                    if accepted { "improved" } else { "rejected" }
+                );
+                assert!((report["incumbent_prior_mass"].as_f64().unwrap() - 0.2).abs() < 1e-10);
+                assert!((report["candidate_prior_mass"].as_f64().unwrap() - 0.24).abs() < 1e-10);
+                assert_eq!(report["training"]["paired_metrics"]["sample_count"], 10);
+                assert_eq!(
+                    report["holdout"]["paired_metrics"]["sample_count"],
+                    holdout_count
+                );
+                assert_eq!(report["training_safeguards"]["passed"], true);
+                assert_eq!(report["holdout_safeguards"]["passed"], true);
+                let holdout_metrics = &report["holdout"]["paired_metrics"];
+                assert_eq!(
+                    holdout_metrics["candidate"]["log_loss"].as_f64().unwrap()
+                        < holdout_metrics["baseline"]["log_loss"].as_f64().unwrap(),
+                    accepted
+                );
+                assert!(report["limitations"]
+                    .as_array()
+                    .is_some_and(|items| !items.is_empty()));
+                if !accepted {
+                    assert!(report["reasons"]
+                        .as_array()
+                        .is_some_and(|items| !items.is_empty()));
+                }
+
+                let candidate = version.join("candidate");
+                let incumbent = version.join("incumbent");
+                let report_path = version.join("report.json");
+                assert_eq!(output["artifact"]["directory"], serde_json::json!(&version));
+                assert_eq!(
+                    output["artifact"]["candidate_config"],
+                    serde_json::json!(&candidate)
+                );
+                assert_eq!(
+                    output["artifact"]["incumbent_config"],
+                    serde_json::json!(&incumbent)
+                );
+                assert_eq!(output["artifact"]["report"], serde_json::json!(&report_path));
+                let saved_report = std::fs::read(&report_path).unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&saved_report).unwrap(),
+                    *report
+                );
+                for (directory, key) in [
+                    (&incumbent, "incumbent_priors"),
+                    (&candidate, "candidate_priors"),
+                ] {
+                    let priors = std::fs::read(directory.join("priors.json")).unwrap();
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&priors).unwrap(),
+                        report[key]
+                    );
+                }
+                #[cfg(unix)]
+                assert_private_tree(&version);
+
+                // Reload both ordinary configuration directories through the
+                // real evaluator and require exactly the frozen fingerprints.
+                let stdout = case
+                    .command_with_config(&candidate)
+                    .args(["replay", "evaluate", "--snapshot"])
+                    .arg(&holdout.snapshot)
+                    .arg("--labels")
+                    .arg(&holdout.labels)
+                    .arg("--baseline-config")
+                    .arg(&incumbent)
+                    .args(["--format", "json"])
+                    .assert()
+                    .success()
+                    .get_output()
+                    .stdout
+                    .clone();
+                let reloaded: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+                assert_eq!(reloaded["command"], "replay evaluate");
+                for (side, key) in [
+                    ("baseline", "incumbent_configuration_sha256"),
+                    ("candidate", "candidate_configuration_sha256"),
+                ] {
+                    assert_eq!(
+                        reloaded["comparison"][side]["configuration_sha256"],
+                        report[key]
+                    );
+                }
+                assert_eq!(
+                    reloaded["comparison"]["paired_metrics"]["sample_count"],
+                    holdout_count
+                );
+
+                let frozen_paths = [
+                    report_path.clone(),
+                    candidate.join("priors.json"),
+                    candidate.join("signatures.json"),
+                    candidate.join("decisions.json"),
+                    candidate.join("patterns/disabled.json"),
+                    incumbent.join("priors.json"),
+                ];
+                let frozen_bytes: Vec<_> = frozen_paths
+                    .iter()
+                    .map(|path| (path, std::fs::read(path).unwrap()))
+                    .collect();
+                refit_command(&case, &training, &holdout, &version)
+                    .assert()
+                    .failure()
+                    .stderr(predicate::str::contains("output already exists"));
+                #[cfg(unix)]
+                {
+                    let alias = case.root.join("existing-version-link");
+                    std::os::unix::fs::symlink(&version, &alias).unwrap();
+                    refit_command(&case, &training, &holdout, &alias)
+                        .assert()
+                        .failure()
+                        .stderr(predicate::str::contains("output already exists"));
+                }
+                for (path, frozen) in frozen_bytes {
+                    assert_eq!(std::fs::read(path).unwrap(), frozen, "{}", path.display());
+                }
+                for (path, original) in originals {
+                    assert_eq!(std::fs::read(path).unwrap(), original, "{}", path.display());
+                }
+                assert!(!case.data.join("sessions").exists());
+            }
+        }
+
+        #[test]
+        fn refit_cli_rejects_shared_process_births_despite_different_capture_names() {
+            let case = CaptureCase::new();
+            configure_neutral_likelihoods(&case);
+            let training = capture(
+                &case,
+                "training-host",
+                TRAINING_BOOT,
+                ReviewSplit::Training,
+                10,
+                5,
+            );
+            let holdout = capture(
+                &case,
+                "holdout-host",
+                TRAINING_BOOT,
+                ReviewSplit::Holdout,
+                10,
+                5,
+            );
+            let version = case.root.join("overlapping-version");
+            let priors = std::fs::read(case.config.join("priors.json")).unwrap();
+            let decisions = std::fs::read(case.config.join("decisions.json")).unwrap();
+            refit_command(&case, &training, &holdout, &version)
+                .assert()
+                .failure()
+                .stderr(predicate::str::contains("share a process incarnation"));
+            assert!(
+                !version.exists(),
+                "invalid holdout must not publish a model version"
+            );
+            assert_eq!(std::fs::read(case.config.join("priors.json")).unwrap(), priors);
+            assert_eq!(
+                std::fs::read(case.config.join("decisions.json")).unwrap(),
+                decisions
+            );
+            assert!(!case.data.join("sessions").exists());
+        }
     }
 }
 
