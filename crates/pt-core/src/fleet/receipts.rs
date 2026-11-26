@@ -1,5 +1,6 @@
 //! Read durable coordinator receipts without connecting to any fleet host.
 use super::apply::{ApplyBindingReceipt, HostApplyStatus};
+use crate::decision::Action;
 use pt_common::ProcessIdentity;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -18,7 +19,12 @@ struct Request {
     host: String,
     binding: ApplyBindingReceipt,
     targets: Vec<ProcessIdentity>,
-    actions: Vec<serde::de::IgnoredAny>,
+    actions: Vec<ApprovedAction>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApprovedAction {
+    action: Action,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -71,20 +77,53 @@ pub struct AttemptStatus {
 }
 
 fn record_matches(request: Option<&Request>, result: &Observation) -> bool {
-    let actions = request.map_or(0, |r| r.actions.len());
+    let actions = request.map_or(&[][..], |r| r.actions.as_slice());
+    let targets = request.map_or(&[][..], |r| r.targets.as_slice());
+    let approved_kills = actions.iter().filter(|a| a.action == Action::Kill).count();
+    let has_effect = result.successful_actions > 0 || result.kill_signals_delivered > 0;
     result.binding.as_ref() == request.map(|r| &r.binding)
-        && result.selected_targets.as_slice() == request.map_or(&[][..], |r| r.targets.as_slice())
-        && result.successful_actions <= actions
-        && result.kill_signals_delivered <= actions
-        && (result.attempted || (result.successful_actions == 0 && result.kill_signals_delivered == 0))
+        && result.selected_targets.as_slice() == targets
+        && result.successful_actions <= actions.len()
+        && result.kill_signals_delivered <= approved_kills
+        && (!has_effect || result.attempted && !targets.is_empty())
         && match result.status {
             HostApplyStatus::Preview => false,
-            HostApplyStatus::Applied => result.attempted && actions > 0 && result.successful_actions == actions,
-            HostApplyStatus::Partial | HostApplyStatus::Unknown => result.attempted,
-            HostApplyStatus::NotStarted => !result.attempted,
-            HostApplyStatus::NoActions => result.successful_actions == 0 && result.kill_signals_delivered == 0,
-            HostApplyStatus::Blocked => result.successful_actions == 0 && result.kill_signals_delivered == 0,
+            HostApplyStatus::Applied => has_effect && result.successful_actions == actions.len(),
+            HostApplyStatus::Partial => has_effect,
+            HostApplyStatus::Unknown => result.attempted && !has_effect,
+            HostApplyStatus::NotStarted => !result.attempted && !has_effect,
+            HostApplyStatus::NoActions => request.is_some()
+                && result.attempted != targets.is_empty()
+                && !has_effect,
+            HostApplyStatus::Blocked => !has_effect,
         }
+}
+
+/// Expose exactly one JSONL record to serde without buffering remote output or
+/// imposing a size limit that the coordinator's writer does not have.
+struct ReceiptLine<'a, R> {
+    reader: &'a mut R,
+    terminated: bool,
+}
+
+impl<R: BufRead> Read for ReceiptLine<'_, R> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if self.terminated || out.is_empty() {
+            return Ok(0);
+        }
+        let available = self.reader.fill_buf()?;
+        let window = &available[..available.len().min(out.len())];
+        let n = match window.iter().position(|&b| b == b'\n') {
+            Some(end) => {
+                self.terminated = true;
+                end + 1
+            }
+            None => window.len(),
+        };
+        out[..n].copy_from_slice(&window[..n]);
+        self.reader.consume(n);
+        Ok(n)
+    }
 }
 
 fn read_attempt(path: &Path, attempt_id: &str, session: &str) -> AttemptStatus {
@@ -111,24 +150,23 @@ fn read_attempt(path: &Path, attempt_id: &str, session: &str) -> AttemptStatus {
             return Err("receipt is not a regular file".into());
         }
         let mut reader = BufReader::new(file);
-        let mut line = Vec::new();
-        loop {
-            line.clear();
-            // Full intents and terminal reports contain the original action lists.
-            const MAX_LINE: u64 = 64 * 1024 * 1024;
-            let n = reader
-                .by_ref()
-                .take(MAX_LINE + 1)
-                .read_until(b'\n', &mut line)
-                .map_err(|e| e.to_string())?;
-            if n == 0 {
-                break;
+        while !reader.fill_buf().map_err(|e| e.to_string())?.is_empty() {
+            let mut line = ReceiptLine { reader: &mut reader, terminated: false };
+            let event = serde_json::from_reader::<_, Event>(BufReader::new(&mut line));
+            if attempt.finished {
+                match event {
+                    Ok(Event::HostResult { result, .. }) if line.terminated && seen.contains_key(&result.host) => {
+                        seen.remove(&result.host);
+                    }
+                    _ => seen.clear(),
+                }
+                return Err("unexpected record after finished report".into());
             }
-            if n as u64 > MAX_LINE || line.last() != Some(&b'\n') {
-                return Err("incomplete or oversized receipt record".into());
+            let event = event.map_err(|e| format!("invalid receipt record: {e}"))?;
+            if !line.terminated {
+                return Err("incomplete final receipt record".into());
             }
-            if attempt.finished { return Err("unexpected record after finished report".into()); }
-            match serde_json::from_slice::<Event>(&line).map_err(|e| format!("invalid receipt record: {e}"))? {
+            match event {
                 Event::Intent { attempt_id: id, fleet_session_id, created_at, hosts }
                     if id == attempt_id && fleet_session_id == session && attempt.created_at.is_none() => {
                     let mut names = BTreeMap::new();
@@ -271,6 +309,52 @@ mod tests {
         assert_eq!(status.receipt_error.as_deref(), Some("write failed"));
         assert_eq!(status.hosts[1].attempted, Some(true));
         assert_eq!(status.hosts[1].status, HostApplyStatus::NoActions);
+    }
+
+    #[test]
+    fn streamed_records_stop_at_the_newline_including_across_buffer_boundaries() {
+        let input = b"{\"long\":\"abcdefghijk\"}\n{}";
+        let mut reader = BufReader::with_capacity(3, &input[..]);
+        let mut record = ReceiptLine { reader: &mut reader, terminated: false };
+        let parsed: Value = serde_json::from_reader(&mut record).unwrap();
+        assert_eq!(parsed["long"], "abcdefghijk");
+        assert!(record.terminated);
+        let mut last = ReceiptLine { reader: &mut reader, terminated: false };
+        let parsed: Value = serde_json::from_reader(&mut last).unwrap();
+        assert_eq!(parsed, json!({}));
+        assert!(!last.terminated);
+    }
+
+    #[test]
+    fn action_counts_and_status_must_be_possible_for_the_approved_remedy() {
+        let mut plan = intent();
+        plan["hosts"][0]["request"]["actions"][0]["action"] = json!("throttle");
+        for observed in [
+            observation("a", "applied", 1, 1),
+            observation("a", "unknown", 1, 0),
+            observation("a", "partial", 0, 0),
+        ] {
+            let attempt = replay(&[plan.clone(), result(&observed)], &[]);
+            assert!(attempt.receipt_error.is_some());
+            assert_eq!(attempt.hosts[0].successful_actions, None);
+        }
+        let valid = observation("a", "applied", 1, 0);
+        let attempt = replay(&[plan, result(&valid)], &[]);
+        assert!(attempt.receipt_error.is_none());
+        assert_eq!(attempt.hosts[0].successful_actions, Some(1));
+    }
+
+    #[test]
+    fn result_after_finished_invalidates_the_affected_host() {
+        let a = observation("a", "applied", 1, 1);
+        let b = observation("b", "no_actions", 0, 0);
+        let end = json!({"event":"finished", "attempt_id":"one", "report":{"hosts":[a,b]}});
+        let contradiction = result(&observation("a", "blocked", 0, 0));
+        let attempt = replay(&[intent(), end, contradiction], &[]);
+        assert!(attempt.receipt_error.is_some());
+        assert!(!attempt.finished);
+        assert_eq!(attempt.hosts[0].successful_actions, None);
+        assert_eq!(attempt.hosts[1].successful_actions, Some(0));
     }
 
     #[test]
