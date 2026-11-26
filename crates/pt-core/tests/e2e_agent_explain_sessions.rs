@@ -875,10 +875,23 @@ fn sessions_report_interrupted_admissions_without_completed_progress_or_resume_h
         later["executed_at"] = serde_json::json!(chrono::Utc::now() - chrono::Duration::seconds(1));
         later["execution_clock"]["ticks"] = serde_json::json!(3);
 
-        for (records, count, uncertain) in [
-            (vec![started.clone()], 0, true),
-            (vec![started.clone(), completed.clone()], 1, false),
-            (vec![started, completed, later], 0, true),
+        let mut failed = completed.clone();
+        failed["status"] = serde_json::json!("failed");
+        let mut skipped = completed.clone();
+        skipped["status"] = serde_json::json!("dry_run");
+        let mut wrong_pid = completed.clone();
+        wrong_pid["pid"] = serde_json::json!(identity.pid.0 + 1);
+
+        for (records, count, failures, uncertain) in [
+            (vec![started.clone()], 0, 0, true),
+            (vec![started.clone(), completed.clone()], 1, 0, false),
+            (vec![started, completed.clone(), later], 0, 0, true),
+            // Older journals contain terminal records without admission lines.
+            (vec![failed.clone(), skipped.clone()], 0, 1, false),
+            (vec![failed, completed.clone(), skipped.clone()], 1, 0, false),
+            (vec![completed.clone(), completed], 1, 0, false),
+            (vec![skipped], 0, 0, false),
+            (vec![wrong_pid], 0, 0, true),
         ] {
             let content: String = records.iter().map(|record| format!("{record}\n")).collect();
             fs::write(&journal, &content).unwrap();
@@ -903,8 +916,9 @@ fn sessions_report_interrupted_admissions_without_completed_progress_or_resume_h
             assert_eq!(status["progress"]["completed_actions"], count, "{status}");
             assert_eq!(status["progress"]["pending_actions"], 1 - count, "{status}");
             assert_eq!(status["execution_uncertain"], uncertain, "{status}");
-            assert_eq!(status["resumable"], !uncertain, "{status}");
-            assert_eq!(status["resume_command"].is_null(), uncertain, "{status}");
+            assert_eq!(status["progress"]["failed_actions"], failures, "{status}");
+            assert_eq!(status["resumable"], !uncertain && count == 0, "{status}");
+            assert_eq!(status["resume_command"].is_null(), uncertain || count > 0, "{status}");
             assert_eq!(
                 status["resume_refusal_reason"].is_string(),
                 uncertain,
@@ -913,6 +927,57 @@ fn sessions_report_interrupted_admissions_without_completed_progress_or_resume_h
             assert_eq!(status["outcomes"].as_array().unwrap().len(), records.len());
             assert_eq!(fs::read_to_string(&journal).unwrap(), content);
         }
+    });
+}
+
+#[test]
+fn sessions_offer_resume_only_for_an_executable_plan_and_intact_journal() {
+    with_temp_data_dir(|dir| {
+        let session = create_session_with_plan(dir, test_identity(222_225), false);
+        let handle = SessionStore::from_env().unwrap().open(&session).unwrap();
+        handle.update_state(pt_core::session::SessionState::Planned).unwrap();
+        let path = handle.dir.join("decision/plan.json");
+        let plan: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let journal = handle.dir.join("action/outcomes.jsonl");
+        let status = || {
+            let output = pt_core_fast().env("PROCESS_TRIAGE_DATA", dir.path())
+                .args(["--format", "json", "agent", "sessions", "--session", &session.0])
+                .assert().success().get_output().stdout.clone();
+            serde_json::from_slice::<Value>(&output).unwrap()
+        };
+        assert!(status()["resume_command"].is_string());
+
+        fs::rename(&path, path.with_extension("backup")).unwrap();
+        let missing = status();
+        assert!(missing["resume_command"].is_null());
+        assert!(missing["resume_refusal_reason"].as_str().unwrap().contains("missing"));
+        assert_eq!(missing["execution_uncertain"], false);
+
+        fs::write(&path, b"{corrupt").unwrap();
+        let corrupt = status();
+        assert_eq!(corrupt["resumable"], false);
+        assert!(corrupt["resume_refusal_reason"].is_string());
+
+        let mut wrong = plan.clone();
+        wrong["session_id"] = serde_json::json!("pt-20260101-000000-wxyz");
+        fs::write(&path, serde_json::to_vec(&wrong).unwrap()).unwrap();
+        assert!(status()["resume_refusal_reason"].as_str().unwrap().contains("another session"));
+
+        let mut blocked = plan.clone();
+        blocked["actions"][0]["blocked"] = serde_json::json!(true);
+        fs::write(&path, serde_json::to_vec(&blocked).unwrap()).unwrap();
+        let inactive = status();
+        assert_eq!(inactive["progress"]["ineligible_actions"], 1);
+        assert_eq!(inactive["progress"]["pending_actions"], 0);
+        assert!(inactive["resume_command"].is_null());
+
+        fs::write(&path, serde_json::to_vec(&plan).unwrap()).unwrap();
+        fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        fs::write(&journal, br#"{"action_id":"action-1","pid":222225,"status":"dry_run"}"#).unwrap();
+        let partial = status();
+        assert_eq!(partial["execution_uncertain"], true);
+        assert!(partial["resume_refusal_reason"].as_str().unwrap().contains("incomplete final record"));
+        assert!(partial["resume_command"].is_null());
     });
 }
 

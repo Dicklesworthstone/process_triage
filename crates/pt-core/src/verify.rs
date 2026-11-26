@@ -860,43 +860,64 @@ pub fn executed_plan_actions<'a>(
         .collect())
 }
 
+/// At most one substantive attempt per canonical action. Only a success causes
+/// `apply --resume` to skip the action; failed attempts remain eligible to retry.
+pub struct ExecutionReplayProgress {
+    pub successful: usize,
+    pub failed: usize,
+    unresolved: Vec<String>,
+}
+
+impl ExecutionReplayProgress {
+    /// Refuse replay of an admitted action whose effect is unknown.
+    pub fn ensure_resolved(&self) -> Result<(), VerifyError> {
+        if self.unresolved.is_empty() {
+            return Ok(());
+        }
+        Err(VerifyError::InvalidOutcomes(format!(
+            "execution outcome is uncertain for action(s) {}; inspect with agent verify and create a fresh plan instead of replaying this session",
+            self.unresolved.join(", "),
+        )))
+    }
+}
+
+pub fn execution_replay_progress(
+    plan: &Plan,
+    saved: &[SavedActionOutcome],
+) -> Result<ExecutionReplayProgress, VerifyError> {
+    let recorded = recorded_plan_actions(plan, saved)?;
+    validate_execution_timestamps(saved, Utc::now())?;
+    let mut progress = ExecutionReplayProgress {
+        successful: 0,
+        failed: 0,
+        unresolved: Vec::new(),
+    };
+    for (action, outcome) in recorded {
+        match outcome.status.as_str() {
+            "success" => progress.successful += 1,
+            "execution_started" => progress.unresolved.push(action.action_id.clone()),
+            // recorded_plan_actions already validated all substantive statuses.
+            _ => progress.failed += 1,
+        }
+    }
+    Ok(progress)
+}
+
 /// Count actions whose latest substantive attempt has a terminal result.
-/// Admissions and non-executing records never complete an action, and a later
-/// interrupted admission supersedes that action's earlier completed attempt.
 pub fn completed_execution_count(
     plan: &Plan,
     saved: &[SavedActionOutcome],
 ) -> Result<usize, VerifyError> {
-    let recorded = recorded_plan_actions(plan, saved)?;
-    validate_execution_timestamps(saved, Utc::now())?;
-    Ok(recorded
-        .into_iter()
-        .filter(|(_, outcome)| outcome.status != "execution_started")
-        .count())
+    let progress = execution_replay_progress(plan, saved)?;
+    Ok(progress.successful + progress.failed)
 }
 
 /// Refuse replay when an admitted execution has no durable terminal outcome.
-/// A process may have changed after the kernel accepted an action, so a fresh
-/// observation alone cannot establish whether retrying that attempt is safe.
 pub fn validate_execution_replay(
     plan: &Plan,
     saved: &[SavedActionOutcome],
 ) -> Result<(), VerifyError> {
-    let recorded = recorded_plan_actions(plan, saved)?;
-    validate_execution_timestamps(saved, Utc::now())?;
-    let unresolved: Vec<_> = recorded
-        .into_iter()
-        .filter(|(_, outcome)| outcome.status == "execution_started")
-        .map(|(action, _)| action.action_id.as_str())
-        .collect();
-    if unresolved.is_empty() {
-        Ok(())
-    } else {
-        Err(VerifyError::InvalidOutcomes(format!(
-            "execution outcome is uncertain for action(s) {}; inspect with agent verify and create a fresh plan instead of replaying this session",
-            unresolved.join(", "),
-        )))
-    }
+    execution_replay_progress(plan, saved)?.ensure_resolved()
 }
 
 /// The terminal record must come from the exact admission whose evidence was

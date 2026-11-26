@@ -111,7 +111,7 @@ use pt_core::verify::resource_prediction::{
     RESOURCE_PREDICTION_SCHEMA_VERSION,
 };
 use pt_core::verify::{
-    completed_execution_count, executed_plan_actions, observe_live_postcondition,
+    executed_plan_actions, observe_live_postcondition,
     parse_action_outcomes, parse_agent_plan, validate_execution_replay,
     verify_plan_with_postconditions, VerifyOutcome,
 };
@@ -49188,24 +49188,25 @@ fn run_agent_session_status(
         session_id.0
     );
 
-    // Incident sessions capture observations; they are never executable plans.
-    let resumable = manifest.mode != SessionMode::DaemonAlert
-        && matches!(
-            manifest.state,
-            SessionState::Created
-                | SessionState::Scanning
-                | SessionState::Planned
-                | SessionState::Executing
-                | SessionState::Cancelled
-        );
-
-    // Count progress from action outcomes and plan metadata.
+    let apply_phase = matches!(
+        manifest.state,
+        SessionState::Planned | SessionState::Executing
+    );
+    let entered_execution = manifest.state == SessionState::Executing
+        || manifest
+            .state_history
+            .iter()
+            .any(|transition| transition.state == SessionState::Executing);
     let outcomes_path = handle.dir.join("action").join("outcomes.jsonl");
     let plan_path = handle.dir.join("decision").join("plan.json");
-    let plan_value = std::fs::read_to_string(&plan_path)
-        .ok()
-        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok());
-
+    let plan_content = match std::fs::read_to_string(&plan_path) {
+        Ok(content) => Some(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            eprintln!("agent sessions: cannot read saved plan: {error}");
+            return ExitCode::IoError;
+        }
+    };
     let outcome_content = match read_action_outcomes(&outcomes_path) {
         Ok(content) => content,
         Err(error) => {
@@ -49227,81 +49228,69 @@ fn run_agent_session_status(
             return ExitCode::IoError;
         }
     };
-    let mut completed_actions = outcome_records
-        .iter()
-        .filter(|record| record["status"] != "execution_started")
-        .count();
-    let has_admissions = outcome_records
-        .iter()
-        .any(|record| record["status"] == "execution_started");
-    let resume_refusal_reason = if has_admissions {
-        // Once the admission protocol is present, progress follows validated
-        // latest attempts rather than counting old successes or journal lines.
-        completed_actions = 0;
-        plan_value
-            .as_ref()
-            .ok_or_else(|| "saved plan is missing for execution admissions".to_string())
-            .and_then(|document| {
-                parse_agent_plan(&document.to_string()).map_err(|error| error.to_string())
-            })
-            .and_then(|plan| {
-                let saved = parse_action_outcomes(outcome_content.as_deref().unwrap_or_default())
-                    .map_err(|error| error.to_string())?;
-                completed_actions =
-                    completed_execution_count(&plan, &saved).map_err(|error| error.to_string())?;
-                validate_execution_replay(&plan, &saved).map_err(|error| error.to_string())
-            })
-            .err()
-    } else if outcome_records.is_empty()
-        && (manifest.state == SessionState::Executing
-            || manifest
-                .state_history
-                .iter()
-                .any(|transition| transition.state == SessionState::Executing))
-    {
-        Some("execution history is missing or empty after execution began; inspect live state and create a fresh plan".to_string())
+    let journal = outcome_content.as_deref().unwrap_or_default();
+    let requires_plan = apply_phase || entered_execution || !outcome_records.is_empty();
+    let mut total_actions = 0;
+    let mut ineligible_actions = 0;
+    let mut completed_actions = 0;
+    let mut failed_actions = 0;
+    // Resume skips only successful identity-bound executions, including in
+    // journals that predate admissions. Raw lines include previews and retries.
+    let replay_state = (|| -> Result<(), String> {
+        let Some(content) = plan_content.as_deref() else {
+            return if requires_plan {
+                Err("saved execution plan is missing".into())
+            } else {
+                Ok(())
+            };
+        };
+        let plan = parse_agent_plan(content).map_err(|error| error.to_string())?;
+        if plan.session_id != manifest.session_id {
+            return Err("saved plan belongs to another session".into());
+        }
+        total_actions = plan.actions.len();
+        ineligible_actions = plan
+            .actions
+            .iter()
+            .filter(|action| action.blocked || action.action == Action::Keep)
+            .count();
+        if !journal.is_empty() && !journal.ends_with('\n') {
+            return Err("action outcome journal has an incomplete final record".into());
+        }
+        if entered_execution && outcome_records.is_empty() {
+            return Err("execution history is missing or empty after execution began; inspect live state and create a fresh plan".into());
+        }
+        let saved = parse_action_outcomes(journal).map_err(|error| error.to_string())?;
+        let progress = pt_core::verify::execution_replay_progress(&plan, &saved)
+            .map_err(|error| error.to_string())?;
+        completed_actions = progress.successful;
+        failed_actions = progress.failed;
+        progress
+            .ensure_resolved()
+            .map_err(|error| error.to_string())
+    })();
+    let resume_refusal_reason = replay_state.err();
+    let execution_uncertain = resume_refusal_reason.is_some()
+        && (entered_execution || !outcome_records.is_empty());
+    let pending_actions = total_actions.saturating_sub(ineligible_actions + completed_actions);
+    let resumable = manifest.mode != SessionMode::DaemonAlert
+        && resume_refusal_reason.is_none()
+        && if apply_phase {
+            pending_actions > 0
+        } else {
+            matches!(
+                manifest.state,
+                SessionState::Created | SessionState::Scanning | SessionState::Cancelled
+            )
+        };
+
+    let plan_detail = if include_detail {
+        plan_content
+            .as_deref()
+            .and_then(|content| serde_json::from_str::<serde_json::Value>(content).ok())
     } else {
         None
     };
-    let execution_uncertain = resume_refusal_reason.is_some();
-    let resumable = resumable && !execution_uncertain;
-
-    let plan_total = plan_value
-        .as_ref()
-        .and_then(|v| {
-            v.get("actions")
-                .and_then(|a| a.as_array())
-                .map(|a| a.len())
-                .or_else(|| {
-                    v.get("recommended")
-                        .and_then(|r| r.get("actions"))
-                        .and_then(|a| a.as_array())
-                        .map(|a| a.len())
-                })
-                .or_else(|| {
-                    v.get("summary")
-                        .and_then(|s| s.get("kill_recommendations"))
-                        .and_then(|k| k.as_u64())
-                        .map(|k| k as usize)
-                })
-                .or_else(|| {
-                    v.get("candidates")
-                        .and_then(|c| c.as_array())
-                        .map(|a| a.len())
-                })
-        })
-        .unwrap_or(0);
-
-    let total_actions = if plan_total == 0 && completed_actions > 0 {
-        completed_actions
-    } else {
-        plan_total
-    };
-
-    let pending_actions = total_actions.saturating_sub(completed_actions);
-
-    // Load plan details if --detail flag is set
-    let plan_detail = if include_detail { plan_value } else { None };
 
     // Load action outcomes if --detail flag is set
     let outcomes_detail = include_detail.then_some(outcome_records);
@@ -49331,11 +49320,13 @@ fn run_agent_session_status(
                     "total_actions": total_actions,
                     "completed_actions": completed_actions,
                     "pending_actions": pending_actions,
+                    "failed_actions": failed_actions,
+                    "ineligible_actions": ineligible_actions,
                 },
                 "resumable": resumable,
                 "execution_uncertain": execution_uncertain,
                 "resume_refusal_reason": resume_refusal_reason,
-                "resume_command": if resumable && matches!(manifest.state, SessionState::Planned | SessionState::Executing) {
+                "resume_command": if resumable && apply_phase {
                     Some(format!("pt agent apply --session {} --resume", manifest.session_id))
                 } else {
                     None
@@ -49417,17 +49408,14 @@ fn run_agent_session_status(
             println!("  Total actions: {}", total_actions);
             println!("  Completed: {}", completed_actions);
             println!("  Pending: {}", pending_actions);
+            println!("  Failed: {}", failed_actions);
+            println!("  Blocked or keep: {}", ineligible_actions);
             println!();
             println!("Resumable: {}", if resumable { "yes" } else { "no" });
             if let Some(reason) = &resume_refusal_reason {
-                println!("Execution outcome uncertain: {reason}");
+                println!("Resume unavailable: {reason}");
             }
-            if resumable
-                && matches!(
-                    manifest.state,
-                    SessionState::Planned | SessionState::Executing
-                )
-            {
+            if resumable && apply_phase {
                 println!(
                     "Resume with: pt agent apply --session {} --resume",
                     manifest.session_id
