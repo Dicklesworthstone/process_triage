@@ -443,6 +443,266 @@ mod replay_recording {
         assert!(!path.exists());
     }
 
+    #[cfg(unix)]
+    fn refit_capture(
+        case: &CaptureCase,
+        name: &str,
+        first_pid: u32,
+        counts: (usize, usize, usize),
+        split: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        use pt_core::collect::{ProcessRecord, ProcessState, ScanMetadata, ScanResult};
+        use pt_core::replay::{ReplayProcessInputs, ReplayScoringContext};
+
+        let scorer = pt_core::scoring::Scorer::new(
+            pt_core::config::Priors::default(),
+            pt_core::decision::decision_store::DecisionStore::default(),
+            pt_core::supervision::signature::SignatureDatabase::new(),
+            pt_core::inference::FastPathConfig::disabled(),
+        );
+        let count = u32::try_from(counts.0 + counts.1 + counts.2).unwrap();
+        let recorded_at = chrono::Utc::now();
+        let processes = (first_pid..first_pid + count)
+            .map(|pid| ProcessRecord {
+                pid: pt_common::ProcessId(pid),
+                ppid: pt_common::ProcessId(7),
+                uid: 1000,
+                user: "refit-fixture".to_string(),
+                pgid: Some(pid),
+                sid: Some(pid),
+                start_id: pt_common::StartId::from_linux("refit-cli-fixture", 1_234_567_890, pid),
+                comm: "refit-worker".to_string(),
+                cmd: "refit-worker --synthetic-cli-case".to_string(),
+                state: ProcessState::Sleeping,
+                cpu_percent: 0.0,
+                rss_bytes: 10 * 1024 * 1024,
+                vsz_bytes: 50 * 1024 * 1024,
+                tty: None,
+                start_time_unix: recorded_at.timestamp() - 7200,
+                elapsed: std::time::Duration::from_secs(7200),
+                source: "refit-cli-fixture".to_string(),
+                container_info: None,
+            })
+            .collect::<Vec<_>>();
+        let process_count = processes.len();
+        let scan = ScanResult {
+            processes,
+            metadata: ScanMetadata {
+                scan_type: "refit-cli-fixture".to_string(),
+                platform: std::env::consts::OS.to_string(),
+                boot_id: Some("refit-cli-fixture".to_string()),
+                started_at: recorded_at.to_rfc3339(),
+                duration_ms: 0,
+                process_count,
+                warnings: Vec::new(),
+            },
+        };
+        let mut snapshot = pt_core::replay::record_snapshot(&scan, Some(name)).unwrap();
+        let inputs = snapshot
+            .processes
+            .iter()
+            .map(|process| {
+                let observations = scorer.recorded_observations(process, None);
+                #[cfg(target_os = "linux")]
+                let observations = {
+                    let mut observations = observations;
+                    observations.provenance = Some(pt_core::scoring::derive_provenance_adjustment(
+                        process.pid.0,
+                        &pt_core::scoring::ProvenanceInferenceBundle::default(),
+                    ));
+                    observations
+                };
+                (
+                    process.pid.0,
+                    ReplayProcessInputs {
+                        identity: pt_common::ProcessIdentity::full(
+                            process.pid.0,
+                            process.start_id.clone(),
+                            process.uid,
+                            process.pgid,
+                            process.sid,
+                            pt_common::IdentityQuality::Full,
+                        ),
+                        cgroup_role: Some(pt_core::collect::cgroup::CgroupRole::LoginSession),
+                        observations: Some(observations),
+                        unavailable_reason: None,
+                    },
+                )
+            })
+            .collect();
+        snapshot.scoring_context = Some(ReplayScoringContext {
+            schema_version: 1,
+            platform: std::env::consts::OS.to_string(),
+            requested_window_ms: 0,
+            invoker_chain: std::collections::BTreeSet::new(),
+            processes: inputs,
+        });
+        let snapshot_path = case.root.join(format!("{name}.json"));
+        snapshot.save(&snapshot_path).unwrap();
+        let labels_path = case.root.join(format!("{name}-labels.json"));
+        case.command()
+            .args(["replay", "label-template", "--snapshot"])
+            .arg(&snapshot_path)
+            .arg("--output")
+            .arg(&labels_path)
+            .args(["--host-id", name, "--split", split])
+            .assert()
+            .success();
+        let mut labels: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&labels_path).unwrap()).unwrap();
+        for (index, row) in labels["processes"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .enumerate()
+        {
+            if index < counts.0 + counts.1 {
+                row["verdict"] = serde_json::json!(if index < counts.0 {
+                    "abandoned"
+                } else {
+                    "useful"
+                });
+                row["reviewer"] = serde_json::json!("refit-cli-fixture");
+                row["reviewed_at"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
+                row["rationale"] = serde_json::json!(
+                    "Synthetic label exercising the offline CLI contract, not measured calibration"
+                );
+            }
+        }
+        std::fs::write(&labels_path, serde_json::to_vec_pretty(&labels).unwrap()).unwrap();
+        (snapshot_path, labels_path)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replay_refit_cli_exports_loadable_priors_without_activation_or_holdout_leakage() {
+        let case = CaptureCase::new();
+        let mut policy = pt_core::config::Policy::default();
+        policy.guardrails.min_process_age_seconds = 0;
+        policy.guardrails.builtin_protection = false;
+        policy.guardrails.protected_users.clear();
+        policy.guardrails.protected_patterns.clear();
+        policy.guardrails.never_kill_pid.clear();
+        policy.guardrails.never_kill_ppid.clear();
+        case.write_policy(&policy);
+        let mut priors = pt_core::config::Priors::default();
+        priors.classes.useful.prior_prob = 0.60;
+        priors.classes.useful_bad.prior_prob = 0.15;
+        priors.classes.abandoned.prior_prob = 0.20;
+        priors.classes.zombie.prior_prob = 0.05;
+        let incumbent_path = case.config.join("priors.json");
+        let incumbent = serde_json::to_vec_pretty(&priors).unwrap();
+        std::fs::write(&incumbent_path, &incumbent).unwrap();
+        let (training, training_labels) =
+            refit_capture(&case, "training", 1000, (15, 5, 3), "training");
+        let (holdout, holdout_labels) =
+            refit_capture(&case, "holdout", 2000, (5, 15, 0), "holdout");
+        let add_args = |command: &mut Command, output: &std::path::Path| {
+            command
+                .args(["replay", "refit", "--training-snapshot"])
+                .arg(&training)
+                .arg("--training-labels")
+                .arg(&training_labels)
+                .arg("--snapshot")
+                .arg(&holdout)
+                .arg("--labels")
+                .arg(&holdout_labels)
+                .arg("--output")
+                .arg(output)
+                .args(["--format", "json"]);
+        };
+        let destination = case.root.join("candidate-one");
+        let mut command = case.command();
+        add_args(&mut command, &destination);
+        let output = command.assert().success().get_output().stdout.clone();
+        let result: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(result["command"], "replay refit");
+        assert_eq!(result["activated"], false);
+        assert_eq!(result["artifact_scope"], "candidate_priors_only");
+        assert_eq!(result["refit"]["training"]["reviewed_count"], 20);
+        assert_eq!(result["refit"]["training"]["unlabeled_count"], 3);
+        assert!(
+            result["refit"]["candidate_abandonment_prior"]
+                .as_f64()
+                .unwrap()
+                > 0.25
+        );
+        assert_eq!(result["refit"]["holdout"]["coverage"]["paired_count"], 20);
+        assert!(result["refit"]["holdout"]["paired_metrics"].is_object());
+        let candidate = std::fs::read(destination.join("priors.json")).unwrap();
+        let saved_report = std::fs::read(destination.join("refit.json")).unwrap();
+        let loaded = pt_core::config::load_config(&pt_core::config::ConfigOptions {
+            config_dir: Some(destination.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(loaded.priors).unwrap(),
+            result["refit"]["candidate_priors"]
+        );
+        assert_eq!(std::fs::read(&incumbent_path).unwrap(), incumbent);
+
+        // A second holdout review changes evaluation, never the fitted artifact.
+        let mut reviewed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&holdout_labels).unwrap()).unwrap();
+        for row in reviewed["processes"].as_array_mut().unwrap() {
+            row["verdict"] = serde_json::json!(if row["verdict"] == "useful" {
+                "abandoned"
+            } else {
+                "useful"
+            });
+        }
+        std::fs::write(
+            &holdout_labels,
+            serde_json::to_vec_pretty(&reviewed).unwrap(),
+        )
+        .unwrap();
+        let second = case.root.join("candidate-two");
+        let mut command = case.command();
+        add_args(&mut command, &second);
+        let output = command.assert().success().get_output().stdout.clone();
+        let changed: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(
+            result["refit"]["version_id"],
+            changed["refit"]["version_id"]
+        );
+        assert_eq!(
+            std::fs::read(second.join("priors.json")).unwrap(),
+            candidate
+        );
+        assert_ne!(
+            result["refit"]["holdout"]["labels_sha256"],
+            changed["refit"]["holdout"]["labels_sha256"]
+        );
+        assert_ne!(
+            result["refit"]["holdout"]["paired_metrics"],
+            changed["refit"]["holdout"]["paired_metrics"]
+        );
+        let mut command = case.command();
+        add_args(&mut command, &destination);
+        command.assert().failure();
+        assert_eq!(
+            std::fs::read(destination.join("refit.json")).unwrap(),
+            saved_report
+        );
+        assert_eq!(std::fs::read(&incumbent_path).unwrap(), incumbent);
+
+        // Defaults can be loaded from an absent config directory. Export must
+        // not turn that location into the next active model by writing priors.
+        let absent_config = case.root.join("absent-default-config");
+        let mut command = pt_core();
+        command
+            .env_remove("PT_CONFIG_DIR")
+            .env("PROCESS_TRIAGE_CONFIG", &absent_config)
+            .env("PROCESS_TRIAGE_DATA", &case.data)
+            .env("PROCESS_TRIAGE_RETENTION", "off");
+        add_args(&mut command, &absent_config);
+        command.assert().failure().stderr(predicate::str::contains(
+            "refit output must be separate from the active configuration directory",
+        ));
+        assert!(!absent_config.join("priors.json").exists());
+    }
+
     #[test]
     fn reviewed_capture_cli_preserves_unknowns_and_compares_explicit_configurations() {
         let case = CaptureCase::new();

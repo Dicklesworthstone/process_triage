@@ -2,29 +2,36 @@
 //!
 //! Labels bind to the complete captured input, not merely a PID or command
 //! pattern. Both configurations use the shared production scorer. This module
-//! evaluates P(abandoned or zombie), never final action recommendations, and
-//! cannot train a model or execute a process action.
+//! evaluates P(abandoned or zombie), never final action recommendations. An
+//! explicit refit can propose bounded binary prior mass from a separate training
+//! capture; it cannot activate that proposal or execute a process action.
 
 use super::snapshot::{
     replay_scores, ReplayError, ReplayScoreResult, ReplayScoreStatus, ReplayScoringReport,
     ReplaySnapshot,
+};
+use crate::calibrate::empirical_bayes::{
+    compute_refit, BetaObservation, EmpiricalBayesConfig, ParamValue, RefitResult,
 };
 use crate::calibrate::{
     compute_metrics, CalibrationCurve, CalibrationData, CalibrationError, CalibrationMetrics,
     MIN_LABELS_PER_CLASS,
 };
 use crate::collect::ProcessRecord;
-use crate::config::Policy;
+use crate::config::{Policy, Priors};
 use crate::scoring::Scorer;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashSet};
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 const REVIEW_SCHEMA_VERSION: &str = "1.0.0";
 const EVALUATION_SCHEMA_VERSION: &str = "1.0.0";
+const REFIT_SCHEMA_VERSION: &str = "1.0.0";
+const BINARY_PRIOR_PATH: &str = "class_mass.abandoned_or_zombie";
+const MIN_REFIT_LABELS: usize = 20;
 
 #[derive(Debug, Error)]
 pub enum ReplayEvaluationError {
@@ -442,6 +449,86 @@ pub struct PairedEvaluationReport {
     pub limitations: Vec<String>,
 }
 
+/// Conservative controls for an explicit binary class-prior proposal. Feature
+/// likelihoods and the relative weights within each binary group are not fitted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayRefitConfig {
+    pub prior_strength: f64,
+    pub empirical_bayes: EmpiricalBayesConfig,
+}
+
+impl Default for ReplayRefitConfig {
+    fn default() -> Self {
+        Self {
+            prior_strength: 2.0,
+            empirical_bayes: EmpiricalBayesConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RefitTrainingSummary {
+    pub snapshot_sha256: String,
+    pub labels_sha256: String,
+    pub snapshot_name: String,
+    pub recorded_at: String,
+    pub host_id: String,
+    pub split: ReviewSplit,
+    pub population_size: usize,
+    pub reviewed_count: usize,
+    pub useful_count: usize,
+    pub abandoned_count: usize,
+    pub unlabeled_count: usize,
+}
+
+/// Descriptive result for the common scored holdout sample, not a quality or
+/// safety guarantee for the full census or other hosts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefitComparisonOutcome {
+    LowerPairedLogLoss,
+    EqualPairedLogLoss,
+    HigherPairedLogLoss,
+    InsufficientPairedSupport,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReplayRefitReport {
+    pub schema_version: String,
+    /// Content identity of this proposal and its training provenance; excludes
+    /// holdout labels and the clock, neither of which participates in fitting.
+    pub version_id: String,
+    pub created_at: String,
+    pub config: ReplayRefitConfig,
+    pub scope: &'static str,
+    pub training: RefitTrainingSummary,
+    /// Canonical JSON digests, independent of the output file's whitespace.
+    pub incumbent_priors_sha256: String,
+    pub candidate_priors_sha256: String,
+    pub incumbent_abandonment_prior: f64,
+    pub candidate_abandonment_prior: f64,
+    pub empirical_bayes: RefitResult,
+    /// Complete original parameters retained for inspection and rollback.
+    pub incumbent_priors: Priors,
+    /// Standard priors schema. This is not a complete scoring configuration:
+    /// policy, signatures and decision history belong to the incumbent context.
+    pub candidate_priors: Priors,
+    pub holdout: PairedEvaluationReport,
+    pub comparison_outcome: RefitComparisonOutcome,
+    pub limitations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReplayRefitArtifacts {
+    pub directory: PathBuf,
+    pub priors_path: PathBuf,
+    pub report_path: PathBuf,
+    /// Digests of the actual written bytes, including formatting and newline.
+    pub priors_file_sha256: String,
+    pub report_file_sha256: String,
+    pub version_id: String,
+}
+
 fn configuration_fingerprint(
     scorer: &Scorer,
     policy: &Policy,
@@ -706,6 +793,388 @@ pub fn evaluate_pair(
     })
 }
 
+fn validate_refit_config(config: &ReplayRefitConfig) -> Result<(), ReplayEvaluationError> {
+    let empirical = &config.empirical_bayes;
+    if !config.prior_strength.is_finite()
+        || config.prior_strength <= 0.0
+        || !empirical.learning_rate.is_finite()
+        || !(0.0..=1.0).contains(&empirical.learning_rate)
+        || !empirical.max_change_fraction.is_finite()
+        || !(0.0..=1.0).contains(&empirical.max_change_fraction)
+        || empirical.min_observations < MIN_REFIT_LABELS
+    {
+        return Err(ReplayEvaluationError::InvalidEvaluation(format!(
+            "refit requires positive finite prior strength, learning rate and relative-change bound in [0,1], and at least {MIN_REFIT_LABELS} training observations"
+        )));
+    }
+    Ok(())
+}
+
+fn label_counts(labels: &ReviewLabels) -> (usize, usize) {
+    labels
+        .processes
+        .iter()
+        .fold((0, 0), |(useful, abandoned), row| match row.verdict {
+            Some(ReviewVerdict::Useful) => (useful + 1, abandoned),
+            Some(ReviewVerdict::Abandoned) => (useful, abandoned + 1),
+            None => (useful, abandoned),
+        })
+}
+
+/// Fit one bounded binary class-prior proposal, then evaluate it once on a
+/// separate reviewed capture. Holdout verdicts are never passed to the fit.
+/// Both scoring passes share the already-loaded incumbent model and policy;
+/// the clone changes only its four prior probabilities. Nothing is activated.
+pub fn refit_and_evaluate(
+    training_snapshot: &ReplaySnapshot,
+    training_labels: &ReviewLabels,
+    holdout_snapshot: &ReplaySnapshot,
+    holdout_labels: &ReviewLabels,
+    baseline_scorer: &Scorer,
+    policy: &Policy,
+    config: &ReplayRefitConfig,
+) -> Result<ReplayRefitReport, ReplayEvaluationError> {
+    validate_refit_config(config)?;
+    validate_labels(training_snapshot, training_labels)?;
+    validate_labels(holdout_snapshot, holdout_labels)?;
+    if training_labels.split != ReviewSplit::Training
+        || holdout_labels.split != ReviewSplit::Holdout
+    {
+        return Err(ReplayEvaluationError::InvalidReview(
+            "refit requires an explicitly declared training capture and a separate holdout capture"
+                .to_string(),
+        ));
+    }
+    if training_labels.snapshot_sha256 == holdout_labels.snapshot_sha256 {
+        return Err(ReplayEvaluationError::InvalidReview(
+            "training and holdout must not use the same capture".to_string(),
+        ));
+    }
+    let training_identities: HashSet<_> = training_labels
+        .processes
+        .iter()
+        .filter(|row| row.verdict.is_some())
+        .map(|row| (row.pid, row.start_id.as_str(), row.uid))
+        .collect();
+    if holdout_labels.processes.iter().any(|row| {
+        row.verdict.is_some()
+            && training_identities.contains(&(row.pid, row.start_id.as_str(), row.uid))
+    }) {
+        return Err(ReplayEvaluationError::InvalidReview(
+            "training and holdout contain an overlapping labeled process incarnation; changing the declared host does not make it independent"
+                .to_string(),
+        ));
+    }
+    let (useful_count, abandoned_count) = label_counts(training_labels);
+    let reviewed_count = useful_count + abandoned_count;
+    let (holdout_useful, holdout_abandoned) = label_counts(holdout_labels);
+    if useful_count < MIN_LABELS_PER_CLASS
+        || abandoned_count < MIN_LABELS_PER_CLASS
+        || reviewed_count < config.empirical_bayes.min_observations
+        || holdout_useful < MIN_LABELS_PER_CLASS
+        || holdout_abandoned < MIN_LABELS_PER_CLASS
+    {
+        return Err(ReplayEvaluationError::InvalidEvaluation(format!(
+            "refit requires at least {} training labels and {MIN_LABELS_PER_CLASS} labels of each class in both splits; found training {useful_count} useful/{abandoned_count} abandoned, holdout {holdout_useful} useful/{holdout_abandoned} abandoned; unknown verdicts do not count",
+            config.empirical_bayes.min_observations,
+        )));
+    }
+    pt_config::validate::validate_priors(&baseline_scorer.priors)
+        .map_err(|error| ReplayEvaluationError::InvalidEvaluation(error.to_string()))?;
+    let classes = &baseline_scorer.priors.classes;
+    let abandoned_mass = classes.abandoned.prior_prob + classes.zombie.prior_prob;
+    let useful_mass = classes.useful.prior_prob + classes.useful_bad.prior_prob;
+    let incumbent_abandonment_prior = abandoned_mass / (abandoned_mass + useful_mass);
+    let alpha = config.prior_strength * incumbent_abandonment_prior;
+    let beta = config.prior_strength * (1.0 - incumbent_abandonment_prior);
+    if !alpha.is_finite() || alpha <= 0.0 || !beta.is_finite() || beta <= 0.0 {
+        return Err(ReplayEvaluationError::InvalidEvaluation(
+            "binary refit requires finite positive prior mass for both class groups".to_string(),
+        ));
+    }
+    let observations = [BetaObservation {
+        path: BINARY_PRIOR_PATH.to_string(),
+        successes: u64::try_from(abandoned_count).map_err(|_| {
+            ReplayEvaluationError::InvalidEvaluation("too many training labels".to_string())
+        })?,
+        trials: u64::try_from(reviewed_count).map_err(|_| {
+            ReplayEvaluationError::InvalidEvaluation("too many training labels".to_string())
+        })?,
+    }];
+    let parameters = HashMap::from([(
+        BINARY_PRIOR_PATH.to_string(),
+        ParamValue::Beta { alpha, beta },
+    )]);
+    let empirical_bayes = compute_refit(
+        &observations,
+        &[],
+        &[],
+        &parameters,
+        &config.empirical_bayes,
+        0,
+    );
+    let (fitted_alpha, fitted_beta) = empirical_bayes
+        .changes
+        .iter()
+        .find_map(|change| match &change.after {
+            ParamValue::Beta { alpha, beta } if change.path == BINARY_PRIOR_PATH => {
+                Some((*alpha, *beta))
+            }
+            _ => None,
+        })
+        .unwrap_or((alpha, beta));
+    let candidate_abandonment_prior = fitted_alpha / (fitted_alpha + fitted_beta);
+    if !candidate_abandonment_prior.is_finite()
+        || candidate_abandonment_prior <= 0.0
+        || candidate_abandonment_prior >= 1.0
+    {
+        return Err(ReplayEvaluationError::InvalidEvaluation(
+            "refit produced an invalid binary prior".to_string(),
+        ));
+    }
+    let mut candidate_priors = baseline_scorer.priors.clone();
+    if candidate_abandonment_prior != incumbent_abandonment_prior {
+        candidate_priors.classes.abandoned.prior_prob =
+            candidate_abandonment_prior * (classes.abandoned.prior_prob / abandoned_mass);
+        candidate_priors.classes.zombie.prior_prob =
+            candidate_abandonment_prior * (classes.zombie.prior_prob / abandoned_mass);
+        candidate_priors.classes.useful.prior_prob =
+            (1.0 - candidate_abandonment_prior) * (classes.useful.prior_prob / useful_mass);
+        candidate_priors.classes.useful_bad.prior_prob =
+            (1.0 - candidate_abandonment_prior) * (classes.useful_bad.prior_prob / useful_mass);
+    }
+    pt_config::validate::validate_priors(&candidate_priors)
+        .map_err(|error| ReplayEvaluationError::InvalidEvaluation(error.to_string()))?;
+
+    let training = RefitTrainingSummary {
+        snapshot_sha256: training_labels.snapshot_sha256.clone(),
+        labels_sha256: canonical_sha256(training_labels)?,
+        snapshot_name: training_snapshot.name.clone(),
+        recorded_at: training_snapshot.context.recorded_at.clone(),
+        host_id: training_labels.host_id.clone(),
+        split: training_labels.split,
+        population_size: training_snapshot.processes.len(),
+        reviewed_count,
+        useful_count,
+        abandoned_count,
+        unlabeled_count: training_snapshot.processes.len() - reviewed_count,
+    };
+    let incumbent_priors_sha256 = canonical_sha256(&baseline_scorer.priors)?;
+    let candidate_priors_sha256 = canonical_sha256(&candidate_priors)?;
+    let version_id = canonical_sha256(&serde_json::json!({
+        "schema_version": REFIT_SCHEMA_VERSION,
+        "incumbent_priors_sha256": incumbent_priors_sha256,
+        "candidate_priors_sha256": candidate_priors_sha256,
+        "training_snapshot_sha256": training.snapshot_sha256,
+        "training_labels_sha256": training.labels_sha256,
+        "config": config,
+    }))?;
+    let mut candidate_scorer = baseline_scorer.clone();
+    candidate_scorer.priors = candidate_priors.clone();
+    let holdout = evaluate_pair(
+        holdout_snapshot,
+        holdout_labels,
+        baseline_scorer,
+        policy,
+        &candidate_scorer,
+        policy,
+    )?;
+    let comparison_outcome = match holdout.paired_metrics.as_ref() {
+        Some(metrics) if metrics.candidate_minus_baseline.log_loss < 0.0 => {
+            RefitComparisonOutcome::LowerPairedLogLoss
+        }
+        Some(metrics) if metrics.candidate_minus_baseline.log_loss > 0.0 => {
+            RefitComparisonOutcome::HigherPairedLogLoss
+        }
+        Some(_) => RefitComparisonOutcome::EqualPairedLogLoss,
+        None => RefitComparisonOutcome::InsufficientPairedSupport,
+    };
+    Ok(ReplayRefitReport {
+        schema_version: REFIT_SCHEMA_VERSION.to_string(),
+        version_id,
+        created_at: empirical_bayes.computed_at.to_rfc3339(),
+        config: config.clone(),
+        scope: "binary_class_prior_mass_only",
+        training,
+        incumbent_priors_sha256,
+        candidate_priors_sha256,
+        incumbent_abandonment_prior,
+        candidate_abandonment_prior,
+        empirical_bayes,
+        incumbent_priors: baseline_scorer.priors.clone(),
+        candidate_priors,
+        holdout,
+        comparison_outcome,
+        limitations: vec![
+            "Only P(abandoned or zombie) prior mass is fitted. Within-group class ratios and every feature likelihood remain unchanged; binary labels do not identify four latent classes.".to_string(),
+            "The exported priors are not a standalone scoring configuration. Evaluation keeps the incumbent policy, signatures, decision history and other scorer settings unchanged; their fingerprints are in the paired report.".to_string(),
+            "Known labeled-incarnation overlap between the supplied splits is rejected. Host names, reviewer independence and exclusion from the incumbent's earlier learning remain operator declarations; this command cannot prove them.".to_string(),
+            "Unknown verdicts do not train the candidate. Reviewed-label prevalence may be selected or biased; paired holdout losses describe only scored reviewed identities, with exclusions retained in coverage.".to_string(),
+            "A candidate is never activated automatically. One capture's lower loss does not establish fleet calibration, action safety or an FDR guarantee; higher loss and unavailable metrics are retained.".to_string(),
+        ],
+    })
+}
+
+/// Write a priors-only candidate and its report into a new private directory.
+/// Existing directories and symlinks are refused. Every file is created
+/// exclusively and synchronized; a partial failure is retained for inspection,
+/// never cleaned up by deleting files or replaced with the incumbent config.
+/// The active config location is excluded even when it does not yet exist or
+/// becomes an alias for the fresh output directory only after creation.
+#[cfg(unix)]
+pub fn write_refit_artifacts(
+    output: &Path,
+    report: &ReplayRefitReport,
+    incumbent_config_dir: &Path,
+) -> Result<ReplayRefitArtifacts, ReplayEvaluationError> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+
+    if prospective_refit_directory(output)? == prospective_refit_directory(incumbent_config_dir)? {
+        return Err(ReplayEvaluationError::InvalidEvaluation(
+            "refit output must be separate from the active configuration directory; candidate priors cannot be activated by export".to_string(),
+        ));
+    }
+    pt_config::validate::validate_priors(&report.candidate_priors)
+        .map_err(|error| ReplayEvaluationError::InvalidEvaluation(error.to_string()))?;
+    if canonical_sha256(&report.candidate_priors)? != report.candidate_priors_sha256 {
+        return Err(ReplayEvaluationError::InvalidEvaluation(
+            "candidate priors no longer match the evaluated proposal".to_string(),
+        ));
+    }
+    let mut priors_bytes = serde_json::to_vec_pretty(&report.candidate_priors)?;
+    priors_bytes.push(b'\n');
+    let mut report_bytes = serde_json::to_vec_pretty(report)?;
+    report_bytes.push(b'\n');
+    let artifacts = ReplayRefitArtifacts {
+        directory: output.to_path_buf(),
+        priors_path: output.join("priors.json"),
+        report_path: output.join("refit.json"),
+        priors_file_sha256: hex::encode(Sha256::digest(&priors_bytes)),
+        report_file_sha256: hex::encode(Sha256::digest(&report_bytes)),
+        version_id: report.version_id.clone(),
+    };
+    std::fs::DirBuilder::new().mode(0o700).create(output)?;
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(output)?;
+    let revalidate = || -> std::io::Result<()> {
+        let current = std::fs::symlink_metadata(output)?;
+        let opened = directory.metadata()?;
+        if !current.is_dir() || current.dev() != opened.dev() || current.ino() != opened.ino() {
+            return Err(std::io::Error::other(
+                "refit artifact directory identity changed",
+            ));
+        }
+        Ok(())
+    };
+    revalidate()?;
+    // A dangling active-config symlink or a case-insensitive path alias may
+    // resolve only now that the output exists. Compare the actual directory
+    // inode before creating priors.json, which would otherwise activate it.
+    match std::fs::metadata(incumbent_config_dir) {
+        Ok(active) => {
+            let opened = directory.metadata()?;
+            if active.dev() == opened.dev() && active.ino() == opened.ino() {
+                return Err(ReplayEvaluationError::InvalidEvaluation(
+                    "refit output aliases the active configuration directory; no candidate files were written".to_string(),
+                ));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    write_new_refit_file(&directory, c"priors.json", &priors_bytes)?;
+    write_new_refit_file(&directory, c"refit.json", &report_bytes)?;
+    directory.sync_all()?;
+    // Synchronize the new directory entry too; success means both complete
+    // files and their containing directory have been made durable.
+    let parent = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::File::open(parent)?.sync_all()?;
+    revalidate()?;
+    Ok(artifacts)
+}
+
+/// Resolve existing ancestors before appending an absent suffix. This preserves
+/// filesystem semantics for symlink ancestors and `..`, unlike normalizing the
+/// spelling first. An unresolved path error is a refusal, never permission to
+/// publish into a potentially active configuration location.
+#[cfg(unix)]
+fn prospective_refit_directory(path: &Path) -> std::io::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut ancestor = absolute.as_path();
+    let mut suffix = Vec::new();
+    loop {
+        match std::fs::canonicalize(ancestor) {
+            Ok(mut resolved) => {
+                for component in suffix.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = ancestor.file_name() else {
+                    return Err(error);
+                };
+                let Some(parent) = ancestor.parent() else {
+                    return Err(error);
+                };
+                suffix.push(name.to_os_string());
+                ancestor = parent;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn write_new_refit_file(
+    directory: &std::fs::File,
+    name: &std::ffi::CStr,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    // SAFETY: the directory descriptor and fixed, single-component C filename
+    // stay live throughout openat. O_EXCL and O_NOFOLLOW prohibit replacement;
+    // relative lookup stays bound to this private directory inode if it moves.
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600 as libc::c_uint,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a new descriptor; this File takes ownership once.
+    let mut file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+#[cfg(not(unix))]
+pub fn write_refit_artifacts(
+    _output: &Path,
+    _report: &ReplayRefitReport,
+    _incumbent_config_dir: &Path,
+) -> Result<ReplayRefitArtifacts, ReplayEvaluationError> {
+    Err(ReplayEvaluationError::Io(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "private refit artifact publication requires a supported Unix platform",
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -745,8 +1214,12 @@ mod tests {
 
     /// Synthetic observations exercise evaluator contracts only, not fleet quality.
     fn snapshot(count: u32) -> ReplaySnapshot {
+        snapshot_from(count, 100)
+    }
+
+    fn snapshot_from(count: u32, first_pid: u32) -> ReplaySnapshot {
         let scorer = scorer();
-        let processes = (100..100 + count)
+        let processes = (first_pid..first_pid + count)
             .map(|pid| {
                 MockProcessBuilder::new()
                     .pid(pid)
@@ -834,6 +1307,47 @@ mod tests {
             );
         }
         labels
+    }
+
+    fn refit_labels(
+        snapshot: &ReplaySnapshot,
+        split: ReviewSplit,
+        abandoned: usize,
+        useful: usize,
+    ) -> ReviewLabels {
+        let mut labels = make_review_template(snapshot, "refit-contract-host", split).unwrap();
+        for (index, process) in labels.processes.iter_mut().enumerate() {
+            if index < abandoned + useful {
+                review(
+                    process,
+                    if index < abandoned {
+                        ReviewVerdict::Abandoned
+                    } else {
+                        ReviewVerdict::Useful
+                    },
+                );
+            }
+        }
+        labels
+    }
+
+    // Equal likelihoods make the expected holdout loss independently computable
+    // from the class-prior mass; production replay still performs both scorings.
+    fn refit_scorer() -> Scorer {
+        let mut model = scorer();
+        let common = model.priors.classes.useful.clone();
+        for (class, probability) in [
+            (&mut model.priors.classes.useful, 0.7),
+            (&mut model.priors.classes.useful_bad, 0.05),
+            (&mut model.priors.classes.abandoned, 0.2),
+            (&mut model.priors.classes.zombie, 0.05),
+        ] {
+            *class = common.clone();
+            class.prior_prob = probability;
+        }
+        model.priors.state_flags = None;
+        model.priors.command_categories = None;
+        model
     }
 
     fn evidence_dir(name: &str) -> PathBuf {
@@ -1225,6 +1739,481 @@ mod tests {
         assert_eq!(metrics.candidate_minus_baseline.brier_score, 0.0);
         assert_eq!(metrics.candidate_minus_baseline.log_loss, 0.0);
         assert_eq!(metrics.candidate_minus_baseline.ece, 0.0);
+    }
+
+    #[test]
+    fn refit_changes_only_binary_mass_and_measures_the_holdout_through_shared_scoring() {
+        let training = snapshot_from(25, 100);
+        let training_labels = refit_labels(&training, ReviewSplit::Training, 15, 5);
+        let holdout = snapshot_from(20, 200);
+        let holdout_labels = refit_labels(&holdout, ReviewSplit::Holdout, 15, 5);
+        let model = refit_scorer();
+        let policy = policy();
+        let fingerprint = configuration_fingerprint(&model, &policy).unwrap();
+        let report = refit_and_evaluate(
+            &training,
+            &training_labels,
+            &holdout,
+            &holdout_labels,
+            &model,
+            &policy,
+            &ReplayRefitConfig::default(),
+        )
+        .unwrap();
+
+        assert_eq!(report.training.population_size, 25);
+        assert_eq!(report.training.reviewed_count, 20);
+        assert_eq!(report.training.unlabeled_count, 5);
+        assert_eq!(report.empirical_bayes.snapshot_before.observation_count, 20);
+        assert_eq!(report.version_id.len(), 64);
+        let expected = 0.65 / 2.2;
+        assert!((report.incumbent_abandonment_prior - 0.25).abs() < 1e-12);
+        assert!((report.candidate_abandonment_prior - expected).abs() < 1e-12);
+        let fitted = &report.candidate_priors.classes;
+        assert!((fitted.abandoned.prior_prob / fitted.zombie.prior_prob - 4.0).abs() < 1e-12);
+        assert!((fitted.useful.prior_prob / fitted.useful_bad.prior_prob - 14.0).abs() < 1e-12);
+        assert!(
+            (fitted.useful.prior_prob
+                + fitted.useful_bad.prior_prob
+                + fitted.abandoned.prior_prob
+                + fitted.zombie.prior_prob
+                - 1.0)
+                .abs()
+                < 1e-12
+        );
+        let mut without_prior_changes = report.candidate_priors.clone();
+        without_prior_changes.classes.useful.prior_prob = model.priors.classes.useful.prior_prob;
+        without_prior_changes.classes.useful_bad.prior_prob =
+            model.priors.classes.useful_bad.prior_prob;
+        without_prior_changes.classes.abandoned.prior_prob =
+            model.priors.classes.abandoned.prior_prob;
+        without_prior_changes.classes.zombie.prior_prob = model.priors.classes.zombie.prior_prob;
+        assert_eq!(
+            serde_json::to_value(&without_prior_changes).unwrap(),
+            serde_json::to_value(&model.priors).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&report.incumbent_priors).unwrap(),
+            serde_json::to_value(&model.priors).unwrap()
+        );
+        assert_eq!(
+            configuration_fingerprint(&model, &policy).unwrap(),
+            fingerprint
+        );
+        let metrics = report.holdout.paired_metrics.as_ref().unwrap();
+        let log_loss =
+            |probability: f64| -0.75 * probability.ln() - 0.25 * (1.0 - probability).ln();
+        assert!((metrics.baseline.log_loss - log_loss(0.25)).abs() < 1e-10);
+        assert!((metrics.candidate.log_loss - log_loss(expected)).abs() < 1e-10);
+        assert_eq!(
+            report.comparison_outcome,
+            RefitComparisonOutcome::LowerPairedLogLoss
+        );
+        assert_eq!(report.holdout.coverage.paired_count, 20);
+        assert_eq!(
+            report.holdout.baseline.evaluated_at,
+            report.holdout.candidate.evaluated_at
+        );
+    }
+
+    #[test]
+    fn refit_does_not_train_on_holdout_labels_and_reports_a_real_loss() {
+        let training = snapshot_from(20, 100);
+        let training_labels = refit_labels(&training, ReviewSplit::Training, 15, 5);
+        let holdout = snapshot_from(20, 200);
+        let useful_holdout = refit_labels(&holdout, ReviewSplit::Holdout, 5, 15);
+        let abandoned_holdout = refit_labels(&holdout, ReviewSplit::Holdout, 15, 5);
+        let model = refit_scorer();
+        let fit = |labels: &ReviewLabels| {
+            refit_and_evaluate(
+                &training,
+                &training_labels,
+                &holdout,
+                labels,
+                &model,
+                &policy(),
+                &ReplayRefitConfig::default(),
+            )
+            .unwrap()
+        };
+        let lost = fit(&useful_holdout);
+        let won = fit(&abandoned_holdout);
+        assert_eq!(lost.version_id, won.version_id);
+        assert_eq!(lost.candidate_priors_sha256, won.candidate_priors_sha256);
+        assert_eq!(
+            serde_json::to_value(&lost.candidate_priors).unwrap(),
+            serde_json::to_value(&won.candidate_priors).unwrap()
+        );
+        assert_ne!(lost.holdout.labels_sha256, won.holdout.labels_sha256);
+        assert_eq!(
+            lost.comparison_outcome,
+            RefitComparisonOutcome::HigherPairedLogLoss
+        );
+        assert!(
+            lost.holdout
+                .paired_metrics
+                .unwrap()
+                .candidate_minus_baseline
+                .log_loss
+                > 0.0
+        );
+        assert_eq!(
+            won.comparison_outcome,
+            RefitComparisonOutcome::LowerPairedLogLoss
+        );
+    }
+
+    #[test]
+    fn refit_refuses_capture_reuse_incarnation_overlap_and_malformed_reviews() {
+        let training = snapshot_from(20, 100);
+        let training_labels = refit_labels(&training, ReviewSplit::Training, 15, 5);
+        let holdout = snapshot_from(20, 200);
+        let holdout_labels = refit_labels(&holdout, ReviewSplit::Holdout, 10, 10);
+        let model = refit_scorer();
+        let reject = |train: &ReviewLabels, capture: &ReplaySnapshot, labels: &ReviewLabels| {
+            assert!(refit_and_evaluate(
+                &training,
+                train,
+                capture,
+                labels,
+                &model,
+                &policy(),
+                &ReplayRefitConfig::default(),
+            )
+            .is_err());
+        };
+        let reused = refit_labels(&training, ReviewSplit::Holdout, 10, 10);
+        reject(&training_labels, &training, &reused);
+        let mut renamed = training.clone();
+        renamed.name.push_str("-a-different-file");
+        let mut overlapping = refit_labels(&renamed, ReviewSplit::Holdout, 10, 10);
+        overlapping.host_id = "a-different-declared-host".to_string();
+        reject(&training_labels, &renamed, &overlapping);
+
+        let mut wrong_split = training_labels.clone();
+        wrong_split.split = ReviewSplit::Holdout;
+        reject(&wrong_split, &holdout, &holdout_labels);
+        let mut wrong_split = holdout_labels.clone();
+        wrong_split.split = ReviewSplit::Training;
+        reject(&training_labels, &holdout, &wrong_split);
+        let mut corrupt = holdout.clone();
+        corrupt.processes[0].cpu_percent += 1.0;
+        reject(&training_labels, &corrupt, &holdout_labels);
+        let mut missing_provenance = training_labels.clone();
+        missing_provenance.processes[0].reviewer = None;
+        reject(&missing_provenance, &holdout, &holdout_labels);
+        let mut unknown_verdict = serde_json::to_value(&training_labels).unwrap();
+        unknown_verdict["processes"][0]["verdict"] = serde_json::json!("unreviewed_guess");
+        assert!(serde_json::from_value::<ReviewLabels>(unknown_verdict).is_err());
+    }
+
+    #[test]
+    fn refit_unknowns_do_not_satisfy_class_or_total_support() {
+        let training = snapshot_from(25, 100);
+        let holdout = snapshot_from(20, 200);
+        let model = refit_scorer();
+        for (training_labels, holdout_labels) in [
+            (
+                refit_labels(&training, ReviewSplit::Training, 4, 16),
+                refit_labels(&holdout, ReviewSplit::Holdout, 10, 10),
+            ),
+            (
+                refit_labels(&training, ReviewSplit::Training, 5, 14),
+                refit_labels(&holdout, ReviewSplit::Holdout, 10, 10),
+            ),
+            (
+                refit_labels(&training, ReviewSplit::Training, 0, 0),
+                refit_labels(&holdout, ReviewSplit::Holdout, 10, 10),
+            ),
+            (
+                refit_labels(&training, ReviewSplit::Training, 15, 5),
+                refit_labels(&holdout, ReviewSplit::Holdout, 4, 16),
+            ),
+        ] {
+            let error = refit_and_evaluate(
+                &training,
+                &training_labels,
+                &holdout,
+                &holdout_labels,
+                &model,
+                &policy(),
+                &ReplayRefitConfig::default(),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("unknown verdicts do not count"));
+        }
+    }
+
+    #[test]
+    fn refit_retains_unscored_holdout_coverage_without_claiming_improvement() {
+        let training = snapshot_from(20, 100);
+        let training_labels = refit_labels(&training, ReviewSplit::Training, 15, 5);
+        let mut holdout = snapshot_from(10, 200);
+        let unavailable = holdout
+            .scoring_context
+            .as_mut()
+            .unwrap()
+            .processes
+            .get_mut(&200)
+            .unwrap();
+        unavailable.cgroup_role = None;
+        unavailable.observations = None;
+        unavailable.unavailable_reason =
+            Some("capture did not obtain an identity-bound sample".to_string());
+        let labels = refit_labels(&holdout, ReviewSplit::Holdout, 5, 5);
+        let report = refit_and_evaluate(
+            &training,
+            &training_labels,
+            &holdout,
+            &labels,
+            &refit_scorer(),
+            &policy(),
+            &ReplayRefitConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            report.comparison_outcome,
+            RefitComparisonOutcome::InsufficientPairedSupport
+        );
+        assert_eq!(report.holdout.coverage.reviewed_count, 10);
+        assert_eq!(report.holdout.coverage.paired_count, 9);
+        assert_eq!(report.holdout.coverage.neither_scored_count, 1);
+        assert_eq!(report.holdout.coverage.paired_abandoned_count, 4);
+        assert!(report.holdout.paired_metrics.is_none());
+        assert!(report.holdout.metrics_unavailable_reason.is_some());
+    }
+
+    #[test]
+    fn refit_rejects_invalid_controls_and_zero_group_prior_mass() {
+        let training = snapshot_from(20, 100);
+        let training_labels = refit_labels(&training, ReviewSplit::Training, 15, 5);
+        let holdout = snapshot_from(10, 200);
+        let holdout_labels = refit_labels(&holdout, ReviewSplit::Holdout, 5, 5);
+        for invalid in 0..7 {
+            let mut config = ReplayRefitConfig::default();
+            match invalid {
+                0 => config.prior_strength = 0.0,
+                1 => config.prior_strength = f64::INFINITY,
+                2 => config.empirical_bayes.learning_rate = f64::NAN,
+                3 => config.empirical_bayes.learning_rate = -1.0,
+                4 => config.empirical_bayes.max_change_fraction = f64::NAN,
+                5 => config.empirical_bayes.max_change_fraction = 1.1,
+                _ => config.empirical_bayes.min_observations = 19,
+            }
+            assert!(
+                refit_and_evaluate(
+                    &training,
+                    &training_labels,
+                    &holdout,
+                    &holdout_labels,
+                    &refit_scorer(),
+                    &policy(),
+                    &config,
+                )
+                .is_err(),
+                "invalid control {invalid}"
+            );
+        }
+        let mut zero_group = refit_scorer();
+        zero_group.priors.classes.abandoned.prior_prob = 0.0;
+        zero_group.priors.classes.zombie.prior_prob = 0.0;
+        zero_group.priors.classes.useful.prior_prob = 0.9;
+        zero_group.priors.classes.useful_bad.prior_prob = 0.1;
+        assert!(refit_and_evaluate(
+            &training,
+            &training_labels,
+            &holdout,
+            &holdout_labels,
+            &zero_group,
+            &policy(),
+            &ReplayRefitConfig::default(),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("positive prior mass"));
+    }
+
+    #[test]
+    fn refit_with_learning_disabled_preserves_the_exact_incumbent() {
+        let training = snapshot_from(20, 100);
+        let training_labels = refit_labels(&training, ReviewSplit::Training, 15, 5);
+        let holdout = snapshot_from(10, 200);
+        let labels = refit_labels(&holdout, ReviewSplit::Holdout, 5, 5);
+        let mut config = ReplayRefitConfig::default();
+        config.empirical_bayes.learning_rate = 0.0;
+        let report = refit_and_evaluate(
+            &training,
+            &training_labels,
+            &holdout,
+            &labels,
+            &refit_scorer(),
+            &policy(),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(
+            report.incumbent_priors_sha256,
+            report.candidate_priors_sha256
+        );
+        assert_eq!(
+            report.holdout.baseline.configuration_sha256,
+            report.holdout.candidate.configuration_sha256
+        );
+        assert_eq!(
+            report.comparison_outcome,
+            RefitComparisonOutcome::EqualPairedLogLoss
+        );
+        assert!(!report.empirical_bayes.has_changes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refit_artifacts_are_loadable_private_and_never_replace_existing_outputs() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let training = snapshot_from(20, 100);
+        let training_labels = refit_labels(&training, ReviewSplit::Training, 15, 5);
+        let holdout = snapshot_from(10, 200);
+        let labels = refit_labels(&holdout, ReviewSplit::Holdout, 5, 5);
+        let report = refit_and_evaluate(
+            &training,
+            &training_labels,
+            &holdout,
+            &labels,
+            &refit_scorer(),
+            &policy(),
+            &ReplayRefitConfig::default(),
+        )
+        .unwrap();
+        let directory = evidence_dir("refit-artifacts");
+        let output = directory.join("candidate");
+        let active_config = directory.join("incumbent-config");
+        let artifacts = write_refit_artifacts(&output, &report, &active_config).unwrap();
+        let priors_bytes = std::fs::read(&artifacts.priors_path).unwrap();
+        let report_bytes = std::fs::read(&artifacts.report_path).unwrap();
+        let loaded: Priors = serde_json::from_slice(&priors_bytes).unwrap();
+        pt_config::validate::validate_priors(&loaded).unwrap();
+        assert_eq!(
+            canonical_sha256(&loaded).unwrap(),
+            report.candidate_priors_sha256
+        );
+        assert_eq!(
+            artifacts.priors_file_sha256,
+            hex::encode(Sha256::digest(&priors_bytes))
+        );
+        assert_eq!(
+            artifacts.report_file_sha256,
+            hex::encode(Sha256::digest(&report_bytes))
+        );
+        let saved_report: serde_json::Value = serde_json::from_slice(&report_bytes).unwrap();
+        assert_eq!(saved_report["version_id"], report.version_id);
+        assert_eq!(saved_report["scope"], "binary_class_prior_mass_only");
+        assert_eq!(
+            saved_report["incumbent_priors"],
+            serde_json::to_value(&report.incumbent_priors).unwrap()
+        );
+        assert_eq!(
+            std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        for path in [&artifacts.priors_path, &artifacts.report_path] {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert!(write_refit_artifacts(&output, &report, &active_config).is_err());
+        assert_eq!(std::fs::read(&artifacts.priors_path).unwrap(), priors_bytes);
+        assert_eq!(std::fs::read(&artifacts.report_path).unwrap(), report_bytes);
+        let alias = directory.join("alias");
+        symlink(&output, &alias).unwrap();
+        assert!(write_refit_artifacts(&alias, &report, &active_config).is_err());
+        assert_eq!(std::fs::read(&artifacts.priors_path).unwrap(), priors_bytes);
+
+        let mut changed = report.clone();
+        changed.candidate_priors.classes.useful.prior_prob -= 0.01;
+        changed.candidate_priors.classes.abandoned.prior_prob += 0.01;
+        let invalid_output = directory.join("unverified-candidate");
+        assert!(write_refit_artifacts(&invalid_output, &changed, &active_config).is_err());
+        assert!(!invalid_output.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refit_artifacts_cannot_activate_absent_or_aliased_configurations() {
+        use std::os::unix::fs::symlink;
+
+        let training = snapshot_from(20, 100);
+        let training_labels = refit_labels(&training, ReviewSplit::Training, 15, 5);
+        let holdout = snapshot_from(10, 200);
+        let labels = refit_labels(&holdout, ReviewSplit::Holdout, 5, 5);
+        let report = refit_and_evaluate(
+            &training,
+            &training_labels,
+            &holdout,
+            &labels,
+            &refit_scorer(),
+            &policy(),
+            &ReplayRefitConfig::default(),
+        )
+        .unwrap();
+        let directory = evidence_dir("refit-no-activation");
+        let absent_config = directory.join("default-config");
+        let error = write_refit_artifacts(&absent_config, &report, &absent_config).unwrap_err();
+        assert!(error.to_string().contains("active configuration directory"));
+        assert!(!absent_config.exists());
+
+        // Construct a relative alias without changing the process-wide CWD,
+        // which would interfere with other tests running concurrently.
+        let current = std::env::current_dir().unwrap();
+        let mut relative = PathBuf::new();
+        for component in current.components() {
+            if matches!(component, std::path::Component::Normal(_)) {
+                relative.push("..");
+            }
+        }
+        relative.push(absent_config.strip_prefix(Path::new("/")).unwrap());
+        assert!(write_refit_artifacts(&relative, &report, &absent_config).is_err());
+        assert!(!absent_config.exists());
+
+        // Resolve the symlink before interpreting '..': alias/.. is the
+        // target's parent, not the directory containing the symlink.
+        let nested = directory.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let real = nested.join("real");
+        std::fs::create_dir(&real).unwrap();
+        let ancestor_alias = directory.join("ancestor-alias");
+        symlink(&real, &ancestor_alias).unwrap();
+        let aliased_output = ancestor_alias.join("../symlink-config");
+        let symlink_config = nested.join("symlink-config");
+        assert!(write_refit_artifacts(&aliased_output, &report, &symlink_config).is_err());
+        assert!(!symlink_config.exists());
+
+        // This active-config alias is dangling during the prospective check.
+        // Creating the output makes it resolvable; the inode check must refuse
+        // before priors.json can activate the candidate on the next CLI run.
+        let target = directory.join("dangling-target");
+        let active_alias = directory.join("active-config-alias");
+        symlink("dangling-target", &active_alias).unwrap();
+        assert!(!active_alias.exists());
+        let error = write_refit_artifacts(&target, &report, &active_alias).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("aliases the active configuration"));
+        assert!(target.is_dir());
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+        assert!(!active_alias.join("priors.json").exists());
+
+        // Exercise the same post-create protection when the test filesystem
+        // supports case aliases (normally macOS, not a Linux case-sensitive FS).
+        std::fs::create_dir(directory.join("CaseProbe")).unwrap();
+        if directory.join("caseprobe").is_dir() {
+            let case_output = directory.join("CaseConfig");
+            let case_active = directory.join("caseconfig");
+            assert!(write_refit_artifacts(&case_output, &report, &case_active).is_err());
+            assert_eq!(std::fs::read_dir(&case_output).unwrap().count(), 0);
+            assert!(!case_active.join("priors.json").exists());
+        }
     }
 
     #[test]

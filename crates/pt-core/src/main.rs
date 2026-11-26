@@ -581,6 +581,21 @@ enum ReplayCommands {
         #[arg(long, value_name = "DIR")]
         baseline_config: PathBuf,
     },
+    /// Fit candidate class priors from reviewed training data and evaluate a separate holdout
+    Refit {
+        #[arg(long, value_name = "PATH")]
+        training_snapshot: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        training_labels: PathBuf,
+        /// Separate holdout capture; its labels never participate in fitting
+        #[arg(long, value_name = "PATH")]
+        snapshot: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        labels: PathBuf,
+        /// New private directory for priors.json and refit.json; existing paths are refused
+        #[arg(long, value_name = "DIR")]
+        output: PathBuf,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -9961,11 +9976,15 @@ fn replay_evaluation_error(error: pt_core::replay::ReplayEvaluationError) -> Exi
 }
 
 fn run_replay(global: &GlobalOpts, args: &ReplayArgs) -> ExitCode {
+    use pt_core::replay::evaluation::{
+        refit_and_evaluate, write_refit_artifacts, ReplayRefitConfig,
+    };
     use pt_core::replay::{evaluate_pair, make_review_template, read_review_labels, ReviewSplit};
 
     let snapshot_path = match &args.command {
         ReplayCommands::LabelTemplate { snapshot, .. }
-        | ReplayCommands::Evaluate { snapshot, .. } => snapshot,
+        | ReplayCommands::Evaluate { snapshot, .. }
+        | ReplayCommands::Refit { snapshot, .. } => snapshot,
     };
     let snapshot = match pt_core::replay::load_snapshot(snapshot_path) {
         Ok(snapshot) => snapshot,
@@ -10012,6 +10031,114 @@ fn run_replay(global: &GlobalOpts, args: &ReplayArgs) -> ExitCode {
                         "population_size": labels.processes.len(),
                         "reviewed_count": 0,
                     },
+                }),
+                summary,
+            )
+        }
+        ReplayCommands::Refit {
+            training_snapshot,
+            training_labels,
+            labels,
+            output,
+            ..
+        } => {
+            if let Some(path) = global
+                .config
+                .as_ref()
+                .filter(|path| !Path::new(path).is_dir())
+            {
+                eprintln!("replay: incumbent configuration directory is inaccessible: {path}");
+                return ExitCode::ArgsError;
+            }
+            let training_snapshot = match pt_core::replay::load_snapshot(training_snapshot) {
+                Ok(snapshot) => snapshot,
+                Err(error) => return replay_evaluation_error(error.into()),
+            };
+            let training_labels = match read_review_labels(training_labels) {
+                Ok(labels) => labels,
+                Err(error) => return replay_evaluation_error(error),
+            };
+            let holdout_labels = match read_review_labels(labels) {
+                Ok(labels) => labels,
+                Err(error) => return replay_evaluation_error(error),
+            };
+            let incumbent = match load_config(&ConfigOptions {
+                config_dir: global.config.as_ref().map(PathBuf::from),
+                ..Default::default()
+            }) {
+                Ok(config) => config,
+                Err(error) => return output_config_error(global, &error),
+            };
+            let scorer = match configured_scorer(&incumbent) {
+                Ok(scorer) => scorer,
+                Err(error) => return output_config_error(global, &error),
+            };
+            let report = match refit_and_evaluate(
+                &training_snapshot,
+                &training_labels,
+                &snapshot,
+                &holdout_labels,
+                &scorer,
+                &incumbent.policy,
+                &ReplayRefitConfig::default(),
+            ) {
+                Ok(report) => report,
+                Err(error) => return replay_evaluation_error(error),
+            };
+            let artifacts = match write_refit_artifacts(output, &report, &incumbent.config_dir) {
+                Ok(artifacts) => artifacts,
+                Err(error) => return replay_evaluation_error(error),
+            };
+            let mut summary = format!(
+                "Created candidate priors {} and refit report {}.\n\
+                 Training: {} reviewed ({} useful, {} abandoned); {} unlabeled.\n\
+                 Combined abandonment prior: {:.6} -> {:.6}.\n\
+                 Holdout: {} reviewed, {} scored by both configurations.\n\
+                 Candidate priors only; evaluation uses the incumbent policy, signatures and decision history.\n\
+                 The incumbent configuration has not been changed.",
+                artifacts.priors_path.display(),
+                artifacts.report_path.display(),
+                report.training.reviewed_count,
+                report.training.useful_count,
+                report.training.abandoned_count,
+                report.training.unlabeled_count,
+                report.incumbent_abandonment_prior,
+                report.candidate_abandonment_prior,
+                report.holdout.coverage.reviewed_count,
+                report.holdout.coverage.paired_count,
+            );
+            if let Some(metrics) = &report.holdout.paired_metrics {
+                summary.push_str(&format!(
+                    "\nHoldout Brier: {:.6} -> {:.6} (candidate minus incumbent {:+.6}).\n\
+                     Holdout log loss: {:.6} -> {:.6} (candidate minus incumbent {:+.6}).",
+                    metrics.baseline.brier_score,
+                    metrics.candidate.brier_score,
+                    metrics.candidate_minus_baseline.brier_score,
+                    metrics.baseline.log_loss,
+                    metrics.candidate.log_loss,
+                    metrics.candidate_minus_baseline.log_loss,
+                ));
+            }
+            if let Some(reason) = &report.holdout.metrics_unavailable_reason {
+                summary.push_str(&format!("\nHoldout metrics unavailable: {reason}"));
+            }
+            for note in report
+                .holdout
+                .warnings
+                .iter()
+                .chain(report.limitations.iter())
+            {
+                summary.push_str(&format!("\n- {note}"));
+            }
+            (
+                serde_json::json!({
+                    "schema_version": SCHEMA_VERSION,
+                    "command": "replay refit",
+                    "incumbent_config": incumbent.config_dir,
+                    "activated": false,
+                    "artifact_scope": "candidate_priors_only",
+                    "artifacts": artifacts,
+                    "refit": report,
                 }),
                 summary,
             )

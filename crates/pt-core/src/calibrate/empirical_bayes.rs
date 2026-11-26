@@ -137,15 +137,26 @@ pub fn conjugate_beta_update(
     let failures = trials - successes;
     let lr = config.learning_rate;
 
-    // Discounted conjugate update.
-    let raw_alpha = prior_alpha + lr * successes as f64;
-    let raw_beta = prior_beta + lr * failures as f64;
+    // Scale both increments together. Independently clipping alpha and beta
+    // makes sufficiently large batches multiply both by the same bound, leaving
+    // the mean unchanged even when the observed success rate is very different.
+    // One shared scale retains the direction of the conjugate update while
+    // respecting the relative-change limit on each parameter.
+    let alpha_increment = lr * successes as f64;
+    let beta_increment = lr * failures as f64;
+    let mut scale = 1.0_f64;
+    if alpha_increment > 0.0 {
+        scale = scale.min(prior_alpha * config.max_change_fraction / alpha_increment);
+    }
+    if beta_increment > 0.0 {
+        scale = scale.min(prior_beta * config.max_change_fraction / beta_increment);
+    }
 
-    // Clamp each parameter's relative change.
-    let (alpha, clamped_a) = clamp_param(prior_alpha, raw_alpha, config.max_change_fraction);
-    let (beta, clamped_b) = clamp_param(prior_beta, raw_beta, config.max_change_fraction);
-
-    (alpha, beta, clamped_a || clamped_b)
+    (
+        prior_alpha + scale * alpha_increment,
+        prior_beta + scale * beta_increment,
+        scale < 1.0,
+    )
 }
 
 /// Perform a conjugate Gamma update with bounded learning rate.
@@ -436,6 +447,47 @@ mod tests {
         let (alpha, _, clamped) = conjugate_beta_update(2.0, 5.0, 100, 100, &config);
         assert!(clamped);
         assert!((alpha - 2.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn bounded_beta_update_retains_imbalanced_batch_direction() {
+        let config = EmpiricalBayesConfig::default();
+        // Prior mean .25; 15/20 positive labels must increase it, even when
+        // both unbounded increments exceed their individual relative limits.
+        let (alpha, beta, clamped) = conjugate_beta_update(0.5, 1.5, 15, 20, &config);
+        assert!(clamped);
+        assert!((alpha - 0.65).abs() < 1e-12);
+        assert!((beta - 1.55).abs() < 1e-12);
+        assert!(alpha / (alpha + beta) > 0.25);
+        assert!(alpha <= 0.5 * 1.3 && beta <= 1.5 * 1.3);
+        // Shared scaling preserves the batch's successes-to-failures ratio.
+        assert!(((alpha - 0.5) / (beta - 1.5) - 3.0).abs() < 1e-12);
+
+        let (alpha, beta, _) = conjugate_beta_update(1.5, 0.5, 5, 20, &config);
+        assert!((alpha - 1.55).abs() < 1e-12);
+        assert!((beta - 0.65).abs() < 1e-12);
+        assert!(alpha / (alpha + beta) < 0.75);
+    }
+
+    #[test]
+    fn bounded_beta_update_retains_a_matching_mean_and_zero_learning() {
+        let config = EmpiricalBayesConfig::default();
+        let (alpha, beta, clamped) = conjugate_beta_update(0.5, 1.5, 5, 20, &config);
+        assert!(clamped);
+        assert!((alpha / (alpha + beta) - 0.25).abs() < 1e-12);
+        for config in [
+            EmpiricalBayesConfig {
+                learning_rate: 0.0,
+                ..config.clone()
+            },
+            EmpiricalBayesConfig {
+                max_change_fraction: 0.0,
+                ..config
+            },
+        ] {
+            let (alpha, beta, _) = conjugate_beta_update(0.5, 1.5, 15, 20, &config);
+            assert_eq!((alpha, beta), (0.5, 1.5));
+        }
     }
 
     #[test]
