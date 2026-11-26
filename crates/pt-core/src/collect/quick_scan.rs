@@ -1178,6 +1178,30 @@ fn explanation_population_with(
             population
                 .processes
                 .retain(|record| !is_kernel_thread(record) || requested.contains(&record.pid.0));
+            if !population.metadata.warnings.is_empty() {
+                let mut missing = requested;
+                for process in &population.processes {
+                    missing.remove(&process.pid.0);
+                }
+                if !missing.is_empty() {
+                    // Retry only the missing targets. Retain the first observation
+                    // of every other PID and keep the partial-census warning.
+                    options.pids = missing.into_iter().collect();
+                    options.pids.sort_unstable();
+                    match scan(&options) {
+                        Ok(targets) => {
+                            population.processes.extend(targets.processes);
+                            population
+                                .metadata
+                                .warnings
+                                .extend(targets.metadata.warnings);
+                        }
+                        Err(error) => population.metadata.warnings.push(format!(
+                            "Targeted retry after incomplete process census failed: {error}"
+                        )),
+                    }
+                }
+            }
             population.metadata.process_count = population.processes.len();
             Ok(population)
         }
@@ -2338,6 +2362,35 @@ mod tests {
         .unwrap();
         assert_eq!(partial.processes[0].pid.0, 177);
         assert!(partial.metadata.warnings[0].contains("fixture census failure"));
+
+        for retry_succeeds in [true, false] {
+            let partial = explanation_population_with(&[177, 216, 216], None, |options| {
+                let mut rows = census.clone();
+                if options.pids.is_empty() {
+                    rows.processes.truncate(1);
+                    rows.metadata.warnings.push("unreadable census row".into());
+                } else {
+                    assert_eq!(options.pids, [216]);
+                    if !retry_succeeds {
+                        return Err(QuickScanError::CommandFailed(
+                            "fixture retry failure".into(),
+                        ));
+                    }
+                    rows.processes.retain(|p| p.pid.0 == 216);
+                }
+                Ok(rows)
+            })
+            .unwrap();
+            assert_eq!(partial.processes[0].pid.0, 177);
+            assert_eq!(partial.metadata.warnings[0], "unreadable census row");
+            if retry_succeeds {
+                assert_eq!(partial.processes[1].pid.0, 216);
+                assert_eq!(partial.metadata.process_count, 2);
+            } else {
+                assert_eq!(partial.metadata.process_count, 1);
+                assert!(partial.metadata.warnings[1].contains("fixture retry failure"));
+            }
+        }
     }
 
     // Children of kthreadd (PID 2) are kernel threads on Linux only.

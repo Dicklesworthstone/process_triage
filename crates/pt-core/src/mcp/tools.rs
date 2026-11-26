@@ -8,7 +8,7 @@ use crate::collect::tool_runner::{ToolConfig, ToolOutput, ToolRunner, ToolSpec};
 use crate::collect::{deep_scan_with_budget, DeepScanOptions, DeepScanRecord, DeepScanResult};
 use crate::collect::{quick_scan, ProcessActivity, ProcessRecord, QuickScanOptions, ScanResult};
 use crate::mcp::protocol::{ToolContent, ToolDefinition};
-use crate::scoring::{AgentActivityReport, ProcessScore, Scorer};
+use crate::scoring::{filter_planning_scan, AgentActivityReport, ProcessScore, Scorer};
 use crate::supervision::pattern_persistence::{SignatureCatalog, SignatureOrigin};
 use crate::supervision::signature::ProcessMatchContext;
 use crate::supervision::{SignatureDatabase, SupervisorCategory};
@@ -139,9 +139,7 @@ impl Evaluator {
         // A per-process check misses the calling shell/agent and workers whose
         // service ownership is only visible through their ancestors. Use the same
         // full-scan filter as `agent plan`, before age/score filtering hides parents.
-        self.protected = self
-            .protected_filter
-            .filter_scan_result(scan)
+        self.protected = filter_planning_scan(&self.protected_filter, scan, &mut self.scorer)
             .filtered
             .into_iter()
             .map(|protection| (protection.pid, protection))
@@ -376,6 +374,18 @@ impl Evaluator {
             Some(m) => serde_json::json!({ "rule": m.pattern, "notes": m.notes }),
             None => serde_json::Value::Null,
         }
+    }
+
+    /// Only report an eligible service's read-only binding. Independent
+    /// protections still override a verified user-service placement.
+    fn supervisor_restart(
+        &self,
+        process: &ProcessRecord,
+    ) -> Option<&crate::action::SystemdUserServiceBinding> {
+        if self.protected.contains_key(&process.pid.0) {
+            return None;
+        }
+        self.scorer.supervisor_restart_for(process)
     }
 }
 
@@ -1214,6 +1224,7 @@ fn tool_scan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
                 "suspicion_score": posterior.suspicion_score(),
                 "posterior": posterior,
                 "protected": protected,
+                "supervisor_restart": evaluator.supervisor_restart(p),
                 "top_signature": top_signature,
             })
         })
@@ -1362,6 +1373,7 @@ fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
                 "score": posterior.map(|s| s.abandonment_probability()),
                 "suspicion_score": posterior.map(|s| s.suspicion_score()),
                 "protected": evaluator.protection(p),
+                "supervisor_restart": evaluator.supervisor_restart(p),
                 "prior_source": prior_source,
                 "learned_prior": learned_prior,
                 "desktop_app": desktop_app,

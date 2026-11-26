@@ -28,7 +28,8 @@ use std::time::Duration;
 
 use crate::action::SystemdUserServiceBinding;
 use crate::collect::duplicates::{DuplicateWorkSnapshot, ProcessWorkDiagnosis};
-use crate::collect::{ProcessActivity, ProcessRecord};
+use crate::collect::protected::{FilterResult, ProtectedFilter};
+use crate::collect::{ProcessActivity, ProcessRecord, ScanResult};
 use crate::config::{Policy, Priors, ResolvedConfig};
 use crate::decision::decision_store::{DecisionStore, LearnedPrior};
 use crate::decision::respawn_loop::{RespawnHistorySnapshot, RespawnLoopSummary};
@@ -814,6 +815,22 @@ struct SupervisorRestartObservation {
     target: pt_common::ProcessIdentity,
     binding: Option<SystemdUserServiceBinding>,
     unavailable: Option<String>,
+}
+
+/// Resolve protected processes using the same census and verified restart
+/// observations on all live planning and inspection surfaces. An incomplete
+/// census cannot establish eligibility for a supervisor-managed restart.
+pub fn filter_planning_scan(
+    filter: &ProtectedFilter,
+    scan: &ScanResult,
+    scorer: &mut Scorer,
+) -> FilterResult {
+    scorer.collect_supervisor_restarts(if scan.metadata.warnings.is_empty() {
+        &scan.processes
+    } else {
+        &[]
+    });
+    filter.filter_scan_result_with_restarts(scan, |process| scorer.supervisor_restart_for(process))
 }
 
 impl Scorer {

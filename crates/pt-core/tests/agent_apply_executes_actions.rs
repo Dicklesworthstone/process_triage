@@ -239,6 +239,36 @@ mod systemd_user_restart_acceptance {
         assert_eq!(plan.actions[0].action, Action::Restart);
         assert_eq!(plan.actions[0].routing, ActionRouting::Supervisor);
         assert_eq!(plan.actions[0].supervisor_restart, Some(binding.clone()));
+        let request = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "pt_explain", "arguments": {"pid": pid, "window_ms": 0}},
+        });
+        let output = cargo_bin_cmd!("pt-core")
+            .arg("--config")
+            .arg(&config)
+            .arg("mcp")
+            .env("PROCESS_TRIAGE_DATA", &data)
+            .env("PROCESS_TRIAGE_RETENTION", "off")
+            .write_stdin(format!("{request}\n"))
+            .timeout(Duration::from_secs(120))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let observed: Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(observed["protected"], Value::Null, "{observed}");
+        assert_eq!(
+            observed["supervisor_restart"],
+            serde_json::to_value(&binding).unwrap()
+        );
+        assert_eq!(
+            live_identity(pid),
+            original,
+            "inspection changed the service"
+        );
         let session = plan.session_id.as_str();
         let target = format!("{pid}:{}", original.start_id.0);
         let handle = SessionStore::at_data_dir(&data)

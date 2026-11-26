@@ -3444,6 +3444,64 @@ mod tests {
         ProtectedFilter::from_guardrails(&crate::config::policy::Guardrails::default()).unwrap()
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn census_user_service_admission_requires_the_current_binding_and_preserves_invoker_protection()
+    {
+        let filter = ProtectedFilter::new(&[], &[], &[], &[])
+            .unwrap()
+            .with_builtin_protection(true);
+        let mut proc = make_test_record(13245, 12345, "sleep", "sleep 60", "alice");
+        // SAFETY: geteuid only reads the caller's credentials.
+        proc.uid = unsafe { libc::geteuid() };
+        let unit = "fixture-worker.service";
+        let binding = crate::action::SystemdUserServiceBinding {
+            target: pt_common::ProcessIdentity::full(
+                proc.pid.0,
+                proc.start_id.clone(),
+                proc.uid,
+                proc.pgid,
+                proc.sid,
+                pt_common::IdentityQuality::Full,
+            ),
+            control_group: format!(
+                "/user.slice/user-{0}.slice/user@{0}.service/{unit}",
+                proc.uid
+            ),
+            unit: unit.into(),
+            invocation_id: "0123456789abcdef0123456789abcdef".into(),
+        };
+        let scan = |binding, invokers: &HashSet<u32>| {
+            filter.filter_with_observations(
+                std::slice::from_ref(&proc),
+                invokers,
+                |_| CgroupRole::UserService,
+                |_| binding,
+            )
+        };
+        let no_invokers = HashSet::new();
+        assert_eq!(
+            scan(None, &no_invokers).filtered[0].matched_field,
+            MatchedField::SupervisedService
+        );
+        assert_eq!(scan(Some(&binding), &no_invokers).passed[0].pid, proc.pid);
+        assert_eq!(
+            scan(Some(&binding), &HashSet::from([proc.pid.0])).filtered[0].matched_field,
+            MatchedField::InvokerChain
+        );
+        let stale = crate::action::SystemdUserServiceBinding {
+            target: pt_common::ProcessIdentity {
+                start_id: StartId::from_linux("another-boot", 1234567890, proc.pid.0),
+                ..binding.target.clone()
+            },
+            ..binding.clone()
+        };
+        assert_eq!(
+            scan(Some(&stale), &no_invokers).filtered[0].matched_field,
+            MatchedField::SupervisedService
+        );
+    }
+
     #[test]
     fn supervisor_restart_only_waives_user_service_placement() {
         let guards = crate::config::policy::Guardrails {

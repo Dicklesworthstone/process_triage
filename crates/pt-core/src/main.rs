@@ -9499,7 +9499,7 @@ use pt_core::decision::goal_progress::{
 use pt_core::decision::load_aware::{prepare_pressure_decision, PressureContext, ResourceShares};
 use pt_core::decision::{Action, ActionFeasibility};
 use pt_core::inference::Evidence;
-use pt_core::scoring::{match_level_label, Scorer};
+use pt_core::scoring::{filter_planning_scan, match_level_label, Scorer};
 
 fn progress_emitter(global: &GlobalOpts) -> Option<Arc<dyn ProgressEmitter>> {
     match global.format {
@@ -34921,21 +34921,6 @@ fn print_responsible_units(table: &ResponsibleUnitTable) {
     print_memory_limit_report(&memory_limit_report(table));
 }
 
-fn filter_planning_scan(
-    filter: &ProtectedFilter,
-    scan: &ScanResult,
-    scorer: &mut Scorer,
-) -> pt_core::collect::protected::FilterResult {
-    // Missing ancestors cannot establish a safe service route. Ordinary
-    // protection remains in force when the full census was incomplete.
-    scorer.collect_supervisor_restarts(if scan.metadata.warnings.is_empty() {
-        &scan.processes
-    } else {
-        &[]
-    });
-    filter.filter_scan_result_with_restarts(scan, |process| scorer.supervisor_restart_for(process))
-}
-
 /// Keep the exact memory controller observation that admitted the action. The
 /// saved plan must not invent a different byte limit when it is later applied.
 fn candidate_action_capabilities(
@@ -37941,6 +37926,15 @@ fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
                         }
                     };
                     explanations.push(explanation);
+                }
+                None if !scan_result.metadata.warnings.is_empty() => {
+                    exit_code = ExitCode::PartialFail;
+                    explanations.push(serde_json::json!({
+                        "pid": pid,
+                        "error": "unable to observe requested PID in an incomplete process census",
+                        "classification": null,
+                        "protection": {"protected": null},
+                    }));
                 }
                 None => explanations.push(serde_json::json!({
                     "pid": pid,
