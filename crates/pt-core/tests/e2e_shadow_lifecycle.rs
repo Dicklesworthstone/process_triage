@@ -908,22 +908,57 @@ fn shadow_filtered_empty_plans_preserve_live_trajectories_and_confirm_exits() {
                 "--min-posterior",
                 "0",
                 "--window-ms",
-                "0",
+                "100",
                 "--probe-budget-ms",
                 "0",
             ]);
         if let Some(sample) = sample {
             cmd.args(["--sample-size", sample]);
         }
-        cmd.assert().code(if sample == Some("0") { 0 } else { 1 });
+        let output = cmd
+            .assert()
+            .code(if sample == Some("0") { 0 } else { 1 })
+            .get_output()
+            .stdout
+            .clone();
+        parse_last_json_object(&output)
     };
-    plan(&pid, None);
+    let planned = plan(&pid, None);
     let pending_path = data.join("shadow/pending.json");
     let pending =
         || -> Vec<Value> { serde_json::from_slice(&fs::read(&pending_path).unwrap()).unwrap() };
     let initial = pending();
     assert_eq!(initial.len(), 1);
     let hash = initial[0]["identity_hash"].clone();
+    let candidate = planned["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|candidate| candidate["pid"].as_u64() == Some(u64::from(child.0.id())))
+        .expect("the owned child has a measured prediction");
+    let measured = &candidate["activity"];
+    let state = &initial[0]["state"];
+    let recorded = &state["activity"];
+    assert_eq!(state["schema_version"], 1);
+    assert_eq!(recorded["source"], "procfs_window");
+    assert_eq!(recorded["requested_window_ms"], 100);
+    assert!(measured["cpu_error"].is_null(), "{measured}");
+    assert!(measured["io_error"].is_null(), "{measured}");
+    assert!(
+        (state["cpu_percent"].as_f64().unwrap() - measured["cpu_percent"].as_f64().unwrap()).abs()
+            < 1e-4
+    );
+    assert_eq!(recorded["cpu_ticks"], measured["cpu_ticks"]);
+    assert_eq!(
+        recorded["cpu_window_seconds"],
+        measured["cpu_window_seconds"]
+    );
+    assert_eq!(recorded["io_window_seconds"], measured["io_window_seconds"]);
+    assert_eq!(recorded["io_read_delta_bytes"], measured["io_read_bytes"]);
+    assert_eq!(recorded["io_write_delta_bytes"], measured["io_write_bytes"]);
+    assert!(state["fd_count"].is_null());
+    assert!(state["io_read_bytes"].is_null());
+    assert!(state["io_write_bytes"].is_null());
 
     // Each invocation reopens persisted state. The first child stays in the
     // census while a PID filter directs all inference to the other child.

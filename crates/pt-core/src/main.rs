@@ -30682,6 +30682,8 @@ mod tui_learning_tests {
                 &score.posterior.posterior,
                 &score.ledger,
                 &decision,
+                score.activity.as_ref(),
+                None,
             )
             .unwrap();
         recorder.flush().unwrap();
@@ -36317,7 +36319,20 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         let abandonment_probability = posterior.abandonment_probability();
 
         if let Some(ref mut recorder) = shadow_recorder {
-            match recorder.record_candidate(proc, posterior, ledger, &decision_outcome) {
+            let child_count = scan_result
+                .metadata
+                .warnings
+                .is_empty()
+                .then(|| u32::try_from(child_counts.get(&proc.pid.0).copied().unwrap_or(0)).ok())
+                .flatten();
+            match recorder.record_candidate(
+                proc,
+                posterior,
+                ledger,
+                &decision_outcome,
+                activity.as_ref(),
+                child_count,
+            ) {
                 Ok(()) => shadow_recorded = recorder.recorded_count(),
                 Err(err) => {
                     eprintln!(

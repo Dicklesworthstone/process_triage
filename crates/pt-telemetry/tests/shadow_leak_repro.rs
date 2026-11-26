@@ -20,7 +20,7 @@ fn test_shadow_storage_identity_leak_on_pid_reuse() {
         pid,
         identity_hash: "identity_A".to_string(),
         state: StateSnapshot {
-            cpu_percent: 10.0,
+            cpu_percent: Some(10.0),
             ..Default::default()
         },
         ..Default::default()
@@ -33,7 +33,7 @@ fn test_shadow_storage_identity_leak_on_pid_reuse() {
         pid,
         identity_hash: "identity_B".to_string(),
         state: StateSnapshot {
-            cpu_percent: 20.0,
+            cpu_percent: Some(20.0),
             ..Default::default()
         },
         ..Default::default()

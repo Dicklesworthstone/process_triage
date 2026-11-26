@@ -2,15 +2,15 @@
 //!
 //! Records prediction snapshots into pt-telemetry shadow storage for calibration.
 
-use crate::collect::ProcessRecord;
+use crate::collect::{ProcessActivity, ProcessRecord};
 use crate::decision::decision_store::Verdict;
 use crate::decision::{Action, DecisionOutcome};
 use crate::inference::{ClassScores, Confidence, EvidenceLedger};
 use chrono::Utc;
 use pt_common::ProcessIdentity;
 use pt_telemetry::shadow::{
-    BeliefState, EventType, Observation, ProcessEvent, ShadowStorage, ShadowStorageConfig,
-    ShadowStorageError, StateSnapshot,
+    ActivityObservation, BeliefState, EventType, Observation, ProcessEvent, ShadowStorage,
+    ShadowStorageConfig, ShadowStorageError, StateSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -19,6 +19,147 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const DEFAULT_MISS_THRESHOLD: u32 = 2;
+
+/// Persist the same identity-bound rates supplied to inference. A failed window
+/// stays unavailable, and window byte deltas never become lifetime counters.
+fn observation_state(
+    proc: &ProcessRecord,
+    activity: Option<&ProcessActivity>,
+    child_count: Option<u32>,
+) -> StateSnapshot {
+    let percent = |value: f64| {
+        (value.is_finite() && value >= 0.0 && value <= f64::from(f32::MAX)).then_some(value as f32)
+    };
+    let mut state = StateSnapshot {
+        schema_version: 1,
+        cpu_lifetime_percent: percent(proc.cpu_percent),
+        memory_bytes: proc.vsz_bytes,
+        rss_bytes: proc.rss_bytes,
+        state_char: proc.state.to_string().chars().next().unwrap_or('?'),
+        has_tty: proc.has_tty(),
+        child_count,
+        ..StateSnapshot::default()
+    };
+    let Some(activity) = activity else {
+        // No sample means the caller chose snapshot-only mode. A requested but
+        // failed window arrives as Some with its missing measurements/errors.
+        state.cpu_percent = state.cpu_lifetime_percent;
+        return state;
+    };
+    let mut observed = ActivityObservation {
+        source: activity.source.clone(),
+        requested_window_ms: activity.requested_window_ms,
+        ..ActivityObservation::default()
+    };
+    let refusal = if !activity.matches_record(proc) {
+        Some("activity does not match the recorded process incarnation")
+    } else if !matches!(
+        activity.source.as_str(),
+        "procfs_window" | "ps_lifetime_fallback"
+    ) {
+        Some("activity source is unsupported")
+    } else if activity.requested_window_ms == 0 {
+        Some("activity sampling interval was not requested")
+    } else {
+        None
+    };
+    if let Some(reason) = refusal {
+        observed.cpu_error = Some(reason.to_string());
+        observed.io_error = Some(reason.to_string());
+        state.activity = Some(observed);
+        return state;
+    }
+
+    if activity.source == "ps_lifetime_fallback" {
+        state.cpu_percent = activity
+            .cpu_percent
+            .filter(|_| activity.cpu_error.is_none())
+            .and_then(percent);
+        observed.cpu_error = activity.cpu_error.clone().or_else(|| {
+            state
+                .cpu_percent
+                .is_none()
+                .then(|| "native lifetime CPU observation is unavailable".to_string())
+        });
+        observed.io_error = Some(
+            activity
+                .io_error
+                .clone()
+                .unwrap_or_else(|| "native lifetime fallback does not measure storage I/O".into()),
+        );
+        state.activity = Some(observed);
+        return state;
+    }
+
+    let completed_window = |seconds: f64| {
+        seconds.is_finite()
+            && seconds > 0.0
+            && seconds >= activity.requested_window_ms as f64 / 1000.0
+    };
+    let cpu = activity
+        .cpu_percent
+        .and_then(percent)
+        .zip(activity.cpu_ticks)
+        .zip(
+            activity
+                .cpu_window_seconds
+                .filter(|seconds| completed_window(*seconds)),
+        )
+        .filter(|_| activity.cpu_error.is_none());
+    if let Some(((percent, ticks), seconds)) = cpu {
+        state.cpu_percent = Some(percent);
+        observed.cpu_ticks = Some(ticks);
+        observed.cpu_window_seconds = Some(seconds);
+    } else {
+        observed.cpu_error = Some(activity.cpu_error.clone().unwrap_or_else(|| {
+            "CPU rate, tick delta or completed sampling interval is unavailable".into()
+        }));
+    }
+
+    let io = activity
+        .io_read_bytes
+        .zip(activity.io_write_bytes)
+        .zip(
+            activity
+                .io_window_seconds
+                .filter(|seconds| completed_window(*seconds)),
+        )
+        .filter(|_| activity.io_error.is_none());
+    if let Some(((read, written), seconds)) = io {
+        let read_rate = read as f64 / seconds;
+        let write_rate = written as f64 / seconds;
+        if read_rate.is_finite() && write_rate.is_finite() {
+            observed.io_read_delta_bytes = Some(read);
+            observed.io_write_delta_bytes = Some(written);
+            observed.io_window_seconds = Some(seconds);
+            observed.read_bytes_per_second = Some(read_rate);
+            observed.write_bytes_per_second = Some(write_rate);
+            observed.io_active = Some(read > 0 || written > 0);
+        } else {
+            observed.io_error = Some("storage I/O rates are not finite".into());
+        }
+    } else {
+        observed.io_error = Some(activity.io_error.clone().unwrap_or_else(|| {
+            "storage I/O deltas or completed sampling interval are unavailable".into()
+        }));
+    }
+    state.thread_count = activity
+        .pressure
+        .as_ref()
+        .filter(|pressure| pressure.memory_error.is_none())
+        .and_then(|pressure| pressure.memory.as_ref())
+        .map(|memory| memory.threads)
+        .filter(|threads| *threads > 0)
+        .or_else(|| {
+            activity.normalized_cpu_occupancy()?;
+            match activity.cpu_occupancy.as_ref()? {
+                crate::collect::CpuOccupancy::Observed { threads, .. } => Some(*threads),
+                crate::collect::CpuOccupancy::Unavailable { .. } => None,
+            }
+        });
+    state.activity = Some(observed);
+    state
+}
 
 #[derive(Debug)]
 pub enum ShadowRecordError {
@@ -271,13 +412,14 @@ impl ShadowRecorder {
         posterior: &ClassScores,
         ledger: &EvidenceLedger,
         decision: &DecisionOutcome,
+        activity: Option<&ProcessActivity>,
+        child_count: Option<u32>,
     ) -> Result<(), ShadowRecordError> {
         self.had_records = true;
         if proc.state.is_zombie() {
             return self.record_zombie_exit(proc);
         }
         let identity_hash = compute_identity_hash(proc);
-        let state_char = proc.state.to_string().chars().next().unwrap_or('?');
         let score = (posterior.abandonment_probability() * 100.0) as f32;
 
         let belief = BeliefState {
@@ -290,18 +432,7 @@ impl ShadowRecorder {
             recommendation: action_to_recommendation(decision.optimal_action).to_string(),
         };
 
-        let state = StateSnapshot {
-            cpu_percent: proc.cpu_percent as f32,
-            memory_bytes: proc.vsz_bytes,
-            rss_bytes: proc.rss_bytes,
-            fd_count: 0,
-            thread_count: 0,
-            state_char,
-            io_read_bytes: 0,
-            io_write_bytes: 0,
-            has_tty: proc.has_tty(),
-            child_count: 0,
-        };
+        let state = observation_state(proc, activity, child_count);
 
         // Only the signature that influenced this prediction may classify its
         // calibration sample. A later verdict must never supply this metadata.
@@ -1018,6 +1149,241 @@ mod tests {
         }
     }
 
+    fn measured_activity(proc: &ProcessRecord) -> ProcessActivity {
+        let mut activity = ProcessActivity::unavailable(
+            proc,
+            std::time::Duration::from_millis(500),
+            "fixture measurement",
+        );
+        activity.source = "procfs_window".into();
+        activity.cpu_percent = Some(37.5);
+        activity.cpu_ticks = Some(30);
+        activity.cpu_window_seconds = Some(0.8);
+        activity.cpu_error = None;
+        activity.cpu_occupancy = Some(crate::collect::CpuOccupancy::Observed {
+            occupancy: 0.375,
+            effective_cores: 1.0,
+            effective_parallelism: 1.0,
+            online_cores: 4,
+            affinity_cores: 4,
+            quota_cores: Some(1.0),
+            threads: 3,
+        });
+        activity.io_window_seconds = Some(0.75);
+        activity.io_read_bytes = Some(300);
+        activity.io_write_bytes = Some(0);
+        activity.read_bytes_per_second = Some(400.0);
+        activity.write_bytes_per_second = Some(0.0);
+        activity.io_active = Some(true);
+        activity.io_error = None;
+        activity
+    }
+
+    #[test]
+    fn recorded_shadow_state_keeps_measured_windows_and_explicit_unknowns() {
+        let directory = TempDir::new().unwrap();
+        let mut recorder = ShadowRecorder::with_config(ShadowStorageConfig {
+            base_dir: directory.path().to_path_buf(),
+            auto_compact: false,
+            delete_expired: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let proc = make_proc(42, "worker", "worker --job");
+        let activity = measured_activity(&proc);
+        let ledger = make_ledger(Confidence::Medium, vec![], vec![], "measured prediction");
+        recorder
+            .record_candidate(
+                &proc,
+                &ledger.posterior.posterior,
+                &ledger,
+                &make_decision(Action::Keep),
+                Some(&activity),
+                Some(0),
+            )
+            .unwrap();
+        recorder.flush().unwrap();
+        drop(recorder);
+
+        let paths: Vec<_> = fs::read_dir(directory.path().join("hot/pid_42"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(paths.len(), 1);
+        let bytes = fs::read(&paths[0]).unwrap();
+        let observations: Vec<Observation> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(observations.len(), 1);
+        let state = &observations[0].state;
+        assert_eq!(state.schema_version, 1);
+        assert_eq!(state.cpu_percent, Some(37.5));
+        assert_eq!(state.cpu_lifetime_percent, Some(5.0));
+        assert_eq!(state.thread_count, Some(3));
+        assert_eq!(state.child_count, Some(0));
+        assert_eq!(state.fd_count, None);
+        assert_eq!(
+            state.io_read_bytes, None,
+            "no lifetime counter was collected"
+        );
+        assert_eq!(state.io_write_bytes, None);
+        let window = state.activity.as_ref().unwrap();
+        assert_eq!(window.source, "procfs_window");
+        assert_eq!(window.requested_window_ms, 500);
+        assert_eq!(window.cpu_window_seconds, Some(0.8));
+        assert_eq!(window.cpu_ticks, Some(30));
+        assert_eq!(window.io_window_seconds, Some(0.75));
+        assert_eq!(window.io_read_delta_bytes, Some(300));
+        assert_eq!(window.io_write_delta_bytes, Some(0));
+        assert_eq!(window.read_bytes_per_second, Some(400.0));
+        assert_eq!(window.write_bytes_per_second, Some(0.0));
+        assert_eq!(window.io_active, Some(true));
+        assert!(window.cpu_error.is_none());
+        assert!(window.io_error.is_none());
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(json[0]["state"]["fd_count"].is_null());
+        assert_eq!(json[0]["state"]["child_count"], 0);
+        let pending: Vec<PendingObservation> =
+            serde_json::from_slice(&fs::read(directory.path().join("pending.json")).unwrap())
+                .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].identity_hash, compute_identity_hash(&proc));
+        assert_eq!(
+            serde_json::to_value(&pending[0].state).unwrap(),
+            json[0]["state"]
+        );
+    }
+
+    #[test]
+    fn shadow_cpu_and_io_fail_independently_without_inventing_idle_values() {
+        let proc = make_proc(42, "worker", "worker");
+        let mut activity = measured_activity(&proc);
+        activity.cpu_percent = Some(0.0);
+        activity.cpu_ticks = Some(0);
+        activity.io_error = Some("permission denied".into());
+        let state = observation_state(&proc, Some(&activity), None);
+        assert_eq!(state.cpu_percent, Some(0.0));
+        assert_eq!(state.cpu_lifetime_percent, Some(5.0));
+        assert_eq!(state.child_count, None);
+        let window = state.activity.unwrap();
+        assert_eq!(window.cpu_ticks, Some(0));
+        assert!(window.cpu_error.is_none());
+        assert_eq!(window.io_read_delta_bytes, None);
+        assert_eq!(window.io_active, None);
+        assert_eq!(window.io_error.as_deref(), Some("permission denied"));
+
+        activity = measured_activity(&proc);
+        activity.cpu_error = Some("counter reset".into());
+        activity.io_read_bytes = Some(0);
+        let state = observation_state(&proc, Some(&activity), None);
+        assert_eq!(
+            state.cpu_percent, None,
+            "failed window cannot use lifetime CPU"
+        );
+        assert_eq!(state.cpu_lifetime_percent, Some(5.0));
+        let window = state.activity.unwrap();
+        assert_eq!(window.cpu_ticks, None);
+        assert_eq!(window.cpu_error.as_deref(), Some("counter reset"));
+        assert_eq!(window.io_read_delta_bytes, Some(0));
+        assert_eq!(window.io_write_delta_bytes, Some(0));
+        assert_eq!(window.read_bytes_per_second, Some(0.0));
+        assert_eq!(window.io_active, Some(false));
+        assert!(window.io_error.is_none());
+    }
+
+    #[test]
+    fn shadow_activity_rejects_changed_identity_and_unrecognized_sources() {
+        let proc = make_proc(42, "worker", "worker");
+        for case in ["pid", "birth", "uid", "source", "no_window"] {
+            let mut activity = measured_activity(&proc);
+            match case {
+                "pid" => activity.pid += 1,
+                "birth" => activity.start_id = pt_common::StartId("boot:6:42".into()),
+                "uid" => activity.uid += 1,
+                "source" => activity.source = "inferred_idle".into(),
+                "no_window" => activity.requested_window_ms = 0,
+                _ => unreachable!(),
+            }
+            let state = observation_state(&proc, Some(&activity), Some(2));
+            assert_eq!(state.cpu_percent, None, "{case}");
+            assert_eq!(state.thread_count, None, "{case}");
+            assert_eq!(state.child_count, Some(2), "separate scan evidence: {case}");
+            let window = state.activity.unwrap();
+            assert_eq!(window.cpu_ticks, None, "{case}");
+            assert_eq!(window.io_read_delta_bytes, None, "{case}");
+            assert_eq!(window.io_active, None, "{case}");
+            assert!(window.cpu_error.is_some(), "{case}");
+            assert!(window.io_error.is_some(), "{case}");
+        }
+    }
+
+    #[test]
+    fn shadow_activity_rejects_invalid_or_incomplete_rate_measurements() {
+        let proc = make_proc(42, "worker", "worker");
+        for value in [f64::NAN, f64::INFINITY, -1.0, f64::MAX] {
+            let mut activity = measured_activity(&proc);
+            activity.cpu_percent = Some(value);
+            let state = observation_state(&proc, Some(&activity), None);
+            assert_eq!(state.cpu_percent, None);
+            let window = state.activity.unwrap();
+            assert!(window.cpu_error.is_some());
+            assert_eq!(window.io_read_delta_bytes, Some(300));
+        }
+        for value in [
+            None,
+            Some(0.0),
+            Some(0.4),
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+        ] {
+            let mut activity = measured_activity(&proc);
+            activity.cpu_window_seconds = value;
+            activity.io_window_seconds = value;
+            let state = observation_state(&proc, Some(&activity), None);
+            assert_eq!(state.cpu_percent, None);
+            let window = state.activity.unwrap();
+            assert!(window.cpu_error.is_some());
+            assert!(window.io_error.is_some());
+            assert_eq!(window.cpu_ticks, None);
+            assert_eq!(window.io_read_delta_bytes, None);
+        }
+        let mut activity = measured_activity(&proc);
+        activity.cpu_ticks = None;
+        activity.io_read_bytes = None;
+        let state = observation_state(&proc, Some(&activity), None);
+        assert_eq!(state.cpu_percent, None);
+        let window = state.activity.unwrap();
+        assert!(window.cpu_error.is_some());
+        assert!(window.io_error.is_some());
+        assert_eq!(window.read_bytes_per_second, None);
+    }
+
+    #[test]
+    fn shadow_snapshot_and_native_fallback_keep_lifetime_cpu_explicit() {
+        let mut proc = make_proc(42, "worker", "worker");
+        let state = observation_state(&proc, None, None);
+        assert_eq!(state.cpu_percent, Some(5.0));
+        assert_eq!(state.cpu_lifetime_percent, Some(5.0));
+        assert!(state.activity.is_none());
+        assert_eq!(state.thread_count, None);
+        assert_eq!(state.io_read_bytes, None);
+        let mut activity = measured_activity(&proc);
+        activity.source = "ps_lifetime_fallback".into();
+        activity.cpu_percent = Some(2.0);
+        let state = observation_state(&proc, Some(&activity), None);
+        assert_eq!(state.cpu_percent, Some(2.0));
+        let window = state.activity.unwrap();
+        assert_eq!(window.source, "ps_lifetime_fallback");
+        assert_eq!(window.cpu_ticks, None);
+        assert_eq!(window.cpu_window_seconds, None);
+        assert_eq!(window.io_read_delta_bytes, None);
+        assert!(window.io_error.is_some());
+
+        proc.cpu_percent = f64::NAN;
+        let state = observation_state(&proc, None, None);
+        assert_eq!(state.cpu_percent, None);
+        assert_eq!(state.cpu_lifetime_percent, None);
+        assert!(serde_json::to_value(state).unwrap()["cpu_percent"].is_null());
+    }
+
     use crate::inference::{BayesFactorEntry, Classification, PosteriorResult};
 
     fn make_ledger(
@@ -1114,6 +1480,8 @@ mod tests {
                 &ledger.posterior.posterior,
                 &ledger,
                 &make_decision(Action::Keep),
+                None,
+                None,
             )
             .unwrap();
         recorder.flush().unwrap();
@@ -1393,7 +1761,7 @@ mod tests {
         let ledger = make_ledger(Confidence::Medium, vec![], vec![], "live prediction");
         let decision = make_decision(Action::Keep);
         recorder
-            .record_candidate(&proc, &posterior, &ledger, &decision)
+            .record_candidate(&proc, &posterior, &ledger, &decision, None, None)
             .unwrap();
         recorder.flush().unwrap();
         proc.state = crate::collect::ProcessState::Zombie;
@@ -1501,7 +1869,7 @@ mod tests {
             let decision = make_decision(Action::Keep);
             let mut recorder = ShadowRecorder::with_config(config.clone()).unwrap();
             recorder
-                .record_candidate(&proc, &posterior, &ledger, &decision)
+                .record_candidate(&proc, &posterior, &ledger, &decision, None, None)
                 .unwrap();
             recorder.flush().unwrap();
             if let Some(signal) = signal {
@@ -1540,13 +1908,13 @@ mod tests {
                 "unfiltered presence records the exit before candidate selection"
             );
             recorder
-                .record_candidate(&proc, &posterior, &ledger, &decision)
+                .record_candidate(&proc, &posterior, &ledger, &decision, None, None)
                 .unwrap();
             recorder.flush().unwrap();
             drop(recorder);
             let mut recorder = ShadowRecorder::with_config(config.clone()).unwrap();
             recorder
-                .record_candidate(&proc, &posterior, &ledger, &decision)
+                .record_candidate(&proc, &posterior, &ledger, &decision, None, None)
                 .unwrap();
             recorder.flush().unwrap();
             assert_eq!(
@@ -2072,6 +2440,8 @@ mod tests {
                     &posterior,
                     &ledger,
                     &decision,
+                    None,
+                    None,
                 )
                 .unwrap();
         }
@@ -2151,7 +2521,7 @@ mod tests {
         let decision = make_decision(Action::Kill);
 
         recorder
-            .record_candidate(&proc, &posterior, &ledger, &decision)
+            .record_candidate(&proc, &posterior, &ledger, &decision, None, None)
             .unwrap();
         assert_eq!(recorder.recorded_count(), 1);
 

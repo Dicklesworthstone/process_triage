@@ -196,8 +196,20 @@ impl Default for Observation {
 /// Resource usage snapshot at observation time.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StateSnapshot {
-    /// CPU percentage (0-100+).
-    pub cpu_percent: f32,
+    /// Version 1 distinguishes missing measurements from measured zero. Version
+    /// 0 denotes older records, whose zero counters may have been placeholders
+    /// and whose CPU percentage was a lifetime average, not a sampled rate.
+    #[serde(default)]
+    pub schema_version: u32,
+
+    /// CPU percentage (one core = 100%). The activity source identifies a
+    /// sampled rate or an explicit lifetime observation; unavailable stays null.
+    pub cpu_percent: Option<f32>,
+
+    /// Lifetime CPU average from the quick scan, kept separate from a requested
+    /// activity window. Never substitute this for a failed sampled rate.
+    #[serde(default)]
+    pub cpu_lifetime_percent: Option<f32>,
 
     /// Memory in bytes.
     pub memory_bytes: u64,
@@ -206,25 +218,50 @@ pub struct StateSnapshot {
     pub rss_bytes: u64,
 
     /// Number of open file descriptors.
-    pub fd_count: u32,
+    pub fd_count: Option<u32>,
 
     /// Number of threads.
-    pub thread_count: u32,
+    pub thread_count: Option<u32>,
 
     /// Process state character (R, S, D, Z, T, etc.).
     pub state_char: char,
 
     /// I/O read bytes since start.
-    pub io_read_bytes: u64,
+    pub io_read_bytes: Option<u64>,
 
     /// I/O write bytes since start.
-    pub io_write_bytes: u64,
+    pub io_write_bytes: Option<u64>,
 
     /// Whether process has a controlling TTY.
     pub has_tty: bool,
 
     /// Number of child processes.
-    pub child_count: u32,
+    pub child_count: Option<u32>,
+
+    /// Identity-checked sampled activity. Its byte counts are deltas over the
+    /// recorded interval, never the lifetime counters above. Absent on legacy
+    /// records and when the caller explicitly requested snapshot-only mode.
+    #[serde(default)]
+    pub activity: Option<ActivityObservation>,
+}
+
+/// Measurements actually used by a shadow prediction, without another probe.
+/// CPU and I/O can fail independently; errors never imply a zero rate.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ActivityObservation {
+    /// `procfs_window` or the explicitly identified `ps_lifetime_fallback`.
+    pub source: String,
+    pub requested_window_ms: u64,
+    pub cpu_window_seconds: Option<f64>,
+    pub cpu_ticks: Option<u64>,
+    pub io_window_seconds: Option<f64>,
+    pub io_read_delta_bytes: Option<u64>,
+    pub io_write_delta_bytes: Option<u64>,
+    pub read_bytes_per_second: Option<f64>,
+    pub write_bytes_per_second: Option<f64>,
+    pub io_active: Option<bool>,
+    pub cpu_error: Option<String>,
+    pub io_error: Option<String>,
 }
 
 /// An event that occurred since the last observation.
@@ -1022,16 +1059,19 @@ pub fn shadow_observations_schema() -> Schema {
         Field::new("pid", DataType::UInt32, false),
         Field::new("identity_hash", DataType::Utf8, false),
         // State snapshot
-        Field::new("cpu_percent", DataType::Float32, false),
+        Field::new("state_schema_version", DataType::UInt32, false),
+        Field::new("cpu_percent", DataType::Float32, true),
+        Field::new("cpu_lifetime_percent", DataType::Float32, true),
         Field::new("memory_bytes", DataType::UInt64, false),
         Field::new("rss_bytes", DataType::UInt64, false),
-        Field::new("fd_count", DataType::UInt32, false),
-        Field::new("thread_count", DataType::UInt32, false),
+        Field::new("fd_count", DataType::UInt32, true),
+        Field::new("thread_count", DataType::UInt32, true),
         Field::new("state_char", DataType::Utf8, false),
-        Field::new("io_read_bytes", DataType::UInt64, false),
-        Field::new("io_write_bytes", DataType::UInt64, false),
+        Field::new("io_read_bytes", DataType::UInt64, true),
+        Field::new("io_write_bytes", DataType::UInt64, true),
         Field::new("has_tty", DataType::Boolean, false),
-        Field::new("child_count", DataType::UInt32, false),
+        Field::new("child_count", DataType::UInt32, true),
+        Field::new("activity_json", DataType::Utf8, true),
         // Belief state
         Field::new("p_abandoned", DataType::Float32, false),
         Field::new("p_legitimate", DataType::Float32, false),
@@ -1123,7 +1163,7 @@ mod tests {
             pid: 1234,
             identity_hash: "test_hash_abc123".to_string(),
             state: StateSnapshot {
-                cpu_percent: 50.0,
+                cpu_percent: Some(50.0),
                 memory_bytes: 1_000_000,
                 ..Default::default()
             },
@@ -1141,7 +1181,7 @@ mod tests {
         assert!(state.is_some());
         let state = state.unwrap();
         assert_eq!(state.pid, 1234);
-        assert_eq!(state.state.cpu_percent, 50.0);
+        assert_eq!(state.state.cpu_percent, Some(50.0));
 
         // Query by score
         let score_result = storage.get_by_score(50.0);
@@ -1280,6 +1320,66 @@ mod tests {
         assert!(schema.field_with_name("p_abandoned").is_ok());
         assert!(schema.field_with_name("belief_score").is_ok());
         assert!(schema.field_with_name("retention_tier").is_ok());
+        assert!(!schema
+            .field_with_name("state_schema_version")
+            .unwrap()
+            .is_nullable());
+        for field in [
+            "cpu_percent",
+            "cpu_lifetime_percent",
+            "fd_count",
+            "thread_count",
+            "io_read_bytes",
+            "io_write_bytes",
+            "child_count",
+            "activity_json",
+        ] {
+            assert!(
+                schema.field_with_name(field).unwrap().is_nullable(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn shadow_state_reads_legacy_numbers_without_claiming_measured_windows() {
+        let legacy = serde_json::json!({
+            "cpu_percent": 12.5,
+            "memory_bytes": 4096,
+            "rss_bytes": 2048,
+            "fd_count": 0,
+            "thread_count": 0,
+            "state_char": "S",
+            "io_read_bytes": 0,
+            "io_write_bytes": 0,
+            "has_tty": false,
+            "child_count": 0,
+        });
+        let state: StateSnapshot = serde_json::from_value(legacy).unwrap();
+        assert_eq!(state.schema_version, 0);
+        assert_eq!(state.cpu_percent, Some(12.5));
+        assert!(state.cpu_lifetime_percent.is_none());
+        assert!(state.activity.is_none());
+        let serialized = serde_json::to_value(&state).unwrap();
+        assert_eq!(serialized["schema_version"], 0);
+        assert!(serialized["activity"].is_null());
+        let reread: StateSnapshot = serde_json::from_value(serialized).unwrap();
+        assert_eq!(reread.cpu_percent, Some(12.5));
+        assert!(reread.activity.is_none());
+
+        let current = StateSnapshot {
+            schema_version: 1,
+            cpu_percent: Some(0.0),
+            child_count: Some(0),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(current).unwrap();
+        assert_eq!(json["cpu_percent"], 0.0);
+        assert_eq!(json["child_count"], 0);
+        assert!(json["fd_count"].is_null());
+        assert!(json["thread_count"].is_null());
+        assert!(json["io_read_bytes"].is_null());
+        assert!(json["io_write_bytes"].is_null());
     }
 
     #[test]
@@ -1406,8 +1506,8 @@ mod tests {
             pid: 999,
             identity_hash: "flush_test".to_string(),
             state: StateSnapshot {
-                cpu_percent: 17.5,
-                io_write_bytes: 12345,
+                cpu_percent: Some(17.5),
+                io_write_bytes: Some(12345),
                 state_char: 'S',
                 ..Default::default()
             },
@@ -1476,7 +1576,7 @@ mod tests {
                     pid: 99,
                     identity_hash: "many_observations".to_string(),
                     state: StateSnapshot {
-                        io_read_bytes: index as u64,
+                        io_read_bytes: Some(index as u64),
                         ..Default::default()
                     },
                     ..Default::default()
@@ -1491,7 +1591,7 @@ mod tests {
             rows.iter()
                 .map(|obs| obs.state.io_read_bytes)
                 .collect::<Vec<_>>(),
-            (0..8).collect::<Vec<_>>()
+            (0..8).map(Some).collect::<Vec<_>>()
         );
         assert_eq!(storage.stats().hot_observations, 8);
     }
