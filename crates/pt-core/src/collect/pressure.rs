@@ -566,6 +566,16 @@ pub struct PsiLine {
     pub total_us: u64,
 }
 
+impl PsiLine {
+    /// Whether every average is a measured percentage, including a real zero.
+    /// Apply the same check to deserialized snapshots as to procfs readings.
+    pub fn is_valid(&self) -> bool {
+        [self.avg10, self.avg60, self.avg300]
+            .iter()
+            .all(|value| value.is_finite() && (0.0..=100.0).contains(value))
+    }
+}
+
 /// PSI for one resource. `full` is absent for CPU on older kernels.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct PsiResource {
@@ -627,13 +637,14 @@ pub struct MemInfo {
 impl MemInfo {
     /// Swap in use (bytes).
     pub fn swap_used(&self) -> Option<u64> {
-        Some(self.swap_total?.saturating_sub(self.swap_free?))
+        self.swap_total?.checked_sub(self.swap_free?)
     }
 
     /// Fraction of RAM not available for new allocations without reclaim.
     pub fn used_fraction(&self) -> Option<f64> {
-        let total = self.total.filter(|t| *t > 0)? as f64;
-        Some((1.0 - self.available? as f64 / total).clamp(0.0, 1.0))
+        let total = self.total.filter(|t| *t > 0)?;
+        let used = total.checked_sub(self.available?)?;
+        Some(used as f64 / total as f64)
     }
 }
 
@@ -699,11 +710,16 @@ impl PressureSnapshot {
     /// Load average over CPU count (1-minute), the playbook's "load ratio".
     pub fn load_ratio(&self) -> Option<f64> {
         let load = self.load?;
-        (self.cpus > 0).then(|| load.one / f64::from(self.cpus))
+        (self.cpus > 0
+            && [load.one, load.five, load.fifteen]
+                .iter()
+                .all(|value| value.is_finite() && *value >= 0.0))
+        .then(|| load.one / f64::from(self.cpus))
     }
 }
 
-/// Parse one PSI file. Returns `None` when neither line parses.
+/// Parse one PSI file. Malformed or duplicate resource lines make the source
+/// unavailable; they cannot be hidden by another valid line from the same file.
 pub fn parse_psi(text: &str) -> Option<PsiResource> {
     let mut some = None;
     let mut full = None;
@@ -714,29 +730,33 @@ pub fn parse_psi(text: &str) -> Option<PsiResource> {
             Some("full") => &mut full,
             _ => continue,
         };
+        if slot.is_some() {
+            return None;
+        }
         let (mut avg10, mut avg60, mut avg300, mut total) = (None, None, None, None);
         for field in parts {
             let Some((key, value)) = field.split_once('=') else {
                 continue;
             };
             match key {
-                "avg10" => avg10 = value.parse::<f64>().ok(),
-                "avg60" => avg60 = value.parse::<f64>().ok(),
-                "avg300" => avg300 = value.parse::<f64>().ok(),
-                "total" => total = value.parse::<u64>().ok(),
+                "avg10" if avg10.is_none() => avg10 = Some(value.parse::<f64>().ok()?),
+                "avg60" if avg60.is_none() => avg60 = Some(value.parse::<f64>().ok()?),
+                "avg300" if avg300.is_none() => avg300 = Some(value.parse::<f64>().ok()?),
+                "total" if total.is_none() => total = Some(value.parse::<u64>().ok()?),
+                "avg10" | "avg60" | "avg300" | "total" => return None,
                 _ => {}
             }
         }
-        if let (Some(avg10), Some(avg60), Some(avg300), Some(total_us)) =
-            (avg10, avg60, avg300, total)
-        {
-            *slot = Some(PsiLine {
-                avg10,
-                avg60,
-                avg300,
-                total_us,
-            });
+        let reading = PsiLine {
+            avg10: avg10?,
+            avg60: avg60?,
+            avg300: avg300?,
+            total_us: total?,
+        };
+        if !reading.is_valid() {
+            return None;
         }
+        *slot = Some(reading);
     }
     (some.is_some() || full.is_some()).then_some(PsiResource { some, full })
 }
@@ -744,56 +764,76 @@ pub fn parse_psi(text: &str) -> Option<PsiResource> {
 /// Parse `/proc/loadavg` (`0.52 0.58 0.59 3/811 12345`).
 pub fn parse_loadavg(text: &str) -> Option<LoadAvg> {
     let mut parts = text.split_whitespace();
-    let one = parts.next()?.parse().ok()?;
-    let five = parts.next()?.parse().ok()?;
-    let fifteen = parts.next()?.parse().ok()?;
+    let one = parts.next()?.parse::<f64>().ok()?;
+    let five = parts.next()?.parse::<f64>().ok()?;
+    let fifteen = parts.next()?.parse::<f64>().ok()?;
+    if [one, five, fifteen]
+        .iter()
+        .any(|value| !value.is_finite() || *value < 0.0)
+    {
+        return None;
+    }
     let (runnable, total) = parts.next()?.split_once('/')?;
+    let runnable = runnable.parse().ok()?;
+    let total = total.parse().ok()?;
+    if total == 0 || runnable > total {
+        return None;
+    }
     Some(LoadAvg {
         one,
         five,
         fifteen,
-        runnable: Some(runnable.parse().ok()?),
-        total: Some(total.parse().ok()?),
+        runnable: Some(runnable),
+        total: Some(total),
     })
 }
 
-/// Parse `/proc/meminfo` (values in kB) into bytes. `None` if MemTotal is missing.
+/// Parse `/proc/meminfo` (values in kB) into bytes. Missing, malformed or
+/// impossible accounting is unavailable, rather than saturated into healthy RAM.
 pub fn parse_meminfo(text: &str) -> Option<MemInfo> {
     let mut info = MemInfo::default();
     for line in text.lines() {
         let Some((key, rest)) = line.split_once(':') else {
             continue;
         };
-        let Some(kb) = rest
-            .split_whitespace()
-            .next()
-            .and_then(|v| v.parse::<u64>().ok())
-        else {
-            continue;
+        let slot = match key.trim() {
+            "MemTotal" => &mut info.total,
+            "MemFree" => &mut info.free,
+            "MemAvailable" => &mut info.available,
+            "Buffers" => &mut info.buffers,
+            "Cached" => &mut info.cached,
+            "SwapCached" => &mut info.swap_cached,
+            "AnonPages" => &mut info.anon,
+            "Shmem" => &mut info.shmem,
+            "Slab" => &mut info.slab,
+            "SReclaimable" => &mut info.slab_reclaimable,
+            "SUnreclaim" => &mut info.slab_unreclaimable,
+            "Dirty" => &mut info.dirty,
+            "Writeback" => &mut info.writeback,
+            "SwapTotal" => &mut info.swap_total,
+            "SwapFree" => &mut info.swap_free,
+            "Committed_AS" => &mut info.committed_as,
+            "CommitLimit" => &mut info.commit_limit,
+            _ => continue,
         };
-        let bytes = Some(kb.saturating_mul(1024));
-        match key.trim() {
-            "MemTotal" => info.total = bytes,
-            "MemFree" => info.free = bytes,
-            "MemAvailable" => info.available = bytes,
-            "Buffers" => info.buffers = bytes,
-            "Cached" => info.cached = bytes,
-            "SwapCached" => info.swap_cached = bytes,
-            "AnonPages" => info.anon = bytes,
-            "Shmem" => info.shmem = bytes,
-            "Slab" => info.slab = bytes,
-            "SReclaimable" => info.slab_reclaimable = bytes,
-            "SUnreclaim" => info.slab_unreclaimable = bytes,
-            "Dirty" => info.dirty = bytes,
-            "Writeback" => info.writeback = bytes,
-            "SwapTotal" => info.swap_total = bytes,
-            "SwapFree" => info.swap_free = bytes,
-            "Committed_AS" => info.committed_as = bytes,
-            "CommitLimit" => info.commit_limit = bytes,
-            _ => {}
+        let mut parts = rest.split_whitespace();
+        let kb = parts.next()?.parse::<u64>().ok()?;
+        if slot.is_some() || parts.next() != Some("kB") || parts.next().is_some() {
+            return None;
         }
+        *slot = Some(kb.checked_mul(1024)?);
     }
-    info.total.map(|_| info)
+    let total = info.total.filter(|total| *total > 0)?;
+    if info.available.is_some_and(|available| available > total)
+        || info.free.is_some_and(|free| free > total)
+        || info
+            .swap_total
+            .zip(info.swap_free)
+            .is_some_and(|(total, free)| free > total)
+    {
+        return None;
+    }
+    Some(info)
 }
 
 /// Parse the counters of `/proc/vmstat` used for diagnosis. `allocstall` sums the
@@ -1738,6 +1778,104 @@ mod tests {
     }
 
     #[test]
+    fn pressure_parsers_reject_invalid_averages_without_inventing_zero() {
+        for index in 0..3 {
+            for invalid in ["NaN", "inf", "-inf", "-0.01", "100.01", "1e999"] {
+                let mut values = ["0.0", "1.0", "100.0"];
+                values[index] = invalid;
+                let line = format!(
+                    "some avg10={} avg60={} avg300={} total=1\n",
+                    values[0], values[1], values[2]
+                );
+                assert!(parse_psi(&line).is_none(), "{line}");
+                // A valid full line cannot conceal a malformed some line.
+                let mixed = format!("{line}full avg10=0 avg60=0 avg300=0 total=0\n");
+                assert!(parse_psi(&mixed).is_none(), "{mixed}");
+            }
+            for invalid in ["NaN", "inf", "-inf", "-0.01", "1e999"] {
+                let mut values = ["0.0", "1.0", "1000.0"];
+                values[index] = invalid;
+                let line = format!("{} {} {} 1/100 42\n", values[0], values[1], values[2]);
+                assert!(parse_loadavg(&line).is_none(), "{line}");
+            }
+        }
+        let endpoints = parse_psi("some avg10=0 avg60=100 avg300=0 total=0\n").unwrap();
+        assert!(endpoints.some.unwrap().is_valid());
+        for duplicate in ["avg10=NaN", "avg10=0", "avg60=0", "avg300=0", "total=0"] {
+            let line = format!("some avg10=0 avg60=0 avg300=0 total=0 {duplicate}\n");
+            assert!(parse_psi(&line).is_none(), "{line}");
+        }
+        assert!(parse_psi(
+            "some avg10=NaN avg10=0 avg60=0 avg300=0 total=0\n"
+        )
+        .is_none());
+        assert!(parse_psi(&format!("{PSI_CPU}{PSI_CPU}")).is_none());
+        assert!(
+            parse_psi(&format!("{PSI_CPU}full avg10=NaN avg60=0 avg300=0 total=0\n")).is_none()
+        );
+        assert!(parse_loadavg("0 1 1000 1/100 42\n").is_some());
+        assert!(parse_loadavg("0 0 0 0/0 42\n").is_none());
+        assert!(parse_loadavg("0 0 0 2/1 42\n").is_none());
+    }
+
+    #[test]
+    fn meminfo_rejects_impossible_counts_units_and_overflow() {
+        for text in [
+            "MemTotal: 0 kB\n",
+            "MemTotal: 1 kB\nMemAvailable: 2 kB\n",
+            "MemTotal: 1 kB\nMemFree: 2 kB\n",
+            "MemTotal: 4 kB\nSwapTotal: 1 kB\nSwapFree: 2 kB\n",
+            "MemTotal: 4 kB\nSwapTotal: 0 kB\nSwapFree: 1 kB\n",
+            "MemTotal: 18446744073709551615 kB\n",
+            "MemTotal: 4 kB\nMemAvailable: 18446744073709551615 kB\n",
+            "MemTotal: 4 MB\n",
+            "MemTotal: 4 kB\nMemAvailable: invalid kB\n",
+            "MemTotal: 4 kB\nMemAvailable: 2\n",
+            "MemTotal: 4 kB\nMemTotal: 4 kB\n",
+        ] {
+            assert!(parse_meminfo(text).is_none(), "{text}");
+        }
+        // Optional counters remain unknown, and overcommit is not physical usage.
+        let memory = parse_meminfo(
+            "MemTotal: 4 kB\nCommitted_AS: 10 kB\nCommitLimit: 8 kB\nHugePages_Total: 0\n",
+        )
+        .unwrap();
+        assert_eq!(memory.used_fraction(), None);
+        assert_eq!(memory.swap_used(), None);
+        assert_eq!(memory.committed_as, Some(10 * 1024));
+        let zero = parse_meminfo(
+            "MemTotal: 4 kB\nMemAvailable: 4 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n",
+        )
+        .unwrap();
+        assert_eq!(zero.used_fraction(), Some(0.0));
+        assert_eq!(zero.swap_used(), Some(0));
+    }
+
+    #[test]
+    fn deserialized_memory_accounting_cannot_saturate_into_healthy_values() {
+        let impossible = MemInfo {
+            total: Some(4),
+            available: Some(5),
+            swap_total: Some(2),
+            swap_free: Some(3),
+            ..MemInfo::default()
+        };
+        let restored: MemInfo =
+            serde_json::from_value(serde_json::to_value(impossible).unwrap()).unwrap();
+        assert_eq!(restored.used_fraction(), None);
+        assert_eq!(restored.swap_used(), None);
+        let large = MemInfo {
+            total: Some(u64::MAX),
+            available: Some(u64::MAX - 1),
+            swap_total: Some(u64::MAX),
+            swap_free: Some(u64::MAX - 1),
+            ..MemInfo::default()
+        };
+        assert!(large.used_fraction().unwrap() > 0.0);
+        assert_eq!(large.swap_used(), Some(1));
+    }
+
+    #[test]
     fn parses_loadavg_meminfo_vmstat_file_nr() {
         let load = parse_loadavg("4.71 2.61 1.19 3/811 290046\n").unwrap();
         assert_eq!(
@@ -2069,6 +2207,52 @@ mod tests {
             .unavailable
             .iter()
             .any(|u| u.source == "/proc/loadavg" && u.reason == "unrecognized format"));
+    }
+
+    #[test]
+    fn invalid_pressure_sources_report_unavailable_and_keep_valid_sources() {
+        let root = fake_root(&[
+            (
+                "proc/pressure/cpu",
+                "some avg10=NaN avg60=0 avg300=0 total=0\nfull avg10=0 avg60=0 avg300=0 total=0\n",
+            ),
+            ("proc/pressure/memory", PSI_CPU),
+            ("proc/loadavg", "-1 0 0 1/100 42\n"),
+            ("proc/meminfo", "MemTotal: 4 kB\nMemAvailable: 5 kB\n"),
+        ]);
+        let mut snapshot = read_pressure_snapshot_from(root.path(), 8);
+        assert_eq!(snapshot.cpu, None);
+        assert_eq!(snapshot.load, None);
+        assert_eq!(snapshot.meminfo, None);
+        assert_eq!(snapshot.load_ratio(), None);
+        assert_eq!(snapshot.memory, parse_psi(PSI_CPU));
+        for source in ["/proc/pressure/cpu", "/proc/loadavg", "/proc/meminfo"] {
+            assert!(snapshot
+                .unavailable
+                .iter()
+                .any(|entry| entry.source == source && entry.reason == "unrecognized format"));
+        }
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert!(json["cpu"].is_null());
+        assert!(json["load"].is_null());
+        assert!(json["meminfo"].is_null());
+
+        // Directly supplied snapshots must obey the same load-ratio contract.
+        let valid = parse_loadavg("0 1 2 1/100 42\n").unwrap();
+        snapshot.load = Some(valid);
+        assert_eq!(snapshot.load_ratio(), Some(0.0));
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1] {
+            for index in 0..3 {
+                let mut load = valid;
+                match index {
+                    0 => load.one = value,
+                    1 => load.five = value,
+                    _ => load.fifteen = value,
+                }
+                snapshot.load = Some(load);
+                assert_eq!(snapshot.load_ratio(), None);
+            }
+        }
     }
 
     #[test]

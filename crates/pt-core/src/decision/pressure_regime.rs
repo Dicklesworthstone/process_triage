@@ -197,16 +197,49 @@ pub struct PressureAssessment {
 
 const GIB: f64 = (1u64 << 30) as f64;
 
+fn valid_window_interval(window: &PressureWindow) -> bool {
+    window.seconds.is_finite() && window.seconds > 0.0
+}
+
+/// Read the same validated PSI value for classification and episode tracking.
+/// An invalid supplied fraction is unknown, not a quiet sample or permission to
+/// replace the selected interval with a different rolling average.
+fn psi_stall_percent(
+    resource: Option<crate::collect::pressure::PsiResource>,
+    window: Option<&PressureWindow>,
+    window_some: Option<f64>,
+) -> Option<f64> {
+    let some = resource?.some?;
+    if !some.is_valid() || window.is_some_and(|window| !valid_window_interval(window)) {
+        return None;
+    }
+    match window_some {
+        Some(fraction) if fraction.is_finite() && (0.0..=1.0).contains(&fraction) => {
+            Some(fraction * 100.0)
+        }
+        Some(_) => None,
+        None => Some(some.avg10),
+    }
+}
+
 /// PSI `some` stall percent for a resource: the exact window fraction when there is a
 /// window, else avg10; and whether avg60 is past the warn line too.
 fn stall(
     resource: Option<crate::collect::pressure::PsiResource>,
+    window: Option<&PressureWindow>,
     window_some: Option<f64>,
     band: Band,
 ) -> Option<(f64, bool)> {
-    let some = resource?.some?;
-    let now = window_some.map_or(some.avg10, |f| f * 100.0);
-    Some((now, some.avg60 >= band.warn))
+    let now = psi_stall_percent(resource, window, window_some)?;
+    Some((now, resource?.some?.avg60 >= band.warn))
+}
+
+fn swap_rate(window: Option<&PressureWindow>) -> Option<f64> {
+    let window = window.filter(|window| valid_window_interval(window))?;
+    let (input, output) = (window.swap_in_per_s?, window.swap_out_per_s?);
+    let total = input + output;
+    (input.is_finite() && input >= 0.0 && output.is_finite() && output >= 0.0 && total.is_finite())
+        .then_some(total)
 }
 
 fn push(
@@ -238,7 +271,12 @@ pub fn assess(
     let load_ratio = snapshot.load_ratio();
 
     // CPU: stall with load as corroboration; high load alone is not contention.
-    let cpu = stall(snapshot.cpu, window.and_then(|w| w.cpu?.some), t.cpu_psi);
+    let cpu = stall(
+        snapshot.cpu,
+        window,
+        window.and_then(|w| w.cpu?.some),
+        t.cpu_psi,
+    );
     if let Some((cpu_some, sustained)) = cpu {
         let level = t.cpu_psi.severity(cpu_some);
         severity.cpu = t.cpu_psi.scale(cpu_some);
@@ -253,8 +291,11 @@ pub fn assess(
                 "CPU contention: some task waited for a CPU {cpu_some:.0}% of the time{load_text}"
             ),
         );
-    } else if let Some(ratio) = load_ratio {
-        // No PSI: fall back to the load ratio alone.
+    } else if let Some(ratio) =
+        load_ratio.filter(|_| snapshot.cpu.and_then(|resource| resource.some).is_none())
+    {
+        // Missing PSI permits a load-only diagnosis; malformed PSI or a selected
+        // window cannot silently change the source of a pressure episode.
         let level = t.load_ratio.severity(ratio);
         severity.cpu = t.load_ratio.scale(ratio);
         push(
@@ -267,7 +308,12 @@ pub fn assess(
     }
 
     // IO, including "high load but CPU quiet" (blocked tasks, not CPU demand).
-    let io = stall(snapshot.io, window.and_then(|w| w.io?.some), t.io_psi);
+    let io = stall(
+        snapshot.io,
+        window,
+        window.and_then(|w| w.io?.some),
+        t.io_psi,
+    );
     let cpu_quiet = cpu.is_some_and(|(c, _)| c < t.cpu_psi_quiet);
     let high_load = load_ratio.is_some_and(|r| r >= t.load_ratio.warn);
     if let Some((io_some, sustained)) = io {
@@ -294,6 +340,7 @@ pub fn assess(
     let mem_used = snapshot.meminfo.and_then(|m| m.used_fraction());
     let memory = stall(
         snapshot.memory,
+        window,
         window.and_then(|w| w.memory?.some),
         t.memory_psi,
     );
@@ -331,7 +378,11 @@ pub fn assess(
             ),
         };
         push(&mut regimes, kind, level, sustained, explanation);
-    } else if let Some(native) = snapshot.meminfo.and_then(|memory| memory.macos_pressure) {
+    } else if let Some(native) = snapshot
+        .meminfo
+        .and_then(|memory| memory.macos_pressure)
+        .filter(|_| snapshot.memory.and_then(|resource| resource.some).is_none())
+    {
         // Darwin reports a qualitative kernel pressure state. Do not invent a
         // PSI percentage or derive "available" RAM from inactive/cache pages.
         let (level, resource_severity, label) = match native {
@@ -352,7 +403,11 @@ pub fn assess(
     }
 
     // Kernel OOM kills during the window are memory crit whatever the averages say.
-    if let Some(kills) = window.and_then(|w| w.oom_kills).filter(|k| *k > 0) {
+    if let Some(kills) = window
+        .filter(|window| valid_window_interval(window))
+        .and_then(|window| window.oom_kills)
+        .filter(|kills| *kills > 0)
+    {
         severity.memory = 1.0;
         push(
             &mut regimes,
@@ -364,7 +419,7 @@ pub fn assess(
     }
 
     // Swap.
-    if let Some(rate) = window.and_then(|w| Some(w.swap_in_per_s? + w.swap_out_per_s?)) {
+    if let Some(rate) = swap_rate(window) {
         push(
             &mut regimes,
             RegimeKind::SwapThrash,
@@ -465,13 +520,7 @@ pub fn assess(
 
 /// Whether a PSI average is usable evidence, including a genuine observed zero.
 pub fn psi_evidence_available(resource: Option<crate::collect::pressure::PsiResource>) -> bool {
-    resource
-        .and_then(|resource| resource.some)
-        .is_some_and(|line| {
-            [line.avg10, line.avg60, line.avg300]
-                .iter()
-                .all(|value| value.is_finite() && (0.0..=100.0).contains(value))
-        })
+    psi_stall_percent(resource, None, None).is_some()
 }
 
 /// A missing source cannot establish that a previously observed regime cleared.
@@ -498,7 +547,8 @@ pub fn regime_evidence_available(
     });
     match kind {
         RegimeKind::CpuContention => {
-            let psi = psi_evidence_available(snapshot.cpu);
+            let psi =
+                psi_stall_percent(snapshot.cpu, window, window.and_then(|w| w.cpu?.some)).is_some();
             let load = snapshot
                 .load_ratio()
                 .is_some_and(|ratio| ratio.is_finite() && ratio >= 0.0);
@@ -506,26 +556,30 @@ pub fn regime_evidence_available(
                 && (!cpu_psi_required || psi)
                 && (!cpu_load_required || load)
         }
-        RegimeKind::IoBound => psi_evidence_available(snapshot.io),
+        RegimeKind::IoBound => {
+            psi_stall_percent(snapshot.io, window, window.and_then(|w| w.io?.some)).is_some()
+        }
         RegimeKind::MemoryExhaustion => {
-            (psi_evidence_available(snapshot.memory) && memory)
-                || (snapshot.memory.is_none()
+            // PSI proves memory stalls even when available-RAM accounting is
+            // absent. The latter refines the diagnosis into cache bloat; it is
+            // not a prerequisite for observing generic memory pressure.
+            psi_stall_percent(snapshot.memory, window, window.and_then(|w| w.memory?.some)).is_some()
+                || (snapshot.memory.and_then(|resource| resource.some).is_none()
                     && snapshot
                         .meminfo
                         .is_some_and(|memory| memory.macos_pressure.is_some()))
         }
-        RegimeKind::CacheBloat => psi_evidence_available(snapshot.memory) && memory,
-        RegimeKind::SwapThrash => window.is_some_and(|window| {
-            window
-                .swap_in_per_s
-                .zip(window.swap_out_per_s)
-                .is_some_and(|(input, output)| {
-                    input.is_finite() && input >= 0.0 && output.is_finite() && output >= 0.0
-                })
-        }),
+        RegimeKind::CacheBloat => {
+            psi_stall_percent(snapshot.memory, window, window.and_then(|w| w.memory?.some)).is_some()
+                && memory
+        }
+        RegimeKind::SwapThrash => swap_rate(window).is_some(),
         RegimeKind::SwapParadox => memory && swap,
         RegimeKind::SwapExhaustion => swap,
-        RegimeKind::OomKills => window.and_then(|window| window.oom_kills).is_some(),
+        RegimeKind::OomKills => window
+            .filter(|window| valid_window_interval(window))
+            .and_then(|window| window.oom_kills)
+            .is_some(),
         RegimeKind::FdExhaustion => snapshot
             .file_handles
             .and_then(|handles| handles.used_fraction())
@@ -766,6 +820,224 @@ mod tests {
     }
 
     #[test]
+    fn memory_stalls_remain_observable_without_available_ram_accounting() {
+        for meminfo in [
+            None,
+            Some(MemInfo::default()),
+            Some(MemInfo {
+                total: Some(32 * GB),
+                ..MemInfo::default()
+            }),
+            Some(MemInfo {
+                total: Some(0),
+                available: Some(0),
+                ..MemInfo::default()
+            }),
+            Some(MemInfo {
+                total: Some(32 * GB),
+                available: Some(33 * GB),
+                ..MemInfo::default()
+            }),
+        ] {
+            let mut snap = snapshot(8, 0.0);
+            snap.memory = psi(30.0, 30.0);
+            snap.meminfo = meminfo;
+            let assessment = assess(&snap, None, None, &PressureThresholds::default());
+            assert_eq!(kinds(&assessment), vec![RegimeKind::MemoryExhaustion]);
+            assert_eq!(assessment.worst, Severity::Crit);
+            assert_eq!(assessment.memory_some, Some(30.0));
+            assert_eq!(assessment.memory_used_fraction, None);
+            assert_eq!(assessment.severity.memory, 1.0);
+            assert!(assessment.regimes[0]
+                .explanation
+                .starts_with("Memory pressure:"));
+            assert!(regime_evidence_available(
+                RegimeKind::MemoryExhaustion,
+                &snap,
+                None,
+                None,
+                false,
+                false,
+            ));
+            assert!(!regime_evidence_available(
+                RegimeKind::CacheBloat,
+                &snap,
+                None,
+                None,
+                false,
+                false,
+            ));
+        }
+    }
+
+    #[test]
+    fn malformed_psi_cannot_drive_decisions_or_change_observation_source() {
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.01, 100.01] {
+            for field in 0..3 {
+                let mut snap = snapshot(8, 100.0);
+                let mut resource = psi(40.0, 40.0).unwrap();
+                let line = resource.some.as_mut().unwrap();
+                match field {
+                    0 => line.avg10 = invalid,
+                    1 => line.avg60 = invalid,
+                    _ => line.avg300 = invalid,
+                }
+                snap.cpu = Some(resource);
+                snap.memory = Some(resource);
+                snap.io = Some(resource);
+                snap.meminfo.as_mut().unwrap().macos_pressure = Some(MacosPressureLevel::Critical);
+                let assessment = assess(&snap, None, None, &PressureThresholds::default());
+                assert!(
+                    assessment.regimes.is_empty(),
+                    "{invalid}/{field}: {assessment:?}"
+                );
+                assert_eq!(assessment.severity, ResourceSeverity::default());
+                assert_eq!(assessment.cpu_some, None);
+                assert_eq!(assessment.memory_some, None);
+                assert_eq!(assessment.io_some, None);
+                for kind in [
+                    RegimeKind::CpuContention,
+                    RegimeKind::IoBound,
+                    RegimeKind::MemoryExhaustion,
+                    RegimeKind::CacheBloat,
+                ] {
+                    assert!(!regime_evidence_available(
+                        kind, &snap, None, None, false, false,
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_stall_windows_neither_confirm_nor_clear_pressure_episodes() {
+        let mut snap = snapshot(8, 100.0);
+        snap.cpu = psi(40.0, 40.0);
+        snap.memory = psi(40.0, 40.0);
+        snap.io = psi(40.0, 40.0);
+        snap.meminfo.as_mut().unwrap().available = Some(GB);
+        let thresholds = PressureThresholds::default();
+        let hot = assess(&snap, None, None, &thresholds);
+        let window = |some| PressureWindow {
+            seconds: 1.0,
+            cpu: Some(StallFractions {
+                some: Some(some),
+                full: None,
+            }),
+            memory: Some(StallFractions {
+                some: Some(some),
+                full: None,
+            }),
+            io: Some(StallFractions {
+                some: Some(some),
+                full: None,
+            }),
+            swap_in_per_s: None,
+            swap_out_per_s: None,
+            major_faults_per_s: None,
+            direct_reclaim_scans_per_s: None,
+            alloc_stalls_per_s: None,
+            oom_kills: None,
+        };
+        for invalid in [f64::NAN, f64::INFINITY, -0.01, 1.01] {
+            let invalid_window = window(invalid);
+            let unknown = assess(&snap, Some(&invalid_window), None, &thresholds);
+            assert!(unknown.regimes.is_empty());
+            assert_eq!(unknown.severity, ResourceSeverity::default());
+            let observed = |kind| {
+                regime_evidence_available(kind, &snap, Some(&invalid_window), None, false, false)
+            };
+            let mut tracker = RegimeTracker::new(1, 1);
+            assert!(tracker.update_observed(Some(&unknown), observed).is_empty());
+            let active = tracker.update(&hot);
+            assert_eq!(active.len(), 3);
+            assert_eq!(tracker.update_observed(Some(&unknown), observed), active);
+
+            // A measured zero is available evidence even while avg10 still
+            // includes the preceding incident; only this reading can recover.
+            let quiet_window = window(0.0);
+            let quiet = assess(&snap, Some(&quiet_window), None, &thresholds);
+            assert!(tracker
+                .update_observed(Some(&quiet), |kind| {
+                    regime_evidence_available(kind, &snap, Some(&quiet_window), None, false, false)
+                })
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn invalid_window_intervals_cannot_confirm_or_clear_regimes() {
+        let mut snap = snapshot(8, 0.0);
+        snap.cpu = psi(40.0, 40.0);
+        snap.memory = psi(40.0, 40.0);
+        snap.io = psi(40.0, 40.0);
+        snap.meminfo.as_mut().unwrap().available = Some(GB);
+        let thresholds = PressureThresholds::default();
+        let hot = assess(&snap, None, None, &thresholds);
+
+        for seconds in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            for fraction in [0.0, 0.4] {
+                let mut window = PressureWindow {
+                    seconds,
+                    cpu: Some(StallFractions {
+                        some: Some(fraction),
+                        full: None,
+                    }),
+                    memory: Some(StallFractions {
+                        some: Some(fraction),
+                        full: None,
+                    }),
+                    io: Some(StallFractions {
+                        some: Some(fraction),
+                        full: None,
+                    }),
+                    swap_in_per_s: Some(fraction * 50_000.0),
+                    swap_out_per_s: Some(0.0),
+                    major_faults_per_s: None,
+                    direct_reclaim_scans_per_s: None,
+                    alloc_stalls_per_s: None,
+                    oom_kills: Some(u64::from(fraction > 0.0)),
+                };
+                let unknown = assess(&snap, Some(&window), None, &thresholds);
+                assert!(unknown.regimes.is_empty(), "{seconds}/{fraction}: {unknown:?}");
+                assert_eq!(unknown.severity, ResourceSeverity::default());
+                assert_eq!(unknown.cpu_some, None);
+                assert_eq!(unknown.memory_some, None);
+                assert_eq!(unknown.io_some, None);
+                for kind in [
+                    RegimeKind::CpuContention,
+                    RegimeKind::IoBound,
+                    RegimeKind::MemoryExhaustion,
+                    RegimeKind::CacheBloat,
+                    RegimeKind::SwapThrash,
+                    RegimeKind::OomKills,
+                ] {
+                    assert!(!regime_evidence_available(
+                        kind, &snap, Some(&window), None, false, false,
+                    ));
+                }
+                let mut tracker = RegimeTracker::new(1, 1);
+                let active = tracker.update(&hot);
+                assert_eq!(active.len(), 3);
+                assert_eq!(
+                    tracker.update_observed(Some(&unknown), |kind| {
+                        regime_evidence_available(kind, &snap, Some(&window), None, false, false)
+                    }),
+                    active,
+                );
+
+                // The same figures become evidence only with a real interval.
+                window.seconds = 1.0;
+                let observed = assess(&snap, Some(&window), None, &thresholds);
+                let active = tracker.update_observed(Some(&observed), |kind| {
+                    regime_evidence_available(kind, &snap, Some(&window), None, false, false)
+                });
+                assert_eq!(active.is_empty(), fraction == 0.0);
+            }
+        }
+    }
+
+    #[test]
     fn cpu_contention_needs_cpu_stall_not_just_load() {
         let t = PressureThresholds::default();
         let mut snap = snapshot(64, 200.0);
@@ -872,6 +1144,41 @@ mod tests {
         // The window's exact fraction (40 %) wins over avg10 (10 %).
         assert_eq!(a.memory_some, Some(40.0));
         assert_eq!(a.worst, Severity::Crit);
+    }
+
+    #[test]
+    fn invalid_swap_rates_are_unknown_instead_of_healthy_or_critical() {
+        let snap = snapshot(8, 0.0);
+        for (input, output) in [
+            (f64::NAN, 0.0),
+            (0.0, f64::INFINITY),
+            (-1.0, 20_000.0),
+            (20_000.0, -1.0),
+            (f64::MAX, f64::MAX),
+        ] {
+            let window = PressureWindow {
+                seconds: 1.0,
+                cpu: None,
+                memory: None,
+                io: None,
+                swap_in_per_s: Some(input),
+                swap_out_per_s: Some(output),
+                major_faults_per_s: None,
+                direct_reclaim_scans_per_s: None,
+                alloc_stalls_per_s: None,
+                oom_kills: None,
+            };
+            let assessment = assess(&snap, Some(&window), None, &PressureThresholds::default());
+            assert!(assessment.regimes.is_empty());
+            assert!(!regime_evidence_available(
+                RegimeKind::SwapThrash,
+                &snap,
+                Some(&window),
+                None,
+                false,
+                false,
+            ));
+        }
     }
 
     #[test]

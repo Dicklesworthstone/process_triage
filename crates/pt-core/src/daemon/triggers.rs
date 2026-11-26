@@ -1143,6 +1143,69 @@ mod tests {
     }
 
     #[test]
+    fn memory_psi_without_meminfo_triggers_and_requires_observed_recovery() {
+        let mut config = cfg(2, 0);
+        config.pressure_regimes.exit_after_ticks = 2;
+        let mut state = TriggerState::new(&config);
+        let start = Instant::now();
+        let reading = |tick, average: Option<f64>, total_us| {
+            let mut value = cpu_reading(start, tick, average.unwrap_or(0.0), total_us);
+            let snapshot = value.pressure.as_mut().unwrap();
+            snapshot.memory = average.and(snapshot.cpu.take());
+            snapshot.meminfo = None;
+            value
+        };
+
+        assert!(evaluate_triggers(&config, &mut state, &reading(0, Some(30.0), 0)).is_empty());
+        assert!(evaluate_triggers(&config, &mut state, &reading(1, None, 0)).is_empty());
+        assert!(
+            evaluate_triggers(&config, &mut state, &reading(2, Some(30.0), 300_000)).is_empty()
+        );
+        let fired = evaluate_triggers(&config, &mut state, &reading(3, Some(30.0), 600_000));
+        assert_eq!(fired.len(), 1);
+        let regime = fired[0].pressure_regime.as_ref().unwrap();
+        assert_eq!(regime.kind, RegimeKind::MemoryExhaustion);
+        assert_eq!(regime.severity, Severity::Crit);
+        assert!(regime.explanation.starts_with("Memory pressure:"));
+        state.pressure.acknowledge(&fired);
+
+        // Missing or malformed PSI cannot stand in for a quiet sample. Each
+        // interrupts the recovery streak even though MemAvailable is absent
+        // throughout the entire pressure episode.
+        for (tick, average) in [
+            (4, Some(0.0)),
+            (5, None),
+            (6, Some(0.0)),
+            (7, Some(-1.0)),
+            (8, Some(0.0)),
+        ] {
+            assert!(
+                evaluate_triggers(&config, &mut state, &reading(tick, average, 600_000)).is_empty()
+            );
+            assert!(state
+                .pressure
+                .active
+                .contains_key(&RegimeKind::MemoryExhaustion));
+        }
+        assert!(
+            evaluate_triggers(&config, &mut state, &reading(9, Some(0.0), 600_000)).is_empty()
+        );
+        assert!(!state
+            .pressure
+            .active
+            .contains_key(&RegimeKind::MemoryExhaustion));
+        assert!(
+            evaluate_triggers(&config, &mut state, &reading(10, Some(30.0), 900_000)).is_empty()
+        );
+        let repeated = evaluate_triggers(&config, &mut state, &reading(11, Some(30.0), 1_200_000));
+        assert_eq!(repeated.len(), 1);
+        assert_eq!(
+            repeated[0].pressure_regime.as_ref().unwrap().kind,
+            RegimeKind::MemoryExhaustion
+        );
+    }
+
+    #[test]
     fn invalid_or_replayed_samples_cannot_confirm_pressure() {
         let config = cfg(2, 0);
         let start = Instant::now();
