@@ -232,6 +232,10 @@ pub struct IncidentTracker {
     pub discarded_pending_archives: u64,
     pub storage_error: Option<String>,
     captured_pending_oom: bool,
+    /// Exact pending and acknowledged episodes at this checkpoint generation.
+    /// Incident causes alone do not establish whether a review was delivered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pressure_triggers: Option<triggers::PressureTriggerState>,
     #[serde(skip)]
     previous: Option<(PressureSnapshot, std::time::Instant)>,
     #[serde(skip)]
@@ -248,6 +252,9 @@ struct IncidentCheckpoint {
     last: Option<IncidentSummary>,
     discarded_pending_archives: u64,
     captured_pending_oom: bool,
+    /// Older checkpoints preserve evidence without claiming delivery state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pressure_triggers: Option<triggers::PressureTriggerState>,
 }
 
 fn incident_session_id(value: &str) -> Option<pt_common::SessionId> {
@@ -476,6 +483,11 @@ impl IncidentTracker {
         } else {
             None
         };
+        self.capture_pressure_triggers(pressure);
+    }
+
+    fn capture_pressure_triggers(&mut self, pressure: &triggers::PressureTriggerState) {
+        self.pressure_triggers = Some(pressure.clone());
         self.generation = self.generation.saturating_add(1);
     }
 
@@ -570,6 +582,7 @@ impl IncidentTracker {
             last: self.last.clone(),
             discarded_pending_archives: self.discarded_pending_archives,
             captured_pending_oom: self.captured_pending_oom,
+            pressure_triggers: self.pressure_triggers.clone(),
         }
     }
 
@@ -581,6 +594,7 @@ impl IncidentTracker {
         self.last = checkpoint.last;
         self.discarded_pending_archives = checkpoint.discarded_pending_archives;
         self.captured_pending_oom = checkpoint.captured_pending_oom;
+        self.pressure_triggers = checkpoint.pressure_triggers;
         self.interrupt_observations();
     }
 
@@ -596,6 +610,25 @@ impl IncidentTracker {
             .err()
             .map(|error| incident_text(error, 1024));
         result
+    }
+
+    /// Recover the pressure delivery state from the same durable checkpoint as
+    /// its incident. The end-of-tick daemon state may predate a planner crash or
+    /// a completed review, so restore pending and acknowledged episodes together.
+    /// Legacy checkpoints cannot establish either and leave the caller unchanged.
+    pub fn recover_with_pressure(
+        &mut self,
+        store: &SessionStore,
+        pressure: &mut triggers::PressureTriggerState,
+    ) -> Result<(), String> {
+        self.recover_persisted(store)?;
+        if let Some(saved) = &self.pressure_triggers {
+            let mut restored = saved.clone();
+            // Downtime is not another measured interval or recovery sample.
+            restored.interrupt_observations();
+            *pressure = restored;
+        }
+        Ok(())
     }
 
     fn recover_incidents(&mut self, store: &SessionStore) -> Result<(), String> {
@@ -1458,6 +1491,9 @@ where
         match outcome.status {
             escalation::EscalationStatus::Completed => {
                 trigger_state.pressure.acknowledge(&fired);
+                state
+                    .incidents
+                    .capture_pressure_triggers(&trigger_state.pressure);
                 if fired
                     .iter()
                     .any(|trigger| trigger.memory_pressure.is_some())
@@ -2189,6 +2225,183 @@ mod tests {
         assert!(store.session_dir(&id).join("incident.json").is_file());
         assert!(restarted.previous.is_none());
         assert_eq!(restarted.recovery_streak, 0);
+    }
+
+    #[test]
+    fn checkpoint_recovers_pressure_delivery_across_both_planner_crash_boundaries() {
+        use crate::collect::pressure::VmStat;
+        use escalation::{EscalationOutcome, EscalationStatus};
+
+        for kind in [RegimeKind::OomKills, RegimeKind::CpuContention] {
+            let temporary = tempfile::tempdir().unwrap();
+            let store = SessionStore::at_data_dir(temporary.path());
+            let mut config = DaemonConfig::default();
+            config.triggers.sustained_ticks = 1;
+            let mut state = DaemonState::new();
+            let mut triggers = triggers::TriggerState::new(&config.triggers);
+            let started = std::time::Instant::now();
+            let reading = |tick: u64| {
+                let cpu = kind == RegimeKind::CpuContention && tick >= 2;
+                let mut metrics = incident_metrics_with_cpu_total(
+                    started,
+                    tick,
+                    cpu,
+                    10_000 + if cpu { (tick - 1) * 400_000 } else { 0 },
+                );
+                metrics.pressure.as_mut().unwrap().vmstat = Some(VmStat {
+                    oom_kill: Some(10 + u64::from(kind == RegimeKind::OomKills && tick >= 2)),
+                    ..VmStat::default()
+                });
+                metrics
+            };
+            process_tick(
+                &config,
+                &mut state,
+                &mut triggers,
+                &reading(1),
+                &mut |_, _| panic!("the baseline must not create a review"),
+            );
+            let older_state = temporary.path().join("before-trigger.json");
+            crate::session::write_json_pretty(&older_state, &(&state, &triggers)).unwrap();
+
+            // Only the pre-planner incident checkpoint reaches disk. Discard
+            // the in-memory outcome exactly as a planner-time crash would.
+            process_tick_with_incident_observer(
+                &config,
+                &mut state,
+                &mut triggers,
+                &reading(2),
+                &mut |tracker| tracker.persist(&store).unwrap(),
+                &mut |_, fired| {
+                    assert_eq!(fired.len(), 1);
+                    assert_eq!(fired[0].pressure_regime.as_ref().unwrap().kind, kind);
+                    EscalationOutcome {
+                        status: EscalationStatus::Failed,
+                        reason: "planner interrupted before publication".into(),
+                        session_id: None,
+                        provenance_summary: None,
+                    }
+                },
+            );
+            let (mut restarted, mut restored_triggers): (DaemonState, triggers::TriggerState) =
+                read_daemon_json_bounded(&older_state, 2 * INCIDENT_CHECKPOINT_MAX_BYTES)
+                    .unwrap()
+                    .unwrap();
+            assert!(!restored_triggers.pressure.pending.contains_key(&kind));
+            restarted
+                .incidents
+                .recover_with_pressure(&store, &mut restored_triggers.pressure)
+                .unwrap();
+            assert!(restored_triggers.pressure.pending.contains_key(&kind));
+            let incident_id = restarted.incidents.active_summary().unwrap().session_id;
+            let pending_state = temporary.path().join("before-acknowledgement.json");
+            crate::session::write_json_pretty(&pending_state, &(&restarted, &restored_triggers))
+                .unwrap();
+
+            // A constant OOM counter cannot rediscover the event after restart.
+            // The recovered pending request, or still-active CPU episode, must
+            // reach the normal callback and be acknowledged there exactly once.
+            let mut deliveries = 0;
+            let delivered = process_tick(
+                &config,
+                &mut restarted,
+                &mut restored_triggers,
+                &reading(3),
+                &mut |_, fired| {
+                    deliveries += 1;
+                    assert_eq!(fired.len(), 1);
+                    assert_eq!(fired[0].pressure_regime.as_ref().unwrap().kind, kind);
+                    EscalationOutcome {
+                        status: EscalationStatus::Completed,
+                        reason: "review delivery completed".into(),
+                        session_id: Some(pt_common::SessionId::new().0),
+                        provenance_summary: None,
+                    }
+                },
+            );
+            assert_eq!(
+                delivered.escalation.unwrap().status,
+                EscalationStatus::Completed
+            );
+            assert_eq!(deliveries, 1);
+            assert!(!restored_triggers.pressure.pending.contains_key(&kind));
+            restarted.incidents.persist(&store).unwrap();
+
+            // Now the acknowledged checkpoint is newer than the ordinary
+            // daemon-state save. Restoring that stale pending bundle must not
+            // produce a second review for the same delivered episode.
+            let (mut restarted, mut restored_triggers): (DaemonState, triggers::TriggerState) =
+                read_daemon_json_bounded(&pending_state, 2 * INCIDENT_CHECKPOINT_MAX_BYTES)
+                    .unwrap()
+                    .unwrap();
+            assert!(restored_triggers.pressure.pending.contains_key(&kind));
+            restarted
+                .incidents
+                .recover_with_pressure(&store, &mut restored_triggers.pressure)
+                .unwrap();
+            assert!(!restored_triggers.pressure.pending.contains_key(&kind));
+            assert_eq!(
+                restarted.incidents.active_summary().unwrap().session_id,
+                incident_id
+            );
+            let quiet = process_tick(
+                &config,
+                &mut restarted,
+                &mut restored_triggers,
+                &reading(4),
+                &mut |_, _| panic!("a durably acknowledged episode must not be requeued"),
+            );
+            assert!(quiet.escalation.is_none());
+        }
+    }
+
+    #[test]
+    fn legacy_or_invalid_checkpoint_cannot_invent_pressure_delivery_state() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = SessionStore::at_data_dir(temporary.path());
+        let mut config = DaemonConfig::default();
+        config.triggers.sustained_ticks = 1;
+        let mut triggers = triggers::TriggerState::new(&config.triggers);
+        let mut tracker = IncidentTracker::default();
+        observe_incident(
+            &mut tracker,
+            &mut triggers,
+            &config,
+            &incident_metrics(std::time::Instant::now(), 1, true),
+        );
+        let mut legacy = serde_json::to_value(tracker.checkpoint()).unwrap();
+        assert!(legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("pressure_triggers")
+            .is_some());
+        let checkpoint = store.sessions_root().join(INCIDENT_CHECKPOINT_FILE);
+        crate::session::write_json_pretty(&checkpoint, &legacy).unwrap();
+
+        for mut pressure in [
+            triggers::PressureTriggerState::default(),
+            triggers.pressure.clone(),
+        ] {
+            let original = serde_json::to_value(&pressure).unwrap();
+            let mut recovered = IncidentTracker::default();
+            recovered
+                .recover_with_pressure(&store, &mut pressure)
+                .unwrap();
+            assert_eq!(serde_json::to_value(&pressure).unwrap(), original);
+            assert_eq!(
+                recovered.active_summary().unwrap().causes,
+                vec![RegimeKind::CpuContention]
+            );
+        }
+
+        legacy["schema_version"] = serde_json::json!(999);
+        crate::session::write_json_pretty(&checkpoint, &legacy).unwrap();
+        let mut pressure = triggers.pressure;
+        let original = serde_json::to_value(&pressure).unwrap();
+        assert!(IncidentTracker::default()
+            .recover_with_pressure(&store, &mut pressure)
+            .is_err());
+        assert_eq!(serde_json::to_value(&pressure).unwrap(), original);
     }
 
     #[test]

@@ -19753,7 +19753,10 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
     let incident_store = pt_core::session::SessionStore::from_env();
     match &incident_store {
         Ok(store) => {
-            let _ = state_bundle.daemon.incidents.recover_persisted(store);
+            let _ = state_bundle
+                .daemon
+                .incidents
+                .recover_with_pressure(store, &mut state_bundle.triggers.pressure);
         }
         Err(error) => {
             state_bundle.daemon.incidents.storage_error =
@@ -20741,7 +20744,12 @@ fn run_daemon_status(global: &GlobalOpts) -> ExitCode {
     // checkpoint. Status must still expose that evidence without modifying it.
     let last_storage_error = recovered.daemon.incidents.storage_error.clone();
     if let Ok(store) = pt_core::session::SessionStore::from_env() {
-        if recovered.daemon.incidents.recover_persisted(&store).is_ok() {
+        if recovered
+            .daemon
+            .incidents
+            .recover_with_pressure(&store, &mut recovered.triggers.pressure)
+            .is_ok()
+        {
             // Reading an artifact does not prove the daemon's last write
             // succeeded (for example on a full or read-only filesystem).
             recovered.daemon.incidents.storage_error = last_storage_error;

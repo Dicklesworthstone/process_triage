@@ -165,9 +165,15 @@ impl PressureTriggerState {
     pub fn observe(&mut self, config: &TriggerConfig, metrics: &TickMetrics) -> Vec<Regime> {
         let settings = (config.sustained_ticks.max(1), config.pressure_regimes);
         if self.settings != Some(settings) {
+            // Threshold changes restart sustained confirmation, but cannot
+            // erase an observed kernel kill that still needs a delivered review.
+            let pending_oom = self.pending.get(&RegimeKind::OomKills).cloned();
             *self = Self::default();
             self.tracker = RegimeTracker::new(settings.0, settings.1.exit_after_ticks);
             self.settings = Some(settings);
+            if let Some(oom) = pending_oom {
+                self.pending.insert(RegimeKind::OomKills, oom);
+            }
         }
         if !settings.1.enabled {
             return Vec::new();
@@ -1114,6 +1120,54 @@ mod tests {
     }
 
     #[test]
+    fn pending_oom_survives_reconfiguration_until_actual_acknowledgement() {
+        use crate::collect::pressure::VmStat;
+        let mut config = cfg(3, 0);
+        let mut state = TriggerState::new(&config);
+        let start = Instant::now();
+        let reading = |tick: u64, count: u64| {
+            let mut metrics = cpu_reading(start, tick, 0.0, 0);
+            metrics.pressure.as_mut().unwrap().vmstat = Some(VmStat {
+                oom_kill: Some(count),
+                ..VmStat::default()
+            });
+            metrics
+        };
+        assert!(evaluate_triggers(&config, &mut state, &reading(0, 10)).is_empty());
+        let first = evaluate_triggers(&config, &mut state, &reading(1, 11));
+        assert_eq!(first.len(), 1);
+
+        let mut restarted: TriggerState =
+            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+        restarted.pressure.interrupt_observations();
+        config.sustained_ticks = 5;
+        let retry = evaluate_triggers(&config, &mut restarted, &reading(2, 11));
+        assert_eq!(retry.len(), 1);
+        assert_eq!(
+            retry[0].pressure_regime.as_ref().unwrap().kind,
+            RegimeKind::OomKills
+        );
+        assert_eq!(retry[0].description, first[0].description);
+
+        config.pressure_regimes.enabled = false;
+        assert!(evaluate_triggers(&config, &mut restarted, &reading(3, 11)).is_empty());
+        assert!(restarted
+            .pressure
+            .pending
+            .contains_key(&RegimeKind::OomKills));
+        config.pressure_regimes.enabled = true;
+        let resumed = evaluate_triggers(&config, &mut restarted, &reading(4, 11));
+        assert_eq!(resumed.len(), 1);
+        restarted.pressure.acknowledge(&resumed);
+        config.sustained_ticks = 7;
+        assert!(evaluate_triggers(&config, &mut restarted, &reading(5, 11)).is_empty());
+        assert!(!restarted
+            .pressure
+            .pending
+            .contains_key(&RegimeKind::OomKills));
+    }
+
+    #[test]
     fn fd_and_memory_regimes_preserve_their_diagnostic_kind() {
         use crate::collect::pressure::{FileHandles, MemInfo};
         let config = cfg(1, 0);
@@ -1187,9 +1241,7 @@ mod tests {
                 .active
                 .contains_key(&RegimeKind::MemoryExhaustion));
         }
-        assert!(
-            evaluate_triggers(&config, &mut state, &reading(9, Some(0.0), 600_000)).is_empty()
-        );
+        assert!(evaluate_triggers(&config, &mut state, &reading(9, Some(0.0), 600_000)).is_empty());
         assert!(!state
             .pressure
             .active
