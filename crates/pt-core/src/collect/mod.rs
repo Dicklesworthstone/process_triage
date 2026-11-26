@@ -108,8 +108,8 @@ pub use tool_runner::{
     DEFAULT_TIMEOUT_SECS,
 };
 pub use types::{
-    CpuOccupancy, ProcessActivity, ProcessMemoryUsage, ProcessPressureActivity, ProcessRecord,
-    ProcessState, ScanMetadata, ScanResult,
+    CpuOccupancy, LeaderWait, ProcessActivity, ProcessMemoryUsage, ProcessPressureActivity,
+    ProcessRecord, ProcessState, ScanMetadata, ScanResult, WaitClass,
 };
 
 // Re-export protected filter types

@@ -3091,6 +3091,7 @@ struct PlanCandidateInput {
     ppid: Option<u32>,
     decision: pt_core::decision::DecisionOutcome,
     process_state: pt_core::collect::ProcessState,
+    d_state_diagnostics: Option<pt_core::plan::DStateDiagnostics>,
     comm: String,
     cmd: String,
     blocked_reasons: Vec<String>,
@@ -3133,7 +3134,7 @@ impl PlanCandidateInput {
             stage_pause_before_kill: false,
             process_state: Some(self.process_state),
             parent_identity: self.parent_identity.clone(),
-            d_state_diagnostics: None,
+            d_state_diagnostics: self.d_state_diagnostics.clone(),
             supervisor_restart: self.supervisor_restart.clone(),
             memory_cap: self.memory_cap.clone(),
         }
@@ -9193,6 +9194,7 @@ fn build_tui_rows(
         let posterior_result = &score.posterior;
         let cpu_percent = process_cpu_percent(proc, score.activity.as_ref());
         let cpu_host_percent = pressure.cpu_goal_percent(proc, score.activity.as_ref());
+        let wait = PlanningWaitState::from_activity(proc, score.activity.as_ref());
         // Reversible selections execute in immutable child sessions, so memory
         // caps use the same durable restoration contract as saved agent plans.
         let (feasibility, memory_cap) = candidate_action_capabilities(proc, &score);
@@ -9355,7 +9357,8 @@ fn build_tui_rows(
                 identity,
                 ppid: Some(proc.ppid.0),
                 decision: decision_outcome.clone(),
-                process_state: proc.state,
+                process_state: wait.state,
+                d_state_diagnostics: wait.diagnostics(),
                 comm: proc.comm.clone(),
                 cmd: proc.cmd.clone(),
                 blocked_reasons,
@@ -25467,6 +25470,7 @@ mod process_tree_safety_tests {
                             ppid: Some(ppid),
                             decision: decision.clone(),
                             process_state: state,
+                            d_state_diagnostics: None,
                             comm: process.comm.clone(),
                             cmd: process.cmd.clone(),
                             blocked_reasons: Vec::new(),
@@ -26663,6 +26667,7 @@ mod process_tree_safety_tests {
                         ppid: Some(1),
                         decision: decision.clone(),
                         process_state: process.state,
+                        d_state_diagnostics: None,
                         comm: process.comm,
                         cmd: process.cmd,
                         blocked_reasons: Vec::new(),
@@ -26731,6 +26736,7 @@ mod process_tree_safety_tests {
                         ppid: Some(process.ppid.0),
                         decision: decision.clone(),
                         process_state: process.state,
+                        d_state_diagnostics: None,
                         comm: process.comm.clone(),
                         cmd: process.cmd.clone(),
                         blocked_reasons: Vec::new(),
@@ -28209,6 +28215,7 @@ mod process_tree_safety_tests {
                     ppid: Some(process.ppid.0),
                     decision,
                     process_state: process.state,
+                    d_state_diagnostics: None,
                     comm: process.comm.clone(),
                     cmd: process.cmd.clone(),
                     blocked_reasons: Vec::new(),
@@ -29624,6 +29631,7 @@ mod process_tree_safety_tests {
                 ppid: Some(child.ppid.0),
                 decision,
                 process_state: child.state,
+                d_state_diagnostics: None,
                 comm: child.comm.clone(),
                 cmd: child.cmd.clone(),
                 blocked_reasons: Vec::new(),
@@ -32778,6 +32786,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                 "supervisor_restart_unavailable": score.supervisor_restart_unavailable,
                 "memory_cap": memory_cap,
             }));
+            let wait = PlanningWaitState::from_activity(proc, score.activity.as_ref());
             action_inputs.insert(
                 proc.pid.0,
                 DecisionCandidate {
@@ -32786,9 +32795,9 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                     decision: decision_outcome,
                     blocked_reasons: Vec::new(),
                     stage_pause_before_kill: false,
-                    process_state: Some(proc.state),
+                    process_state: Some(wait.state),
                     parent_identity: parent.map(process_identity_from_record),
-                    d_state_diagnostics: None,
+                    d_state_diagnostics: wait.diagnostics(),
                     supervisor_restart: score.supervisor_restart.clone(),
                     memory_cap,
                 },
@@ -33523,6 +33532,32 @@ mod planning_pressure_tests {
                 ..ProcessPressureActivity::default()
             }),
         }
+    }
+
+    #[test]
+    fn a_sampled_kernel_wait_tightens_planning_only_for_the_observed_process() {
+        let mut proc = process();
+        let mut sample = activity(&proc);
+        sample.pressure.as_mut().unwrap().leader_wait = Some(pt_core::collect::LeaderWait {
+            state: ProcessState::DiskSleep,
+            class: pt_core::collect::WaitClass::Uninterruptible,
+            wchan: Some("io_schedule".into()),
+        });
+        let wait = PlanningWaitState::from_activity(&proc, Some(&sample));
+        assert_eq!(wait.state, ProcessState::DiskSleep);
+        let diag = wait.diagnostics().unwrap();
+        assert_eq!(diag.wchan.as_deref(), Some("io_schedule"));
+        assert!(diag.io_read_bytes.is_none() && diag.d_state_duration_ms.is_none());
+        let mask = ActionFeasibility::from_process_state(false, wait.state.is_disksleep(), wait.wchan.as_deref());
+        assert!(!mask.is_allowed(Action::Kill));
+        assert!(mask.disabled.iter().any(|rule| rule.reason.contains("io_schedule")));
+        proc.state = ProcessState::Zombie;
+        assert_eq!(PlanningWaitState::from_activity(&proc, Some(&sample)).state, ProcessState::Zombie);
+        proc.state = ProcessState::Running;
+        sample.uid += 1;
+        assert_eq!(PlanningWaitState::from_activity(&proc, Some(&sample)).state, ProcessState::Running);
+        proc.state = ProcessState::DiskSleep;
+        assert_eq!(PlanningWaitState::from_activity(&proc, None).state, ProcessState::DiskSleep);
     }
 
     #[cfg(feature = "ui")]
@@ -35019,6 +35054,38 @@ fn print_responsible_units(table: &ResponsibleUnitTable) {
     print_memory_limit_report(&memory_limit_report(table));
 }
 
+/// A later identity-bound D-state sample can tighten planning. Preserve a
+/// previously observed D-state or zombie when a later sample is unavailable.
+struct PlanningWaitState {
+    state: ProcessState,
+    wchan: Option<String>,
+}
+
+impl PlanningWaitState {
+    fn from_activity(proc: &ProcessRecord, activity: Option<&pt_core::collect::ProcessActivity>) -> Self {
+        let blocked = activity
+            .and_then(|sample| sample.leader_wait_for(proc))
+            .filter(|wait| wait.state.is_disksleep());
+        if let Some(wait) = blocked.filter(|_| matches!(proc.state, ProcessState::Running | ProcessState::Sleeping | ProcessState::DiskSleep)) {
+            return Self {
+                state: ProcessState::DiskSleep,
+                wchan: wait.wchan.clone(),
+            };
+        }
+        Self { state: proc.state, wchan: None }
+    }
+
+    fn diagnostics(&self) -> Option<pt_core::plan::DStateDiagnostics> {
+        Some(pt_core::plan::DStateDiagnostics {
+            wchan: Some(self.wchan.clone()?),
+            // The activity window records byte deltas, not lifetime counters.
+            io_read_bytes: None,
+            io_write_bytes: None,
+            d_state_duration_ms: None,
+        })
+    }
+}
+
 /// Keep the exact memory controller observation that admitted the action. The
 /// saved plan must not invent a different byte limit when it is later applied.
 fn candidate_action_capabilities(
@@ -35028,10 +35095,12 @@ fn candidate_action_capabilities(
     ActionFeasibility,
     Option<pt_core::action::memory_cap::MemoryCapPlan>,
 ) {
-    let mut feasibility = pt_core::action::planning_action_feasibility_with_restart(
+    let wait = PlanningWaitState::from_activity(proc, score.activity.as_ref());
+    let mut feasibility = pt_core::action::dispatch::planning_action_feasibility_with_wait(
         &process_identity_from_record(proc),
-        proc.state,
+        wait.state,
         score.supervisor_restart.as_ref(),
+        wait.wchan.as_deref(),
     );
     if let Some(reason) = &score.supervisor_restart_unavailable {
         for disabled in &mut feasibility.disabled {
@@ -35173,6 +35242,7 @@ fn candidate_recommendation(
     #[cfg(target_os = "linux")]
     let provenance = score.provenance.as_ref();
 
+    let wait = PlanningWaitState::from_activity(proc, score.activity.as_ref());
     let candidate = pt_core::decision::ProcessCandidate {
         pid: proc.pid.0 as i32,
         ppid: proc.ppid.0 as i32,
@@ -35195,8 +35265,8 @@ fn candidate_recommendation(
         has_active_tty: Some(proc.has_tty()),
         seconds_since_io: None,
         cwd_deleted: None,
-        process_state: Some(proc.state),
-        wchan: None,
+        process_state: Some(wait.state),
+        wchan: wait.wchan,
         critical_files,
         cgroup_role: policy
             .guardrails
@@ -36841,6 +36911,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             }
         }
 
+        let wait = PlanningWaitState::from_activity(proc, activity.as_ref());
         // Store candidate with its ranking key (no early break!)
         action_inputs.insert(
             proc.pid.0,
@@ -36850,9 +36921,9 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 decision: decision_outcome,
                 blocked_reasons,
                 stage_pause_before_kill: false,
-                process_state: Some(proc.state),
+                process_state: Some(wait.state),
                 parent_identity: parent.map(process_identity_from_record),
-                d_state_diagnostics: None,
+                d_state_diagnostics: wait.diagnostics(),
                 supervisor_restart: scorer.supervisor_restart_for(proc).cloned(),
                 memory_cap,
             },
@@ -46372,6 +46443,7 @@ fn evaluate_watch_candidate(
         "intervention_probability"
     };
 
+    let wait = PlanningWaitState::from_activity(proc, score.activity.as_ref());
     Some(WatchEval {
         confidence,
         decision_candidate: DecisionCandidate {
@@ -46380,9 +46452,9 @@ fn evaluate_watch_candidate(
             decision: decision_outcome,
             blocked_reasons: Vec::new(),
             stage_pause_before_kill: false,
-            process_state: Some(proc.state),
+            process_state: Some(wait.state),
             parent_identity: parent.map(process_identity_from_record),
-            d_state_diagnostics: None,
+            d_state_diagnostics: wait.diagnostics(),
             supervisor_restart: score.supervisor_restart.clone(),
             memory_cap: memory_cap.clone(),
         },

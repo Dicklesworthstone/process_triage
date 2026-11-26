@@ -21,7 +21,8 @@ use super::proc_parsers::{
     parse_io_content, parse_process_memory_status, parse_schedstat_content, IoStats, SchedStats,
 };
 use super::{
-    CpuOccupancy, ProcessActivity, ProcessMemoryUsage, ProcessPressureActivity, ProcessRecord,
+    CpuOccupancy, LeaderWait, ProcessActivity, ProcessMemoryUsage, ProcessPressureActivity,
+    ProcessRecord, ProcessState,
 };
 use pt_common::{IdentityQuality, ProcessIdentity, StartId};
 use serde::{Deserialize, Serialize};
@@ -275,6 +276,7 @@ pub fn collect_tick_snapshot(pid: u32) -> Option<TickSnapshot> {
 
 #[derive(Debug, Clone)]
 struct PressureStatCounters {
+    state: ProcessState,
     major_faults: Option<u64>,
     leader_blkio_delay_ticks: Option<u64>,
 }
@@ -283,6 +285,7 @@ fn parse_pressure_stat_counters(content: &str) -> Option<PressureStatCounters> {
     let after_comm = content.get(content.rfind(')')? + 1..)?;
     let fields: Vec<_> = after_comm.split_whitespace().collect();
     Some(PressureStatCounters {
+        state: ProcessState::from_char(fields.first()?.chars().next()?),
         // proc_pid_stat(5): fields 12 and 42; this slice starts at field 3.
         major_faults: fields.get(9).and_then(|value| value.parse().ok()),
         leader_blkio_delay_ticks: fields.get(39).and_then(|value| value.parse().ok()),
@@ -515,6 +518,7 @@ pub fn sample_tick_delta(
 
 #[derive(Debug, Clone)]
 struct ActivitySnapshot {
+    leader_wait: Option<LeaderWait>,
     ticks: TickSnapshot,
     io: Result<IoStats, String>,
     io_observed_at: Instant,
@@ -578,9 +582,10 @@ fn collect_activity_snapshot(
     process: &ProcessRecord,
     accounting: &ActivityAccounting,
     capacities: &mut CpuCapacitySampler,
+    observe_wait: bool,
 ) -> Result<ActivitySnapshot, String> {
     let pid = process.pid.0;
-    let before = collect_tick_snapshot(pid)
+    let (before, first_stat) = collect_tick_sample(pid)
         .ok_or_else(|| "CPU stat/identity is unreadable or invalid".to_string())?;
     if !ticks_match_process(&before, process) {
         return Err("process identity does not match the scanned incarnation".to_string());
@@ -605,6 +610,14 @@ fn collect_activity_snapshot(
         .and_then(|content| parse_process_memory_status(&content));
     let cpu_capacity = capacities.observe(pid, before.num_threads);
 
+    // Only the final endpoint is reported. A sleeping task's hidden symbol
+    // cannot distinguish between different waits.
+    let channel = if observe_wait && matches!(first_stat.state, ProcessState::Sleeping | ProcessState::DiskSleep) {
+        super::proc_parsers::parse_wchan(pid)
+    } else {
+        None
+    };
+
     // All these files are addressed by numeric PID. Bracket them with identity
     // reads so a replacement cannot donate counters or memory to the old record.
     let (after, counters) = collect_tick_sample(pid).ok_or_else(|| {
@@ -618,7 +631,13 @@ fn collect_activity_snapshot(
     } else {
         Err("thread count changed while sampling CPU capacity".to_string())
     };
+    let leader_wait = if observe_wait {
+        LeaderWait::from_sample(first_stat.state, counters.state, channel.as_deref())
+    } else {
+        None
+    };
     Ok(ActivitySnapshot {
+        leader_wait,
         ticks: after,
         io,
         io_observed_at,
@@ -675,7 +694,10 @@ fn pressure_from_snapshots(
     after: &ActivitySnapshot,
     clock_ticks_per_second: u64,
 ) -> ProcessPressureActivity {
-    let mut pressure = ProcessPressureActivity::default();
+    let mut pressure = ProcessPressureActivity {
+        leader_wait: after.leader_wait.clone(),
+        ..Default::default()
+    };
     match &after.memory {
         Ok(memory) => pressure.memory = Some(memory.clone()),
         Err(error) => pressure.memory_error = Some(error.clone()),
@@ -859,7 +881,7 @@ pub fn sample_process_activity(
         .map(|process| {
             (
                 process,
-                collect_activity_snapshot(process, &accounting_before, &mut capacities_before),
+                collect_activity_snapshot(process, &accounting_before, &mut capacities_before, false),
             )
         })
         .collect();
@@ -880,6 +902,7 @@ pub fn sample_process_activity(
                     process,
                     &accounting_after,
                     &mut capacities_after,
+                    true,
                 ) {
                     Ok(after) => activity_from_snapshots(process, &before, &after, window, tck),
                     Err(error) => ProcessActivity::unavailable(
@@ -929,6 +952,7 @@ mod tests {
         };
         let instant = Instant::now();
         let first = ActivitySnapshot {
+            leader_wait: None,
             ticks: TickSnapshot {
                 pid: 1234,
                 identity,
@@ -947,6 +971,7 @@ mod tests {
             }),
             io_observed_at: instant,
             counters: PressureStatCounters {
+                state: ProcessState::Sleeping,
                 major_faults: Some(10_000),
                 leader_blkio_delay_ticks: Some(100),
             },
@@ -973,6 +998,18 @@ mod tests {
         second.io_observed_at += Duration::from_millis(500);
         second.scheduler_observed_at += Duration::from_millis(500);
         (process, first, second)
+    }
+
+    #[test]
+    fn window_reports_only_the_final_leader_wait_and_rejects_reused_identity() {
+        let (proc, mut first, mut second) = activity_fixture();
+        first.leader_wait = LeaderWait::from_sample(ProcessState::Sleeping, ProcessState::Sleeping, Some("pipe_read"));
+        second.leader_wait = LeaderWait::from_sample(ProcessState::Sleeping, ProcessState::Sleeping, Some("do_wait"));
+        let sample = activity_from_snapshots(&proc, &first, &second, Duration::from_millis(500), 100);
+        assert_eq!(sample.pressure.unwrap().leader_wait.unwrap().wchan.as_deref(), Some("do_wait"));
+        second.ticks.identity.uid += 1;
+        let rejected = activity_from_snapshots(&proc, &first, &second, Duration::from_millis(500), 100);
+        assert!(rejected.pressure.unwrap().leader_wait.is_none());
     }
 
     fn capacity_fixture(threads: u32, affinity: u32, quota: Option<f64>) -> CpuCapacitySample {

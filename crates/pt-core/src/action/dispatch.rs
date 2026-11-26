@@ -206,8 +206,18 @@ pub fn planning_action_feasibility_with_restart(
     state: ProcessState,
     supervisor_restart: Option<&super::supervisor::SystemdUserServiceBinding>,
 ) -> ActionFeasibility {
+    planning_action_feasibility_with_wait(target, state, supervisor_restart, None)
+}
+
+/// Use a wait channel bound to the same incarnation for D-state diagnostics.
+pub fn planning_action_feasibility_with_wait(
+    target: &ProcessIdentity,
+    state: ProcessState,
+    supervisor_restart: Option<&super::supervisor::SystemdUserServiceBinding>,
+    wchan: Option<&str>,
+) -> ActionFeasibility {
     let mut feasibility =
-        ActionFeasibility::from_process_state(state.is_zombie(), state.is_disksleep(), None);
+        ActionFeasibility::from_process_state(state.is_zombie(), state.is_disksleep(), wchan);
     let bound_user_restart = !state.is_zombie()
         && supervisor_restart.is_some_and(|binding| binding.matches_target(target));
     if bound_user_restart {

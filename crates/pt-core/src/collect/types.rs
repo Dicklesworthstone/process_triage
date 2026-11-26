@@ -217,6 +217,73 @@ pub struct ProcessMemoryUsage {
     pub threads: u32,
 }
 
+/// Instantaneous Linux thread-group leader observation. Sleeping here says
+/// nothing about what the other threads are doing or how long this wait lasted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct LeaderWait {
+    pub state: ProcessState,
+    pub class: WaitClass,
+    pub wchan: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitClass {
+    Runnable,
+    WaitingForChild,
+    PipeRead,
+    UnixSocketRead,
+    Timer,
+    EventLoop,
+    Uninterruptible,
+    Other,
+}
+
+impl LeaderWait {
+    /// Classify only matching state observations bracketing the channel read.
+    /// A kernel 0 can mean a hidden symbol, so it never proves a runnable task.
+    pub(crate) fn from_sample(
+        before: ProcessState,
+        after: ProcessState,
+        channel: Option<&str>,
+    ) -> Option<Self> {
+        if before != after {
+            return None;
+        }
+        let wchan = channel.map(str::trim).filter(|symbol| {
+            !symbol.is_empty()
+                && *symbol != "0"
+                && symbol.len() <= 128
+                && symbol
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
+        });
+        let class = match after {
+            ProcessState::Running if wchan.is_none() => WaitClass::Runnable,
+            ProcessState::DiskSleep => WaitClass::Uninterruptible,
+            ProcessState::Sleeping => match wchan? {
+                "do_wait" | "kernel_wait4" | "kernel_waitid" | "__do_wait" => {
+                    WaitClass::WaitingForChild
+                }
+                "pipe_read" | "anon_pipe_read" => WaitClass::PipeRead,
+                "unix_stream_read_generic" | "unix_stream_data_wait" => WaitClass::UnixSocketRead,
+                "hrtimer_nanosleep" | "do_nanosleep" => WaitClass::Timer,
+                "ep_poll" | "do_epoll_wait" | "do_select" | "do_poll" | "do_sys_poll"
+                | "poll_schedule_timeout" | "poll_schedule_timeout.constprop.0" => {
+                    WaitClass::EventLoop
+                }
+                _ => WaitClass::Other,
+            },
+            _ => return None,
+        };
+        Some(Self {
+            state: after,
+            class,
+            wchan: wchan.map(str::to_owned),
+        })
+    }
+}
+
 /// Pressure diagnostics observed alongside CPU and storage-I/O activity.
 ///
 /// Scheduler and block-I/O delay counters cover the thread-group leader only;
@@ -224,6 +291,8 @@ pub struct ProcessMemoryUsage {
 /// kernel accounting stays null with an explanation instead of looking idle.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ProcessPressureActivity {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leader_wait: Option<LeaderWait>,
     pub major_faults: Option<u64>,
     pub major_faults_per_second: Option<f64>,
     pub stat_window_seconds: Option<f64>,
@@ -306,6 +375,17 @@ pub struct ProcessActivity {
 }
 
 impl ProcessActivity {
+    /// Read wait evidence only for its measured incarnation and sampling source.
+    pub fn leader_wait_for(&self, process: &ProcessRecord) -> Option<&LeaderWait> {
+        if self.source != "procfs_window" || self.requested_window_ms == 0 || !self.matches_record(process) {
+            return None;
+        }
+        let wait = self.pressure.as_ref()?.leader_wait.as_ref()?;
+        Some(wait).filter(|wait| {
+            LeaderWait::from_sample(wait.state, wait.state, wait.wchan.as_deref()).as_ref() == Some(*wait)
+        })
+    }
+
     /// CPU input used by scoring and explain/replay surfaces. A requested Linux
     /// window requires recorded capacity; only the explicit native-ps fallback
     /// retains the legacy one-core fraction on unsupported platforms.
@@ -467,6 +547,49 @@ mod tests {
             source: "test".to_string(),
             container_info: None,
         }
+    }
+
+    #[test]
+    fn leader_wait_distinguishes_known_symbols_hidden_channels_and_state_changes() {
+        use ProcessState::{DiskSleep, Running, Sleeping};
+        for (symbol, class) in [
+            ("do_wait", WaitClass::WaitingForChild),
+            ("anon_pipe_read", WaitClass::PipeRead),
+            ("unix_stream_data_wait", WaitClass::UnixSocketRead),
+            ("hrtimer_nanosleep", WaitClass::Timer),
+            ("ep_poll", WaitClass::EventLoop),
+            ("futex_wait_queue", WaitClass::Other),
+        ] {
+            let sample = LeaderWait::from_sample(Sleeping, Sleeping, Some(symbol)).unwrap();
+            assert_eq!(sample.class, class);
+            assert_eq!(sample.wchan.as_deref(), Some(symbol));
+        }
+        for channel in [None, Some("0"), Some(""), Some("invalid symbol")] {
+            assert!(LeaderWait::from_sample(Sleeping, Sleeping, channel).is_none());
+            let blocked = LeaderWait::from_sample(DiskSleep, DiskSleep, channel).unwrap();
+            assert_eq!(blocked.class, WaitClass::Uninterruptible);
+            assert!(blocked.wchan.is_none());
+        }
+        assert!(LeaderWait::from_sample(Sleeping, DiskSleep, Some("io_schedule")).is_none());
+        assert!(LeaderWait::from_sample(Running, Running, Some("pipe_read")).is_none());
+        assert_eq!(LeaderWait::from_sample(Running, Running, None).unwrap().class, WaitClass::Runnable);
+    }
+
+    #[test]
+    fn wait_evidence_is_bound_to_the_incarnation_and_sampling_source() {
+        let process = record(120, 1, Some(1));
+        let mut sample = ProcessActivity::unavailable(&process, Duration::from_secs(1), "fixture");
+        sample.source = "procfs_window".into();
+        sample.pressure.as_mut().unwrap().leader_wait =
+            LeaderWait::from_sample(ProcessState::DiskSleep, ProcessState::DiskSleep, Some("io_schedule"));
+        assert!(sample.leader_wait_for(&process).is_some());
+        let mut reused = process.clone();
+        reused.start_id = StartId::from_linux("b", 2, 120);
+        assert!(sample.leader_wait_for(&reused).is_none());
+        sample.source = "ps_lifetime_fallback".into();
+        assert!(sample.leader_wait_for(&process).is_none());
+        let legacy: ProcessPressureActivity = serde_json::from_str("{}").unwrap();
+        assert!(legacy.leader_wait.is_none());
     }
 
     #[test]
