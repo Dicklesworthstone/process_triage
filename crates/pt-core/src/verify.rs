@@ -1238,6 +1238,21 @@ fn find_respawn_with_birth_order(
     current: &[ProcessRecord],
     required_order: std::cmp::Ordering,
 ) -> Option<RespawnDetected> {
+    let replacement =
+        find_respawn_candidate_with_birth_order(action, executed, current, required_order)?;
+    let parent = observed_respawn_parent(executed, current).ok()?;
+    Some(attributed_respawn(replacement, parent))
+}
+
+/// A command, owner and numeric PPID identify only a possible replacement.
+/// Keep that observation separate from attribution so missing parent evidence
+/// cannot turn either a false positive or an unknown lineage into success.
+fn find_respawn_candidate_with_birth_order<'a>(
+    action: &PlanAction,
+    executed: &SavedActionOutcome,
+    current: &'a [ProcessRecord],
+    required_order: std::cmp::Ordering,
+) -> Option<&'a ProcessRecord> {
     if action.action != Action::Kill
         || action.blocked
         || executed.status != "success"
@@ -1253,18 +1268,8 @@ fn find_respawn_with_birth_order(
         return None;
     }
     let parent_pid = executed.parent_pid?;
-    let parent = current.iter().find(|process| process.pid.0 == parent_pid);
-    if let Some(identity) = &executed.parent_identity {
-        let parent = parent?;
-        if parent.pid != identity.pid
-            || parent.uid != identity.uid
-            || parent.start_id != identity.start_id
-        {
-            return None;
-        }
-    }
     let executed_at = executed.executed_at?;
-    let replacement = current
+    current
         .iter()
         .filter(|process| {
             process.uid == action.target.uid
@@ -1274,15 +1279,58 @@ fn find_respawn_with_birth_order(
                 && normalize_cmd(&process.cmd) == command
                 && execution_birth_order(process, executed, executed_at) == Some(required_order)
         })
-        .max_by_key(|process| (process.start_time_unix, process.pid.0))?;
-    Some(RespawnDetected {
+        .max_by_key(|process| (process.start_time_unix, process.pid.0))
+}
+
+fn observed_respawn_parent<'a>(
+    executed: &SavedActionOutcome,
+    current: &'a [ProcessRecord],
+) -> Result<&'a ProcessRecord, &'static str> {
+    let identity = executed
+        .parent_identity
+        .as_ref()
+        .ok_or("the execution record has no parent birth identity")?;
+    let executed_at = executed
+        .executed_at
+        .ok_or("the execution timestamp is unavailable")?;
+    let (boot, birth) = routed_process_birth(identity, executed_at, cfg!(target_os = "macos"))
+        .ok_or("the recorded parent birth identity cannot be revalidated")?;
+    if Some(identity.pid.0) != executed.parent_pid
+        || executed
+            .execution_clock
+            .as_ref()
+            .is_some_and(|clock| boot != clock.boot_id || birth > clock.ticks)
+    {
+        return Err("the recorded parent birth identity is inconsistent with execution");
+    }
+    let mut parents = current.iter().filter(|process| process.pid == identity.pid);
+    let parent = parents
+        .next()
+        .ok_or("the recorded parent is absent from the current snapshot")?;
+    if parents.next().is_some() {
+        return Err("the current snapshot contains ambiguous parent observations");
+    }
+    if parent.uid != identity.uid || parent.start_id != identity.start_id {
+        return Err("the current parent PID has a different birth identity or owner");
+    }
+    if matches!(
+        parent.state,
+        ProcessState::Zombie | ProcessState::Dead | ProcessState::Unknown
+    ) {
+        return Err("the recorded parent has no established live state");
+    }
+    Ok(parent)
+}
+
+fn attributed_respawn(replacement: &ProcessRecord, parent: &ProcessRecord) -> RespawnDetected {
+    RespawnDetected {
         pid: replacement.pid.0,
         cmd_full: replacement.cmd.clone(),
         start_time_unix: replacement.start_time_unix,
-        parent_pid,
-        parent_cmd: parent.map(|process| process.cmd.clone()),
-        parent_start_id: parent.map(|process| process.start_id.0.clone()),
-    })
+        parent_pid: parent.pid.0,
+        parent_cmd: Some(parent.cmd.clone()),
+        parent_start_id: Some(parent.start_id.0.clone()),
+    }
 }
 
 fn execution_birth_order(
@@ -1456,12 +1504,32 @@ pub fn verify_plan_with_postconditions(
             None
         };
         let current_target = by_pid.get(&action.target.pid.0).copied();
-        let respawn = detect_respawn(action, execution, current);
-        let ambiguous_respawn = if respawn.is_none() {
-            find_respawn_with_birth_order(action, execution, current, std::cmp::Ordering::Equal)
+        let replacement = find_respawn_candidate_with_birth_order(
+            action,
+            execution,
+            current,
+            std::cmp::Ordering::Greater,
+        );
+        let same_tick_replacement = if replacement.is_none() {
+            find_respawn_candidate_with_birth_order(
+                action,
+                execution,
+                current,
+                std::cmp::Ordering::Equal,
+            )
         } else {
             None
         };
+        let parent = observed_respawn_parent(execution, current);
+        let respawn = replacement
+            .zip(parent.as_ref().ok())
+            .map(|(replacement, parent)| attributed_respawn(replacement, parent));
+        let ambiguous_respawn = same_tick_replacement
+            .zip(parent.as_ref().ok())
+            .map(|(replacement, parent)| attributed_respawn(replacement, parent));
+        let unverified_lineage = replacement
+            .or(same_tick_replacement)
+            .zip(parent.as_ref().err());
         let (outcome, actual, mut note) = if respawn.is_some() {
             (VerifyOutcome::Respawned, "respawned", None)
         } else if let Some(possible) = &ambiguous_respawn {
@@ -1471,6 +1539,31 @@ pub fn verify_plan_with_postconditions(
                 Some(format!(
                     "Matching PID {} from parent {} was born in the execution clock's same tick or second; its birth cannot be ordered against the kill",
                     possible.pid, possible.parent_pid
+                )),
+            )
+        } else if let Some((possible, reason)) = unverified_lineage {
+            let target_observation = match current_target {
+                None => "The executed target is absent from the current snapshot".to_string(),
+                Some(process)
+                    if process.start_id != action.target.start_id
+                        || process.uid != action.target.uid =>
+                {
+                    "The executed target's PID now belongs to a different incarnation".to_string()
+                }
+                Some(process) if process.state.is_zombie() => {
+                    "The executed target is a zombie".to_string()
+                }
+                Some(process) => format!(
+                    "The executed target is still present in state {}",
+                    process.state
+                ),
+            };
+            (
+                VerifyOutcome::Unsupported,
+                "respawn_lineage_unverified",
+                Some(format!(
+                    "{target_observation}. Matching PID {} cannot be attributed to the recorded spawner because {reason}; numeric PPID {} alone does not establish a respawn or successful remediation",
+                    possible.pid.0, possible.ppid.0,
                 )),
             )
         } else {
@@ -1794,6 +1887,11 @@ pub fn verify_plan_with_postconditions(
                     .as_deref()
                     .unwrap_or("command unavailable")
             ));
+        } else if let Some((possible, _)) = unverified_lineage {
+            recommendations.push(format!(
+                "PID {} has a possible replacement at PID {} with unverified parent lineage; inspect the live process tree and create a fresh plan before another kill",
+                action.target.pid.0, possible.pid.0,
+            ));
         } else if outcome == VerifyOutcome::PidReused {
             recommendations.push(format!(
                 "PID {} reused; regenerate plan before taking action",
@@ -1901,8 +1999,9 @@ pub fn verify_plan_with_postconditions(
             .map(|(expected, freed)| ResourceSummary {
                 expected_mb: expected as f64 / (1024.0 * 1024.0),
                 expected_freed_mb: freed as f64 / (1024.0 * 1024.0),
-                shortfall_reason: (freed < expected)
-                    .then(|| "some executed kills remain active or respawned".to_string()),
+                shortfall_reason: (freed < expected).then(|| {
+                    "some executed kills do not have independently verified outcomes".to_string()
+                }),
             })
     };
     Ok(VerificationReport {
@@ -2136,6 +2235,17 @@ mod tests {
             }),
             time_ms: Some(50),
         }
+    }
+
+    fn execution_with_parent(action: &PlanAction) -> (SavedActionOutcome, ProcessRecord) {
+        let mut saved = execution(action);
+        let parent = make_proc(10, 1000, "sh respawner.sh", 1, ProcessState::Sleeping);
+        saved.parent_identity = Some(ProcessIdentity::new(
+            parent.pid.0,
+            parent.start_id.clone(),
+            parent.uid,
+        ));
+        (saved, parent)
     }
 
     fn failed_attempt(action: &PlanAction) -> SavedActionOutcome {
@@ -3116,14 +3226,14 @@ mod tests {
     #[test]
     fn respawn_rejects_near_identical_wrong_owner_parent_command_and_preexisting_process() {
         let action = make_action(123, Action::Kill);
-        let saved = execution(&action);
+        let (saved, parent) = execution_with_parent(&action);
         let positive = make_proc(456, 1000, "node app --port 3000", 20, ProcessState::Running);
-        assert!(detect_respawn(&action, &saved, std::slice::from_ref(&positive)).is_some());
+        assert!(detect_respawn(&action, &saved, &[positive.clone(), parent.clone()]).is_some());
         for recorded_kind in [None, Some(Action::Pause)] {
             let mut wrong_kind = saved.clone();
             wrong_kind.action = recorded_kind;
             assert!(
-                detect_respawn(&action, &wrong_kind, std::slice::from_ref(&positive)).is_none()
+                detect_respawn(&action, &wrong_kind, &[positive.clone(), parent.clone()]).is_none()
             );
         }
         for field in [
@@ -3147,33 +3257,33 @@ mod tests {
                 _ => unreachable!(),
             }
             assert!(
-                detect_respawn(&action, &saved, &[negative]).is_none(),
+                detect_respawn(&action, &saved, &[negative, parent.clone()]).is_none(),
                 "{field}"
             );
         }
         let mut absent_time = saved.clone();
         absent_time.executed_at = None;
-        assert!(detect_respawn(&action, &absent_time, &[positive]).is_none());
+        assert!(detect_respawn(&action, &absent_time, &[positive, parent]).is_none());
     }
 
     #[test]
     fn boot_ticks_detect_later_birth_within_same_wall_second() {
         let action = make_action(123, Action::Kill);
-        let mut saved = execution(&action);
+        let (mut saved, parent) = execution_with_parent(&action);
         saved.execution_clock.as_mut().unwrap().ticks = 1050;
         saved.executed_at = Some(DateTime::from_timestamp(10, 500_000_000).unwrap());
         let mut replacement =
             make_proc(456, 1000, "node app --port 3000", 10, ProcessState::Running);
         replacement.start_id = StartId("boot:1051:456".to_string());
-        assert!(detect_respawn(&action, &saved, std::slice::from_ref(&replacement)).is_some());
+        assert!(detect_respawn(&action, &saved, &[replacement.clone(), parent.clone()]).is_some());
         replacement.start_id = StartId("boot:1049:456".to_string());
-        assert!(detect_respawn(&action, &saved, &[replacement]).is_none());
+        assert!(detect_respawn(&action, &saved, &[replacement, parent.clone()]).is_none());
         saved.execution_clock = None;
         let mut later_second =
             make_proc(456, 1000, "node app --port 3000", 11, ProcessState::Running);
-        assert!(detect_respawn(&action, &saved, std::slice::from_ref(&later_second)).is_some());
+        assert!(detect_respawn(&action, &saved, &[later_second.clone(), parent.clone()]).is_some());
         later_second.start_time_unix = 9;
-        assert!(detect_respawn(&action, &saved, &[later_second]).is_none());
+        assert!(detect_respawn(&action, &saved, &[later_second, parent]).is_none());
     }
 
     #[test]
@@ -3314,6 +3424,169 @@ mod tests {
     }
 
     #[test]
+    fn possible_respawns_without_verified_parent_lineage_are_unknown_not_clean_or_attributed() {
+        let action = make_action(123, Action::Kill);
+        let plan = make_plan(vec![action.clone()]);
+        let predictions = private_predictions(&plan, &[(0, 100 * 1024 * 1024)]);
+        for case in [
+            "missing_saved_parent",
+            "missing_live_parent",
+            "reused_parent",
+            "changed_parent_owner",
+            "duplicate_parent",
+            "zombie_parent",
+            "unknown_parent_state",
+            "parent_from_another_boot",
+            "parent_born_after_execution",
+        ] {
+            for birth_ticks in [1000, 1001] {
+                let (mut saved, mut parent) = execution_with_parent(&action);
+                let mut duplicate = false;
+                let mut absent = false;
+                match case {
+                    "missing_saved_parent" => saved.parent_identity = None,
+                    "missing_live_parent" => absent = true,
+                    "reused_parent" => parent.start_id = StartId("boot:200:10".into()),
+                    "changed_parent_owner" => parent.uid += 1,
+                    "duplicate_parent" => duplicate = true,
+                    "zombie_parent" => parent.state = ProcessState::Zombie,
+                    "unknown_parent_state" => parent.state = ProcessState::Unknown,
+                    "parent_from_another_boot" => {
+                        parent.start_id = StartId("other-boot:100:10".into());
+                        saved.parent_identity.as_mut().unwrap().start_id = parent.start_id.clone();
+                    }
+                    "parent_born_after_execution" => {
+                        parent.start_id = StartId("boot:1100:10".into());
+                        saved.parent_identity.as_mut().unwrap().start_id = parent.start_id.clone();
+                    }
+                    _ => unreachable!(),
+                }
+                let mut replacement =
+                    make_proc(456, 1000, "node app --port 3000", 10, ProcessState::Running);
+                replacement.start_id = StartId(format!("boot:{birth_ticks}:456"));
+                let mut current = vec![replacement];
+                if !absent {
+                    current.push(parent.clone());
+                }
+                if duplicate {
+                    current.push(parent);
+                }
+                // Legacy journals without a parent incarnation remain readable;
+                // deserialization must not manufacture one from the numeric PID.
+                let encoded = serde_json::to_string(&saved).unwrap();
+                let saved = parse_action_outcomes(&encoded).unwrap();
+                assert!(
+                    detect_respawn(&action, &saved[0], &current).is_none(),
+                    "{case}"
+                );
+                let verification = forecast_report(&plan, &saved, &current, &predictions);
+                let outcome = &verification.action_outcomes[0];
+                assert_eq!(outcome.outcome, VerifyOutcome::Unsupported, "{case}");
+                assert_eq!(
+                    outcome.actual.as_deref(),
+                    Some("respawn_lineage_unverified"),
+                    "{case}"
+                );
+                assert_eq!(outcome.verified, Some(false), "{case}");
+                assert!(outcome.respawn_detected.is_none(), "{case}");
+                assert!(outcome.expected_resources_freed.is_none(), "{case}");
+                let note = outcome.note.as_ref().unwrap();
+                assert!(note.contains("executed target is absent"), "{case}: {note}");
+                assert!(note.contains("numeric PPID 10 alone"), "{case}: {note}");
+                assert_eq!(
+                    verification.verification.overall_status, "failure",
+                    "{case}"
+                );
+                assert_eq!(verification.follow_up_needed, Some(true), "{case}");
+                assert!(verification.recommendations.as_ref().unwrap()[0]
+                    .contains("unverified parent lineage"));
+                let resources = verification.resource_summary.as_ref().unwrap();
+                assert_eq!(resources.expected_mb, 100.0, "{case}");
+                assert_eq!(resources.expected_freed_mb, 0.0, "{case}");
+                assert!(resources.shortfall_reason.is_some(), "{case}");
+                let json = serde_json::to_value(&verification).unwrap();
+                assert_eq!(json["action_outcomes"][0]["outcome"], "unsupported");
+                assert!(json["action_outcomes"][0].get("respawn_detected").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_respawn_lineage_preserves_the_original_targets_observed_state() {
+        let action = make_action(123, Action::Kill);
+        let saved = execution(&action);
+        let plan = make_plan(vec![action]);
+        let possible = make_proc(456, 1000, "node app --port 3000", 20, ProcessState::Running);
+        for (state, start_id, expected_note) in [
+            (
+                ProcessState::Zombie,
+                "boot:500:123",
+                "executed target is a zombie",
+            ),
+            (
+                ProcessState::Running,
+                "boot:500:123",
+                "executed target is still present in state",
+            ),
+            (
+                ProcessState::Running,
+                "boot:900:123",
+                "target's PID now belongs to a different incarnation",
+            ),
+        ] {
+            let mut original = make_proc(123, 1000, "node app --port 3000", 5, state);
+            original.start_id = StartId(start_id.into());
+            let verification = report(
+                &plan,
+                std::slice::from_ref(&saved),
+                &[possible.clone(), original],
+            );
+            let outcome = &verification.action_outcomes[0];
+            assert_eq!(outcome.outcome, VerifyOutcome::Unsupported);
+            assert_eq!(outcome.verified, Some(false));
+            assert!(outcome.note.as_ref().unwrap().contains(expected_note));
+            assert!(outcome.respawn_detected.is_none());
+            assert_eq!(verification.follow_up_needed, Some(true));
+        }
+    }
+
+    #[test]
+    fn legacy_parentless_execution_can_confirm_death_without_a_possible_replacement() {
+        let action = make_action(123, Action::Kill);
+        let saved = execution(&action);
+        let plan = make_plan(vec![action]);
+        for variant in [
+            "absent",
+            "older",
+            "other_parent",
+            "other_owner",
+            "other_command",
+        ] {
+            let mut process =
+                make_proc(456, 1000, "node app --port 3000", 20, ProcessState::Running);
+            match variant {
+                "absent" => {}
+                "older" => process.start_id = StartId("boot:900:456".into()),
+                "other_parent" => process.ppid = ProcessId(11),
+                "other_owner" => process.uid += 1,
+                "other_command" => process.cmd = "node app --port 30000".into(),
+                _ => unreachable!(),
+            }
+            let current = if variant == "absent" {
+                vec![]
+            } else {
+                vec![process]
+            };
+            let verification = report(&plan, std::slice::from_ref(&saved), &current);
+            let outcome = &verification.action_outcomes[0];
+            assert_eq!(outcome.outcome, VerifyOutcome::ConfirmedDead, "{variant}");
+            assert_eq!(outcome.verified, Some(true), "{variant}");
+            assert!(outcome.respawn_detected.is_none(), "{variant}");
+            assert_eq!(verification.follow_up_needed, Some(false), "{variant}");
+        }
+    }
+
+    #[test]
     fn executed_kill_verifies_absence_zombie_and_identity_reuse() {
         let action = make_action(123, Action::Kill);
         let saved = execution(&action);
@@ -3361,7 +3634,7 @@ mod tests {
     #[test]
     fn same_pid_birth_order_distinguishes_reuse_ambiguity_and_respawn() {
         let action = make_action(123, Action::Kill);
-        let saved = execution(&action);
+        let (saved, parent) = execution_with_parent(&action);
         let plan = make_plan(vec![action]);
         for (ticks, expected, actual) in [
             (999, VerifyOutcome::PidReused, "pid_reused"),
@@ -3376,7 +3649,11 @@ mod tests {
                 ProcessState::Running,
             );
             process.start_id = StartId(format!("boot:{ticks}:123"));
-            let verified = report(&plan, std::slice::from_ref(&saved), &[process]);
+            let verified = report(
+                &plan,
+                std::slice::from_ref(&saved),
+                &[process, parent.clone()],
+            );
             let outcome = &verified.action_outcomes[0];
             assert_eq!(outcome.outcome, expected);
             assert_eq!(outcome.actual.as_deref(), Some(actual));
