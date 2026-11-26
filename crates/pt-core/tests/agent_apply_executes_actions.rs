@@ -3774,6 +3774,100 @@ fn agent_apply_subset_and_failed_child_do_not_kill_a_live_parent() {
 }
 
 #[test]
+fn agent_apply_resume_preserves_the_confirmed_selection_across_pid_reuse() {
+    let data = TempDir::new().unwrap();
+    let config = TempDir::new().unwrap();
+    write_test_policy(config.path());
+    let first = ForeignTarget::spawn("sleep 354");
+    let other = ForeignTarget::spawn("sleep 355");
+    let first_id = live_identity(first.pid);
+    let other_id = live_identity(other.pid);
+    let other_nice = nice_of(other.pid).unwrap();
+    let mut previous = other_id.clone();
+    let (head, _) = previous.start_id.0.rsplit_once(':').unwrap();
+    let (boot, ticks) = head.rsplit_once(':').unwrap();
+    previous.start_id.0 = format!("{boot}:{}:{}", ticks.parse::<u64>().unwrap() + 7, other.pid);
+
+    let mut completed = plan_action(Action::Renice, &first_id);
+    completed.action_id = "approved-completed".into();
+    let mut pending = plan_action(Action::Renice, &previous);
+    pending.action_id = "approved-stale".into();
+    let mut outside = plan_action(Action::Renice, &other_id);
+    outside.action_id = "outside".into();
+    let session = session_with_actions(data.path(), vec![completed, pending, outside]);
+    let handle = SessionStore::at_data_dir(data.path())
+        .open(&SessionId::parse(&session).unwrap()).unwrap();
+    let scope = handle.dir.join("action/apply_scope.json");
+    let selected = format!("{}:{},{}:{}", first.pid, first_id.start_id.0, other.pid, previous.start_id.0);
+    let other_target = format!("{}:{}", other.pid, other_id.start_id.0);
+    let run = |label: &str, preview: bool, flags: &[&str]| {
+        let mut args = vec!["--format", "json"];
+        if preview {
+            args.push("--dry-run");
+        }
+        args.extend(["agent", "apply", "--session", &session, "--settle", "0"]);
+        args.extend_from_slice(flags);
+        recorded_action_command(data.path(), config.path(), &session, label, &args).1
+    };
+
+    run("preview", true, &["--targets", &selected]);
+    assert!(!scope.exists(), "a preview must not grant authority to resume");
+    let result = run("confirm", false, &["--targets", &selected, "--yes", "--max-kills", "2"]);
+    assert!(result["outcomes"].as_array().unwrap().iter()
+        .any(|row| row["action_id"] == "approved-completed" && row["status"] == "success"), "{result}");
+    let bytes = fs::read(&scope).unwrap();
+    let approval: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(approval["action_ids"], serde_json::json!(["approved-completed", "approved-stale"]));
+    assert_eq!(approval["limits"]["max_kills"], 2);
+    let status_args = ["--format", "json", "agent", "sessions", "--session", &session];
+    let (_, status) = recorded_action_command(data.path(), config.path(), &session, "status", &status_args);
+    assert_eq!(status["progress"]["pending_actions"], 2, "{status}");
+    assert_eq!(status["progress"]["approved_pending_actions"], 1, "{status}");
+    assert!(status["resume_command"].as_str().unwrap().ends_with("--resume"), "{status}");
+    for flags in [vec!["--resume"], vec!["--resume", "--recommended"]] {
+        let pending = run("resume-preview", true, &flags);
+        let rows = pending["outcomes"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{pending}");
+        assert_eq!(rows[0]["action_id"], "approved-stale", "{pending}");
+    }
+    assert_eq!(run("widen", true, &["--resume", "--targets", &other_target])["error"], "apply_scope_refused");
+    assert_eq!(run("ambiguous", true, &["--resume", "--pids", &other.pid.to_string()])["error"], "apply_scope_refused");
+    assert_eq!(fs::read(&scope).unwrap(), bytes);
+    assert_eq!(nice_of(other.pid).unwrap(), other_nice);
+
+    // A changed canonical identity cannot inherit even an existing action ID.
+    let path = handle.dir.join("decision/plan.json");
+    let original = fs::read(&path).unwrap();
+    let mut altered: Value = serde_json::from_slice(&original).unwrap();
+    altered["actions"][2]["target"]["start_id"] = serde_json::json!(previous.start_id.0);
+    fs::write(&path, serde_json::to_vec(&altered).unwrap()).unwrap();
+    assert_eq!(run("changed-plan", true, &["--resume"])["error"], "apply_scope_refused");
+    fs::write(path, original).unwrap();
+
+    // Older sessions may have valid terminal outcomes but no record of whether
+    // untouched actions were selected. They need an explicit identity approval.
+    fs::remove_file(&scope).unwrap();
+    for flags in [vec!["--resume"], vec!["--resume", "--recommended"]] {
+        assert_eq!(run("legacy", true, &flags)["error"], "apply_scope_refused");
+    }
+    let exact = run("legacy-exact", true, &["--resume", "--targets", &other_target]);
+    assert_eq!(exact["outcomes"][0]["action_id"], "outside", "{exact}");
+    assert!(!scope.exists());
+
+    // A deliberate fresh approval can select a full plan. Its following bare
+    // resume skips successful rows and keeps the unfinished identity in scope.
+    let full = run("fresh-full", false, &["--recommended", "--yes"]);
+    assert!(full["outcomes"].as_array().unwrap().iter()
+        .any(|row| row["action_id"] == "outside" && row["status"] == "success"), "{full}");
+    let full_scope: Value = serde_json::from_slice(&fs::read(&scope).unwrap()).unwrap();
+    assert_eq!(full_scope["action_ids"].as_array().unwrap().len(), 3);
+    let remaining = run("full-resume", true, &["--resume"]);
+    let rows = remaining["outcomes"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{remaining}");
+    assert_eq!(rows[0]["action_id"], "approved-stale", "{remaining}");
+}
+
+#[test]
 fn agent_apply_executes_renice_then_kill_on_live_process() {
     let data_dir = TempDir::new().expect("data dir").keep();
     let config_dir = TempDir::new().expect("config dir").keep();

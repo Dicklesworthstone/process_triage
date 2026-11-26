@@ -917,11 +917,12 @@ fn sessions_report_interrupted_admissions_without_completed_progress_or_resume_h
             assert_eq!(status["progress"]["pending_actions"], 1 - count, "{status}");
             assert_eq!(status["execution_uncertain"], uncertain, "{status}");
             assert_eq!(status["progress"]["failed_actions"], failures, "{status}");
-            assert_eq!(status["resumable"], !uncertain && count == 0, "{status}");
-            assert_eq!(status["resume_command"].is_null(), uncertain || count > 0, "{status}");
+            assert_eq!(status["resumable"], false, "{status}");
+            assert!(status["resume_command"].is_null(), "{status}");
+            assert_eq!(status["progress"]["approved_pending_actions"], 0, "{status}");
             assert_eq!(
                 status["resume_refusal_reason"].is_string(),
-                uncertain,
+                uncertain || count == 0,
                 "{status}"
             );
             assert_eq!(status["outcomes"].as_array().unwrap().len(), records.len());
@@ -945,7 +946,9 @@ fn sessions_offer_resume_only_for_an_executable_plan_and_intact_journal() {
                 .assert().success().get_output().stdout.clone();
             serde_json::from_slice::<Value>(&output).unwrap()
         };
-        assert!(status()["resume_command"].is_string());
+        let unapproved = status();
+        assert!(unapproved["resume_command"].is_null());
+        assert!(unapproved["resume_refusal_reason"].as_str().unwrap().contains("no saved apply scope"));
 
         fs::rename(&path, path.with_extension("backup")).unwrap();
         let missing = status();
