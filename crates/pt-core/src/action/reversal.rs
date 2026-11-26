@@ -38,8 +38,9 @@ const MAX_RESTORATIONS: usize = 64;
 #[cfg(target_os = "linux")]
 const MAX_RESTORE_VERIFY_MS: u64 = 10_000;
 
-/// New journaled freezes schedule recovery after this many seconds. The daemon
-/// or next mutating invocation attempts the conditional thaw; read-only scans do not.
+/// New journaled freezes and pauses schedule recovery after this many seconds.
+/// The daemon or next mutating invocation attempts conditional thaw or resume;
+/// read-only scans do not.
 pub const DEFAULT_FREEZE_TTL_SECS: u64 = 30 * 60;
 
 #[cfg(target_os = "linux")]
@@ -53,9 +54,10 @@ const RECOVERY_WALL_BUDGET: Duration = Duration::from_secs(2);
 #[cfg(target_os = "linux")]
 const MAX_AUTOMATIC_THAW_ATTEMPTS: u8 = 8;
 
-/// A deadline in Linux's suspend-aware boot clock. The cgroup receipt supplies
-/// the boot identity; the time namespace also has to match before clocks compare.
-/// This authorizes clearing only a freeze request that pt changed from 0 to 1.
+/// A deadline in Linux's suspend-aware boot clock. The recorded cgroup or process
+/// supplies the boot identity; the time namespace must match before clocks compare.
+/// Only a new freeze request or pause of a previously running process is eligible.
+/// The existing type and serialized field names also cover signal-pause leases.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FreezeLease {
@@ -200,15 +202,25 @@ fn action_digest(action: &PlanAction) -> Result<String, ActionError> {
 #[cfg(target_os = "linux")]
 impl FreezeLease {
     fn validate(&self, record: &ReversalRecord) -> Result<(), ActionError> {
-        if record.action != Action::Freeze
-            || !matches!(
-                record.operation,
+        let owns_stop = matches!(
+            (record.action, &record.operation),
+            (
+                Action::Freeze,
                 ReversalOperation::CgroupV2 {
                     before: ReversalValue::Freeze { requested: false },
                     applied: ReversalValue::Freeze { requested: true },
                     ..
                 }
+            ) | (
+                Action::Pause,
+                ReversalOperation::SignalStop {
+                    was_stopped: false,
+                    ..
+                }
             )
+        );
+        if !owns_stop
+            || record.status == ReversalStatus::NotApplied
             || self.time_namespace_inode == 0
             || self
                 .expires_boottime_ms
@@ -224,7 +236,7 @@ impl FreezeLease {
                 .last_recovery_boottime_ms
                 .is_some_and(|last| last < self.expires_boottime_ms)
         {
-            return Err(failed("invalid or unowned automatic freeze lease"));
+            return Err(failed("invalid or unowned automatic freeze or pause lease"));
         }
         self.approved_action
             .validate_signal_timing()
@@ -245,11 +257,19 @@ fn freeze_lease_due(
     if !record.has_unresolved_control() {
         return Ok(false);
     }
-    let ReversalOperation::CgroupV2 { scope, .. } = &record.operation else {
-        return Err(failed("automatic thaw requires a recorded cgroup freeze"));
+    let boot_id = match &record.operation {
+        ReversalOperation::CgroupV2 { scope, .. } => scope.boot_id.as_str(),
+        ReversalOperation::SignalStop { target, .. } => {
+            target.start_id.0.split(':').next().unwrap_or_default()
+        }
+        _ => {
+            return Err(failed(
+                "automatic recovery requires a recorded freeze or pause",
+            ))
+        }
     };
-    if clock.boot_id != scope.boot_id {
-        // A freeze from an earlier boot cannot own a control in this boot.
+    if clock.boot_id != boot_id {
+        // An earlier boot cannot own a control in this boot.
         return Ok(false);
     }
     if clock.time_namespace_device != lease.time_namespace_device
@@ -258,6 +278,16 @@ fn freeze_lease_due(
     {
         return Err(failed(
             "freeze lease clock or time namespace is not comparable",
+        ));
+    }
+    if matches!(record.operation, ReversalOperation::SignalStop { .. })
+        && !record.restorations.is_empty()
+    {
+        // A failed or interrupted restoration might already have sent SIGCONT.
+        // Retrying automatically could release a later external stop; explicit
+        // undo must review that ambiguous ownership instead.
+        return Err(failed(
+            "automatic pause recovery cannot retry an attempted restoration; inspect the retained receipt and use agent undo",
         ));
     }
     if lease.recovery_attempts >= MAX_AUTOMATIC_THAW_ATTEMPTS {
@@ -1083,12 +1113,20 @@ impl ReversalJournal {
             was_stopped,
             action.timeouts.verify_ms.min(MAX_RESTORE_VERIFY_MS),
         )?;
+        let freeze_lease = if was_stopped {
+            None
+        } else {
+            let clock = FreezeRecoveryClock::read()?;
+            validate_target(&action.target, &clock.boot_id)?;
+            Some(clock.lease(action, &self.plan_sha256)?)
+        };
         if job_control_stopped(super::signal::signal_state(&action.target)?)? != was_stopped {
             return Err(failed(
                 "job-control state changed before pause receipt preparation",
             ));
         }
-        let record = self.insert(action, operation, ReversalStatus::Prepared)?;
+        let record =
+            self.insert_with_lease(action, operation, ReversalStatus::Prepared, freeze_lease)?;
         Ok(PreparedReversal {
             journal: Arc::clone(self),
             attempt_id: record.attempt_id,
@@ -1229,13 +1267,16 @@ impl ReversalJournal {
     }
 }
 
-/// Release due, owned freeze requests using their immutable approved action.
+/// Release due, owned freezes and signal pauses using their approved action.
 ///
 /// The caller must hold the same execution-policy lock as apply/undo for this
 /// entire call and must not invoke it from dry-run, shadow, or read-only paths.
-/// A missing current plan does not remove the obligation to thaw; the private
+/// A missing current plan does not remove the recovery obligation; the private
 /// receipt retains the approved action and its original plan digest. Ordinary
 /// undo continues to require the current canonical plan's exact digest.
+/// Signal pauses allow only one automatic restoration attempt: an interrupted
+/// SIGCONT cannot establish ownership of a later stop. Explicit undo remains
+/// available for review after any failed or interrupted restoration.
 ///
 /// Work stops at bounded session, receipt, restoration, and wall-time budgets.
 /// One pass inspects at most 64 sessions and 4096 discovery receipts, and starts
@@ -1593,6 +1634,11 @@ impl PreparedReversal {
                 ));
             }
             record.status = if result.is_ok() { success } else { failure };
+            if record.status == ReversalStatus::NotApplied {
+                // No signal was attempted, so this receipt must not acquire
+                // automatic resume authority over a later independent stop.
+                record.freeze_lease = None;
+            }
             record.detail = result.as_ref().err().map(ToString::to_string);
             record.updated_at = now();
             self.journal.write_record(&directory, &record, false)
@@ -2609,7 +2655,7 @@ fn restore_live_before(
         return Ok(changed);
     }
     if matches!(record.operation, ReversalOperation::SignalStop { .. }) {
-        return restore_signal_stop(record);
+        return restore_signal_stop(record, deadline);
     }
     let ReversalOperation::CgroupV2 { scope, .. } = &record.operation else {
         return Err(failed("unsupported recorded undo operation"));
@@ -2853,7 +2899,10 @@ fn observe_original_signal_stop(
 }
 
 #[cfg(target_os = "linux")]
-fn restore_signal_stop(record: &ReversalRecord) -> Result<bool, ActionError> {
+fn restore_signal_stop(
+    record: &ReversalRecord,
+    deadline: Option<Instant>,
+) -> Result<bool, ActionError> {
     let ReversalOperation::SignalStop {
         was_stopped,
         verify_timeout_ms,
@@ -2867,19 +2916,27 @@ fn restore_signal_stop(record: &ReversalRecord) -> Result<bool, ActionError> {
         *was_stopped,
         restored,
         Duration::from_millis(*verify_timeout_ms),
+        deadline,
         || {
+            check_recovery_deadline(deadline)?;
             validate_signal_stop_scope(record)?;
+            check_recovery_deadline(deadline)?;
             let state = super::signal::signal_state(&record.target)?;
+            check_recovery_deadline(deadline)?;
             validate_signal_stop_scope(record)?;
+            check_recovery_deadline(deadline)?;
             Ok(state)
         },
         || {
+            check_recovery_deadline(deadline)?;
             validate_signal_stop_scope(record)?;
+            check_recovery_deadline(deadline)?;
             if super::signal::signal_state(&record.target)? != 'T' {
                 return Err(failed("job-control stop changed before pause restoration"));
             }
+            check_recovery_deadline(deadline)?;
             // No numeric-PID fallback: a replacement cannot inherit this signal.
-            super::signal::send_bound_signal(&record.target, libc::SIGCONT)
+            super::signal::send_bound_signal(&record.target, libc::SIGCONT, deadline)
         },
     )
 }
@@ -2892,12 +2949,21 @@ fn restore_signal_stop_with(
     was_stopped: bool,
     already_restored: bool,
     timeout: Duration,
+    deadline: Option<Instant>,
     mut observe: impl FnMut() -> Result<char, ActionError>,
     mut resume: impl FnMut() -> Result<(), ActionError>,
 ) -> Result<bool, ActionError> {
-    let stopped = job_control_stopped(observe()?)?;
+    let mut observe_before_deadline = || -> Result<char, ActionError> {
+        check_recovery_deadline(deadline)?;
+        let state = observe()?;
+        check_recovery_deadline(deadline)?;
+        Ok(state)
+    };
+    let stopped = job_control_stopped(observe_before_deadline()?)?;
     if already_restored || was_stopped {
-        if stopped != was_stopped || job_control_stopped(observe()?)? != was_stopped {
+        if stopped != was_stopped
+            || job_control_stopped(observe_before_deadline()?)? != was_stopped
+        {
             return Err(failed(
                 "original job-control state changed after pause restoration",
             ));
@@ -2914,18 +2980,19 @@ fn restore_signal_stop_with(
     if timeout.is_zero() {
         return Err(ActionError::Timeout);
     }
-    if !job_control_stopped(observe()?)? {
+    if !job_control_stopped(observe_before_deadline()?)? {
         return Err(failed("job-control stop changed before pause restoration"));
     }
+    check_recovery_deadline(deadline)?;
     let started = std::time::Instant::now();
     resume()?;
     loop {
-        let state = observe()?;
+        let state = observe_before_deadline()?;
         if started.elapsed() >= timeout {
             return Err(ActionError::Timeout);
         }
         if !job_control_stopped(state)? {
-            let confirmed = observe()?;
+            let confirmed = observe_before_deadline()?;
             if started.elapsed() >= timeout {
                 return Err(ActionError::Timeout);
             }
@@ -2938,6 +3005,16 @@ fn restore_signal_stop_with(
             .checked_sub(started.elapsed())
             .filter(|remaining| !remaining.is_zero())
             .ok_or(ActionError::Timeout)?;
+        let remaining = if let Some(deadline) = deadline {
+            remaining.min(
+                deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|remaining| !remaining.is_zero())
+                    .ok_or(ActionError::Timeout)?,
+            )
+        } else {
+            remaining
+        };
         std::thread::sleep(remaining.min(Duration::from_millis(25)));
     }
 }
@@ -3793,6 +3870,120 @@ mod tests {
         }
     }
 
+    fn leased_pause(journal: &ReversalJournal) -> (PlanAction, ReversalRecord) {
+        let action = action(Action::Pause);
+        let lease = freeze_clock(1000)
+            .lease(&action, &journal.plan_sha256)
+            .unwrap();
+        let record = journal
+            .insert_with_lease(
+                &action,
+                pause_operation(&action, false),
+                ReversalStatus::Prepared,
+                Some(lease),
+            )
+            .unwrap();
+        (action, record)
+    }
+
+    #[test]
+    fn pause_leases_expire_on_the_original_boot_and_time_namespace() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = journal(directory.path());
+        let (_, mut record) = leased_pause(&journal);
+        let expires = record.freeze_lease.as_ref().unwrap().expires_boottime_ms;
+        for status in [
+            ReversalStatus::Prepared,
+            ReversalStatus::Applied,
+            ReversalStatus::Verified,
+            ReversalStatus::Failed,
+        ] {
+            // A crash or error after attempted SIGSTOP may still own a stop.
+            record.status = status;
+            validate_record(&record).unwrap();
+            assert!(!freeze_lease_due(&record, &freeze_clock(expires - 1)).unwrap());
+            assert!(freeze_lease_due(&record, &freeze_clock(expires)).unwrap());
+        }
+        let mut changed = freeze_clock(expires);
+        changed.boot_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee".into();
+        assert!(!freeze_lease_due(&record, &changed).unwrap());
+        changed = freeze_clock(expires);
+        changed.time_namespace_inode += 1;
+        assert!(freeze_lease_due(&record, &changed).is_err());
+        changed = freeze_clock(expires);
+        changed.time_namespace_device += 1;
+        assert!(freeze_lease_due(&record, &changed).is_err());
+        assert!(freeze_lease_due(&record, &freeze_clock(999)).is_err());
+
+        record.prepared_at = "2099-01-01T00:00:00Z".into();
+        record.updated_at = "1970-01-01T00:00:00Z".into();
+        assert!(freeze_lease_due(&record, &freeze_clock(expires)).unwrap());
+    }
+
+    #[test]
+    fn pause_lease_rejects_changed_authority_and_preserves_legacy_receipts() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = journal(directory.path());
+        let (action, record) = leased_pause(&journal);
+        for alteration in ["preexisting", "kind", "target", "snapshot", "plan", "unsent"] {
+            let mut changed = record.clone();
+            match alteration {
+                "preexisting" => changed.operation = pause_operation(&action, true),
+                "kind" => changed.action = Action::Resume,
+                "target" => changed.target.uid += 1,
+                "snapshot" => changed.freeze_lease.as_mut().unwrap().approved_action.order += 1,
+                "plan" => {
+                    changed.freeze_lease.as_mut().unwrap().approved_plan_sha256 = "b".repeat(64)
+                }
+                _ => {
+                    changed.status = ReversalStatus::NotApplied;
+                    changed.detail = Some("known failure before delivery".into());
+                }
+            }
+            assert!(validate_record(&changed).is_err(), "{alteration}");
+        }
+        let clock = freeze_clock(record.freeze_lease.as_ref().unwrap().expires_boottime_ms);
+        let mut legacy = serde_json::to_value(&record).unwrap();
+        legacy.as_object_mut().unwrap().remove("freeze_lease");
+        let legacy: ReversalRecord = serde_json::from_value(legacy).unwrap();
+        validate_record(&legacy).unwrap();
+        legacy.check_action(&action).unwrap();
+        assert!(!freeze_lease_due(&legacy, &clock).unwrap());
+
+        let mut restored = record;
+        restored.restorations.push(restored_outcome(&restored));
+        assert!(!freeze_lease_due(&restored, &clock).unwrap());
+    }
+
+    #[test]
+    fn automatic_pause_recovery_never_retries_an_uncertain_resume() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = journal(directory.path());
+        let (action, record) = leased_pause(&journal);
+        let clock = freeze_clock(record.freeze_lease.as_ref().unwrap().expires_boottime_ms);
+        for status in [RestorationStatus::Prepared, RestorationStatus::Failed] {
+            for automatic in [false, true] {
+                let mut changed = record.clone();
+                let mut restoration = restored_outcome(&record);
+                restoration.status = status;
+                restoration.changed = None;
+                changed.restorations.push(restoration);
+                if automatic {
+                    let lease = changed.freeze_lease.as_mut().unwrap();
+                    lease.recovery_attempts = 1;
+                    lease.last_recovery_boottime_ms = Some(clock.boottime_ms);
+                }
+                validate_record(&changed).unwrap();
+                changed.check_action(&action).unwrap();
+                assert!(changed.has_unresolved_control());
+                assert!(freeze_lease_due(&changed, &clock)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("cannot retry"));
+            }
+        }
+    }
+
     #[test]
     fn pause_receipts_bind_the_exact_process_action_namespace_and_budget() {
         let temp = tempfile::tempdir().unwrap();
@@ -3864,14 +4055,7 @@ mod tests {
     fn known_unsent_pause_is_terminal_without_claiming_restoration() {
         let directory = tempfile::tempdir().unwrap();
         let journal = journal(directory.path());
-        let action = action(Action::Pause);
-        let original = journal
-            .insert(
-                &action,
-                pause_operation(&action, false),
-                ReversalStatus::Prepared,
-            )
-            .unwrap();
+        let (action, original) = leased_pause(&journal);
         let receipt = PreparedReversal {
             journal: Arc::clone(&journal),
             attempt_id: original.attempt_id.clone(),
@@ -3888,6 +4072,12 @@ mod tests {
         assert!(!saved.has_unresolved_control());
         assert!(!saved.is_restored());
         assert!(saved.restorations.is_empty());
+        assert!(saved.freeze_lease.is_none());
+        assert!(!freeze_lease_due(
+            &saved,
+            &freeze_clock(original.freeze_lease.as_ref().unwrap().expires_boottime_ms),
+        )
+        .unwrap());
         assert_eq!(
             serde_json::to_value(&saved).unwrap()["status"],
             "not_applied"
@@ -4025,6 +4215,7 @@ mod tests {
                 false,
                 false,
                 Duration::from_millis(10),
+                None,
                 || Ok(state),
                 || {
                     sent.set(sent.get() + 1);
@@ -4039,6 +4230,7 @@ mod tests {
             false,
             false,
             Duration::ZERO,
+            None,
             || Ok('T'),
             || {
                 sent.set(true);
@@ -4052,6 +4244,7 @@ mod tests {
             false,
             false,
             Duration::from_millis(10),
+            None,
             || Ok(samples.next().expect("two pre-signal observations")),
             || panic!("a changed stop must not receive SIGCONT"),
         )
@@ -4066,6 +4259,7 @@ mod tests {
             false,
             false,
             Duration::from_secs(1),
+            None,
             || Ok(state.get()),
             || {
                 sent.set(sent.get() + 1);
@@ -4080,6 +4274,7 @@ mod tests {
             false,
             true,
             Duration::from_millis(10),
+            None,
             || Ok('S'),
             || panic!("a completed receipt must never signal again"),
         )
@@ -4088,6 +4283,7 @@ mod tests {
             false,
             true,
             Duration::from_millis(10),
+            None,
             || Ok('T'),
             || panic!("an external later stop belongs to its new controller"),
         )
@@ -4097,6 +4293,7 @@ mod tests {
                 true,
                 completed,
                 Duration::ZERO,
+                None,
                 || Ok('T'),
                 || panic!("never resume a process that was already stopped"),
             )
@@ -4105,6 +4302,7 @@ mod tests {
                 true,
                 completed,
                 Duration::from_millis(10),
+                None,
                 || Ok('S'),
                 || panic!("undo cannot recreate somebody else's original stop"),
             )
@@ -4119,6 +4317,7 @@ mod tests {
             false,
             false,
             Duration::from_millis(1),
+            None,
             || {
                 if resumed.get() {
                     std::thread::sleep(Duration::from_millis(2));
@@ -4137,6 +4336,51 @@ mod tests {
     }
 
     #[test]
+    fn pause_recovery_deadline_covers_preflight_and_final_observations() {
+        for slow_sample in [1, 2] {
+            let samples = Cell::new(0);
+            let deadline = Instant::now() + Duration::from_millis(10);
+            let result = restore_signal_stop_with(
+                false,
+                false,
+                Duration::from_secs(1),
+                Some(deadline),
+                || {
+                    samples.set(samples.get() + 1);
+                    if samples.get() == slow_sample {
+                        std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                    }
+                    Ok('T')
+                },
+                || panic!("expired preflight cannot send SIGCONT"),
+            );
+            assert!(matches!(result, Err(ActionError::Timeout)));
+        }
+
+        let resumed = Cell::new(false);
+        let deadline = Instant::now() + Duration::from_millis(10);
+        let result = restore_signal_stop_with(
+            false,
+            false,
+            Duration::from_secs(1),
+            Some(deadline),
+            || {
+                if resumed.get() {
+                    std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                    Ok('S')
+                } else {
+                    Ok('T')
+                }
+            },
+            || {
+                resumed.set(true);
+                Ok(())
+            },
+        );
+        assert!(matches!(result, Err(ActionError::Timeout)));
+    }
+
+    #[test]
     fn pause_restore_reports_post_signal_identity_loss_tracing_and_timeout() {
         for failure in ["identity", "gone", "tracing", "timeout"] {
             let sent = Cell::new(false);
@@ -4144,6 +4388,7 @@ mod tests {
                 false,
                 false,
                 Duration::from_millis(1),
+                None,
                 || {
                     if !sent.get() {
                         return Ok('T');
@@ -4429,6 +4674,222 @@ mod tests {
         (child, action)
     }
 
+    fn expired_live_pause_clock(record: &ReversalRecord) -> FreezeRecoveryClock {
+        let mut clock = FreezeRecoveryClock::read().unwrap();
+        clock.boottime_ms = record.freeze_lease.as_ref().unwrap().expires_boottime_ms;
+        clock
+    }
+
+    #[test]
+    fn expired_pause_recovery_resumes_an_owned_child_once_after_runner_exit() {
+        use crate::action::{ActionRunner, SignalActionRunner};
+        let (_child, mut action) = owned_renice_target();
+        action.action = Action::Pause;
+        let directory = tempfile::tempdir().unwrap();
+        let journal = journal(directory.path());
+        {
+            let runner =
+                SignalActionRunner::with_defaults().with_reversal_journal(Arc::clone(&journal));
+            runner.execute(&action).unwrap();
+            runner.verify(&action).unwrap();
+        }
+        let record = journal.inspect(&action).unwrap().remove(0);
+        assert_eq!(record.status, ReversalStatus::Verified);
+        let clock = expired_live_pause_clock(&record);
+        let mut early = clock.clone();
+        early.boottime_ms -= 1;
+        let report = recover_expired_freezes_with(
+            &journal.sessions_root,
+            None,
+            &early,
+            &FreezeRecoveryLimits::default(),
+            |_, _, _, _, _| panic!("pause cannot expire early"),
+        )
+        .unwrap();
+        assert!(report.errors.is_empty());
+        assert!(report.candidates.is_empty());
+        assert_eq!(super::super::signal::signal_state(&action.target).unwrap(), 'T');
+        assert!(matches!(
+            journal.restore_before(
+                &action,
+                Some(&record.attempt_id),
+                Some((&clock, Instant::now())),
+            ),
+            Err(ActionError::Timeout)
+        ));
+        assert!(journal.inspect(&action).unwrap()[0].restorations.is_empty());
+        assert_eq!(super::super::signal::signal_state(&action.target).unwrap(), 'T');
+
+        let mut wrong_namespace = record.clone();
+        if let ReversalOperation::SignalStop {
+            pid_namespace_inode,
+            ..
+        } = &mut wrong_namespace.operation
+        {
+            *pid_namespace_inode += 1;
+        }
+        assert!(restore_live_before(
+            &wrong_namespace,
+            Some(Instant::now() + Duration::from_secs(1)),
+        )
+        .is_err());
+        assert_eq!(super::super::signal::signal_state(&action.target).unwrap(), 'T');
+
+        let report = recover_expired_freezes_with(
+            &journal.sessions_root,
+            None,
+            &clock,
+            &FreezeRecoveryLimits::default(),
+            |journal, action, attempt, clock, deadline| {
+                journal.restore_before(action, Some(attempt), Some((clock, deadline)))
+            },
+        )
+        .unwrap();
+        assert!(report.errors.is_empty());
+        assert_eq!(report.candidates.len(), 1);
+        assert_eq!(report.outcomes.len(), 1);
+        let outcome = report.outcomes[0].outcome.as_ref().unwrap();
+        assert_eq!(outcome.status, RestorationStatus::Restored);
+        assert_eq!(outcome.changed, Some(true));
+        assert!(
+            !job_control_stopped(super::super::signal::signal_state(&action.target).unwrap())
+                .unwrap()
+        );
+        let saved = journal.inspect(&action).unwrap().remove(0);
+        assert_eq!(saved.restorations.len(), 1);
+        assert_eq!(saved.restorations[0].restore_id, outcome.restore_id);
+        assert_eq!(saved.freeze_lease.as_ref().unwrap().recovery_attempts, 1);
+
+        // A later independent stop cannot inherit the completed lease.
+        let external = SignalActionRunner::with_defaults();
+        external.execute(&action).unwrap();
+        external.verify(&action).unwrap();
+        let repeated = recover_expired_freezes_with(
+            &journal.sessions_root,
+            None,
+            &clock,
+            &FreezeRecoveryLimits::default(),
+            |_, _, _, _, _| panic!("settled pause must not resume a later stop"),
+        )
+        .unwrap();
+        assert!(repeated.errors.is_empty());
+        assert!(repeated.candidates.is_empty());
+        assert!(repeated.outcomes.is_empty());
+        assert_eq!(super::super::signal::signal_state(&action.target).unwrap(), 'T');
+    }
+
+    #[test]
+    fn expired_pause_recovers_an_owned_stop_after_uncertain_signal_execution() {
+        use crate::action::{ActionRunner, SignalActionRunner};
+        for failed_execution in [false, true] {
+            let (_child, mut action) = owned_renice_target();
+            action.action = Action::Pause;
+            let directory = tempfile::tempdir().unwrap();
+            let journal = journal(directory.path());
+            let prepared = journal.prepare_signal_stop(&action, false).unwrap();
+            // Deliver the prepared pause, then model a crash before completion
+            // persistence or an error reported after the signal was delivered.
+            let delivery = SignalActionRunner::with_defaults();
+            delivery.execute(&action).unwrap();
+            delivery.verify(&action).unwrap();
+            if failed_execution {
+                assert!(prepared
+                    .finish::<()>(Err(ActionError::Timeout), ReversalStatus::Applied)
+                    .is_err());
+            }
+            let record = journal.inspect(&action).unwrap().remove(0);
+            assert_eq!(
+                record.status,
+                if failed_execution {
+                    ReversalStatus::Failed
+                } else {
+                    ReversalStatus::Prepared
+                }
+            );
+            let clock = expired_live_pause_clock(&record);
+            let report = recover_expired_freezes_with(
+                &journal.sessions_root,
+                None,
+                &clock,
+                &FreezeRecoveryLimits::default(),
+                |journal, action, attempt, clock, deadline| {
+                    journal.restore_before(action, Some(attempt), Some((clock, deadline)))
+                },
+            )
+            .unwrap();
+            assert!(report.errors.is_empty());
+            assert_eq!(report.outcomes.len(), 1);
+            let outcome = report.outcomes[0].outcome.as_ref().unwrap();
+            assert_eq!(outcome.status, RestorationStatus::Restored);
+            assert_eq!(outcome.changed, Some(true));
+            assert!(
+                !job_control_stopped(super::super::signal::signal_state(&action.target).unwrap())
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn uncertain_automatic_resume_cannot_release_a_later_external_stop() {
+        use crate::action::{ActionRunner, SignalActionRunner};
+        let (_child, mut action) = owned_renice_target();
+        action.action = Action::Pause;
+        let directory = tempfile::tempdir().unwrap();
+        let journal = journal(directory.path());
+        let runner =
+            SignalActionRunner::with_defaults().with_reversal_journal(Arc::clone(&journal));
+        runner.execute(&action).unwrap();
+        runner.verify(&action).unwrap();
+        let record = journal.inspect(&action).unwrap().remove(0);
+        let clock = expired_live_pause_clock(&record);
+        let report = recover_expired_freezes_with(
+            &journal.sessions_root,
+            None,
+            &clock,
+            &FreezeRecoveryLimits::default(),
+            |journal, action, attempt, clock, deadline| {
+                journal.restore_before_with(
+                    action,
+                    Some(attempt),
+                    Some((clock, deadline)),
+                    |record, deadline| {
+                        assert!(restore_live_before(record, deadline)?);
+                        // SIGCONT happened, but completion is uncertain to the
+                        // durable caller. A later stop no longer belongs to it.
+                        Err(ActionError::Timeout)
+                    },
+                )
+            },
+        )
+        .unwrap();
+        assert!(report.errors.is_empty());
+        assert_eq!(report.outcomes.len(), 1);
+        assert_eq!(
+            report.outcomes[0].outcome.as_ref().unwrap().status,
+            RestorationStatus::Failed
+        );
+        assert!(
+            !job_control_stopped(super::super::signal::signal_state(&action.target).unwrap())
+                .unwrap()
+        );
+        let external = SignalActionRunner::with_defaults();
+        external.execute(&action).unwrap();
+        external.verify(&action).unwrap();
+        let retry = recover_expired_freezes_with(
+            &journal.sessions_root,
+            None,
+            &clock,
+            &FreezeRecoveryLimits::default(),
+            |_, _, _, _, _| panic!("uncertain resume must not retry automatically"),
+        )
+        .unwrap();
+        assert!(retry.candidates.is_empty());
+        assert!(retry.outcomes.is_empty());
+        assert!(retry.errors.iter().any(|error| error.contains("cannot retry")));
+        assert_eq!(super::super::signal::signal_state(&action.target).unwrap(), 'T');
+        assert_eq!(journal.inspect(&action).unwrap()[0].restorations.len(), 1);
+    }
+
     #[test]
     fn known_unsent_pause_releases_ownership_without_resuming_an_external_stop() {
         use crate::action::{ActionRunner, SignalActionRunner};
@@ -4440,6 +4901,7 @@ mod tests {
         let prepared = first.prepare_signal_stop(&action, false).unwrap();
         let original = first.inspect(&action).unwrap().remove(0);
         assert_eq!(original.status, ReversalStatus::Prepared);
+        assert!(original.freeze_lease.is_some());
 
         // This stop belongs to an independent actor and predates our own send.
         let external = SignalActionRunner::with_defaults();
@@ -4452,6 +4914,7 @@ mod tests {
         assert_eq!(aborted.status, ReversalStatus::NotApplied);
         assert_eq!(aborted.operation, original.operation);
         assert!(aborted.restorations.is_empty());
+        assert!(aborted.freeze_lease.is_none());
         assert!(first.restore(&action, None).is_err());
         assert!(first.observe_restoration(&action).unwrap().is_none());
         assert_eq!(
@@ -4571,6 +5034,20 @@ mod tests {
                 ..
             }
         ));
+        assert!(journal.inspect(&action).unwrap()[0].freeze_lease.is_none());
+        let mut clock = FreezeRecoveryClock::read().unwrap();
+        clock.boottime_ms += DEFAULT_FREEZE_TTL_SECS * 1000;
+        let recovery = recover_expired_freezes_with(
+            &journal.sessions_root,
+            None,
+            &clock,
+            &FreezeRecoveryLimits::default(),
+            |_, _, _, _, _| panic!("a preexisting stop cannot acquire a resume lease"),
+        )
+        .unwrap();
+        assert!(recovery.errors.is_empty());
+        assert!(recovery.candidates.is_empty());
+        assert!(recovery.outcomes.is_empty());
         let restored = journal.restore(&action, None).unwrap();
         assert_eq!(restored.status, RestorationStatus::Restored);
         assert_eq!(restored.changed, Some(false));
@@ -4585,6 +5062,50 @@ mod tests {
                 .unwrap()
                 .original_value,
             RestorationValue::JobControl { stopped: true },
+        );
+    }
+
+    #[test]
+    fn legacy_pause_receipt_remains_readable_and_requires_explicit_undo() {
+        use crate::action::{ActionRunner, SignalActionRunner};
+        let (_child, mut action) = owned_renice_target();
+        action.action = Action::Pause;
+        let directory = tempfile::tempdir().unwrap();
+        let journal = journal(directory.path());
+        {
+            let runner =
+                SignalActionRunner::with_defaults().with_reversal_journal(Arc::clone(&journal));
+            runner.execute(&action).unwrap();
+            runner.verify(&action).unwrap();
+        }
+        let record = journal.inspect(&action).unwrap().remove(0);
+        let clock = expired_live_pause_clock(&record);
+        // Model an on-disk receipt produced before pause leases existed.
+        let mut legacy = serde_json::to_value(&record).unwrap();
+        legacy.as_object_mut().unwrap().remove("freeze_lease");
+        let legacy: ReversalRecord = serde_json::from_value(legacy).unwrap();
+        let stored = JournalDirectory::open(journal.directory(), false)
+            .unwrap()
+            .unwrap();
+        journal.write_record(&stored, &legacy, false).unwrap();
+        let recovery = recover_expired_freezes_with(
+            &journal.sessions_root,
+            None,
+            &clock,
+            &FreezeRecoveryLimits::default(),
+            |_, _, _, _, _| panic!("legacy pause requires explicit undo"),
+        )
+        .unwrap();
+        assert!(recovery.errors.is_empty());
+        assert!(recovery.candidates.is_empty());
+        assert!(recovery.outcomes.is_empty());
+        assert_eq!(super::super::signal::signal_state(&action.target).unwrap(), 'T');
+        let restored = journal.restore(&action, None).unwrap();
+        assert_eq!(restored.status, RestorationStatus::Restored);
+        assert_eq!(restored.changed, Some(true));
+        assert!(
+            !job_control_stopped(super::super::signal::signal_state(&action.target).unwrap())
+                .unwrap()
         );
     }
 

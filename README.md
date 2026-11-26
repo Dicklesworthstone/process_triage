@@ -111,7 +111,7 @@ Every process on your system passes through a five-stage pipeline:
 
 **Decide** picks the action with the lowest expected loss under the policy's loss matrix, among the actions feasible for the process state, then applies protection, supervision and policy enforcement. It evaluates Keep, Renice, Pause, Freeze, Throttle, CapMemory, Quarantine, Restart and Kill.
 
-**Act** re-verifies identity (exact start time; a pidfd on Linux) and runs live pre-checks immediately before each signal, then escalates SIGTERM → SIGKILL. Renice, pause/resume and kill run on Linux and macOS; freeze, throttle and quarantine are Linux-only and refused unless the target owns its cgroup. Failures are reported. New journaled freezes have an expiry lease; other controls require explicit restoration.
+**Act** re-verifies identity (exact start time; a pidfd on Linux) and runs live pre-checks immediately before each signal, then escalates SIGTERM → SIGKILL. Renice, pause/resume and kill run on Linux and macOS; freeze, throttle and quarantine are Linux-only and refused unless the target owns its cgroup. Failures are reported. New journaled Linux freezes and pauses have an expiry lease; other controls require explicit restoration.
 
 Kill execution always tries `SIGTERM` first. For an individual Linux target, two complete identity-bound observations of `SigIgn` and `SigCgt` can establish that TERM is ignored and skip the otherwise futile grace period. Caught handlers, unavailable or changed evidence, weaker identities, and process-group actions retain the configured grace, bounded by the saved action timeout. The saved `signal_outcome` records successful signal deliveries, the escalation reason, and measured timing; these delivery facts remain separate from verification that the process exited.
 
@@ -2186,29 +2186,36 @@ Plans with retained receipts keep their original bytes. To plan again, create
 a new session by omitting `agent plan --session`; replacing the old plan would
 invalidate the evidence needed for undo and verification.
 
-**Expiring freezes.** A new Linux `Freeze` from `agent apply` records a fixed
-30-minute lease before changing `cgroup.freeze` from `0` to `1`. The deadline
-uses the suspend-aware boot clock and records its time namespace, so wall-clock
-adjustments cannot bring the thaw forward. A request that was already frozen,
-an old receipt without a lease, and an unjournaled TUI freeze acquire no automatic
-thaw authority.
+**Expiring freezes and pauses.** A new journaled Linux `Freeze` records a fixed
+30-minute lease before changing `cgroup.freeze` from `0` to `1`. A new journaled
+Linux `Pause` records the same lease before sending SIGSTOP to a previously
+running process. The deadline uses the suspend-aware boot clock and records its
+time namespace, so wall-clock adjustments cannot bring recovery forward.
+Already frozen or stopped targets, old receipts without leases, and unjournaled
+TUI actions acquire no automatic thaw or resume authority. A pause known to have
+failed before any signal attempt clears its lease; an interrupted or failed
+attempt that may have delivered SIGSTOP retains its first recovery opportunity.
 
 The running daemon attempts recovery after expiry, including ticks on which
 normal planning is deferred by its overhead budget. Real `agent apply` and
 confirmed TUI execution also attempt a bounded recovery pass before executing
 their new actions. Agent output includes `freeze_recovery`; the TUI session
-retains `action/freeze_recovery.json`. These invocations share an advisory
+retains `action/freeze_recovery.json`. These existing report names cover both
+freeze and pause recovery. These invocations share an advisory
 continuation cursor, so bounded passes advance through session history even
 without a daemon. Recovery holds the same
-execution lock as apply and undo, checks the original process identity, cgroup,
-boot and namespaces, and refuses conflicting owners or changed controls. It
+execution lock as apply and undo, checks the original process identity, boot,
+namespaces and, for freezes, cgroup, and refuses conflicting owners or changed
+controls. Pause recovery requires a current job-control stop and sends SIGCONT
+through a pidfd pinned to the original process. The shared recovery deadline
+covers signal preflight, delivery and verification. It
 retains the exact approved action in the receipt, so later plan-file changes
 cannot strand that lease. Successful and refused restorations remain in the
 durable journal, and daemon state retains the recovery report and continuation
 cursor. Work is bounded per tick; lock contention, budget limits, and failed
-identity checks are reported rather than claimed as successful thaws. No
+identity checks are reported rather than claimed as successful restorations. No
 background timer is created by `agent apply`: without a running recovery path,
-the deadline alone does not change the kernel's freezer state. Dry-run, shadow,
+the deadline alone does not thaw or resume a process. Dry-run, shadow,
 and read-only inspection paths never perform recovery.
 
 Refused automatic thaws use persisted exponential backoff, starting at one
@@ -2218,6 +2225,13 @@ sessions and 4,096 receipts, attempts at most 16 restorations, and stops startin
 work after two seconds. The existing complete ownership check also has a
 4,096-entry session-history ceiling; exceeding it reports an error and requires
 attention instead of skipping ownership evidence.
+
+Signal pauses allow at most one recorded automatic restoration attempt. Any
+earlier manual or automatic restoration attempt blocks automatic retries: a
+failed or interrupted SIGCONT may already have resumed the process, and the
+same receipt must not automatically release a later independent stop. Inspect
+the retained outcome and use explicit `agent undo` when restoration remains
+uncertain. A completed restoration never authorizes another automatic resume.
 
 `agent verify` distinguishes a **confirmed restoration** from a missing
 original action effect. After a successful undo, it independently checks the
@@ -2295,7 +2309,7 @@ Kill action failed (Timeout)
 | Identity mismatch | Abort (PID reused; wrong process) | Re-scan and re-plan |
 | Resource conflict | Wait and retry with backoff | Skip |
 
-These failure-recovery trees describe escalation and diagnosis. Explicit undo restores recorded controls; the separate freeze-lease recovery path conditionally releases only an expired, owned freeze request.
+These failure-recovery trees describe escalation and diagnosis. Explicit undo restores recorded controls; lease recovery conditionally releases expired, owned freeze requests and Linux signal pauses.
 
 ---
 

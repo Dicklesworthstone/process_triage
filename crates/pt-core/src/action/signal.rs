@@ -222,26 +222,39 @@ pub(crate) fn signal_state(target: &pt_common::ProcessIdentity) -> Result<char, 
 
 /// Undo may release only a verified job-control stop, through an fd pinned to
 /// that process. A numeric-PID fallback cannot provide this restoration promise.
+/// Automatic recovery's deadline covers preflight and the final signal send.
 #[cfg(target_os = "linux")]
 pub(crate) fn send_bound_signal(
     target: &pt_common::ProcessIdentity,
     signal: i32,
+    deadline: Option<Instant>,
 ) -> Result<(), ActionError> {
+    let check_deadline = || {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            Err(ActionError::Timeout)
+        } else {
+            Ok(())
+        }
+    };
+    check_deadline()?;
     if signal != libc::SIGCONT || target.quality != pt_common::IdentityQuality::Full {
         return Err(ActionError::Failed(
             "pause restoration requires SIGCONT and the full original identity".to_string(),
         ));
     }
     ensure_action_pid_namespace()?;
+    check_deadline()?;
     let pidfd = PidFd::open(target.pid.0)?.ok_or_else(|| {
         ActionError::Failed("pause restoration requires kernel pidfd support".to_string())
     })?;
+    check_deadline()?;
     if signal_state(target)? != 'T' {
         return Err(ActionError::Failed(
             "pause restoration requires the original process to remain job-control stopped"
                 .to_string(),
         ));
     }
+    check_deadline()?;
     pidfd.send(signal)
 }
 
@@ -2797,13 +2810,21 @@ mod tests {
             let mut weak_identity = action.target.clone();
             weak_identity.quality = pt_common::IdentityQuality::NoBootId;
             for stale in [&wrong_owner, &wrong_birth, &weak_identity] {
-                assert!(send_bound_signal(stale, libc::SIGCONT).is_err());
+                assert!(send_bound_signal(stale, libc::SIGCONT, None).is_err());
                 assert_eq!(runner.get_process_state(child.0.id()), Some('T'));
             }
-            assert!(send_bound_signal(&action.target, libc::SIGTERM).is_err());
+            assert!(send_bound_signal(&action.target, libc::SIGTERM, None).is_err());
+            assert!(matches!(
+                send_bound_signal(&action.target, libc::SIGCONT, Some(Instant::now())),
+                Err(ActionError::Timeout)
+            ));
             assert_eq!(signal_state(&action.target).unwrap(), 'T');
-            send_bound_signal(&action.target, libc::SIGCONT)
-                .expect("resume the pinned owned child");
+            send_bound_signal(
+                &action.target,
+                libc::SIGCONT,
+                Some(Instant::now() + Duration::from_secs(5)),
+            )
+            .expect("resume the pinned owned child");
             runner
                 .wait_for_planned_state(
                     &action.target,
@@ -2811,7 +2832,7 @@ mod tests {
                     Duration::from_secs(1),
                 )
                 .expect("the original child resumed");
-            assert!(send_bound_signal(&action.target, libc::SIGCONT).is_err());
+            assert!(send_bound_signal(&action.target, libc::SIGCONT, None).is_err());
             assert!(!marker.exists());
             assert!(!runner.take_kill_signal_delivered());
         }
