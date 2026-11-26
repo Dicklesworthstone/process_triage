@@ -33249,6 +33249,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                 confidence: score.ledger.confidence.label().to_string(),
                 recommended_action: advice.action.to_string(),
                 score: posterior.suspicion_score(),
+                evidence_ledger: Some(serde_json::json!(score.ledger)),
                 blast_radius_risk_level: None,
                 blast_radius_total_affected: None,
                 provenance_evidence_completeness: None,
@@ -37329,6 +37330,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             confidence: ledger.confidence.label().to_string(),
             recommended_action: recommended_action.to_string(),
             score,
+            evidence_ledger: Some(serde_json::json!(ledger)),
             blast_radius_risk_level,
             #[cfg(target_os = "linux")]
             blast_radius_total_affected: provenance_adjustment
@@ -50081,10 +50083,57 @@ fn prepare_report_from_session(
         export_profile: generator.config().redaction_profile.clone(),
     };
 
-    // A session report needs its recorded plan. Missing or corrupt data is an
-    // error, not a successful report with invented empty candidate counts.
+    // Prefer the canonical plan. Snapshot-only sessions can report their
+    // validated recorded inference without creating a plan or rescoring a PID.
+    // A corrupt existing plan must not be hidden by the fallback.
     let plan_path = handle.dir.join("decision").join("plan.json");
-    let plan: serde_json::Value = serde_json::from_slice(&std::fs::read(&plan_path)?)?;
+    let plan: serde_json::Value = match std::fs::read(&plan_path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::metadata(handle.dir.join("inference/results.json")) {
+                Ok(_) => {}
+                Err(inference_error) if inference_error.kind() == std::io::ErrorKind::NotFound => {
+                    // Keep a wholly missing recording as an IO failure, not an
+                    // invented empty report or a request for a fresh scan.
+                    return Err(error.into());
+                }
+                Err(inference_error) => return Err(inference_error.into()),
+            }
+            let recorded =
+                pt_core::session::snapshot_persist::load_recorded_explanation_snapshot(handle)
+                    .map_err(pt_report::ReportError::MissingData)?;
+            if manifest.session_id != handle.id.0 {
+                return Err(pt_report::ReportError::MissingData(
+                    "manifest session ID does not match the recorded snapshot".into(),
+                ));
+            }
+            if context.as_ref().is_some_and(|context| {
+                context.session_id != handle.id.0
+                    || recorded.source["host_id"].as_str() != Some(context.host_id.as_str())
+            }) {
+                return Err(pt_report::ReportError::MissingData(
+                    "session context identity does not match the recorded snapshot".into(),
+                ));
+            }
+            let candidates: Vec<_> = recorded.candidates.into_values().collect();
+            let mut source = recorded.source;
+            // Use the existing export schema's public artifact-path field while
+            // preserving the loader's full recorded provenance for redaction.
+            source["artifact_path"] = source["artifact"].clone();
+            serde_json::json!({
+                "session_id": handle.id.0,
+                "generated_at": source["observed_at"],
+                "host_id": source["host_id"],
+                "summary": {
+                    "total_processes_scanned": source["total_system_processes"],
+                    "protected_filtered": source["protected_filtered"],
+                },
+                "source": source,
+                "candidates": candidates,
+            })
+        }
+        Err(error) => return Err(error.into()),
+    };
     let outcomes_path = handle.dir.join("action/outcomes.jsonl");
     let outcomes =
         match read_action_outcomes(&outcomes_path).map_err(pt_report::ReportError::MissingData)? {
@@ -50110,6 +50159,270 @@ mod report_generation_tests {
                 dir,
             },
         )
+    }
+
+    fn populate_report_snapshot(handle: &SessionHandle, ledger: Option<serde_json::Value>) {
+        use pt_core::session::snapshot_persist::{
+            persist_inference, persist_inventory, InferenceArtifact, InventoryArtifact,
+        };
+
+        handle
+            .write_manifest(&SessionManifest::new(
+                &handle.id,
+                None,
+                SessionMode::ScanOnly,
+                None,
+            ))
+            .unwrap();
+        handle
+            .write_context(&SessionContext {
+                schema_version: SCHEMA_VERSION.to_string(),
+                session_id: handle.id.0.clone(),
+                generated_at: "2026-01-15T12:00:00Z".to_string(),
+                host_id: "private-snapshot-host".to_string(),
+                run_id: "saved-report-run".to_string(),
+                label: None,
+                os: pt_core::session::SessionOs {
+                    family: "linux".to_string(),
+                    arch: "x86_64".to_string(),
+                },
+            })
+            .unwrap();
+        let inventory: InventoryArtifact = serde_json::from_value(serde_json::json!({
+            "total_system_processes": 97,
+            "protected_filtered": 13,
+            "record_count": 2,
+            "records": [{
+                "pid": 4242, "ppid": 1, "uid": 1000,
+                "start_id": "saved-boot:12345:4242",
+                "comm": "private-snapshot-worker",
+                "cmd": "private-snapshot-worker --token=snapshot-secret-value",
+                "state": "S", "start_time_unix": 1700000000,
+                "elapsed_secs": 3600, "identity_quality": "Full",
+            }, {
+                "pid": 4243, "ppid": 1, "uid": 1000,
+                "start_id": "saved-boot:12346:4243",
+                "comm": "different-snapshot-worker", "cmd": "different-snapshot-worker",
+                "state": "S", "start_time_unix": 1700000001,
+                "elapsed_secs": 3599, "identity_quality": "Full",
+            }],
+        }))
+        .unwrap();
+        let inference: InferenceArtifact = serde_json::from_value(serde_json::json!({
+            "candidate_count": 1,
+            "candidates": [{
+                "pid": 4242, "start_id": "saved-boot:12345:4242",
+                "classification": "abandoned", "confidence": "high",
+                "posterior_useful": 0.05, "posterior_useful_bad": 0.02,
+                "posterior_abandoned": 0.90, "posterior_zombie": 0.03,
+                "recommended_action": "review", "score": 92,
+                "evidence_ledger": ledger,
+            }],
+        }))
+        .unwrap();
+        persist_inventory(handle, &handle.id.0, "private-snapshot-host", inventory).unwrap();
+        persist_inference(handle, &handle.id.0, "private-snapshot-host", inference).unwrap();
+    }
+
+    fn saved_report_data(html: &str) -> serde_json::Value {
+        let embedded = html
+            .split("id=\"recorded-session-data\">")
+            .nth(1)
+            .expect("rendered recorded artifacts")
+            .split("</script>")
+            .next()
+            .unwrap();
+        serde_json::from_str(embedded).unwrap()
+    }
+
+    #[test]
+    fn generate_report_from_snapshot_preserves_recorded_facts_without_writing_a_plan() {
+        let session_id = SessionId::new();
+        let (_tmp, handle) = make_report_handle(&session_id);
+        let ledger = serde_json::json!({
+            "evidence_terms": [{
+                "feature": "cpu",
+                "log_likelihood": {"useful": -2.0, "abandoned": -0.4},
+            }],
+            "log_bf": 1.23456789012345,
+        });
+        populate_report_snapshot(&handle, Some(ledger.clone()));
+        let original_artifacts: Vec<_> = [
+            handle.manifest_path(),
+            handle.context_path(),
+            handle.dir.join("scan/inventory.json"),
+            handle.dir.join("inference/results.json"),
+        ]
+        .into_iter()
+        .map(|path| {
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+        let inference: serde_json::Value =
+            serde_json::from_slice(&original_artifacts[3].1).unwrap();
+        let mut config = ReportConfig::new()
+            .with_embed_assets(true)
+            .with_galaxy_brain(true);
+        config.redaction_profile = "Forensic".to_string();
+        let report = prepare_report_from_session(&ReportGenerator::new(config), &handle).unwrap();
+        let html = report.render_html().unwrap();
+        let recorded = saved_report_data(&html);
+        assert_eq!(recorded["overview"]["processes_scanned"], 97);
+        assert_eq!(recorded["overview"]["candidates_found"], 1);
+        assert_eq!(recorded["plan"]["summary"]["protected_filtered"], 13);
+        assert_eq!(
+            recorded["plan"]["source"]["artifact_path"],
+            "inference/results.json"
+        );
+        assert_eq!(recorded["plan"]["source"]["session_id"], session_id.0);
+        assert_eq!(
+            recorded["plan"]["source"]["integrity_sha256"],
+            inference["integrity_sha256"]
+        );
+        assert_eq!(recorded["plan"]["generated_at"], inference["generated_at"]);
+        let candidate = &recorded["plan"]["candidates"][0];
+        assert_eq!(candidate["pid"], 4242);
+        assert!(candidate["start_id"].as_str().is_some());
+        assert_eq!(candidate["uid"], 1000);
+        assert_eq!(candidate["posterior"]["abandoned"], 0.90);
+        assert_eq!(candidate["recommended_action"], "review");
+        assert_eq!(candidate["score"], 92);
+        assert_eq!(candidate["evidence_ledger"], ledger);
+        for field in ["cpu_percent", "memory_mb", "prior_source", "inference"] {
+            assert!(candidate.get(field).is_none(), "{field}");
+        }
+        for field in [
+            "deep_scan",
+            "memory_bytes",
+            "cores",
+            "kills_attempted",
+            "kills_successful",
+            "spares",
+        ] {
+            assert!(recorded["overview"][field].is_null(), "{field}");
+        }
+        assert!(recorded["plan"].get("actions").is_none());
+        assert_eq!(recorded["outcomes"], serde_json::json!([]));
+        assert!(html.contains("Recorded Evidence Ledger"));
+        assert!(!html.contains("Exact ledger not recorded for this candidate."));
+        let summary = report.render_summary(
+            pt_report::generator::TextReportFormat::Prose,
+            pt_report::generator::TextReportStyle::Technical,
+        );
+        assert!(summary.contains("processes scanned: 97; candidates: 1"));
+        assert!(summary.contains("Recommendations: review 1."));
+        assert!(summary.contains("Outcomes: not recorded; execution is unknown."));
+        assert!(!handle.dir.join("decision/plan.json").exists());
+        assert!(!handle.dir.join("action").exists());
+        for (path, bytes) in original_artifacts {
+            assert_eq!(fs::read(path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn generate_report_from_snapshot_refuses_mixed_session_metadata() {
+        let session_id = SessionId::new();
+        let (_tmp, handle) = make_report_handle(&session_id);
+        populate_report_snapshot(&handle, None);
+        let generator = ReportGenerator::new(ReportConfig::new());
+        assert!(prepare_report_from_session(&generator, &handle).is_ok());
+        let original_context = handle.read_context().unwrap();
+        let mut context = handle.read_context().unwrap();
+        context.host_id = "another-snapshot-host".into();
+        handle.write_context(&context).unwrap();
+        assert!(matches!(
+            prepare_report_from_session(&generator, &handle),
+            Err(pt_report::ReportError::MissingData(message))
+                if message.contains("session context identity"),
+        ));
+        context.host_id = original_context.host_id.clone();
+        context.session_id = SessionId::new().0;
+        handle.write_context(&context).unwrap();
+        assert!(matches!(
+            prepare_report_from_session(&generator, &handle),
+            Err(pt_report::ReportError::MissingData(message))
+                if message.contains("session context identity"),
+        ));
+        handle.write_context(&original_context).unwrap();
+        let mut manifest = handle.read_manifest().unwrap();
+        manifest.session_id = SessionId::new().0;
+        handle.write_manifest(&manifest).unwrap();
+        assert!(matches!(
+            prepare_report_from_session(&generator, &handle),
+            Err(pt_report::ReportError::MissingData(message))
+                if message.contains("manifest session ID"),
+        ));
+        manifest.session_id = session_id.0;
+        handle.write_manifest(&manifest).unwrap();
+        assert!(prepare_report_from_session(&generator, &handle).is_ok());
+        assert!(!handle.dir.join("decision/plan.json").exists());
+    }
+
+    #[test]
+    fn generate_report_from_legacy_snapshot_keeps_unknown_ledger_and_export_redaction() {
+        let session_id = SessionId::new();
+        let (_tmp, handle) = make_report_handle(&session_id);
+        populate_report_snapshot(&handle, None);
+        for profile in ["safe", "minimal"] {
+            let mut config = ReportConfig::new()
+                .with_embed_assets(true)
+                .with_galaxy_brain(true);
+            config.redaction_profile = profile.to_string();
+            let report =
+                prepare_report_from_session(&ReportGenerator::new(config), &handle).unwrap();
+            let html = report.render_html().unwrap();
+            let recorded = saved_report_data(&html);
+            assert_eq!(recorded["overview"]["processes_scanned"], 97);
+            assert_eq!(recorded["overview"]["candidates_found"], 1);
+            assert_eq!(recorded["overview"]["export_profile"], profile);
+            assert!(recorded["overview"]["kills_attempted"].is_null());
+            if profile == "safe" {
+                assert!(recorded["plan"]["candidates"][0]
+                    .get("evidence_ledger")
+                    .is_none());
+                assert!(html.contains("Exact ledger not recorded for this candidate."));
+                assert_eq!(recorded["overview"]["host_id"], recorded["plan"]["host_id"]);
+                assert_eq!(
+                    recorded["plan"]["host_id"],
+                    recorded["plan"]["source"]["host_id"]
+                );
+            } else {
+                assert!(recorded.get("plan").is_none());
+                assert_eq!(recorded["candidate_count"], 1);
+                assert!(recorded.get("outcomes").is_none());
+            }
+            let summary = report.render_summary(
+                pt_report::generator::TextReportFormat::Slack,
+                pt_report::generator::TextReportStyle::Technical,
+            );
+            for private in [
+                "private-snapshot-host",
+                "private-snapshot-worker",
+                "snapshot-secret-value",
+            ] {
+                assert!(!html.contains(private), "{profile}: {private}");
+                assert!(!summary.contains(private), "{profile}: {private}");
+            }
+        }
+        assert!(!handle.dir.join("decision/plan.json").exists());
+    }
+
+    #[test]
+    fn generate_report_from_snapshot_rejects_corrupted_recorded_inference() {
+        let session_id = SessionId::new();
+        let (_tmp, handle) = make_report_handle(&session_id);
+        populate_report_snapshot(&handle, None);
+        let path = handle.dir.join("inference/results.json");
+        let mut inference: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        inference["payload"]["candidates"][0]["score"] = serde_json::json!(0);
+        fs::write(&path, serde_json::to_vec(&inference).unwrap()).unwrap();
+        assert!(matches!(
+            prepare_report_from_session(&ReportGenerator::default_config(), &handle),
+            Err(pt_report::ReportError::MissingData(_)),
+        ));
+        assert!(!handle.dir.join("decision/plan.json").exists());
     }
 
     #[test]
@@ -50321,6 +50634,8 @@ mod report_generation_tests {
             prepare_report_from_session(&generator, &handle),
             Err(pt_report::ReportError::IoError(error)) if error.kind() == std::io::ErrorKind::NotFound,
         ));
+        // Valid snapshot data cannot conceal an existing corrupt canonical plan.
+        populate_report_snapshot(&handle, None);
         fs::create_dir_all(handle.dir.join("decision")).unwrap();
         fs::write(handle.dir.join("decision/plan.json"), b"not-json").unwrap();
         assert!(matches!(

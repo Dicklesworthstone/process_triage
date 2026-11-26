@@ -653,6 +653,252 @@ fn explain_recorded_plan_survives_process_exit_and_configuration_changes() {
 }
 
 #[test]
+fn explain_recorded_snapshot_preserves_ledger_after_exit_and_prior_changes() {
+    with_temp_data_dir(|dir| {
+        let config = TempDir::new().unwrap();
+        let mut policy = pt_core::config::Policy::default();
+        policy.guardrails.builtin_protection = false;
+        policy.guardrails.protected_users.clear();
+        policy.guardrails.protected_groups.clear();
+        policy.guardrails.protected_patterns.clear();
+        policy.guardrails.protected_categories.clear();
+        policy.guardrails.min_process_age_seconds = 0;
+        // Keep the saved census distinct from the inference population so a
+        // report cannot substitute candidate count for processes scanned.
+        policy.guardrails.never_kill_pid.push(std::process::id());
+        fs::write(
+            config.path().join("policy.json"),
+            serde_json::to_vec(&policy).unwrap(),
+        )
+        .unwrap();
+        let child = ChildGuard {
+            child: ProcessCommand::new("sleep").arg("601").spawn().unwrap(),
+        };
+        let pid = child.child.id();
+        let output = pt_core_fast()
+            .env("PROCESS_TRIAGE_DATA", dir.path())
+            .env("PROCESS_TRIAGE_RETENTION", "off")
+            .arg("--config")
+            .arg(config.path())
+            .args(["--format", "json", "agent", "snapshot", "--window-ms", "25"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let snapshot: Value = serde_json::from_slice(&output).unwrap();
+        let session = snapshot["session_id"].as_str().unwrap();
+        let session_dir = dir.path().join("sessions").join(session);
+        let inventory_path = session_dir.join("scan/inventory.json");
+        let inference_path = session_dir.join("inference/results.json");
+        let original_inventory = fs::read(&inventory_path).unwrap();
+        let original_inference = fs::read(&inference_path).unwrap();
+        let inventory: Value = serde_json::from_slice(&original_inventory).unwrap();
+        let inference: Value = serde_json::from_slice(&original_inference).unwrap();
+        let process = inventory["payload"]["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|process| process["pid"] == pid)
+            .expect("owned process in actual snapshot inventory");
+        let candidate = inference["payload"]["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| candidate["pid"] == pid)
+            .expect("owned process evaluated by actual snapshot producer");
+        let ledger = &candidate["evidence_ledger"];
+        assert!(
+            ledger.is_object(),
+            "snapshot must preserve its exact ledger"
+        );
+        assert!(!ledger["posterior"]["evidence_terms"]
+            .as_array()
+            .expect("numerical evidence terms")
+            .is_empty());
+        assert_eq!(candidate["start_id"], process["start_id"]);
+        assert!(inventory["payload"]["protected_filtered"].as_u64().unwrap() > 0);
+        assert!(!session_dir.join("decision/plan.json").exists());
+        drop(child);
+        // The historical commands must use saved observations even when a new
+        // scan could neither find this incarnation nor load current priors.
+        fs::write(
+            config.path().join("priors.json"),
+            b"{invalid-current-priors",
+        )
+        .unwrap();
+
+        let output = pt_core_fast()
+            .env("PROCESS_TRIAGE_DATA", dir.path())
+            .env("PROCESS_TRIAGE_RETENTION", "off")
+            .arg("--config")
+            .arg(config.path())
+            .args([
+                "--format",
+                "json",
+                "agent",
+                "explain",
+                "--session",
+                session,
+                "--target",
+            ])
+            .arg(format!("{pid}:{}", process["start_id"].as_str().unwrap()))
+            .args(["--include", "ledger"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let explained: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(explained["mode"], "recorded");
+        assert_eq!(explained["source"]["artifact"], "inference/results.json");
+        assert_eq!(explained["source"]["session_id"], session);
+        assert_eq!(
+            explained["source"]["observed_at"],
+            inference["generated_at"]
+        );
+        assert_eq!(
+            explained["source"]["integrity_sha256"],
+            inference["integrity_sha256"]
+        );
+        assert_eq!(
+            explained["source"]["inventory_integrity_sha256"],
+            inventory["integrity_sha256"]
+        );
+        let rows = explained["explanations"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        let actual = &rows[0];
+        assert_eq!(actual["pid"], pid);
+        assert_eq!(actual["start_id"], process["start_id"]);
+        assert_eq!(actual["uid"], process["uid"]);
+        assert_eq!(actual["command"], process["cmd"]);
+        for field in [
+            "classification",
+            "confidence",
+            "score",
+            "recommended_action",
+        ] {
+            assert_eq!(actual[field], candidate[field], "recorded {field} changed");
+        }
+        for class in ["useful", "useful_bad", "abandoned", "zombie"] {
+            assert_eq!(
+                actual["posterior"][class],
+                candidate[format!("posterior_{class}")]
+            );
+        }
+        assert_eq!(actual["evidence_ledger"], *ledger);
+        assert_eq!(actual["bayes_factors"], ledger["bayes_factors"]);
+        assert_eq!(actual["why_summary"], ledger["why_summary"]);
+        assert_eq!(actual["ledger_status"], "recorded");
+
+        #[cfg(feature = "report")]
+        {
+            let report_path = dir.path().join("snapshot-report.html");
+            let output = pt_core_fast()
+                .env("PROCESS_TRIAGE_DATA", dir.path())
+                .env("PROCESS_TRIAGE_RETENTION", "off")
+                .arg("--config")
+                .arg(config.path())
+                .args([
+                    "--format",
+                    "json",
+                    "agent",
+                    "report",
+                    "--session",
+                    session,
+                    "--profile",
+                    "forensic",
+                    "--galaxy-brain",
+                    "--embed-assets",
+                    "--out",
+                ])
+                .arg(&report_path)
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone();
+            let response: Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(response["status"], "success");
+            let html = fs::read_to_string(report_path).unwrap();
+            let embedded = html
+                .split("id=\"recorded-session-data\">")
+                .nth(1)
+                .expect("report embeds the validated recorded artifacts")
+                .split("</script>")
+                .next()
+                .unwrap();
+            let recorded: Value = serde_json::from_str(embedded).unwrap();
+            assert_eq!(
+                recorded["overview"]["processes_scanned"],
+                inventory["payload"]["total_system_processes"]
+            );
+            assert_eq!(
+                recorded["overview"]["candidates_found"],
+                inference["payload"]["candidate_count"]
+            );
+            assert_eq!(
+                recorded["plan"]["source"]["artifact_path"],
+                "inference/results.json"
+            );
+            for field in ["session_id", "host_id", "integrity_sha256"] {
+                assert_eq!(
+                    recorded["plan"]["source"][field],
+                    explained["source"][field]
+                );
+            }
+            assert_eq!(recorded["plan"]["generated_at"], inference["generated_at"]);
+            let reported = recorded["plan"]["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|candidate| candidate["pid"] == pid)
+                .expect("exited process retained in historical report");
+            assert!(reported["start_id"]
+                .as_str()
+                .is_some_and(|start_id| !start_id.is_empty()));
+            assert_eq!(reported["uid"], process["uid"]);
+            assert_eq!(reported["posterior"], actual["posterior"]);
+            // Export profiles may redact narrative strings. The saved numeric
+            // evidence must still survive the same report redaction path.
+            let reported_ledger = &reported["evidence_ledger"];
+            for field in ["posterior", "log_posterior", "log_odds_abandoned_useful"] {
+                assert_eq!(
+                    reported_ledger["posterior"][field],
+                    ledger["posterior"][field]
+                );
+            }
+            let saved_terms = ledger["posterior"]["evidence_terms"].as_array().unwrap();
+            let reported_terms = reported_ledger["posterior"]["evidence_terms"]
+                .as_array()
+                .unwrap();
+            assert_eq!(reported_terms.len(), saved_terms.len());
+            for (reported_term, saved_term) in reported_terms.iter().zip(saved_terms) {
+                assert_eq!(
+                    reported_term["log_likelihood"],
+                    saved_term["log_likelihood"]
+                );
+            }
+            let saved_factors = ledger["bayes_factors"].as_array().unwrap();
+            let reported_factors = reported_ledger["bayes_factors"].as_array().unwrap();
+            assert_eq!(reported_factors.len(), saved_factors.len());
+            for (reported_factor, saved_factor) in reported_factors.iter().zip(saved_factors) {
+                for field in ["bf", "log_bf", "delta_bits"] {
+                    assert_eq!(reported_factor[field], saved_factor[field]);
+                }
+            }
+            assert!(recorded["plan"].get("actions").is_none());
+            assert_eq!(recorded["outcomes"], serde_json::json!([]));
+        }
+
+        assert_eq!(fs::read(inventory_path).unwrap(), original_inventory);
+        assert_eq!(fs::read(inference_path).unwrap(), original_inference);
+        assert!(!session_dir.join("decision/plan.json").exists());
+        assert!(!session_dir.join("action/outcomes.jsonl").exists());
+    });
+}
+
+#[test]
 fn explain_live_refuses_reused_identity_and_malformed_targets() {
     with_temp_data_dir(|dir| {
         let child = ChildGuard {

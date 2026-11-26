@@ -110,6 +110,11 @@ pub struct PersistedInference {
     pub confidence: String,
     pub recommended_action: String,
     pub score: u32,
+    /// Exact JSON emitted by the scorer at observation time. This retains the
+    /// historical likelihood terms and priors without rescoring a live PID.
+    /// Older snapshots omit the field; missing evidence is never reconstructed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_ledger: Option<serde_json::Value>,
 
     // ── Provenance context (bd-c4d1) ─────────────────────────────
     /// Blast-radius risk level from provenance graph (low/medium/high/critical).
@@ -529,6 +534,7 @@ pub fn persist_inference(
     host_id: &str,
     artifact: InferenceArtifact,
 ) -> Result<PathBuf, SessionError> {
+    validate_inference_ledgers(&artifact, &handle.dir.join(INFERENCE_FILE))?;
     let envelope = ArtifactEnvelope::new(session_id, host_id, artifact);
     persist_artifact(handle, INFERENCE_FILE, envelope)
 }
@@ -774,7 +780,37 @@ pub fn load_inventory_unchecked(
 pub fn load_inference(
     handle: &SessionHandle,
 ) -> Result<ArtifactEnvelope<InferenceArtifact>, SessionError> {
-    load_artifact(handle, INFERENCE_FILE)
+    let envelope: ArtifactEnvelope<InferenceArtifact> = load_artifact(handle, INFERENCE_FILE)?;
+    validate_inference_ledgers(&envelope.payload, &handle.dir.join(INFERENCE_FILE))?;
+    Ok(envelope)
+}
+
+/// Preserve a recorded ledger as JSON instead of reconstructing floating-point
+/// log terms. A nested null can represent an unbounded term; a null or scalar
+/// ledger cannot represent recorded evidence or round-trip through Option.
+fn validate_inference_ledgers(
+    artifact: &InferenceArtifact,
+    path: &Path,
+) -> Result<(), SessionError> {
+    for candidate in &artifact.candidates {
+        if candidate
+            .evidence_ledger
+            .as_ref()
+            .is_some_and(|ledger| !ledger.is_object())
+        {
+            return Err(SessionError::Json {
+                path: path.to_path_buf(),
+                source: serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "recorded evidence ledger for PID {} must be an object",
+                        candidate.pid
+                    ),
+                )),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Load the inference artifact but skip integrity validation.
@@ -896,7 +932,8 @@ fn index_explanation_candidates(
 
 /// Prefer the rich canonical plan so final policy/tree/goal decisions and exact
 /// ledgers agree with the approved document. Snapshot-only sessions use the
-/// existing checksummed inventory/inference pair and explicitly lack a ledger.
+/// existing checksummed inventory/inference pair, including its saved ledger
+/// when available. Older snapshots explicitly lack that evidence.
 /// A corrupt available artifact is an error, never permission to inspect a new
 /// process that happens to have the same PID.
 pub fn load_recorded_explanation_snapshot(
@@ -912,6 +949,7 @@ pub fn load_recorded_explanation_snapshot(
             }
             let source = serde_json::json!({
                 "artifact": PLAN_FILE,
+                "session_id": plan["session_id"],
                 "sha256": sha256_hex(&bytes),
                 "observed_at": plan["generated_at"],
                 "host_id": plan["host_id"],
@@ -969,8 +1007,11 @@ pub fn load_recorded_explanation_snapshot(
         return Err("recorded snapshot count mismatch".into());
     }
     let mut records = BTreeMap::new();
+    let mut inventory_pids = std::collections::BTreeSet::new();
     for process in &inventory.payload.records {
-        if records.insert(process.start_id.as_str(), process).is_some() {
+        if !inventory_pids.insert(process.pid)
+            || records.insert(process.start_id.as_str(), process).is_some()
+        {
             return Err("recorded inventory has duplicate process identities".into());
         }
     }
@@ -988,7 +1029,7 @@ pub fn load_recorded_explanation_snapshot(
                         candidate.pid
                     )
                 })?;
-            Ok(serde_json::json!({
+            let mut recorded = serde_json::json!({
                 "pid": candidate.pid,
                 "start_id": candidate.start_id,
                 "uid": process.uid,
@@ -996,6 +1037,8 @@ pub fn load_recorded_explanation_snapshot(
                 "command_short": process.comm,
                 "command": process.cmd,
                 "state": process.state,
+                "start_time_unix": process.start_time_unix,
+                "identity_quality": process.identity_quality,
                 "age_seconds": process.elapsed_secs,
                 "classification": candidate.classification,
                 "confidence": candidate.confidence,
@@ -1007,7 +1050,27 @@ pub fn load_recorded_explanation_snapshot(
                 },
                 "score": candidate.score,
                 "recommended_action": candidate.recommended_action,
-            }))
+            });
+            if let Some(ledger) = &candidate.evidence_ledger {
+                recorded["evidence_ledger"] = ledger.clone();
+            }
+            if let Some(level) = &candidate.blast_radius_risk_level {
+                recorded["blast_radius_risk_level"] = serde_json::json!(level);
+            }
+            if let Some(affected) = candidate.blast_radius_total_affected {
+                recorded["blast_radius_total_affected"] = serde_json::json!(affected);
+            }
+            if let Some(completeness) = candidate.provenance_evidence_completeness {
+                recorded["provenance_evidence_completeness"] = serde_json::json!(completeness);
+            }
+            if !candidate.provenance_score_terms.is_empty() {
+                recorded["provenance_score_terms"] =
+                    serde_json::json!(candidate.provenance_score_terms);
+            }
+            if let Some(shift) = candidate.provenance_log_odds_shift {
+                recorded["provenance_log_odds_shift"] = serde_json::json!(shift);
+            }
+            Ok(recorded)
         })
         .collect::<Result<Vec<_>, String>>()?;
     Ok(RecordedExplanationSnapshot {
@@ -1015,10 +1078,13 @@ pub fn load_recorded_explanation_snapshot(
         protected: BTreeMap::new(),
         source: serde_json::json!({
             "artifact": INFERENCE_FILE,
+            "session_id": inference.session_id,
             "integrity_sha256": inference.integrity_sha256,
             "inventory_integrity_sha256": inventory.integrity_sha256,
             "observed_at": inference.generated_at,
             "host_id": inference.host_id,
+            "total_system_processes": inventory.payload.total_system_processes,
+            "protected_filtered": inventory.payload.protected_filtered,
         }),
         activity_window_ms: None,
     })
@@ -1257,6 +1323,7 @@ mod tests {
                 confidence: "high".to_string(),
                 recommended_action: "kill".to_string(),
                 score: 92,
+                evidence_ledger: None,
                 blast_radius_risk_level: None,
                 blast_radius_total_affected: None,
                 provenance_evidence_completeness: None,
@@ -1280,6 +1347,127 @@ mod tests {
                 rationale: "P(abandoned)=0.90, low blast radius".to_string(),
             }],
         }
+    }
+
+    #[test]
+    fn snapshot_ledger_preserves_recorded_wire_evidence_and_detects_tampering() {
+        use crate::inference::{compute_posterior, CpuEvidence, Evidence, EvidenceLedger};
+
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let evidence = Evidence {
+            cpu: Some(CpuEvidence::Fraction { occupancy: 0.001 }),
+            runtime_seconds: Some(86400.0),
+            orphan: Some(true),
+            tty: Some(false),
+            ..Evidence::default()
+        };
+        let posterior =
+            compute_posterior(&crate::config::priors::Priors::default(), &evidence).unwrap();
+        let mut ledger = serde_json::to_value(EvidenceLedger::from_posterior_result(
+            &posterior,
+            Some(1234),
+            None,
+        ))
+        .unwrap();
+        // Wire-format evidence can contain null for a non-finite log term, and
+        // future scorer fields must survive without deserializing into today's
+        // typed ledger or recomputing its numbers.
+        ledger["future_evidence"] = serde_json::json!({
+            "log_likelihood": null,
+            "precise_term": 1.2345678901234567,
+            "small_term": 1.0e-200,
+            "negative_zero": -0.0,
+        });
+        let mut inference = sample_inference();
+        let candidate = &mut inference.candidates[0];
+        candidate.posterior_useful = posterior.posterior.useful;
+        candidate.posterior_useful_bad = posterior.posterior.useful_bad;
+        candidate.posterior_abandoned = posterior.posterior.abandoned;
+        candidate.posterior_zombie = posterior.posterior.zombie;
+        candidate.score = posterior.posterior.suspicion_score();
+        candidate.evidence_ledger = Some(ledger.clone());
+        persist_inventory(&handle, &handle.id.0, "host1", sample_inventory()).unwrap();
+        let path = persist_inference(&handle, &handle.id.0, "host1", inference).unwrap();
+
+        let loaded = load_inference(&handle).unwrap();
+        assert_eq!(
+            loaded.payload.candidates[0].evidence_ledger,
+            Some(ledger.clone())
+        );
+        let saved = load_recorded_explanation_snapshot(&handle).unwrap();
+        assert_eq!(saved.candidates[&1234]["evidence_ledger"], ledger);
+        assert_eq!(
+            saved.candidates[&1234]["posterior"],
+            serde_json::json!(posterior.posterior)
+        );
+        assert_eq!(saved.source["session_id"], handle.id.0);
+        assert_eq!(saved.source["total_system_processes"], 300);
+        assert_eq!(saved.source["protected_filtered"], 50);
+        assert!(!handle.dir.join(PLAN_FILE).exists());
+
+        let mut corrupted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        corrupted["payload"]["candidates"][0]["evidence_ledger"]["why_summary"] =
+            serde_json::json!("a rewritten explanation");
+        std::fs::write(path, serde_json::to_vec(&corrupted).unwrap()).unwrap();
+        assert!(load_recorded_explanation_snapshot(&handle)
+            .unwrap_err()
+            .contains("integrity check failed"));
+    }
+
+    #[test]
+    fn snapshot_ledger_requires_an_object_without_replacing_valid_evidence() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let mut inference = sample_inference();
+        inference.candidates[0].evidence_ledger =
+            Some(serde_json::json!({"why_summary": "original observation"}));
+        let path = persist_inference(&handle, &handle.id.0, "host1", inference.clone()).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!([]),
+            serde_json::json!("discarded evidence"),
+            serde_json::json!(42),
+        ] {
+            inference.candidates[0].evidence_ledger = Some(invalid);
+            assert!(
+                persist_inference(&handle, &handle.id.0, "host1", inference.clone())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("must be an object")
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+
+        // Even an integrity-valid envelope from another writer must meet the
+        // same shape contract when it is loaded.
+        let envelope = ArtifactEnvelope::new(&handle.id.0, "host1", inference);
+        persist_artifact(&handle, INFERENCE_FILE, envelope).unwrap();
+        assert!(load_inference(&handle)
+            .unwrap_err()
+            .to_string()
+            .contains("must be an object"));
+    }
+
+    #[test]
+    fn snapshot_ledger_is_optional_for_legacy_integrity_and_explanations() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        persist_inventory(&handle, &handle.id.0, "host1", sample_inventory()).unwrap();
+        let path = persist_inference(&handle, &handle.id.0, "host1", sample_inference()).unwrap();
+        let old_bytes = std::fs::read(&path).unwrap();
+        let old_envelope: serde_json::Value = serde_json::from_slice(&old_bytes).unwrap();
+        assert!(old_envelope["payload"]["candidates"][0]
+            .get("evidence_ledger")
+            .is_none());
+        let loaded = load_inference(&handle).unwrap();
+        assert!(loaded.payload.candidates[0].evidence_ledger.is_none());
+        assert_eq!(serde_json::to_value(loaded).unwrap(), old_envelope);
+        let saved = load_recorded_explanation_snapshot(&handle).unwrap();
+        assert!(saved.candidates[&1234].get("evidence_ledger").is_none());
+        assert_eq!(std::fs::read(path).unwrap(), old_bytes);
     }
 
     #[test]
@@ -1340,6 +1528,59 @@ mod tests {
     }
 
     #[test]
+    fn recorded_snapshot_projection_retains_observed_identity_and_provenance() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let mut inventory = sample_inventory();
+        inventory.records[0].start_time_unix = 1700000123;
+        inventory.records[0].identity_quality = "QuickScan".to_string();
+        let mut inference = sample_inference();
+        let candidate = &mut inference.candidates[0];
+        candidate.blast_radius_risk_level = Some("low".to_string());
+        candidate.blast_radius_total_affected = Some(0);
+        candidate.provenance_evidence_completeness = Some(0.625);
+        candidate.provenance_score_terms = vec!["shared_resource".to_string()];
+        candidate.provenance_log_odds_shift = Some(0.0);
+        let inventory_path = persist_inventory(&handle, &handle.id.0, "host1", inventory).unwrap();
+        let inference_path = persist_inference(&handle, &handle.id.0, "host1", inference).unwrap();
+        let inventory_bytes = std::fs::read(&inventory_path).unwrap();
+        let inference_bytes = std::fs::read(&inference_path).unwrap();
+        let inventory: serde_json::Value = serde_json::from_slice(&inventory_bytes).unwrap();
+        let inference: serde_json::Value = serde_json::from_slice(&inference_bytes).unwrap();
+
+        let saved = load_recorded_explanation_snapshot(&handle).unwrap();
+        let candidate = &saved.candidates[&1234];
+        for field in ["start_time_unix", "identity_quality"] {
+            assert_eq!(
+                candidate.get(field),
+                inventory["payload"]["records"][0].get(field),
+                "{field}"
+            );
+            assert!(candidate.get(field).is_some(), "{field}");
+        }
+        for field in [
+            "blast_radius_risk_level",
+            "blast_radius_total_affected",
+            "provenance_evidence_completeness",
+            "provenance_score_terms",
+            "provenance_log_odds_shift",
+        ] {
+            assert_eq!(
+                candidate.get(field),
+                inference["payload"]["candidates"][0].get(field),
+                "{field}"
+            );
+            assert!(candidate.get(field).is_some(), "{field}");
+        }
+        // Explicit zero observations are retained, not mistaken for unknowns.
+        assert_eq!(candidate["blast_radius_total_affected"], 0);
+        assert_eq!(candidate["provenance_log_odds_shift"], 0.0);
+        assert_eq!(std::fs::read(inventory_path).unwrap(), inventory_bytes);
+        assert_eq!(std::fs::read(inference_path).unwrap(), inference_bytes);
+        assert!(!handle.dir.join(PLAN_FILE).exists());
+    }
+
+    #[test]
     fn recorded_explanations_validate_snapshot_identity_and_integrity() {
         let tmp = TempDir::new().unwrap();
         let handle = make_handle(&tmp);
@@ -1348,8 +1589,26 @@ mod tests {
         let saved = load_recorded_explanation_snapshot(&handle).unwrap();
         assert_eq!(saved.candidates[&1234]["command"], "node server.js");
         assert_eq!(saved.candidates[&1234]["posterior"]["abandoned"], 0.90);
-        assert!(saved.candidates[&1234].get("evidence_ledger").is_none());
+        for field in [
+            "evidence_ledger",
+            "blast_radius_risk_level",
+            "blast_radius_total_affected",
+            "provenance_evidence_completeness",
+            "provenance_score_terms",
+            "provenance_log_odds_shift",
+        ] {
+            assert!(saved.candidates[&1234].get(field).is_none(), "{field}");
+        }
         assert!(saved.activity_window_ms.is_none());
+
+        let mut duplicate_inventory = sample_inventory();
+        duplicate_inventory.records[1].pid = 1234;
+        duplicate_inventory.records[1].start_id = "boot1:99999:1234".into();
+        persist_inventory(&handle, &handle.id.0, "host1", duplicate_inventory).unwrap();
+        assert!(load_recorded_explanation_snapshot(&handle)
+            .unwrap_err()
+            .contains("duplicate process identities"));
+        persist_inventory(&handle, &handle.id.0, "host1", sample_inventory()).unwrap();
 
         let mut wrong_identity = sample_inference();
         wrong_identity.candidates[0].start_id = "boot1:99999:1234".into();

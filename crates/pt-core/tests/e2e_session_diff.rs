@@ -224,6 +224,7 @@ fn inf(
         confidence: "high".to_string(),
         recommended_action: action.to_string(),
         score,
+        evidence_ledger: None,
         blast_radius_risk_level: None,
         blast_radius_total_affected: None,
         provenance_evidence_completeness: None,
