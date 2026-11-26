@@ -45690,8 +45690,22 @@ fn run_agent_label(global: &GlobalOpts, args: &AgentLabelArgs) -> ExitCode {
     }
     let learned = store.learned_prior(&comm, &cmd, &config.priors);
 
+    // A successful label receipt must describe the observation that was actually
+    // persisted. MCP callers use this binding instead of trusting any JSON from
+    // a child process or re-reading a PID that may already have been reused.
     let response = serde_json::json!({
         "schema_version": SCHEMA_VERSION,
+        "command": "agent label",
+        "pid": args.pid,
+        "session_id": args.session,
+        "start_id": recorded_target
+            .as_ref()
+            .map(|target| &target.identity.start_id)
+            .or_else(|| labeled_process.as_ref().map(|process| &process.start_id)),
+        "uid": recorded_target
+            .as_ref()
+            .map(|target| target.identity.uid)
+            .or_else(|| labeled_process.as_ref().map(|process| process.uid)),
         "verdict": verdict,
         "comm": comm,
         "patterns": DecisionStore::pattern_keys(&comm, &cmd),

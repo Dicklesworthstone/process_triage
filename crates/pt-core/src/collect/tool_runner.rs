@@ -612,7 +612,9 @@ impl ToolRunner {
 
         debug!(
             command = %spec.command,
-            args = ?spec.args,
+            // Arguments may contain private command text or credentials. Human
+            // logging does not run the JSONL field redactor.
+            argument_count = spec.args.len(),
             timeout_ms = timeout.as_millis(),
             max_output,
             "running tool"

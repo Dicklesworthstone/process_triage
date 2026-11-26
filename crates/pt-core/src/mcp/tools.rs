@@ -739,10 +739,11 @@ fn label_command_args(params: &serde_json::Value) -> Result<Vec<String>, String>
     let object = params
         .as_object()
         .ok_or_else(|| "pt_label arguments must be an object".to_string())?;
+    plan_timeout(params)?;
     for key in object.keys() {
         if !matches!(
             key.as_str(),
-            "pid" | "session" | "cmd" | "comm" | "verdict" | "confirmed_by_user"
+            "pid" | "session" | "cmd" | "comm" | "verdict" | "confirmed_by_user" | "timeout_secs"
         ) {
             return Err(format!("unknown pt_label argument: {key}"));
         }
@@ -1005,7 +1006,9 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                           Updates future recommendations; never signals a process. \
                           Supply session with pid to label the recorded incarnation after it exits. \
                           Do not record model recommendations or accepted defaults as human verdicts. \
-                          Each successful call adds one observation; do not retry a successful call."
+                          Each successful call adds one observation; do not retry a successful call. \
+                          If a worker fails or times out, persistence may already have occurred; \
+                          inspect the learning store and shadow records before retrying."
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -1040,6 +1043,13 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "type": "boolean",
                         "const": true,
                         "description": "Must be true only after the user explicitly chose this verdict"
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_PLAN_TIMEOUT_SECS,
+                        "default": DEFAULT_PLAN_TIMEOUT_SECS,
+                        "description": "Total feedback worker deadline in seconds, including store locking and output collection; an incomplete receipt is an error and must not be retried blindly"
                     }
                 },
                 "required": ["verdict", "confirmed_by_user"],
@@ -1622,20 +1632,52 @@ fn parse_plan_worker_output(output: &ToolOutput) -> Result<String, String> {
 /// generalization rules and identity-bound shadow events as explicit CLI labels.
 fn tool_label(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
     let args = label_command_args(params)?;
+    let timeout = plan_timeout(params)?;
     let config = crate::config::resolve_config_dir(&crate::mcp::config_options())
         .map_err(|error| format!("cannot resolve label config directory: {error}"))?;
-    let exe = std::env::current_exe().map_err(|e| format!("cannot locate pt-core: {e}"))?;
-    let output = std::process::Command::new(&exe)
-        .arg("--config")
-        .arg(config)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|e| format!("failed to run agent label: {e}"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    if !output.status.success() || serde_json::from_str::<serde_json::Value>(&stdout).is_err() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let tail = stderr
+    let exe = std::env::current_exe().map_err(|error| format!("cannot locate pt-core: {error}"))?;
+    let spec = agent_worker_spec(&exe, &config, args, timeout)?;
+    let stdout = run_label_worker(&spec, params, &config)?;
+    Ok(vec![ToolContent {
+        content_type: "text".to_string(),
+        text: stdout,
+    }])
+}
+
+fn run_label_worker(
+    spec: &ToolSpec,
+    params: &serde_json::Value,
+    config: &Path,
+) -> Result<String, String> {
+    let output = run_agent_worker(spec, "agent label").map_err(label_receipt_unconfirmed)?;
+    parse_label_worker_output(&output, params, config).map_err(label_receipt_unconfirmed)
+}
+
+/// Cancellation can occur after either durable write. A missing receipt does
+/// not prove that no verdict was stored, and automatic retries would teach twice.
+fn label_receipt_unconfirmed(error: String) -> String {
+    format!(
+        "{error}; feedback persistence is unconfirmed and may already have occurred; \
+         inspect the learning store and shadow records before retrying"
+    )
+}
+
+fn parse_label_worker_output(
+    output: &ToolOutput,
+    params: &serde_json::Value,
+    config: &Path,
+) -> Result<String, String> {
+    use crate::decision::decision_store::{DecisionStore, DECISIONS_FILE};
+
+    if output.timed_out {
+        return Err("agent label timed out; no complete receipt was returned".into());
+    }
+    if output.truncated {
+        return Err("agent label output was truncated; no complete receipt was returned".into());
+    }
+    if output.exit_code != Some(0) {
+        let detail = output
+            .stderr_str()
             .lines()
             .rev()
             .take(5)
@@ -1645,14 +1687,112 @@ fn tool_label(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
             .collect::<Vec<_>>()
             .join("\n");
         return Err(format!(
-            "agent label failed (exit {:?}): {tail}",
-            output.status.code()
+            "agent label failed (exit {:?}): {detail}",
+            output.exit_code
         ));
     }
-    Ok(vec![ToolContent {
-        content_type: "text".to_string(),
-        text: stdout,
-    }])
+    let stdout = std::str::from_utf8(&output.stdout)
+        .map_err(|_| "agent label returned invalid UTF-8".to_string())?;
+    let document: serde_json::Value = serde_json::from_str(stdout)
+        .map_err(|error| format!("agent label returned invalid JSON: {error}"))?;
+    let expected_store = config.join(DECISIONS_FILE);
+    if document["command"] != "agent label"
+        || !document["schema_version"]
+            .as_str()
+            .is_some_and(pt_common::schema::is_compatible)
+        || document["verdict"] != params["verdict"]
+        || document.get("pid") != Some(&params["pid"])
+        || document.get("session_id") != Some(&params["session"])
+        || document["store"].as_str().map(Path::new) != Some(expected_store.as_path())
+    {
+        return Err("agent label returned a receipt for a different request or store".into());
+    }
+    let comm = document["comm"]
+        .as_str()
+        .filter(|comm| !comm.trim().is_empty() && !comm.contains('\0'))
+        .ok_or("agent label returned no labeled command")?;
+    let patterns = document["patterns"]
+        .as_array()
+        .filter(|patterns| {
+            !patterns.is_empty()
+                && patterns
+                    .iter()
+                    .all(|key| key.as_str().is_some_and(|key| !key.is_empty()))
+        })
+        .ok_or("agent label returned no learned patterns")?;
+    let count_key = if params["verdict"] == "kill" {
+        "kill"
+    } else {
+        "spare"
+    };
+    let learned = &document["learned_prior"];
+    if !patterns.contains(&learned["pattern_key"])
+        || !learned[count_key].as_u64().is_some_and(|count| count > 0)
+        || !learned["abandonment_prior"]
+            .as_f64()
+            .is_some_and(|value| value.is_finite() && (0.0..=1.0).contains(&value))
+    {
+        return Err("agent label returned an incomplete learning receipt".into());
+    }
+    let shadow = &document["shadow_label"];
+    if let Some(pid) = params["pid"].as_u64() {
+        let start_id = document["start_id"]
+            .as_str()
+            .filter(|start| {
+                pt_common::StartId::parse(start).is_some()
+                    && start
+                        .rsplit(':')
+                        .next()
+                        .and_then(|pid| pid.parse::<u64>().ok())
+                        == Some(pid)
+            })
+            .ok_or("agent label returned an invalid process birth identity")?;
+        let uid = document["uid"]
+            .as_u64()
+            .and_then(|uid| u32::try_from(uid).ok())
+            .ok_or("agent label returned no process owner")?;
+        if shadow["recorded"] != true
+            || !shadow["identity_hash"]
+                .as_str()
+                .is_some_and(|hash| !hash.is_empty())
+        {
+            return Err("agent label returned no identity-bound shadow receipt".into());
+        }
+        if let Some(session) = params["session"].as_str() {
+            let source = &document["recorded_source"];
+            if source["session_id"] != session
+                || source["pid"].as_u64() != Some(pid)
+                || source["start_id"].as_str() != Some(start_id)
+                || source["uid"].as_u64() != Some(u64::from(uid))
+                || source["artifact"] != "scan/inventory.json"
+                || shadow["reason"] != "explicit_session_process_verdict"
+            {
+                return Err("agent label returned a different recorded process identity".into());
+            }
+        } else if document.get("recorded_source") != Some(&serde_json::Value::Null)
+            || shadow["reason"] != "explicit_live_process_verdict"
+        {
+            return Err("agent label returned a different feedback source".into());
+        }
+    } else {
+        let cmd = params["cmd"].as_str().ok_or("missing label command")?;
+        let first = cmd.split_whitespace().next().unwrap_or("");
+        let expected_comm = params["comm"]
+            .as_str()
+            .unwrap_or_else(|| first.rsplit('/').next().unwrap_or(first));
+        if comm != expected_comm
+            || document["patterns"] != serde_json::json!(DecisionStore::pattern_keys(comm, cmd))
+            || document.get("start_id") != Some(&serde_json::Value::Null)
+            || document.get("uid") != Some(&serde_json::Value::Null)
+            || document.get("recorded_source") != Some(&serde_json::Value::Null)
+            || shadow["recorded"] != false
+            || shadow.get("identity_hash") != Some(&serde_json::Value::Null)
+            || shadow["reason"] != "command_pattern_has_no_process_identity"
+        {
+            return Err("agent label returned a different command-pattern receipt".into());
+        }
+    }
+    Ok(stdout.to_string())
 }
 
 fn tool_history(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
@@ -2972,6 +3112,287 @@ mod tests {
         evaluator.scorer.collect_activity(&[], Duration::ZERO);
         assert!(evaluator.scorer.activity_for(&process).is_none());
         assert_eq!(reported_cpu_percent(&process, None), Some(81.0));
+    }
+
+    fn worker_label_document() -> serde_json::Value {
+        let patterns = crate::decision::decision_store::DecisionStore::pattern_keys(
+            "node",
+            "node /srv/reviewed.js",
+        );
+        serde_json::json!({
+            "command": "agent label",
+            "schema_version": "1.0.0",
+            "pid": null,
+            "session_id": null,
+            "start_id": null,
+            "uid": null,
+            "verdict": "spare",
+            "comm": "node",
+            "patterns": patterns,
+            "store": "/tmp/label-config/decisions.json",
+            "recorded_source": null,
+            "learned_prior": {
+                "pattern_key": patterns[0],
+                "kill": 0,
+                "spare": 1,
+                "abandonment_prior": 0.16666666666666666,
+            },
+            "shadow_label": {
+                "recorded": false,
+                "identity_hash": null,
+                "reason": "command_pattern_has_no_process_identity",
+            },
+        })
+    }
+
+    fn label_worker_output(document: &serde_json::Value) -> ToolOutput {
+        ToolOutput {
+            command: "pt-core".into(),
+            args: Vec::new(),
+            stdout: document.to_string().into_bytes(),
+            stderr: Vec::new(),
+            exit_code: Some(0),
+            truncated: false,
+            duration: Duration::ZERO,
+            timed_out: false,
+        }
+    }
+
+    #[test]
+    fn label_worker_rejects_unrelated_incomplete_and_ambiguous_receipts() {
+        let params = serde_json::json!({
+            "cmd": "node /srv/reviewed.js", "verdict": "spare", "confirmed_by_user": true,
+        });
+        let config = Path::new("/tmp/label-config");
+        let document = worker_label_document();
+        let parse = |output: &ToolOutput| parse_label_worker_output(output, &params, config);
+        let original = label_worker_output(&document);
+        assert_eq!(parse(&original).unwrap(), document.to_string());
+
+        for (path, value) in [
+            ("/command", serde_json::json!("agent plan")),
+            ("/schema_version", serde_json::json!("99.0.0")),
+            ("/verdict", serde_json::json!("kill")),
+            ("/pid", serde_json::json!(42)),
+            ("/session_id", serde_json::json!("pt-20260115-143022-a7xq")),
+            ("/start_id", serde_json::json!("boot:123:42")),
+            ("/uid", serde_json::json!(1000)),
+            ("/comm", serde_json::json!("python")),
+            ("/patterns", serde_json::json!([])),
+            ("/patterns", serde_json::json!(["exact|node|unrelated"])),
+            ("/store", serde_json::json!("/tmp/other/decisions.json")),
+            ("/recorded_source", serde_json::json!({})),
+            ("/learned_prior", serde_json::Value::Null),
+            ("/learned_prior/spare", serde_json::json!(0)),
+            ("/learned_prior/abandonment_prior", serde_json::json!(1.1)),
+            ("/shadow_label/recorded", serde_json::json!(true)),
+            ("/shadow_label/identity_hash", serde_json::json!("invented")),
+            (
+                "/shadow_label/reason",
+                serde_json::json!("explicit_live_process_verdict"),
+            ),
+        ] {
+            let mut invalid = document.clone();
+            *invalid.pointer_mut(path).unwrap() = value;
+            assert!(parse(&label_worker_output(&invalid)).is_err(), "{path}");
+        }
+        for field in ["pid", "session_id", "start_id", "uid", "recorded_source"] {
+            let mut invalid = document.clone();
+            invalid.as_object_mut().unwrap().remove(field);
+            assert!(parse(&label_worker_output(&invalid)).is_err(), "{field}");
+        }
+        for bytes in [b"{}".to_vec(), b"{\"verdict\":".to_vec(), vec![0xff]] {
+            let mut output = original.clone();
+            output.stdout = bytes;
+            assert!(parse(&output).is_err());
+        }
+        for status in [None, Some(1), Some(20)] {
+            let mut output = original.clone();
+            output.exit_code = status;
+            assert!(parse(&output).is_err());
+        }
+        let mut output = original.clone();
+        output.timed_out = true;
+        assert!(parse(&output).unwrap_err().contains("timed out"));
+        output = original;
+        output.truncated = true;
+        assert!(parse(&output).unwrap_err().contains("truncated"));
+    }
+
+    #[test]
+    fn label_worker_binds_live_and_recorded_feedback_to_the_requested_identity() {
+        let config = Path::new("/tmp/label-config");
+        let mut params = serde_json::json!({
+            "pid": 42, "verdict": "spare", "confirmed_by_user": true,
+        });
+        let mut document = worker_label_document();
+        document["pid"] = serde_json::json!(42);
+        document["start_id"] = serde_json::json!("test-boot:123:42");
+        document["uid"] = serde_json::json!(1000);
+        document["shadow_label"] = serde_json::json!({
+            "recorded": true,
+            "identity_hash": "0123456789abcdef",
+            "reason": "explicit_live_process_verdict",
+        });
+        assert!(
+            parse_label_worker_output(&label_worker_output(&document), &params, config).is_ok()
+        );
+
+        let session = "pt-20260115-143022-a7xq";
+        params["session"] = serde_json::json!(session);
+        document["session_id"] = serde_json::json!(session);
+        document["shadow_label"]["reason"] = serde_json::json!("explicit_session_process_verdict");
+        document["recorded_source"] = serde_json::json!({
+            "session_id": session,
+            "pid": 42,
+            "start_id": "test-boot:123:42",
+            "uid": 1000,
+            "artifact": "scan/inventory.json",
+        });
+        assert!(
+            parse_label_worker_output(&label_worker_output(&document), &params, config).is_ok()
+        );
+        for (path, value) in [
+            ("/pid", serde_json::json!(43)),
+            ("/start_id", serde_json::json!("test-boot:123:43")),
+            ("/start_id", serde_json::Value::Null),
+            ("/uid", serde_json::Value::Null),
+            ("/uid", serde_json::json!(u64::MAX)),
+            ("/session_id", serde_json::Value::Null),
+            ("/recorded_source/pid", serde_json::json!(43)),
+            (
+                "/recorded_source/start_id",
+                serde_json::json!("test-boot:124:42"),
+            ),
+            ("/recorded_source/uid", serde_json::json!(0)),
+            (
+                "/recorded_source/session_id",
+                serde_json::json!("pt-20260115-143022-abcd"),
+            ),
+            (
+                "/recorded_source/artifact",
+                serde_json::json!("unrelated.json"),
+            ),
+            ("/shadow_label/recorded", serde_json::json!(false)),
+            ("/shadow_label/identity_hash", serde_json::Value::Null),
+            (
+                "/shadow_label/reason",
+                serde_json::json!("explicit_live_process_verdict"),
+            ),
+        ] {
+            let mut invalid = document.clone();
+            *invalid.pointer_mut(path).unwrap() = value;
+            assert!(
+                parse_label_worker_output(&label_worker_output(&invalid), &params, config).is_err(),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn label_deadlines_match_the_schema_and_keep_worker_environment_scoped() {
+        let params = serde_json::json!({
+            "cmd": "node /srv/reviewed.js", "verdict": "spare",
+            "confirmed_by_user": true, "timeout_secs": 7,
+        });
+        let spec = agent_worker_spec(
+            Path::new("/tmp/pt core"),
+            Path::new("/tmp/label-config"),
+            label_command_args(&params).unwrap(),
+            plan_timeout(&params).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(spec.timeout, Some(Duration::from_secs(7)));
+        assert_eq!(
+            &spec.args[..3],
+            ["--config", "/tmp/label-config", "--timeout=7"]
+        );
+        for key in [
+            "PT_CONFIG_DIR",
+            "PT_SKIP_GLOBAL_LOCK",
+            "PT_OUTPUT_FORMAT",
+            "LD_PRELOAD",
+        ] {
+            assert!(!spec.env.contains_key(key), "{key}");
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert!(spec.isolate_process_group);
+        let definitions = tool_definitions();
+        let label = definitions
+            .iter()
+            .find(|tool| tool.name == "pt_label")
+            .unwrap();
+        let timeout = &label.input_schema["properties"]["timeout_secs"];
+        assert_eq!(timeout["default"], DEFAULT_PLAN_TIMEOUT_SECS);
+        assert_eq!(timeout["minimum"], 1);
+        assert_eq!(timeout["maximum"], MAX_PLAN_TIMEOUT_SECS);
+        for invalid in [
+            serde_json::json!(0),
+            serde_json::json!(MAX_PLAN_TIMEOUT_SECS + 1),
+            serde_json::json!(-1),
+            serde_json::json!(0.5),
+            serde_json::json!("7"),
+            serde_json::Value::Null,
+        ] {
+            let mut invalid_params = params.clone();
+            invalid_params["timeout_secs"] = invalid;
+            let error = call_tool("pt_label", &invalid_params).unwrap_err();
+            assert!(error.contains("timeout_secs"), "{error}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn label_worker_bounds_output_exit_and_descendants_without_claiming_rollback() {
+        let params = serde_json::json!({
+            "cmd": "node /srv/reviewed.js", "verdict": "spare", "confirmed_by_user": true,
+        });
+        let config = Path::new("/tmp/label-config");
+        let document = worker_label_document().to_string();
+        let spec = ToolSpec::new(
+            "/bin/sh",
+            vec![
+                "-c".into(),
+                "printf '%s' \"$1\"; exit \"$2\"".into(),
+                "mcp-label-receipt".into(),
+                document.clone(),
+                "0".into(),
+            ],
+        )
+        .with_timeout(Duration::from_secs(5));
+        assert_eq!(run_label_worker(&spec, &params, config).unwrap(), document);
+        let truncated =
+            run_label_worker(&spec.clone().with_max_output(16), &params, config).unwrap_err();
+        assert!(truncated.contains("truncated"));
+        assert!(truncated.contains("before retrying"));
+        let mut failed = spec;
+        *failed.args.last_mut().unwrap() = "7".into();
+        let error = run_label_worker(&failed, &params, config).unwrap_err();
+        assert!(error.contains("exit Some(7)"));
+        assert!(error.contains("may already have occurred"));
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        for script in [
+            "printf '%s' \"$1\"; exec sleep 30",
+            "sleep 30 & printf '%s' \"$1\"; exit 0",
+        ] {
+            let held = ToolSpec::new(
+                "/bin/sh",
+                vec![
+                    "-c".into(),
+                    script.into(),
+                    "mcp-label-timeout".into(),
+                    document.clone(),
+                ],
+            )
+            .with_timeout(Duration::from_millis(100))
+            .with_process_group();
+            let started = std::time::Instant::now();
+            let error = run_label_worker(&held, &params, config).unwrap_err();
+            assert!(error.contains("timed out"), "{error}");
+            assert!(error.contains("before retrying"));
+            assert!(started.elapsed() < Duration::from_secs(5));
+        }
     }
 
     #[test]

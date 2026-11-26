@@ -96,6 +96,13 @@ fn human_kill_labels_raise_the_plan_prior_for_that_pattern() {
             "label failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+        let receipt: Value = serde_json::from_slice(&out.stdout).expect("label receipt");
+        assert_eq!(receipt["command"], "agent label");
+        assert_eq!(receipt["pid"], pid);
+        assert_eq!(receipt["start_id"], before["start_id"]);
+        assert_eq!(receipt["uid"], before["uid"]);
+        assert!(receipt["session_id"].is_null());
+        assert!(receipt["recorded_source"].is_null());
     }
     let store: Value = serde_json::from_str(
         &std::fs::read_to_string(config_dir.path().join("decisions.json")).expect("store"),
@@ -413,6 +420,13 @@ fn pattern_labels_do_not_invent_shadow_process_identities() {
         .stdout
         .clone();
     let response: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(response["command"], "agent label");
+    for field in ["pid", "session_id", "start_id", "uid", "recorded_source"] {
+        assert!(
+            response.get(field).is_some_and(Value::is_null),
+            "{field}: {response}"
+        );
+    }
     assert_eq!(response["shadow_label"]["recorded"], false);
     assert!(response["shadow_label"]["identity_hash"].is_null());
     assert!(config_dir.path().join("decisions.json").exists());
@@ -488,6 +502,12 @@ fn recorded_labels_resolve_exited_process_predictions_without_live_pid_lookup() 
             .iter()
             .find(|candidate| candidate["pid"].as_u64() == Some(u64::from(pid)))
             .unwrap();
+        assert_eq!(label["command"], "agent label");
+        assert_eq!(label["session_id"], session);
+        assert_eq!(label["pid"], pid);
+        assert_eq!(label["start_id"], candidate["start_id"]);
+        assert_eq!(label["uid"], candidate["uid"]);
+        assert_eq!(label["recorded_source"]["uid"], label["uid"]);
         assert_eq!(label["recorded_source"]["session_id"], session);
         assert_eq!(label["recorded_source"]["start_id"], candidate["start_id"]);
         assert_eq!(label["recorded_source"]["pid"], pid);

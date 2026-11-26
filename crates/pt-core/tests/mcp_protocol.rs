@@ -2791,6 +2791,8 @@ fn actual_mcp_labels_require_confirmation_and_use_the_servers_store() {
     let config = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     let fallback = tempfile::tempdir().unwrap();
+    // The server's explicit configuration must also govern its isolated worker.
+    std::fs::write(fallback.path().join("priors.json"), b"{malformed").unwrap();
     let marker = data.path().join("must-not-execute");
     let command = format!("node /srv/reviewed.js; touch {}", marker.display());
     let arguments = serde_json::json!({
@@ -2818,7 +2820,16 @@ fn actual_mcp_labels_require_confirmation_and_use_the_servers_store() {
     assert_eq!(result["isError"], false, "{result}");
     let label: serde_json::Value =
         serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(label["command"], "agent label");
     assert_eq!(label["verdict"], "spare");
+    assert!(label["pid"].is_null());
+    assert!(label["session_id"].is_null());
+    assert!(label["start_id"].is_null());
+    assert!(label["uid"].is_null());
+    assert_eq!(
+        label["store"],
+        serde_json::json!(config.path().join("decisions.json"))
+    );
     assert_eq!(label["learned_prior"]["spare"], 1);
     assert_eq!(label["shadow_label"]["recorded"], false);
     assert!(!data.path().join("shadow").exists());
@@ -2832,6 +2843,153 @@ fn actual_mcp_labels_require_confirmation_and_use_the_servers_store() {
     assert_eq!(prior.kill, 0);
     assert_eq!(prior.spare, 1);
     assert_eq!(prior.specificity, "exact");
+}
+
+#[test]
+fn actual_mcp_label_keeps_private_arguments_out_of_human_debug_logs() {
+    use assert_cmd::cargo::cargo_bin_cmd;
+
+    let config = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let private_command = "MCP_PRIVATE_COMMAND_CANARY";
+    let private_comm = "MCP_PRIVATE_COMM_CANARY";
+    let command = format!("node /srv/{private_command}.js --token={private_command}");
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 82,
+        "method": "tools/call",
+        "params": {
+            "name": "pt_label",
+            "arguments": {
+                "cmd": command,
+                "comm": private_comm,
+                "verdict": "spare",
+                "confirmed_by_user": true,
+            },
+        },
+    });
+    // Summary output selects the plain human log formatter. Its fields do not
+    // pass through the JSONL redactor, so arguments must be withheld at source.
+    let output = cargo_bin_cmd!("pt-core")
+        .env_remove("PT_CONFIG_DIR")
+        .env_remove("PT_SKIP_GLOBAL_LOCK")
+        .env_remove("RUST_LOG")
+        .env("PROCESS_TRIAGE_CONFIG", config.path())
+        .env("PROCESS_TRIAGE_DATA", data.path())
+        .env("PROCESS_TRIAGE_RETENTION", "off")
+        .arg("--config")
+        .arg(config.path())
+        .args(["--format", "summary", "-v", "mcp"])
+        .write_stdin(format!("{request}\n"))
+        .timeout(std::time::Duration::from_secs(60))
+        .output()
+        .expect("run actual MCP label with human debug logging");
+    assert!(output.status.success(), "{output:?}");
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["id"], 82);
+    assert!(response["error"].is_null(), "{response}");
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    let store = pt_core::decision::decision_store::DecisionStore::load(config.path()).unwrap();
+    let prior = store
+        .learned_prior(private_comm, &command, &pt_core::config::Priors::default())
+        .expect("private arguments still reach the durable learning worker");
+    assert_eq!(prior.spare, 1);
+
+    let stderr = std::str::from_utf8(&output.stderr).unwrap();
+    let execution_log = stderr
+        .lines()
+        .find(|line| line.contains("running tool"))
+        .expect("exercise the worker's debug log, not a disabled logging path");
+    assert!(execution_log.contains("DEBUG"), "{stderr}");
+    assert!(!execution_log.trim_start().starts_with('{'), "{stderr}");
+    for canary in [private_command, private_comm] {
+        assert!(
+            !stderr.contains(canary),
+            "private label text reached stderr"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn actual_mcp_label_deadline_cancels_a_waiting_writer_and_keeps_server_responsive() {
+    use assert_cmd::cargo::cargo_bin_cmd;
+    use std::os::unix::io::AsRawFd;
+    use std::time::{Duration, Instant};
+
+    let config = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let fallback = tempfile::tempdir().unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(config.path().join("decisions.json.lock"))
+        .unwrap();
+    // SAFETY: this test owns the descriptor, and closing it releases the lock.
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let command = "node /srv/blocked-feedback.js";
+    let arguments = serde_json::json!({
+        "cmd": command, "verdict": "spare", "confirmed_by_user": true, "timeout_secs": 1,
+    });
+    let label = serde_json::json!({
+        "jsonrpc": "2.0", "id": 91, "method": "tools/call",
+        "params": {"name": "pt_label", "arguments": arguments},
+    });
+    let ping = serde_json::json!({"jsonrpc": "2.0", "id": 92, "method": "ping"});
+    let started = Instant::now();
+    let output = cargo_bin_cmd!("pt-core")
+        .env_remove("PT_CONFIG_DIR")
+        .env("PT_SKIP_GLOBAL_LOCK", "1")
+        .env("PT_OUTPUT_FORMAT", "invalid-inherited-format")
+        .env("PROCESS_TRIAGE_CONFIG", fallback.path())
+        .env("PROCESS_TRIAGE_DATA", data.path())
+        .env("PROCESS_TRIAGE_RETENTION", "off")
+        .arg("--config")
+        .arg(config.path())
+        .args(["--format", "json", "mcp"])
+        .write_stdin(format!("{label}\n{ping}\n"))
+        .timeout(Duration::from_secs(15))
+        .output()
+        .expect("run MCP while the learning store is locked");
+    assert!(output.status.success(), "{output:?}");
+    assert!(started.elapsed() < Duration::from_secs(10));
+    let responses: Vec<serde_json::Value> = std::str::from_utf8(&output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(responses.len(), 2, "{responses:?}");
+    assert_eq!(responses[0]["id"], 91);
+    assert_eq!(responses[0]["result"]["isError"], true, "{responses:?}");
+    let error = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(error.contains("timed out"), "{error}");
+    assert!(error.contains("before retrying"), "{error}");
+    assert_eq!(responses[1]["id"], 92);
+    assert_eq!(responses[1]["result"], serde_json::json!({}));
+    assert!(responses[1]["error"].is_null());
+    assert!(!config.path().join("decisions.json").exists());
+    assert!(!data.path().join("shadow").exists());
+    drop(lock);
+
+    // Only now is retry known safe for this command-only fixture. The cancelled
+    // writer must not wake after unlocking and silently add a second verdict.
+    let mut retry = arguments;
+    retry["timeout_secs"] = serde_json::json!(10);
+    let result = call_actual_mcp_label(config.path(), data.path(), fallback.path(), retry);
+    assert_eq!(result["isError"], false, "{result}");
+    let store = pt_core::decision::decision_store::DecisionStore::load(config.path()).unwrap();
+    let prior = store
+        .learned_prior("node", command, &pt_core::config::Priors::default())
+        .unwrap();
+    assert_eq!(prior.kill, 0);
+    assert_eq!(prior.spare, 1);
+    assert!(!fallback.path().join("decisions.json").exists());
 }
 
 #[cfg(unix)]
@@ -2872,7 +3030,15 @@ fn actual_mcp_live_labels_preserve_processes_and_record_shadow_identity() {
         assert_eq!(result["isError"], false, "{result}");
         let label: serde_json::Value =
             serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(label["command"], "agent label");
         assert_eq!(label["verdict"], verdict);
+        assert_eq!(label["pid"], pid);
+        assert!(label["session_id"].is_null());
+        let start_id = label["start_id"].as_str().unwrap();
+        assert!(pt_common::StartId::parse(start_id).is_some());
+        assert_eq!(start_id.rsplit(':').next().unwrap(), pid.to_string());
+        assert!(label["uid"].as_u64().is_some());
+        assert!(label["recorded_source"].is_null());
         assert_eq!(label["shadow_label"]["recorded"], true);
         let observed = label["shadow_label"]["identity_hash"]
             .as_str()
@@ -3023,6 +3189,11 @@ fn actual_mcp_recorded_labels_calibrate_an_exited_process() {
             label["shadow_label"]["reason"],
             "explicit_session_process_verdict"
         );
+        assert_eq!(label["command"], "agent label");
+        assert_eq!(label["pid"], pid);
+        assert_eq!(label["session_id"], session);
+        assert_eq!(label["start_id"], plan["candidates"][0]["start_id"]);
+        assert_eq!(label["uid"], label["recorded_source"]["uid"]);
         assert_eq!(label["recorded_source"]["session_id"], session);
         assert_eq!(
             label["recorded_source"]["start_id"],
