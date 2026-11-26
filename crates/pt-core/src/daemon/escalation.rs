@@ -17,10 +17,15 @@ use crate::collect::tool_runner::{
     notification_runner, run_notification, NOTIFICATION_MAX_OUTPUT_BYTES,
 };
 use crate::collect::tool_runner::{ToolConfig, ToolOutput, ToolRunner, ToolSpec};
+use crate::session::{SessionManifest, SessionMode, SessionState, SessionStore};
 
 /// Each quick/deep planner invocation is bounded, including its output pipes.
 /// The CLI's explicit `--timeout` can override this default.
 pub const PLAN_TIMEOUT_SECS: u64 = 60;
+// The persisted document is pretty-printed and can exceed the compact stdout
+// limit. Keep both reads bounded even when the planner or storage is damaged.
+const PUBLISHED_PLAN_MAX_BYTES: usize = 32 * 1024 * 1024;
+const PLAN_MANIFEST_MAX_BYTES: usize = 64 * 1024;
 
 /// A completed planner response, suitable for publishing a review request.
 #[derive(Debug, PartialEq, Eq)]
@@ -75,6 +80,17 @@ fn parse_planner_output(
     }
     let document: serde_json::Value = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("invalid daemon planner JSON: {error}"))?;
+    let result = parse_planner_document(&document, expected_session)?;
+    if output.exit_code != Some(i32::from(result.candidates_found > 0)) {
+        return Err("daemon plan has inconsistent candidate counts or exit status".into());
+    }
+    Ok(result)
+}
+
+fn parse_planner_document(
+    document: &serde_json::Value,
+    expected_session: Option<&str>,
+) -> Result<DaemonEscalationResult, String> {
     if document["command"].as_str() != Some("agent plan")
         || !document["error"].is_null()
         || (!document["status"].is_null() && document["status"].as_str() != Some("ok"))
@@ -98,15 +114,49 @@ fn parse_planner_output(
         .ok_or("daemon plan has no process census")?;
     if document["summary"]["candidates_returned"].as_u64() != Some(u64::from(candidates_found))
         || scanned < u64::from(candidates_found)
-        || output.exit_code != Some(i32::from(candidates_found > 0))
     {
-        return Err("daemon plan has inconsistent candidate counts or exit status".into());
+        return Err("daemon plan has inconsistent candidate counts".into());
     }
     Ok(DaemonEscalationResult {
         session_id: plan.session_id,
         candidates_found,
-        plan_sha256: crate::fleet::apply::plan_document_sha256(&document)?,
+        plan_sha256: crate::fleet::apply::plan_document_sha256(document)?,
     })
+}
+
+/// Bind an accepted child response to the completed publication users can read.
+///
+/// The caller holds the canonical-plan lock. A failed deep replan can leave the
+/// same session Scanning, or replace its plan before later publication fails.
+/// Neither unchanged quick-plan bytes in an unfinished session nor a different
+/// completed plan may acknowledge the quick response as a successful fallback.
+pub fn validate_published_plan(
+    store: &SessionStore,
+    result: &DaemonEscalationResult,
+) -> Result<(), String> {
+    let session_id = pt_common::SessionId::parse(&result.session_id)
+        .ok_or("daemon publication has an invalid session identity")?;
+    let directory = store.session_dir(&session_id);
+    let manifest: SessionManifest =
+        super::read_daemon_json_bounded(&directory.join("manifest.json"), PLAN_MANIFEST_MAX_BYTES)?
+            .ok_or("daemon plan has no published session manifest")?;
+    if manifest.session_id != result.session_id
+        || manifest.schema_version != pt_common::SCHEMA_VERSION
+        || manifest.mode != SessionMode::RobotPlan
+        || manifest.state != SessionState::Planned
+    {
+        return Err("daemon plan session identity or completed publication state does not match the response".into());
+    }
+    let document: serde_json::Value = super::read_daemon_json_bounded(
+        &directory.join("decision/plan.json"),
+        PUBLISHED_PLAN_MAX_BYTES,
+    )?
+    .ok_or("daemon plan has no published canonical document")?;
+    let published = parse_planner_document(&document, Some(&result.session_id))?;
+    if &published != result {
+        return Err("daemon canonical plan no longer matches the accepted planner response".into());
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -433,6 +483,308 @@ mod tests {
             ..planner_output(0)
         };
         assert!(parse_planner_output(&output, None).is_err());
+    }
+
+    fn published_plan_fixture(
+        root: &std::path::Path,
+        document: &serde_json::Value,
+    ) -> (
+        SessionStore,
+        crate::session::SessionHandle,
+        DaemonEscalationResult,
+    ) {
+        let result = parse_planner_document(document, None).unwrap();
+        let id = pt_common::SessionId::parse(&result.session_id).unwrap();
+        let store = SessionStore::at_data_dir(root);
+        let mut manifest = SessionManifest::new(&id, None, SessionMode::RobotPlan, None);
+        manifest.record_state(SessionState::Planned);
+        let handle = store.create(&manifest).unwrap();
+        crate::session::write_json_pretty(&handle.dir.join("decision/plan.json"), document)
+            .unwrap();
+        (store, handle, result)
+    }
+
+    #[test]
+    fn published_plan_binds_the_response_to_the_complete_canonical_document() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut document = planner_document(2);
+        let (store, handle, quick) = published_plan_fixture(temporary.path(), &document);
+        validate_published_plan(&store, &quick).unwrap();
+
+        // A deep plan may keep the same session and candidate count while
+        // changing its decision evidence. The entire digest must still match.
+        document["plan_id"] = serde_json::json!("replacement-deep-plan");
+        document["candidates"][0]["pid"] = serde_json::json!(9999);
+        crate::session::write_json_pretty(&handle.dir.join("decision/plan.json"), &document)
+            .unwrap();
+        assert!(validate_published_plan(&store, &quick)
+            .unwrap_err()
+            .contains("no longer matches"));
+
+        let mut deep = parse_planner_document(&document, Some(&quick.session_id)).unwrap();
+        validate_published_plan(&store, &deep).unwrap();
+        deep.candidates_found += 1;
+        assert!(validate_published_plan(&store, &deep).is_err());
+
+        document["session_id"] = serde_json::json!("pt-20261112-123456-efgh");
+        crate::session::write_json_pretty(&handle.dir.join("decision/plan.json"), &document)
+            .unwrap();
+        assert!(validate_published_plan(&store, &quick)
+            .unwrap_err()
+            .contains("session identity"));
+    }
+
+    #[test]
+    fn published_plan_requires_a_matching_completed_planner_manifest() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (store, handle, result) =
+            published_plan_fixture(temporary.path(), &planner_document(0));
+        let completed = handle.read_manifest().unwrap();
+        for state in [
+            SessionState::Created,
+            SessionState::Scanning,
+            SessionState::Executing,
+            SessionState::Completed,
+            SessionState::Cancelled,
+            SessionState::Failed,
+            SessionState::Archived,
+        ] {
+            let mut manifest = completed.clone();
+            manifest.record_state(state);
+            handle.write_manifest(&manifest).unwrap();
+            assert!(
+                validate_published_plan(&store, &result).is_err(),
+                "unchanged quick-plan bytes cannot complete a {state:?} publication"
+            );
+        }
+        for field in ["session_id", "schema_version", "mode"] {
+            let mut manifest = completed.clone();
+            match field {
+                "session_id" => manifest.session_id = "pt-20261112-123456-efgh".into(),
+                "schema_version" => manifest.schema_version = "unsupported".into(),
+                "mode" => manifest.mode = SessionMode::DaemonAlert,
+                _ => unreachable!(),
+            }
+            handle.write_manifest(&manifest).unwrap();
+            assert!(
+                validate_published_plan(&store, &result).is_err(),
+                "accepted mismatched manifest {field}"
+            );
+        }
+        handle.write_manifest(&completed).unwrap();
+        validate_published_plan(&store, &result).unwrap();
+    }
+
+    #[test]
+    fn published_plan_requires_present_valid_and_bounded_artifacts() {
+        let temporary = tempfile::tempdir().unwrap();
+        let document = planner_document(1);
+        let result = parse_planner_document(&document, None).unwrap();
+        let id = pt_common::SessionId::parse(&result.session_id).unwrap();
+        let missing = SessionStore::at_data_dir(&temporary.path().join("missing"));
+        assert!(validate_published_plan(&missing, &result).is_err());
+        let mut manifest = SessionManifest::new(&id, None, SessionMode::RobotPlan, None);
+        manifest.record_state(SessionState::Planned);
+        missing.create(&manifest).unwrap();
+        assert!(validate_published_plan(&missing, &result)
+            .unwrap_err()
+            .contains("no published canonical document"));
+
+        let (store, handle, _) =
+            published_plan_fixture(&temporary.path().join("damaged"), &document);
+        let plan = handle.dir.join("decision/plan.json");
+        std::fs::write(&plan, b"{incomplete").unwrap();
+        assert!(validate_published_plan(&store, &result).is_err());
+        let file = std::fs::File::create(&plan).unwrap();
+        file.set_len(PUBLISHED_PLAN_MAX_BYTES as u64 + 1).unwrap();
+        assert!(validate_published_plan(&store, &result).is_err());
+        crate::session::write_json_pretty(&plan, &document).unwrap();
+        let file = std::fs::File::create(handle.manifest_path()).unwrap();
+        file.set_len(PLAN_MANIFEST_MAX_BYTES as u64 + 1).unwrap();
+        assert!(validate_published_plan(&store, &result).is_err());
+    }
+
+    #[test]
+    fn published_plan_failure_keeps_pressure_pending_until_matching_completion() {
+        use crate::collect::pressure::{LoadAvg, MemInfo, PressureSnapshot, PsiLine, PsiResource};
+        use crate::daemon::{
+            process_tick, triggers::TriggerState, DaemonConfig, DaemonState, TickMetrics,
+        };
+        use crate::decision::pressure_regime::RegimeKind;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let document = planner_document(1);
+        let (store, handle, quick) = published_plan_fixture(temporary.path(), &document);
+        let completed = handle.read_manifest().unwrap();
+        handle.update_state(SessionState::Scanning).unwrap();
+        let config = DaemonConfig::default();
+        let mut state = DaemonState::new();
+        let mut triggers = TriggerState::new(&config.triggers);
+        let started = std::time::Instant::now();
+        let mut attempts = 0;
+        for tick in 0..6 {
+            if tick == 3 {
+                // The session now claims completion, but a failed deep child
+                // replaced the document referenced by the quick response.
+                let mut replacement = document.clone();
+                replacement["plan_id"] = serde_json::json!("unaccepted-deep-plan");
+                crate::session::write_json_pretty(
+                    &handle.dir.join("decision/plan.json"),
+                    &replacement,
+                )
+                .unwrap();
+                handle.write_manifest(&completed).unwrap();
+            } else if tick == 4 {
+                crate::session::write_json_pretty(
+                    &handle.dir.join("decision/plan.json"),
+                    &document,
+                )
+                .unwrap();
+            }
+            let metrics = TickMetrics {
+                timestamp: format!("sample-{tick}"),
+                load_avg_1: 1.0,
+                load_avg_5: 1.0,
+                memory_used_mb: 400,
+                memory_total_mb: 1000,
+                swap_used_mb: 0,
+                process_count: 200,
+                orphan_count: Some(0),
+                process_census: None,
+                pressure_observed_at: Some(started + std::time::Duration::from_secs(tick)),
+                pressure: Some(PressureSnapshot {
+                    sampled_at_ms: 1000 + tick * 1000,
+                    cpus: 4,
+                    cpu: Some(PsiResource {
+                        some: Some(PsiLine {
+                            avg10: 40.0,
+                            avg60: 40.0,
+                            avg300: 40.0,
+                            total_us: 1_000_000 + tick * 400_000,
+                        }),
+                        full: None,
+                    }),
+                    memory: None,
+                    io: None,
+                    irq: None,
+                    load: Some(LoadAvg {
+                        one: 1.0,
+                        five: 1.0,
+                        fifteen: 1.0,
+                        runnable: Some(1),
+                        total: Some(200),
+                    }),
+                    meminfo: Some(MemInfo {
+                        total: Some(1_000_000),
+                        available: Some(600_000),
+                        ..MemInfo::default()
+                    }),
+                    vmstat: None,
+                    file_handles: None,
+                    unavailable: Vec::new(),
+                }),
+            };
+            let outcome = process_tick(
+                &config,
+                &mut state,
+                &mut triggers,
+                &metrics,
+                &mut |_, fired| {
+                    attempts += 1;
+                    assert_eq!(fired.len(), 1);
+                    let validation = validate_published_plan(&store, &quick);
+                    let status = if validation.is_ok() {
+                        EscalationStatus::Completed
+                    } else {
+                        EscalationStatus::Failed
+                    };
+                    EscalationOutcome {
+                        status,
+                        reason: validation.err().unwrap_or_else(|| "plan published".into()),
+                        session_id: (status == EscalationStatus::Completed)
+                            .then(|| quick.session_id.clone()),
+                        provenance_summary: None,
+                    }
+                },
+            );
+            let expected = match tick {
+                2 | 3 => Some(EscalationStatus::Failed),
+                4 => Some(EscalationStatus::Completed),
+                _ => None,
+            };
+            assert_eq!(outcome.escalation.map(|result| result.status), expected);
+            assert_eq!(
+                triggers
+                    .pressure
+                    .pending
+                    .contains_key(&RegimeKind::CpuContention),
+                matches!(tick, 2 | 3),
+                "publication failures must remain pending at tick {tick}"
+            );
+        }
+        assert_eq!(attempts, 3);
+        assert_eq!(state.escalation_count, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_deep_child_cannot_acknowledge_replaced_or_unfinished_quick_publication() {
+        for failure in [
+            "before_session",
+            "while_scanning",
+            "after_plan_write",
+            "after_publication",
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let (store, handle, quick) =
+                published_plan_fixture(temporary.path(), &planner_document(2));
+            let mut manifest = handle.read_manifest().unwrap();
+            let mut replacement = planner_document(1);
+            replacement["plan_id"] = serde_json::json!("deep-plan");
+            let script = match failure {
+                "before_session" => "exit 23",
+                "while_scanning" => {
+                    manifest.record_state(SessionState::Scanning);
+                    "printf '%s' \"$3\" > \"$4\"; exit 23"
+                }
+                "after_plan_write" => {
+                    manifest.record_state(SessionState::Scanning);
+                    "printf '%s' \"$1\" > \"$2\"; printf '%s' \"$3\" > \"$4\"; exit 23"
+                }
+                "after_publication" => {
+                    "printf '%s' \"$1\" > \"$2\"; printf '%s' \"$3\" > \"$4\"; exit 23"
+                }
+                _ => unreachable!(),
+            };
+            // The owned child performs actual artifact writes and really fails;
+            // no successful response is fabricated for the failed deep scan.
+            let spec = ToolSpec::new(
+                "/bin/sh",
+                vec![
+                    "-c".into(),
+                    script.into(),
+                    "daemon-publication-fixture".into(),
+                    replacement.to_string(),
+                    handle
+                        .dir
+                        .join("decision/plan.json")
+                        .to_str()
+                        .unwrap()
+                        .into(),
+                    serde_json::to_string(&manifest).unwrap(),
+                    handle.manifest_path().to_str().unwrap().into(),
+                ],
+            )
+            .with_timeout(std::time::Duration::from_secs(5));
+            assert!(run_planner(&spec, Some(&quick.session_id))
+                .unwrap_err()
+                .contains("Some(23)"));
+            assert_eq!(
+                validate_published_plan(&store, &quick).is_ok(),
+                failure == "before_session",
+                "unsafe quick fallback after {failure}"
+            );
+        }
     }
 
     #[cfg(unix)]

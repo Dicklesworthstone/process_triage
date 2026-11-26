@@ -22641,6 +22641,14 @@ fn run_daemon_escalation(
     ) {
         Ok(deep) => Ok(deep),
         Err(err) => {
+            // A deep replan shares this session and may replace its canonical
+            // plan before a later error. Revalidate the quick publication so
+            // failure cannot acknowledge a stale or unfinished review plan.
+            validate_daemon_plan_publication(&quick).map_err(|fallback_error| {
+                format!(
+                    "daemon deep plan failed ({err}); quick fallback is unavailable: {fallback_error}"
+                )
+            })?;
             eprintln!(
                 "daemon escalation: deep plan failed, using quick plan: {}",
                 err
@@ -22720,7 +22728,19 @@ fn run_daemon_plan(
 ) -> Result<DaemonEscalationResult, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let spec = daemon_planner_spec(global, &exe, session_id, deep, max_candidates, relief_goal)?;
-    pt_core::daemon::escalation::run_planner(&spec, session_id)
+    let result = pt_core::daemon::escalation::run_planner(&spec, session_id)?;
+    validate_daemon_plan_publication(&result)?;
+    Ok(result)
+}
+
+#[cfg(feature = "daemon")]
+fn validate_daemon_plan_publication(result: &DaemonEscalationResult) -> Result<(), String> {
+    let store = SessionStore::from_env().map_err(|error| error.to_string())?;
+    let session_id = SessionId::parse(&result.session_id)
+        .ok_or("daemon publication has an invalid session identity")?;
+    let handle = store.open(&session_id).map_err(|error| error.to_string())?;
+    let _lock = lock_canonical_session_plan(&handle)?;
+    pt_core::daemon::escalation::validate_published_plan(&store, result)
 }
 
 #[cfg(feature = "daemon")]
