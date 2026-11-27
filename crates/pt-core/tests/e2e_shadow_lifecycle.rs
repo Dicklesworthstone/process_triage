@@ -286,6 +286,18 @@ fn birth_of(pid: u32) -> u64 {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn birth_record(pid: u32, birth: u64) -> String {
+    let record = format!("{pid} {birth}");
+    #[cfg(target_os = "linux")]
+    let record = {
+        let identity = pt_core::action::signal::capture_process_signal_identity(pid).unwrap();
+        let boot = identity.start_id.0.split(':').next().unwrap();
+        format!("{record} {} {boot}", identity.uid)
+    };
+    record
+}
+
 /// Run `shadow stop` against a pid file naming a live bystander, with the birth
 /// sidecar `birth(pid)` returns (none for a pre-2.3.0 file); report whether the
 /// bystander survived, the JSON response and whether the pid file is left.
@@ -299,10 +311,11 @@ fn stop_with_pid_file(birth: impl Fn(u32) -> Option<u64>) -> (bool, Value, bool)
         .spawn()
         .expect("spawn bystander");
     let pid_path = shadow_dir.join("shadow.pid");
-    if let Some(birth) = birth(bystander.id()) {
+    let recorded_birth = birth(bystander.id());
+    if let Some(birth) = recorded_birth {
         fs::write(
             shadow_dir.join("shadow.pid.birth"),
-            format!("{} {birth}", bystander.id()),
+            birth_record(bystander.id(), birth),
         )
         .expect("write birth sidecar");
     }
@@ -312,7 +325,7 @@ fn stop_with_pid_file(birth: impl Fn(u32) -> Option<u64>) -> (bool, Value, bool)
         .env("PROCESS_TRIAGE_DATA", dir.path())
         .args(["--format", "json", "shadow", "stop"])
         .assert()
-        .success()
+        .code(if recorded_birth.is_some() { 0 } else { 3 })
         .get_output()
         .stdout
         .clone();
@@ -331,7 +344,8 @@ fn stop_with_pid_file(birth: impl Fn(u32) -> Option<u64>) -> (bool, Value, bool)
 fn test_shadow_stop_does_not_signal_an_unverified_pid_file() {
     let (survived, json, pid_file_left) = stop_with_pid_file(|_| None);
     assert!(survived, "stop signalled an unverified pid: {json}");
-    assert_eq!(json["running"], false, "{json}");
+    assert!(json["running"].is_null(), "{json}");
+    assert_eq!(json["signaled"], false, "{json}");
     assert!(pid_file_left, "an unverified pid file must be kept: {json}");
 }
 
@@ -382,12 +396,9 @@ fn test_shadow_stop_retains_identity_when_exit_is_unconfirmed() {
     assert_eq!(ready.trim(), "ready");
     let pid = child.id();
     let birth = birth_of(pid);
+    let record = birth_record(pid, birth);
     fs::write(shadow_dir.join("shadow.pid"), pid.to_string()).unwrap();
-    fs::write(
-        shadow_dir.join("shadow.pid.birth"),
-        format!("{pid} {birth}"),
-    )
-    .unwrap();
+    fs::write(shadow_dir.join("shadow.pid.birth"), &record).unwrap();
     let result = pt_core()
         .env("PROCESS_TRIAGE_DATA", dir.path())
         .args(["--format", "json", "--timeout", "0", "shadow", "stop"])
@@ -410,8 +421,127 @@ fn test_shadow_stop_retains_identity_when_exit_is_unconfirmed() {
     );
     assert_eq!(
         fs::read_to_string(shadow_dir.join("shadow.pid.birth")).unwrap(),
-        format!("{pid} {birth}")
+        record
     );
+}
+
+#[cfg(all(target_os = "linux", feature = "daemon"))]
+#[test]
+fn test_daemon_stop_requires_full_identity_and_observed_exit() {
+    use std::io::{BufRead, BufReader};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command as ProcessCommand, Stdio};
+
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    for case in ["missing", "legacy", "boot", "owner", "ignore_term", "exit"] {
+        let dir = tempdir().unwrap();
+        let daemon = dir.path().join("daemon");
+        fs::create_dir_all(&daemon).unwrap();
+        let lock_path = daemon.join("daemon.pid.lock");
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+            .unwrap();
+        let fd = lock.as_raw_fd();
+        // SAFETY: the open descriptor is valid; the child inherits this same
+        // open-file-description lock, and the parent drops it after spawning.
+        assert_eq!(unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) }, 0);
+        let mut command = ProcessCommand::new("sh");
+        command
+            .args([
+                "-c",
+                if case == "ignore_term" {
+                    "trap '' TERM; printf 'ready\\n'; exec sleep 30"
+                } else {
+                    "printf 'ready\\n'; exec sleep 30"
+                },
+            ])
+            .stdout(Stdio::piped());
+        // SAFETY: only fcntl on an existing descriptor runs between fork/exec.
+        unsafe {
+            command.pre_exec(move || {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = ChildGuard(command.spawn().unwrap());
+        drop(lock);
+        let mut ready = String::new();
+        BufReader::new(child.0.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready.trim(), "ready");
+        let pid = child.0.id();
+        let birth = birth_of(pid);
+        let identity = pt_core::action::signal::capture_process_signal_identity(pid).unwrap();
+        let boot = identity.start_id.0.split(':').next().unwrap();
+        let record = match case {
+            "missing" => None,
+            "legacy" => Some(format!("{pid} {birth}")),
+            "boot" => Some(format!("{pid} {birth} {} another-boot", identity.uid)),
+            "owner" => Some(format!(
+                "{pid} {birth} {} {boot}",
+                identity.uid.wrapping_add(1)
+            )),
+            _ => Some(birth_record(pid, birth)),
+        };
+        let pid_path = daemon.join("daemon.pid");
+        let identity_path = daemon.join("daemon.pid.birth");
+        fs::write(&lock_path, pid.to_string()).unwrap();
+        fs::write(&pid_path, pid.to_string()).unwrap();
+        if let Some(record) = &record {
+            fs::write(&identity_path, record).unwrap();
+        }
+        let result = pt_core()
+            .env("PROCESS_TRIAGE_DATA", dir.path())
+            .args([
+                "--format",
+                "json",
+                "--timeout",
+                if case == "exit" { "5" } else { "0" },
+                "daemon",
+                "stop",
+            ])
+            .output()
+            .unwrap();
+        let alive = child.0.try_wait().unwrap().is_none();
+        if case == "exit" {
+            assert!(result.status.success(), "{case}: {result:?}");
+            assert!(!alive, "stop did not terminate the recorded child");
+            assert!(!pid_path.exists());
+            assert!(!identity_path.exists());
+        } else {
+            assert!(!result.status.success(), "{case}: {result:?}");
+            assert!(
+                alive,
+                "{case}: stop terminated a refused or TERM-ignoring child"
+            );
+            assert_eq!(fs::read_to_string(&pid_path).unwrap(), pid.to_string());
+            assert_eq!(fs::read_to_string(&identity_path).ok(), record);
+        }
+        if matches!(case, "ignore_term" | "exit") {
+            let json: Value = serde_json::from_slice(&result.stdout).unwrap();
+            assert_eq!(json["signaled"], true);
+            assert_eq!(json["stopped"], case == "exit");
+            assert_eq!(json["running"], case != "exit");
+            if case == "ignore_term" {
+                assert_eq!(result.status.code(), Some(3));
+            }
+        }
+    }
 }
 
 // ============================================================================

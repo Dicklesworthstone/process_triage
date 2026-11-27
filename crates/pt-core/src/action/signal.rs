@@ -1794,6 +1794,112 @@ impl super::executor::IdentityProvider for LiveIdentityProvider {
     }
 }
 
+/// Capture the birth, boot and owner used by a persisted observer pid record.
+/// Read the identity again after ownership so a changed PID is never recorded
+/// as one coherent observation.
+#[cfg(target_os = "linux")]
+pub fn capture_process_signal_identity(
+    pid: u32,
+) -> Result<pt_common::ProcessIdentity, ActionError> {
+    signal_syscall_target(pid, false)?;
+    ensure_action_pid_namespace()?;
+    let provider = LiveIdentityProvider::new();
+    let start_id = provider
+        .read_start_id(pid)
+        .ok_or_else(|| ActionError::Failed("cannot capture observer process birth".to_string()))?;
+    let uid = provider
+        .read_uid(pid)
+        .ok_or_else(|| ActionError::Failed("cannot capture observer process owner".to_string()))?;
+    let target = pt_common::ProcessIdentity::new(pid, pt_common::StartId(start_id), uid);
+    match observe_signal_target(&target)? {
+        SignalObservation::Present(state) if !matches!(state, 'Z' | 'X' | 'x') => Ok(target),
+        SignalObservation::Present(_) | SignalObservation::Gone => {
+            Err(ActionError::ProcessNotFound)
+        }
+        SignalObservation::Replaced => Err(ActionError::IdentityMismatch),
+    }
+}
+
+/// An observer process pinned before checking its persisted identity. This is
+/// deliberately stricter than a numeric-PID fallback: without pidfd support,
+/// stopping a detached observer cannot meet the identity-safety contract.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub struct PinnedProcessSignal {
+    pidfd: PidFd,
+    target: pt_common::ProcessIdentity,
+}
+
+#[cfg(target_os = "linux")]
+impl PinnedProcessSignal {
+    pub fn pin(target: &pt_common::ProcessIdentity) -> Result<Self, ActionError> {
+        if target.quality != pt_common::IdentityQuality::Full {
+            return Err(ActionError::IdentityMismatch);
+        }
+        ensure_action_pid_namespace()?;
+        let pidfd = PidFd::open(target.pid.0)?.ok_or_else(|| {
+            ActionError::Failed("stopping an observer requires kernel pidfd support".to_string())
+        })?;
+        // Opening first closes the check-then-kill race. If this process exits
+        // after validation, the descriptor cannot signal its PID's replacement.
+        match observe_signal_target(target)? {
+            SignalObservation::Present(state) if !matches!(state, 'Z' | 'X' | 'x') => Ok(Self {
+                pidfd,
+                target: target.clone(),
+            }),
+            SignalObservation::Present(_) | SignalObservation::Gone => {
+                Err(ActionError::ProcessNotFound)
+            }
+            SignalObservation::Replaced => Err(ActionError::IdentityMismatch),
+        }
+    }
+
+    pub fn terminate(&self) -> Result<(), ActionError> {
+        if self.has_exited()? {
+            return Err(ActionError::ProcessNotFound);
+        }
+        // The descriptor pins birth, not mutable ownership or job-control
+        // context. Recheck those facts at the delivery boundary as well.
+        match observe_signal_target(&self.target)? {
+            SignalObservation::Present(state) if !matches!(state, 'Z' | 'X' | 'x') => {
+                self.pidfd.send(libc::SIGTERM)
+            }
+            SignalObservation::Present(_) | SignalObservation::Gone => {
+                Err(ActionError::ProcessNotFound)
+            }
+            SignalObservation::Replaced => Err(ActionError::IdentityMismatch),
+        }
+    }
+
+    /// Observe the same pinned incarnation, even after its numeric PID is
+    /// reused. Signal delivery alone never proves that the observer stopped.
+    pub fn has_exited(&self) -> Result<bool, ActionError> {
+        let mut descriptor = libc::pollfd {
+            fd: self.pidfd.0,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: the owned pidfd and one initialized pollfd remain live for
+        // this nonblocking observation. No process is reaped or signaled.
+        let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                return Ok(false);
+            }
+            return Err(ActionError::Failed(format!(
+                "cannot observe pinned process exit: {error}"
+            )));
+        }
+        if descriptor.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+            return Err(ActionError::Failed(
+                "pinned process exit descriptor is unavailable".to_string(),
+            ));
+        }
+        Ok(descriptor.revents & (libc::POLLIN | libc::POLLHUP) != 0)
+    }
+}
+
 /// A pidfd (Linux >= 5.3): a file descriptor pinned to one specific process.
 /// Signals sent through it can never reach a process that later reuses the PID.
 #[cfg(target_os = "linux")]
@@ -2348,6 +2454,78 @@ mod tests {
                 let _ = self.0.kill();
                 let _ = self.0.wait();
             }
+        }
+
+        #[test]
+        fn pinned_observer_refuses_incomplete_or_changed_identity() {
+            let mut child = OwnedSignalChild(
+                std::process::Command::new("sleep")
+                    .arg("30")
+                    .spawn()
+                    .unwrap(),
+            );
+            let target = capture_process_signal_identity(child.0.id()).unwrap();
+            let (boot, start, pid) = parse_start_id(&target.start_id.0);
+            for mismatch in ["boot", "birth", "owner", "quality"] {
+                let mut changed = target.clone();
+                match mismatch {
+                    "boot" => {
+                        changed.start_id = pt_common::StartId::from_linux(
+                            "another-boot",
+                            start.unwrap(),
+                            pid.unwrap(),
+                        )
+                    }
+                    "birth" => {
+                        changed.start_id = pt_common::StartId::from_linux(
+                            boot.unwrap(),
+                            start.unwrap() + 1,
+                            pid.unwrap(),
+                        )
+                    }
+                    "owner" => changed.uid = target.uid.wrapping_add(1),
+                    "quality" => changed.quality = pt_common::IdentityQuality::PidOnly,
+                    _ => unreachable!(),
+                }
+                assert!(PinnedProcessSignal::pin(&changed).is_err(), "{mismatch}");
+                assert!(child.0.try_wait().unwrap().is_none(), "{mismatch}");
+            }
+            let pinned = PinnedProcessSignal::pin(&target).unwrap();
+            assert!(!pinned.has_exited().unwrap());
+            pinned.terminate().unwrap();
+            let status = child.0.wait().unwrap();
+            assert_eq!(status.signal(), Some(libc::SIGTERM));
+            assert!(pinned.has_exited().unwrap());
+            assert!(matches!(
+                pinned.terminate(),
+                Err(ActionError::ProcessNotFound)
+            ));
+        }
+
+        #[test]
+        fn pinned_observer_does_not_confuse_delivered_term_with_exit() {
+            use std::io::{BufRead, BufReader};
+
+            let mut child = OwnedSignalChild(
+                std::process::Command::new("sh")
+                    .args(["-c", "trap '' TERM; printf 'ready\\n'; exec sleep 30"])
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            let mut ready = String::new();
+            BufReader::new(child.0.stdout.take().unwrap())
+                .read_line(&mut ready)
+                .unwrap();
+            assert_eq!(ready.trim(), "ready");
+            let target = capture_process_signal_identity(child.0.id()).unwrap();
+            let pinned = PinnedProcessSignal::pin(&target).unwrap();
+            pinned.terminate().unwrap();
+            assert!(!pinned.has_exited().unwrap(), "ignored TERM is not exit");
+            assert!(child.0.try_wait().unwrap().is_none());
+            child.0.kill().unwrap();
+            child.0.wait().unwrap();
+            assert!(pinned.has_exited().unwrap());
         }
 
         /// The shell stops itself only after installing its handler. Its open

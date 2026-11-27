@@ -20111,6 +20111,7 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
     }
     if let Err(err) = write_daemon_pid(own_pid) {
         eprintln!("daemon start: failed to write pid file: {}", err);
+        return ExitCode::IoError;
     }
 
     let state_path = daemon_state_path();
@@ -21054,40 +21055,69 @@ fn run_daemon_stop(global: &GlobalOpts) -> ExitCode {
             return ExitCode::IoError;
         }
     }
-    // A daemon runs, but the file may still name another process (a daemon in a
-    // container sharing this data dir). Files from before v2.3.0 record no birth.
-    if pid_file_target(pid, birth) == PidFileTarget::Stale {
+    // A held lock is coordination evidence, not proof of process identity.
+    // Unreadable or missing birth must never authorize a signal.
+    if pid_file_target(pid, birth) != PidFileTarget::Verified {
         eprintln!(
-            "daemon stop: pid {pid} in the daemon pid file is not the running daemon; not signalled"
+            "daemon stop: pid {pid} in the daemon pid file cannot be verified as the running daemon; not signaled"
         );
         return ExitCode::IoError;
     }
-
-    if let Err(err) = terminate_process(pid) {
-        eprintln!("daemon stop: failed to terminate daemon: {}", err);
-        return ExitCode::IoError;
+    let stopped = match stop_recorded_process(
+        &daemon_pid_path(),
+        pid,
+        birth,
+        std::time::Duration::from_secs(global.timeout.unwrap_or(5)),
+    ) {
+        Ok(stopped) => stopped,
+        Err(err) => {
+            eprintln!("daemon stop: failed to stop the recorded daemon: {err}");
+            return ExitCode::IoError;
+        }
+    };
+    if stopped {
+        // A concurrent restart may already own the lifetime lock and have
+        // published a new pid record. Never remove that new daemon's state.
+        match try_acquire_daemon_pid_lock() {
+            Ok(Some(_lock)) => match read_pid_file_record(&daemon_pid_path()) {
+                Ok(Some(record)) if record == (pid, birth) => {
+                    if let Err(err) = remove_daemon_pid() {
+                        eprintln!("daemon stop: failed to remove pid file: {err}");
+                        return ExitCode::IoError;
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    eprintln!("daemon stop: cannot recheck pid record: {err}");
+                    return ExitCode::IoError;
+                }
+            },
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!("daemon stop: cannot lock pid record for cleanup: {err}");
+                return ExitCode::IoError;
+            }
+        }
     }
-
-    if let Err(err) = remove_daemon_pid() {
-        eprintln!("daemon stop: failed to remove pid file: {}", err);
-        return ExitCode::IoError;
-    }
-
     let response = serde_json::json!({
         "command": "daemon stop",
-        "running": false,
         "pid": pid,
+        "signaled": true,
+        "stopped": stopped,
+        "running": !stopped,
     });
     match global.format {
         OutputFormat::Json | OutputFormat::Toon | OutputFormat::Jsonl => {
             println!("{}", format_structured_output(global, response));
         }
-        _ => {
-            println!("Daemon stopped (pid {}).", pid);
-        }
+        _ if stopped => println!("Daemon stopped (pid {pid})."),
+        _ => eprintln!("Daemon {pid} was signaled; its exit is unconfirmed. Tracking state retained."),
     }
-
-    ExitCode::Clean
+    if stopped {
+        ExitCode::Clean
+    } else {
+        ExitCode::PartialFail
+    }
 }
 
 #[cfg(feature = "daemon")]
@@ -22054,8 +22084,10 @@ fn run_shadow_stop(global: &GlobalOpts) -> ExitCode {
         }
         let response = serde_json::json!({
             "command": "shadow stop",
-            "running": false,
+            "running": if target == PidFileTarget::Unverified { None } else { Some(false) },
             "pid": pid,
+            "signaled": false,
+            "stopped": target == PidFileTarget::Stale,
             "message": message,
         });
         match global.format {
@@ -22066,24 +22098,25 @@ fn run_shadow_stop(global: &GlobalOpts) -> ExitCode {
                 println!("Shadow observer not signalled: {message}.");
             }
         }
-        return ExitCode::Clean;
+        return if target == PidFileTarget::Stale {
+            ExitCode::Clean
+        } else {
+            ExitCode::PartialFail
+        };
     }
 
-    if let Err(err) = terminate_process(pid) {
-        eprintln!("shadow stop: failed to signal pid {}: {}", pid, err);
-        return ExitCode::IoError;
-    }
-
-    let started = std::time::Instant::now();
-    let wait = std::time::Duration::from_secs(global.timeout.unwrap_or(5));
-    let mut target = pid_file_target(pid, birth);
-    while target != PidFileTarget::Stale && started.elapsed() < wait {
-        std::thread::sleep(
-            std::time::Duration::from_millis(25).min(wait.saturating_sub(started.elapsed())),
-        );
-        target = pid_file_target(pid, birth);
-    }
-    let stopped = target == PidFileTarget::Stale;
+    let stopped = match stop_recorded_process(
+        &shadow_pid_path(),
+        pid,
+        birth,
+        std::time::Duration::from_secs(global.timeout.unwrap_or(5)),
+    ) {
+        Ok(stopped) => stopped,
+        Err(err) => {
+            eprintln!("shadow stop: failed to stop the recorded observer {pid}: {err}");
+            return ExitCode::IoError;
+        }
+    };
     if stopped {
         if let Err(err) = remove_shadow_pid() {
             eprintln!("shadow stop: failed to remove pid file: {}", err);
@@ -22095,11 +22128,7 @@ fn run_shadow_stop(global: &GlobalOpts) -> ExitCode {
         "pid": pid,
         "signaled": true,
         "stopped": stopped,
-        "running": match target {
-            PidFileTarget::Verified => Some(true),
-            PidFileTarget::Stale => Some(false),
-            PidFileTarget::Unverified => None,
-        },
+        "running": !stopped,
     });
     match global.format {
         OutputFormat::Json | OutputFormat::Toon | OutputFormat::Jsonl => {
@@ -22515,25 +22544,38 @@ fn pid_file_process_stat(pid: u32) -> Option<pt_core::collect::proc_parsers::Pro
     }
 }
 
-/// `<pid file>.birth`: `<pid> <birth>` for the pid the pid file names. A sidecar
-/// keeps the pid file itself a bare pid, as scripts and older pt versions read it.
+/// `<pid file>.birth` records `<pid> <birth>` and, on Linux, `<uid> <boot_id>`.
+/// The pid file remains a bare pid; the sidecar binds stop to its incarnation.
 fn pid_birth_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(".birth");
     PathBuf::from(name)
 }
 
-/// Write the pid file, recording the process's birth beside it when readable.
+/// Publish a pid only after its identity has been captured successfully.
 fn write_pid_file_record(path: &Path, pid: u32) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // The sidecar first: a reader binds it to the pid file's pid, so a sidecar
-    // left by an earlier run never applies to a new pid.
-    match process_birth_for_pid_file(pid) {
-        Some(birth) => std::fs::write(pid_birth_path(path), format!("{pid} {birth}"))?,
-        None => remove_if_present(&pid_birth_path(path))?,
-    }
+    let birth = process_birth_for_pid_file(pid)
+        .ok_or_else(|| std::io::Error::other("cannot record observer process birth"))?;
+    let record = format!("{pid} {birth}");
+    #[cfg(target_os = "linux")]
+    let record = {
+        let identity = pt_core::action::signal::capture_process_signal_identity(pid)
+            .map_err(std::io::Error::other)?;
+        let fields: Vec<_> = identity.start_id.0.split(':').collect();
+        if fields.len() != 3 || fields[1].parse::<u64>().ok() != Some(birth) {
+            return Err(std::io::Error::other(
+                "observer identity changed while recording its pid",
+            ));
+        }
+        format!("{record} {} {}", identity.uid, fields[0])
+    };
+    // Publish identity first. A sidecar left by another PID cannot authorize
+    // signaling the pid file's target, and a birth-only legacy record cannot
+    // authorize a Linux stop without the recorded boot and owner.
+    std::fs::write(pid_birth_path(path), record)?;
     std::fs::write(path, pid.to_string())
 }
 
@@ -22666,8 +22708,8 @@ impl GlobalLock {
 
         file.set_len(0)?;
         let mut writer = &file;
-        let _ = writer.write_all(format!("{}", std::process::id()).as_bytes());
-        let _ = writer.flush();
+        writer.write_all(format!("{}", std::process::id()).as_bytes())?;
+        writer.flush()?;
 
         Ok(Some(Self { file }))
     }
@@ -25221,30 +25263,101 @@ fn load_daemon_config(global: &GlobalOpts) -> (pt_core::daemon::DaemonConfig, bo
     (config, enabled)
 }
 
-/// SIGTERM a pid read from one of pt's own pid files. The pid must name one
-/// process: 0 would signal pt's process group, and values past i32::MAX would
-/// become negative (a process group, or every process for -1).
+/// Stop only the incarnation named by the pid record, retaining tracking state
+/// until exit is observed. Linux pins a pidfd before identity validation;
+/// macOS retains its native birth checks immediately before and after signaling.
 #[cfg(unix)]
-fn terminate_process(pid: u32) -> std::io::Result<()> {
-    let pid = match libc::pid_t::try_from(pid) {
-        Ok(pid) if pid > 1 => pid,
-        _ => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("refusing to signal pid {pid} from a pid file"),
-            ))
+fn stop_recorded_process(
+    path: &Path,
+    pid: u32,
+    birth: Option<u64>,
+    timeout: std::time::Duration,
+) -> std::io::Result<bool> {
+    if pid <= 1 || pid > i32::MAX as u32 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing to signal pid {pid} from a pid file"),
+        ));
+    }
+    let birth = birth.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "observer pid record has no verified birth; not signaled",
+        )
+    })?;
+    #[cfg(target_os = "linux")]
+    let target = {
+        let record = std::fs::read_to_string(pid_birth_path(path))?;
+        let fields: Vec<_> = record.split_whitespace().collect();
+        let invalid_record = || {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "observer pid record lacks a matching full boot, birth and owner identity; not signaled",
+            )
+        };
+        if fields.len() != 4
+            || fields[0].parse::<u32>().ok() != Some(pid)
+            || fields[1].parse::<u64>().ok() != Some(birth)
+        {
+            return Err(invalid_record());
         }
+        let uid = fields[2].parse::<u32>().map_err(|_| invalid_record())?;
+        let identity = pt_common::ProcessIdentity::new(
+            pid,
+            pt_common::StartId::from_linux(fields[3], birth, pid),
+            uid,
+        );
+        let target = pt_core::action::signal::PinnedProcessSignal::pin(&identity)
+            .map_err(std::io::Error::other)?;
+        target.terminate().map_err(std::io::Error::other)?;
+        target
     };
-    let result = unsafe { libc::kill(pid, libc::SIGTERM) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        // No atomic pidfd equivalent is used on this platform. Keep the native
+        // birth guard directly at the signal boundary; never act on Unknown.
+        if pid_file_target(pid, Some(birth)) != PidFileTarget::Verified {
+            return Err(std::io::Error::other(
+                "observer identity is no longer verified; not signaled",
+            ));
+        }
+        // SAFETY: the range check excludes init, groups and broadcast values.
+        if unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    let started = std::time::Instant::now();
+    loop {
+        #[cfg(target_os = "linux")]
+        let exited = target.has_exited().map_err(std::io::Error::other)?;
+        #[cfg(not(target_os = "linux"))]
+        let exited = match pid_file_target(pid, Some(birth)) {
+            PidFileTarget::Stale => true,
+            PidFileTarget::Verified => false,
+            PidFileTarget::Unverified => {
+                return Err(std::io::Error::other("observer exit cannot be verified"));
+            }
+        };
+        if exited {
+            return Ok(true);
+        }
+        if started.elapsed() >= timeout {
+            return Ok(false);
+        }
+        std::thread::sleep(
+            std::time::Duration::from_millis(25).min(timeout.saturating_sub(started.elapsed())),
+        );
     }
 }
 
 #[cfg(not(unix))]
-fn terminate_process(_pid: u32) -> std::io::Result<()> {
+fn stop_recorded_process(
+    _path: &Path,
+    _pid: u32,
+    _birth: Option<u64>,
+    _timeout: std::time::Duration,
+) -> std::io::Result<bool> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "terminate not supported on this platform",
@@ -31619,14 +31732,20 @@ mod config_file_kind_tests {
 
 #[cfg(all(test, unix))]
 mod pid_file_signal_tests {
-    use super::terminate_process;
+    use super::stop_recorded_process;
 
     /// A pid file holding 0, 1 or a value that wraps negative must not become
     /// kill(0) (pt's own process group), kill(1) or a process-group signal.
     #[test]
-    fn terminate_process_refuses_non_process_pids_without_signalling() {
+    fn stop_recorded_process_refuses_non_process_pids_without_signalling() {
         for pid in [0, 1, u32::MAX, i32::MAX as u32 + 1] {
-            let error = terminate_process(pid).unwrap_err();
+            let error = stop_recorded_process(
+                std::path::Path::new("unused-observer.pid"),
+                pid,
+                Some(1),
+                std::time::Duration::ZERO,
+            )
+            .unwrap_err();
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{pid}");
         }
     }
