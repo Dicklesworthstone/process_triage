@@ -1178,6 +1178,30 @@ fn raw_bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
     (n == size && info.pbi_pid == pid as u32).then_some(info)
 }
 
+/// Effective credential group, distinct from the real and saved GIDs.
+#[cfg(target_os = "macos")]
+pub(super) fn effective_gid(target: &pt_common::ProcessIdentity) -> Option<u32> {
+    let pid = target.pid.0;
+    let info = raw_bsd_info(pid)?;
+    let boot = target.start_id.0.split_once(':')?.0;
+    if !target.can_safely_revalidate()
+        || info.pbi_uid != target.uid
+        || boot.is_empty()
+        || (target.quality == pt_common::IdentityQuality::NoBootId && boot != "unknown")
+        || info.pbi_start_tvusec >= 1_000_000
+    {
+        return None;
+    }
+    let birth = info
+        .pbi_start_tvsec
+        .checked_mul(1_000_000)?
+        .checked_add(info.pbi_start_tvusec)?;
+    // Darwin quick scans use "unknown" for the boot ID, but libproc supplies
+    // the native microsecond birth and owner in the same record as the GID.
+    (birth > 0 && target.start_id == pt_common::StartId::from_macos(boot, birth, pid))
+        .then_some(info.pbi_gid)
+}
+
 /// Session facts for `pid` in the shape of a Linux `/proc/<pid>/stat` record.
 /// `starttime` carries the native process birth in microseconds since the Unix
 /// epoch, rather than Linux clock ticks, so session safety can compare process
@@ -1651,6 +1675,30 @@ mod tests {
         assert!(!fence.accepts_reading(1, Some(0)));
         assert!(!fence.accepts_reading(0, Some(499)));
         assert!(!fence.accepts_reading(1, None));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn effective_group_binds_the_native_birth_when_boot_id_is_unknown() {
+        let pid = std::process::id();
+        let live = read_bsd_info(pid).unwrap();
+        let mut target = pt_common::ProcessIdentity::full(
+            pid,
+            pt_common::StartId::from_macos("unknown", live.start_us, pid),
+            live.uid,
+            None,
+            None,
+            pt_common::IdentityQuality::NoBootId,
+        );
+        // SAFETY: getegid only observes this test process's credentials.
+        assert_eq!(effective_gid(&target), Some(unsafe { libc::getegid() }));
+        target.uid = live.uid.wrapping_add(1);
+        assert_eq!(effective_gid(&target), None);
+        target.uid = live.uid;
+        target.start_id = pt_common::StartId::from_macos("unknown", live.start_us + 1, pid);
+        assert_eq!(effective_gid(&target), None);
+        target.start_id = pt_common::StartId::from_macos("synthetic", live.start_us, pid);
+        assert_eq!(effective_gid(&target), None);
     }
 
     #[cfg(target_os = "macos")]

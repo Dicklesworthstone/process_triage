@@ -4272,24 +4272,8 @@ fn process_policy_candidate(
             return Err(reason);
         }
     }
-    let group = if !enforcer.requires_group_evidence() {
-        None
-    } else {
-        let output = std::process::Command::new("ps")
-            .args(["-o", "group=", "-p", &proc.pid.0.to_string()])
-            .output()
-            .map_err(|error| format!("cannot collect protected-group evidence: {error}"))?;
-        if !output.status.success() {
-            return Err("cannot collect protected-group evidence".to_string());
-        }
-        let group = std::str::from_utf8(&output.stdout)
-            .map_err(|error| format!("invalid protected-group evidence: {error}"))?
-            .trim();
-        if group.is_empty() {
-            return Err("protected-group evidence is unavailable".to_string());
-        }
-        Some(group.to_string())
-    };
+    let group =
+        enforcer.observe_policy_group(&process_identity_from_record(proc), action, false)?;
     // Critical lock rules are mandatory even when the configurable generic
     // writable-file gate is relaxed. Capture both from one complete observation
     // of this incarnation, never from the earlier plan or a partial FD parser.
@@ -28605,12 +28589,23 @@ mod process_tree_safety_tests {
             zombie: 0.999,
         };
         let signatures = SignatureDatabase::new();
+        // The owned child's effective GID is inherited from this test process.
+        // Use the host directory independently of the triage collectors.
+        let observed = std::process::Command::new("id")
+            .arg("-gn")
+            .output()
+            .unwrap();
+        assert!(observed.status.success());
+        let group = std::str::from_utf8(&observed.stdout).unwrap().trim();
+        assert!(!group.is_empty());
         for case in [
             "eligible",
             "init",
             "named_pid",
             "service",
             "user",
+            "protected_group",
+            "other_group",
             "young",
             "memory",
         ] {
@@ -28619,6 +28614,8 @@ mod process_tree_safety_tests {
             match case {
                 "init" => parent.pid = ProcessId(1),
                 "named_pid" => policy.guardrails.never_kill_pid.push(base_parent.pid.0),
+                "protected_group" => policy.guardrails.protected_groups.push(group.to_owned()),
+                "other_group" => policy.guardrails.protected_groups.push(format!("nonmember-{group}")),
                 "service" => {
                     policy.guardrails.builtin_protection = true;
                     parent.comm = "sshd".to_string();
@@ -28637,6 +28634,20 @@ mod process_tree_safety_tests {
             }
             let filter = super::ProtectedFilter::from_guardrails(&policy.guardrails).unwrap();
             let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
+            if matches!(case, "protected_group" | "other_group") {
+                use pt_core::decision::Action;
+                let identity = super::process_identity_from_record(&parent);
+                for planning in [true, false] {
+                    assert_eq!(
+                        enforcer.observe_policy_group(&identity, Action::Renice, planning)
+                            .unwrap().as_deref(), Some(group)
+                    );
+                    let mut stale = identity.clone();
+                    stale.uid = stale.uid.wrapping_add(1);
+                    assert!(enforcer.observe_policy_group(&stale, Action::Renice, planning).is_err());
+                    assert_eq!(enforcer.observe_policy_group(&stale, Action::Keep, planning), Ok(None));
+                }
+            }
             let refusal = super::planned_zombie_parent_refusal(
                 &parent,
                 &super::PlanningProtection {
@@ -28649,7 +28660,7 @@ mod process_tree_safety_tests {
                 &posterior,
                 true,
             );
-            if case == "eligible" {
+            if matches!(case, "eligible" | "other_group") {
                 assert!(refusal.is_none(), "{refusal:?}");
             } else {
                 assert!(refusal.is_some(), "{case}");
@@ -28659,6 +28670,7 @@ mod process_tree_safety_tests {
                     "named_pid" => "never_kill_pid",
                     "service" => "protected",
                     "user" => "protected",
+                    "protected_group" => "guardrails.protected_groups",
                     "young" => "min_process_age_seconds",
                     "memory" => "max_blast_radius_mb",
                     _ => unreachable!(),
@@ -36351,7 +36363,7 @@ fn candidate_recommendation(
     // under its mounts for a writable-file probe can itself block on a stalled
     // server, so do not probe them once the infrastructure gate has refused.
     // For a zombie remedy this evidence belongs to the actual parent target.
-    let fuse_server = if policy.guardrails.builtin_protection {
+    let fuse_server = if enforcer.requires_builtin_placement() {
         subject.and_then(|subject| pt_core::collect::protected::holds_fuse_device(subject.pid.0))
     } else {
         None
@@ -36364,7 +36376,7 @@ fn candidate_recommendation(
         Vec::new()
     };
     #[cfg(target_os = "linux")]
-    let fuse_refusal = if policy.guardrails.builtin_protection && subject.is_some() {
+    let fuse_refusal = if enforcer.requires_builtin_placement() && subject.is_some() {
         match pt_core::action::prechecks::fuse_action_precheck(fuse_server, evidence_action) {
             pt_core::action::prechecks::PreCheckResult::Blocked { reason, .. } => Some(reason),
             _ => None,
@@ -36374,28 +36386,30 @@ fn candidate_recommendation(
     };
     #[cfg(not(target_os = "linux"))]
     let fuse_refusal: Option<String> = None;
+    let group = subject
+        .filter(|_| fuse_refusal.is_none())
+        .and_then(|target| {
+            match enforcer.observe_policy_group(
+                &process_identity_from_record(target),
+                evidence_action,
+                true,
+            ) {
+                Ok(name) => name,
+                Err(error) => {
+                    evidence_refusal =
+                        Some(format!("protected-group evidence unavailable: {error}"));
+                    None
+                }
+            }
+        });
     let destructive =
         fuse_refusal.is_none() && matches!(decision.optimal_action, Action::Kill | Action::Restart);
     let descriptor_evidence = if destructive && evidence_refusal.is_none() {
         subject.and_then(|subject| {
-            let evidence = if routed_zombie {
-                // Preserve the parent's infrastructure/group evidence ordering;
-                // a dead source's empty or unreadable table proves nothing about it.
-                process_policy_candidate(enforcer, subject, evidence_action)
-                    .map(|target| (target.open_write_fds, target.has_locked_files, target.critical_files))
-            } else {
-                pt_core::action::prechecks::descriptor_policy_evidence(
-                    &process_identity_from_record(subject),
-                    enforcer.requires_lock_evidence(),
-                )
-                .map(|evidence| {
-                    (
-                        Some(evidence.open_write_fds),
-                        evidence.has_locked_files,
-                        evidence.critical_writes,
-                    )
-                })
-            };
+            let evidence = pt_core::action::prechecks::descriptor_policy_evidence(
+                &process_identity_from_record(subject),
+                enforcer.requires_lock_evidence(),
+            ).map(|evidence| (Some(evidence.open_write_fds), evidence.has_locked_files, evidence.critical_writes));
             match evidence {
                 Ok(evidence) => Some(evidence),
                 Err(error) => {
@@ -36419,7 +36433,7 @@ fn candidate_recommendation(
         ppid: proc.ppid.0 as i32,
         cmdline: proc.cmd.clone(),
         user: Some(proc.user.clone()),
-        group: None,
+        group,
         category: score
             .signature
             .as_ref()

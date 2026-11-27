@@ -148,7 +148,7 @@ pub struct ProcessCandidate {
     pub cmdline: String,
     /// Process owner username.
     pub user: Option<String>,
-    /// Process owner group.
+    /// Canonical directory name for the process's effective GID.
     pub group: Option<String>,
     /// Process category (e.g., "daemon", "shell").
     pub category: Option<String>,
@@ -351,6 +351,8 @@ pub struct PolicyEnforcer {
     protected_users: HashSet<String>,
     /// Protected groups (lowercase).
     protected_groups: HashSet<String>,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    planning_group_names: crate::collect::protected::PlanningGroupNames,
     /// Protected categories (lowercase).
     protected_categories: HashSet<String>,
     /// Never kill these PIDs.
@@ -449,6 +451,8 @@ impl PolicyEnforcer {
             force_review_patterns,
             protected_users,
             protected_groups,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            planning_group_names: Default::default(),
             protected_categories,
             never_kill_pid,
             never_kill_ppid,
@@ -538,6 +542,36 @@ impl PolicyEnforcer {
                 .recorded_policy
                 .as_ref()
                 .is_some_and(|policy| policy.requires_lock_evidence())
+    }
+
+    /// Retrieve the effective credential group for either applicable policy.
+    /// Execution always resolves the current directory mapping independently.
+    pub fn observe_policy_group(
+        &self,
+        target: &pt_common::ProcessIdentity,
+        action: Action,
+        planning: bool,
+    ) -> Result<Option<String>, String> {
+        if action == Action::Keep || !self.requires_group_evidence() {
+            return Ok(None);
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            use crate::collect::protected::{group_name, observe_effective_group};
+            observe_effective_group(target, |gid| {
+                if planning {
+                    self.planning_group_names.lookup(gid, group_name)
+                } else {
+                    group_name(gid)
+                }
+            })
+            .map(Some)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (target, planning);
+            Err("effective process group evidence is unsupported on this platform".into())
+        }
     }
 
     pub fn requires_builtin_placement(&self) -> bool {

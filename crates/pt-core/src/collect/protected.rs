@@ -40,6 +40,257 @@ use tracing::{debug, trace};
 
 use super::types::{ProcessRecord, ScanResult};
 
+#[derive(Default)]
+pub(crate) struct PlanningGroupNames {
+    records: std::sync::Mutex<HashMap<u32, GroupNameRecord>>,
+}
+
+struct GroupNameRecord {
+    observed: std::time::Instant,
+    name: Result<String, String>,
+}
+
+impl PlanningGroupNames {
+    /// Cache directory answers (including outages) for one planning burst.
+    /// Never cache which GID belongs to a PID. Apply bypasses this cache.
+    pub(crate) fn lookup(
+        &self,
+        gid: u32,
+        resolve: impl FnOnce(u32) -> Result<String, String>,
+    ) -> Result<String, String> {
+        let records = || self.records.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hit) = records().get(&gid) {
+            if hit.observed.elapsed() < std::time::Duration::from_secs(30) {
+                return hit.name.clone();
+            }
+        }
+        let name = resolve(gid);
+        let mut records = records();
+        if records.len() >= 1024 {
+            records.clear();
+        }
+        records.insert(
+            gid,
+            GroupNameRecord {
+                observed: std::time::Instant::now(),
+                name: name.clone(),
+            },
+        );
+        name
+    }
+}
+
+/// Read the process's effective credential group, the meaning of ps "group".
+/// Neither its job-control PGID nor its login user's default group identifies it.
+#[cfg(target_os = "linux")]
+fn effective_gid(pid: u32) -> Result<u32, String> {
+    let status = std::fs::read(format!("/proc/{pid}/status"))
+        .map_err(|error| format!("cannot read effective GID for PID {pid}: {error}"))?;
+    effective_gid_from_status(&status)
+        .ok_or_else(|| format!("missing or malformed effective GID for PID {pid}"))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn effective_gid_from_status(status: &[u8]) -> Option<u32> {
+    let mut rows = status
+        .split(|b| *b == b'\n')
+        .filter_map(|row| row.strip_prefix(b"Gid:"));
+    let parse = |row: &[u8]| {
+        let fields: Vec<u32> = std::str::from_utf8(row)
+            .ok()?
+            .split_ascii_whitespace()
+            .map(str::parse)
+            .collect::<Result<_, _>>()
+            .ok()?;
+        let [_, effective, _, _] = fields.as_slice() else {
+            return None;
+        };
+        Some(*effective)
+    };
+    rows.next()
+        .and_then(parse)
+        .filter(|_| rows.next().is_none())
+}
+
+/// Resolve through the host account directory without permitting an NSS/LDAP
+/// outage to hang triage. The account name must be from a record for this GID.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn group_name(gid: u32) -> Result<String, String> {
+    let id = gid.to_string();
+    #[cfg(target_os = "linux")]
+    let (cmd, args): (&str, &[&str]) = ("/usr/bin/getent", &["group", &id]);
+    #[cfg(target_os = "macos")]
+    let (cmd, args): (&str, &[&str]) = ("/usr/bin/dscacheutil", &["-q", "group", "-a", "gid", &id]);
+    let runner = super::tool_runner::ToolRunner::new(super::tool_runner::ToolConfig {
+        use_nice: false,
+        default_timeout: std::time::Duration::from_secs(2),
+        max_output_bytes: 64 * 1024,
+        ..Default::default()
+    });
+    let observed = runner.run_tool(cmd, args, None)
+    .map_err(|error| format!("group directory lookup for GID {gid}: {error}"))?;
+    if !observed.success() || !observed.stderr.is_empty() {
+        return Err(format!(
+            "group directory lookup for GID {gid} did not complete"
+        ));
+    }
+    let record = std::str::from_utf8(&observed.stdout)
+        .map_err(|_| format!("invalid group directory record for GID {gid}"))?;
+    #[cfg(target_os = "linux")]
+    let name = parse_getent_group(record, gid);
+    #[cfg(target_os = "macos")]
+    let name = parse_directory_group(record, gid);
+    name.filter(|name| {
+        !name.is_empty() && name.trim() == *name && !name.chars().any(char::is_control)
+    })
+    .map(str::to_owned)
+    .ok_or_else(|| format!("ambiguous or missing name for effective GID {gid}"))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_getent_group(record: &str, gid: u32) -> Option<&str> {
+    let row = record.strip_suffix('\n')?;
+    if row.contains('\n') {
+        return None;
+    }
+    let mut fields = row.split(':');
+    let name = fields.next()?;
+    fields.next()?; // password
+    let found = fields.next()?.parse::<u32>().ok()?;
+    fields.next()?; // member list
+    (found == gid && fields.next().is_none()).then_some(name)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_directory_group(record: &str, gid: u32) -> Option<&str> {
+    let record = record.trim_matches(['\r', '\n']);
+    let mut name = None;
+    let mut observed_gid = None;
+    for row in record.lines() {
+        // An internal blank line starts a second directory record. Reject
+        // malformed fields too, including an empty duplicate name or GID.
+        let (field, value) = row.split_once(':')?;
+        if field.is_empty() || field.trim() != field {
+            return None;
+        }
+        match field {
+            "name" => {
+                let value = value.strip_prefix(' ')?;
+                if value.is_empty() || name.replace(value).is_some() {
+                    return None;
+                }
+            }
+            "gid" => {
+                let value = value.strip_prefix(' ')?.parse::<u32>().ok()?;
+                if observed_gid.replace(value).is_some() {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    name.filter(|_| observed_gid == Some(gid))
+}
+
+#[cfg(test)]
+mod group_evidence_tests {
+    use super::*;
+
+    #[test]
+    fn effective_group_uses_only_the_effective_credential_and_requires_one_complete_row() {
+        let status = b"Name:\t\xff\nGid:\t10 20 30 40\nGroups:\t1 2 10\n";
+        assert_eq!(effective_gid_from_status(status), Some(20));
+        for invalid in [
+            &b"Groups: 10 20\n"[..],
+            b"Gid: 10 xx 30 40\n",
+            b"Gid: 10 20\n",
+            b"Gid: 10 20 30 40\nGid: 1 2 3 4\n",
+        ] {
+            assert_eq!(effective_gid_from_status(invalid), None);
+        }
+    }
+
+    #[test]
+    fn directory_answers_require_one_record_for_the_observed_gid() {
+        assert_eq!(
+            parse_getent_group("operators_long_name:x:20:user1,user2\n", 20),
+            Some("operators_long_name")
+        );
+        assert_eq!(parse_getent_group("operators:x:21:\n", 20), None);
+        assert_eq!(parse_getent_group("one:x:20:\ntwo:x:20:\n", 20), None);
+        assert_eq!(
+            parse_directory_group("name: staff\npassword: *\ngid: 20\n", 20),
+            Some("staff")
+        );
+        assert_eq!(parse_directory_group("name: staff\ngid: 21\n", 20), None);
+        assert_eq!(parse_directory_group("name: staff\n\ngid: 20\n", 20), None);
+        assert_eq!(parse_directory_group("name: staff\ngid: 20\nname:\n", 20), None);
+        assert_eq!(parse_directory_group("name: staff\ngid: 20\ngid:bad\n", 20), None);
+        assert_eq!(
+            parse_directory_group("name: staff\ngid: 20\nname: alt\n", 20),
+            None
+        );
+    }
+
+    #[test]
+    fn planning_group_names_share_account_lookups_by_gid_only() {
+        let names = PlanningGroupNames::default();
+        assert_eq!(names.lookup(10, |_| Ok("one".into())).unwrap(), "one");
+        assert_eq!(
+            names.lookup(10, |_| panic!("already observed")).unwrap(),
+            "one"
+        );
+        assert!(names
+            .lookup(20, |_| Err("directory unavailable".into()))
+            .is_err());
+        assert!(names
+            .lookup(20, |_| panic!("do not repeatedly wait on an outage"))
+            .is_err());
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn observe_effective_group(
+    target: &pt_common::ProcessIdentity,
+    lookup: impl FnOnce(u32) -> Result<String, String>,
+) -> Result<String, String> {
+    use crate::action::{IdentityProvider, LiveIdentityProvider};
+    let identity = LiveIdentityProvider::new();
+    let validate = || {
+        // Darwin's native credential read binds its own birth and UID. A
+        // recorded full identity also has to satisfy the live boot check.
+        if target.quality == pt_common::IdentityQuality::Full && target.can_safely_revalidate() {
+            if identity
+                .revalidate(target)
+                .map_err(|error| error.to_string())?
+            {
+                return Ok(());
+            }
+        } else if cfg!(target_os = "macos")
+            && target.quality == pt_common::IdentityQuality::NoBootId
+            && target.can_safely_revalidate()
+        {
+            return Ok(());
+        }
+        Err("cannot bind protected-group evidence to the target identity".to_string())
+    };
+    #[cfg(target_os = "linux")]
+    let credential = || effective_gid(target.pid.0);
+    #[cfg(target_os = "macos")]
+    let credential = || {
+        super::macos::effective_gid(target)
+            .ok_or_else(|| "effective GID or native process identity unavailable".to_string())
+    };
+    validate()?;
+    let gid = credential()?;
+    let name = lookup(gid)?;
+    if credential()? != gid {
+        return Err("effective GID changed during protected-group inspection".to_string());
+    }
+    validate()?;
+    Ok(name)
+}
+
 /// Errors during protected filter setup.
 #[derive(Debug, Error)]
 pub enum ProtectedFilterError {
