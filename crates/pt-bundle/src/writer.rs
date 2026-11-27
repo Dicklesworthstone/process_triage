@@ -2,6 +2,9 @@
 //!
 //! Creates ZIP archives with manifest and checksums.
 
+mod verification;
+pub use verification::VerificationSummary;
+
 use crate::encryption;
 use crate::{BundleError, BundleManifest, BundleProvenanceSummary, FileEntry, Result};
 use pt_redact::{ExportProfile, RedactionEngine, RedactionPolicy};
@@ -56,6 +59,7 @@ pub struct BundleWriter {
     manifest: BundleManifest,
     files: Vec<(String, Vec<u8>)>,
     redaction: Option<RedactionEngine>,
+    recorded_verification: Option<Vec<u8>>,
 }
 
 impl BundleWriter {
@@ -70,7 +74,14 @@ impl BundleWriter {
             manifest,
             files: Vec::new(),
             redaction: None,
+            recorded_verification: None,
         }
+    }
+
+    /// Attach the verifier's source document for aggregation against the original
+    /// plan. The source bytes and individual verification rows are never exported.
+    pub fn set_recorded_verification(&mut self, bytes: Vec<u8>) {
+        self.recorded_verification = Some(bytes);
     }
 
     /// Use an explicit policy/key, including field allowlists for forensic data.
@@ -87,6 +98,18 @@ impl BundleWriter {
         };
         let profile = self.manifest.export_profile;
         let source_session = self.manifest.session_id.clone();
+        let verification = if let Some(bytes) = self.recorded_verification.take() {
+            let saved = serde_json::from_slice(&bytes)?;
+            let plan = self.files.iter().find(|(path, _)| path == "plan.json");
+            match plan {
+                Some((_, bytes)) => VerificationSummary::from_artifacts(
+                    &source_session, &serde_json::from_slice(bytes)?, &saved,
+                )?,
+                None => None,
+            }
+        } else {
+            None
+        };
         let mut source_host =
             (self.manifest.host_id != "unknown").then(|| self.manifest.host_id.clone());
         let policy_bytes = serde_json::to_vec(&serde_json::to_value(engine.policy())?)?;
@@ -257,6 +280,22 @@ impl BundleWriter {
             }
         }
 
+        // The typed aggregate contains only a canonical timestamp and counts
+        // keyed by the verifier's fixed outcome vocabulary. Add it after the
+        // sharing profile is applied, and before computing final checksums.
+        if let Some(mut verification) = verification {
+            verification.bind_export_session(&self.manifest.session_id);
+            if let Some((_, bytes)) = self.files.iter_mut().find(|(p, _)| p == "summary.json") {
+                let mut summary: serde_json::Value = serde_json::from_slice(bytes)?;
+                let fields = summary.as_object_mut().ok_or_else(|| {
+                    BundleError::CorruptedManifest("session summary must be an object".into())
+                })?;
+                fields.insert("action_verification".into(), serde_json::to_value(verification)?);
+                *bytes = serde_json::to_vec_pretty(&summary)?;
+            } else {
+                self.add_summary(&serde_json::json!({"action_verification": verification}))?;
+            }
+        }
         let mut exported_paths = HashSet::new();
         for (path, _) in &self.files {
             if !exported_paths.insert(path) {

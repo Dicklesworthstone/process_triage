@@ -15056,6 +15056,15 @@ fn run_bundle_create(
         }
     }
 
+    match pt_core::session::read_jsonl(&handle.dir.join("action/verifications.json")) {
+        Ok(Some(bytes)) => writer.set_recorded_verification(bytes),
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("bundle create: cannot read recorded verification: {error}");
+            return ExitCode::IoError;
+        }
+    }
+
     // Optional artifacts may be absent; existing unreadable artifacts must not
     // silently disappear from a successful export.
     for (source, destination, file_type) in [
@@ -50183,6 +50192,17 @@ fn prepare_report_from_session(
         }
     };
 
+    if manifest.session_id != handle.id.0 {
+        return Err(pt_report::ReportError::MissingData(
+            "manifest session ID does not match the requested session".into(),
+        ));
+    }
+    if context.as_ref().is_some_and(|ctx| ctx.session_id != handle.id.0) {
+        return Err(pt_report::ReportError::MissingData(
+            "session context identity does not match the requested session".into(),
+        ));
+    }
+
     // Build overview section from session data
     let overview = OverviewSection {
         session_id: manifest.session_id.clone(),
@@ -50236,14 +50256,8 @@ fn prepare_report_from_session(
             let recorded =
                 pt_core::session::snapshot_persist::load_recorded_explanation_snapshot(handle)
                     .map_err(pt_report::ReportError::MissingData)?;
-            if manifest.session_id != handle.id.0 {
-                return Err(pt_report::ReportError::MissingData(
-                    "manifest session ID does not match the recorded snapshot".into(),
-                ));
-            }
-            if context.as_ref().is_some_and(|context| {
-                context.session_id != handle.id.0
-                    || recorded.source["host_id"].as_str() != Some(context.host_id.as_str())
+            if context.as_ref().is_some_and(|ctx| {
+                recorded.source["host_id"].as_str() != Some(ctx.host_id.as_str())
             }) {
                 return Err(pt_report::ReportError::MissingData(
                     "session context identity does not match the recorded snapshot".into(),
@@ -50274,7 +50288,11 @@ fn prepare_report_from_session(
             Some(content) => pt_report::generator::parse_outcomes(content.as_bytes())?,
             None => Vec::new(),
         };
-    generator.prepare_from_session_artifacts(overview, &plan, &outcomes)
+    let verification = pt_core::session::read_jsonl(&handle.dir.join("action/verifications.json"))
+        .map_err(|error| pt_report::ReportError::MissingData(format!("verification: {error}")))?
+        .map(|bytes| serde_json::from_slice(&bytes))
+        .transpose()?;
+    generator.prepare_from_verified_session_artifacts(overview, &plan, &outcomes, verification.as_ref())
 }
 
 #[cfg(all(test, feature = "report"))]
