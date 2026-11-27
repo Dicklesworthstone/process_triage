@@ -4228,7 +4228,7 @@ fn check_execution_policy(
         .iter()
         .find(|proc| proc.pid == action.target.pid)
         .ok_or("target is absent from current policy evidence")?;
-    if !action.target.matches(&process_identity_from_record(proc)) {
+    if !proc.matches_saved_identity(&action.target) {
         return Err("current policy evidence belongs to a different process identity".to_string());
     }
     let mut candidate = process_policy_candidate(enforcer, proc, action.action)?;
@@ -5105,10 +5105,7 @@ fn capture_action_execution_evidence(
     process: &ProcessRecord,
     deadline: Option<std::time::Instant>,
 ) -> Result<serde_json::Value, String> {
-    if process.pid != action.target.pid
-        || process.uid != action.target.uid
-        || process.start_id != action.target.start_id
-    {
+    if !process.matches_saved_identity(&action.target) {
         return Err("execution evidence does not match the saved target identity".to_string());
     }
     if action.action == pt_core::decision::Action::Kill
@@ -5214,16 +5211,14 @@ fn capture_current_action_execution_evidence(
     if let Some(child) = &action.original_zombie_target {
         // The provider brackets this scan, including the owner and any supplied
         // group/session constraints. Historical plans may omit those constraints.
-        if !action
-            .target
-            .matches(&process_identity_from_record(process))
+        if !process.matches_saved_identity(&action.target)
             || matches!(
                 process.state,
                 ProcessState::Zombie | ProcessState::Dead | ProcessState::Unknown
             )
             || !scan.processes.iter().any(|record| {
                 record.state == ProcessState::Zombie
-                    && child.matches(&process_identity_from_record(record))
+                    && record.matches_saved_identity(child)
                     && record.ppid == process.pid
             })
         {
@@ -36952,20 +36947,7 @@ fn finalize_candidate_remedy(
 }
 
 fn process_identity_from_record(proc: &ProcessRecord) -> ProcessIdentity {
-    let quality =
-        if proc.start_id.0.starts_with("unknown:") || proc.start_id.0.starts_with("synthetic:") {
-            IdentityQuality::NoBootId
-        } else {
-            IdentityQuality::Full
-        };
-    ProcessIdentity::full(
-        proc.pid.0,
-        proc.start_id.clone(),
-        proc.uid,
-        proc.pgid,
-        proc.sid,
-        quality,
-    )
+    proc.identity()
 }
 
 fn candidate_matches_filter(candidate: &serde_json::Value, only: &str) -> bool {
@@ -39527,7 +39509,7 @@ fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
                 Some(process)
                     if target
                         .as_ref()
-                        .is_some_and(|(_, id)| &process.start_id != id) =>
+                        .is_some_and(|(_, id)| !process.matches_saved_start_id(id)) =>
                 {
                     exit_code = ExitCode::IdentityError;
                     explanations.push(serde_json::json!({
@@ -41709,7 +41691,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     for action in &actions_to_apply {
         let pid = action.target.pid.0;
         let before_proc = before_by_pid.get(&pid).copied().filter(|process| {
-            process.start_id == action.target.start_id && process.uid == action.target.uid
+            process.matches_saved_identity(&action.target)
         });
         let label = before_proc
             .map(|proc| proc.cmd.clone())
@@ -42201,10 +42183,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     }
                 };
             #[cfg(any(target_os = "linux", target_os = "macos"))]
-            if !action
-                .target
-                .matches(&process_identity_from_record(&current_process))
-            {
+            if !current_process.matches_saved_identity(&action.target) {
                 blocked_by_prechecks += 1;
                 checkpoint_outcome!(serde_json::json!({
                     "action_id": action.action_id,
@@ -44534,10 +44513,7 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
             }
             let still_running = target_identities.iter().any(|identity| {
                 current.processes.iter().any(|process| {
-                    process.pid == identity.pid
-                        && process.start_id == identity.start_id
-                        && process.uid == identity.uid
-                        && !process.state.is_zombie()
+                    process.matches_saved_identity(identity) && !process.state.is_zombie()
                 })
             });
 

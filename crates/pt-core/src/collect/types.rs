@@ -169,6 +169,55 @@ pub struct ProcessRecord {
 }
 
 impl ProcessRecord {
+    /// Identity and provenance represented by this inventory row.
+    pub fn identity(&self) -> pt_common::ProcessIdentity {
+        let quality = if self.start_id.0.starts_with("unknown:")
+            || self.start_id.0.starts_with("synthetic:")
+        {
+            pt_common::IdentityQuality::NoBootId
+        } else {
+            pt_common::IdentityQuality::Full
+        };
+        pt_common::ProcessIdentity::full(
+            self.pid.0,
+            self.start_id.clone(),
+            self.uid,
+            self.pgid,
+            self.sid,
+            quality,
+        )
+    }
+
+    /// Match a fresh inventory row to a saved action. Old Darwin scans lacked
+    /// the boot UUID but recorded the same native birth in epoch microseconds.
+    pub fn matches_saved_identity(&self, target: &pt_common::ProcessIdentity) -> bool {
+        if self.pid != target.pid || self.uid != target.uid || !target.can_safely_revalidate() {
+            return false;
+        }
+        if target.quality == pt_common::IdentityQuality::NoBootId {
+            return self.matches_saved_start_id(&target.start_id);
+        }
+        self.start_id == target.start_id
+    }
+
+    /// Match an explicit selector to this observed PID, retaining the native
+    /// birth component for Darwin selectors copied from pre-UUID inventories.
+    pub fn matches_saved_start_id(&self, saved: &StartId) -> bool {
+        if self.start_id == *saved {
+            return true;
+        }
+        #[cfg(target_os = "macos")]
+        if saved.0.starts_with("unknown:") {
+            return super::macos::legacy_birth_matches(
+                saved,
+                &self.start_id,
+                self.pid.0,
+                super::macos::boot_session_id().as_deref(),
+            );
+        }
+        false
+    }
+
     /// Kernel state used for scoring and planning, with its observed D-state
     /// channel when available. A later leader wait can tighten feasibility for
     /// a nonterminal process. Terminal snapshots retain their existing routing.

@@ -1149,6 +1149,76 @@ impl MacosScanBirthFence {
     }
 }
 
+/// XNU exports kern.bootsessionuuid as a read-only, NUL-terminated uuid_string_t.
+#[cfg(target_os = "macos")]
+pub(crate) fn boot_session_id() -> Option<String> {
+    let mut bytes = [0xffu8; 37];
+    let mut len = bytes.len();
+    // SAFETY: sysctlbyname writes at most len bytes into the array. No new value is supplied.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"kern.bootsessionuuid".as_ptr(),
+            bytes.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    parse_boot_session_id(bytes.get(..len)?)
+}
+
+fn parse_boot_session_id(bytes: &[u8]) -> Option<String> {
+    let text = std::ffi::CStr::from_bytes_with_nul(bytes)
+        .ok()?
+        .to_str()
+        .ok()?;
+    let id = uuid::Uuid::parse_str(text).ok()?;
+    (text.len() == 36 && !id.is_nil()).then(|| id.hyphenated().to_string())
+}
+
+/// A full identity must match the independently observed boot. Older scans
+/// recorded the literal "unknown" together with the same native birth and PID.
+pub(crate) fn target_birth(
+    target: &pt_common::ProcessIdentity,
+    current_boot: Option<&str>,
+) -> Option<u64> {
+    let (boot, birth) = parse_native_start(&target.start_id, target.pid.0)?;
+    match target.quality {
+        IdentityQuality::Full if current_boot == Some(boot) => Some(birth),
+        IdentityQuality::NoBootId if boot == "unknown" => Some(birth),
+        _ => None,
+    }
+}
+
+fn parse_native_start(id: &StartId, pid: u32) -> Option<(&str, u64)> {
+    let (boot, suffix) = id.0.split_once(':')?;
+    let (birth, recorded_pid) = suffix.split_once(':')?;
+    let birth = birth.parse::<u64>().ok()?;
+    (pid > 0
+        && birth > 0
+        && recorded_pid.parse::<u32>() == Ok(pid)
+        && *id == StartId::from_macos(boot, birth, pid))
+        .then_some((boot, birth))
+}
+
+/// Compare a saved pre-UUID selector with one newly observed native Darwin birth.
+pub(super) fn legacy_birth_matches(
+    saved: &StartId,
+    observed: &StartId,
+    pid: u32,
+    current_boot: Option<&str>,
+) -> bool {
+    let (Some(("unknown", birth)), Some((boot, live_birth))) =
+        (parse_native_start(saved, pid), parse_native_start(observed, pid))
+    else {
+        return false;
+    };
+    current_boot == Some(boot) && birth == live_birth
+}
+
 /// Exact identity facts for a live process from `proc_pidinfo(PROC_PIDTBSDINFO)`
 /// (public `<libproc.h>` API).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1170,7 +1240,8 @@ fn raw_bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
         libc::proc_pidinfo(
             pid,
             libc::PROC_PIDTBSDINFO,
-            0,
+            // XNU uses a nonzero argument for this flavor to include unreaped zombies.
+            1,
             (&mut info as *mut libc::proc_bsdinfo).cast(),
             size,
         )
@@ -1183,23 +1254,15 @@ fn raw_bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
 pub(super) fn effective_gid(target: &pt_common::ProcessIdentity) -> Option<u32> {
     let pid = target.pid.0;
     let info = raw_bsd_info(pid)?;
-    let boot = target.start_id.0.split_once(':')?.0;
-    if !target.can_safely_revalidate()
-        || info.pbi_uid != target.uid
-        || boot.is_empty()
-        || (target.quality == pt_common::IdentityQuality::NoBootId && boot != "unknown")
-        || info.pbi_start_tvusec >= 1_000_000
-    {
+    let expected_birth = target_birth(target, boot_session_id().as_deref())?;
+    if info.pbi_uid != target.uid || info.pbi_start_tvusec >= 1_000_000 {
         return None;
     }
     let birth = info
         .pbi_start_tvsec
         .checked_mul(1_000_000)?
         .checked_add(info.pbi_start_tvusec)?;
-    // Darwin quick scans use "unknown" for the boot ID, but libproc supplies
-    // the native microsecond birth and owner in the same record as the GID.
-    (birth > 0 && target.start_id == pt_common::StartId::from_macos(boot, birth, pid))
-        .then_some(info.pbi_gid)
+    (birth == expected_birth).then_some(info.pbi_gid)
 }
 
 /// Session facts for `pid` in the shape of a Linux `/proc/<pid>/stat` record.
@@ -1675,6 +1738,151 @@ mod tests {
         assert!(!fence.accepts_reading(1, Some(0)));
         assert!(!fence.accepts_reading(0, Some(499)));
         assert!(!fence.accepts_reading(1, None));
+    }
+
+    #[test]
+    fn boot_session_uuid_requires_the_complete_kernel_string() {
+        let boot = "9d2d4e20-8c2b-4a3a-a8a2-90bcb7a1d86f";
+        assert_eq!(
+            parse_boot_session_id(format!("{}\0", boot.to_uppercase()).as_bytes()).as_deref(),
+            Some(boot)
+        );
+        for invalid in [
+            boot,
+            "",
+            "unknown\0",
+            "00000000-0000-0000-0000-000000000000\0",
+            "9d2d4e208c2b4a3aa8a290bcb7a1d86f\0",
+            "9d2d4e20-8c2b-4a3a-a8a2-90bcb7a1d86f\0\0",
+            "9d2d4e20-8c2b-4a3a-a8a2-90bcb7a1d86X\0",
+        ] {
+            assert_eq!(parse_boot_session_id(invalid.as_bytes()), None);
+        }
+    }
+
+    #[test]
+    fn full_and_legacy_births_have_distinct_boot_requirements() {
+        let boot = "9d2d4e20-8c2b-4a3a-a8a2-90bcb7a1d86f";
+        let other = "22222222-2222-4222-8222-222222222222";
+        let pid = 42;
+        let birth = 1_800_000_000_123_456;
+        let current = StartId::from_macos(boot, birth, pid);
+        let mut target = pt_common::ProcessIdentity::new(pid, current.clone(), 1000);
+        assert_eq!(target_birth(&target, Some(boot)), Some(birth));
+        assert_eq!(target_birth(&target, Some(other)), None);
+        assert_eq!(target_birth(&target, None), None);
+        let legacy = StartId::from_macos("unknown", birth, pid);
+        target.start_id = legacy.clone();
+        assert_eq!(target_birth(&target, Some(boot)), None);
+        target.quality = IdentityQuality::NoBootId;
+        assert_eq!(target_birth(&target, None), Some(birth));
+        assert_eq!(target_birth(&target, Some(boot)), Some(birth));
+        assert!(legacy_birth_matches(&legacy, &current, pid, Some(boot)));
+        assert!(!legacy_birth_matches(&current, &legacy, pid, Some(boot)));
+        assert!(!legacy_birth_matches(&legacy, &current, pid, Some(other)));
+        assert!(!legacy_birth_matches(&legacy, &current, pid, None));
+        assert!(!legacy_birth_matches(&legacy, &current, pid + 1, Some(boot)));
+        for (scope, value, id) in [
+            ("synthetic", birth, pid),
+            ("unknown", 0, pid),
+            ("unknown", birth, pid + 1),
+            ("unknown", birth / 1_000_000, pid),
+        ] {
+            let saved = StartId::from_macos(scope, value, id);
+            assert!(!legacy_birth_matches(&saved, &current, pid, Some(boot)));
+        }
+        target.start_id = current;
+        assert_eq!(target_birth(&target, Some(boot)), None);
+        target.quality = IdentityQuality::PidOnly;
+        assert_eq!(target_birth(&target, Some(boot)), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_scan_and_live_provider_agree_on_the_running_boot() {
+        use crate::action::executor::IdentityProvider;
+        use crate::action::signal::LiveIdentityProvider;
+        let pid = std::process::id();
+        let scan = super::super::quick_scan(&super::super::QuickScanOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .unwrap();
+        let boot = boot_session_id().expect("read native boot UUID");
+        assert_eq!(scan.metadata.boot_id.as_deref(), Some(boot.as_str()));
+        let row = scan.processes.iter().find(|row| row.pid.0 == pid).unwrap();
+        let native = read_bsd_info(pid).unwrap();
+        let mut target = row.identity();
+        let provider = LiveIdentityProvider::new();
+        assert_eq!(target.quality, IdentityQuality::Full);
+        assert_eq!(target.start_id, StartId::from_macos(&boot, native.start_us, pid));
+        assert!(provider.revalidate(&target).unwrap());
+        // SAFETY: getegid observes this test process's own effective group.
+        let group = unsafe { libc::getegid() };
+        assert_eq!(effective_gid(&target), Some(group));
+        assert!(crate::decision::goal_contribution::macos_fd_count(&target).is_some());
+        let mut foreign = uuid::Uuid::parse_str(&boot).unwrap().into_bytes();
+        foreign[0] ^= 1;
+        let foreign = uuid::Uuid::from_bytes(foreign).to_string();
+        target.start_id = StartId::from_macos(&foreign, native.start_us, pid);
+        assert!(!row.matches_saved_identity(&target));
+        assert!(!provider.revalidate(&target).unwrap());
+        assert_eq!(effective_gid(&target), None);
+        assert_eq!(crate::decision::goal_contribution::macos_fd_count(&target), None);
+        target.start_id = StartId::from_macos("unknown", native.start_us, pid);
+        target.quality = IdentityQuality::NoBootId;
+        assert!(row.matches_saved_identity(&target));
+        assert!(provider.revalidate(&target).unwrap());
+        assert_eq!(effective_gid(&target), Some(group));
+        assert!(crate::decision::goal_contribution::macos_fd_count(&target).is_some());
+        target.uid = target.uid.wrapping_add(1);
+        assert!(!row.matches_saved_identity(&target));
+        assert!(!provider.revalidate(&target).unwrap());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unreaped_child_keeps_its_exact_birth_until_wait() {
+        use crate::action::executor::IdentityProvider;
+        use crate::action::signal::{observe_zombie_reaped, LiveIdentityProvider};
+
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = Child(std::process::Command::new("/usr/bin/true").spawn().unwrap());
+        let pid = child.0.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let stat = loop {
+            if let Some(stat) = read_session_stat(pid).filter(|stat| stat.state == 'Z') {
+                break stat;
+            }
+            assert!(std::time::Instant::now() < deadline, "unreaped child was not visible");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        let scan = super::super::quick_scan(&super::super::QuickScanOptions {
+            pids: vec![pid],
+            include_kernel_threads: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let row = scan.processes.iter().find(|row| row.pid.0 == pid).unwrap();
+        let target = row.identity();
+        assert!(row.state.is_zombie());
+        assert_eq!(row.ppid.0, std::process::id());
+        assert_eq!(target.quality, IdentityQuality::Full);
+        assert_eq!(target_birth(&target, scan.metadata.boot_id.as_deref()), Some(stat.starttime));
+        assert_eq!(target.sid, u32::try_from(stat.session).ok());
+        let provider = LiveIdentityProvider::new();
+        assert!(provider.revalidate(&target).unwrap());
+        assert!(!observe_zombie_reaped(&target).unwrap());
+        let mut wrong_session = target.clone();
+        wrong_session.sid = Some(target.sid.unwrap_or(0).wrapping_add(1));
+        assert!(!provider.revalidate(&wrong_session).unwrap());
+        assert!(child.0.wait().unwrap().success());
+        assert!(observe_zombie_reaped(&target).unwrap());
     }
 
     #[cfg(target_os = "macos")]

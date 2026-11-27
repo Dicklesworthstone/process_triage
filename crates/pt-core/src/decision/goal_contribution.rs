@@ -117,11 +117,7 @@ impl GoalResourceSnapshot {
                 if need_fds {
                     let mut unavailable = 0;
                     for process in population {
-                        let identity = ProcessIdentity::new(
-                            process.pid.0,
-                            process.start_id.clone(),
-                            process.uid,
-                        );
+                        let identity = process.identity();
                         match macos_fd_count(&identity) {
                             Some(fd_count) => {
                                 snapshot.processes.insert(
@@ -281,15 +277,13 @@ pub fn macos_fd_count(identity: &ProcessIdentity) -> Option<u64> {
     use std::mem::{size_of, MaybeUninit};
     let pid = identity.pid.0;
     let native_pid = i32::try_from(pid).ok().filter(|&pid| pid > 0)?;
+    let boot = crate::collect::macos::boot_session_id();
+    let birth = crate::collect::macos::target_birth(identity, boot.as_deref())?;
     let same_process = || {
-        crate::collect::macos::read_bsd_info(pid).is_some_and(|info| {
-            info.uid == identity.uid
-                && info.start_us != 0
-                && pt_common::StartId::from_macos("unknown", info.start_us, pid)
-                    == identity.start_id
-        })
+        crate::collect::macos::read_bsd_info(pid)
+            .is_some_and(|info| info.uid == identity.uid && info.start_us == birth)
     };
-    if !identity.can_safely_revalidate() || !same_process() {
+    if !same_process() {
         return None;
     }
     let entry_size = size_of::<libc::proc_fdinfo>();

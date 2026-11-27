@@ -600,7 +600,7 @@ fn detect_platform() -> String {
     }
 }
 
-/// Read boot ID from /proc/sys/kernel/random/boot_id (Linux only).
+/// Read the running kernel’s boot session identity, when available.
 fn read_boot_id() -> Option<String> {
     #[cfg(target_os = "linux")]
     {
@@ -608,7 +608,11 @@ fn read_boot_id() -> Option<String> {
             .ok()
             .map(|s| s.trim().to_string())
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        super::macos::boot_session_id()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         None
     }

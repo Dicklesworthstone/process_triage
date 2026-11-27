@@ -1292,7 +1292,7 @@ fn find_respawn_candidate_with_birth_order<'a>(
             process.uid == action.target.uid
                 && process.ppid.0 == parent_pid
                 && !process.state.is_zombie()
-                && process.start_id != action.target.start_id
+                && !process.matches_saved_identity(&action.target)
                 && normalize_cmd(&process.cmd) == command
                 && execution_birth_order(process, executed, executed_at) == Some(required_order)
         })
@@ -1327,7 +1327,7 @@ fn observed_respawn_parent<'a>(
     if parents.next().is_some() {
         return Err("the current snapshot contains ambiguous parent observations");
     }
-    if parent.uid != identity.uid || parent.start_id != identity.start_id {
+    if !parent.matches_saved_identity(identity) {
         return Err("the current parent PID has a different birth identity or owner");
     }
     if matches!(
@@ -1561,10 +1561,7 @@ pub fn verify_plan_with_postconditions(
         } else if let Some((possible, reason)) = unverified_lineage {
             let target_observation = match current_target {
                 None => "The executed target is absent from the current snapshot".to_string(),
-                Some(process)
-                    if process.start_id != action.target.start_id
-                        || process.uid != action.target.uid =>
-                {
+                Some(process) if !process.matches_saved_identity(&action.target) => {
                     "The executed target's PID now belongs to a different incarnation".to_string()
                 }
                 Some(process) if process.state.is_zombie() => {
@@ -1649,8 +1646,7 @@ pub fn verify_plan_with_postconditions(
                     | Action::CapMemory
                     | Action::Quarantine,
                     Some(process),
-                ) if process.start_id != action.target.start_id
-                    || process.uid != action.target.uid =>
+                ) if !process.matches_saved_identity(&action.target) =>
                 {
                     (VerifyOutcome::PidReused, "pid_reused", None)
                 }

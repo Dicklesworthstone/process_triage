@@ -107,16 +107,15 @@ fn observe_signal_target(
 ) -> Result<SignalObservation, ActionError> {
     signal_syscall_target(target.pid.0, false)?;
     ensure_action_pid_namespace()?;
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     let (expected_boot, expected_start, expected_pid) = parse_start_id(&target.start_id.0);
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     let expected_start = expected_start
         .filter(|_| target.can_safely_revalidate())
         .filter(|_| expected_pid.is_none_or(|pid| pid == target.pid.0))
         .filter(|_| {
             target.quality != pt_common::IdentityQuality::Full
-                || (expected_pid.is_some()
-                    && (!cfg!(target_os = "linux") || expected_boot.is_some()))
+                || (expected_pid.is_some() && expected_boot.is_some())
         })
         .ok_or(ActionError::IdentityMismatch)?;
 
@@ -164,7 +163,9 @@ fn observe_signal_target(
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = expected_boot;
+        let boot = crate::collect::macos::boot_session_id();
+        let expected_start = crate::collect::macos::target_birth(target, boot.as_deref())
+            .ok_or(ActionError::IdentityMismatch)?;
         let Some(before) = crate::collect::macos::read_bsd_info(target.pid.0) else {
             return signal_observation_unavailable(target.pid.0, "cannot read native identity");
         };
@@ -1958,7 +1959,7 @@ impl Drop for PidFd {
 }
 
 /// Values of a `boot_id:start_ticks:pid` start id that are known (not placeholders).
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", test))]
 fn parse_start_id(id: &str) -> (Option<&str>, Option<u64>, Option<u32>) {
     let parts: Vec<&str> = id.split(':').collect();
     let known = |s: &str| !s.is_empty() && !matches!(s, "unknown" | "synthetic");

@@ -530,13 +530,22 @@ mod process_priority {
             let stat = crate::collect::macos::read_session_stat(pid).ok_or_else(|| {
                 ActionError::Failed("cannot capture native process context".into())
             })?;
+            let boot = crate::collect::macos::boot_session_id();
             let target = ProcessIdentity::full(
                 pid,
-                pt_common::StartId::from_macos("unknown", before.start_us, pid),
+                pt_common::StartId::from_macos(
+                    boot.as_deref().unwrap_or("unknown"),
+                    before.start_us,
+                    pid,
+                ),
                 before.uid,
                 Some(u32::try_from(stat.pgrp).map_err(|_| ActionError::IdentityMismatch)?),
                 Some(u32::try_from(stat.session).map_err(|_| ActionError::IdentityMismatch)?),
-                pt_common::IdentityQuality::NoBootId,
+                if boot.is_some() {
+                    pt_common::IdentityQuality::Full
+                } else {
+                    pt_common::IdentityQuality::NoBootId
+                },
             );
             if stat.starttime != before.start_us {
                 return Err(ActionError::IdentityMismatch);
