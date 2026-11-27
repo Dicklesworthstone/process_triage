@@ -4295,9 +4295,10 @@ fn process_policy_candidate(
     // of this incarnation, never from the earlier plan or a partial FD parser.
     let descriptors = if matches!(action, Action::Kill | Action::Restart) {
         Some(
-            pt_core::action::prechecks::descriptor_safety_evidence(&process_identity_from_record(
-                proc,
-            ))
+            pt_core::action::prechecks::descriptor_policy_evidence(
+                &process_identity_from_record(proc),
+                enforcer.requires_lock_evidence(),
+            )
             .map_err(|error| format!("descriptor safety evidence unavailable: {error}"))?,
         )
     } else {
@@ -4315,7 +4316,7 @@ fn process_policy_candidate(
         memory_mb: Some(proc.rss_bytes as f64 / (1024.0 * 1024.0)),
         has_known_signature: false,
         open_write_fds: descriptors.as_ref().map(|evidence| evidence.open_write_fds),
-        has_locked_files: None,
+        has_locked_files: descriptors.as_ref().and_then(|evidence| evidence.has_locked_files),
         has_active_tty: Some(proc.has_tty()),
         seconds_since_io: None,
         cwd_deleted: None,
@@ -28562,10 +28563,18 @@ mod process_tree_safety_tests {
                 let _ = self.0.wait();
             }
         }
+        #[cfg(target_os = "linux")]
+        let lock_file = tempfile::NamedTempFile::new().unwrap();
+        #[cfg(target_os = "linux")]
+        let lock_handle = std::fs::File::open(lock_file.path()).unwrap();
+        #[cfg(target_os = "linux")]
+        let stdin = std::process::Stdio::from(lock_handle.try_clone().unwrap());
+        #[cfg(not(target_os = "linux"))]
+        let stdin = std::process::Stdio::null();
         let child = OwnedChild(
             std::process::Command::new("sleep")
                 .arg("600")
-                .stdin(std::process::Stdio::null())
+                .stdin(stdin)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
@@ -28655,6 +28664,43 @@ mod process_tree_safety_tests {
                     _ => unreachable!(),
                 };
                 assert!(reason.contains(expected), "{case}: {reason}");
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            use pt_core::decision::Action;
+            use std::os::fd::AsRawFd;
+            // The child's read-only descriptor shares our file description.
+            // There are no writable FDs or critical filenames to trigger a refusal.
+            // SAFETY: flock operates only on the retained temporary file.
+            assert_eq!(unsafe { libc::flock(lock_handle.as_raw_fd(), libc::LOCK_SH) }, 0);
+            for enabled in [true, false] {
+                let mut policy = base_policy.clone();
+                policy.data_loss_gates.block_if_locked_files = enabled;
+                let filter = super::ProtectedFilter::from_guardrails(&policy.guardrails).unwrap();
+                let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
+                let target = super::process_policy_candidate(&enforcer, &base_parent, Action::Kill)
+                    .unwrap();
+                assert_eq!(target.open_write_fds, Some(0));
+                assert_eq!(target.has_locked_files, enabled.then_some(true));
+                let refusal = super::planned_zombie_parent_refusal(
+                    &base_parent,
+                    &super::PlanningProtection {
+                        filter: &filter,
+                        population: std::slice::from_ref(&base_parent),
+                    },
+                    &enforcer,
+                    &policy,
+                    &signatures,
+                    &posterior,
+                    true,
+                );
+                if enabled {
+                    assert!(refusal.unwrap().contains("block_if_locked_files"));
+                } else {
+                    assert!(refusal.is_none(), "{refusal:?}");
+                }
             }
         }
     }
@@ -36328,12 +36374,19 @@ fn candidate_recommendation(
                 // Preserve the parent's infrastructure/group evidence ordering;
                 // a dead source's empty or unreadable table proves nothing about it.
                 process_policy_candidate(enforcer, subject, evidence_action)
-                    .map(|target| (target.open_write_fds, target.critical_files))
+                    .map(|target| (target.open_write_fds, target.has_locked_files, target.critical_files))
             } else {
-                pt_core::action::prechecks::descriptor_safety_evidence(
+                pt_core::action::prechecks::descriptor_policy_evidence(
                     &process_identity_from_record(subject),
+                    enforcer.requires_lock_evidence(),
                 )
-                .map(|evidence| (Some(evidence.open_write_fds), evidence.critical_writes))
+                .map(|evidence| {
+                    (
+                        Some(evidence.open_write_fds),
+                        evidence.has_locked_files,
+                        evidence.critical_writes,
+                    )
+                })
             };
             match evidence {
                 Ok(evidence) => Some(evidence),
@@ -36347,7 +36400,8 @@ fn candidate_recommendation(
     } else {
         None
     };
-    let (open_write_fds, critical_files) = descriptor_evidence.unwrap_or_default();
+    let (open_write_fds, has_locked_files, critical_files) =
+        descriptor_evidence.unwrap_or_default();
     #[cfg(target_os = "linux")]
     let provenance = score.provenance.as_ref();
 
@@ -36370,7 +36424,7 @@ fn candidate_recommendation(
         memory_mb: Some(proc.rss_bytes as f64 / (1024.0 * 1024.0)),
         has_known_signature: score.signature.is_some(),
         open_write_fds,
-        has_locked_files: None,
+        has_locked_files,
         has_active_tty: Some(proc.has_tty()),
         seconds_since_io: None,
         cwd_deleted: None,

@@ -1160,12 +1160,7 @@ fn lsof_lock_evidence(
             if !seen_file {
                 return Err(format!("lsof lock without descriptor for pid {pid}"));
             }
-            match lock {
-                "" | " " => {}
-                // Lower-case fields denote partial-file or read/write locks.
-                "r" | "R" | "w" | "W" | "u" | "U" | "N" | "x" | "X" => found = true,
-                _ => return Err(format!("unknown lsof lock state for pid {pid}: {lock}")),
-            }
+            found |= lsof_field_is_locked(pid, lock)?;
         } else {
             return Err(format!("invalid lsof field for pid {pid}"));
         }
@@ -1178,11 +1173,22 @@ fn lsof_lock_evidence(
     Ok(found)
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn lsof_field_is_locked(pid: u32, lock: &str) -> Result<bool, String> {
+    match lock {
+        "" | " " => Ok(false),
+        // Lower-case fields denote partial-file or read/write locks.
+        "r" | "R" | "w" | "W" | "u" | "U" | "N" | "x" | "X" => Ok(true),
+        _ => Err(format!("unknown lsof lock state for pid {pid}: {lock}")),
+    }
+}
+
 /// Keep the safety query separate from the best-effort inventory collector.
 /// `+w` enables warnings, and `0` keeps field contents separate from records.
 #[cfg(any(target_os = "macos", test))]
-fn lsof_write_fd_args(pid: &str) -> [&str; 7] {
-    ["+w", "-n", "-P", "-p", pid, "-F", "0pftna"]
+fn lsof_write_fd_args(pid: &str, inspect_locks: bool) -> [&str; 7] {
+    let fields = if inspect_locks { "0pftnal" } else { "0pftna" };
+    ["+w", "-n", "-P", "-p", pid, "-F", fields]
 }
 
 /// Read one complete lsof field set: NUL-terminated fields followed by a newline.
@@ -1214,6 +1220,8 @@ fn take_lsof_field_set<'a>(remaining: &mut &'a str) -> Result<Vec<&'a str>, Stri
 #[derive(Debug, Clone, Default)]
 pub struct DescriptorSafetyEvidence {
     pub open_write_fds: u32,
+    /// Present only when a complete lock inspection was requested.
+    pub has_locked_files: Option<bool>,
     pub critical_writes: Vec<crate::collect::CriticalFile>,
 }
 
@@ -1223,6 +1231,7 @@ pub struct DescriptorSafetyEvidence {
 #[cfg(any(target_os = "macos", test))]
 fn lsof_descriptor_safety_evidence(
     pid: u32,
+    inspect_locks: bool,
     output: Result<crate::collect::tool_runner::ToolOutput, crate::collect::tool_runner::ToolError>,
 ) -> Result<DescriptorSafetyEvidence, String> {
     let output = output.map_err(|error| format!("lsof for pid {pid}: {error}"))?;
@@ -1250,7 +1259,10 @@ fn lsof_descriptor_safety_evidence(
     }
 
     let mut descriptors = HashSet::new();
-    let mut evidence = DescriptorSafetyEvidence::default();
+    let mut evidence = DescriptorSafetyEvidence {
+        has_locked_files: inspect_locks.then_some(false),
+        ..Default::default()
+    };
     while !remaining.is_empty() {
         let fields = take_lsof_field_set(&mut remaining)?;
         let fd = fields[0]
@@ -1277,6 +1289,7 @@ fn lsof_descriptor_safety_evidence(
         let mut file_type = None;
         let mut access = None;
         let mut name = None;
+        let mut lock_seen = false;
         for field in &fields[1..] {
             if let Some(value) = field.strip_prefix('t') {
                 if file_type.replace(value).is_some() || value.is_empty() {
@@ -1294,6 +1307,14 @@ fn lsof_descriptor_safety_evidence(
             } else if let Some(value) = field.strip_prefix('n') {
                 if name.replace(value).is_some() {
                     return Err(format!("duplicate lsof descriptor name for pid {pid}"));
+                }
+            } else if let Some(lock) = field.strip_prefix('l') {
+                if !inspect_locks || lock_seen {
+                    return Err(format!("unexpected or duplicate lsof lock field for pid {pid}"));
+                }
+                lock_seen = true;
+                if lsof_field_is_locked(pid, lock)? {
+                    evidence.has_locked_files = Some(true);
                 }
             } else {
                 return Err(format!("unexpected lsof descriptor field for pid {pid}"));
@@ -1355,7 +1376,7 @@ fn lsof_write_fd_evidence(
     pid: u32,
     output: Result<crate::collect::tool_runner::ToolOutput, crate::collect::tool_runner::ToolError>,
 ) -> Result<u32, String> {
-    lsof_descriptor_safety_evidence(pid, output).map(|evidence| evidence.open_write_fds)
+    lsof_descriptor_safety_evidence(pid, false, output).map(|evidence| evidence.open_write_fds)
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -1705,20 +1726,40 @@ fn descriptor_safety_from_metadata(
 }
 
 #[cfg(target_os = "linux")]
-fn descriptor_safety_with_probe<F>(pid: u32, probe: F) -> Option<DescriptorSafetyEvidence>
+fn descriptor_safety_with_probe<F>(
+    pid: u32,
+    inspect_locks: bool,
+    probe: F,
+) -> Option<DescriptorSafetyEvidence>
 where
     F: FnOnce(&[String], Duration) -> Option<crate::collect::tool_runner::ToolOutput>,
 {
     let deadline = Instant::now().checked_add(WRITE_FD_INSPECTION_TIMEOUT)?;
     let birth = read_io_birth(pid).ok()?;
     let before = write_fd_snapshot(pid, deadline)?;
+    // The task walk already captured every descriptor's fdinfo, including
+    // read-only and unshared tables. The system lock table also records POSIX
+    // locks and blocked waiters. Require both before reporting a clear result.
+    let has_locked_files = if inspect_locks {
+        let table = read_bounded_lock_table(
+            std::path::Path::new("/proc/locks"),
+            deadline,
+            MAX_LOCK_TABLE_BYTES,
+        )
+        .ok()?;
+        let owned = proc_locks_mentions_target(&table, |owner| before.tasks.contains_key(&owner))
+            .ok()?;
+        Some(owned || before.descriptors.values().any(|fd| fd.has_lock))
+    } else {
+        None
+    };
     let requested: std::collections::BTreeMap<_, _> = before
         .descriptors
         .iter()
         .filter(|(_, observation)| observation.writable())
         .map(|(path, observation)| (path.clone(), observation))
         .collect();
-    let evidence = if requested.is_empty() {
+    let mut evidence = if requested.is_empty() {
         DescriptorSafetyEvidence::default()
     } else {
         let remaining = deadline.checked_duration_since(Instant::now())?;
@@ -1731,6 +1772,7 @@ where
     if before != write_fd_snapshot(pid, deadline)? || read_io_birth(pid).ok()? != birth {
         return None;
     }
+    evidence.has_locked_files = has_locked_files;
     (Instant::now() < deadline).then_some(evidence)
 }
 
@@ -1747,7 +1789,7 @@ fn open_write_fd_count_with_probe<F>(pid: u32, probe: F) -> Option<u32>
 where
     F: FnOnce(&[String], Duration) -> Option<crate::collect::tool_runner::ToolOutput>,
 {
-    descriptor_safety_with_probe(pid, probe).map(|evidence| evidence.open_write_fds)
+    descriptor_safety_with_probe(pid, false, probe).map(|evidence| evidence.open_write_fds)
 }
 
 #[cfg(target_os = "linux")]
@@ -1768,7 +1810,7 @@ fn write_fd_probe_runner(remaining: Duration) -> crate::collect::tool_runner::To
 /// not prove shared ownership. `None` means incomplete, changing or over-budget
 /// evidence; only a complete zero proves there are no persistent writers.
 pub fn open_write_fd_count(pid: u32) -> Option<u32> {
-    collect_descriptor_safety_evidence(pid)
+    collect_descriptor_safety_evidence(pid, false)
         .ok()
         .map(|evidence| evidence.open_write_fds)
 }
@@ -1779,6 +1821,15 @@ pub fn open_write_fd_count(pid: u32) -> Option<u32> {
 /// never an empty set of critical files.
 pub fn descriptor_safety_evidence(
     target: &pt_common::ProcessIdentity,
+) -> Result<DescriptorSafetyEvidence, String> {
+    descriptor_policy_evidence(target, false)
+}
+
+/// Collect file-policy facts for the same verified process incarnation. With
+/// the lock gate enabled, unavailable lock evidence also refuses the result.
+pub fn descriptor_policy_evidence(
+    target: &pt_common::ProcessIdentity,
+    inspect_locks: bool,
 ) -> Result<DescriptorSafetyEvidence, String> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
@@ -1792,12 +1843,12 @@ pub fn descriptor_safety_evidence(
                     .revalidate(target)
                     .map_err(|error| error.to_string())
             },
-            || collect_descriptor_safety_evidence(target.pid.0),
+            || collect_descriptor_safety_evidence(target.pid.0, inspect_locks),
         )
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = target;
+        let _ = (target, inspect_locks);
         Err("complete descriptor safety evidence is unsupported on this platform".to_string())
     }
 }
@@ -1821,11 +1872,14 @@ fn descriptor_safety_for_identity(
     Ok(evidence)
 }
 
-fn collect_descriptor_safety_evidence(pid: u32) -> Result<DescriptorSafetyEvidence, String> {
+fn collect_descriptor_safety_evidence(
+    pid: u32,
+    inspect_locks: bool,
+) -> Result<DescriptorSafetyEvidence, String> {
     #[cfg(target_os = "linux")]
     {
         use crate::collect::tool_runner::ToolSpec;
-        descriptor_safety_with_probe(pid, |paths, remaining| {
+        descriptor_safety_with_probe(pid, inspect_locks, |paths, remaining| {
             let mut args = vec![
                 "-L".to_string(),
                 "-c".to_string(),
@@ -1839,7 +1893,7 @@ fn collect_descriptor_safety_evidence(pid: u32) -> Result<DescriptorSafetyEviden
         })
         .ok_or_else(|| {
             format!(
-                "cannot establish complete data-loss evidence for pid {pid}: descriptor tables, access modes, file metadata or process identity are unavailable, changed or over budget"
+                "cannot establish complete data-loss evidence for pid {pid}: descriptor tables, access modes, file metadata, required lock evidence or process identity are unavailable, changed or over budget"
             )
         })
     }
@@ -1849,9 +1903,10 @@ fn collect_descriptor_safety_evidence(pid: u32) -> Result<DescriptorSafetyEviden
             .ok_or_else(|| format!("cannot read descriptor owner identity for pid {pid}"))?;
         let evidence = lsof_descriptor_safety_evidence(
             pid,
+            inspect_locks,
             crate::collect::tool_runner::run_tool(
                 crate::collect::macos::lsof_path(),
-                &lsof_write_fd_args(&pid.to_string()),
+                &lsof_write_fd_args(&pid.to_string(), inspect_locks),
                 Some(Duration::from_secs(5)),
                 None,
             ),
@@ -1865,7 +1920,7 @@ fn collect_descriptor_safety_evidence(pid: u32) -> Result<DescriptorSafetyEviden
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = pid;
+        let _ = (pid, inspect_locks);
         Err("complete descriptor safety evidence is unsupported on this platform".to_string())
     }
 }
@@ -3415,7 +3470,7 @@ impl PreCheckProvider for LivePreCheckProvider {
         // writable-file policy is disabled or allows some ordinary writers.
         // The same complete observation supplies both rules. Preserve specific
         // configured-gate diagnostics when independent evidence also refuses.
-        let descriptors = collect_descriptor_safety_evidence(pid);
+        let descriptors = collect_descriptor_safety_evidence(pid, false);
         if let Ok(evidence) = &descriptors {
             if let Some(critical) = evidence
                 .critical_writes
@@ -4792,6 +4847,7 @@ mod tests {
             || {
                 Ok(DescriptorSafetyEvidence {
                     open_write_fds: 2,
+                    has_locked_files: None,
                     critical_writes: vec![crate::collect::proc_parsers::detect_critical_file(
                         3,
                         "/work/.git/index.lock",
@@ -4816,7 +4872,7 @@ mod tests {
             "f6\0au\0tREG\0n/work/state.sqlite\0\n",
             "f7\0aw\0tCHR\0n/dev/transaction-wal\0\n",
         );
-        let observed = lsof_descriptor_safety_evidence(42, Ok(lsof_output(content))).unwrap();
+        let observed = lsof_descriptor_safety_evidence(42, false, Ok(lsof_output(content))).unwrap();
         assert_eq!(observed.open_write_fds, 2);
         assert_eq!(observed.critical_writes.len(), 2);
         assert_eq!(observed.critical_writes[0].fd, 3);
@@ -4831,7 +4887,21 @@ mod tests {
             crate::collect::DetectionStrength::Soft
         );
         let partial = format!("{content}f8\0aw\0tREG\0n/work/incomplete");
-        assert!(lsof_descriptor_safety_evidence(42, Ok(lsof_output(&partial))).is_err());
+        assert!(lsof_descriptor_safety_evidence(42, false, Ok(lsof_output(&partial))).is_err());
+    }
+
+    #[test]
+    fn lsof_lock_policy_observes_read_locks_and_rejects_invalid_lock_fields() {
+        let fields = |lock: &str| format!("p42\0\nf3\0ar\0tREG\0n/file\0{lock}\n");
+        for (lock, expected) in [("", false), ("l \0", false), ("lR\0", true)] {
+            let observed = lsof_descriptor_safety_evidence(42, true, Ok(lsof_output(&fields(lock))))
+                .unwrap();
+            assert_eq!(observed.has_locked_files, Some(expected));
+            assert_eq!(observed.open_write_fds, 0);
+        }
+        for lock in ["l?\0", "lR\0l \0"] {
+            assert!(lsof_descriptor_safety_evidence(42, true, Ok(lsof_output(&fields(lock)))).is_err());
+        }
     }
 
     #[test]
@@ -5025,7 +5095,7 @@ mod tests {
             let command = "lsof";
             let output = crate::collect::tool_runner::run_tool(
                 command,
-                &lsof_write_fd_args(&pid.to_string()),
+                &lsof_write_fd_args(&pid.to_string(), false),
                 Some(Duration::from_secs(5)),
                 None,
             );

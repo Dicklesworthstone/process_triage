@@ -532,6 +532,14 @@ impl PolicyEnforcer {
                 .is_some_and(|policy| policy.requires_group_evidence())
     }
 
+    pub fn requires_lock_evidence(&self) -> bool {
+        self.data_loss_gates.block_if_locked_files
+            || self
+                .recorded_policy
+                .as_ref()
+                .is_some_and(|policy| policy.requires_lock_evidence())
+    }
+
     pub fn requires_builtin_placement(&self) -> bool {
         self.builtin_protection
             || self
@@ -1571,16 +1579,19 @@ mod tests {
     }
 
     #[test]
-    fn recorded_policy_requests_removed_group_and_builtin_evidence() {
+    fn recorded_policy_requests_removed_group_lock_and_builtin_evidence() {
         let mut current = test_policy();
         current.guardrails.builtin_protection = false;
         current.robot_mode.enabled = true;
+        current.data_loss_gates.block_if_locked_files = false;
         let mut recorded = current.clone();
+        recorded.data_loss_gates.block_if_locked_files = true;
         recorded.guardrails.builtin_protection = true;
         recorded.guardrails.protected_groups = vec!["testgroup".to_string()];
         let enforcer =
             PolicyEnforcer::new_with_recorded_policy(&current, Some(&recorded), None).unwrap();
         assert!(enforcer.requires_group_evidence());
+        assert!(enforcer.requires_lock_evidence());
         assert!(enforcer.requires_builtin_placement());
         let candidate = test_candidate();
         assert!(
