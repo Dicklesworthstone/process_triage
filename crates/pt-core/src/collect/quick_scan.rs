@@ -266,6 +266,26 @@ fn omit_owned_collector(
     }
 }
 
+#[cfg(target_os = "linux")]
+mod linux_birth;
+
+fn scan_birth_check(pids: &[u32]) -> impl Fn(u32, u64) -> bool {
+    #[cfg(target_os = "linux")]
+    let fence = linux_birth::LinuxBirthFence::capture(pids, clock_ticks_per_second());
+    #[cfg(target_os = "macos")]
+    let fence = super::macos::MacosScanBirthFence::capture(pids);
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        move |pid, birth| fence.accepts(pid, birth)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pids;
+        |_, _| false
+    }
+}
+
 /// Perform a quick scan of running processes.
 ///
 /// Uses the ps command with a custom format string to collect process
@@ -298,6 +318,8 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
     // Build ps command
     let mut cmd = build_ps_command(&platform, options)?;
 
+    // Establish the identity boundary before ps can observe any rows.
+    let confirms_birth = scan_birth_check(&options.pids);
     // Execute and capture output
     let child = cmd
         .stdout(Stdio::piped())
@@ -305,7 +327,7 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
         .spawn()
         .map_err(|e| QuickScanError::CommandFailed(e.to_string()))?;
 
-    scan_ps_child(child, options, &platform, &boot_id, start)
+    scan_ps_child(child, options, &platform, &boot_id, start, &confirms_birth)
 }
 
 /// The actual collector lifecycle, separated from command construction so tests
@@ -316,6 +338,7 @@ fn scan_ps_child(
     platform: &str,
     boot_id: &Option<String>,
     start: Instant,
+    confirms_birth: &dyn Fn(u32, u64) -> bool,
 ) -> Result<ScanResult, QuickScanError> {
     let pid = child.id();
     let collector_pid = collector_pid_for_scan(platform, pid);
@@ -366,7 +389,14 @@ fn scan_ps_child(
             }
         }
 
-        match parse_ps_line_with_timing(line, platform, boot_id, None, clock.as_ref()) {
+        match parse_ps_line_with_timing(
+            line,
+            platform,
+            boot_id,
+            None,
+            clock.as_ref(),
+            confirms_birth,
+        ) {
             Ok(record) => {
                 if !requested_pids.is_empty() {
                     if !requested_pids.contains(&record.pid.0) {
@@ -656,7 +686,14 @@ fn parse_ps_line(
     } else {
         None
     };
-    parse_ps_line_with_timing(line, platform, boot_id, None, clock.as_ref())
+    parse_ps_line_with_timing(
+        line,
+        platform,
+        boot_id,
+        None,
+        clock.as_ref(),
+        &scan_birth_check(&[]),
+    )
 }
 
 /// Parse a single line of ps output like `parse_ps_line`, but with deterministic
@@ -667,7 +704,7 @@ fn parse_ps_line_synthetic(
     boot_id: &Option<String>,
     now_unix: i64,
 ) -> Result<ProcessRecord, String> {
-    parse_ps_line_with_timing(line, platform, boot_id, Some(now_unix), None)
+    parse_ps_line_with_timing(line, platform, boot_id, Some(now_unix), None, &|_, _| false)
 }
 
 fn parse_ps_line_with_timing(
@@ -676,37 +713,37 @@ fn parse_ps_line_with_timing(
     boot_id: &Option<String>,
     synthetic_now_unix: Option<i64>,
     clock: Option<&LinuxClock>,
+    confirms_birth: &dyn Fn(u32, u64) -> bool,
 ) -> Result<ProcessRecord, String> {
     let parsed = parse_ps_fields(line, platform)?;
 
     // On Linux, prefer the kernel's exact start time over `ps etimes`.
     let exact = match (synthetic_now_unix, clock) {
-        (None, Some(clock)) => linux_exact_timing(parsed.pid, clock),
+        (None, Some(clock)) => linux_exact_timing(parsed.pid, clock)
+            .filter(|timing| confirms_birth(parsed.pid, timing.start_ticks)),
         _ => None,
     };
 
     // On macOS, the exact start time (microseconds) from proc_pidinfo; the action layer
     // revalidates identity against the same value before signaling.
     #[cfg(target_os = "macos")]
-    let mac_start_us = match synthetic_now_unix {
-        None => crate::collect::macos::read_bsd_info(parsed.pid).map(|info| info.start_us),
-        Some(_) => None,
-    };
-    #[cfg(not(target_os = "macos"))]
-    let mac_start_us: Option<u64> = None;
-
-    #[cfg(target_os = "macos")]
-    let sid = if platform == "macos" && synthetic_now_unix.is_none() {
-        mac_start_us.and_then(|start_us| {
+    let (mac_start_us, sid) = if platform == "macos" && synthetic_now_unix.is_none() {
+        let birth = crate::collect::macos::read_bsd_info(parsed.pid).map(|info| info.start_us);
+        let sid = birth.and_then(|start| {
             crate::collect::macos::read_session_stat(parsed.pid)
-                .filter(|native| native.starttime == start_us)
+                .filter(|native| native.starttime == start)
                 .and_then(|native| u32::try_from(native.session).ok())
-        })
+        });
+        // The final fence read follows both the BSD identity and session reads.
+        match birth.filter(|start| confirms_birth(parsed.pid, *start)) {
+            Some(start) => (Some(start), sid),
+            None => (None, None),
+        }
     } else {
-        parsed.sid
+        (None, parsed.sid)
     };
     #[cfg(not(target_os = "macos"))]
-    let sid = parsed.sid;
+    let (mac_start_us, sid): (Option<u64>, _) = (None, parsed.sid);
 
     let (start_time_unix, elapsed, start_id) = if let Some(exact) = exact {
         let boot = boot_id.as_deref().unwrap_or("unknown");
@@ -1429,6 +1466,7 @@ mod tests {
             &detect_platform(),
             &read_boot_id(),
             start,
+            &|_, _| false,
         );
         assert!(matches!(result, Err(QuickScanError::Timeout(_))));
         assert!(start.elapsed() < Duration::from_secs(2));
@@ -1502,6 +1540,7 @@ mod tests {
                 &detect_platform(),
                 &read_boot_id(),
                 start,
+                &|_, _| false,
             );
             assert!(
                 matches!(result, Err(QuickScanError::Timeout(_))),
@@ -1580,6 +1619,7 @@ mod tests {
             &detect_platform(),
             &read_boot_id(),
             start,
+            &|_, _| false,
         );
         assert!(matches!(result, Err(QuickScanError::Timeout(_))));
         assert!(start.elapsed() < Duration::from_secs(2));
@@ -1604,6 +1644,7 @@ mod tests {
             &detect_platform(),
             &read_boot_id(),
             Instant::now(),
+            &|_, _| false,
         );
         assert!(matches!(
             result,
@@ -1625,6 +1666,7 @@ mod tests {
             &detect_platform(),
             &read_boot_id(),
             Instant::now(),
+            &|_, _| false,
         );
         assert!(matches!(
             result,
@@ -1885,8 +1927,15 @@ mod tests {
             uptime: 2_323_130.0,
             boot_time: 1_788_000_000,
         };
-        let rec = parse_ps_line_with_timing(line, "linux", &Some("b".into()), None, Some(&clock))
-            .expect("parse");
+        let rec = parse_ps_line_with_timing(
+            line,
+            "linux",
+            &Some("b".into()),
+            None,
+            Some(&clock),
+            &|_, _| false,
+        )
+        .expect("parse");
         assert_eq!(rec.elapsed, Duration::ZERO);
     }
 
@@ -1900,8 +1949,15 @@ mod tests {
             boot_time: 1_788_000_000,
         };
         let observe = || {
-            parse_ps_line_with_timing(line, "linux", &Some("real-boot".into()), None, Some(&clock))
-                .unwrap()
+            parse_ps_line_with_timing(
+                line,
+                "linux",
+                &Some("real-boot".into()),
+                None,
+                Some(&clock),
+                &|_, _| false,
+            )
+            .unwrap()
         };
         let first = observe();
         assert_eq!(first.elapsed, Duration::from_secs(3600));
@@ -1912,6 +1968,39 @@ mod tests {
         let target = pt_common::ProcessIdentity::new(first.pid.0, first.start_id, first.uid);
         assert_eq!(target.quality, pt_common::IdentityQuality::PidOnly);
         assert!(!target.can_safely_revalidate());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn later_native_birth_cannot_promote_a_ps_row_for_that_pid() {
+        let pid = std::process::id();
+        let line = format!("{pid} 1 1000 user {pid} {pid} S 0.0 1 2 ? Tue Jan 14 10:30:00 2026 0 old-worker old-worker job");
+        let boot = read_boot_id();
+        let clock = LinuxClock::read().unwrap();
+        let native = super::super::proc_parsers::read_required_proc_stat(pid)
+            .unwrap()
+            .starttime;
+        let calls = std::cell::Cell::new(0);
+        let result = parse_ps_line_with_timing(
+            &line,
+            "linux",
+            &boot,
+            None,
+            Some(&clock),
+            &|observed_pid, birth| {
+                assert_eq!((observed_pid, birth), (pid, native));
+                calls.set(calls.get() + 1);
+                false
+            },
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(result.comm, "old-worker");
+        assert_eq!(result.elapsed, Duration::ZERO);
+        assert!(StartId::is_unverified_observation_for(
+            &result.start_id.0,
+            pid
+        ));
     }
 
     #[test]

@@ -1104,6 +1104,51 @@ pub fn collect_environ(pid: u32) -> Option<HashMap<String, String>> {
     }
 }
 
+/// Capture this boundary before spawning ps. XNU initializes ps_start with
+/// microtime_with_abstime at fork and exports it as ri_proc_start_abstime
+/// through proc_pid_rusage. Both observations use the Mach absolute clock,
+/// independently of calendar-clock adjustments between ps and libproc reads.
+#[derive(Clone, Copy)]
+pub(crate) struct MacosScanBirthFence(u64);
+
+impl MacosScanBirthFence {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn capture(_pids: &[u32]) -> Self {
+        // libSystem exports this clock in <mach/mach_time.h>. Its native
+        // ticks can be compared directly with ri_proc_start_abstime.
+        unsafe extern "C" {
+            fn mach_absolute_time() -> u64;
+        }
+        // SAFETY: mach_absolute_time reads a clock and takes no arguments.
+        Self(unsafe { mach_absolute_time() })
+    }
+
+    fn accepts_reading(&self, calendar_birth_us: u64, absolute_birth: Option<u64>) -> bool {
+        calendar_birth_us != 0 && absolute_birth.is_some_and(|ticks| ticks > 0 && ticks < self.0)
+    }
+
+    /// Call after reading BSD identity and session data. A replacement that
+    /// supplied any of these fields also has a new absolute birth, so it cannot
+    /// be attached to an earlier ps row. Missing accounting leaves identity unknown.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn accepts(&self, pid: u32, calendar_birth_us: u64) -> bool {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        let mut usage = std::mem::MaybeUninit::<libc::rusage_info_v0>::zeroed();
+        // SAFETY: libproc's V0 flavor writes one rusage_info_v0 into this buffer.
+        // The C API types the output parameter as rusage_info_t *, an opaque pointer.
+        let status = unsafe {
+            libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V0, usage.as_mut_ptr().cast())
+        };
+        let absolute_birth = (status == 0).then(|| {
+            // SAFETY: the buffer was zeroed and the syscall reported success.
+            unsafe { usage.assume_init() }.ri_proc_start_abstime
+        });
+        self.accepts_reading(calendar_birth_us, absolute_birth)
+    }
+}
+
 /// Exact identity facts for a live process from `proc_pidinfo(PROC_PIDTBSDINFO)`
 /// (public `<libproc.h>` API).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1130,7 +1175,7 @@ fn raw_bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
             size,
         )
     };
-    (n == size).then_some(info)
+    (n == size && info.pbi_pid == pid as u32).then_some(info)
 }
 
 /// Session facts for `pid` in the shape of a Linux `/proc/<pid>/stat` record.
@@ -1188,11 +1233,16 @@ pub fn read_session_stat(pid: u32) -> Option<crate::collect::proc_parsers::Proce
 #[cfg(target_os = "macos")]
 pub fn read_bsd_info(pid: u32) -> Option<MacBsdInfo> {
     let info = raw_bsd_info(pid)?;
+    if info.pbi_start_tvusec >= 1_000_000 {
+        return None;
+    }
+    let start_us = info
+        .pbi_start_tvsec
+        .checked_mul(1_000_000)?
+        .checked_add(info.pbi_start_tvusec)
+        .filter(|value| *value > 0)?;
     Some(MacBsdInfo {
-        start_us: info
-            .pbi_start_tvsec
-            .saturating_mul(1_000_000)
-            .saturating_add(info.pbi_start_tvusec),
+        start_us,
         uid: info.pbi_uid,
         ppid: info.pbi_ppid,
     })
@@ -1591,12 +1641,26 @@ fn parse_etime_macos(s: &str) -> Option<u64> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn native_scan_fence_requires_both_births_and_strict_absolute_order() {
+        let fence = MacosScanBirthFence(500);
+        assert!(fence.accepts_reading(1_700_000_000_000_010, Some(499)));
+        // A backwards calendar adjustment cannot make a replacement older.
+        assert!(!fence.accepts_reading(1_699_999_999_000_000, Some(501)));
+        assert!(!fence.accepts_reading(1, Some(500)));
+        assert!(!fence.accepts_reading(1, Some(0)));
+        assert!(!fence.accepts_reading(0, Some(499)));
+        assert!(!fence.accepts_reading(1, None));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn test_session_stat_preserves_native_process_birth() {
         let pid = std::process::id();
         let identity = read_bsd_info(pid).expect("read current process native identity");
         assert!(identity.start_us > 0, "native birth must be available");
+        let fence = MacosScanBirthFence::capture(&[pid]);
+        assert!(fence.accepts(pid, identity.start_us));
 
         let stat = read_session_stat(pid).expect("read current process session facts");
         assert_eq!(stat.pid, pid);
