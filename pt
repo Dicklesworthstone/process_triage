@@ -343,7 +343,7 @@ run_update() {
     # and every `pt update` installed unverified. The env var is kept for newer ones.
     local verify_env=1
     [[ "$verify_arg" == "--no-verify" ]] && verify_env=0
-    local -a installer_env=("VERIFY=${verify_env}")
+    local -a installer_env=("VERIFY=${verify_env}" "PT_VERSION=${target_version}" "PT_REFRESHED=1")
     # The user's own pin (either variable) is inherited as is; the installer
     # prefers PT_RELEASE_PUBLIC_KEY_FINGERPRINT, so setting it here would
     # silently discard a PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE.
@@ -363,11 +363,10 @@ run_update() {
         echo "(network problem, or that release is not published yet). Nothing was changed." >&2
         exit 1
     fi
-    # Fed through a pipe, exactly as `curl ... | bash -s` would run it (the installer
-    # behaves differently when its stdin is a pipe).
+    # Execute the release-specific file we just downloaded. Older installers use
+    # PT_REFRESHED to suppress fetching a replacement from the main branch.
     local status=0
-    # shellcheck disable=SC2002
-    cat "$installer" | env "${installer_env[@]}" bash -s -- "$verify_arg" || status=$?
+    env "${installer_env[@]}" bash "$installer" "$verify_arg" || status=$?
     if [[ $status -ne 0 ]]; then
         echo "Update failed: the v${target_version} installer exited with status ${status}; its message is above." >&2
         if [[ "$verify_arg" == "--verify" ]]; then

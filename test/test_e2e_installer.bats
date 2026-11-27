@@ -692,6 +692,47 @@ MOCK_CURL
     test_end "checksum valid" "pass"
 }
 
+@test "installer: verify authenticates a same-version replacement before executing installed tools" {
+    setup_installer_test_env "1.0.0" "Linux" "x86_64"
+    export DEST="$INSTALL_DEST" PT_NO_PATH=1 PT_REFRESHED=1
+    export OLD_BINARY_RAN="${TEST_DIR}/old-binary-ran"
+    cat > "$DEST/pt" <<'OLD'
+#!/usr/bin/env bash
+touch "$OLD_BINARY_RAN"
+echo "pt 1.0.0"
+OLD
+    cp "$DEST/pt" "$DEST/pt-core"
+    chmod +x "$DEST/pt" "$DEST/pt-core"
+
+    # A previously authenticated installer may be launched with piped stdin
+    # (including by pt update). It must not replace itself from the main branch.
+    unset PT_REFRESHED
+    run bash -c 'printf "" | bash "$1" --version 1.0.0 --verify --no-configure' _ "$INSTALLER_PATH"
+    [ "$status" -eq 0 ]
+    [ ! -e "$OLD_BINARY_RAN" ]
+    cmp "$DEST/pt" "$ASSETS_DIR/pt"
+    cmp "$DEST/pt-core" "$ASSETS_DIR/tarball_staging/pt-core"
+}
+
+@test "installer: verified download failure cannot select a source build" {
+    setup_installer_test_env "1.0.0" "Linux" "x86_64"
+    export DEST="$INSTALL_DEST" PT_NO_PATH=1 PT_REFRESHED=1
+    mkdir "$TEST_DIR/withheld"
+    mv "$ASSETS_DIR"/*.tar.gz "$TEST_DIR/withheld/"
+
+    run bash "$INSTALLER_PATH" --version 1.0.0 --verify
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"requires the signed pt-core archive"* ]]
+    [ ! -e "$DEST/pt" ]
+    [ ! -e "$DEST/pt-core" ]
+}
+
+@test "installer: explicit source build rejects release verification before acquisition" {
+    run env VERIFY=1 bash "$INSTALLER_PATH" --from-source
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"cannot verify a source build"* ]]
+}
+
 @test "installer: VERIFY=1 fails on release key fingerprint mismatch" {
     test_start "fingerprint mismatch" "verify key pin mismatch fails closed"
 

@@ -213,9 +213,9 @@ Options:
   --dest <dir>         Install directory (default: ~/.local/bin)
   --system             Install to /usr/local/bin
   --easy-mode          Update shell PATH files automatically
-  --verify             Require checksum + signature verification
+  --verify             Install signed release artifacts, including on a same-version reinstall
   --verify-self        Run post-install diagnostics
-  --from-source        Build pt-core from source
+  --from-source        Build pt-core from source (incompatible with --verify or --offline)
   --offline <file>     Install pt-core from a local tarball
                        Version inferred from bundle name or local VERSION file
   --force              Reinstall even if already at target version
@@ -497,7 +497,7 @@ create_temp_dir() {
 }
 
 maybe_self_refresh() {
-    if [[ -p /dev/stdin && -z "${PT_REFRESHED:-}" && -z "$OFFLINE_BUNDLE" ]]; then
+    if [[ "$VERIFY" -eq 0 && -p /dev/stdin && -z "${PT_REFRESHED:-}" && -z "$OFFLINE_BUNDLE" ]]; then
         export PT_REFRESHED=1
         exec bash <(fetch_stdout "$(append_cache_buster "${RAW_URL}/install.sh")") "$@"
     fi
@@ -694,7 +694,11 @@ preflight_checks() {
     info "Running preflight checks"
     check_disk_space
     check_write_permissions
-    check_existing_install
+    # A version probe executes the existing installation. Verified installs acquire
+    # and authenticate fresh release artifacts before running any installed code.
+    if [[ "$VERIFY" -eq 0 ]]; then
+        check_existing_install
+    fi
     check_network
 }
 
@@ -1154,7 +1158,7 @@ maybe_build_from_source() {
 }
 
 verify_existing_install_short_circuit() {
-    if [[ "$FORCE_INSTALL" -eq 1 ]]; then
+    if [[ "$FORCE_INSTALL" -eq 1 || "$VERIFY" -eq 1 ]]; then
         return 1
     fi
     if [[ "${INSTALLED_WRAPPER_VERSION:-}" == "$VERSION" && "${INSTALLED_CORE_VERSION:-}" == "$CORE_VERSION" ]]; then
@@ -1293,6 +1297,14 @@ main() {
         skill_payload
         return 0
     fi
+    if [[ "$FROM_SOURCE" -eq 1 && -n "$OFFLINE_BUNDLE" ]]; then
+        err "--from-source and --offline select different installation sources"
+        return 1
+    fi
+    if [[ "$FROM_SOURCE" -eq 1 && "$VERIFY" -eq 1 ]]; then
+        err "--verify requires signed release artifacts and cannot verify a source build"
+        return 1
+    fi
     setup_proxy
     detect_gum
     maybe_self_refresh "$@"
@@ -1353,6 +1365,10 @@ main() {
     else
         run_with_spinner "Downloading pt wrapper" download_wrapper "$wrapper_file"
         if ! run_with_spinner "Downloading pt-core archive" download_core_archive "$core_archive"; then
+            if [[ "$VERIFY" -eq 1 ]]; then
+                err "Verified installation requires the signed pt-core archive for ${PLATFORM} v${CORE_VERSION}"
+                return 1
+            fi
             warn "Prebuilt pt-core download failed; falling back to source build"
             FROM_SOURCE=1
             maybe_build_from_source

@@ -495,6 +495,7 @@ elif [[ "$url" == */v9.9.9/install.sh ]]; then
 #!/usr/bin/env bash
 printf 'INSTALLER_ARGS=%s\nINSTALLER_VERIFY=%s\n' "$*" "$VERIFY" >> "$PT_INSTALLER_LOG"
 [[ "$*" == --verify && "$VERIFY" == 1 ]] || exit 44
+[[ "$PT_REFRESHED" == 1 && "$PT_VERSION" == 9.9.9 && -f "$0" ]] || exit 45
 INSTALLER
 else
   exit 31
