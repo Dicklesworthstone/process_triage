@@ -9001,6 +9001,7 @@ fn finalize_tui_recommendations(
         population,
         policy,
         false,
+        CandidateOrder::Ranked,
     );
     for candidate in final_candidates {
         if let Some(pid) = candidate["pid"]
@@ -9496,15 +9497,17 @@ fn build_tui_rows(
         );
     }
 
+    // An agent or live-child refusal withdraws modeled relief before ranking.
+    // Run the same pre-pass as plan while all candidate children are visible.
+    apply_process_tree_safety(
+        &mut goal_candidates.values_mut().collect::<Vec<_>>(),
+        population,
+        decision_policy.guardrails.builtin_protection,
+    );
     rows.sort_by(|a, b| {
-        let relief = |pid| {
-            goal_candidates
-                .get(&pid)
-                .map_or(0.0, candidate_pressure_relief)
-        };
-        relief(b.pid)
-            .total_cmp(&relief(a.pid))
-            .then_with(|| b.score.cmp(&a.score))
+        compare_candidate_priority(&goal_candidates[&a.pid], &goal_candidates[&b.pid], |pid| {
+            plan_candidates.get(&pid)?.decision.rationale.posterior
+        })
     });
     let mut goal_summary: Option<Vec<String>> = None;
     let mut goal_selection = goal_str.map(|_| HashMap::new());
@@ -25630,6 +25633,144 @@ mod process_tree_safety_tests {
     }
 
     #[test]
+    fn one_kill_budget_uses_the_same_evidence_on_ranked_and_census_surfaces() {
+        use super::{compare_candidate_priority, finalize_candidate_safety, CandidateOrder};
+
+        let mut policy = pt_core::config::Policy::default();
+        policy.guardrails.max_kills_per_run = 1;
+        policy.fdr_control.lfdr_null = vec!["useful".into(), "useful_bad".into()];
+        // All four displayed scores round to 98. The two strongest are tied
+        // on abandonment; intervention probability then PID resolves the tie.
+        let (population, original, mut inputs) = fdr_fixture(&[
+            (70, 1, 0.024),
+            (50, 1, 0.023),
+            (60, 1, 0.023),
+            (40, 1, 0.023),
+        ]);
+        for pid in [50, 60] {
+            let posterior = inputs
+                .get_mut(&pid)
+                .unwrap()
+                .decision
+                .rationale
+                .posterior
+                .as_mut()
+                .unwrap();
+            posterior.useful -= 0.01;
+            posterior.useful_bad += 0.01;
+        }
+        for preferred_remedy in [None, Some("kill"), Some("pause")] {
+            let mut rows = original.clone();
+            if let Some(chosen) = preferred_remedy {
+                rows[0]["pressure_decision"] = serde_json::json!({
+                    "applied": true, "chosen_action": chosen, "modeled_pressure_relief": 1.0
+                });
+            }
+            // Modelled relief counts only while that exact remedy is allowed.
+            let expected = if preferred_remedy == Some("kill") {
+                70
+            } else {
+                50
+            };
+            for reverse in [false, true] {
+                if reverse {
+                    rows.reverse();
+                }
+                for order in [CandidateOrder::Census, CandidateOrder::Ranked] {
+                    let mut candidates = rows.clone();
+                    if matches!(order, CandidateOrder::Ranked) {
+                        candidates.sort_by(|a, b| {
+                            compare_candidate_priority(a, b, |pid| {
+                                inputs.get(&pid)?.decision.rationale.posterior
+                            })
+                        });
+                    }
+                    let ids: Vec<_> = candidates.iter().map(|c| c["pid"].as_u64()).collect();
+                    let gate = finalize_candidate_safety(
+                        &mut candidates,
+                        &inputs,
+                        &population,
+                        &policy,
+                        false,
+                        order,
+                    );
+                    assert_eq!(
+                        ids,
+                        candidates
+                            .iter()
+                            .map(|c| c["pid"].as_u64())
+                            .collect::<Vec<_>>()
+                    );
+                    let plan = build_agent_action_plan(
+                        &pt_common::SessionId::new(),
+                        &policy,
+                        &candidates,
+                        &inputs,
+                        "2026-11-27T00:00:00Z".into(),
+                    );
+                    assert_eq!(plan.actions.len(), 1);
+                    assert_eq!(plan.actions[0].target.pid.0, expected);
+                    let report = super::snapshot_fdr_report(gate, plan, &policy);
+                    assert_eq!(
+                        report["selection_stage"],
+                        "candidate_gate_before_kill_budget"
+                    );
+                    assert_eq!(report["selected_targets"], 4);
+                    let final_risk = &report["final_recommendations"];
+                    assert_eq!(final_risk["selected_targets"], 1);
+                    assert_eq!(final_risk["decisions"][0]["target"]["pid"], expected);
+                    let expected_risk = if expected == 70 { 0.024 } else { 0.023 };
+                    let measured = final_risk["expected_fdr"].as_f64().unwrap();
+                    assert!((measured - expected_risk).abs() < 1e-9);
+                }
+            }
+        }
+        // A resource optimizer may explicitly prefer a lower-suspicion target.
+        let mut goal = original;
+        finalize_candidate_safety(
+            &mut goal,
+            &inputs,
+            &population,
+            &policy,
+            false,
+            CandidateOrder::Ranked,
+        );
+        assert_eq!(goal[0]["recommended_action"], "kill");
+        assert_eq!(goal[0]["pid"], 70);
+    }
+
+    #[test]
+    fn refused_child_and_its_parent_do_not_consume_the_only_kill_slot() {
+        let mut policy = pt_core::config::Policy::default();
+        policy.guardrails.max_kills_per_run = 1;
+        let (population, mut candidates, inputs) =
+            fdr_fixture(&[(100, 1, 0.001), (200, 100, 0.099), (300, 1, 0.01)]);
+        // A resource goal prefers this branch. Risk excludes the leaf and
+        // therefore its parent, so only the independent target can be acted on.
+        let report = super::finalize_candidate_safety(
+            &mut candidates,
+            &inputs,
+            &population,
+            &policy,
+            false,
+            super::CandidateOrder::Ranked,
+        );
+        assert_eq!(report.blocked_targets, 1);
+        assert_eq!(candidates[0]["tree_safety"]["rule"], "live_child");
+        assert_eq!(candidates[1]["fdr_control"]["selected"], false);
+        assert_eq!(candidates[2]["recommended_action"], "kill");
+        let plan = build_agent_action_plan(
+            &pt_common::SessionId::new(),
+            &policy,
+            &candidates,
+            &inputs,
+            "2026-11-27T00:00:00Z".into(),
+        );
+        assert_eq!(plan.actions.len(), 1);
+        assert_eq!(plan.actions[0].target.pid.0, 300);
+    }
+
+    #[test]
     fn fdr_apply_preserves_both_policies_and_canonical_plan() {
         let (_, candidates, inputs) = fdr_fixture(&[(100, 1, 0.005), (200, 1, 0.04)]);
         let mut current = pt_core::config::Policy::default();
@@ -33220,6 +33361,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                 "supervisor_restart": score.supervisor_restart,
                 "supervisor_restart_unavailable": score.supervisor_restart_unavailable,
                 "memory_cap": memory_cap,
+                "pressure_decision": inputs.report,
             }));
             let wait = PlanningWaitState::from_activity(proc, score.activity.as_ref());
             action_inputs.insert(
@@ -33256,12 +33398,25 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                 provenance_log_odds_shift: None,
             });
         }
-        fdr_control = Some(finalize_candidate_safety(
+        let candidate_gate = finalize_candidate_safety(
             &mut recommendations,
             &action_inputs,
             &scan_result.processes,
             &decision_policy,
             global.robot,
+            CandidateOrder::Census,
+        );
+        let recommended_plan = build_agent_action_plan(
+            &session_id,
+            &decision_policy,
+            &recommendations,
+            &action_inputs,
+            timestamp.to_rfc3339(),
+        );
+        fdr_control = Some(snapshot_fdr_report(
+            candidate_gate,
+            recommended_plan,
+            &decision_policy,
         ));
         let final_actions: HashMap<u32, &str> = recommendations
             .iter()
@@ -36084,27 +36239,86 @@ fn apply_candidate_fdr_gate(
     report
 }
 
-/// Finalize the exact recommendation set consistently across plan, TUI, watch
-/// and snapshot. Risk exclusions can leave live children behind, so tree safety
-/// must run again after the FDR gate, not just inside the planned kill budget.
+/// Rank by permitted pressure relief, then the full-precision probabilities.
+/// PID makes exact ties stable across scan order and map iteration.
+fn compare_candidate_priority(
+    left: &serde_json::Value,
+    right: &serde_json::Value,
+    posterior_for: impl Fn(u32) -> Option<pt_core::inference::ClassScores>,
+) -> std::cmp::Ordering {
+    let rank = |candidate: &serde_json::Value| {
+        // All four producers construct rows with the PID of their scored process.
+        let pid = candidate["pid"]
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok());
+        let posterior = pid.and_then(&posterior_for);
+        (
+            candidate_pressure_relief(candidate),
+            posterior.map_or(-1.0, |p| p.abandonment_probability()),
+            posterior.map_or(-1.0, |p| p.intervention_probability()),
+            pid,
+        )
+    };
+    let (left_relief, left_suspicion, left_intervention, left_pid) = rank(left);
+    let (right_relief, right_suspicion, right_intervention, right_pid) = rank(right);
+    right_relief
+        .total_cmp(&left_relief)
+        .then_with(|| right_suspicion.total_cmp(&left_suspicion))
+        .then_with(|| right_intervention.total_cmp(&left_intervention))
+        .then_with(|| left_pid.cmp(&right_pid))
+}
+
+#[derive(Clone, Copy)]
+enum CandidateOrder {
+    /// Plan or interactive rows already ranked, possibly for an explicit resource goal.
+    Ranked,
+    /// Watch or snapshot rows still in operating-system enumeration order.
+    Census,
+}
+
+/// Exclude unsafe actions before allocating limited kill slots. A parent's
+/// eligibility can change when the risk gate refuses its child, so the budget
+/// rechecks the tree against the surviving recommendations.
 fn finalize_candidate_safety(
     candidates: &mut [serde_json::Value],
     action_inputs: &HashMap<u32, DecisionCandidate>,
     population: &[ProcessRecord],
     policy: &pt_core::config::Policy,
     robot: bool,
+    order: CandidateOrder,
 ) -> pt_core::decision::PlanFdrReport {
-    let mut values: Vec<_> = candidates.iter_mut().collect();
-    apply_planned_kill_budget(&mut values, population, policy, robot);
-    let report = apply_candidate_fdr_gate(policy, candidates, action_inputs);
-    // Each admitted target independently meets the risk ceiling. Further tree
-    // exclusions cannot increase the remaining set's modeled FDR above it.
-    let mut values: Vec<_> = candidates.iter_mut().collect();
     apply_process_tree_safety(
-        &mut values,
+        &mut candidates.iter_mut().collect::<Vec<_>>(),
         population,
         policy.guardrails.builtin_protection,
     );
+    let report = apply_candidate_fdr_gate(policy, candidates, action_inputs);
+    let mut values: Vec<_> = candidates.iter_mut().collect();
+    if matches!(order, CandidateOrder::Census) {
+        // Sort only the budget's view. Callers keep identity-aligned snapshot
+        // records and watch events in their own original order.
+        values.sort_by(|a, b| {
+            compare_candidate_priority(a, b, |pid| {
+                action_inputs.get(&pid)?.decision.rationale.posterior
+            })
+        });
+    }
+    apply_planned_kill_budget(&mut values, population, policy, robot);
+    report
+}
+
+/// Preserve per-candidate refusals while reporting the posterior risk of the
+/// remedies that survived tree safety and the kill budget. Snapshot records
+/// recommendations only; no saved executable plan is created.
+fn snapshot_fdr_report(
+    candidate_gate: pt_core::decision::PlanFdrReport,
+    mut recommended_plan: Plan,
+    policy: &pt_core::config::Policy,
+) -> serde_json::Value {
+    let final_risk = pt_core::decision::apply_plan_fdr_gate(&mut recommended_plan, policy);
+    let mut report = serde_json::json!(candidate_gate);
+    report["selection_stage"] = serde_json::json!("candidate_gate_before_kill_budget");
+    report["final_recommendations"] = serde_json::json!(final_risk);
     report
 }
 
@@ -36638,16 +36852,9 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
 
     // Process each candidate: compute posterior, make decision, build candidate output.
     //
-    // Collect all candidates above threshold with their ranking key
-    // (P(abandoned or zombie), P(intervention)) plus a compact persisted snapshot
-    // (inventory + inference) so `diff` can compare sessions.
-    #[allow(clippy::type_complexity)]
-    let mut all_candidates: Vec<(
-        (f64, f64),
-        serde_json::Value,
-        PersistedProcess,
-        PersistedInference,
-    )> = Vec::new();
+    // Retain the observations alongside each candidate for session comparison.
+    let mut all_candidates: Vec<(serde_json::Value, PersistedProcess, PersistedInference)> =
+        Vec::new();
     let mut action_inputs: HashMap<u32, DecisionCandidate> = HashMap::new();
     let mut policy_blocked_count = 0usize;
     let mut signature_match_count = 0usize;
@@ -37384,12 +37591,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 memory_cap,
             },
         );
-        all_candidates.push((
-            (abandonment_probability, intervention_probability),
-            candidate,
-            persisted_proc,
-            persisted_inf,
-        ));
+        all_candidates.push((candidate, persisted_proc, persisted_inf));
     }
 
     if let Some(ref e) = emitter {
@@ -37421,7 +37623,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     // killed too, and cap descendants of live agent sessions at review.
     {
         let mut candidate_values: Vec<&mut serde_json::Value> =
-            all_candidates.iter_mut().map(|c| &mut c.1).collect();
+            all_candidates.iter_mut().map(|c| &mut c.0).collect();
         apply_process_tree_safety(
             &mut candidate_values,
             &scan_result.processes,
@@ -37432,10 +37634,9 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     // Under attributed pressure, surface permitted relief before suspicion.
     // Otherwise preserve the evidence-only ordering and displayed scores.
     all_candidates.sort_by(|a, b| {
-        candidate_pressure_relief(&b.1)
-            .total_cmp(&candidate_pressure_relief(&a.1))
-            .then_with(|| b.0 .0.total_cmp(&a.0 .0))
-            .then_with(|| b.0 .1.total_cmp(&a.0 .1))
+        compare_candidate_priority(&a.0, &b.0, |pid| {
+            action_inputs.get(&pid)?.decision.rationale.posterior
+        })
     });
 
     // Capture count before truncation for summary stats
@@ -37444,14 +37645,14 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     // Filter the policy/tree-adjusted recommendations, not the raw loss argmin.
     // Later truncation, budgets and plan routing can still tighten this verdict;
     // reapply the filter to that final contract below.
-    all_candidates.retain(|candidate| candidate_matches_filter(&candidate.1, &args.only));
+    all_candidates.retain(|candidate| candidate_matches_filter(&candidate.0, &args.only));
 
     // Keep the full post-policy candidate set through resource-goal ranking.
     // A display limit must not hide the only holder that can satisfy the goal.
     let mut candidates: Vec<serde_json::Value> = Vec::new();
     let mut persisted_inventory_records: Vec<PersistedProcess> = Vec::new();
     let mut persisted_inference_records: Vec<PersistedInference> = Vec::new();
-    for (_, candidate_json, proc_rec, inf_rec) in all_candidates {
+    for (candidate_json, proc_rec, inf_rec) in all_candidates {
         candidates.push(candidate_json);
         persisted_inventory_records.push(proc_rec);
         persisted_inference_records.push(inf_rec);
@@ -37555,6 +37756,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         &scan_result.processes,
         &decision_policy,
         global.robot,
+        CandidateOrder::Ranked,
     );
     candidates.retain(|candidate| candidate_matches_filter(candidate, &args.only));
 
@@ -47183,6 +47385,7 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
             &scan_result.processes,
             &decision_policy,
             global.robot,
+            CandidateOrder::Census,
         );
         for ((proc, confidence), recommendation) in evaluated.into_iter().zip(recommendations) {
             if let Some(candidate) = WatchCandidate::new(
@@ -49273,6 +49476,7 @@ mod watch_tests {
             &processes,
             &policy,
             false,
+            CandidateOrder::Census,
         );
         assert_eq!(report.blocked_targets, 1);
         assert_eq!(recommendations[0]["recommended_action"], "review");
@@ -49324,7 +49528,14 @@ mod watch_tests {
         // The event decisions agree with the executable plan from this exact
         // snapshot and policy, including the parent affected by a child's gate.
         let mut planned = original;
-        finalize_candidate_safety(&mut planned, &action_inputs, &processes, &policy, false);
+        finalize_candidate_safety(
+            &mut planned,
+            &action_inputs,
+            &processes,
+            &policy,
+            false,
+            CandidateOrder::Ranked,
+        );
         let plan = build_agent_action_plan(
             &SessionId::new(),
             &policy,
