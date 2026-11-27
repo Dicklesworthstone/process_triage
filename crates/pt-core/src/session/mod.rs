@@ -366,12 +366,27 @@ pub struct ActionHistory {
 pub const ACTION_HISTORY_BYTE_LIMIT: usize = 16 * 1024 * 1024;
 
 /// Result of a cleanup operation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CleanupResult {
+    /// Session IDs eligible at inspection time, including those removed.
+    #[serde(default)]
+    pub eligible_sessions: Vec<String>,
+    /// Sum of regular file lengths per eligible directory entry. This is not
+    /// an estimate of freed blocks (files may be sparse or hard-linked).
+    #[serde(default)]
+    pub eligible_file_bytes: u64,
     pub removed_count: u32,
     pub removed_sessions: Vec<String>,
     pub preserved_count: u32,
     pub errors: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+enum CleanupMode {
+    Preview,
+    Confirmed,
+    #[cfg(not(target_os = "linux"))]
+    Automatic,
 }
 
 #[derive(Debug, Clone)]
@@ -469,7 +484,7 @@ impl SessionStore {
             return;
         }
         let _ = std::fs::write(&marker, b"");
-        if let Ok(result) = self.cleanup_sessions(retention) {
+        if let Ok(result) = self.inspect_or_cleanup_sessions(retention, CleanupMode::Automatic) {
             if result.removed_count > 0 {
                 tracing::debug!(
                     removed = result.removed_count,
@@ -778,12 +793,20 @@ impl SessionStore {
     /// receipt must survive too. Cleanup shares the execution-policy lock with
     /// action preparation, undo and canonical plan writes.
     pub fn cleanup_sessions(&self, older_than: Duration) -> Result<CleanupResult, SessionError> {
-        let mut result = CleanupResult {
-            removed_count: 0,
-            removed_sessions: Vec::new(),
-            preserved_count: 0,
-            errors: Vec::new(),
-        };
+        self.inspect_or_cleanup_sessions(older_than, CleanupMode::Confirmed)
+    }
+
+    /// Inspect the same candidates as a confirmed cleanup, without removing artifacts.
+    pub fn preview_cleanup(&self, older_than: Duration) -> Result<CleanupResult, SessionError> {
+        self.inspect_or_cleanup_sessions(older_than, CleanupMode::Preview)
+    }
+
+    fn inspect_or_cleanup_sessions(
+        &self,
+        older_than: Duration,
+        mode: CleanupMode,
+    ) -> Result<CleanupResult, SessionError> {
+        let mut result = CleanupResult::default();
         match std::fs::symlink_metadata(&self.sessions_root) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(result),
             Err(source) => {
@@ -809,56 +832,118 @@ impl SessionStore {
                 source,
             }
         })?;
-        let options = ListSessionsOptions {
-            older_than: Some(older_than),
-            ..Default::default()
-        };
-
-        let sessions = self.list_sessions(&options)?;
-
-        for session in sessions {
-            cleanup_lock
-                .revalidate()
-                .map_err(|source| SessionError::Io {
-                    path: self.sessions_root.clone(),
-                    source,
-                })?;
-            // The list is a discovery snapshot. Read the current manifest and
-            // reversal metadata while holding the same lock as their writers.
-            if retention_requires_preservation(&session.path, &session.session_id, older_than) {
+        // Listing for display reads plans and journals to count their records.
+        // Retention needs only the directory name, manifest and reversal metadata.
+        let entries = std::fs::read_dir(&self.sessions_root)
+            .map_err(|e| session_io(&self.sessions_root, e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| session_io(&self.sessions_root, e))?;
+            let Some(session_id) = entry.file_name().to_str().and_then(SessionId::parse) else {
+                continue;
+            };
+            let path = entry.path();
+            cleanup_lock.revalidate().map_err(|e| session_io(&path, e))?;
+            if retention_requires_preservation(&path, &session_id.0, older_than) {
                 result.preserved_count += 1;
                 continue;
             }
-            cleanup_lock
-                .revalidate()
-                .map_err(|source| SessionError::Io {
-                    path: self.sessions_root.clone(),
-                    source,
-                })?;
-            if retention_has_reversal_artifacts(&session.path) {
-                result.preserved_count += 1;
-                continue;
-            }
-
-            // Remove the session directory
-            match std::fs::remove_dir_all(&session.path) {
-                Ok(_) => {
-                    result.removed_count += 1;
-                    result.removed_sessions.push(session.session_id);
+            let bytes = match mode {
+                CleanupMode::Preview | CleanupMode::Confirmed => {
+                    match session_file_bytes(&self.sessions_root, &path) {
+                        Ok(bytes) => Some(bytes),
+                        Err(error) => {
+                            result.errors.push(format!("{session_id}: {error}"));
+                            continue;
+                        }
+                    }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // Already removed, treat as success
+                // Ordinary session creation does not need a byte inventory.
+                #[cfg(not(target_os = "linux"))]
+                CleanupMode::Automatic => None,
+            };
+            cleanup_lock.revalidate().map_err(|e| session_io(&path, e))?;
+            if retention_requires_preservation(&path, &session_id.0, older_than) {
+                result.preserved_count += 1;
+                continue;
+            }
+            if let Some(bytes) = bytes {
+                result.eligible_file_bytes = result.eligible_file_bytes.saturating_add(bytes);
+                result.eligible_sessions.push(session_id.0.clone());
+            }
+            if matches!(mode, CleanupMode::Preview) {
+                continue;
+            }
+            #[cfg(target_os = "linux")]
+            let removal = automatic_retention::remove_manual(
+                &cleanup_lock,
+                &self.sessions_root,
+                &session_id.0,
+                older_than,
+            );
+            #[cfg(not(target_os = "linux"))]
+            let removal = std::fs::remove_dir_all(&path).map_err(|e| session_io(&path, e));
+            match removal {
+                Ok(()) => {
                     result.removed_count += 1;
-                    result.removed_sessions.push(session.session_id);
+                    result.removed_sessions.push(session_id.0);
                 }
                 Err(e) => {
-                    result.errors.push(format!("{}: {}", session.session_id, e));
+                    result.errors.push(format!("{session_id}: {e}"));
                 }
             }
         }
-
+        result.eligible_sessions.sort_unstable();
+        result.removed_sessions.sort_unstable();
         Ok(result)
     }
+}
+
+/// Inspect directory entries without opening journal contents, devices or symlinks.
+fn session_file_bytes(root: &Path, session: &Path) -> Result<u64, SessionError> {
+    #[cfg(unix)]
+    fn mount(path: &Path) -> Result<u64, SessionError> {
+        let dir = JsonDirectory::open(path)?;
+        #[cfg(target_os = "linux")]
+        {
+            automatic_retention::directory_mount_id(&dir)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Ok(dir.handle.metadata().map_err(|e| session_io(path, e))?.dev() as u64)
+        }
+    }
+    #[cfg(unix)]
+    let root_mount = mount(root)?;
+    #[cfg(not(unix))]
+    let _ = root;
+    let mut bytes = 0u64;
+    let mut pending = vec![(session.to_owned(), 0)];
+    while let Some((path, depth)) = pending.pop() {
+        #[cfg(unix)]
+        if mount(&path)? != root_mount {
+            return Err(session_io(
+                &path,
+                std::io::Error::other("session contains a mounted directory"),
+            ));
+        }
+        if depth > 32 {
+            return Err(session_io(
+                &path,
+                std::io::Error::other("retention tree exceeds depth limit"),
+            ));
+        }
+        for entry in std::fs::read_dir(&path).map_err(|e| session_io(&path, e))? {
+            let child = entry.map_err(|e| session_io(&path, e))?.path();
+            let metadata = std::fs::symlink_metadata(&child).map_err(|e| session_io(&child, e))?;
+            if metadata.is_dir() {
+                pending.push((child, depth + 1));
+            } else if metadata.is_file() {
+                bytes = bytes.saturating_add(metadata.len());
+            }
+        }
+    }
+    Ok(bytes)
 }
 
 /// Automatic retention is deliberately independent from the manual cleanup
@@ -1380,7 +1465,40 @@ mod automatic_retention {
         }
     }
 
-    fn directory_mount_id(directory: &JsonDirectory) -> Result<u64, SessionError> {
+    pub(super) fn remove_manual(
+        lock: &SessionCleanupLock,
+        root_path: &Path,
+        session_id: &str,
+        retention: Duration,
+    ) -> Result<(), SessionError> {
+        let root = JsonDirectory::open(root_path)?;
+        let path = root.path.join(session_id);
+        let identity = fs::symlink_metadata(&path).map_err(|e| session_io(&path, e))?;
+        let pending = Pending {
+            session_id: session_id.to_owned(),
+            device: identity.dev(),
+            inode: identity.ino(),
+        };
+        let mut budget = Budget {
+            started: Instant::now(),
+            limits: Limits {
+                tree_nodes: usize::MAX,
+                wall: WallDuration::MAX,
+                ..Limits::default()
+            },
+            report: Report::default(),
+        };
+        if prune_session(lock, &root, &pending, retention, &mut budget)? {
+            Ok(())
+        } else {
+            Err(session_io(
+                &path,
+                std::io::Error::other("incomplete session removal"),
+            ))
+        }
+    }
+
+    pub(super) fn directory_mount_id(directory: &JsonDirectory) -> Result<u64, SessionError> {
         use std::io::Read;
         let path = PathBuf::from(format!(
             "/proc/self/fdinfo/{}",
@@ -3780,7 +3898,7 @@ mod tests {
             removed_count: 3,
             removed_sessions: vec!["s1".to_string(), "s2".to_string(), "s3".to_string()],
             preserved_count: 1,
-            errors: vec![],
+            ..Default::default()
         };
         let json = serde_json::to_string(&result).unwrap();
         let back: CleanupResult = serde_json::from_str(&json).unwrap();

@@ -1862,7 +1862,8 @@ prose\:"Structured natural language for agent-to-user communication"))' \
 '--fields=[Select specific output fields (comma-separated or preset\: minimal, standard, full)]:FIELDS:_default' \
 '--max-tokens=[Maximum token budget for output (enables truncation with continuation)]:TOKENS:_default' \
 '--detail[Include full session detail (plan contents, actions taken)]' \
-'--cleanup[Remove old sessions]' \
+'--cleanup[Preview old sessions eligible for removal]' \
+'--yes[Confirm removal of eligible sessions with --cleanup]' \
 '*-v[Increase verbosity (-v, -vv, -vvv)]' \
 '*--verbose[Increase verbosity (-v, -vv, -vvv)]' \
 '-q[Decrease verbosity (quiet mode)]' \
@@ -3713,7 +3714,8 @@ prose\:"Structured natural language for agent-to-user communication"))' \
 '--fields=[Select specific output fields (comma-separated or preset\: minimal, standard, full)]:FIELDS:_default' \
 '--max-tokens=[Maximum token budget for output (enables truncation with continuation)]:TOKENS:_default' \
 '--detail[Include full session detail (plan contents, actions taken)]' \
-'--cleanup[Remove old sessions]' \
+'--cleanup[Preview old sessions eligible for removal]' \
+'--yes[Confirm removal of eligible sessions with --cleanup]' \
 '*-v[Increase verbosity (-v, -vv, -vvv)]' \
 '*--verbose[Increase verbosity (-v, -vv, -vvv)]' \
 '-q[Decrease verbosity (quiet mode)]' \

@@ -343,7 +343,8 @@ pt-core agent sessions --session <id> [--detail]
 | `--limit <N>` | Limit results in list mode |
 | `--state <state>` | Filter by session state |
 | `--format json\|md` | Output format |
-| `--cleanup` | Remove old sessions |
+| `--cleanup` | Preview eligible session IDs and their total regular-file bytes |
+| `--yes` | Confirm a cleanup. The command rechecks age and protection under the execution lock. Global `--dry-run` and `--shadow` always preview. |
 | `--older-than <duration>` | For cleanup: age threshold (default: 7d) |
 
 ---

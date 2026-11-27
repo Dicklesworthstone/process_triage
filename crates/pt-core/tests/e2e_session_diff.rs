@@ -9,7 +9,7 @@
 //! - `diff --category` filters by delta kind
 //! - `agent diff --base` with focus modes (all, new, removed, changed)
 //! - `agent sessions` lists and shows session details
-//! - `agent sessions --cleanup` removes old sessions
+//! - `agent sessions --cleanup` previews old sessions and requires confirmation to remove them
 //! - Error paths: invalid session IDs, missing sessions, incompatible flags
 //! - Exit codes for success and error paths
 //!
@@ -1049,39 +1049,108 @@ fn test_agent_sessions_invalid_session_id() {
 // ============================================================================
 
 #[test]
-fn test_agent_sessions_cleanup_removes_old() {
+fn test_agent_sessions_cleanup_previews_then_removes_only_eligible_sessions() {
     let dir = tempdir().expect("tempdir");
     let data_dir = dir.path().to_str().unwrap();
 
-    // Create a session
-    create_snapshot(data_dir, None);
-
-    // Cleanup with 0 hours (should clean everything)
-    // Note: Sessions just created won't be "older than 0d" in practice,
-    // so use "0h" or "1s" if supported. Otherwise just test the command works.
-    let output = pt_core_with_data(data_dir)
-        .args([
-            "--format",
-            "json",
-            "agent",
-            "sessions",
-            "--cleanup",
-            "--older-than",
-            "0d",
-        ])
-        .assert()
-        .get_output()
-        .stdout
-        .clone();
-
-    // If zero-duration isn't supported, the command may error — that's fine,
-    // we just verify the command is parseable.
-    if let Ok(json) = serde_json::from_slice::<Value>(&output) {
-        assert!(
-            json.get("removed_count").is_some() || json.get("status").is_some(),
-            "cleanup should produce structured output"
-        );
+    let sessions = dir.path().join("sessions");
+    let mut predicted_bytes = 0u64;
+    for (suffix, old, state) in [
+        ("plan", true, SessionState::Planned),
+        ("scan", true, SessionState::Scanning),
+        ("exec", true, SessionState::Executing),
+        ("undo", true, SessionState::Completed),
+        ("fres", false, SessionState::Completed),
+    ] {
+        let id = SessionId(format!("pt-20260101-000000-{suffix}"));
+        let path = sessions.join(&id.0);
+        std::fs::create_dir_all(path.join("scan")).unwrap();
+        let mut manifest = SessionManifest::new(&id, None, SessionMode::RobotPlan, None);
+        manifest.state = state;
+        if old {
+            manifest.timing.created_at = "2001-01-01T00:00:00Z".into();
+        }
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        std::fs::write(path.join("manifest.json"), &manifest_bytes).unwrap();
+        std::fs::write(path.join("scan/inventory.json"), b"[]").unwrap();
+        if suffix == "undo" {
+            std::fs::create_dir_all(path.join("action/reversals")).unwrap();
+        }
+        if matches!(suffix, "plan" | "scan") {
+            predicted_bytes += manifest_bytes.len() as u64 + 2;
+        }
     }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(
+        sessions.join("pt-20260101-000000-fres"),
+        sessions.join("pt-20260101-000000-scan/external"),
+    )
+    .unwrap();
+
+    let run = |format: &str, args: &[&str]| -> Value {
+        let output = pt_core_with_data(data_dir)
+            .args([
+                "--format",
+                format,
+                "agent",
+                "sessions",
+                "--cleanup",
+                "--older-than",
+                "7d",
+            ])
+            .args(args)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        serde_json::from_slice(&output).unwrap()
+    };
+    let eligible = serde_json::json!(["pt-20260101-000000-plan", "pt-20260101-000000-scan"]);
+    for args in [
+        &[][..],
+        &["--robot"][..],
+        &["--yes", "--dry-run"][..],
+        &["--yes", "--shadow"][..],
+    ] {
+        let preview = run("json", args);
+        assert_eq!(preview["preview"], true);
+        assert_eq!(preview["removed_count"], 0);
+        assert_eq!(preview["eligible_sessions"], eligible);
+        assert_eq!(preview["eligible_count"], 2);
+        assert_eq!(preview["eligible_file_bytes"], predicted_bytes);
+        assert!(sessions
+            .join("pt-20260101-000000-plan/manifest.json")
+            .is_file());
+    }
+    assert_eq!(run("jsonl", &[])["eligible_sessions"], eligible);
+    for invalid in [
+        &["--session", "pt-20260101-000000-plan"][..],
+        &["--limit", "10"][..],
+        &["--older-than=-1d"][..],
+    ] {
+        pt_core_with_data(data_dir)
+            .args(["agent", "sessions", "--cleanup", "--yes"])
+            .args(invalid)
+            .assert()
+            .code(10);
+        assert!(sessions.join("pt-20260101-000000-plan").is_dir());
+    }
+    let applied = run("json", &["--yes"]);
+    assert_eq!(applied["preview"], false);
+    assert_eq!(applied["removed_sessions"], eligible);
+    assert_eq!(applied["eligible_file_bytes"], predicted_bytes);
+    for suffix in ["plan", "scan"] {
+        assert!(!sessions
+            .join(format!("pt-20260101-000000-{suffix}"))
+            .exists());
+    }
+    for suffix in ["exec", "undo", "fres"] {
+        assert!(sessions
+            .join(format!("pt-20260101-000000-{suffix}/manifest.json"))
+            .is_file());
+    }
+    assert_eq!(run("json", &["--yes"])["removed_count"], 0);
 }
 
 // ============================================================================

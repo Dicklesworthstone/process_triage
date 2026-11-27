@@ -1143,7 +1143,8 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_s
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from sessions" -l fields -d 'Select specific output fields (comma-separated or preset: minimal, standard, full)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from sessions" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from sessions" -l detail -d 'Include full session detail (plan contents, actions taken)'
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from sessions" -l cleanup -d 'Remove old sessions'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from sessions" -l cleanup -d 'Preview old sessions eligible for removal'
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from sessions" -l yes -d 'Confirm removal of eligible sessions with --cleanup'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from sessions" -s v -l verbose -d 'Increase verbosity (-v, -vv, -vvv)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from sessions" -s q -l quiet -d 'Decrease verbosity (quiet mode)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from sessions" -l no-color -d 'Disable colored output'
@@ -1847,7 +1848,8 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_s
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from sessions" -l fields -d 'Select specific output fields (comma-separated or preset: minimal, standard, full)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from sessions" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from sessions" -l detail -d 'Include full session detail (plan contents, actions taken)'
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from sessions" -l cleanup -d 'Remove old sessions'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from sessions" -l cleanup -d 'Preview old sessions eligible for removal'
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from sessions" -l yes -d 'Confirm removal of eligible sessions with --cleanup'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from sessions" -s v -l verbose -d 'Increase verbosity (-v, -vv, -vvv)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from sessions" -s q -l quiet -d 'Decrease verbosity (quiet mode)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from sessions" -l no-color -d 'Disable colored output'

@@ -1707,16 +1707,20 @@ struct AgentSessionsArgs {
     detail: bool,
 
     /// Maximum sessions to return in list mode (default: 10)
-    #[arg(long, default_value = "10")]
-    limit: u32,
+    #[arg(long)]
+    limit: Option<u32>,
 
     /// Filter by session state
     #[arg(long)]
     state: Option<String>,
 
-    /// Remove old sessions
+    /// Preview old sessions eligible for removal
     #[arg(long)]
     cleanup: bool,
+
+    /// Confirm removal of eligible sessions with --cleanup
+    #[arg(long, requires = "cleanup")]
+    yes: bool,
 
     /// Remove sessions older than duration (e.g., "7d", "30d")
     #[arg(long, default_value = "7d")]
@@ -50782,7 +50786,7 @@ fn run_agent_sessions(global: &GlobalOpts, args: &AgentSessionsArgs) -> ExitCode
             eprintln!("agent sessions: --session cannot be combined with --cleanup");
             return ExitCode::ArgsError;
         }
-        if args.limit != 10 {
+        if args.limit.is_some() {
             eprintln!(
                 "agent sessions: --session cannot be combined with --limit (limit only applies to list mode)"
             );
@@ -50813,7 +50817,11 @@ fn run_agent_sessions(global: &GlobalOpts, args: &AgentSessionsArgs) -> ExitCode
 
     // Handle cleanup mode
     if args.cleanup {
-        return run_agent_sessions_cleanup(global, &store, &args.older_than, &host_id);
+        if args.state.is_some() || args.limit.is_some() || args.detail {
+            eprintln!("agent sessions: --state, --limit and --detail do not apply to --cleanup");
+            return ExitCode::ArgsError;
+        }
+        return run_agent_sessions_cleanup(global, &store, &args.older_than, &host_id, args.yes);
     }
 
     // Default: list sessions
@@ -51253,8 +51261,9 @@ fn run_agent_sessions_cleanup(
     store: &SessionStore,
     older_than_str: &str,
     host_id: &str,
+    confirmed: bool,
 ) -> ExitCode {
-    let duration = match parse_duration(older_than_str) {
+    let duration = match parse_duration(older_than_str).filter(|d| *d >= chrono::Duration::zero()) {
         Some(d) => d,
         None => {
             eprintln!(
@@ -51265,29 +51274,56 @@ fn run_agent_sessions_cleanup(
         }
     };
 
-    let result = match store.cleanup_sessions(duration) {
+    let preview = !confirmed || global.dry_run || global.shadow;
+    let cleanup = if preview {
+        store.preview_cleanup(duration)
+    } else {
+        store.cleanup_sessions(duration)
+    };
+    let result = match cleanup {
         Ok(r) => r,
+        Err(pt_core::session::SessionError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::WouldBlock =>
+        {
+            eprintln!("agent sessions: cleanup deferred while the session store is in use");
+            return ExitCode::LockError;
+        }
         Err(e) => {
             eprintln!("agent sessions: cleanup failed: {}", e);
             return ExitCode::InternalError;
         }
     };
 
+    let command = format!("pt agent sessions --cleanup --older-than {older_than_str}");
+    let confirm_command = format!("{command} --yes");
     match global.format {
-        OutputFormat::Json | OutputFormat::Toon => {
+        OutputFormat::Json | OutputFormat::Jsonl | OutputFormat::Toon => {
             let output = serde_json::json!({
                 "schema_version": SCHEMA_VERSION,
                 "generated_at": chrono::Utc::now().to_rfc3339(),
                 "host_id": host_id,
                 "older_than": older_than_str,
+                "preview": preview,
+                "eligible_count": result.eligible_sessions.len(),
+                "eligible_file_bytes": result.eligible_file_bytes,
+                "eligible_sessions": result.eligible_sessions,
                 "removed_count": result.removed_count,
                 "removed_sessions": result.removed_sessions,
                 "preserved_count": result.preserved_count,
                 "errors": result.errors,
                 "status": if result.errors.is_empty() { "ok" } else { "partial" },
-                "command": format!("pt agent sessions --cleanup --older-than {}", older_than_str),
+                "command": if preview { &command } else { &confirm_command },
+                "confirm_command": preview.then_some(&confirm_command),
             });
             println!("{}", format_structured_output(global, output));
+        }
+        OutputFormat::Summary if preview => {
+            println!(
+                "{} eligible sessions ({} file bytes). Confirm with: {}",
+                result.eligible_sessions.len(),
+                result.eligible_file_bytes,
+                confirm_command
+            );
         }
         OutputFormat::Summary => {
             println!(
@@ -51300,11 +51336,19 @@ fn run_agent_sessions_cleanup(
             println!("# Session Cleanup");
             println!();
             println!("Older than: {}", older_than_str);
+            if preview {
+                println!(
+                    "Eligible: {} sessions ({} file bytes)",
+                    result.eligible_sessions.len(),
+                    result.eligible_file_bytes
+                );
+                for session in &result.eligible_sessions {
+                    println!("  - {session}");
+                }
+                println!("Confirm removal with: {confirm_command}");
+            }
             println!("Removed: {} sessions", result.removed_count);
-            println!(
-                "Preserved: {} sessions (active or in-progress)",
-                result.preserved_count
-            );
+            println!("Preserved: {} sessions", result.preserved_count);
             if !result.errors.is_empty() {
                 println!();
                 println!("## Errors");
@@ -51322,7 +51366,11 @@ fn run_agent_sessions_cleanup(
         }
     }
 
-    ExitCode::Clean
+    if result.errors.is_empty() {
+        ExitCode::Clean
+    } else {
+        ExitCode::PartialFail
+    }
 }
 
 fn run_agent_sessions_list(
@@ -51347,7 +51395,7 @@ fn run_agent_sessions_list(
         });
 
     let options = ListSessionsOptions {
-        limit: Some(args.limit),
+        limit: Some(args.limit.unwrap_or(10)),
         state: state_filter,
         older_than: None,
     };
