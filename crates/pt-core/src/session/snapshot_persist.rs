@@ -838,8 +838,7 @@ pub struct RecordedProtection {
 }
 
 fn valid_recorded_start_id(pid: u32, start_id: &str) -> bool {
-    pt_common::StartId::parse(start_id).is_some()
-        && start_id.rsplit(':').next().and_then(|p| p.parse().ok()) == Some(pid)
+    pt_common::StartId::is_observation_for(start_id, pid)
 }
 
 fn valid_recorded_posterior(values: &[f64]) -> bool {
@@ -1557,6 +1556,25 @@ mod tests {
         assert!(load_recorded_explanation_snapshot(&handle)
             .unwrap_err()
             .contains("invalid recorded plan"));
+    }
+
+    #[test]
+    fn unavailable_birth_can_join_artifacts_only_within_its_recorded_observation() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let mut inventory = sample_inventory();
+        let mut inference = sample_inference();
+        let pid = inventory.records[0].pid;
+        let tag = pt_common::StartId::unverified(pid);
+        inventory.records[0].start_id = tag.0.clone();
+        inference.candidates[0].start_id = tag.0;
+        persist_inventory(&handle, &handle.id.0, "host1", inventory).unwrap();
+        persist_inference(&handle, &handle.id.0, "host1", inference.clone()).unwrap();
+        assert!(load_recorded_snapshot_pair(&handle).is_ok());
+
+        inference.candidates[0].start_id = pt_common::StartId::unverified(pid).0;
+        persist_inference(&handle, &handle.id.0, "host1", inference).unwrap();
+        assert!(load_recorded_snapshot_pair(&handle).is_err());
     }
 
     #[test]

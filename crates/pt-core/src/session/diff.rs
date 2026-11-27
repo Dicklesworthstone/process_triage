@@ -4,7 +4,7 @@
 //! downstream commands can use for incremental display and agent diffs.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use super::snapshot_persist::{PersistedInference, PersistedProcess};
 
@@ -115,6 +115,9 @@ pub struct SessionDiff {
 pub struct DiffSummary {
     pub total_old: usize,
     pub total_new: usize,
+    /// A missing native birth on either side prevents lifecycle comparisons for that PID.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub unverified_pids: BTreeSet<u32>,
     pub new_count: usize,
     pub resolved_count: usize,
     pub changed_count: usize,
@@ -149,6 +152,16 @@ impl Default for DiffConfig {
 // Core diff algorithm
 // ---------------------------------------------------------------------------
 
+/// A whole PID is incomparable when either snapshot lacks its birth. Keeping
+/// only the stronger side would turn unknown continuity into an arrival or exit.
+pub fn unverified_comparison_pids<'a>(
+    observations: impl Iterator<Item = (u32, &'a str)>,
+) -> BTreeSet<u32> {
+    observations
+        .filter_map(|(pid, raw)| pt_common::StartId::is_unverified_observation_for(raw, pid).then_some(pid))
+        .collect()
+}
+
 /// Compute the diff between two session snapshots.
 ///
 /// `old_procs` / `old_inferences` are from the baseline session.
@@ -162,6 +175,9 @@ pub fn compute_diff(
     new_inferences: &[PersistedInference],
     config: &DiffConfig,
 ) -> SessionDiff {
+    let unverified_pids = unverified_comparison_pids(
+        old_procs.iter().chain(new_procs).map(|p| (p.pid, p.start_id.as_str())),
+    );
     // Build lookup maps by identity key.
     let old_proc_map: HashMap<&str, &PersistedProcess> =
         old_procs.iter().map(|p| (p.start_id.as_str(), p)).collect();
@@ -181,6 +197,9 @@ pub fn compute_diff(
 
     // Processes in new snapshot: either New or Changed/Unchanged.
     for (key, new_proc) in &new_proc_map {
+        if unverified_pids.contains(&new_proc.pid) {
+            continue;
+        }
         let new_inf = new_inf_map.get(key);
         let old_inf = old_inf_map.get(key);
 
@@ -219,7 +238,7 @@ pub fn compute_diff(
 
     // Processes only in old snapshot: Resolved.
     for (key, old_proc) in &old_proc_map {
-        if !new_proc_map.contains_key(key) {
+        if !unverified_pids.contains(&old_proc.pid) && !new_proc_map.contains_key(key) {
             let old_inf = old_inf_map.get(key);
             deltas.push(ProcessDelta {
                 pid: old_proc.pid,
@@ -257,6 +276,7 @@ pub fn compute_diff(
     let mut summary = DiffSummary {
         total_old: old_procs.len(),
         total_new: new_procs.len(),
+        unverified_pids,
         new_count: 0,
         resolved_count: 0,
         changed_count: 0,
@@ -487,6 +507,22 @@ mod tests {
             start_time_unix: 1700000000,
             elapsed_secs: 100,
             identity_quality: "Full".to_string(),
+        }
+    }
+
+    #[test]
+    fn unavailable_birth_does_not_assert_a_lifecycle_change_for_either_side() {
+        let tag = pt_common::StartId::unverified(42);
+        let old = vec![proc(42, &tag.0), proc(43, "boot:15:43")];
+        for other in [&tag.0[..], "boot:20:42"] {
+            let new = vec![proc(42, other), proc(44, "boot:22:44")];
+            for (base, current) in [(&old, &new), (&new, &old)] {
+                let diff = compute_diff("base", "current", base, &[], current, &[], &DiffConfig::default());
+                assert_eq!(diff.summary.unverified_pids, BTreeSet::from([42]));
+                assert_eq!((diff.summary.total_old, diff.summary.total_new), (2, 2));
+                assert_eq!((diff.summary.new_count, diff.summary.resolved_count), (1, 1));
+                assert!(diff.deltas.iter().all(|delta| delta.pid != 42));
+            }
         }
     }
 

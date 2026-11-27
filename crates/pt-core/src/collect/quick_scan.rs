@@ -739,7 +739,10 @@ fn parse_ps_line_with_timing(
         }
         let start_id = match synthetic_now_unix {
             Some(_) => compute_start_id_synthetic(platform, boot_id, start_time_unix, parsed.pid),
-            None => compute_start_id(platform, boot_id, start_time_unix, elapsed, parsed.pid),
+            // A seconds-resolution ps age cannot identify a process birth.
+            // Retain the row for the census and tree guards, but never join this
+            // observation to a later occupant of the PID or authorize an action.
+            None => StartId::unverified(parsed.pid),
         };
         (start_time_unix, elapsed, start_id)
     };
@@ -959,71 +962,6 @@ fn parse_etime_format(s: &str) -> Option<u64> {
     Some(days_part * 86400 + hours * 3600 + mins * 60 + secs)
 }
 
-/// Compute start_id from available information.
-fn compute_start_id(
-    platform: &str,
-    boot_id: &Option<String>,
-    start_time_unix: i64,
-    elapsed: Duration,
-    pid: u32,
-) -> StartId {
-    match platform {
-        "linux" => {
-            let boot = boot_id.as_deref().unwrap_or("unknown");
-            let start_ticks = linux_start_ticks_from_uptime(elapsed)
-                .or_else(|| linux_start_ticks_from_btime(start_time_unix));
-            let ticks = start_ticks.unwrap_or_else(|| start_time_unix.max(0) as u64);
-            StartId::from_linux(boot, ticks, pid)
-        }
-        "macos" => {
-            // macOS: use start_time:pid (no boot_id available easily)
-            let boot = boot_id.as_deref().unwrap_or("unknown");
-            StartId::from_macos(boot, start_time_unix as u64, pid)
-        }
-        _ => {
-            // Fallback: use start_time:pid
-            StartId(format!("unknown:{}:{}", start_time_unix, pid))
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn linux_start_ticks_from_uptime(elapsed: Duration) -> Option<u64> {
-    let uptime = read_uptime_seconds()?;
-    let hz = clock_ticks_per_second()?;
-    let elapsed_secs = elapsed.as_secs_f64();
-    if uptime < elapsed_secs {
-        return None;
-    }
-    let start_secs = uptime - elapsed_secs;
-    let ticks = (start_secs * hz as f64).floor();
-    if ticks.is_sign_negative() {
-        return None;
-    }
-    Some(ticks as u64)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn linux_start_ticks_from_uptime(_elapsed: Duration) -> Option<u64> {
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn linux_start_ticks_from_btime(start_time_unix: i64) -> Option<u64> {
-    let boot_time = read_boot_time_unix()?;
-    let hz = clock_ticks_per_second()?;
-    let delta = start_time_unix - boot_time;
-    if delta < 0 {
-        return None;
-    }
-    Some((delta as u64) * hz)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn linux_start_ticks_from_btime(_start_time_unix: i64) -> Option<u64> {
-    None
-}
-
 /// Exact process timing read from the kernel.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct ExactTiming {
@@ -1041,7 +979,7 @@ struct ExactTiming {
 /// ticks used for identity (start_id) checks before signaling.
 #[cfg(target_os = "linux")]
 fn linux_exact_timing(pid: u32, clock: &LinuxClock) -> Option<ExactTiming> {
-    let stat = super::proc_parsers::parse_proc_stat(pid)?;
+    let stat = super::proc_parsers::read_required_proc_stat(pid).ok()?;
     let start_secs = stat.starttime as f64 / clock.hz as f64;
     // A start time after "now" means we read a different/garbled record.
     if start_secs > clock.uptime + 1.0 {
@@ -1950,6 +1888,30 @@ mod tests {
         let rec = parse_ps_line_with_timing(line, "linux", &Some("b".into()), None, Some(&clock))
             .expect("parse");
         assert_eq!(rec.elapsed, Duration::ZERO);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unavailable_kernel_birth_preserves_ps_inventory_without_an_action_identity() {
+        let line = "4194304 1 1000 u 4194304 4194304 S 0.0 10 20 ? Tue Jan 14 10:30:00 2026 3600 worker worker --job";
+        let clock = LinuxClock {
+            hz: 100,
+            uptime: 8000.0,
+            boot_time: 1_788_000_000,
+        };
+        let observe = || {
+            parse_ps_line_with_timing(line, "linux", &Some("real-boot".into()), None, Some(&clock))
+                .unwrap()
+        };
+        let first = observe();
+        assert_eq!(first.elapsed, Duration::from_secs(3600));
+        assert_eq!(first.ppid, ProcessId(1));
+        assert_eq!(first.cmd, "worker --job");
+        assert_ne!(first.start_id, observe().start_id);
+        assert!(StartId::parse(&first.start_id.0).is_none());
+        let target = pt_common::ProcessIdentity::new(first.pid.0, first.start_id, first.uid);
+        assert_eq!(target.quality, pt_common::IdentityQuality::PidOnly);
+        assert!(!target.can_safely_revalidate());
     }
 
     #[test]

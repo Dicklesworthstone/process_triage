@@ -343,7 +343,7 @@ pub fn generate_plan(bundle: &DecisionBundle) -> Plan {
     let mut blocked_candidates = 0;
 
     for candidate in &bundle.candidates {
-        let blocked = !candidate.blocked_reasons.is_empty();
+        let blocked = !candidate.blocked_reasons.is_empty() || !candidate.identity.can_safely_revalidate();
         if blocked {
             blocked_candidates += 1;
             continue;
@@ -575,6 +575,7 @@ fn plan_zombie_actions(candidate: &DecisionCandidate, policy: &Policy) -> Option
     // list. Other explicitly protected parent PIDs are also non-executable;
     // the summary still counts only candidates carrying blocked_reasons.
     if parent_identity.pid.0 <= 1
+        || !parent_identity.can_safely_revalidate()
         || policy
             .guardrails
             .never_kill_pid
@@ -930,6 +931,24 @@ mod tests {
             page_size_bytes: 4096,
         });
         input
+    }
+
+    #[test]
+    fn unverified_process_birth_never_produces_a_direct_or_routed_action() {
+        let mut direct = candidate(42, Action::Renice, 1.0, 0.3);
+        direct.identity.start_id = StartId::unverified(42);
+        let mut zombie = candidate(43, Action::Kill, 1.0, 0.3);
+        zombie.process_state = Some(ProcessState::Zombie);
+        zombie.parent_identity = Some(direct.identity.clone());
+        let bundle = DecisionBundle {
+            session_id: SessionId("pt-20260115-120000-abcd".into()),
+            policy: Policy::default(),
+            candidates: vec![direct, zombie, candidate(44, Action::Renice, 1.0, 0.3)],
+            generated_at: Some("2026-01-15T12:00:00Z".into()),
+        };
+        let plan = generate_plan(&bundle);
+        assert_eq!(plan.actions.len(), 1);
+        assert_eq!(plan.actions[0].target.pid.0, 44);
     }
 
     #[test]

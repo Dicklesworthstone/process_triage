@@ -45,6 +45,37 @@ impl StartId {
         StartId(format!("{}:{}:{}", boot_id, start_time, pid))
     }
 
+    /// Tag one census observation for which the kernel birth could not be read.
+    /// The opaque component cannot parse as ticks or join successive scans by PID.
+    pub fn unverified(pid: u32) -> Self {
+        Self(format!("unverified:{}:{pid}", uuid::Uuid::new_v4()))
+    }
+
+    fn is_unverified(&self) -> bool {
+        self.0.starts_with("unverified:")
+    }
+
+    /// Validate the opaque tag on a stored observation. Even two records carrying
+    /// the same tag cannot establish that a process persisted across scans.
+    pub fn is_unverified_observation_for(raw: &str, pid: u32) -> bool {
+        let Some((nonce, recorded_pid)) = raw.strip_prefix("unverified:").and_then(|s| s.split_once(':')) else {
+            return false;
+        };
+        pid > 0
+            && recorded_pid.parse::<u32>() == Ok(pid)
+            && uuid::Uuid::parse_str(nonce).is_ok_and(|id| {
+                id.get_version_num() == 4 && id.hyphenated().to_string() == nonce
+            })
+    }
+
+    /// Stored observations can identify an inventory row even when no kernel
+    /// birth was available. Action targets still require the normal birth parser.
+    pub fn is_observation_for(raw: &str, pid: u32) -> bool {
+        Self::is_unverified_observation_for(raw, pid)
+            || (Self::parse(raw).is_some()
+                && raw.rsplit(':').next().and_then(|s| s.parse().ok()) == Some(pid))
+    }
+
     /// Parse and validate a StartId string.
     pub fn parse(s: &str) -> Option<Self> {
         let mut parts = s.split(':');
@@ -56,7 +87,7 @@ impl StartId {
         }
         // boot_id can be a UUID (Linux) or "synthetic"/"unknown" (macOS/fallback)
         // We validate that it's not empty rather than requiring strict UUID format.
-        if boot_id.is_empty() {
+        if boot_id.is_empty() || boot_id == "unverified" {
             return None;
         }
         if start_time.parse::<u64>().is_err() {
@@ -209,14 +240,7 @@ pub struct ProcessIdentity {
 impl ProcessIdentity {
     /// Create a new ProcessIdentity with full quality.
     pub fn new(pid: u32, start_id: StartId, uid: u32) -> Self {
-        ProcessIdentity {
-            pid: ProcessId(pid),
-            start_id,
-            uid,
-            pgid: None,
-            sid: None,
-            quality: IdentityQuality::Full,
-        }
+        Self::full(pid, start_id, uid, None, None, IdentityQuality::Full)
     }
 
     /// Create a ProcessIdentity with all fields.
@@ -228,6 +252,11 @@ impl ProcessIdentity {
         sid: Option<u32>,
         quality: IdentityQuality,
     ) -> Self {
+        let quality = if start_id.is_unverified() {
+            IdentityQuality::PidOnly
+        } else {
+            quality
+        };
         ProcessIdentity {
             pid: ProcessId(pid),
             start_id,
@@ -242,14 +271,17 @@ impl ProcessIdentity {
     ///
     /// Returns true if both identities refer to the same process incarnation.
     pub fn matches(&self, other: &ProcessIdentity) -> bool {
-        self.pid == other.pid && self.start_id == other.start_id && self.uid == other.uid
+        !self.start_id.is_unverified()
+            && self.pid == other.pid
+            && self.start_id == other.start_id
+            && self.uid == other.uid
     }
 
     /// Check if a revalidation should be trusted.
     ///
     /// Returns false if identity quality is too weak for safe revalidation.
     pub fn can_safely_revalidate(&self) -> bool {
-        self.quality.is_automatable()
+        self.quality.is_automatable() && !self.start_id.is_unverified()
     }
 }
 
@@ -276,6 +308,23 @@ mod tests {
         let sid = SessionId::new();
         assert!(sid.0.starts_with("pt-"));
         assert_eq!(sid.0.len(), 23);
+    }
+
+    #[test]
+    fn unverified_birth_is_local_to_one_observation_and_cannot_be_promoted() {
+        let start = StartId::unverified(42);
+        assert_ne!(start, StartId::unverified(42));
+        assert!(StartId::is_observation_for(&start.0, 42));
+        assert!(!StartId::is_observation_for(&start.0, 41));
+        assert!(!StartId::is_observation_for("unverified:123:42", 42));
+        assert!(StartId::parse(&start.0).is_none());
+        assert!(StartId::parse("unverified:123:42").is_none());
+        let mut target = ProcessIdentity::new(42, start, 1000);
+        assert_eq!(target.quality, IdentityQuality::PidOnly);
+        assert!(!target.matches(&target.clone()));
+        // Even a stale serialized quality field cannot confer a kernel birth.
+        target.quality = IdentityQuality::Full;
+        assert!(!target.can_safely_revalidate());
     }
 
     #[test]

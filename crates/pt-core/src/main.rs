@@ -33804,7 +33804,12 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                 state: proc.state.to_string(),
                 start_time_unix: proc.start_time_unix,
                 elapsed_secs: proc.elapsed.as_secs(),
-                identity_quality: "QuickScan".to_string(),
+                identity_quality: if process_identity_from_record(proc).can_safely_revalidate() {
+                    "QuickScan"
+                } else {
+                    "PidOnly"
+                }
+            .to_string(),
             })
             .collect();
         let mut persisted_inference_records: Vec<PersistedInference> = Vec::new();
@@ -36291,6 +36296,9 @@ fn candidate_policy_evidence_subject<'a>(
     parent: Option<&'a ProcessRecord>,
     action: Action,
 ) -> Result<&'a ProcessRecord, &'static str> {
+    if action != Action::Keep && !process_identity_from_record(process).can_safely_revalidate() {
+        return Err("process birth was unavailable; this observation cannot be an action target");
+    }
     if !process.state.is_zombie() || !matches!(action, Action::Kill | Action::Restart) {
         return Ok(process);
     }
@@ -38020,8 +38028,12 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             state: proc.state.to_string(),
             start_time_unix: proc.start_time_unix,
             elapsed_secs: proc.elapsed.as_secs(),
-            // Quick scan provides a solid start_id but lacks full TOCTOU coverage.
-            identity_quality: "QuickScan".to_string(),
+            identity_quality: if process_identity_from_record(proc).can_safely_revalidate() {
+                "QuickScan"
+            } else {
+                "PidOnly"
+            }
+            .to_string(),
         };
 
         let persisted_inf = PersistedInference {
@@ -44771,6 +44783,15 @@ fn format_diff_plain(
     output
 }
 
+fn report_unverified_diff_pids(global: &GlobalOpts, count: usize) {
+    if count > 0 && !matches!(
+        global.format,
+        OutputFormat::Json | OutputFormat::Jsonl | OutputFormat::Toon | OutputFormat::Exitcode
+    ) {
+        eprintln!("Birth identity unavailable for {count} PID(s); their changes could not be determined.");
+    }
+}
+
 fn run_diff(global: &GlobalOpts, args: &DiffArgs) -> ExitCode {
     let store = match SessionStore::from_env() {
         Ok(store) => store,
@@ -44823,6 +44844,7 @@ fn run_diff(global: &GlobalOpts, args: &DiffArgs) -> ExitCode {
         }
     };
 
+    report_unverified_diff_pids(global, diff.summary.unverified_pids.len());
     let filtered_summary = summarize_deltas(&filtered_deltas);
     let report = generate_comparison_report(
         &diff,
@@ -45794,13 +45816,7 @@ fn run_agent_diff(global: &GlobalOpts, args: &AgentDiffArgs) -> ExitCode {
         let mut identities = HashSet::new();
         for candidate in &candidates {
             if candidate.pid == 0
-                || pt_common::StartId::parse(&candidate.start_id).is_none()
-                || candidate
-                    .start_id
-                    .rsplit(':')
-                    .next()
-                    .and_then(|pid| pid.parse::<u32>().ok())
-                    != Some(candidate.pid)
+                || !pt_common::StartId::is_observation_for(&candidate.start_id, candidate.pid)
                 || candidate.score > 100
             {
                 return Err(format!(
@@ -45829,6 +45845,12 @@ fn run_agent_diff(global: &GlobalOpts, args: &AgentDiffArgs) -> ExitCode {
         }
     };
 
+    let unverified_pids = pt_core::session::diff::unverified_comparison_pids(
+        base_candidates
+            .iter()
+            .chain(&compare_candidates)
+            .map(|c| (c.pid, c.start_id.as_str())),
+    );
     let candidate_key =
         |c: &DiffCandidate| -> (u32, String, u32) { (c.pid, c.start_id.clone(), c.uid) };
 
@@ -45856,12 +45878,12 @@ fn run_agent_diff(global: &GlobalOpts, args: &AgentDiffArgs) -> ExitCode {
     // identical argv, and a reused PID belongs to a new process incarnation.
     // Ordered maps also make repeated comparisons byte-stable.
     let mut base_map: BTreeMap<(u32, String, u32), DiffCandidate> = BTreeMap::new();
-    for cand in &base_candidates {
+    for cand in base_candidates.iter().filter(|c| !unverified_pids.contains(&c.pid)) {
         base_map.insert(candidate_key(cand), cand.clone());
     }
 
     let mut compare_map: BTreeMap<(u32, String, u32), DiffCandidate> = BTreeMap::new();
-    for cand in &compare_candidates {
+    for cand in compare_candidates.iter().filter(|c| !unverified_pids.contains(&c.pid)) {
         compare_map.insert(candidate_key(cand), cand.clone());
     }
 
@@ -46029,6 +46051,7 @@ fn run_agent_diff(global: &GlobalOpts, args: &AgentDiffArgs) -> ExitCode {
         },
         "summary": {
             "prior_candidates": base_candidates.len(),
+            "unverified_pids": unverified_pids,
             "current_candidates": compare_candidates.len(),
             "new_count": new_list.len(),
             "worsened_count": worsened.len(),
@@ -46039,6 +46062,8 @@ fn run_agent_diff(global: &GlobalOpts, args: &AgentDiffArgs) -> ExitCode {
             "filtered": focus != FocusMode::All,
         },
     });
+
+    report_unverified_diff_pids(global, unverified_pids.len());
 
     match global.format {
         OutputFormat::Json | OutputFormat::Toon => {

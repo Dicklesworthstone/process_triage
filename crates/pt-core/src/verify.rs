@@ -1025,7 +1025,7 @@ fn recorded_action_outcomes<'a>(
                 || outcome
                     .target
                     .as_ref()
-                    .is_some_and(|target| !target.matches(&action.target))
+                    .is_some_and(|target| target != &action.target && !target.matches(&action.target))
             {
                 return Err(VerifyError::InvalidOutcomes(format!(
                     "{} failed attempt target does not match the plan",
@@ -3160,6 +3160,21 @@ mod tests {
                 assert!(verified.resource_summary.is_none());
             }
         }
+    }
+
+    #[test]
+    fn a_refusal_for_an_unverified_observation_is_never_execution_evidence() {
+        let mut action = make_action(123, Action::Kill);
+        action.target = ProcessIdentity::new(123, pt_common::StartId::unverified(123), 1000);
+        let mut failed = failed_attempt(&action);
+        failed.target = Some(action.target.clone());
+        let success = execution(&action);
+        let plan = make_plan(vec![action]);
+        assert!(executed_plan_actions(&plan, std::slice::from_ref(&failed)).unwrap().is_empty());
+        assert!(executed_plan_actions(&plan, &[success]).is_err());
+
+        failed.target = Some(ProcessIdentity::new(123, pt_common::StartId::unverified(123), 1000));
+        assert!(executed_plan_actions(&plan, &[failed]).is_err());
     }
 
     #[test]
