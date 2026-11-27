@@ -444,6 +444,15 @@ impl CpusetQuarantineActionRunner {
             || {
                 deadline.check()?;
                 scope.revalidate(&action.target)?;
+                let checked_path = super::dispatch::ensure_cgroup_action_target(
+                    &action.target,
+                    Action::Quarantine,
+                )?;
+                if checked_path != scope.unified_path {
+                    return Err(ActionError::Failed(
+                        "target cgroup changed before quarantine".to_string(),
+                    ));
+                }
                 deadline.check()
             },
             |previous, requested| match &self.reversal_journal {
@@ -1523,6 +1532,36 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("without an executed assignment"));
+        }
+
+        #[test]
+        fn quarantine_refuses_new_fuse_evidence_before_controller_write() {
+            for changed in [Some(true), None] {
+                let directory = tempfile::tempdir().unwrap();
+                let requested = directory.path().join("cpuset.cpus");
+                let effective = directory.path().join("cpuset.cpus.effective");
+                fs::write(&requested, "\n").unwrap();
+                fs::write(&effective, "8-11\n").unwrap();
+                let evidence = std::cell::Cell::new(Some(false));
+                let result = CpusetQuarantineActionRunner::with_defaults()
+                    .apply_quarantine_with_reversal(
+                        directory.path(),
+                        "cpuset.cpus.effective",
+                        || {
+                            crate::action::dispatch::ensure_cgroup_fuse_evidence(
+                                Action::Quarantine,
+                                evidence.get(),
+                            )
+                        },
+                        |_, _| {
+                            evidence.set(changed);
+                            Ok(None)
+                        },
+                    );
+                assert!(result.is_err(), "evidence={changed:?}");
+                assert_eq!(fs::read_to_string(requested).unwrap(), "\n");
+                assert_eq!(fs::read_to_string(effective).unwrap(), "8-11\n");
+            }
         }
 
         #[test]

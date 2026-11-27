@@ -555,6 +555,13 @@ impl MemoryCapActionRunner {
                 deadline.check()?;
                 ensure_cap_state(&action.target)?;
                 scope.revalidate(&action.target, &plan.scope)?;
+                let checked_path = super::dispatch::ensure_cgroup_action_target(
+                    &action.target,
+                    Action::CapMemory,
+                )?;
+                if checked_path != plan.scope.cgroup_path {
+                    return Err(failed("target cgroup changed before memory cap"));
+                }
                 deadline.check()
             },
             || {
@@ -849,6 +856,37 @@ mod tests {
                 assert!(matches!(result, Err(ActionError::Timeout)));
                 assert_eq!(read_high(temp.path()).unwrap(), None);
             }
+            assert_eq!(
+                fs::read_to_string(temp.path().join("memory.max")).unwrap(),
+                "max\n"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn memory_cap_refuses_new_fuse_evidence_before_controller_write() {
+        let plan = plan();
+        for changed in [Some(true), None] {
+            let temp = fixture(&plan);
+            let evidence = std::cell::Cell::new(Some(false));
+            let result = apply_at(
+                temp.path(),
+                &plan,
+                || Ok(()),
+                || {
+                    crate::action::dispatch::ensure_cgroup_fuse_evidence(
+                        Action::CapMemory,
+                        evidence.get(),
+                    )
+                },
+                || {
+                    evidence.set(changed);
+                    Ok(None)
+                },
+            );
+            assert!(result.is_err(), "evidence={changed:?}");
+            assert_eq!(read_high(temp.path()).unwrap(), None);
             assert_eq!(
                 fs::read_to_string(temp.path().join("memory.max")).unwrap(),
                 "max\n"

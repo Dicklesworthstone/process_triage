@@ -465,6 +465,9 @@ impl CpuThrottleActionRunner {
             || {
                 deadline.check()?;
                 self.revalidate_membership(action, &scope)?;
+                let checked_path =
+                    super::dispatch::ensure_cgroup_action_target(&action.target, Action::Throttle)?;
+                scope.unified.check_current_path(&checked_path)?;
                 deadline.check()
             },
             |before, applied| match &self.reversal_journal {
@@ -1702,6 +1705,37 @@ mod tests {
                 );
                 assert_eq!(applied, desired);
                 assert!(receipt.is_none());
+            }
+        }
+
+        #[test]
+        fn throttle_refuses_new_fuse_evidence_before_controller_write() {
+            for is_v2 in [true, false] {
+                for changed in [Some(true), None] {
+                    let fixture =
+                        controller_fixture(is_v2, if is_v2 { "max" } else { "-1" }, "100000");
+                    let filename = if is_v2 { "cpu.max" } else { "cpu.cfs_quota_us" };
+                    let path = fixture.path().join(filename);
+                    let before = fs::read_to_string(&path).unwrap();
+                    let evidence = std::cell::Cell::new(Some(false));
+                    let result = CpuThrottleActionRunner::with_defaults()
+                        .apply_throttle_with_reversal(
+                            fixture.path(),
+                            is_v2,
+                            || {
+                                crate::action::dispatch::ensure_cgroup_fuse_evidence(
+                                    Action::Throttle,
+                                    evidence.get(),
+                                )
+                            },
+                            |_, _| {
+                                evidence.set(changed);
+                                Ok(None)
+                            },
+                        );
+                    assert!(result.is_err(), "v2={is_v2}, evidence={changed:?}");
+                    assert_eq!(fs::read_to_string(path).unwrap(), before);
+                }
             }
         }
 

@@ -391,7 +391,12 @@ impl FreezeActionRunner {
         let mut written = false;
         let execution = (|| {
             deadline.check()?;
-            scope.check_current_path(&super::dispatch::ensure_cgroup_target(&action.target)?)?;
+            let checked_path = if frozen {
+                super::dispatch::ensure_cgroup_action_target(&action.target, Action::Freeze)?
+            } else {
+                super::dispatch::ensure_cgroup_target(&action.target)?
+            };
+            scope.check_current_path(&checked_path)?;
             if let Some(before) = before {
                 if read_freezer_state(&scope.pinned_directory())?.requested != before.requested {
                     return Err(ActionError::Failed(

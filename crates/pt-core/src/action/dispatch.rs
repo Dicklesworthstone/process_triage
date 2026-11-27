@@ -462,8 +462,48 @@ pub(super) fn read_cgroup_identity(pid: u32) -> Option<pt_common::ProcessIdentit
 pub(super) fn ensure_cgroup_target(
     target: &pt_common::ProcessIdentity,
 ) -> Result<String, ActionError> {
+    ensure_cgroup_target_for_action(target, None)
+}
+
+/// Recheck live FUSE protection at a controller write boundary. Read-only
+/// observations and exact restoration use `ensure_cgroup_target` instead.
+#[cfg(target_os = "linux")]
+pub(super) fn ensure_cgroup_action_target(
+    target: &pt_common::ProcessIdentity,
+    action: Action,
+) -> Result<String, ActionError> {
+    ensure_cgroup_target_for_action(target, Some(action))
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn ensure_cgroup_fuse_evidence(
+    action: Action,
+    evidence: Option<bool>,
+) -> Result<(), ActionError> {
+    match super::prechecks::fuse_action_precheck(evidence, action) {
+        super::prechecks::PreCheckResult::Passed => Ok(()),
+        super::prechecks::PreCheckResult::Blocked { reason, .. } => {
+            Err(ActionError::Failed(reason))
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_cgroup_target_for_action(
+    target: &pt_common::ProcessIdentity,
+    action: Option<Action>,
+) -> Result<String, ActionError> {
     ensure_cgroup_target_with(
-        || ensure_cgroup_identity(target).map(|_| ()),
+        || {
+            ensure_cgroup_identity(target)?;
+            if let Some(action) = action {
+                ensure_cgroup_fuse_evidence(
+                    action,
+                    crate::collect::protected::holds_fuse_device(target.pid.0),
+                )?;
+            }
+            Ok(())
+        },
         || read_unified_cgroup_membership(target.pid.0),
         |path| {
             ensure_exclusive_cgroup_path(
@@ -1256,6 +1296,69 @@ mod tests {
                 .contains("effective-controller-access-refused"));
         } else {
             assert!(check_controller_access(&path).is_err());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_action_refuses_fuse_acquired_during_leaf_inspection() {
+        use std::cell::Cell;
+
+        for action in [
+            Action::Freeze,
+            Action::Throttle,
+            Action::Quarantine,
+            Action::CapMemory,
+        ] {
+            for changed in [Some(true), None] {
+                let evidence = Cell::new(Some(false));
+                let checks = Cell::new(0);
+                let result = ensure_cgroup_target_with(
+                    || {
+                        checks.set(checks.get() + 1);
+                        ensure_cgroup_fuse_evidence(action, evidence.get())
+                    },
+                    || Ok("/owned/leaf".to_string()),
+                    |_| {
+                        evidence.set(changed);
+                        Ok(())
+                    },
+                );
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains(if changed == Some(true) {
+                        "builtin.fuse_server"
+                    } else {
+                        "cannot inspect FUSE device descriptors"
+                    }),
+                    "{action:?}: {error}",
+                );
+                assert_eq!(checks.get(), 2);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_fuse_guard_preserves_safe_targets_and_restoration() {
+        for action in [
+            Action::Freeze,
+            Action::Throttle,
+            Action::Quarantine,
+            Action::CapMemory,
+        ] {
+            assert!(ensure_cgroup_fuse_evidence(action, Some(false)).is_ok());
+        }
+        for action in [Action::Unfreeze, Action::Unquarantine] {
+            for evidence in [Some(false), Some(true), None] {
+                let path = ensure_cgroup_target_with(
+                    || ensure_cgroup_fuse_evidence(action, evidence),
+                    || Ok("/owned/leaf".to_string()),
+                    |_| Ok(()),
+                )
+                .unwrap();
+                assert_eq!(path, "/owned/leaf");
+            }
         }
     }
 
