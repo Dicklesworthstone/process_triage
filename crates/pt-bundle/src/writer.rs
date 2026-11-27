@@ -86,6 +86,9 @@ impl BundleWriter {
             None => RedactionEngine::new(RedactionPolicy::default())?,
         };
         let profile = self.manifest.export_profile;
+        let source_session = self.manifest.session_id.clone();
+        let mut source_host =
+            (self.manifest.host_id != "unknown").then(|| self.manifest.host_id.clone());
         let policy_bytes = serde_json::to_vec(&serde_json::to_value(engine.policy())?)?;
         self.manifest.redaction_policy_version = engine.policy_version().to_string();
         self.manifest.redaction_policy_hash = FileEntry::compute_checksum(&policy_bytes);
@@ -124,6 +127,32 @@ impl BundleWriter {
                     }
                 }
             }
+            // Snapshot-only sessions have no plan summary. Keep their measured
+            // census and candidate counts without retaining any process rows.
+            for (path, bytes) in &self.files {
+                if matches!(
+                    path.as_str(),
+                    "scan/inventory.json" | "inference/results.json"
+                ) {
+                    let mut value = serde_json::from_slice(bytes)?;
+                    verify_snapshot_source(path, &mut value, &source_session, &mut source_host)?;
+                    let payload = &value["payload"];
+                    let fields: &[&str] = if path == "scan/inventory.json" {
+                        &[
+                            "total_system_processes",
+                            "protected_filtered",
+                            "record_count",
+                        ]
+                    } else {
+                        &["candidate_count"]
+                    };
+                    for &field in fields {
+                        if let Some(count) = payload[field].as_u64() {
+                            summary.entry(field).or_insert_with(|| count.into());
+                        }
+                    }
+                }
+            }
             self.files = vec![(
                 "summary.json".to_string(),
                 serde_json::to_vec_pretty(&summary)?,
@@ -137,7 +166,18 @@ impl BundleWriter {
                     .and_then(|entry| entry.mime_type.as_deref());
                 match file_type {
                     Some("application/json") => {
-                        let value = serde_json::from_slice(bytes)?;
+                        let mut value = serde_json::from_slice(bytes)?;
+                        if matches!(
+                            path.as_str(),
+                            "scan/inventory.json" | "inference/results.json"
+                        ) {
+                            verify_snapshot_source(
+                                path,
+                                &mut value,
+                                &source_session,
+                                &mut source_host,
+                            )?;
+                        }
                         let mut sanitized = engine.redact_json_for_export(&value, profile);
                         refresh_payload_integrity(&mut sanitized)?;
                         *bytes = serde_json::to_vec_pretty(&sanitized)?;
@@ -530,6 +570,54 @@ fn refresh_payload_integrity(value: &mut serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+/// Verify the canonical local payload before redaction gives it a new digest.
+/// Keep the raw JSON so older envelopes and additional producer fields survive.
+fn verify_snapshot_source(
+    path: &str,
+    envelope: &mut serde_json::Value,
+    session_id: &str,
+    host_id: &mut Option<String>,
+) -> Result<()> {
+    let invalid = || BundleError::CorruptedManifest(format!("invalid source envelope for {path}"));
+    if envelope["session_id"].as_str() != Some(session_id) {
+        return Err(invalid());
+    }
+    if let Some(host) = envelope.get("host_id") {
+        let host = host
+            .as_str()
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(invalid)?;
+        if host != host_id.get_or_insert_with(|| host.to_owned()).as_str() {
+            return Err(invalid());
+        }
+    }
+    let payload = envelope
+        .get_mut("payload")
+        .filter(|value| value.is_object())
+        .ok_or_else(invalid)?;
+    let (count, rows) = if path == "scan/inventory.json" {
+        ("record_count", "records")
+    } else {
+        ("candidate_count", "candidates")
+    };
+    if let Some(declared) = payload.get(count) {
+        let length = payload[rows].as_array().ok_or_else(invalid)?.len();
+        if declared.as_u64() != Some(length as u64) {
+            return Err(BundleError::CorruptedManifest(format!(
+                "source record count mismatch for {path}"
+            )));
+        }
+    }
+    payload.sort_all_objects();
+    let actual = FileEntry::compute_checksum(&serde_json::to_vec(payload)?);
+    if envelope["integrity_sha256"].as_str() != Some(actual.as_str()) {
+        return Err(BundleError::CorruptedManifest(format!(
+            "source payload checksum mismatch for {path}"
+        )));
+    }
+    Ok(())
+}
+
 fn export_artifact_path(engine: &RedactionEngine, path: &str) -> String {
     if matches!(
         path,
@@ -779,12 +867,16 @@ mod tests {
     #[test]
     fn export_recomputes_saved_envelope_integrity_after_redaction() {
         let mut writer = BundleWriter::new("session", "host", ExportProfile::Safe);
+        let mut payload =
+            serde_json::json!({"pid": 1234, "cmd": "private-customer-command", "score": 87});
+        payload.sort_all_objects();
         writer
             .add_json(
                 "inference/results.json",
                 &serde_json::json!({
-                    "integrity_sha256": "a".repeat(64),
-                    "payload": {"pid": 1234, "cmd": "private-customer-command", "score": 87}
+                    "session_id": "session", "host_id": "host",
+                    "integrity_sha256": FileEntry::compute_checksum(&serde_json::to_vec(&payload).unwrap()),
+                    "payload": payload
                 }),
             )
             .unwrap();
@@ -797,6 +889,64 @@ mod tests {
         );
         assert_eq!(envelope["payload"]["score"], 87);
         assert!(!envelope.to_string().contains("private-customer"));
+    }
+
+    #[test]
+    fn changed_snapshot_source_cannot_be_rechecksummed_for_sharing() {
+        for profile in [
+            ExportProfile::Minimal,
+            ExportProfile::Safe,
+            ExportProfile::Forensic,
+        ] {
+            let mut writer = BundleWriter::new("session", "host", profile);
+            writer
+                .add_json(
+                    "inference/results.json",
+                    &serde_json::json!({
+                        "session_id": "session", "host_id": "host",
+                        "integrity_sha256": "a".repeat(64),
+                        "payload": {"candidate_count": 0, "candidates": []},
+                    }),
+                )
+                .unwrap();
+            assert!(
+                matches!(writer.write_to_vec(), Err(BundleError::CorruptedManifest(message))
+                if message.contains("source payload checksum mismatch"))
+            );
+        }
+    }
+
+    #[test]
+    fn minimal_counts_cannot_combine_unrelated_hosts_or_miscount_rows() {
+        for (host, count, expected) in [
+            ("other-host", 0, "invalid source envelope"),
+            ("scanned-host", 1, "source record count mismatch"),
+        ] {
+            let mut writer = BundleWriter::new("session", "unknown", ExportProfile::Minimal);
+            for (path, host, mut payload) in [
+                (
+                    "scan/inventory.json",
+                    "scanned-host",
+                    serde_json::json!({"record_count":0, "records":[]}),
+                ),
+                (
+                    "inference/results.json",
+                    host,
+                    serde_json::json!({"candidate_count":count, "candidates":[]}),
+                ),
+            ] {
+                payload.sort_all_objects();
+                writer.add_json(path, &serde_json::json!({
+                    "session_id":"session", "host_id":host,
+                    "integrity_sha256":FileEntry::compute_checksum(&serde_json::to_vec(&payload).unwrap()),
+                    "payload":payload,
+                })).unwrap();
+            }
+            assert!(
+                matches!(writer.write_to_vec(), Err(BundleError::CorruptedManifest(message))
+                if message.contains(expected))
+            );
+        }
     }
 
     #[test]

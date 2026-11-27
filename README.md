@@ -1358,6 +1358,11 @@ pt agent report --bundle session.ptb --report-format prose --format json
 Encrypted reports use the same checksum verification and redaction profiles as
 plain bundles. An incorrect or missing passphrase fails before writing the report.
 
+Bundles from `pt agent snapshot` can also produce reports. Safe and forensic
+exports retain the recorded census, per-process scores, recommendations, and
+available evidence ledgers. The report joins each inference to its inventory
+record by PID and process birth identity. Minimal exports retain aggregate counts.
+
 ---
 
 ## Fleet Mode

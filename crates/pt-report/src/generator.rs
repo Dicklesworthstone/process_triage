@@ -294,6 +294,156 @@ pub fn recorded_session_end(metadata: &serde_json::Value) -> Option<DateTime<Utc
     (ended >= started).then_some(ended)
 }
 
+/// Join only the exported inventory and inference. Birth identities can already
+/// be pseudonyms in a shared archive, so compare their recorded values exactly.
+fn archived_snapshot_report<R: Read + Seek>(
+    reader: &mut pt_bundle::BundleReader<R>,
+    overview: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    use serde_json::{json, Value};
+    use std::collections::{BTreeMap, HashSet};
+
+    let inventory: Value = reader.read_json("scan/inventory.json")?;
+    let inference: Value = reader.read_json("inference/results.json")?;
+    let invalid = |message: &str| ReportError::MissingData(format!("recorded snapshot: {message}"));
+    for source in [&inventory, &inference] {
+        if source["session_id"].as_str() != Some(reader.manifest().session_id.as_str())
+            || source["host_id"]
+                .as_str()
+                .is_none_or(|id| id.trim().is_empty())
+            || source["host_id"] != inventory["host_id"]
+            || (overview["host_id"] != "unknown" && source["host_id"] != overview["host_id"])
+            || (reader.manifest().host_id != "unknown"
+                && source["host_id"] != reader.manifest().host_id)
+        {
+            return Err(invalid("inconsistent session or host identity"));
+        }
+        if source["schema_version"]
+            .as_str()
+            .and_then(|v| v.split('.').next())
+            != Some("1")
+        {
+            return Err(invalid("unsupported snapshot schema"));
+        }
+        // Older exports calculated this digest over the sanitized JSON, which
+        // can differ from the local source payload. The ZIP entry is separately
+        // verified by read_json before any of these values are used.
+        if source["integrity_sha256"]
+            != pt_bundle::FileEntry::compute_checksum(&serde_json::to_vec(&source["payload"])?)
+        {
+            return Err(invalid("payload checksum mismatch"));
+        }
+    }
+    let inventory_payload = &inventory["payload"];
+    let inference_payload = &inference["payload"];
+    let records = inventory_payload["records"]
+        .as_array()
+        .ok_or_else(|| invalid("missing inventory records"))?;
+    let inferences = inference_payload["candidates"]
+        .as_array()
+        .ok_or_else(|| invalid("missing inference candidates"))?;
+    if inventory_payload["record_count"].as_u64() != Some(records.len() as u64)
+        || inference_payload["candidate_count"].as_u64() != Some(inferences.len() as u64)
+    {
+        return Err(invalid("recorded artifact counts disagree"));
+    }
+
+    let mut by_pid = BTreeMap::new();
+    let mut births = HashSet::new();
+    for record in records {
+        let pid = record["pid"]
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok())
+            .ok_or_else(|| invalid("invalid inventory PID"))?;
+        let birth = record["start_id"]
+            .as_str()
+            .filter(|id| !id.is_empty() && *id != "[REDACTED]")
+            .ok_or_else(|| invalid("missing process birth identity"))?;
+        if !births.insert(birth) || by_pid.insert(pid, record).is_some() {
+            return Err(invalid("duplicate inventory identity"));
+        }
+    }
+    let mut candidates = BTreeMap::new();
+    for row in inferences {
+        let pid = row["pid"]
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok())
+            .filter(|pid| *pid > 0)
+            .ok_or_else(|| invalid("invalid inference PID"))?;
+        let process = by_pid
+            .get(&pid)
+            .filter(|p| p["start_id"] == row["start_id"])
+            .ok_or_else(|| invalid("inference does not match its inventory birth identity"))?;
+        let mut posterior = serde_json::Map::new();
+        let mut sum = 0.0;
+        for class in ["useful", "useful_bad", "abandoned", "zombie"] {
+            let value = &row[format!("posterior_{class}")];
+            sum += value
+                .as_f64()
+                .filter(|p| (0.0..=1.0).contains(p))
+                .ok_or_else(|| invalid("invalid posterior probability"))?;
+            posterior.insert(class.into(), value.clone());
+        }
+        if (sum - 1.0).abs() > 1e-6
+            || row
+                .get("evidence_ledger")
+                .is_some_and(|ledger| !ledger.is_object())
+        {
+            return Err(invalid("invalid posterior or evidence ledger"));
+        }
+        let mut candidate = json!({
+            "pid": pid, "start_id": process["start_id"], "posterior": posterior,
+        });
+        for (source, dest) in [
+            ("comm", "command_short"),
+            ("cmd", "command"),
+            ("elapsed_secs", "age_seconds"),
+            ("ppid", "ppid"),
+            ("uid", "uid"),
+            ("state", "state"),
+            ("identity_quality", "identity_quality"),
+            ("start_time_unix", "start_time_unix"),
+        ] {
+            if let Some(value) = process.get(source) {
+                candidate[dest] = value.clone();
+            }
+        }
+        for field in [
+            "classification",
+            "confidence",
+            "recommended_action",
+            "score",
+            "evidence_ledger",
+            "blast_radius_risk_level",
+            "blast_radius_total_affected",
+            "provenance_evidence_completeness",
+            "provenance_score_terms",
+            "provenance_log_odds_shift",
+        ] {
+            if let Some(value) = row.get(field) {
+                candidate[field] = value.clone();
+            }
+        }
+        if candidates.insert(pid, candidate).is_some() {
+            return Err(invalid("duplicate inference PID"));
+        }
+    }
+    Ok(json!({
+        "session_id": inference["session_id"],
+        "generated_at": inference["generated_at"],
+        "host_id": inference["host_id"],
+        "summary": {
+            "total_processes_scanned": inventory_payload["total_system_processes"],
+            "protected_filtered": inventory_payload["protected_filtered"],
+        },
+        "source": {
+            "artifact_path": "inference/results.json", "session_id": inference["session_id"],
+            "host_id": inference["host_id"], "integrity_sha256": inference["integrity_sha256"],
+        },
+        "candidates": candidates.into_values().collect::<Vec<_>>(),
+    }))
+}
+
 impl ReportGenerator {
     /// Create a new report generator with configuration.
     pub fn new(config: ReportConfig) -> Self {
@@ -335,6 +485,14 @@ impl ReportGenerator {
         if reader.has_file("session/context.json") {
             let context: serde_json::Value =
                 serde_json::from_slice(&reader.read_verified("session/context.json")?)?;
+            if context
+                .get("session_id")
+                .is_some_and(|id| id != &overview.session_id)
+            {
+                return Err(ReportError::MissingData(
+                    "bundle context session ID mismatch".into(),
+                ));
+            }
             recorded_overview["host_id"] = context["host_id"].clone();
             recorded_overview["os_family"] = context["os"]["family"].clone();
             recorded_overview["arch"] = context["os"]["arch"].clone();
@@ -342,6 +500,14 @@ impl ReportGenerator {
         if reader.has_file("session/manifest.json") {
             let metadata: serde_json::Value =
                 serde_json::from_slice(&reader.read_verified("session/manifest.json")?)?;
+            if metadata
+                .get("session_id")
+                .is_some_and(|id| id != &overview.session_id)
+            {
+                return Err(ReportError::MissingData(
+                    "bundle session manifest ID mismatch".into(),
+                ));
+            }
             recorded_overview["started_at"] = metadata["timing"]["created_at"].clone();
             recorded_overview["state"] = metadata["state"].clone();
             recorded_overview["mode"] = metadata["mode"].clone();
@@ -350,6 +516,9 @@ impl ReportGenerator {
         let plan: Option<serde_json::Value> = reader.read_plan()?;
         let plan = match plan {
             Some(plan) => plan,
+            None if reader.has_file("inference/results.json") => {
+                archived_snapshot_report(reader, &recorded_overview)?
+            }
             None if reader.has_file("summary.json") => {
                 serde_json::json!({"summary": reader.read_summary::<serde_json::Value>()?})
             }
@@ -410,15 +579,18 @@ impl ReportGenerator {
         let engine = pt_redact::RedactionEngine::new(pt_redact::RedactionPolicy::default())
             .map_err(|error| ReportError::InvalidConfig(error.to_string()))?;
         let candidate_count = plan["candidates"].as_array().map(Vec::len);
-        recorded_overview["candidates_found"] = candidate_count
+        let candidate_count = candidate_count
             .map(serde_json::Value::from)
             .or_else(|| plan.pointer("/summary/candidates_returned").cloned())
             .or_else(|| plan.pointer("/summary/candidates").cloned())
+            .or_else(|| plan.pointer("/summary/candidate_count").cloned())
             .unwrap_or(serde_json::Value::Null);
+        recorded_overview["candidates_found"] = candidate_count.clone();
         recorded_overview["processes_scanned"] = plan
             .pointer("/scan/total_processes")
             .or_else(|| plan.pointer("/summary/total_processes_scanned"))
             .or_else(|| plan.pointer("/summary/total_processes"))
+            .or_else(|| plan.pointer("/summary/total_system_processes"))
             .cloned()
             .unwrap_or(serde_json::Value::Null);
         // The planner records elapsed deep-scan time only when --deep is set;
@@ -1519,6 +1691,103 @@ fn json_script_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn archive_snapshot(
+        profile: pt_bundle::ExportProfile,
+        inference_birth: &str,
+    ) -> pt_bundle::BundleReader<std::io::Cursor<Vec<u8>>> {
+        let session = "pt-20260115-120000-abcd";
+        let host = "private-snapshot-host";
+        let mut writer = pt_bundle::BundleWriter::new(session, host, profile);
+        for (path, mut payload) in [
+            (
+                "scan/inventory.json",
+                serde_json::json!({
+                    "total_system_processes": 93, "protected_filtered": 21, "record_count": 1,
+                    "records": [{"pid": 4721, "start_id": "boot:1234:4721", "ppid": 1, "uid": 1000,
+                                 "cmd":"private-snapshot-command", "elapsed_secs": 3600}],
+                }),
+            ),
+            (
+                "inference/results.json",
+                serde_json::json!({
+                    "candidate_count": 1, "candidates": [{
+                        "pid": 4721, "start_id": inference_birth, "classification":"abandoned",
+                        "recommended_action":"review", "confidence":"high", "score":92,
+                        "posterior_useful":0.03, "posterior_useful_bad":0.07,
+                        "posterior_abandoned":0.89, "posterior_zombie":0.01,
+                        "evidence_ledger":{"log_bf":1.23456789012345},
+                    }],
+                }),
+            ),
+        ] {
+            payload.sort_all_objects();
+            let checksum =
+                pt_bundle::FileEntry::compute_checksum(&serde_json::to_vec(&payload).unwrap());
+            writer.add_json(path, &serde_json::json!({
+                "session_id":session, "host_id":host, "schema_version":"1.0.0",
+                "generated_at":"2026-01-15T12:00:00Z", "integrity_sha256":checksum, "payload":payload,
+            })).unwrap();
+        }
+        let (bytes, _) = writer.write_to_vec().unwrap();
+        pt_bundle::BundleReader::from_bytes(bytes).unwrap()
+    }
+
+    #[test]
+    fn snapshot_only_archives_render_saved_census_candidates_and_evidence() {
+        use pt_bundle::ExportProfile;
+        for profile in [
+            ExportProfile::Safe,
+            ExportProfile::Forensic,
+            ExportProfile::Minimal,
+        ] {
+            let mut reader = archive_snapshot(profile, "boot:1234:4721");
+            assert!(!reader.has_file("plan.json"));
+            assert!(reader.verify_all().is_empty());
+            let mut config = ReportConfig::new().with_galaxy_brain(true);
+            config.redaction_profile = profile.to_string();
+            let report = ReportGenerator::new(config)
+                .prepare_from_bundle(&mut reader)
+                .unwrap();
+            let recorded = &report.recorded;
+            assert_eq!(recorded["overview"]["processes_scanned"], 93);
+            assert_eq!(recorded["overview"]["candidates_found"], 1);
+            assert!(recorded["overview"]["kills_attempted"].is_null());
+            let html = report.render_html().unwrap();
+            let text = report.render_summary(TextReportFormat::Prose, TextReportStyle::Technical);
+            assert!(text.contains("processes scanned: 93; candidates: 1"));
+            if profile != ExportProfile::Forensic {
+                assert!(!html.contains("private-snapshot"));
+            }
+            if profile == ExportProfile::Minimal {
+                assert!(recorded.get("plan").is_none());
+                assert!(!reader.has_file("scan/inventory.json"));
+                assert!(!reader.has_file("inference/results.json"));
+                continue;
+            }
+            assert_eq!(
+                recorded["plan"]["source"]["artifact_path"],
+                "inference/results.json"
+            );
+            assert_eq!(recorded["plan"]["summary"]["protected_filtered"], 21);
+            let candidate = &recorded["plan"]["candidates"][0];
+            assert_eq!(candidate["pid"], 4721);
+            assert_eq!(candidate["score"], 92);
+            assert_eq!(candidate["posterior"]["abandoned"], 0.89);
+            assert_eq!(candidate["evidence_ledger"]["log_bf"], 1.23456789012345);
+            assert!(recorded["plan"].get("actions").is_none());
+            assert!(html.contains("Recorded Evidence Ledger"));
+        }
+    }
+
+    #[test]
+    fn archived_inference_refuses_a_reused_pid_even_after_redaction() {
+        let mut reader = archive_snapshot(pt_bundle::ExportProfile::Safe, "boot:5678:4721");
+        assert!(
+            matches!(ReportGenerator::default_config().prepare_from_bundle(&mut reader),
+            Err(ReportError::MissingData(message)) if message.contains("birth identity"))
+        );
+    }
 
     #[test]
     fn bundle_reports_use_terminal_history_and_the_active_export_profile() {

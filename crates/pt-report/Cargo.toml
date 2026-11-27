@@ -9,7 +9,9 @@ rust-version.workspace = true
 
 [dependencies]
 serde.workspace = true
-serde_json.workspace = true
+# Historical bundles checksum the serialized, redacted payload in archive key
+# order. Preserve that order even when the report crate is built on its own.
+serde_json = { workspace = true, features = ["preserve_order"] }
 chrono.workspace = true
 thiserror.workspace = true
 

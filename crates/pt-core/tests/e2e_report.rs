@@ -576,6 +576,122 @@ mod galaxy_brain {
     }
 }
 
+#[test]
+fn snapshot_without_plan_round_trips_through_bundle_and_report_commands() {
+    use pt_core::session::snapshot_persist::{
+        persist_inference, persist_inventory, InferenceArtifact, InventoryArtifact,
+    };
+    use pt_core::session::{SessionContext, SessionManifest, SessionMode, SessionStore};
+    use serde_json::json;
+    use std::fs;
+
+    let data = tempdir().unwrap();
+    let config = tempdir().unwrap();
+    let id = pt_common::SessionId::new();
+    let host = "private-archive-host";
+    let handle = SessionStore::at_data_dir(data.path())
+        .create(&SessionManifest::new(
+            &id,
+            None,
+            SessionMode::ScanOnly,
+            None,
+        ))
+        .unwrap();
+    handle
+        .write_context(&SessionContext::new(
+            &id,
+            host.into(),
+            "saved-run".into(),
+            None,
+        ))
+        .unwrap();
+    let inventory: InventoryArtifact = serde_json::from_value(json!({
+        "total_system_processes":97, "protected_filtered":13, "record_count":1,
+        "records":[{"pid":4242,"ppid":1,"uid":1000,"start_id":"boot:234:4242",
+                    "comm":"private-archive-worker","cmd":"private-archive-worker --debug",
+                    "state":"S","start_time_unix":1700000000,"elapsed_secs":3600,"identity_quality":"Full"}],
+    })).unwrap();
+    let inference: InferenceArtifact = serde_json::from_value(json!({
+        "candidate_count":1, "candidates":[{
+            "pid":4242,"start_id":"boot:234:4242","classification":"abandoned","confidence":"high",
+            "posterior_useful":0.010001,"posterior_useful_bad":0.019999,
+            "posterior_abandoned":0.93,"posterior_zombie":0.04,"score":97,"recommended_action":"review",
+            "evidence_ledger":{"log_bf":1e-6, "why_summary":"private-archive-ledger",
+                               "description":"AKIAIOSFODNN7EXAMPLE"},
+        }],
+    })).unwrap();
+    persist_inventory(&handle, &id.0, host, inventory).unwrap();
+    persist_inference(&handle, &id.0, host, inference).unwrap();
+    let cli = || {
+        let mut cmd = pt_core();
+        cmd.env("PROCESS_TRIAGE_DATA", data.path())
+            .env("PROCESS_TRIAGE_RETENTION", "off")
+            .arg("--config")
+            .arg(config.path());
+        cmd
+    };
+    for profile in ["minimal", "safe", "forensic"] {
+        let destination = data.path().join(format!("{profile}.ptb"));
+        cli()
+            .args([
+                "bundle",
+                "create",
+                "--profile",
+                profile,
+                "--session",
+                &id.0,
+                "--output",
+            ])
+            .arg(&destination)
+            .assert()
+            .success();
+        let mut archive = pt_bundle::BundleReader::open(&destination).unwrap();
+        assert!(archive.verify_all().is_empty());
+        for entry in archive.manifest().files.clone() {
+            let exported = String::from_utf8(archive.read_verified(&entry.path).unwrap()).unwrap();
+            assert!(!exported.contains("AKIAIOSFODNN7EXAMPLE"));
+            if profile != "forensic" {
+                assert!(!exported.contains("private-archive"));
+            }
+        }
+        let html = data.path().join(format!("{profile}.html"));
+        cli()
+            .args(["agent", "report", "--bundle"])
+            .arg(&destination)
+            .args(["--profile", profile, "--galaxy-brain", "--out"])
+            .arg(&html)
+            .assert()
+            .success();
+        let html = fs::read_to_string(html).unwrap();
+        let data: Value = serde_json::from_str(
+            html.split("id=\"recorded-session-data\">")
+                .nth(1)
+                .unwrap()
+                .split("</script>")
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(data["overview"]["processes_scanned"], 97);
+        assert_eq!(data["overview"]["candidates_found"], 1);
+        assert!(data["overview"]["kills_attempted"].is_null());
+        if profile != "forensic" {
+            assert!(!html.contains("private-archive"));
+        }
+        assert!(!html.contains("AKIAIOSFODNN7EXAMPLE"));
+        if profile == "minimal" {
+            assert!(data.get("plan").is_none());
+        } else {
+            let candidate = &data["plan"]["candidates"][0];
+            assert_eq!(candidate["pid"], 4242);
+            assert_eq!(candidate["posterior"]["useful"], 0.010001);
+            assert_eq!(candidate["evidence_ledger"]["log_bf"], 1e-6);
+            assert_eq!(candidate["recommended_action"], "review");
+        }
+    }
+    assert!(!handle.dir.join("decision/plan.json").exists());
+}
+
 /// Exercise the actual session -> CLI export -> ZIP reader -> CLI HTML paths.
 /// The planted candidate/outcome values are routing and privacy fixtures, not
 /// proof of a live kill or calibrated inference quality.
@@ -634,7 +750,7 @@ fn recorded_session_bundle_and_report_preserve_data_without_leaking_canaries() {
         serde_json::to_vec(&plan).unwrap(),
     )
     .unwrap();
-    for (path, payload) in [
+    for (path, mut payload) in [
         (
             "scan/inventory.json",
             serde_json::json!({"records": [
@@ -648,6 +764,9 @@ fn recorded_session_bundle_and_report_preserve_data_without_leaking_canaries() {
             serde_json::json!({"candidates": [{"pid": 1234, "posterior_useful_bad": 0.03}]}),
         ),
     ] {
+        // Match the producer's canonical payload digest, including builds
+        // where serde_json preserves map insertion order.
+        payload.sort_all_objects();
         let envelope = serde_json::json!({
             "schema_version": "1.0.0", "session_id": session_id.0,
             "payload": payload,
