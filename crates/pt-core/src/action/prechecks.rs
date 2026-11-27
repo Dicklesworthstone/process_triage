@@ -2032,15 +2032,9 @@ impl RecentIoBaseline {
         ))
     }
 
-    /// Translate a valid saved observation into the current process's monotonic
-    /// clock only after a fresh, equally scoped read. The interval excludes both
-    /// reads, so serialization or slow procfs reads cannot inflate coverage.
-    fn observation(
-        &self,
-        current: &Self,
-        after: IoSample,
-        window: Duration,
-    ) -> Option<RecentIoObservation> {
+    /// The interval excludes both reads. An invalid boundary cannot contribute
+    /// even partial coverage towards the required window.
+    fn elapsed_until(&self, current: &Self) -> Option<Duration> {
         if self.target.quality != pt_common::IdentityQuality::Full
             || current.target.quality != pt_common::IdentityQuality::Full
             || !self.target.matches(&current.target)
@@ -2059,8 +2053,18 @@ impl RecentIoBaseline {
         {
             return None;
         }
-        let elapsed =
-            Duration::from_nanos(current.started_boot_ns.checked_sub(self.finished_boot_ns)?);
+        Some(Duration::from_nanos(
+            current.started_boot_ns.checked_sub(self.finished_boot_ns)?,
+        ))
+    }
+
+    fn observation(
+        &self,
+        current: &Self,
+        after: IoSample,
+        window: Duration,
+    ) -> Option<RecentIoObservation> {
+        let elapsed = self.elapsed_until(current)?;
         if elapsed < window {
             return None;
         }
@@ -2307,23 +2311,23 @@ impl LivePreCheckProvider {
         self
     }
 
-    fn io_deadline_refusal(&self, required_window: Duration) -> Option<String> {
+    fn io_deadline_refusal(&self, required_wait: Duration) -> Option<String> {
         let remaining = self.deadline?.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             Some("operation deadline expired before recent-I/O observation".to_string())
-        } else if remaining <= required_window {
+        } else if remaining <= required_wait {
             Some(format!(
-                "operation deadline cannot cover the complete {}s recent-I/O window; the required window is not shortened",
-                required_window.as_secs_f64(),
+                "operation deadline cannot cover the complete {}s recent-I/O window ({:.3}s still required); the required window is not shortened",
+                self.config.block_if_recent_io_seconds,
+                required_wait.as_secs_f64(),
             ))
         } else {
             None
         }
     }
 
-    /// Reuse plan-time counters only when a fresh read already covers the full
-    /// configured window for the same process, boot and namespaces. Missing,
-    /// ambiguous, young or invalid baselines use the unchanged shared live probe.
+    /// Reuse identity-bound plan-time counters. A young baseline needs only the
+    /// remaining interval; ambiguous or invalid baselines require a fresh window.
     /// Counter growth over a longer saved interval conservatively blocks action.
     #[cfg(target_os = "linux")]
     pub fn prime_recent_io_from_baselines(
@@ -2336,8 +2340,17 @@ impl LivePreCheckProvider {
         }
         let window = Duration::from_secs(self.config.block_if_recent_io_seconds);
         let mut unobserved = Vec::new();
+        let mut pending = Vec::new();
         let mut seen = HashSet::new();
         let mut observations = Vec::new();
+        let mut by_pid = std::collections::HashMap::new();
+        for baseline in baselines {
+            // Duplicate rows cannot choose whichever observation grants action.
+            by_pid
+                .entry(baseline.target.pid.0)
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(baseline));
+        }
         for target in targets {
             if !seen.insert(target.pid.0) {
                 continue;
@@ -2349,34 +2362,82 @@ impl LivePreCheckProvider {
                 ));
                 continue;
             }
-            let mut matching = baselines
-                .iter()
-                .filter(|baseline| baseline.target.pid == target.pid);
-            let baseline = matching.next().filter(|_| matching.next().is_none());
-            let observation = baseline
+            let Some(baseline) = by_pid
+                .get(&target.pid.0)
+                .copied()
+                .flatten()
                 .filter(|baseline| baseline.target.matches(target))
-                .and_then(|baseline| {
-                    let (current, sample) = RecentIoBaseline::capture_with_sample(target).ok()?;
-                    if let Some(reason) = self.io_deadline_refusal(Duration::ZERO) {
-                        return Some(RecentIoObservation::unavailable(window, reason));
-                    }
-                    baseline.observation(&current, sample, window)
-                });
-            match observation {
-                Some(observation) => observations.push((target.pid.0, observation)),
-                None => unobserved.push(target.pid.0),
+            else {
+                unobserved.push(target.pid.0);
+                continue;
+            };
+            let Ok((current, sample)) = RecentIoBaseline::capture_with_sample(target) else {
+                unobserved.push(target.pid.0);
+                continue;
+            };
+            let Some(elapsed) = baseline.elapsed_until(&current) else {
+                unobserved.push(target.pid.0);
+                continue;
+            };
+            let remaining = window.saturating_sub(elapsed);
+            let Some(ready_at) = sample.started_at.checked_add(remaining) else {
+                unobserved.push(target.pid.0);
+                continue;
+            };
+            if let Some(reason) =
+                self.io_deadline_refusal(ready_at.saturating_duration_since(Instant::now()))
+            {
+                observations.push((
+                    target.pid.0,
+                    RecentIoObservation::unavailable(window, reason),
+                ));
+            } else if remaining.is_zero() {
+                match baseline.observation(&current, sample, window) {
+                    Some(observation) => observations.push((target.pid.0, observation)),
+                    None => unobserved.push(target.pid.0),
+                }
+            } else {
+                pending.push((ready_at, baseline, current));
             }
         }
         trace!(
             reused = observations.len(),
+            partial = pending.len(),
             fresh = unobserved.len(),
             "priming identity-bound recent I/O evidence"
         );
+        // Fresh windows overlap all partial windows. If the operation budget
+        // refuses a full probe, eligible partial windows can still complete.
+        self.prime_recent_io(&unobserved);
+        if let Some(ready_at) = pending.iter().map(|(ready_at, _, _)| *ready_at).max() {
+            std::thread::sleep(ready_at.saturating_duration_since(Instant::now()));
+        }
+        for (_, baseline, initial) in pending {
+            let finish = || {
+                if let Some(reason) = self.io_deadline_refusal(Duration::ZERO) {
+                    return Err(reason);
+                }
+                let (end, sample) = RecentIoBaseline::capture_with_sample(&initial.target)?;
+                // Recheck both intervals. A counter that decreased after the
+                // intermediate read cannot be hidden by an older, lower value.
+                initial.elapsed_until(&end).ok_or_else(|| {
+                    "I/O identity, scope, clock or counters changed while completing the window"
+                        .to_string()
+                })?;
+                baseline.observation(&end, sample, window).ok_or_else(|| {
+                    "saved and live I/O samples do not cover the complete required window"
+                        .to_string()
+                })
+            };
+            observations.push((
+                initial.target.pid.0,
+                finish().unwrap_or_else(|reason| RecentIoObservation::unavailable(window, reason)),
+            ));
+        }
         self.recent_io
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .extend(observations);
-        self.prime_recent_io(&unobserved);
     }
 
     /// Sample recent I/O for all `pids` in ONE probe window and cache the results,
@@ -7038,6 +7099,35 @@ finally:
             );
             assert!(bounded.check_data_loss(pid).is_passed());
 
+            // A two-second-old baseline can finish the four-second gate within
+            // a three-second operation. A different target without a baseline
+            // still requires an entire fresh window and is refused separately.
+            let window = Duration::from_secs(4);
+            let partial =
+                io_only_provider(4).with_deadline(Some(Instant::now() + Duration::from_secs(3)));
+            let missing = pt_common::ProcessIdentity::new(
+                u32::MAX,
+                pt_common::StartId::from_linux(&scope.boot_id, 1, u32::MAX),
+                target.uid,
+            );
+            partial.prime_recent_io_from_baselines(
+                &[target.clone(), missing],
+                std::slice::from_ref(&restored),
+            );
+            assert_eq!(partial.has_recent_io(pid, window), RecentIoEvidence::Idle);
+            assert!(matches!(
+                partial.has_recent_io(u32::MAX, window),
+                RecentIoEvidence::Unknown(reason) if reason.contains("complete 4s")
+            ));
+            let cache = partial.recent_io.lock().unwrap();
+            let observed = &cache[&pid];
+            assert!(
+                observed.after.as_ref().unwrap().started_at
+                    - observed.before.as_ref().unwrap().finished_at
+                    >= window
+            );
+            drop(cache);
+
             // Ambiguous evidence cannot choose whichever baseline grants action.
             let provider = io_only_provider(1);
             let began = Instant::now();
@@ -7084,12 +7174,23 @@ finally:
             std::thread::sleep(Duration::from_secs(2));
             let provider = io_only_provider(2);
             let began = Instant::now();
-            provider.prime_recent_io_from_baselines(&[target], &[baseline]);
+            provider.prime_recent_io_from_baselines(std::slice::from_ref(&target), &[baseline]);
             assert!(began.elapsed() < Duration::from_secs(2));
             assert!(matches!(
                 provider.check_data_loss(pid),
                 PreCheckResult::Blocked { reason, .. } if reason.contains("recent I/O")
             ));
+            // New writes during a partially saved window must also be visible
+            // in the live endpoint used for admission.
+            let fresh = RecentIoBaseline::capture(&target).expect("second writer observation");
+            std::thread::sleep(Duration::from_secs(2));
+            let partial =
+                io_only_provider(4).with_deadline(Some(Instant::now() + Duration::from_secs(3)));
+            partial.prime_recent_io_from_baselines(&[target], &[fresh]);
+            assert_eq!(
+                partial.has_recent_io(pid, Duration::from_secs(4)),
+                RecentIoEvidence::Active
+            );
             assert!(child.0.try_wait().unwrap().is_none(), "writer must survive");
         }
 
