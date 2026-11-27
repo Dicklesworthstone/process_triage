@@ -451,8 +451,15 @@ You can inspect the saved candidate through the existing comparison command:
 ```bash
 pt --config ./model-version-001/candidate replay evaluate \
   --snapshot holdout.json --labels holdout-labels.json \
-  --baseline-config ./model-version-001/incumbent --format json
+  --baseline-config ./model-version-001/incumbent --top-k 10 --format json
 ```
+
+The `score_ranking` section shows which PIDs have the highest abandonment
+probabilities under each configuration. Equal scores are ordered by PID.
+Precision uses the number of PIDs actually returned. If any of them still lack
+a verdict, the report gives lower and upper precision bounds. Reviewed recall
+uses every labeled abandoned process in the capture, including those excluded
+by the configuration. These metrics evaluate suspicion scores before action selection.
 
 The original report preserves the fit's single frozen evaluation time. A later
 comparison uses a new evaluation time, so learned-verdict decay may differ.

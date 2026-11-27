@@ -780,7 +780,7 @@ mod replay_recording {
             .arg(&labels_path)
             .arg("--baseline-config")
             .arg(&baseline_config)
-            .args(["--format", "jsonl"])
+            .args(["--format", "jsonl", "--top-k", "3"])
             .assert()
             .success()
             .get_output()
@@ -794,6 +794,11 @@ mod replay_recording {
         );
         let output: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(output["command"], "replay evaluate");
+        assert_eq!(output["score_ranking"]["requested_k"], 3);
+        let candidate = &output["score_ranking"]["candidate"];
+        assert_eq!(candidate["pids"], serde_json::json!([]));
+        assert!(candidate["precision_bounds"].is_null());
+        assert!(candidate["reviewed_recall"].is_null());
         let comparison = &output["comparison"];
         assert_eq!(comparison["scoring_only"], true);
         assert_eq!(comparison["snapshot_sha256"], labels["snapshot_sha256"]);

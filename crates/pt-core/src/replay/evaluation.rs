@@ -450,6 +450,88 @@ pub struct PairedEvaluationReport {
     pub limitations: Vec<String>,
 }
 
+/// The highest abandonment probabilities from one configuration, before any
+/// action decision. Unreviewed identities keep their places in the ranking.
+#[derive(Debug, Serialize)]
+pub struct ScoreRanking {
+    /// Descending probability, then ascending PID within equal scores.
+    pub pids: Vec<u32>,
+    pub abandoned: usize,
+    pub useful: usize,
+    pub unlabeled: usize,
+    /// All reviewed positives in the capture, including unscored identities.
+    pub reviewed_abandoned_total: usize,
+    /// Fraction of the returned rows labeled abandoned, when fully reviewed.
+    pub precision: Option<f64>,
+    /// Possible precision if unknown labels are respectively all useful or all abandoned.
+    pub precision_bounds: Option<[f64; 2]>,
+    /// Share of reviewed positives in the entire capture that appear here.
+    pub reviewed_recall: Option<f64>,
+}
+
+fn rank_scores(
+    rows: impl Iterator<Item = (u32, Option<f64>, Option<ReviewVerdict>)>,
+    k: usize,
+) -> ScoreRanking {
+    let mut scored = Vec::new();
+    let mut reviewed_abandoned_total = 0;
+    for (pid, probability, verdict) in rows {
+        if verdict == Some(ReviewVerdict::Abandoned) {
+            reviewed_abandoned_total += 1;
+        }
+        if let Some(probability) = probability {
+            scored.push((probability, pid, verdict));
+        }
+    }
+    scored.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    scored.truncate(k);
+    let mut abandoned = 0;
+    let mut useful = 0;
+    let mut pids = Vec::with_capacity(scored.len());
+    for (_, pid, verdict) in scored {
+        pids.push(pid);
+        match verdict {
+            Some(ReviewVerdict::Abandoned) => abandoned += 1,
+            Some(ReviewVerdict::Useful) => useful += 1,
+            None => {}
+        }
+    }
+    let returned = pids.len();
+    let unlabeled = returned - abandoned - useful;
+    let precision_bounds = (returned > 0).then(|| {
+        [
+            abandoned as f64 / returned as f64,
+            (abandoned + unlabeled) as f64 / returned as f64,
+        ]
+    });
+    ScoreRanking {
+        pids,
+        abandoned,
+        useful,
+        unlabeled,
+        reviewed_abandoned_total,
+        precision: precision_bounds.filter(|_| unlabeled == 0).map(|p| p[0]),
+        precision_bounds,
+        reviewed_recall: (reviewed_abandoned_total > 0)
+            .then(|| abandoned as f64 / reviewed_abandoned_total as f64),
+    }
+}
+
+impl PairedEvaluationReport {
+    /// Compare what an operator inspecting the first k suspicion scores would see.
+    pub fn score_rankings(&self, k: usize) -> (ScoreRanking, ScoreRanking) {
+        let baseline = rank_scores(
+            self.processes.iter().map(|p| (p.pid, p.baseline_probability, p.verdict)),
+            k,
+        );
+        let candidate = rank_scores(
+            self.processes.iter().map(|p| (p.pid, p.candidate_probability, p.verdict)),
+            k,
+        );
+        (baseline, candidate)
+    }
+}
+
 /// Conservative controls for an explicit binary class-prior proposal. Feature
 /// likelihoods and the relative weights within each binary group are not fitted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2245,6 +2327,38 @@ mod tests {
                 CalibrationError::InsufficientData { .. }
             ))
         ));
+    }
+
+    #[test]
+    fn suspicion_ranking_retains_unknowns_and_counts_missed_reviewed_positives() {
+        use ReviewVerdict::{Abandoned, Useful};
+        let rows = [
+            (3, Some(0.8), Some(Useful)),
+            (2, Some(0.8), Some(Abandoned)),
+            (1, Some(0.9), None),
+            (5, None, Some(Abandoned)),
+        ];
+        let top = rank_scores(rows.into_iter(), 2);
+        assert_eq!(top.pids, [1, 2]);
+        assert_eq!((top.abandoned, top.useful, top.unlabeled), (1, 0, 1));
+        assert_eq!(top.precision, None);
+        assert_eq!(top.precision_bounds, Some([0.5, 1.0]));
+        assert_eq!(top.reviewed_recall, Some(0.5));
+        assert_eq!(rank_scores(rows.into_iter().rev(), 2).pids, top.pids);
+
+        let complete = rank_scores(rows.into_iter().filter(|row| row.2.is_some()), 10);
+        assert_eq!(complete.pids, [2, 3]);
+        assert_eq!(complete.precision, Some(0.5));
+        assert_eq!(complete.precision_bounds, Some([0.5, 0.5]));
+        assert_eq!(complete.reviewed_recall, Some(0.5));
+
+        let unscored = rank_scores([(5, None, Some(Abandoned))].into_iter(), 1);
+        assert!(unscored.pids.is_empty());
+        assert!(unscored.precision_bounds.is_none());
+        assert_eq!(unscored.reviewed_recall, Some(0.0));
+        let no_positives = rank_scores([(3, Some(0.8), Some(Useful))].into_iter(), 1);
+        assert_eq!(no_positives.precision, Some(0.0));
+        assert!(no_positives.reviewed_recall.is_none());
     }
 
     #[test]

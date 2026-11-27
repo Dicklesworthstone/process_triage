@@ -577,6 +577,9 @@ enum ReplayCommands {
         /// Existing configuration directory for the incumbent model
         #[arg(long, value_name = "DIR")]
         baseline_config: PathBuf,
+        /// Compare the highest K suspicion scores from each configuration
+        #[arg(long, default_value = "10")]
+        top_k: std::num::NonZeroUsize,
     },
     /// Fit candidate class priors from reviewed training data and evaluate a separate holdout
     Refit {
@@ -10208,6 +10211,7 @@ fn run_replay(global: &GlobalOpts, args: &ReplayArgs) -> ExitCode {
         ReplayCommands::Evaluate {
             labels,
             baseline_config,
+            top_k,
             ..
         } => {
             if !baseline_config.is_dir() {
@@ -10263,6 +10267,7 @@ fn run_replay(global: &GlobalOpts, args: &ReplayArgs) -> ExitCode {
                 Err(error) => return replay_evaluation_error(error),
             };
             let coverage = &report.coverage;
+            let (baseline_ranking, candidate_ranking) = report.score_rankings(top_k.get());
             let mut summary = format!(
                 "Paired score evaluation for {} ({:?}): {} captured, {} reviewed, {} unlabeled.\n\
                  Common scored sample: {}; baseline-only: {}; candidate-only: {}; neither: {}.",
@@ -10276,6 +10281,17 @@ fn run_replay(global: &GlobalOpts, args: &ReplayArgs) -> ExitCode {
                 coverage.candidate_only_count,
                 coverage.neither_scored_count
             );
+            for (name, ranking) in [("Baseline", &baseline_ranking), ("Candidate", &candidate_ranking)] {
+                let precision = match ranking.precision_bounds {
+                    Some([low, high]) if ranking.unlabeled > 0 => format!("{low:.1}%–{high:.1}%", low = 100.0 * low, high = 100.0 * high),
+                    Some([value, _]) => format!("{:.1}%", 100.0 * value),
+                    None => "unavailable".to_string(),
+                };
+                summary.push_str(&format!(
+                    "\n{name} top {top_k} suspicion scores returned {} rows ({} useful, {} unlabeled). Precision {precision}. Retrieved {} of {} reviewed abandoned processes.",
+                    ranking.pids.len(), ranking.useful, ranking.unlabeled, ranking.abandoned, ranking.reviewed_abandoned_total
+                ));
+            }
             if let Some(metrics) = &report.paired_metrics {
                 summary.push_str(&format!(
                     "\nBrier: {:.6} -> {:.6} (candidate minus baseline {:+.6}).\n\
@@ -10300,6 +10316,11 @@ fn run_replay(global: &GlobalOpts, args: &ReplayArgs) -> ExitCode {
                     "command": "replay evaluate",
                     "baseline_config": baseline.config_dir,
                     "candidate_config": candidate.config_dir,
+                    "score_ranking": {
+                        "requested_k": top_k,
+                        "baseline": baseline_ranking,
+                        "candidate": candidate_ranking,
+                    },
                     "comparison": report,
                 }),
                 summary,
