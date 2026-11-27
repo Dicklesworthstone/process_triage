@@ -324,7 +324,7 @@ fn log_add_positive(a: f64, b: f64) -> f64 {
 }
 
 fn marginal_rank(
-    candidate: &OptCandidate,
+    contributions: &[f64],
     adjusted_loss: f64,
     goals: &[ResourceGoal],
     remaining: impl Iterator<Item = f64>,
@@ -333,7 +333,7 @@ fn marginal_rank(
 ) -> Option<GreedyRank> {
     let mut weighted_gain = f64::NEG_INFINITY;
     let mut unweighted_gain = f64::NEG_INFINITY;
-    for ((contribution, goal), deficit) in candidate.contributions.iter().zip(goals).zip(remaining)
+    for ((contribution, goal), deficit) in contributions.iter().zip(goals).zip(remaining)
     {
         if *contribution <= 0.0 || deficit <= 0.0 {
             continue;
@@ -487,7 +487,7 @@ fn optimize_greedy_internal(
         .iter()
         .filter_map(|(index, candidate)| {
             marginal_rank(
-                candidate,
+                &candidate.contributions,
                 ranking_loss(candidate.expected_loss),
                 goals,
                 remaining_targets.iter().copied(),
@@ -505,7 +505,7 @@ fn optimize_greedy_internal(
         let cand = &candidates[rank.index];
         if rank.generation != selected.len() {
             if let Some(updated) = marginal_rank(
-                cand,
+                &cand.contributions,
                 ranking_loss(cand.expected_loss),
                 goals,
                 remaining_targets.iter().copied(),
@@ -868,6 +868,8 @@ pub fn optimize_dp(
 }
 
 const ILP_NODE_BUDGET: usize = 25_000;
+// One complete scoring pass is always allowed, even on very large inputs.
+const HOLDER_MOVE_WORK_BUDGET: usize = 1_000_000;
 const ILP_CANDIDATE_LIMIT: usize = 64;
 // Bound the remaining-capacity table and the work per search node as well as
 // recursion depth. At the limits it contains 16 * 65 * 65 f64 cells.
@@ -925,6 +927,274 @@ fn ilp_greedy_fallback(
     result.algorithm = format!("ilp_branch_bound ({reason}, greedy fallback; optimum not proven)");
     result.log_events.extend(log_events);
     result
+}
+
+/// Optimize additive resources and shared-port release. A port column uses one
+/// unit per distinct observed holder and a target equal to their total count.
+pub fn optimize_holder_sets_with_limit(
+    mut candidates: Vec<OptCandidate>,
+    goals: &[ResourceGoal],
+    max_actions: usize,
+) -> OptimizationResult {
+    let shared: Vec<_> = goals
+        .iter()
+        .map(|goal| goal.resource.starts_with("port_") && goal.target > 1.0)
+        .collect();
+    if !shared.contains(&true) {
+        return optimize_ilp_with_limit(&candidates, goals, max_actions);
+    }
+    // Masking a finite contribution to zero preserves a row's validity.
+    let valid: Vec<_> = candidates
+        .iter()
+        .map(|c| valid_candidate_inputs(c, goals.len()))
+        .collect();
+    for (column, goal) in goals.iter().enumerate() {
+        if !shared[column] {
+            continue;
+        }
+        // Duplicate candidate rows must never stand in for another holder.
+        let complete = {
+            let mut holders = HashSet::new();
+            let distinct = candidates
+                .iter()
+                .zip(&valid)
+                .filter(|(c, valid)| **valid && !c.blocked && c.contributions[column] > 0.0)
+                .all(|(c, _)| c.contributions[column] == 1.0 && holders.insert(c.id.as_str()));
+            distinct && holders.len() as f64 == goal.target
+        };
+        if !complete || goal.target > max_actions as f64 {
+            for (candidate, valid) in candidates.iter_mut().zip(&valid) {
+                if *valid {
+                    candidate.contributions[column] = 0.0;
+                }
+            }
+        }
+    }
+    let result = optimize_ilp_with_limit(&candidates, goals, max_actions);
+    if !result
+        .goal_achievement
+        .iter()
+        .zip(&shared)
+        .any(|(g, shared)| *shared && g.achieved > 0.0 && !g.met)
+    {
+        return result;
+    }
+
+    // The additive best-effort result used fractional port credit. Re-rank
+    // using a complete holder group as a single choice that costs one action
+    // per remaining holder. Individuals may still contribute other resources.
+    let eligible: Vec<_> = candidates
+        .iter()
+        .zip(&valid)
+        .filter_map(|(c, valid)| (*valid && !c.blocked).then_some(c))
+        .filter(|c| {
+            c.contributions
+                .iter()
+                .zip(goals)
+                .any(|(v, g)| *v > 0.0 && g.target > 0.0)
+        })
+        .collect();
+    let mut groups = Vec::new();
+    for (column, goal) in goals.iter().enumerate().filter(|(i, _)| shared[*i]) {
+        let holders: Vec<_> = eligible
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.contributions[column] == 1.0)
+            .map(|(index, _)| index)
+            .collect();
+        if holders.len() as f64 == goal.target && holders.len() <= max_actions {
+            groups.push(holders);
+        }
+    }
+    let singletons: Vec<_> = (0..eligible.len()).collect();
+    let moves: Vec<_> = singletons
+        .iter()
+        .map(std::slice::from_ref)
+        .chain(groups.iter().map(Vec::as_slice))
+        .collect();
+    let mut best = holder_portfolio(result.selected, goals, &shared, "bounded_selection");
+    for objective in [GreedyObjective::LossEfficiency, GreedyObjective::Progress] {
+        let candidate =
+            rank_whole_holder_moves(&eligible, &moves, goals, &shared, max_actions, objective);
+        if prefer_bounded_result(&candidate, &best, goals) {
+            best = candidate;
+        }
+    }
+    best
+}
+
+fn rank_whole_holder_moves(
+    eligible: &[&OptCandidate],
+    moves: &[&[usize]],
+    goals: &[ResourceGoal],
+    shared: &[bool],
+    max_actions: usize,
+    objective: GreedyObjective,
+) -> OptimizationResult {
+    let mut chosen = vec![false; eligible.len()];
+    let mut order = Vec::new();
+    let mut totals = vec![0.0_f64; goals.len()];
+    let mut loss = 0.0_f64;
+    let mut gain = vec![0.0; goals.len()];
+    // Bound supplementary search in units of member-by-goal evaluations.
+    // The independently repaired bounded-solver result remains an incumbent.
+    let work_per_round = moves
+        .iter()
+        .fold(0_usize, |count, members| {
+            count.saturating_add(members.len())
+        })
+        .saturating_mul(goals.len())
+        .max(1);
+    let round_limit = (HOLDER_MOVE_WORK_BUDGET / work_per_round).max(1);
+    let mut rounds = 0;
+    let mut work_limited = false;
+    while order.len() < max_actions {
+        if rounds == round_limit {
+            work_limited = true;
+            break;
+        }
+        rounds += 1;
+        let mut best: Option<GreedyRank> = None;
+        for (index, members) in moves.iter().enumerate() {
+            gain.fill(0.0);
+            let mut count = 0;
+            let mut cost = 0.0;
+            for &member in members.iter().filter(|m| !chosen[**m]) {
+                count += 1;
+                cost += eligible[member].expected_loss;
+                for (delta, value) in gain.iter_mut().zip(&eligible[member].contributions) {
+                    *delta += value;
+                }
+            }
+            if count == 0 || count > max_actions - order.len() || !(loss + cost).is_finite() {
+                continue;
+            }
+            if !gain
+                .iter()
+                .zip(&totals)
+                .all(|(delta, total)| (delta + total).is_finite())
+            {
+                continue;
+            }
+            for (column, delta) in gain.iter_mut().enumerate() {
+                if shared[column] {
+                    *delta = if totals[column] < goals[column].target
+                        && totals[column] + *delta >= goals[column].target
+                    {
+                        goals[column].target
+                    } else {
+                        0.0
+                    };
+                }
+            }
+            let ranking_cost = match objective {
+                GreedyObjective::Progress => 1.0,
+                GreedyObjective::LossEfficiency => cost,
+            };
+            let rank = marginal_rank(
+                &gain,
+                ranking_cost,
+                goals,
+                goals.iter().enumerate().map(|(i, g)| {
+                    if shared[i] && totals[i] < g.target {
+                        g.target
+                    } else {
+                        g.target - totals[i]
+                    }
+                }),
+                index,
+                0,
+            );
+            best = best.max(rank);
+        }
+        let Some(best) = best else { break };
+        for &member in moves[best.index] {
+            if !chosen[member] {
+                chosen[member] = true;
+                order.push(member);
+                loss += eligible[member].expected_loss;
+                for (total, value) in totals.iter_mut().zip(&eligible[member].contributions) {
+                    *total += value;
+                }
+            }
+        }
+    }
+
+    let selected = order
+        .into_iter()
+        .map(|index| {
+            let candidate = eligible[index];
+            SelectedAction {
+                id: candidate.id.clone(),
+                expected_loss: candidate.expected_loss,
+                contributions: candidate.contributions.clone(),
+            }
+        })
+        .collect();
+    let strategy = match objective {
+        GreedyObjective::LossEfficiency => "loss_efficiency",
+        GreedyObjective::Progress => "maximum_progress",
+    };
+    let mut result = holder_portfolio(selected, goals, shared, strategy);
+    if work_limited && !result.feasible {
+        let mut event = OptimizationLogEvent::new("search_budget_exhausted", "whole_holder_sets");
+        event.note = Some(format!(
+            "rounds={rounds} member_goal_evaluations_per_round={work_per_round}"
+        ));
+        result.log_events.push(event);
+    }
+    result
+}
+
+fn holder_portfolio(
+    mut selected: Vec<SelectedAction>,
+    goals: &[ResourceGoal],
+    shared: &[bool],
+    strategy: &str,
+) -> OptimizationResult {
+    let mut totals = total_contributions_from_actions(&selected, goals.len());
+    for (column, goal) in goals.iter().enumerate() {
+        if shared[column] && totals[column] < goal.target {
+            totals[column] = 0.0;
+            for action in &mut selected {
+                action.contributions[column] = 0.0;
+            }
+        }
+    }
+    // After removing fractional credit, discard actions whose removal keeps
+    // every capped achievement. This also removes incidental surplus that a
+    // holder contributes to an already satisfied additive goal.
+    selected.retain(|action| {
+        let needed = action
+            .contributions
+            .iter()
+            .enumerate()
+            .any(|(i, value)| *value > 0.0 && totals[i] - value < goals[i].target);
+        if !needed {
+            for (total, value) in totals.iter_mut().zip(&action.contributions) {
+                *total -= value;
+            }
+        }
+        needed
+    });
+    let total_loss = selected.iter().map(|action| action.expected_loss).sum();
+    let total_contributions = total_contributions_from_actions(&selected, goals.len());
+    let goal_achievement = compute_goal_achievements(goals, &total_contributions);
+    let feasible = goal_achievement.iter().all(|g| g.met);
+    let mut event = OptimizationLogEvent::new("whole_holder_sets", "greedy");
+    event.note = Some(strategy.into());
+    event.total_loss = Some(total_loss);
+    event.total_contributions = total_contributions.clone();
+    OptimizationResult {
+        selected,
+        total_loss,
+        total_contributions,
+        goal_achievement,
+        feasible,
+        algorithm: "whole port holder sets (best-effort heuristic)".into(),
+        alternatives: Vec::new(),
+        log_events: vec![event],
+    }
 }
 
 /// Bounded branch-and-bound optimization for simultaneous resource goals.
@@ -1736,7 +2006,7 @@ fn pareto_efficiency(candidate: &OptCandidate, goals: &[ResourceGoal]) -> Option
     // same normalized, capped objective. Exact search still minimizes actual
     // expected loss; this only determines which incumbent it discovers first.
     marginal_rank(
-        candidate,
+        &candidate.contributions,
         candidate.expected_loss,
         goals,
         goals.iter().map(|goal| goal.target),
@@ -1892,6 +2162,121 @@ mod tests {
             .iter()
             .map(|action| action.id.as_str())
             .collect()
+    }
+
+    #[test]
+    fn best_effort_compares_whole_ports_against_independent_recovery() {
+        let goals = [
+            ResourceGoal {
+                resource: "port_3000".into(),
+                target: 2.0,
+                weight: 1.0,
+            },
+            ResourceGoal {
+                resource: "memory_mb".into(),
+                target: 100.0,
+                weight: 1.0,
+            },
+        ];
+        let candidates = vec![
+            goal_candidate("first holder", 1.0, &[1.0, 0.0]),
+            goal_candidate("second holder", 1.0, &[1.0, 0.0]),
+            goal_candidate("other", 1.0, &[0.0, 60.0]),
+        ];
+        // The additive relaxation takes the 60% memory action and a single
+        // holder. Only the full pair actually releases a resource.
+        let result = optimize_holder_sets_with_limit(candidates.clone(), &goals, 2);
+        assert!(!result.feasible);
+        assert_eq!(selected_ids(&result), ["first holder", "second holder"]);
+        assert_eq!(result.total_contributions, [2.0, 0.0]);
+        assert_eq!(result.total_loss, 2.0);
+
+        let duplicated = vec![
+            candidates[0].clone(),
+            candidates[0].clone(),
+            candidates[2].clone(),
+        ];
+        let duplicate_result = optimize_holder_sets_with_limit(duplicated, &goals, 3);
+        assert_eq!(selected_ids(&duplicate_result), ["other"]);
+        assert_eq!(duplicate_result.total_contributions, [0.0, 60.0]);
+
+        let result = optimize_holder_sets_with_limit(candidates.clone(), &goals, 1);
+        assert_eq!(selected_ids(&result), ["other"]);
+        assert_eq!(result.total_contributions, [0.0, 60.0]);
+
+        // A holder can still be the best standalone memory recovery.
+        let mut candidates = candidates;
+        candidates[0].contributions[1] = 80.0;
+        let result = optimize_holder_sets_with_limit(candidates, &goals, 1);
+        assert_eq!(selected_ids(&result), ["first holder"]);
+        assert_eq!(result.total_contributions, [0.0, 80.0]);
+    }
+
+    #[test]
+    fn repaired_solver_selection_removes_holders_contributing_only_surplus() {
+        let goals = [
+            ResourceGoal {
+                resource: "port_3000".into(),
+                target: 2.0,
+                weight: 1.0,
+            },
+            ResourceGoal {
+                resource: "memory_mb".into(),
+                target: 100.0,
+                weight: 1.0,
+            },
+        ];
+        let selected = vec![
+            SelectedAction {
+                id: "partial holder".into(),
+                expected_loss: 2.0,
+                contributions: vec![1.0, 4.0],
+            },
+            SelectedAction {
+                id: "memory".into(),
+                expected_loss: 1.0,
+                contributions: vec![0.0, 100.0],
+            },
+        ];
+        let result = holder_portfolio(selected, &goals, &[true, false], "bounded_selection");
+        assert_eq!(selected_ids(&result), ["memory"]);
+        assert_eq!(result.total_contributions, [0.0, 100.0]);
+        assert_eq!(result.total_loss, 1.0);
+    }
+
+    #[test]
+    fn overlapping_ports_charge_each_holder_once_and_never_project_partial_release() {
+        let goals: Vec<_> = ["port_3000", "port_4000", "memory_mb"]
+            .into_iter()
+            .map(|resource| ResourceGoal {
+                resource: resource.into(),
+                target: 2.0,
+                weight: 1.0,
+            })
+            .collect();
+        let candidates = vec![
+            goal_candidate("first", 1.0, &[1.0, 0.0, 1.0]),
+            goal_candidate("shared", 1.0, &[1.0, 1.0, 0.0]),
+            goal_candidate("last", 1.0, &[0.0, 1.0, 1.0]),
+        ];
+        let result = optimize_holder_sets_with_limit(candidates.clone(), &goals, 2);
+        assert_eq!(result.selected.len(), 2);
+        assert_eq!(result.total_loss, 2.0);
+        assert_eq!(result.total_contributions[2], 1.0);
+        assert!(matches!(
+            &result.total_contributions[..2],
+            [0.0, 2.0] | [2.0, 0.0]
+        ));
+        assert_eq!(
+            total_contributions_from_actions(&result.selected, goals.len()),
+            result.total_contributions
+        );
+
+        let complete = optimize_holder_sets_with_limit(candidates, &goals, 3);
+        assert!(complete.feasible);
+        assert_eq!(complete.selected.len(), 3);
+        assert_eq!(complete.total_loss, 3.0);
+        assert_eq!(complete.total_contributions, [2.0, 2.0, 2.0]);
     }
 
     #[test]

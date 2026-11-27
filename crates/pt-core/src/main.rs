@@ -1462,7 +1462,7 @@ struct AgentExplainArgs {
 use pt_core::action::{ActionRunner, IdentityProvider, LiveIdentityProvider};
 use pt_core::decision::{
     goal_contribution::GoalResourceSnapshot,
-    goal_optimizer::{optimize_ilp_with_limit, OptCandidate, OptimizationResult, ResourceGoal},
+    goal_optimizer::{optimize_holder_sets_with_limit, OptCandidate, OptimizationResult, ResourceGoal},
     goal_parser::{parse_goal, Comparator, Goal, Metric, ResourceTarget},
     relief::{select_relief_plan, ReliefGoal, ReliefPlan},
     ConstraintChecker, RobotCandidate, RuntimeRobotConstraints,
@@ -10672,21 +10672,15 @@ fn build_resource_goals(
     Ok((goals, warnings))
 }
 
-fn parse_kill_loss(candidate: &serde_json::Value) -> f64 {
-    candidate
-        .get("expected_loss")
-        .and_then(|v| v.as_array())
-        .and_then(|entries| {
-            entries.iter().find_map(|entry| {
-                let action = entry.get("action")?.as_str()?;
-                if action.eq_ignore_ascii_case("kill") {
-                    entry.get("loss").and_then(|v| v.as_f64())
-                } else {
-                    None
-                }
-            })
-        })
-        .unwrap_or(0.0)
+fn parse_kill_loss(candidate: &serde_json::Value) -> Option<f64> {
+    let entry = candidate.get("expected_loss")?.as_array()?.iter().find(|entry| {
+        entry["action"]
+            .as_str()
+            .is_some_and(|action| action.eq_ignore_ascii_case("kill"))
+    })?;
+    entry["loss"]
+        .as_f64()
+        .filter(|loss| loss.is_finite() && *loss >= 0.0)
 }
 
 fn build_opt_candidates_for_goals(
@@ -10697,7 +10691,19 @@ fn build_opt_candidates_for_goals(
     let eligible: Vec<_> = candidates
         .iter()
         .filter(|candidate| candidate["recommended_action"].as_str() == Some("kill"))
+        .filter(|candidate| parse_kill_loss(candidate).is_some())
         .filter_map(goal_candidate_identity)
+        .collect();
+    // Price and validate the complete observed holder set once per port.
+    // A missing participant keeps the entire port column unavailable.
+    let port_holders: Vec<_> = goals
+        .iter()
+        .map(|goal| {
+            let port = goal.resource.strip_prefix("port_")?.parse::<u16>().ok()?;
+            resources.ports.get(&port)?.holders.as_ref().filter(|holders| {
+                holders.iter().all(|holder| eligible.iter().any(|id| id.matches(holder)))
+            })
+        })
         .collect();
     candidates
         .iter()
@@ -10723,7 +10729,8 @@ fn build_opt_candidates_for_goals(
 
             let contributions: Vec<f64> = goals
                 .iter()
-                .map(|goal| match goal.resource.as_str() {
+                .enumerate()
+                .map(|(column, goal)| match goal.resource.as_str() {
                     "memory_mb" => memory_mb,
                     "cpu_pct" => cpu_pct,
                     "fd_count" => identity
@@ -10742,28 +10749,15 @@ fn build_opt_candidates_for_goals(
                         .and_then(|identity| resources.exclusive_disk_bytes(identity).ok())
                         .unwrap_or(0) as f64,
                     resource if resource.starts_with("port_") => {
-                        let holders = resource
-                            .strip_prefix("port_")
-                            .and_then(|port| port.parse::<u16>().ok())
-                            .and_then(|port| resources.ports.get(&port))
-                            .and_then(|port| port.holders.as_ref());
-                        holders
-                            .filter(|holders| {
-                                // A partial kill set does not free a port. Do not
-                                // select a subset solely for an unattainable goal.
-                                holders
-                                    .iter()
-                                    .all(|holder| eligible.iter().any(|id| id.matches(holder)))
+                        if port_holders[column].is_some_and(|holders| {
+                            identity.as_ref().is_some_and(|identity| {
+                                holders.iter().any(|holder| holder.matches(identity))
                             })
-                            .map_or(0.0, |holders| {
-                                if identity.as_ref().is_some_and(|identity| {
-                                    holders.iter().any(|holder| holder.matches(identity))
-                                }) {
-                                    1.0
-                                } else {
-                                    0.0
-                                }
-                            })
+                        }) {
+                            1.0
+                        } else {
+                            0.0
+                        }
                     }
                     _ => 0.0,
                 })
@@ -10771,7 +10765,7 @@ fn build_opt_candidates_for_goals(
 
             Some(OptCandidate {
                 id: pid.to_string(),
-                expected_loss: parse_kill_loss(candidate),
+                expected_loss: parse_kill_loss(candidate)?,
                 contributions,
                 blocked,
                 block_reason: None,
@@ -11030,6 +11024,16 @@ fn build_goal_plan_from_candidates(
 ) -> Result<GoalPlanOutput, String> {
     let _ = goal.disk_target().map_err(|error| error.to_string())?;
     let mut warnings = resources.warnings.clone();
+    let unknown_loss = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate["recommended_action"].as_str() == Some("kill")
+                && parse_kill_loss(candidate).is_none()
+        })
+        .count();
+    if unknown_loss > 0 {
+        warnings.push(format!("kill_loss_unavailable_for_{unknown_loss}_candidates"));
+    }
     let requests_cpu = goal_requests_metric(goal, Metric::Cpu);
     let requests_memory = goal_requests_metric(goal, Metric::Memory);
     let requests_disk = goal_requests_metric(goal, Metric::Disk);
@@ -11168,7 +11172,7 @@ fn build_goal_plan_from_candidates(
                 warnings.append(&mut w);
                 let goals = vec![g.clone()];
                 let opt_candidates = build_opt_candidates_for_goals(candidates, &goals, resources);
-                let result = optimize_ilp_with_limit(&opt_candidates, &goals, max_actions);
+                let result = optimize_holder_sets_with_limit(opt_candidates, &goals, max_actions);
                 let achieved = result
                     .goal_achievement
                     .first()
@@ -11221,7 +11225,7 @@ fn build_goal_plan_from_candidates(
     warnings.append(&mut w);
 
     let opt_candidates = build_opt_candidates_for_goals(candidates, &goals, resources);
-    let result = optimize_ilp_with_limit(&opt_candidates, &goals, max_actions);
+    let result = optimize_holder_sets_with_limit(opt_candidates, &goals, max_actions);
 
     let selected_pids = result
         .selected
@@ -13463,6 +13467,82 @@ mod executable_goal_tests {
             attach_goal_resource_observations(&mut candidates, &stale);
             assert!(candidates[1]["goal_resources"]["fd_count"].is_null());
         }
+    }
+
+    #[test]
+    fn capped_port_ranking_preserves_independent_recovery_before_truncation() {
+        let (candidates, plan) = fixture(&[(100, 0, 0.0), (200, 0, 0.0), (300, 40, 0.0)]);
+        let resources = GoalResourceSnapshot {
+            ports: [(
+                3000,
+                PortGoalResources {
+                    holders: Some(plan.actions[..2].iter().map(|a| a.target.clone()).collect()),
+                    bound_socket_count: Some(1),
+                },
+            )]
+            .into(),
+            ..memory_resources(&plan, &[(300, 40 * MIB)])
+        };
+        for (text, projected) in [
+            ("free port 3000 OR free 100MB RAM", vec![40.0]),
+            ("free port 3000 AND free 100MB RAM", vec![0.0, 40.0]),
+        ] {
+            let goal = parse_goal(text).unwrap();
+            let ranked =
+                build_goal_plan_from_candidates(text, &goal, 0.0, &candidates, &resources, 1)
+                    .unwrap();
+            assert_eq!(ranked.selected_pids, [300], "{text}");
+            assert_eq!(ranked.result.total_contributions, projected, "{text}");
+            assert!(!ranked.result.feasible);
+            // CLI and TUI retain the preliminary winner at --max-candidates 1,
+            // then rebuild the forecast against the executable actions.
+            let mut retained = vec![candidates[2].clone()];
+            let executable = build_goal_plan_from_executable_actions(
+                text, &goal, 0.0, &mut retained, &plan, &resources,
+            )
+            .unwrap();
+            assert_eq!(executable.selected_pids, [300], "{text}");
+            assert_eq!(executable.result.total_contributions, projected, "{text}");
+        }
+    }
+
+    #[test]
+    fn unknown_kill_loss_disqualifies_its_holder_without_zero_cost_credit() {
+        let text = "free port 3000";
+        let goal = parse_goal(text).unwrap();
+        let (mut candidates, plan) = fixture(&[(100, 0, 0.0), (200, 0, 0.0)]);
+        let resources = GoalResourceSnapshot {
+            ports: [(
+                3000,
+                PortGoalResources {
+                    holders: Some(plan.actions.iter().map(|a| a.target.clone()).collect()),
+                    bound_socket_count: Some(1),
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!([{"action": "keep", "loss": 0.0}]),
+            serde_json::json!([{"action": "kill", "loss": -1.0}]),
+            serde_json::json!([{"action": "kill", "loss": "unknown"}]),
+        ] {
+            candidates[0]["expected_loss"] = invalid;
+            let output =
+                build_goal_plan_from_candidates(text, &goal, 0.0, &candidates, &resources, 2)
+                    .unwrap();
+            assert!(output.selected_pids.is_empty());
+            assert!(!output.result.feasible);
+            assert_eq!(output.result.total_contributions, [0.0]);
+            assert!(output.warnings.iter().any(|w| w.starts_with("kill_loss_unavailable")));
+        }
+        candidates[0]["expected_loss"] = serde_json::json!([{"action": "kill", "loss": 0.0}]);
+        let output = build_goal_plan_from_candidates(text, &goal, 0.0, &candidates, &resources, 2)
+            .unwrap();
+        assert!(output.result.feasible);
+        assert_eq!(output.selected_pids.len(), 2);
+        assert_eq!(output.result.total_loss, 1.0);
     }
 
     #[test]
