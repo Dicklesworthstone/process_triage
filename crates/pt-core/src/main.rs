@@ -118,7 +118,7 @@ use pt_telemetry::shadow::{Observation, ShadowStorage, ShadowStorageConfig};
 use pt_telemetry::writer::default_telemetry_dir;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -35594,6 +35594,18 @@ mod planning_pressure_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn goal_port_census_rejects_partial_and_malformed_tables() {
+        let observed_ports = |content: &str, tcp, ipv6| -> Option<Vec<u16>> {
+            let mut listeners = BTreeSet::new();
+            observe_port_table(
+                content,
+                tcp,
+                ipv6,
+                &BTreeSet::new(),
+                &mut listeners,
+                &mut RequestedPortBindings::default(),
+            )?;
+            Some(listeners.into_iter().collect())
+        };
         let header = "sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n";
         let listening =
             "0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 10\n";
@@ -35615,6 +35627,131 @@ mod planning_pressure_tests {
             Some(Vec::new())
         );
         assert_eq!(observed_ports(&valid, false, false), Some(vec![8080]));
+    }
+
+    #[test]
+    fn requested_ports_preserve_or_branches_and_read_older_targets() {
+        let document = serde_json::json!({
+            "goal": "free port 8080 OR free port 3000",
+            "goal_summary": {"targets": [{"resource": "port_3000"}]}
+        });
+        assert_eq!(saved_goal_ports(&document), [3000, 8080].into());
+        let old = serde_json::json!({"goal_summary": {"targets": [
+            {"resource": "port_8080"}, {"resource": "port_8080"}, {"resource": "memory_mb"},
+            {"resource": "port_0"}, {"resource": "port_99999"}
+        ]}});
+        assert_eq!(saved_goal_ports(&old), [8080].into());
+    }
+
+    #[test]
+    fn requested_port_progress_distinguishes_simultaneous_independent_changes() {
+        let ports = [3000, 4000, 5000, 6000].into();
+        let before = RequestedPortBindings {
+            complete: true,
+            observed: [3000, 4000, 7000].into(),
+            namespace: Some((1, 900)),
+            ..Default::default()
+        };
+        let after = RequestedPortBindings {
+            complete: true,
+            observed: [4000, 5000, 8000].into(),
+            namespace: Some((1, 900)),
+            ..Default::default()
+        };
+        let progress = requested_port_progress(&ports, &before, &after, false, true);
+        let statuses: Vec<_> = progress
+            .iter()
+            .map(|p| (p.port, p.status, p.observed_release))
+            .collect();
+        assert_eq!(
+            statuses,
+            [
+                (3000, "released", Some(true)),
+                (4000, "still_occupied", Some(false)),
+                (5000, "became_occupied", Some(false)),
+                (6000, "already_free", Some(false))
+            ]
+        );
+        let partial = RequestedPortBindings {
+            complete: false,
+            observed: [4000].into(),
+            namespace: Some((1, 900)),
+            ..Default::default()
+        };
+        for (namespace, status) in [
+            (Some((1, 901)), "namespace_changed"),
+            (None, "namespace_unavailable"),
+        ] {
+            let other = RequestedPortBindings {
+                namespace,
+                complete: true,
+                ..Default::default()
+            };
+            let results = requested_port_progress(&ports, &before, &other, false, true);
+            assert!(results.iter().all(|p| p.status == status
+                && p.after_occupied.is_none()
+                && p.observed_release.is_none()));
+        }
+        let progress = requested_port_progress(&ports, &before, &partial, false, true);
+        assert_eq!(progress[0].status, "incomplete_census");
+        assert_eq!(progress[0].after_occupied, None);
+        assert_eq!(progress[0].observed_release, None);
+        assert_eq!(progress[1].after_occupied, Some(true));
+        assert_eq!(progress[1].after_census_complete, Some(false));
+        for (preview, comparable, status) in
+            [(true, true, "not_executed"), (false, false, "incomparable")]
+        {
+            for p in requested_port_progress(&ports, &before, &after, preview, comparable) {
+                assert_eq!(p.status, status);
+                assert_eq!(p.before_occupied, None);
+                assert_eq!(p.after_occupied, None);
+                assert_eq!(p.observed_release, None);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn requested_port_bindings_include_connected_and_ownerless_kernel_rows() {
+        let header = "  sl  local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n";
+        let mut listeners = BTreeSet::new();
+        let ports = [3000, 3001, 3002].into();
+        let mut bindings = RequestedPortBindings::default();
+        for (tcp, row) in [
+            (
+                true,
+                "0: 0100007F:0BB8 0100007F:C350 01 00:00 00:00 00 1000 0 77\n",
+            ),
+            (
+                true,
+                "0: 0100007F:0BB9 0100007F:C351 06 00:00 00:00 00 1000 0 0\n",
+            ),
+            (
+                false,
+                "0: 0100007F:0BBA 0100007F:C352 01 00:00 00:00 00 1000 0 78\n",
+            ),
+        ] {
+            assert!(observe_port_table(
+                &format!("{header}{row}"),
+                tcp,
+                false,
+                &ports,
+                &mut listeners,
+                &mut bindings
+            )
+            .is_some());
+        }
+        assert!(listeners.is_empty());
+        assert_eq!(bindings.observed, ports);
+        assert!(observe_port_table(
+            "sl local_address\n",
+            true,
+            false,
+            &ports,
+            &mut listeners,
+            &mut bindings
+        )
+        .is_none());
     }
 
     #[test]
@@ -40054,10 +40191,139 @@ fn precheck_label_for_apply(check: &pt_core::plan::PreCheck) -> &'static str {
     }
 }
 
+fn saved_goal_ports(document: &serde_json::Value) -> BTreeSet<u16> {
+    fn collect(goal: &Goal, ports: &mut BTreeSet<u16>) {
+        match goal {
+            Goal::Target(target) if target.metric == Metric::Port => {
+                ports.extend(target.port.filter(|port| *port > 0));
+            }
+            Goal::And(parts) | Goal::Or(parts) => {
+                for part in parts {
+                    collect(part, ports);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // An OR plan's optimized targets contain only its winning branch.
+    let mut ports = BTreeSet::new();
+    let goal = ["/goal", "/args/goal", "/goal_summary/goal"]
+        .iter()
+        .find_map(|path| document.pointer(path)?.as_str());
+    if let Some(goal) = goal.and_then(|text| parse_goal(text).ok()) {
+        collect(&goal, &mut ports);
+    } else if let Some(targets) = document
+        .pointer("/goal_summary/targets")
+        .and_then(|v| v.as_array())
+    {
+        for target in targets {
+            if let Some(port) = target["resource"]
+                .as_str()
+                .and_then(|name| name.strip_prefix("port_"))
+                .and_then(|value| value.parse::<u16>().ok())
+                .filter(|port| *port > 0)
+            {
+                ports.insert(port);
+            }
+        }
+    }
+    ports
+}
+
+#[derive(Default)]
+struct RequestedPortBindings {
+    observed: BTreeSet<u16>,
+    complete: bool,
+    namespace: Option<(u64, u64)>,
+    // Keep the namespace alive until both snapshots have been compared.
+    _namespace_handle: Option<std::fs::File>,
+}
+
+impl RequestedPortBindings {
+    fn occupied(&self, port: u16) -> Option<bool> {
+        if self.observed.contains(&port) {
+            Some(true)
+        } else {
+            self.complete.then_some(false)
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct RequestedPortProgress {
+    port: u16,
+    status: &'static str,
+    before_occupied: Option<bool>,
+    after_occupied: Option<bool>,
+    observed_release: Option<bool>,
+    before_census_complete: Option<bool>,
+    after_census_complete: Option<bool>,
+}
+
+fn requested_port_progress(
+    ports: &BTreeSet<u16>,
+    before: &RequestedPortBindings,
+    after: &RequestedPortBindings,
+    planning_only: bool,
+    comparable: bool,
+) -> Vec<RequestedPortProgress> {
+    let unavailable = if planning_only {
+        Some("not_executed")
+    } else if !comparable {
+        Some("incomparable")
+    } else {
+        match before.namespace.zip(after.namespace) {
+            Some((a, b)) if a == b => None,
+            Some(_) => Some("namespace_changed"),
+            None => Some("namespace_unavailable"),
+        }
+    };
+    let measured = unavailable.is_none();
+    ports
+        .iter()
+        .map(|&port| {
+            let before_occupied = measured.then(|| before.occupied(port)).flatten();
+            let after_occupied = measured.then(|| after.occupied(port)).flatten();
+            let pair = before_occupied.zip(after_occupied);
+            let status = unavailable.unwrap_or(match pair {
+                Some((true, false)) => "released",
+                Some((true, true)) => "still_occupied",
+                Some((false, true)) => "became_occupied",
+                Some((false, false)) => "already_free",
+                None => "incomplete_census",
+            });
+            RequestedPortProgress {
+                port,
+                status,
+                before_occupied,
+                after_occupied,
+                observed_release: pair.map(|(was_bound, is_bound)| was_bound && !is_bound),
+                before_census_complete: measured.then_some(before.complete),
+                after_census_complete: measured.then_some(after.complete),
+            }
+        })
+        .collect()
+}
+
 #[cfg(target_os = "linux")]
-fn observed_ports(content: &str, tcp: bool, ipv6: bool) -> Option<Vec<u16>> {
+fn observe_port_table(
+    content: &str,
+    tcp: bool,
+    ipv6: bool,
+    requested: &BTreeSet<u16>,
+    listeners: &mut BTreeSet<u16>,
+    bindings: &mut RequestedPortBindings,
+) -> Option<()> {
     let mut lines = content.lines();
-    if !lines.next()?.contains("local_address") {
+    let mut header = lines.next()?.split_whitespace();
+    if header.next() != Some("sl")
+        || header.next() != Some("local_address")
+        || !matches!(header.next(), Some("rem_address" | "remote_address"))
+        || header.next() != Some("st")
+        || !header.any(|field| field == "inode")
+        || !content.ends_with('\n')
+    {
         return None;
     }
     let address_port = |value: &str| -> Option<u16> {
@@ -40065,46 +40331,87 @@ fn observed_ports(content: &str, tcp: bool, ipv6: bool) -> Option<Vec<u16>> {
         if address.len() != if ipv6 { 32 } else { 8 }
             || !address.bytes().all(|byte| byte.is_ascii_hexdigit())
             || port.len() != 4
+            || !port.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
             return None;
         }
         u16::from_str_radix(port, 16).ok()
     };
-    let mut ports = Vec::new();
     for line in lines.filter(|line| !line.trim().is_empty()) {
-        let fields: Vec<_> = line.split_whitespace().collect();
-        if fields.len() < 10 {
+        let mut fields = line.split_whitespace();
+        fields.next()?.strip_suffix(':')?.parse::<u32>().ok()?;
+        let local = address_port(fields.next()?)?;
+        let remote = address_port(fields.next()?)?;
+        let state = fields.next()?;
+        if state.len() != 2 || !state.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return None;
         }
-        let local = address_port(fields[1])?;
-        let remote = address_port(fields[2])?;
-        let state = u8::from_str_radix(fields[3], 16).ok()?;
+        let state = u8::from_str_radix(state, 16).ok()?;
+        fields.nth(5)?.parse::<u64>().ok()?; // socket inode, including zero
+        if requested.contains(&local) {
+            // Connected sockets and ownerless TIME_WAIT entries retain the
+            // local endpoint. Attribution to a process is unnecessary here.
+            bindings.observed.insert(local);
+        }
         if local > 0 && if tcp { state == 0x0a } else { remote == 0 } {
-            ports.push(local);
+            listeners.insert(local);
         }
     }
-    Some(ports)
+    Some(())
 }
 
 #[cfg(target_os = "linux")]
-fn collect_occupied_ports_for_goal_progress() -> Option<Vec<u16>> {
-    let mut ports = std::collections::BTreeSet::new();
+fn collect_occupied_ports_for_goal_progress(
+    requested: &BTreeSet<u16>,
+) -> (Option<Vec<u16>>, RequestedPortBindings) {
+    use std::os::unix::fs::MetadataExt;
+    let namespace_id = |metadata: std::fs::Metadata| (metadata.dev(), metadata.ino());
+    let namespace_handle = if requested.is_empty() {
+        None
+    } else {
+        std::fs::File::open("/proc/self/ns/net").ok()
+    };
+    let namespace = namespace_handle
+        .as_ref()
+        .and_then(|file| file.metadata().ok())
+        .map(namespace_id);
+    let mut listeners = BTreeSet::new();
+    let mut bindings = RequestedPortBindings {
+        complete: true,
+        ..Default::default()
+    };
     for (path, tcp, ipv6) in [
         ("/proc/net/tcp", true, false),
         ("/proc/net/tcp6", true, true),
         ("/proc/net/udp", false, false),
         ("/proc/net/udp6", false, true),
     ] {
-        // A partial/unreadable table is not evidence that a port became free.
-        let content = std::fs::read_to_string(path).ok()?;
-        ports.extend(observed_ports(&content, tcp, ipv6)?);
+        if std::fs::read_to_string(path).ok().and_then(|content| {
+            observe_port_table(&content, tcp, ipv6, requested, &mut listeners, &mut bindings)
+        }).is_none() {
+            bindings.complete = false;
+        }
     }
-    Some(ports.into_iter().collect())
+    if namespace.is_some()
+        && namespace
+            == std::fs::metadata("/proc/self/ns/net")
+                .ok()
+                .map(namespace_id)
+    {
+        bindings.namespace = namespace;
+        bindings._namespace_handle = namespace_handle;
+    }
+    (
+        bindings.complete.then(|| listeners.into_iter().collect()),
+        bindings,
+    )
 }
 
 #[cfg(not(target_os = "linux"))]
-fn collect_occupied_ports_for_goal_progress() -> Option<Vec<u16>> {
-    None
+fn collect_occupied_ports_for_goal_progress(
+    _requested: &BTreeSet<u16>,
+) -> (Option<Vec<u16>>, RequestedPortBindings) {
+    (None, RequestedPortBindings::default())
 }
 
 #[cfg(target_os = "linux")]
@@ -40145,17 +40452,20 @@ fn collect_total_fds_for_goal_progress(_processes: &[ProcessRecord]) -> Option<u
 
 fn capture_metric_snapshot_for_goal_progress(
     processes: Option<&[ProcessRecord]>,
-) -> MetricSnapshot {
-    MetricSnapshot {
+    requested_ports: &BTreeSet<u16>,
+) -> (MetricSnapshot, RequestedPortBindings) {
+    let (occupied_ports, bindings) = collect_occupied_ports_for_goal_progress(requested_ports);
+    let snapshot = MetricSnapshot {
         // Filled only from comparable, execution-bound host observation windows.
         available_memory_bytes: None,
         total_cpu_frac: None,
-        occupied_ports: collect_occupied_ports_for_goal_progress(),
+        occupied_ports,
         total_fds: processes.and_then(collect_total_fds_for_goal_progress),
         process_count: processes.and_then(|processes| u64::try_from(processes.len()).ok()),
         disk_space: None,
         timestamp: chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
-    }
+    };
+    (snapshot, bindings)
 }
 
 /// Reuse the filesystem resolved at planning time. Re-resolving the caller's
@@ -40201,11 +40511,13 @@ fn observe_disk_goal_mount(
     })
 }
 
+/// Attach bound host measurements and return whether the snapshot pair can
+/// support comparisons of separately collected, timestamped observations.
 fn attach_measured_goal_resources(
     before: &mut MetricSnapshot,
     after: &mut MetricSnapshot,
     run: Option<&ResourceRunResult>,
-) {
+) -> bool {
     before.available_memory_bytes = None;
     after.available_memory_bytes = None;
     before.total_cpu_frac = None;
@@ -40223,7 +40535,7 @@ fn attach_measured_goal_resources(
         after.process_count = None;
         before.disk_space = None;
         after.disk_space = None;
-        return;
+        return false;
     }
     let run = run.unwrap();
     let delta = run.resource_delta.as_ref().unwrap();
@@ -40238,6 +40550,9 @@ fn attach_measured_goal_resources(
         before.total_cpu_frac = delta.cpu.busy_percent.before.map(|percent| percent / 100.0);
         after.total_cpu_frac = delta.cpu.busy_percent.after.map(|percent| percent / 100.0);
     }
+    before.timestamp.is_finite()
+        && after.timestamp.is_finite()
+        && after.timestamp > before.timestamp
 }
 
 /// Observe only the selected executable targets, once per exact incarnation.
@@ -41261,6 +41576,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         .filter(|a| selected_ids.contains(&a.action_id))
         .filter(|a| !completed_action_ids.contains(&a.action_id))
         .collect();
+    let requested_ports = saved_goal_ports(&saved_document);
     if actions_to_apply.is_empty() {
         let _completion_lock = if resumed_outcomes.is_empty() {
             None
@@ -41292,6 +41608,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             execution_binding.as_ref(),
             &resumed_outcomes,
             resume_validated_at,
+            &requested_ports,
         );
         return ExitCode::Clean;
     }
@@ -41357,8 +41674,9 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             )
         })
         .collect();
-    let mut before_snapshot = capture_metric_snapshot_for_goal_progress(
+    let (mut before_snapshot, before_bindings) = capture_metric_snapshot_for_goal_progress(
         before_scan_complete.then_some(before_scan_processes.as_slice()),
+        &requested_ports,
     );
     let (disk_goal_mount, disk_goal_error) = match saved_disk_goal_mount(
         &saved_document,
@@ -43136,9 +43454,10 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         .ok()
         .filter(|scan| scan.metadata.warnings.is_empty())
         .map(|scan| scan.processes.as_slice());
-    let mut after_snapshot = capture_metric_snapshot_for_goal_progress(after_scan_processes);
+    let (mut after_snapshot, after_bindings) =
+        capture_metric_snapshot_for_goal_progress(after_scan_processes, &requested_ports);
     after_snapshot.disk_space = disk_goal_mount.as_ref().map(observe_disk_goal_mount);
-    attach_measured_goal_resources(
+    let port_windows_comparable = attach_measured_goal_resources(
         &mut before_snapshot,
         &mut after_snapshot,
         resource_observation.as_ref(),
@@ -43357,7 +43676,16 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         &progress_config,
         Some(sid.0.clone()),
     );
+    let requested_port_results = requested_port_progress(
+        &requested_ports,
+        &before_bindings,
+        &after_bindings,
+        planning_only,
+        port_windows_comparable,
+    );
     let goal_progress_payload = serde_json::json!({
+        "requested_ports": requested_port_results,
+        "requested_port_scope": "local_endpoints_visible_in_observer_network_namespace_tcp_tcp6_udp_udp6_tables",
         "session_id": sid.0,
         "before": before_snapshot,
         "after": after_snapshot,
@@ -43375,6 +43703,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             "CPU predictions are measured fractions of whole-host capacity. Private-memory predictions use Private_Clean plus Private_Dirty and exclude shared pages and huge-TLB pools.",
             "CPU comparison additionally requires the observed online capacity to match the original planning window.",
             "Port-release forecasts require exclusive ownership in the observer network namespace and remain unavailable without it.",
+            "Requested-port observations compare visible local bindings, including connected sockets and ownerless TIME_WAIT. A release does not establish causation or guarantee a new bind will succeed.",
             "Process-count forecasts credit one departure per distinct successful direct kill, without descendant or routed-zombie credit. Unreaped zombies, respawns and concurrent process starts can prevent the observed total from falling; partial censuses remain unknown.",
             "Disk forecasts retain exclusive unlinked-inode allocated blocks from planning; progress compares available bytes on the same saved filesystem and may be negative. Shared holders, kernel-held references, snapshots, reflinks, and concurrent writes can prevent equivalent physical recovery.",
             "A host-wide before/after change is an association, not a causal per-action recovery measurement. Unsupported actions or missing forecasts keep the complete comparison unknown."
@@ -43563,6 +43892,9 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         global.format,
         OutputFormat::Json | OutputFormat::Jsonl | OutputFormat::Toon | OutputFormat::Exitcode
     ) {
+        for port in &requested_port_results {
+            println!("Port {} {}", port.port, port.status.replace('_', " "));
+        }
         for event in &respawn_history_update.events {
             println!("Respawn: {}", event.summary.review_message);
         }
@@ -43966,6 +44298,7 @@ fn output_apply_nothing(
     binding: Option<&ApplyBindingReceipt>,
     resumed_outcomes: &[pt_core::verify::SavedActionOutcome],
     resume_validated_at: Option<chrono::DateTime<chrono::Utc>>,
+    requested_ports: &BTreeSet<u16>,
 ) {
     let mut result = serde_json::json!({
         "session_id": sid.0,
@@ -43978,6 +44311,14 @@ fn output_apply_nothing(
         "resume_validated_at": resume_validated_at,
         "resume_evidence_scope": "historical_execution_completion_not_current_postcondition",
     });
+    if !requested_ports.is_empty() {
+        let bindings = RequestedPortBindings::default();
+        result["goal_progress"] = serde_json::json!({
+            "planning_only": true,
+            "requested_port_scope": "local_endpoints_visible_in_observer_network_namespace_tcp_tcp6_udp_udp6_tables",
+            "requested_ports": requested_port_progress(requested_ports, &bindings, &bindings, true, false),
+        });
+    }
     if let Some(binding) = binding {
         result["execution_binding"] = serde_json::json!(binding);
     }
