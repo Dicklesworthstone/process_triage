@@ -19103,7 +19103,6 @@ fn apply_process_tree_safety(
     processes: &[ProcessRecord],
     agent_rule: bool,
 ) -> usize {
-    let parent_of: HashMap<u32, u32> = processes.iter().map(|p| (p.pid.0, p.ppid.0)).collect();
     let by_pid: HashMap<u32, &ProcessRecord> = processes.iter().map(|p| (p.pid.0, p)).collect();
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
     for p in processes {
@@ -19122,24 +19121,6 @@ fn apply_process_tree_safety(
         .filter(|c| is_kill(c))
         .map(|c| pid_of(c))
         .collect();
-
-    let agent_ancestor = |pid: u32| -> Option<u32> {
-        let mut cur = parent_of.get(&pid).copied();
-        let mut hops = 0;
-        while let Some(p) = cur {
-            if p <= 1 || hops > 64 {
-                return None;
-            }
-            if let Some(rec) = by_pid.get(&p) {
-                if pt_core::collect::protected::builtin_force_review_match(&rec.cmd).is_some() {
-                    return Some(p);
-                }
-            }
-            cur = parent_of.get(&p).copied();
-            hops += 1;
-        }
-        None
-    };
 
     let downgrade = |c: &mut serde_json::Value, reason: String, rule: &str| {
         if let Some(obj) = c.as_object_mut() {
@@ -19167,12 +19148,16 @@ fn apply_process_tree_safety(
     // Agent rule first: no automatic action at all (SIGSTOP of an agent's tool process
     // can hang the agent just as a kill can break it).
     if agent_rule {
+        let mut agents = pt_core::collect::protected::ScanAncestors::new(&by_pid, |process| {
+            pt_core::collect::protected::builtin_force_review_match(&process.cmd).is_some()
+        });
         for c in candidates.iter_mut() {
             if !is_active(c) {
                 continue;
             }
             let pid = pid_of(c);
-            if let Some(agent) = agent_ancestor(pid) {
+            if let Some(ancestor) = agents.nearest(pid) {
+                let agent = ancestor.pid.0;
                 downgrade(
                     c,
                     format!(
@@ -31106,6 +31091,35 @@ mod process_tree_safety_tests {
             &unreadable_log,
             serde_json::json!({"step": "state_io_refusal", "callback_error": error, "outer_error": exit_error}),
         );
+    }
+
+    #[test]
+    fn deep_agent_descendants_remain_protected_in_plans_and_fresh_execution_checks() {
+        let mut processes = vec![rec(100, 1, "claude", ProcessState::Sleeping)];
+        for pid in 101..=240 {
+            processes.push(rec(pid, pid - 1, "worker", ProcessState::Sleeping));
+        }
+        processes.push(rec(241, 240, "codex", ProcessState::Running));
+        processes.push(rec(242, 241, "worker", ProcessState::Sleeping));
+        processes.push(rec(500, 499, "worker", ProcessState::Sleeping));
+        processes.reverse();
+        let mut candidates = [cand(240), cand(242), cand(500)];
+        candidates[0]["recommended_action"] = serde_json::json!("pause");
+        let changed = apply_process_tree_safety(
+            &mut candidates.iter_mut().collect::<Vec<_>>(),
+            &processes,
+            true,
+        );
+        assert_eq!(changed, 2);
+        for (index, ancestor) in [(0, 100), (1, 241)] {
+            assert_eq!(candidates[index]["tree_safety"]["rule"], "agent_descendant");
+            let reason = candidates[index]["action_rationale"].as_str().unwrap();
+            assert!(reason.contains(&format!("session {ancestor};")));
+        }
+        assert_eq!(candidates[2]["recommended_action"], "kill");
+        let refusal = super::execution_tree_refusal(240, &processes, true).unwrap();
+        assert!(refusal.contains("session 100;"));
+        assert!(super::execution_tree_refusal(500, &processes, true).is_none());
     }
 
     #[test]

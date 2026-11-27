@@ -34,7 +34,7 @@
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 use tracing::{debug, trace};
 
@@ -598,6 +598,9 @@ impl ProtectedFilter {
         let mut filtered = Vec::new();
         let by_pid: std::collections::HashMap<u32, &ProcessRecord> =
             processes.iter().map(|p| (p.pid.0, p)).collect();
+        let mut service_ancestors = ScanAncestors::new(&by_pid, |process| {
+            is_service_daemon(&process.comm, &process.cmd)
+        });
 
         for record in processes {
             let protection = if self.builtin && invoker_chain.contains(&record.pid.0) {
@@ -625,9 +628,9 @@ impl ProtectedFilter {
                 };
                 self.is_protected_with_role_and_restart(record, role, bound_restart)
                     .or_else(|| {
-                        let (daemon_pid, daemon) = self
+                        let daemon = self
                             .builtin
-                            .then(|| service_ancestor(record.pid.0, &by_pid))??;
+                            .then(|| service_ancestors.nearest(record.pid.0))??;
                         Some(ProtectedMatch {
                             pid: record.pid.0,
                             comm: record.comm.clone(),
@@ -635,7 +638,8 @@ impl ProtectedFilter {
                             matched_field: MatchedField::Builtin,
                             pattern: "builtin.service_child".to_string(),
                             notes: Some(format!(
-                                "worker/plugin of service {daemon} (pid {daemon_pid})"
+                                "worker/plugin of service {} (pid {})",
+                                daemon.comm, daemon.pid.0
                             )),
                         })
                     })
@@ -2947,8 +2951,57 @@ fn placement_on(
 /// Name of the built-in rule for database / web / message servers.
 pub const SERVICE_DAEMON_RULE: &str = "builtin.service_daemon";
 
-/// Maximum ancestor depth walked for parent-identity protection.
-const MAX_ANCESTOR_DEPTH: usize = 64;
+/// Nearest matching ancestors in one captured census. The inclusive answer
+/// for each examined parent is cached, including missing or cyclic branches.
+/// Each distinct record is classified at most once across all queries.
+pub struct ScanAncestors<'a> {
+    records: &'a HashMap<u32, &'a ProcessRecord>,
+    matches: fn(&ProcessRecord) -> bool,
+    inclusive: HashMap<u32, Option<u32>>,
+}
+
+impl<'a> ScanAncestors<'a> {
+    pub fn new(
+        records: &'a HashMap<u32, &'a ProcessRecord>,
+        matches: fn(&ProcessRecord) -> bool,
+    ) -> Self {
+        Self {
+            records,
+            matches,
+            inclusive: HashMap::new(),
+        }
+    }
+
+    pub fn nearest(&mut self, pid: u32) -> Option<&'a ProcessRecord> {
+        let mut current = self.records.get(&pid)?.ppid.0;
+        let mut path = Vec::new();
+        let found = loop {
+            if current <= 1 {
+                break None;
+            }
+            if let Some(&known) = self.inclusive.get(&current) {
+                break known;
+            }
+            // A revisit before this walk finishes is a cycle. Leave it
+            // unmatched unless a matching record was actually observed.
+            self.inclusive.insert(current, None);
+            path.push(current);
+            let Some(record) = self.records.get(&current) else {
+                break None;
+            };
+            if (self.matches)(record) {
+                break Some(current);
+            }
+            current = record.ppid.0;
+        };
+        for traversed in path {
+            self.inclusive.insert(traversed, found);
+        }
+        found
+            .filter(|&ancestor| ancestor != pid)
+            .and_then(|ancestor| self.records.get(&ancestor).copied())
+    }
+}
 
 /// Whether a process is a service or shared agent-coordination daemon.
 pub fn is_service_daemon(comm: &str, cmd: &str) -> bool {
@@ -2964,10 +3017,11 @@ fn service_ancestor_with(
     parent_of: impl Fn(u32) -> Option<u32>,
     identity_of: impl Fn(u32) -> Option<(String, String)>,
 ) -> Option<(u32, String)> {
+    let mut seen = HashSet::from([pid]);
     let mut current = pid;
-    for _ in 0..MAX_ANCESTOR_DEPTH {
+    loop {
         let parent = parent_of(current)?;
-        if parent <= 1 || parent == current {
+        if parent <= 1 || !seen.insert(parent) {
             return None;
         }
         if let Some((comm, cmd)) = identity_of(parent) {
@@ -2977,7 +3031,6 @@ fn service_ancestor_with(
         }
         current = parent;
     }
-    None
 }
 
 /// [`service_ancestor_with`] over a scan (no extra syscalls).
@@ -2985,11 +3038,11 @@ pub fn service_ancestor(
     pid: u32,
     processes: &std::collections::HashMap<u32, &ProcessRecord>,
 ) -> Option<(u32, String)> {
-    service_ancestor_with(
-        pid,
-        |p| processes.get(&p).map(|r| r.ppid.0),
-        |p| processes.get(&p).map(|r| (r.comm.clone(), r.cmd.clone())),
-    )
+    ScanAncestors::new(processes, |process| {
+        is_service_daemon(&process.comm, &process.cmd)
+    })
+    .nearest(pid)
+    .map(|record| (record.pid.0, record.comm.clone()))
 }
 
 /// [`service_ancestor_with`] against live OS state, for apply-time checks.
@@ -3825,6 +3878,47 @@ mod tests {
             notes.contains(&format!("mattermost (pid {})", B + 100)),
             "{notes}"
         );
+    }
+
+    #[test]
+    fn service_protection_traverses_deep_trees_and_terminates_on_cycles() {
+        let mut processes = vec![make_test_record(100, 1, "postgres", "postgres -D /db", "u")];
+        for pid in 101..=230 {
+            processes.push(make_test_record(pid, pid - 1, "worker", "worker", "u"));
+        }
+        // A nested service is the nearest explanation for its own workers.
+        processes.push(make_test_record(231, 230, "nginx", "nginx", "u"));
+        processes.push(make_test_record(232, 231, "worker", "worker", "u"));
+        processes.push(make_test_record(300, 301, "worker", "worker", "u"));
+        processes.push(make_test_record(301, 300, "worker", "worker", "u"));
+        processes.reverse();
+        let result = default_filter().filter_with_observations(
+            &processes,
+            &HashSet::new(),
+            |_| super::super::cgroup::CgroupRole::Unknown,
+            |_| None,
+        );
+        for (leaf, daemon) in [(230, "postgres (pid 100)"), (232, "nginx (pid 231)")] {
+            let protected = result.filtered.iter().find(|m| m.pid == leaf).unwrap();
+            assert_eq!(protected.pattern, "builtin.service_child");
+            assert!(protected.notes.as_deref().unwrap().contains(daemon));
+        }
+        assert!(result.passed.iter().any(|p| p.pid.0 == 300));
+        // Apply observes parent IDs and command identities live through these
+        // callbacks, without the scan cache. Both paths must agree.
+        let by_pid: HashMap<_, _> = processes.iter().map(|p| (p.pid.0, p)).collect();
+        for (pid, expected) in [(230, Some(100)), (232, Some(231)), (300, None)] {
+            let live = service_ancestor_with(
+                pid,
+                |p| Some(by_pid.get(&p)?.ppid.0),
+                |p| {
+                    let record = by_pid.get(&p)?;
+                    Some((record.comm.clone(), record.cmd.clone()))
+                },
+            );
+            assert_eq!(live.map(|(p, _)| p), expected);
+            assert_eq!(service_ancestor(pid, &by_pid).map(|(p, _)| p), expected);
+        }
     }
 
     /// Every case here was rated P(abandoned) ~ 1.0 on the 2026-09-24 fleet scan.
