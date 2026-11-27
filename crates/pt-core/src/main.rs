@@ -11103,7 +11103,7 @@ fn build_goal_plan_from_candidates(
     let resource_observations = serde_json::json!({
         "basis": "observed_snapshot",
         "port_scope": "current_network_namespace",
-        "process_scope": "mounted_procfs",
+        "process_scope": if cfg!(target_os = "macos") { "darwin_process_table" } else { "mounted_procfs" },
         "ports": resources.ports,
         "processes": requests_processes.then(|| serde_json::json!({
             "count": resources.process_count,
@@ -40029,7 +40029,12 @@ fn observed_process_fd_count(process: &ProcessRecord) -> Option<u64> {
     provider.revalidate(&identity).ok()?.then_some(count)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(target_os = "macos")]
+fn observed_process_fd_count(process: &ProcessRecord) -> Option<u64> {
+    pt_core::decision::goal_contribution::macos_fd_count(&process_identity_from_record(process))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn collect_total_fds_for_goal_progress(processes: &[ProcessRecord]) -> Option<u64> {
     if processes.is_empty() {
         return None;
@@ -40039,7 +40044,7 @@ fn collect_total_fds_for_goal_progress(processes: &[ProcessRecord]) -> Option<u6
     })
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn collect_total_fds_for_goal_progress(_processes: &[ProcessRecord]) -> Option<u64> {
     None
 }

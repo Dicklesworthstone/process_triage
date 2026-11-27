@@ -108,20 +108,54 @@ impl GoalResourceSnapshot {
         };
         #[cfg(not(target_os = "linux"))]
         let mut snapshot = {
-            let _ = population;
-            let mut warnings = Vec::new();
-            if need_fds || !ports.is_empty() {
-                warnings.push("fd_and_port_goal_measurements_unavailable_on_this_platform".into());
+            let mut snapshot = Self {
+                ports,
+                ..Self::default()
+            };
+            #[cfg(target_os = "macos")]
+            {
+                if need_fds {
+                    let mut unavailable = 0;
+                    for process in population {
+                        let identity = ProcessIdentity::new(
+                            process.pid.0,
+                            process.start_id.clone(),
+                            process.uid,
+                        );
+                        match macos_fd_count(&identity) {
+                            Some(fd_count) => {
+                                snapshot.processes.insert(
+                                    process.pid.0,
+                                    ProcessGoalResources { identity, fd_count },
+                                );
+                            }
+                            None => unavailable += 1,
+                        }
+                    }
+                    if unavailable > 0 {
+                        snapshot
+                            .warnings
+                            .push(format!("fd_count_unavailable_for_{unavailable}_processes"));
+                    }
+                }
+                if !snapshot.ports.is_empty() {
+                    snapshot
+                        .warnings
+                        .push("port_goal_measurements_unavailable_on_this_platform".into());
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            if need_fds || !snapshot.ports.is_empty() {
+                snapshot
+                    .warnings
+                    .push("fd_and_port_goal_measurements_unavailable_on_this_platform".into());
             }
             if need_memory {
-                warnings
+                snapshot
+                    .warnings
                     .push("private_memory_goal_measurements_unavailable_on_this_platform".into());
             }
-            Self {
-                ports,
-                warnings,
-                ..Self::default()
-            }
+            snapshot
         };
         snapshot.process_count = process_count;
         if let Some(target) = disk_target {
@@ -213,6 +247,74 @@ impl GoalResourceSnapshot {
             .checked_add(observed.private_dirty_bytes)
             .ok_or_else(|| "private-memory byte total overflows u64".into())
     }
+}
+
+/// PROC_PIDLISTFDS returns bytes copied. A full buffer can be a truncated list.
+/// Retry within a fixed per-process budget and credit only a complete reading.
+#[cfg(any(target_os = "macos", test))]
+fn bounded_fd_count(
+    entry_size: usize,
+    mut read: impl FnMut(usize) -> Option<usize>,
+) -> Option<u64> {
+    const MAX_BYTES: usize = 1024 * 1024;
+    if entry_size == 0 {
+        return None;
+    }
+    let mut entries = 64usize;
+    while entries.checked_mul(entry_size)? <= MAX_BYTES {
+        let bytes = read(entries)?;
+        if bytes % entry_size != 0 || bytes / entry_size > entries {
+            return None;
+        }
+        if bytes / entry_size < entries {
+            return u64::try_from(bytes / entry_size).ok();
+        }
+        entries = entries.checked_mul(2)?;
+    }
+    None
+}
+
+/// Count entries in the Darwin descriptor table for the same process birth and owner.
+/// The BSD info table capacity can exceed the number of open descriptors.
+#[cfg(target_os = "macos")]
+pub fn macos_fd_count(identity: &ProcessIdentity) -> Option<u64> {
+    use std::mem::{size_of, MaybeUninit};
+    let pid = identity.pid.0;
+    let native_pid = i32::try_from(pid).ok().filter(|&pid| pid > 0)?;
+    let same_process = || {
+        crate::collect::macos::read_bsd_info(pid).is_some_and(|info| {
+            info.uid == identity.uid
+                && info.start_us != 0
+                && pt_common::StartId::from_macos("unknown", info.start_us, pid)
+                    == identity.start_id
+        })
+    };
+    if !identity.can_safely_revalidate() || !same_process() {
+        return None;
+    }
+    let entry_size = size_of::<libc::proc_fdinfo>();
+    let count = bounded_fd_count(entry_size, |entries| {
+        let mut buffer = vec![MaybeUninit::<libc::proc_fdinfo>::uninit(); entries];
+        let capacity = i32::try_from(entries * entry_size).ok()?;
+        // SAFETY: libproc receives aligned writable storage of exactly capacity bytes.
+        // On failure it returns zero and sets errno; zero is also a valid empty table.
+        // __error is the calling thread's errno. No uninitialized entry is read.
+        unsafe {
+            *libc::__error() = 0;
+            let bytes = libc::proc_pidinfo(
+                native_pid,
+                libc::PROC_PIDLISTFDS,
+                0,
+                buffer.as_mut_ptr().cast(),
+                capacity,
+            );
+            if bytes == 0 && *libc::__error() != 0 {
+                return None;
+            }
+            usize::try_from(bytes).ok()
+        }
+    })?;
+    same_process().then_some(count)
 }
 
 fn requested_resources(
@@ -1113,6 +1215,47 @@ mod tests {
             assert_eq!(fd_count, 5);
             assert_eq!(sockets, BTreeSet::from([u64::MAX]));
         }
+    }
+
+    #[test]
+    fn native_fd_count_requires_a_complete_aligned_reading() {
+        let mut reads = Vec::new();
+        assert_eq!(
+            bounded_fd_count(8, |entries| {
+                reads.push(entries);
+                Some(entries.min(90) * 8)
+            }),
+            Some(90)
+        );
+        assert_eq!(reads, [64, 128]);
+        assert_eq!(bounded_fd_count(8, |_| Some(0)), Some(0));
+        assert_eq!(bounded_fd_count(8, |_| None), None);
+        assert_eq!(bounded_fd_count(8, |_| Some(7)), None);
+        assert_eq!(bounded_fd_count(8, |entries| Some((entries + 1) * 8)), None);
+        assert_eq!(bounded_fd_count(8, |entries| Some(entries * 8)), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_fd_goal_measures_the_requested_incarnation() {
+        let pid = std::process::id();
+        let scan = crate::collect::quick_scan(&crate::collect::QuickScanOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .unwrap();
+        let process = scan
+            .processes
+            .iter()
+            .find(|process| process.pid.0 == pid)
+            .unwrap();
+        let mut identity = ProcessIdentity::new(pid, process.start_id.clone(), process.uid);
+        let goal = super::super::goal_parser::parse_goal("free 10 FDs").unwrap();
+        let snapshot = GoalResourceSnapshot::collect(&goal, &scan.processes);
+        assert!(snapshot.fd_count(&identity).is_some_and(|count| count > 0));
+        identity.uid = identity.uid.wrapping_add(1);
+        assert_eq!(macos_fd_count(&identity), None);
+        assert_eq!(snapshot.fd_count(&identity), None);
     }
 
     #[test]
