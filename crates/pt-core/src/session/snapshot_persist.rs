@@ -842,6 +842,90 @@ fn valid_recorded_start_id(pid: u32, start_id: &str) -> bool {
         && start_id.rsplit(':').next().and_then(|p| p.parse().ok()) == Some(pid)
 }
 
+fn valid_recorded_posterior(values: &[f64]) -> bool {
+    values.iter().all(|value| (0.0..=1.0).contains(value))
+        && (values.iter().sum::<f64>() - 1.0).abs() <= 1e-6
+}
+
+/// The inventory and scoring results from one historical observation.
+pub type RecordedSnapshotPair = (
+    ArtifactEnvelope<InventoryArtifact>,
+    ArtifactEnvelope<InferenceArtifact>,
+);
+
+/// Read the two checksummed artifacts as one observation. A process may have
+/// no inference, but every inference must identify exactly one inventory row.
+pub fn load_recorded_snapshot_pair(handle: &SessionHandle) -> Result<RecordedSnapshotPair, String> {
+    let inventory =
+        load_inventory(handle).map_err(|error| format!("recorded inventory: {error}"))?;
+    let inference =
+        load_inference(handle).map_err(|error| format!("recorded inference: {error}"))?;
+    if inventory.session_id != handle.id.0 || inference.session_id != handle.id.0 {
+        return Err("recorded snapshot session ID mismatch".into());
+    }
+    if inventory.host_id.trim().is_empty() || inventory.host_id != inference.host_id {
+        return Err(
+            "recorded snapshot host ID mismatch: inventory and inference host IDs differ".into(),
+        );
+    }
+    for (name, timestamp) in [
+        ("inventory", &inventory.generated_at),
+        ("inference", &inference.generated_at),
+    ] {
+        chrono::DateTime::parse_from_rfc3339(timestamp)
+            .map_err(|_| format!("recorded {name} has an invalid timestamp"))?;
+    }
+    if inventory.payload.record_count != inventory.payload.records.len()
+        || inference.payload.candidate_count != inference.payload.candidates.len()
+    {
+        return Err("recorded snapshot count mismatch".into());
+    }
+    let mut identities = BTreeMap::new();
+    for process in &inventory.payload.records {
+        if !valid_recorded_start_id(process.pid, &process.start_id) {
+            return Err(format!(
+                "recorded PID {} has an invalid process birth identity",
+                process.pid
+            ));
+        }
+        if identities
+            .insert(process.pid, process.start_id.as_str())
+            .is_some()
+        {
+            return Err("recorded inventory has duplicate process identities".into());
+        }
+    }
+    let mut scored = std::collections::BTreeSet::new();
+    for candidate in &inference.payload.candidates {
+        if identities.get(&candidate.pid).copied() != Some(candidate.start_id.as_str()) {
+            return Err(format!(
+                "recorded PID {} inference does not match its inventory",
+                candidate.pid
+            ));
+        }
+        if !scored.insert(candidate.pid) {
+            return Err(format!(
+                "recorded inference has ambiguous duplicate PID {}",
+                candidate.pid
+            ));
+        }
+        if candidate.pid == 0
+            || !valid_recorded_posterior(&[
+                candidate.posterior_useful,
+                candidate.posterior_useful_bad,
+                candidate.posterior_abandoned,
+                candidate.posterior_zombie,
+            ])
+        {
+            return Err(format!(
+                "recorded PID {} has an invalid PID or posterior",
+                candidate.pid
+            ));
+        }
+    }
+    Ok((inventory, inference))
+}
+
 fn recorded_protection(
     summary: &serde_json::Value,
     candidates: &BTreeMap<u32, serde_json::Value>,
@@ -913,12 +997,10 @@ fn index_explanation_candidates(
             .iter()
             .map(|class| candidate["posterior"][*class].as_f64())
             .collect();
-        if probabilities.as_ref().is_none_or(|values| {
-            values
-                .iter()
-                .any(|value| !value.is_finite() || !(0.0..=1.0).contains(value))
-                || (values.iter().sum::<f64>() - 1.0).abs() > 1e-6
-        }) {
+        if probabilities
+            .as_ref()
+            .is_none_or(|values| !valid_recorded_posterior(values))
+        {
             return Err(format!("recorded PID {pid} has an invalid posterior"));
         }
         if indexed.insert(pid, candidate).is_some() {
@@ -991,44 +1073,19 @@ pub fn load_recorded_explanation_snapshot(
         Err(error) => return Err(format!("cannot inspect recorded inference: {error}")),
         Ok(_) => {}
     }
-    let inventory =
-        load_inventory(handle).map_err(|error| format!("recorded inventory: {error}"))?;
-    let inference =
-        load_inference(handle).map_err(|error| format!("recorded inference: {error}"))?;
-    if inventory.session_id != handle.id.0 || inference.session_id != handle.id.0 {
-        return Err("recorded snapshot session ID mismatch".into());
-    }
-    if inventory.host_id.is_empty() || inventory.host_id != inference.host_id {
-        return Err("recorded inventory and inference host IDs differ".into());
-    }
-    if inventory.payload.record_count != inventory.payload.records.len()
-        || inference.payload.candidate_count != inference.payload.candidates.len()
-    {
-        return Err("recorded snapshot count mismatch".into());
-    }
-    let mut records = BTreeMap::new();
-    let mut inventory_pids = std::collections::BTreeSet::new();
-    for process in &inventory.payload.records {
-        if !inventory_pids.insert(process.pid)
-            || records.insert(process.start_id.as_str(), process).is_some()
-        {
-            return Err("recorded inventory has duplicate process identities".into());
-        }
-    }
+    let (inventory, inference) = load_recorded_snapshot_pair(handle)?;
+    let records: BTreeMap<_, _> = inventory
+        .payload
+        .records
+        .iter()
+        .map(|p| (p.pid, p))
+        .collect();
     let candidates = inference
         .payload
         .candidates
         .iter()
         .map(|candidate| {
-            let process = records
-                .get(candidate.start_id.as_str())
-                .filter(|process| process.pid == candidate.pid)
-                .ok_or_else(|| {
-                    format!(
-                        "recorded PID {} inference does not match its inventory",
-                        candidate.pid
-                    )
-                })?;
+            let process = records[&candidate.pid];
             let mut recorded = serde_json::json!({
                 "pid": candidate.pid,
                 "start_id": candidate.start_id,
@@ -1070,11 +1127,11 @@ pub fn load_recorded_explanation_snapshot(
             if let Some(shift) = candidate.provenance_log_odds_shift {
                 recorded["provenance_log_odds_shift"] = serde_json::json!(shift);
             }
-            Ok(recorded)
+            (candidate.pid, recorded)
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect();
     Ok(RecordedExplanationSnapshot {
-        candidates: index_explanation_candidates(candidates)?,
+        candidates,
         protected: BTreeMap::new(),
         source: serde_json::json!({
             "artifact": INFERENCE_FILE,

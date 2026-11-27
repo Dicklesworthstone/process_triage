@@ -624,6 +624,83 @@ fn test_diff_category_filter() {
 }
 
 #[test]
+fn diff_uses_validated_snapshots_from_one_host() {
+    let dir = tempdir().unwrap();
+    let data_dir = dir.path().to_str().unwrap();
+    let store = SessionStore::at_data_dir(dir.path());
+    let base = create_custom_session(data_dir, "pt-20260317-000001-aaab", vec![], vec![]);
+    let foreign = create_custom_session(data_dir, "pt-20260317-000002-aaac", vec![], vec![]);
+    let compare = create_custom_session(
+        data_dir,
+        "pt-20260317-000003-aaad",
+        vec![proc(100, 42, 1000, "b1:100:100", "S", 3600)],
+        vec![inf(100, "b1:100:100", "useful_bad", 40, "review", 0.3)],
+    );
+    for (id, time) in [
+        (&base, "00:00:01"),
+        (&foreign, "00:00:02"),
+        (&compare, "00:00:03"),
+    ] {
+        let handle = store.open(&SessionId(id.clone())).unwrap();
+        let mut manifest = handle.read_manifest().unwrap();
+        manifest.timing.created_at = format!("2026-03-17T{time}Z");
+        handle.write_manifest(&manifest).unwrap();
+    }
+    let foreign_handle = store.open(&SessionId(foreign.clone())).unwrap();
+    for file in ["scan/inventory.json", "inference/results.json"] {
+        let path = foreign_handle.dir.join(file);
+        let mut envelope: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        envelope["host_id"] = "another-host".into();
+        std::fs::write(path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+    }
+    let output = pt_core_with_data(data_dir)
+        .args(["--format", "json", "diff", "--last"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let diff: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(diff["comparison"]["base_session"], base);
+    assert_eq!(diff["comparison"]["compare_session"], compare);
+    assert_eq!(diff["comparison"]["host_id"], "host-test");
+    assert_eq!(diff["summary"]["new_count"], 1);
+    pt_core_with_data(data_dir)
+        .args(["diff", &base, &foreign])
+        .assert()
+        .code(10)
+        .stderr(predicate::str::contains("different hosts"));
+
+    let handle = store.open(&SessionId(compare.clone())).unwrap();
+    let path = handle.dir.join("inference/results.json");
+    let mut envelope: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    envelope["payload"]["candidates"][0]["score"] = 99.into();
+    std::fs::write(path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+    pt_core_with_data(data_dir)
+        .args(["diff", &base, &compare])
+        .assert()
+        .code(10)
+        .stderr(predicate::str::contains("integrity check failed"));
+
+    // A valid checksum on the wrong process's result still cannot establish continuity.
+    persist_inference(
+        &handle,
+        &compare,
+        "host-test",
+        InferenceArtifact {
+            candidate_count: 1,
+            candidates: vec![inf(100, "b1:999:100", "abandoned", 90, "kill", 0.9)],
+        },
+    )
+    .unwrap();
+    pt_core_with_data(data_dir)
+        .args(["diff", &base, &compare])
+        .assert()
+        .code(10)
+        .stderr(predicate::str::contains("does not match its inventory"));
+}
+
+#[test]
 fn test_diff_json_includes_lifecycle_metadata() {
     let dir = tempdir().expect("tempdir");
     let data_dir = dir.path().to_str().unwrap();

@@ -78,13 +78,12 @@ use pt_core::session::diff::{
 };
 use pt_core::session::fleet::{create_fleet_session, HostInput};
 use pt_core::session::snapshot_persist::{
-    load_inference, load_inference_unchecked, load_inventory, load_inventory_unchecked,
-    persist_inference, persist_inventory, ArtifactEnvelope, InferenceArtifact, InventoryArtifact,
-    PersistedInference, PersistedProcess,
+    load_recorded_snapshot_pair, persist_inference, persist_inventory, ArtifactEnvelope,
+    InferenceArtifact, InventoryArtifact, PersistedInference, PersistedProcess,
 };
 use pt_core::session::{
     ListSessionsOptions, SessionContext, SessionHandle, SessionManifest, SessionMode, SessionState,
-    SessionStore, SessionSummary,
+    SessionStore,
 };
 use pt_core::shadow::ShadowRecorder;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -36304,20 +36303,10 @@ fn load_agent_plan_baseline(
     let handle = store.open(session_id).map_err(|error| error.to_string())?;
     // These loaders check the schema and canonical payload SHA-256. A plan.json
     // alone does not establish that comparable observations were persisted.
-    let inventory = load_inventory(&handle)
-        .map_err(|error| format!("baseline {session_id} inventory: {error}"))?;
-    let inference = load_inference(&handle)
-        .map_err(|error| format!("baseline {session_id} inference: {error}"))?;
-    for (kind, artifact_session, artifact_host) in [
-        ("inventory", &inventory.session_id, &inventory.host_id),
-        ("inference", &inference.session_id, &inference.host_id),
-    ] {
-        if artifact_session != &session_id.0 {
-            return Err(format!("baseline {session_id} {kind} session ID mismatch"));
-        }
-        if artifact_host.is_empty() || artifact_host != host_id {
-            return Err(format!("baseline {session_id} {kind} host ID mismatch"));
-        }
+    let (inventory, inference) = load_recorded_snapshot_pair(&handle)
+        .map_err(|error| format!("baseline {session_id}: {error}"))?;
+    if inventory.host_id != host_id {
+        return Err(format!("baseline {session_id} host ID mismatch"));
     }
     let inventory_time = chrono::DateTime::parse_from_rfc3339(&inventory.generated_at)
         .map_err(|_| format!("baseline {session_id} inventory has an invalid timestamp"))?
@@ -36325,41 +36314,6 @@ fn load_agent_plan_baseline(
     let inference_time = chrono::DateTime::parse_from_rfc3339(&inference.generated_at)
         .map_err(|_| format!("baseline {session_id} inference has an invalid timestamp"))?
         .with_timezone(&chrono::Utc);
-    if inventory.payload.record_count != inventory.payload.records.len()
-        || inference.payload.candidate_count != inference.payload.candidates.len()
-    {
-        return Err(format!(
-            "baseline {session_id} artifact record count mismatch"
-        ));
-    }
-    let mut identities = HashMap::new();
-    for process in &inventory.payload.records {
-        let identity_pid = process
-            .start_id
-            .rsplit(':')
-            .next()
-            .and_then(|pid| pid.parse::<u32>().ok());
-        if pt_common::StartId::parse(&process.start_id).is_none()
-            || identity_pid != Some(process.pid)
-            || identities
-                .insert(process.start_id.as_str(), process.pid)
-                .is_some()
-        {
-            return Err(format!(
-                "baseline {session_id} contains an invalid or duplicate process identity"
-            ));
-        }
-    }
-    let mut inference_identities = HashSet::new();
-    for candidate in &inference.payload.candidates {
-        if identities.get(candidate.start_id.as_str()) != Some(&candidate.pid)
-            || !inference_identities.insert(candidate.start_id.as_str())
-        {
-            return Err(format!(
-                "baseline {session_id} inference identities do not match its inventory"
-            ));
-        }
-    }
     Ok(AgentPlanBaseline {
         session_id: session_id.0.clone(),
         // Both artifacts must have existed by a requested time boundary.
@@ -43768,144 +43722,106 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
     }
 }
 
+struct DiffSnapshot {
+    id: SessionId,
+    label: Option<String>,
+    inventory: ArtifactEnvelope<InventoryArtifact>,
+    inference: ArtifactEnvelope<InferenceArtifact>,
+}
+
+fn read_diff_snapshot(store: &SessionStore, raw: &str) -> Result<DiffSnapshot, String> {
+    let id = SessionId::parse(raw).ok_or_else(|| format!("diff: invalid session ID {raw}"))?;
+    let handle = store.open(&id).map_err(|error| format!("diff: {error}"))?;
+    let manifest = handle
+        .read_manifest()
+        .map_err(|error| format!("diff: {error}"))?;
+    if manifest.session_id != id.0 {
+        return Err(format!("diff: manifest session ID mismatch for {id}"));
+    }
+    let (inventory, inference) = load_recorded_snapshot_pair(&handle)
+        .map_err(|error| format!("diff: session {id}: {error}"))?;
+    if inventory.host_id.trim().eq_ignore_ascii_case("unknown") {
+        return Err(format!("diff: snapshot {id} has no recorded host identity"));
+    }
+    Ok(DiffSnapshot {
+        id,
+        label: manifest.label,
+        inventory,
+        inference,
+    })
+}
+
 fn resolve_diff_sessions(
     store: &SessionStore,
     args: &DiffArgs,
-) -> Result<(SessionId, SessionId, Option<String>, Option<String>), String> {
-    fn has_required_artifacts(summary: &SessionSummary) -> bool {
-        // Diff requires both inventory + inference artifacts.
-        // Older sessions may not have these yet; skip them to avoid confusing failures.
-        summary.path.join("scan").join("inventory.json").exists()
-            && summary.path.join("inference").join("results.json").exists()
-    }
-
+) -> Result<(DiffSnapshot, DiffSnapshot), String> {
     if args.baseline && args.last {
         return Err("diff: --baseline and --last cannot be used together".to_string());
     }
     if (args.baseline || args.last) && (args.base.is_some() || args.compare.is_some()) {
-        return Err(
-            "diff: positional sessions cannot be combined with --baseline/--last".to_string(),
-        );
+        return Err("diff: positional sessions cannot be combined with --baseline/--last".into());
     }
 
-    let list_options = ListSessionsOptions {
-        limit: Some(200),
-        state: None,
-        older_than: None,
-    };
-    let all_sessions = store
-        .list_sessions(&list_options)
-        .map_err(|e| format!("diff: failed to list sessions: {}", e))?;
-    if all_sessions.is_empty() {
-        return Err("diff: no sessions found".to_string());
-    }
-
-    let sessions: Vec<SessionSummary> = all_sessions
-        .into_iter()
-        .filter(has_required_artifacts)
-        .collect();
-    if sessions.is_empty() {
-        return Err(
-            "diff: no sessions with required artifacts (need scan inventory + inference results)"
-                .to_string(),
-        );
-    }
-
-    let use_last = args.last || (!args.baseline && args.base.is_none());
-
-    let (base_summary, compare_summary) = if args.baseline {
-        let base = sessions
-            .iter()
-            .find(|s| {
-                s.label
-                    .as_deref()
-                    .map(|l| l.eq_ignore_ascii_case("baseline"))
-                    .unwrap_or(false)
-            })
-            .cloned()
-            .ok_or_else(|| {
-                "diff: no baseline session found (label a session 'baseline')".to_string()
-            })?;
-        let compare = sessions
-            .iter()
-            .find(|s| s.session_id != base.session_id)
-            .cloned()
-            .ok_or_else(|| "diff: need at least two sessions to compare".to_string())?;
-        (base, compare)
-    } else if use_last {
-        if sessions.len() < 2 {
-            return Err("diff: need at least two sessions to compare".to_string());
+    if let (Some(base), Some(compare)) = (args.base.as_deref(), args.compare.as_deref()) {
+        if !matches!(compare, "current" | "latest") {
+            if base == compare {
+                return Err("diff: base and compare sessions must differ".into());
+            }
+            let base = read_diff_snapshot(store, base)?;
+            let compare = read_diff_snapshot(store, compare)?;
+            if base.inventory.host_id != compare.inventory.host_id {
+                return Err("diff: snapshots come from different hosts".into());
+            }
+            return Ok((base, compare));
         }
-        (sessions[1].clone(), sessions[0].clone())
-    } else {
-        let base_raw = args
-            .base
-            .as_ref()
-            .ok_or_else(|| "diff: base session required".to_string())?;
-
-        let compare_summary = match args.compare.as_deref() {
-            Some("current") | Some("latest") | None => sessions
-                .iter()
-                .find(|s| s.session_id != *base_raw)
-                .cloned()
-                .ok_or_else(|| {
-                    "diff: no compare session found (need at least two sessions)".to_string()
-                })?,
-            Some(raw) => sessions
-                .iter()
-                .find(|s| s.session_id == raw)
-                .cloned()
-                .unwrap_or_else(|| SessionSummary {
-                    session_id: raw.to_string(),
-                    created_at: String::new(),
-                    state: SessionState::Created,
-                    mode: SessionMode::ScanOnly,
-                    label: None,
-                    host_id: None,
-                    candidates_count: None,
-                    actions_count: None,
-                    path: PathBuf::new(),
-                }),
-        };
-
-        let base_summary = sessions
-            .iter()
-            .find(|s| s.session_id == *base_raw)
-            .cloned()
-            .unwrap_or_else(|| SessionSummary {
-                session_id: base_raw.to_string(),
-                created_at: String::new(),
-                state: SessionState::Created,
-                mode: SessionMode::ScanOnly,
-                label: None,
-                host_id: None,
-                candidates_count: None,
-                actions_count: None,
-                path: PathBuf::new(),
-            });
-
-        (base_summary, compare_summary)
-    };
-
-    if base_summary.session_id == compare_summary.session_id {
-        return Err("diff: base and compare sessions must differ".to_string());
     }
 
-    let base_id = SessionId::parse(&base_summary.session_id)
-        .ok_or_else(|| format!("diff: invalid base session {}", base_summary.session_id))?;
-    let compare_id = SessionId::parse(&compare_summary.session_id).ok_or_else(|| {
-        format!(
-            "diff: invalid compare session {}",
-            compare_summary.session_id
-        )
-    })?;
-
-    Ok((
-        base_id,
-        compare_id,
-        base_summary.label,
-        compare_summary.label,
-    ))
+    let summaries = store
+        .list_sessions(&ListSessionsOptions::default())
+        .map_err(|error| format!("diff: failed to list sessions: {error}"))?;
+    let sessions = summaries.iter().filter(|summary| {
+        summary.path.file_name().and_then(|name| name.to_str()) == Some(summary.session_id.as_str())
+            && summary.path.join("scan/inventory.json").is_file()
+            && summary.path.join("inference/results.json").is_file()
+    });
+    let anchor_id = match &args.base {
+        Some(raw) => raw.as_str(),
+        None if args.baseline => {
+            &sessions
+                .clone()
+                .find(|s| {
+                    s.label
+                        .as_deref()
+                        .is_some_and(|label| label.eq_ignore_ascii_case("baseline"))
+                })
+                .ok_or("diff: no baseline session found (label a session 'baseline')")?
+                .session_id
+        }
+        None => {
+            &sessions
+                .clone()
+                .next()
+                .ok_or("diff: no sessions with recorded snapshots")?
+                .session_id
+        }
+    };
+    let anchor = read_diff_snapshot(store, anchor_id)?;
+    // --last anchors the newer side. A baseline or named session anchors the
+    // older side. In both cases search past interleaved foreign-host captures.
+    for summary in sessions {
+        if summary.session_id == anchor.id.0 {
+            continue;
+        }
+        let other = read_diff_snapshot(store, &summary.session_id)?;
+        if other.inventory.host_id == anchor.inventory.host_id {
+            return if args.base.is_none() && !args.baseline {
+                Ok((other, anchor))
+            } else {
+                Ok((anchor, other))
+            };
+        }
+    }
+    Err("diff: need at least two snapshots from the same host to compare".into())
 }
 
 fn filter_diff_deltas(diff: &SessionDiff, args: &DiffArgs) -> Result<Vec<ProcessDelta>, String> {
@@ -44118,58 +44034,25 @@ fn run_diff(global: &GlobalOpts, args: &DiffArgs) -> ExitCode {
         }
     };
 
-    let (base_id, compare_id, base_label, compare_label) = match resolve_diff_sessions(&store, args)
-    {
+    let (base, compare) = match resolve_diff_sessions(&store, args) {
         Ok(pair) => pair,
-        Err(e) => {
-            eprintln!("{}", e);
+        Err(error) => {
+            eprintln!("{error}");
             return ExitCode::ArgsError;
         }
     };
-
-    let base_handle = match store.open(&base_id) {
-        Ok(handle) => handle,
-        Err(e) => {
-            eprintln!("diff: base {}", e);
-            return ExitCode::ArgsError;
-        }
-    };
-    let compare_handle = match store.open(&compare_id) {
-        Ok(handle) => handle,
-        Err(e) => {
-            eprintln!("diff: compare {}", e);
-            return ExitCode::ArgsError;
-        }
-    };
-
-    let base_inventory = match load_inventory_unchecked(&base_handle) {
-        Ok(inv) => inv,
-        Err(e) => {
-            eprintln!("diff: base inventory: {}", e);
-            return ExitCode::ArgsError;
-        }
-    };
-    let base_inference = match load_inference_unchecked(&base_handle) {
-        Ok(inf) => inf,
-        Err(e) => {
-            eprintln!("diff: base inference: {}", e);
-            return ExitCode::ArgsError;
-        }
-    };
-    let compare_inventory = match load_inventory_unchecked(&compare_handle) {
-        Ok(inv) => inv,
-        Err(e) => {
-            eprintln!("diff: compare inventory: {}", e);
-            return ExitCode::ArgsError;
-        }
-    };
-    let compare_inference = match load_inference_unchecked(&compare_handle) {
-        Ok(inf) => inf,
-        Err(e) => {
-            eprintln!("diff: compare inference: {}", e);
-            return ExitCode::ArgsError;
-        }
-    };
+    let DiffSnapshot {
+        id: base_id,
+        label: base_label,
+        inventory: base_inventory,
+        inference: base_inference,
+    } = base;
+    let DiffSnapshot {
+        id: compare_id,
+        label: compare_label,
+        inventory: compare_inventory,
+        inference: compare_inference,
+    } = compare;
 
     let mut config = DiffConfig::default();
     if let Some(min) = args.min_score_delta {
@@ -44210,6 +44093,7 @@ fn run_diff(global: &GlobalOpts, args: &DiffArgs) -> ExitCode {
             "compare_session": compare_id.0,
             "base_timestamp": base_ts,
             "compare_timestamp": compare_ts,
+            "host_id": base_inventory.host_id,
             "base_label": base_label,
             "compare_label": compare_label,
         },
