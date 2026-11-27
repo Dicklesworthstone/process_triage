@@ -350,6 +350,10 @@ pub enum CpuOccupancy {
         effective_parallelism: f64,
         online_cores: u32,
         affinity_cores: u32,
+        /// Maximum threads simultaneously placeable on distinct online CPUs
+        /// when their observed affinity masks differ.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        affinity_parallelism: Option<u32>,
         quota_cores: Option<f64>,
         threads: u32,
     },
@@ -438,6 +442,7 @@ impl ProcessActivity {
             effective_parallelism,
             online_cores,
             affinity_cores,
+            affinity_parallelism,
             quota_cores,
             threads,
         } = self.cpu_occupancy.as_ref()?
@@ -447,13 +452,16 @@ impl ProcessActivity {
         if *online_cores == 0
             || *affinity_cores == 0
             || *threads == 0
+            || affinity_parallelism.is_some_and(|count| {
+                count == 0 || count > *threads || count > *affinity_cores || count > *online_cores
+            })
             || quota_cores.is_some_and(|cores| !cores.is_finite() || cores <= 0.0)
         {
             return None;
         }
         let capacity = f64::from((*online_cores).min(*affinity_cores))
             .min(quota_cores.unwrap_or(f64::INFINITY));
-        let parallelism = capacity.min(f64::from(*threads));
+        let parallelism = capacity.min(f64::from(affinity_parallelism.unwrap_or(*threads)));
         let percent = self
             .cpu_percent
             .filter(|percent| percent.is_finite() && *percent >= 0.0)?;

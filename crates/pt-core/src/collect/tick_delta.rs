@@ -672,7 +672,9 @@ fn normalized_cpu_occupancy(
             .filter(|value| value.is_finite() && *value >= 0.0)
             .ok_or("CPU activity is unavailable")?;
         let effective_cores = second.effective_cores();
-        let effective_parallelism = effective_cores.min(f64::from(second.threads));
+        let effective_parallelism = effective_cores.min(f64::from(
+            second.affinity_parallelism.unwrap_or(second.threads),
+        ));
         if !effective_parallelism.is_finite() || effective_parallelism <= 0.0 {
             return Err("observed CPU capacity is not positive and finite".into());
         }
@@ -682,6 +684,7 @@ fn normalized_cpu_occupancy(
             effective_parallelism,
             online_cores: second.online_cores,
             affinity_cores: second.affinity_cores,
+            affinity_parallelism: second.affinity_parallelism,
             quota_cores: second.quota_cores,
             threads: second.threads,
         })
@@ -1019,9 +1022,15 @@ mod tests {
             affinity_cores: affinity,
             quota_cores: quota,
             threads,
-            affinity: vec![(0, affinity - 1)],
+            affinity_parallelism: None,
             membership: "0::/workload\n".into(),
-            tasks: (0..threads).map(|index| (1234 + index, 12345)).collect(),
+            tasks: (0..threads)
+                .map(|index| super::super::cpu_capacity::TaskAffinity {
+                    tid: 1234 + index,
+                    start_ticks: 12345,
+                    mask: vec![(0, affinity - 1)],
+                })
+                .collect(),
         }
     }
 
@@ -1057,6 +1066,45 @@ mod tests {
     }
 
     #[test]
+    fn heterogeneous_parallelism_survives_replay_and_respects_quota() {
+        for (quota, expected_occupancy) in [(None, 0.5), (Some(1.25), 0.8)] {
+            let (process, mut first, mut second) = activity_fixture();
+            let mut capacity = capacity_fixture(3, 8, quota);
+            first.ticks.num_threads = 3;
+            second.ticks.num_threads = 3;
+            capacity.tasks[0].mask = vec![(0, 0)];
+            capacity.tasks[1].mask = vec![(0, 0)];
+            capacity.affinity_parallelism = Some(2);
+            first.cpu_capacity = Ok(capacity);
+            second.cpu_capacity = first.cpu_capacity.clone();
+            second.ticks.utime += 50;
+            second.ticks.total_ticks += 50;
+            let activity =
+                activity_from_snapshots(&process, &first, &second, Duration::from_millis(500), 100);
+            assert_eq!(activity.cpu_percent, Some(100.0));
+            assert_eq!(activity.normalized_cpu_occupancy(), Some(expected_occupancy));
+            let serialized = serde_json::to_value(&activity).unwrap();
+            let restored: ProcessActivity = serde_json::from_value(serialized.clone()).unwrap();
+            assert_eq!(restored.normalized_cpu_occupancy(), Some(expected_occupancy));
+            for impossible in [0, 4] {
+                let mut damaged = serialized.clone();
+                damaged["cpu_occupancy"]["affinity_parallelism"] = serde_json::json!(impossible);
+                let restored: ProcessActivity = serde_json::from_value(damaged).unwrap();
+                assert_eq!(restored.normalized_cpu_occupancy(), None);
+            }
+            // Swapping which worker is broadly allowed preserves both the
+            // union and the matching size, but changes the recorded evidence.
+            let tasks = &mut second.cpu_capacity.as_mut().unwrap().tasks;
+            tasks[0].mask = vec![(0, 7)];
+            tasks[2].mask = vec![(0, 0)];
+            let changed =
+                activity_from_snapshots(&process, &first, &second, Duration::from_millis(500), 100);
+            assert_eq!(changed.normalized_cpu_occupancy(), None);
+            assert_eq!(changed.cpu_percent, Some(100.0));
+        }
+    }
+
+    #[test]
     fn changed_or_unavailable_capacity_preserves_rates_but_withholds_cpu_inference() {
         for change in [
             "quota",
@@ -1075,9 +1123,9 @@ mod tests {
                 "quota" => capacity.quota_cores = Some(0.2),
                 "online" => capacity.online_cores = 4,
                 "online_ids" => capacity.online = vec![(1, 8)],
-                "affinity" => capacity.affinity = vec![(2, 3)],
+                "affinity" => capacity.tasks[0].mask = vec![(2, 3)],
                 "membership" => capacity.membership = "0::/other\n".into(),
-                "thread_identity" => capacity.tasks[0].1 += 1,
+                "thread_identity" => capacity.tasks[0].start_ticks += 1,
                 "threads" => capacity.threads = 2,
                 "unreadable" => (),
                 _ => unreachable!(),

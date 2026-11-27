@@ -16,13 +16,14 @@
 
 use super::cgroup::CgroupDetails;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 const CAPACITY_MAX_THREADS: usize = 256;
+const CAPACITY_MAX_MASK_RANGES: usize = 32_768;
 const CAPACITY_MAX_FILE_BYTES: usize = 64 * 1024;
 const CAPACITY_MAX_MOUNT_BYTES: usize = 2 * 1024 * 1024;
 const CAPACITY_PROCESS_BUDGET: Duration = Duration::from_millis(50);
@@ -37,9 +38,16 @@ pub(super) struct CpuCapacitySample {
     pub affinity_cores: u32,
     pub quota_cores: Option<f64>,
     pub threads: u32,
-    pub affinity: Vec<(u32, u32)>,
+    pub affinity_parallelism: Option<u32>,
     pub membership: String,
-    pub tasks: Vec<(u32, u64)>,
+    pub tasks: Vec<TaskAffinity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct TaskAffinity {
+    pub tid: u32,
+    pub start_ticks: u64,
+    pub mask: Vec<(u32, u32)>,
 }
 
 impl CpuCapacitySample {
@@ -102,32 +110,34 @@ impl CpuCapacitySampler {
         capacity_budget(started, self.started)?;
         let tasks = read_capacity_tasks(&root.join("task"), threads)?;
         let mut observed_tasks = Vec::with_capacity(tasks.len());
-        let mut affinity = None;
+        let mut range_count = 0;
         for tid in &tasks {
             capacity_budget(started, self.started)?;
             let task = root.join("task").join(tid.to_string());
             let starttime = read_capacity_starttime(&task.join("stat"), *tid)?;
             let status = read_capacity_text(&task.join("status"), CAPACITY_MAX_FILE_BYTES)?;
             let mask = parse_observed_affinity(&status)?;
-            if affinity.as_ref().is_some_and(|expected| *expected != mask) {
-                return Err(
-                    "threads have different CPU affinities; capacity is not established".into(),
-                );
+            range_count += mask.len();
+            if range_count > CAPACITY_MAX_MASK_RANGES {
+                return Err("thread affinity masks exceed CPU capacity inspection limit".into());
             }
-            affinity = Some(mask);
             if read_capacity_membership(&task.join("cgroup"))? != membership {
                 return Err("threads have different CPU cgroup memberships".into());
             }
-            observed_tasks.push((*tid, starttime));
+            observed_tasks.push(TaskAffinity {
+                tid: *tid,
+                start_ticks: starttime,
+                mask,
+            });
         }
         // A thread that exits or changes affinity/membership during inspection
         // must not lend a capacity denominator to the original process.
-        for (tid, starttime) in &observed_tasks {
+        for observed in &observed_tasks {
             capacity_budget(started, self.started)?;
-            let task = root.join("task").join(tid.to_string());
+            let task = root.join("task").join(observed.tid.to_string());
             let status = read_capacity_text(&task.join("status"), CAPACITY_MAX_FILE_BYTES)?;
-            if read_capacity_starttime(&task.join("stat"), *tid)? != *starttime
-                || Some(parse_observed_affinity(&status)?) != affinity
+            if read_capacity_starttime(&task.join("stat"), observed.tid)? != observed.start_ticks
+                || parse_observed_affinity(&status)? != observed.mask
                 || read_capacity_membership(&task.join("cgroup"))? != membership
             {
                 return Err(
@@ -142,17 +152,18 @@ impl CpuCapacitySampler {
             return Err("thread inventory or cgroup changed during capacity sampling".into());
         }
         capacity_budget(started, self.started)?;
-        let affinity = affinity.ok_or("no complete thread affinity observation")?;
-        // Affinity can retain offline CPU IDs. Intersect the actual masks;
-        // min(mask sizes) can overstate the CPUs this process can execute on.
-        let affinity_cores = online_affinity_count(&affinity, online)?;
+        let (affinity_cores, affinity_parallelism) = thread_affinity_capacity(
+            &observed_tasks,
+            online,
+            || capacity_budget(started, self.started),
+        )?;
         Ok(CpuCapacitySample {
             online_cores,
             online: online.clone(),
             affinity_cores,
             quota_cores,
             threads,
-            affinity,
+            affinity_parallelism,
             membership,
             tasks: observed_tasks,
         })
@@ -310,7 +321,10 @@ fn affinity_count(intervals: &[(u32, u32)]) -> Result<u32, String> {
     })
 }
 
-fn online_affinity_count(affinity: &[(u32, u32)], online: &[(u32, u32)]) -> Result<u32, String> {
+fn online_affinity(
+    affinity: &[(u32, u32)],
+    online: &[(u32, u32)],
+) -> Result<Vec<(u32, u32)>, String> {
     let mut intersection = Vec::new();
     let (mut left, mut right) = (0, 0);
     while left < affinity.len() && right < online.len() {
@@ -325,11 +339,89 @@ fn online_affinity_count(affinity: &[(u32, u32)], online: &[(u32, u32)]) -> Resu
             right += 1;
         }
     }
-    affinity_count(&intersection).and_then(|count| {
-        (count > 0)
-            .then_some(count)
-            .ok_or_else(|| "CPU affinity has no observed online CPUs".into())
-    })
+    if intersection.is_empty() {
+        return Err("CPU affinity has no observed online CPUs".into());
+    }
+    Ok(intersection)
+}
+
+/// Count online CPUs in the union, then find how many threads can actually
+/// run on distinct CPUs. Two workers pinned to CPU 0 cannot fill two cores
+/// just because a third worker is allowed to run anywhere.
+fn thread_affinity_capacity(
+    tasks: &[TaskAffinity],
+    online: &[(u32, u32)],
+    budget: impl Fn() -> Result<(), String>,
+) -> Result<(u32, Option<u32>), String> {
+    let first = tasks
+        .first()
+        .ok_or("no complete thread affinity observation")?;
+    if tasks.iter().all(|task| task.mask == first.mask) {
+        let count = affinity_count(&online_affinity(&first.mask, online)?)?;
+        return Ok((count, None));
+    }
+
+    let mut union = Vec::new();
+    let mut choices = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        budget()?;
+        let mask = online_affinity(&task.mask, online)?;
+        // There are at most N-1 other threads. Keeping any N distinct CPUs
+        // per thread therefore preserves the maximum matching, even for a
+        // range spanning billions of CPU IDs.
+        choices.push(
+            mask.iter()
+                .flat_map(|&(lo, hi)| lo..=hi)
+                .take(tasks.len())
+                .collect(),
+        );
+        if union.len() + mask.len() > CAPACITY_MAX_MASK_RANGES {
+            return Err("online thread affinity ranges exceed CPU capacity inspection limit".into());
+        }
+        union.extend(mask);
+    }
+    union.sort_unstable();
+    let mut disjoint: Vec<(u32, u32)> = Vec::new();
+    for (lo, hi) in union {
+        if let Some(last) = disjoint.last_mut() {
+            if lo <= last.1.saturating_add(1) {
+                last.1 = last.1.max(hi);
+                continue;
+            }
+        }
+        disjoint.push((lo, hi));
+    }
+    let affinity_cores = affinity_count(&disjoint)?;
+    let mut owners = HashMap::new();
+    for task in 0..tasks.len() {
+        budget()?;
+        assign_cpu(task, &choices, &mut owners, &mut HashSet::new(), &budget)?;
+    }
+    Ok((affinity_cores, Some(owners.len() as u32)))
+}
+
+/// Find an augmenting path from the new task to an unoccupied CPU.
+fn assign_cpu(
+    task: usize,
+    choices: &[Vec<u32>],
+    owners: &mut HashMap<u32, usize>,
+    visited: &mut HashSet<u32>,
+    budget: &impl Fn() -> Result<(), String>,
+) -> Result<bool, String> {
+    budget()?;
+    for &cpu in &choices[task] {
+        if let std::collections::hash_map::Entry::Vacant(slot) = owners.entry(cpu) {
+            slot.insert(task);
+            return Ok(true);
+        }
+    }
+    for &cpu in &choices[task] {
+        if visited.insert(cpu) && assign_cpu(owners[&cpu], choices, owners, visited, budget)? {
+            owners.insert(cpu, task);
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Effective CPU capacity for a process.
@@ -741,13 +833,46 @@ mod tests {
 
     #[test]
     fn online_affinity_uses_cpu_ids_instead_of_minimum_mask_sizes() {
-        assert_eq!(online_affinity_count(&[(0, 3)], &[(2, 5)]).unwrap(), 2);
+        assert_eq!(online_affinity(&[(0, 3)], &[(2, 5)]).unwrap(), vec![(2, 3)]);
         assert_eq!(
-            online_affinity_count(&[(0, 3), (8, 11)], &[(1, 2), (4, 9)]).unwrap(),
-            4
+            online_affinity(&[(0, 3), (8, 11)], &[(1, 2), (4, 9)]).unwrap(),
+            vec![(1, 2), (8, 9)]
         );
-        assert!(online_affinity_count(&[(0, 3)], &[(4, 7)]).is_err());
-        assert!(online_affinity_count(&[], &[(0, 3)]).is_err());
+        assert!(online_affinity(&[(0, 3)], &[(4, 7)]).is_err());
+        assert!(online_affinity(&[], &[(0, 3)]).is_err());
+    }
+
+    #[test]
+    fn heterogeneous_masks_measure_simultaneously_placeable_threads() {
+        let capacity = |ranges: &[(u32, u32)], online| {
+            let tasks: Vec<_> = ranges
+                .iter()
+                .enumerate()
+                .map(|(index, &range)| TaskAffinity {
+                    tid: index as u32 + 1,
+                    start_ticks: 100,
+                    mask: vec![range],
+                })
+                .collect();
+            thread_affinity_capacity(&tasks, &[online], || Ok(()))
+        };
+        // The broad first worker must move off CPU 0 for the pinned worker.
+        assert_eq!(capacity(&[(0, 1), (0, 0)], (0, 7)).unwrap(), (2, Some(2)));
+        // A union-size or thread-count denominator would incorrectly use 3.
+        assert_eq!(
+            capacity(&[(0, 0), (0, 0), (0, 7)], (0, 7)).unwrap(),
+            (8, Some(2))
+        );
+        // Disjoint pinned workers can both run, and offline IDs do not count.
+        assert_eq!(capacity(&[(0, 1), (2, 3)], (1, 2)).unwrap(), (2, Some(2)));
+        assert!(capacity(&[(0, 0), (2, 3)], (1, 2)).is_err());
+        // A huge legal mask is represented by ranges and bounded choices.
+        assert_eq!(
+            capacity(&[(0, u32::MAX - 1), (0, 0)], (0, u32::MAX - 1)).unwrap(),
+            (u32::MAX, Some(2))
+        );
+        // The homogeneous fast path preserves the legacy observation.
+        assert_eq!(capacity(&[(0, 3), (0, 3)], (0, 7)).unwrap(), (4, None));
     }
 
     #[test]

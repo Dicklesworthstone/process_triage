@@ -5107,6 +5107,7 @@ int main(int argc, char **argv) {
             effective_parallelism: 1.0,
             online_cores: 1,
             affinity_cores: 1,
+            affinity_parallelism: None,
             quota_cores: None,
             threads: 1,
         });
@@ -5456,6 +5457,7 @@ int main(int argc, char **argv) {
                     effective_parallelism: 1.0,
                     online_cores: 1,
                     affinity_cores: 1,
+                    affinity_parallelism: None,
                     quota_cores: None,
                     threads: 1,
                 });
@@ -5741,6 +5743,7 @@ int main(int argc, char **argv) {
             effective_parallelism: 0.1,
             online_cores: 32,
             affinity_cores: 8,
+            affinity_parallelism: None,
             quota_cores: Some(0.1),
             threads: 4,
         });
@@ -6007,6 +6010,7 @@ int main(int argc, char **argv) {
                 effective_parallelism: 0.1,
                 online_cores: 8,
                 affinity_cores: 2,
+                affinity_parallelism: None,
                 quota_cores: Some(0.1),
                 threads: 1,
             });

@@ -1166,6 +1166,7 @@ mod tests {
             effective_parallelism: 1.0,
             online_cores: 4,
             affinity_cores: 4,
+            affinity_parallelism: None,
             quota_cores: Some(1.0),
             threads: 3,
         });
