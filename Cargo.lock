@@ -4177,6 +4177,7 @@ dependencies = [
  "criterion",
  "dirs",
  "filetime",
+ "flate2",
  "ftui",
  "ftui-harness",
  "hex",

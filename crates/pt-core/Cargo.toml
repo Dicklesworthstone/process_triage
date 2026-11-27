@@ -195,4 +195,5 @@ path = "tests/container_gpu_detection.rs"
 required-features = ["test-utils"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
+flate2 = "1"
 io-uring = "0.7"

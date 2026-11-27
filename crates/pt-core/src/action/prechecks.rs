@@ -1953,9 +1953,99 @@ impl RecentIoScope {
         Ok(Self {
             boot_id,
             pid_namespace: namespace("pid")?,
-            time_namespace: namespace("time")?,
+            time_namespace: Self::time_namespace()?,
         })
     }
+
+    fn time_namespace() -> Result<String, String> {
+        static NO_TIME_NAMESPACES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        match std::fs::read_link("/proc/self/ns/time") {
+            Ok(link) => link
+                .into_os_string()
+                .into_string()
+                .map_err(|_| "invalid I/O time namespace".to_string()),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && *NO_TIME_NAMESPACES.get_or_init(kernel_has_no_time_namespaces) =>
+            {
+                Ok("kernel-global:CONFIG_TIME_NS=n".to_string())
+            }
+            Err(error) => Err(format!("cannot read I/O time namespace: {error}")),
+        }
+    }
+}
+
+/// A missing link alone can also mean restricted procfs access. Require the
+/// running kernel's own configuration to prove that its boot clock is global.
+#[cfg(target_os = "linux")]
+fn kernel_has_no_time_namespaces() -> bool {
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(root) = std::fs::File::open("/proc") else {
+        return false;
+    };
+    let mut fs = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: fstatfs initializes fs on success, and root owns the descriptor.
+    if unsafe { libc::fstatfs(root.as_raw_fd(), fs.as_mut_ptr()) } != 0
+        || unsafe { fs.assume_init() }.f_type != libc::PROC_SUPER_MAGIC
+        || !root.metadata().is_ok_and(|meta| meta.ino() == 1)
+    {
+        return false;
+    }
+    // Bind the read to the procfs root, declining symlinks and bind mounts.
+    // Older kernels lacking openat2 retain the ordinary full-window probe.
+    // SAFETY: zero is a valid starting value for open_how.
+    let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+    how.flags = (libc::O_RDONLY | libc::O_CLOEXEC) as u64;
+    how.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_XDEV;
+    // SAFETY: pointers and the root descriptor remain valid across the syscall.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            root.as_raw_fd(),
+            c"config.gz".as_ptr(),
+            &how,
+            std::mem::size_of_val(&how),
+        )
+    };
+    if fd < 0 {
+        return false;
+    }
+    // SAFETY: successful openat2 returned a new owned descriptor.
+    let file = unsafe { std::fs::File::from_raw_fd(fd as libc::c_int) };
+    const COMPRESSED_LIMIT: u64 = 1 << 20;
+    let mut compressed = Vec::new();
+    if file
+        .take(COMPRESSED_LIMIT + 1)
+        .read_to_end(&mut compressed)
+        .is_err()
+        || compressed.len() as u64 > COMPRESSED_LIMIT
+    {
+        return false;
+    }
+    embedded_config_disables_time_namespaces(&compressed)
+}
+
+#[cfg(target_os = "linux")]
+fn embedded_config_disables_time_namespaces(compressed: &[u8]) -> bool {
+    use std::io::Read;
+    const LIMIT: u64 = 4 << 20;
+    let mut config = String::new();
+    if flate2::read::MultiGzDecoder::new(compressed)
+        .take(LIMIT + 1)
+        .read_to_string(&mut config)
+        .is_err()
+        || config.len() as u64 > LIMIT
+        || !config.ends_with('\n')
+    {
+        return false;
+    }
+    let mut settings = config.lines().filter(|line| {
+        line.starts_with("CONFIG_TIME_NS=") || line.starts_with("# CONFIG_TIME_NS ")
+    });
+    settings.next() == Some("# CONFIG_TIME_NS is not set") && settings.next().is_none()
 }
 
 #[cfg(target_os = "linux")]
@@ -6955,6 +7045,40 @@ finally:
                 wchar: 20,
                 write_bytes: 30,
             }
+        }
+
+        #[test]
+        fn global_clock_requires_complete_explicit_kernel_configuration() {
+            use std::io::Write;
+            let encode = |text: &[u8]| {
+                let mut encoder =
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+                encoder.write_all(text).unwrap();
+                encoder.finish().unwrap()
+            };
+            let disabled = b"# CONFIG_TIME_NS is not set\n";
+            let config = encode(disabled);
+            assert!(embedded_config_disables_time_namespaces(&config));
+            assert!(!embedded_config_disables_time_namespaces(
+                &config[..config.len() - 1]
+            ));
+            for input in [
+                "CONFIG_TIME_NS=y\n",
+                "CONFIG_TIME_NS=n\n",
+                "# CONFIG_OTHER is not set\n",
+                "# CONFIG_TIME_NS is not set",
+                "# CONFIG_TIME_NS is not set\nCONFIG_TIME_NS=y\n",
+                "# CONFIG_TIME_NS is not set\n# CONFIG_TIME_NS is not set\n",
+            ] {
+                assert!(!embedded_config_disables_time_namespaces(&encode(
+                    input.as_bytes()
+                )));
+            }
+            let mut oversized = disabled.to_vec();
+            oversized.resize((4 << 20) + 1, b'\n');
+            assert!(!embedded_config_disables_time_namespaces(&encode(
+                &oversized
+            )));
         }
 
         #[test]
