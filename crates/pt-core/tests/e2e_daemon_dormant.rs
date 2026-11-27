@@ -648,6 +648,14 @@ fn read_jsonl_items(path: &Path) -> Vec<Value> {
         .collect()
 }
 
+fn state_tick_count(state_path: &Path) -> u64 {
+    let state: Value =
+        serde_json::from_slice(&fs::read(state_path).expect("read daemon state")).unwrap();
+    state["daemon"]["tick_count"]
+        .as_u64()
+        .expect("recorded daemon tick count")
+}
+
 fn state_has_event(state_path: &Path, event_type: &str) -> bool {
     let content = match fs::read_to_string(state_path) {
         Ok(content) => content,
@@ -801,6 +809,12 @@ fn daemon_starts_with_defaults_when_daemon_json_is_missing() {
         child.try_wait().expect("query child status").is_none(),
         "daemon should stay alive when daemon.json is missing (default config path)"
     );
+    let status_output = run_daemon_cli(&config_dir, &data_dir, &["daemon", "status"]);
+    assert!(status_output.status.success());
+    let status: Value = serde_json::from_slice(&status_output.stdout).unwrap();
+    assert_eq!(status["running"], true);
+    assert!(status["config_error"].is_null());
+    assert!(status["state"].is_object());
 
     send_sigterm(&mut child);
     wait_for(
@@ -816,6 +830,48 @@ fn daemon_starts_with_defaults_when_daemon_json_is_missing() {
         !pid_path.exists(),
         "daemon pid file should be removed after clean shutdown"
     );
+}
+
+#[test]
+fn daemon_start_honors_disabled_policy_and_rejects_unusable_configs() {
+    let mut native = serde_json::to_value(pt_core::daemon::DaemonConfig::default()).unwrap();
+    native["enabled"] = json!(false);
+    for (name, content, should_succeed) in [
+        ("native_disabled", Some(native.to_string()), true),
+        (
+            "legacy_disabled",
+            Some(r#"{"enabled":false}"#.to_string()),
+            true,
+        ),
+        ("malformed_json", Some("{ invalid json".to_string()), false),
+        (
+            "partial_native",
+            Some(r#"{"tick_interval_secs":1}"#.to_string()),
+            false,
+        ),
+        (
+            "invalid_enabled",
+            Some(r#"{"enabled":"false"}"#.to_string()),
+            false,
+        ),
+        ("unreadable_config", None, false),
+    ] {
+        let data_dir = TempDir::new().expect("temp data dir").keep();
+        let config_dir = TempDir::new().expect("temp config dir").keep();
+        match content {
+            Some(content) => write_daemon_json_config(&config_dir, &content),
+            None => fs::create_dir(config_dir.join("daemon.json")).unwrap(),
+        }
+        let mut child = start_daemon_foreground(&config_dir, &data_dir);
+        wait_for(&mut child, Duration::from_secs(10), name, |child| {
+            child.try_wait().expect("query child status").is_some()
+        });
+        let status = child.wait().expect("wait for declined daemon startup");
+        assert_eq!(status.success(), should_succeed, "{name}: {status}");
+        assert!(!daemon_pid_path(&data_dir).exists(), "{name}");
+        assert!(!data_dir.join("daemon/daemon.pid.birth").exists(), "{name}");
+        assert!(!daemon_state_path(&data_dir).exists(), "{name}");
+    }
 }
 
 #[test]
@@ -1229,11 +1285,12 @@ fn daemon_sigterm_stops_and_cleans_pid_file() {
 fn daemon_sighup_reloads_config_without_exiting() {
     let data_dir = TempDir::new().expect("temp data dir").keep();
     let config_dir = TempDir::new().expect("temp config dir").keep();
+    let _execution_lock = acquire_global_lock(&data_dir);
 
     write_daemon_json_config(
         &config_dir,
         r#"{
-  "tick_interval_secs": 1,
+  "tick_interval_secs": 30,
   "max_cpu_percent": 1000.0,
   "max_rss_mb": 4096,
   "triggers": {
@@ -1268,6 +1325,10 @@ fn daemon_sighup_reloads_config_without_exiting() {
         |_| pid_path.exists() && state_path.exists(),
     );
 
+    let config_path = config_dir.join("daemon.json");
+    let mut reloaded: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    reloaded["tick_interval_secs"] = json!(1);
+    fs::write(&config_path, serde_json::to_vec(&reloaded).unwrap()).unwrap();
     send_signal(&mut child, libc::SIGHUP);
     wait_for(
         &mut child,
@@ -1279,6 +1340,16 @@ fn daemon_sighup_reloads_config_without_exiting() {
                 .expect("query child status after SIGHUP")
                 .is_none()
                 && state_has_event(&state_path, "config_reloaded")
+        },
+    );
+    let ticks_after_reload = state_tick_count(&state_path);
+    wait_for(
+        &mut child,
+        Duration::from_secs(10),
+        "reload_applied_one_second_cadence",
+        |child| {
+            child.try_wait().expect("query child status").is_none()
+                && state_tick_count(&state_path) >= ticks_after_reload + 2
         },
     );
 
@@ -1302,6 +1373,7 @@ fn daemon_sighup_reloads_config_without_exiting() {
 fn daemon_sighup_with_deleted_config_keeps_running() {
     let data_dir = TempDir::new().expect("temp data dir").keep();
     let config_dir = TempDir::new().expect("temp config dir").keep();
+    let _execution_lock = acquire_global_lock(&data_dir);
 
     write_daemon_json_config(
         &config_dir,
@@ -1358,7 +1430,18 @@ fn daemon_sighup_with_deleted_config_keeps_running() {
         "missing_reload_event_observed",
         |child| {
             child.try_wait().expect("query child status").is_none()
-                && state_has_event(&state_path, "config_reloaded")
+                && state_has_event(&state_path, "config_reload_rejected")
+        },
+    );
+    assert!(!state_has_event(&state_path, "config_reloaded"));
+    let ticks_after_rejection = state_tick_count(&state_path);
+    wait_for(
+        &mut child,
+        Duration::from_secs(10),
+        "missing_reload_preserved_one_second_cadence",
+        |child| {
+            child.try_wait().expect("query child status").is_none()
+                && state_tick_count(&state_path) >= ticks_after_rejection + 2
         },
     );
 
@@ -1380,6 +1463,7 @@ fn daemon_sighup_with_deleted_config_keeps_running() {
 fn daemon_sighup_with_invalid_config_keeps_running() {
     let data_dir = TempDir::new().expect("temp data dir").keep();
     let config_dir = TempDir::new().expect("temp config dir").keep();
+    let _execution_lock = acquire_global_lock(&data_dir);
 
     write_daemon_json_config(
         &config_dir,
@@ -1429,9 +1513,27 @@ fn daemon_sighup_with_invalid_config_keeps_running() {
         "invalid_reload_event_observed",
         |child| {
             child.try_wait().expect("query child status").is_none()
-                && state_has_event(&state_path, "config_reloaded")
+                && state_has_event(&state_path, "config_reload_rejected")
         },
     );
+    assert!(!state_has_event(&state_path, "config_reloaded"));
+    let ticks_after_rejection = state_tick_count(&state_path);
+    wait_for(
+        &mut child,
+        Duration::from_secs(10),
+        "invalid_reload_preserved_one_second_cadence",
+        |child| {
+            child.try_wait().expect("query child status").is_none()
+                && state_tick_count(&state_path) >= ticks_after_rejection + 2
+        },
+    );
+    let status_output = run_daemon_cli(&config_dir, &data_dir, &["daemon", "status"]);
+    assert_eq!(status_output.status.code(), Some(3));
+    let status: Value = serde_json::from_slice(&status_output.stdout).unwrap();
+    assert_eq!(status["running"], true);
+    assert!(status["config_error"].as_str().is_some());
+    assert!(status["next_tick_interval_secs"].is_null());
+    assert!(status["state"].is_object());
 
     send_sigterm(&mut child);
     wait_for(
@@ -1445,6 +1547,67 @@ fn daemon_sighup_with_invalid_config_keeps_running() {
         status.success(),
         "daemon should remain healthy when config is invalid during SIGHUP reload"
     );
+}
+
+#[test]
+fn daemon_sighup_disabled_config_stops_before_another_tick() {
+    for native_format in [false, true] {
+        let data_dir = TempDir::new().expect("temp data dir").keep();
+        let config_dir = TempDir::new().expect("temp config dir").keep();
+        let _execution_lock = acquire_global_lock(&data_dir);
+        let mut config = pt_core::daemon::DaemonConfig {
+            tick_interval_secs: 60,
+            max_cpu_percent: 1000.0,
+            max_rss_mb: 4096,
+            ..Default::default()
+        };
+        config.triggers.load_threshold = Some(9999.0);
+        config.triggers.memory_threshold = 9999.0;
+        config.triggers.orphan_threshold = 9999999;
+        config.notifications.enabled = false;
+        write_daemon_json_config(&config_dir, &serde_json::to_string(&config).unwrap());
+
+        let mut child = start_daemon_foreground(&config_dir, &data_dir);
+        let pid_path = daemon_pid_path(&data_dir);
+        let state_path = daemon_state_path(&data_dir);
+        wait_for(
+            &mut child,
+            Duration::from_secs(10),
+            "disabled_reload_started",
+            |_| pid_path.exists() && state_path.exists(),
+        );
+        let ticks_before_disable = state_tick_count(&state_path);
+        let mut disabled = if native_format {
+            serde_json::to_value(config).unwrap()
+        } else {
+            json!({})
+        };
+        disabled["enabled"] = json!(false);
+        write_daemon_json_config(&config_dir, &disabled.to_string());
+        send_signal(&mut child, libc::SIGHUP);
+        wait_for(
+            &mut child,
+            Duration::from_secs(10),
+            "disabled_reload_stopped_without_signal",
+            |child| child.try_wait().expect("query child status").is_some(),
+        );
+        let status = child.wait().expect("wait for disabled daemon");
+        assert!(status.success(), "native format={native_format}: {status}");
+        assert!(!pid_path.exists());
+        assert!(!data_dir.join("daemon/daemon.pid.birth").exists());
+        assert_eq!(state_tick_count(&state_path), ticks_before_disable);
+        assert!(state_has_event(&state_path, "stopped"));
+        assert!(!state_has_event(&state_path, "config_reloaded"));
+        let state: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(
+            state["daemon"]["recent_events"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()["detail"],
+            "disabled in reloaded configuration"
+        );
+    }
 }
 
 #[test]

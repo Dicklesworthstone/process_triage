@@ -19980,7 +19980,10 @@ where
 
 #[cfg(feature = "daemon")]
 fn run_daemon_start(global: &GlobalOpts, foreground: bool) -> ExitCode {
-    let (config, enabled) = load_daemon_config(global);
+    let (config, enabled) = match load_daemon_config(global) {
+        Ok(config) => config.unwrap_or_else(|| (pt_core::daemon::DaemonConfig::default(), true)),
+        Err(error) => return output_config_error(global, &error),
+    };
     if !enabled {
         let response = serde_json::json!({
             "command": "daemon start",
@@ -20137,6 +20140,7 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
         config.notification_ladder.clone(),
         state_bundle.notifications.clone(),
     );
+    let mut shutdown_reason = "received stop signal";
 
     loop {
         if DAEMON_SIGNALS.should_stop() {
@@ -20144,23 +20148,42 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
         }
 
         if DAEMON_SIGNALS.take_reload() {
-            let (reloaded, enabled) = load_daemon_config(global);
-            if enabled {
-                config = reloaded;
-                // Observations under the old limits cannot establish recovery
-                // under newly loaded overhead budgets.
-                state_bundle.daemon.interrupt_overhead_recovery();
-                state_bundle.daemon.incidents.interrupt_observations();
-                state_bundle.triggers.pressure.interrupt_observations();
-                // Apply new ladder config while preserving persisted state.
-                notify_mgr = pt_core::decision::escalation::EscalationManager::from_persisted(
-                    config.notification_ladder.clone(),
-                    notify_mgr.persisted_state(),
-                );
-                state_bundle.daemon.record_event(
+            match load_daemon_config(global) {
+                Ok(Some((_, false))) => {
+                    shutdown_reason = "disabled in reloaded configuration";
+                    break;
+                }
+                Ok(Some((reloaded, true))) => {
+                    config = reloaded;
+                    // Observations under the old limits cannot establish recovery
+                    // under newly loaded overhead budgets.
+                    state_bundle.daemon.interrupt_overhead_recovery();
+                    state_bundle.daemon.incidents.interrupt_observations();
+                    state_bundle.triggers.pressure.interrupt_observations();
+                    // Apply new ladder config while preserving persisted state.
+                    notify_mgr = pt_core::decision::escalation::EscalationManager::from_persisted(
+                        config.notification_ladder.clone(),
+                        notify_mgr.persisted_state(),
+                    );
+                    state_bundle.daemon.record_event(
                     pt_core::daemon::DaemonEventType::ConfigReloaded,
                     "config reloaded",
-                );
+                    );
+                }
+                Ok(None) => state_bundle.daemon.record_event(
+                    pt_core::daemon::DaemonEventType::ConfigReloadRejected,
+                    "daemon.json is absent; keeping the running configuration",
+                ),
+                Err(error) => state_bundle.daemon.record_event(
+                    pt_core::daemon::DaemonEventType::ConfigReloadRejected,
+                    &format!("{error}; keeping the running configuration"),
+                ),
+            }
+            // Publish the actual reload outcome before a planner can delay the
+            // next tick checkpoint. Failed reloads leave all live policy intact.
+            state_bundle.notifications = notify_mgr.persisted_state();
+            if let Err(error) = save_daemon_state(&state_path, &state_bundle) {
+                eprintln!("daemon: cannot persist configuration reload outcome: {error}");
             }
         }
 
@@ -20397,12 +20420,25 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
         }
     }
 
+    state_bundle.notifications = notify_mgr.persisted_state();
+    state_bundle
+        .daemon
+        .record_event(pt_core::daemon::DaemonEventType::Stopped, shutdown_reason);
+    let state_persisted = match save_daemon_state(&state_path, &state_bundle) {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("daemon: cannot persist shutdown outcome: {error}");
+            false
+        }
+    };
     cleanup_daemon_pid_if_owned(own_pid);
 
     let response = serde_json::json!({
         "command": "daemon start",
         "mode": "foreground",
         "ticks": state_bundle.daemon.tick_count,
+        "shutdown_reason": shutdown_reason,
+        "state_persisted": state_persisted,
         "base_dir": daemon_base_dir().display().to_string(),
     });
     match global.format {
@@ -20417,7 +20453,11 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
         }
     }
 
-    ExitCode::Clean
+    if state_persisted {
+        ExitCode::Clean
+    } else {
+        ExitCode::IoError
+    }
 }
 
 #[cfg(feature = "daemon")]
@@ -21126,7 +21166,14 @@ fn run_daemon_status(global: &GlobalOpts) -> ExitCode {
     let pid = record.map(|(pid, _)| pid);
     let running = record.is_some_and(|(pid, birth)| pid_file_running(pid, birth));
     let state_path = daemon_state_path();
-    let (config, _) = load_daemon_config(global);
+    let (config, config_error) = match load_daemon_config(global) {
+        Ok(Some((config, _))) => (Some(config), None),
+        Ok(None) if !running => (Some(pt_core::daemon::DaemonConfig::default()), None),
+        // An optional absent config is valid at startup, but may also follow a
+        // rejected reload. Do not guess the running cadence in either case.
+        Ok(None) => (None, None),
+        Err(error) => (None, Some(error.to_string())),
+    };
     let saved_state = pt_core::daemon::read_daemon_json_bounded::<DaemonStateBundle>(
         &state_path,
         DAEMON_STATE_MAX_BYTES,
@@ -21134,7 +21181,13 @@ fn run_daemon_status(global: &GlobalOpts) -> ExitCode {
     let state_error = saved_state.as_ref().err().cloned();
     let saved_state = saved_state.ok().flatten();
     let had_state = saved_state.is_some();
-    let mut recovered = saved_state.unwrap_or_else(|| new_daemon_state(&config));
+    let mut recovered = saved_state.unwrap_or_else(|| {
+        new_daemon_state(
+            config
+                .as_ref()
+                .unwrap_or(&pt_core::daemon::DaemonConfig::default()),
+        )
+    });
     // A crash during the very first planner can leave only the incident
     // checkpoint. Status must still expose that evidence without modifying it.
     let last_storage_error = recovered.daemon.incidents.storage_error.clone();
@@ -21161,7 +21214,8 @@ fn run_daemon_status(global: &GlobalOpts) -> ExitCode {
     .then_some(recovered);
     let next_tick_interval_secs = state
         .as_ref()
-        .map(|state| state.daemon.next_tick_interval_secs(&config));
+        .zip(config.as_ref())
+        .map(|(state, config)| state.daemon.next_tick_interval_secs(config));
     let response = serde_json::json!({
         "command": "daemon status",
         "running": running,
@@ -21172,6 +21226,7 @@ fn run_daemon_status(global: &GlobalOpts) -> ExitCode {
         "last_incident": last_incident,
         "incident_storage_error": incident_storage_error,
         "discarded_incident_archives": discarded_incident_archives,
+        "config_error": config_error,
         "state_error": state_error,
         "state": state
             .as_ref()
@@ -21213,10 +21268,13 @@ fn run_daemon_status(global: &GlobalOpts) -> ExitCode {
                 if let Some(reason) = &state.triggers.pressure.unavailable_reason {
                     println!("Pressure evidence: {reason}.");
                 }
-                if state.daemon.overhead_backoff.interval_secs > 0 {
+                if let Some(config) = config
+                    .as_ref()
+                    .filter(|_| state.daemon.overhead_backoff.interval_secs > 0)
+                {
                     println!(
                         "Overhead backoff: {}s between ticks; {}/{} healthy ticks toward recovery.",
-                        state.daemon.next_tick_interval_secs(&config),
+                        state.daemon.next_tick_interval_secs(config),
                         state.daemon.overhead_backoff.healthy_ticks,
                         config.overhead_backoff.healthy_ticks_before_recovery.max(1)
                     );
@@ -21225,10 +21283,17 @@ fn run_daemon_status(global: &GlobalOpts) -> ExitCode {
             if let Some(error) = state_error {
                 println!("Daemon state unavailable: {error}.");
             }
+            if let Some(error) = config_error.as_ref() {
+                println!("Daemon configuration unavailable: {error}.");
+            }
         }
     }
 
-    ExitCode::Clean
+    if config_error.is_some() {
+        ExitCode::PartialFail
+    } else {
+        ExitCode::Clean
+    }
 }
 
 fn run_telemetry(global: &GlobalOpts, _args: &TelemetryArgs) -> ExitCode {
@@ -23690,6 +23755,164 @@ mod daemon_pressure_tests {
     }
 
     #[test]
+    fn daemon_config_rejects_invalid_policy_without_falling_back_to_defaults() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let config_path = directory.join("daemon.json");
+        let cli =
+            Cli::try_parse_from(["pt-core", "--config", directory.to_str().unwrap(), "daemon"])
+                .unwrap();
+        assert!(load_daemon_config(&cli.global).unwrap().is_none());
+
+        for content in [
+            "{ invalid json",
+            "[]",
+            "null",
+            r#"{"enabled":null}"#,
+            r#"{"enabled":"false"}"#,
+            r#"{"enabled":0}"#,
+            r#"{"enabled":false,"enabled":true}"#,
+            r#"{"notifications":false}"#,
+            r#"{"tick_interval_secs":1}"#,
+            r#"{"triggers":{"load_threshold":4}}"#,
+            r#"{"collection_interval_seconds":"fast"}"#,
+        ] {
+            std::fs::write(&config_path, content).unwrap();
+            assert!(
+                load_daemon_config(&cli.global).is_err(),
+                "invalid config must not become enabled defaults: {content}"
+            );
+        }
+
+        let native = serde_json::to_value(DaemonConfig::default()).unwrap();
+        for (field, value) in [
+            ("tick_interval_secs", serde_json::json!("fast")),
+            ("collection_interval_seconds", serde_json::json!(1)),
+            ("auto_mitigate", serde_json::json!({"enabled": true})),
+        ] {
+            let mut malformed = native.clone();
+            malformed[field] = value;
+            std::fs::write(&config_path, serde_json::to_vec(&malformed).unwrap()).unwrap();
+            assert!(load_daemon_config(&cli.global).is_err(), "field {field}");
+        }
+        // Duplicate control fields must be rejected before Value can collapse
+        // them into a last-wins policy, in both schemas.
+        for content in [
+            serde_json::to_string(&native).unwrap().replacen(
+                "\"allow_auto_mitigation\":false",
+                "\"allow_auto_mitigation\":false,\"allow_auto_mitigation\":true",
+                1,
+            ),
+            format!(
+                "{{\"enabled\":false,\"enabled\":true,{}",
+                &serde_json::to_string(&native).unwrap()[1..]
+            ),
+            r#"{"auto_mitigate":{"enabled":false,"enabled":true}}"#.to_string(),
+        ] {
+            std::fs::write(&config_path, &content).unwrap();
+            assert!(load_daemon_config(&cli.global).is_err(), "{content}");
+        }
+    }
+
+    #[test]
+    fn daemon_config_honors_disable_and_preserves_documented_legacy_fields() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let config_path = directory.join("daemon.json");
+        let cli =
+            Cli::try_parse_from(["pt-core", "--config", directory.to_str().unwrap(), "daemon"])
+                .unwrap();
+        let mut native = serde_json::to_value(DaemonConfig::default()).unwrap();
+        native["tick_interval_secs"] = serde_json::json!(7);
+        native["enabled"] = serde_json::json!(false);
+        std::fs::write(&config_path, serde_json::to_vec(&native).unwrap()).unwrap();
+        let (config, enabled) = load_daemon_config(&cli.global).unwrap().unwrap();
+        assert!(!enabled);
+        assert_eq!(config.tick_interval_secs, 7);
+
+        std::fs::write(&config_path, r#"{"enabled":false}"#).unwrap();
+        assert!(!load_daemon_config(&cli.global).unwrap().unwrap().1);
+        // The documented legacy format includes notification and future
+        // controls that were historically ignored; keep those files readable.
+        std::fs::write(
+            &config_path,
+            r#"{
+                "enabled": true,
+                "collection_interval_seconds": 30,
+                "overhead_budget": {
+                    "max_cpu_percent": 2.5, "max_memory_mb": 80,
+                    "max_io_bytes_per_sec": 1048576
+                },
+                "triggers": {
+                    "sustained_load": {
+                        "enabled": true, "threshold_multiplier": 3,
+                        "min_duration_seconds": 90
+                    },
+                    "memory_pressure": {"enabled": true, "threshold_percent": 90},
+                    "orphan_spike": {"enabled": true, "threshold_delta": 42},
+                    "psi_stall": {"enabled": false}
+                },
+                "notifications": {
+                    "desktop": false, "terminal_bell": false,
+                    "webhook_url": null, "email": null
+                },
+                "auto_mitigate": {"enabled": false, "allowed_actions": []},
+                "cooldown": {
+                    "after_escalation_seconds": 180,
+                    "after_alert_seconds": 60, "after_manual_run_seconds": 60
+                }
+            }"#,
+        )
+        .unwrap();
+        let (config, enabled) = load_daemon_config(&cli.global).unwrap().unwrap();
+        assert!(enabled);
+        assert_eq!(config.tick_interval_secs, 30);
+        assert_eq!(config.max_cpu_percent, 2.5);
+        assert_eq!(config.max_rss_mb, 80);
+        assert_eq!(config.triggers.load_per_cpu_threshold, 3.0);
+        assert_eq!(config.triggers.sustained_ticks, 3);
+        assert_eq!(config.triggers.memory_threshold, 0.9);
+        assert_eq!(config.triggers.orphan_threshold, 42);
+        assert_eq!(config.escalation.min_interval_secs, 180);
+        assert!(!config.escalation.allow_auto_mitigation);
+
+        std::fs::write(&config_path, "{}").unwrap();
+        let (config, enabled) = load_daemon_config(&cli.global).unwrap().unwrap();
+        assert!(enabled);
+        assert_eq!(
+            serde_json::to_value(config).unwrap(),
+            serde_json::to_value(DaemonConfig::default()).unwrap()
+        );
+    }
+
+    #[test]
+    fn daemon_config_read_errors_are_not_treated_as_absence() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        std::fs::create_dir(directory.join("daemon.json")).unwrap();
+        let cli =
+            Cli::try_parse_from(["pt-core", "--config", directory.to_str().unwrap(), "daemon"])
+                .unwrap();
+        assert!(matches!(
+            load_daemon_config(&cli.global),
+            Err(ConfigError::IoError { .. })
+        ));
+
+        #[cfg(unix)]
+        {
+            let directory = tempfile::tempdir().unwrap().keep();
+            let target = directory.join("target.json");
+            std::os::unix::fs::symlink(&target, directory.join("daemon.json")).unwrap();
+            let cli =
+                Cli::try_parse_from(["pt-core", "--config", directory.to_str().unwrap(), "daemon"])
+                    .unwrap();
+            assert!(matches!(
+                load_daemon_config(&cli.global),
+                Err(ConfigError::IoError { .. })
+            ));
+            std::fs::write(target, r#"{"enabled":false}"#).unwrap();
+            assert!(!load_daemon_config(&cli.global).unwrap().unwrap().1);
+        }
+    }
+
+    #[test]
     fn daemon_dry_run_survives_config_reload_and_child_invocations() {
         let directory = tempfile::tempdir().unwrap().keep();
         let config_path = directory.join("daemon.json");
@@ -23708,6 +23931,8 @@ mod daemon_pressure_tests {
         std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
         assert!(
             !load_daemon_config(&cli.global)
+                .expect("valid native daemon config")
+                .expect("native daemon config is present")
                 .0
                 .escalation
                 .allow_auto_mitigation
@@ -23716,6 +23941,8 @@ mod daemon_pressure_tests {
         std::fs::write(&config_path, r#"{"auto_mitigate":{"enabled":true}}"#).unwrap();
         assert!(
             !load_daemon_config(&cli.global)
+                .expect("valid legacy daemon config")
+                .expect("legacy daemon config is present")
                 .0
                 .escalation
                 .allow_auto_mitigation
@@ -25116,28 +25343,126 @@ fn apply_daemon_nice() {
 }
 
 #[cfg(feature = "daemon")]
-fn load_daemon_config(global: &GlobalOpts) -> (pt_core::daemon::DaemonConfig, bool) {
+fn load_daemon_config(
+    global: &GlobalOpts,
+) -> Result<Option<(pt_core::daemon::DaemonConfig, bool)>, ConfigError> {
     let config_dir = resolve_config_dir(global);
     let path = config_dir.join("daemon.json");
-    if !path.exists() {
-        return (pt_core::daemon::DaemonConfig::default(), true);
-    }
-
     let content = match std::fs::read_to_string(&path) {
         Ok(content) => content,
-        Err(_) => return (pt_core::daemon::DaemonConfig::default(), true),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            // A dangling config symlink is an unreadable policy, not an
+            // intentional absence. Keep valid symlinked configs supported.
+            return match std::fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(source) => Err(ConfigError::IoError { path, source }),
+                Ok(_) => Err(ConfigError::IoError { path, source }),
+            };
+        }
+        Err(source) => return Err(ConfigError::IoError { path, source }),
     };
-
-    if let Ok(mut config) = serde_json::from_str::<pt_core::daemon::DaemonConfig>(&content) {
+    let value: serde_json::Value =
+        serde_json::from_str(&content).map_err(|source| ConfigError::ParseError {
+            path: path.clone(),
+            source,
+        })?;
+    let object = value.as_object().ok_or_else(|| ConfigError::SchemaError {
+        path: path.clone(),
+        message: "daemon configuration must be a JSON object".to_string(),
+    })?;
+    if object
+        .get("notifications")
+        .is_some_and(|notifications| !notifications.is_object())
+    {
+        return Err(ConfigError::SchemaError {
+            path,
+            message: "daemon notifications must be a JSON object".to_string(),
+        });
+    }
+    if object
+        .get("enabled")
+        .is_some_and(|enabled| !enabled.is_boolean())
+    {
+        return Err(ConfigError::SchemaError {
+            path,
+            message: "daemon enabled must be a boolean".to_string(),
+        });
+    }
+    #[derive(Deserialize)]
+    struct DaemonEnabled {
+        enabled: Option<bool>,
+    }
+    // Deserialize from the original text so duplicate control keys are errors,
+    // rather than silently accepting the last value in the JSON object.
+    let enabled = serde_json::from_str::<DaemonEnabled>(&content)
+        .map_err(|error| ConfigError::SchemaError {
+            path: path.clone(),
+            message: error.to_string(),
+        })?
+        .enabled
+        .unwrap_or(true);
+    let has_any = |keys: &[&str]| keys.iter().any(|key| object.contains_key(*key));
+    let trigger_has_any = |keys: &[&str]| {
+        object
+            .get("triggers")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|triggers| keys.iter().any(|key| triggers.contains_key(*key)))
+    };
+    // Select the schema before deserialization. Retrying a malformed native
+    // config as the all-optional legacy schema silently discards its policy.
+    let native = has_any(&[
+        "tick_interval_secs",
+        "max_cpu_percent",
+        "max_rss_mb",
+        "escalation",
+        "notification_ladder",
+    ]) || trigger_has_any(&[
+        "ewma_alpha",
+        "load_threshold",
+        "load_per_cpu_threshold",
+        "memory_threshold",
+        "orphan_threshold",
+        "sustained_ticks",
+        "cooldown_ticks",
+    ]) || object
+        .get("notifications")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|notifications| {
+            ["enabled", "notify_cmd", "notify_arg"]
+                .iter()
+                .any(|key| notifications.contains_key(*key))
+        });
+    let legacy = has_any(&[
+        "collection_interval_seconds",
+        "overhead_budget",
+        "auto_mitigate",
+        "cooldown",
+    ]) || trigger_has_any(&[
+        "sustained_load",
+        "memory_pressure",
+        "orphan_spike",
+        "psi_stall",
+    ]);
+    if native && legacy {
+        return Err(ConfigError::SchemaError {
+            path,
+            message: "daemon configuration mixes native and legacy fields".to_string(),
+        });
+    }
+    if native {
+        let mut config: pt_core::daemon::DaemonConfig =
+            serde_json::from_str(&content).map_err(|error| ConfigError::SchemaError {
+                path,
+                message: error.to_string(),
+            })?;
         if global.dry_run {
             config.escalation.allow_auto_mitigation = false;
         }
-        return (config, true);
+        return Ok(Some((config, enabled)));
     }
 
     #[derive(Deserialize)]
     struct DaemonFileConfig {
-        enabled: Option<bool>,
         collection_interval_seconds: Option<u64>,
         overhead_budget: Option<DaemonBudget>,
         triggers: Option<DaemonTriggerConfig>,
@@ -25189,78 +25514,76 @@ fn load_daemon_config(global: &GlobalOpts) -> (pt_core::daemon::DaemonConfig, bo
         after_escalation_seconds: Option<u64>,
     }
 
+    let file_cfg: DaemonFileConfig =
+        serde_json::from_str(&content).map_err(|error| ConfigError::SchemaError {
+            path,
+            message: error.to_string(),
+        })?;
     let mut config = pt_core::daemon::DaemonConfig::default();
-    let mut enabled = true;
-
-    if let Ok(file_cfg) = serde_json::from_str::<DaemonFileConfig>(&content) {
-        if let Some(pressure) = file_cfg.memory_pressure {
-            config.memory_pressure = pressure;
+    if let Some(pressure) = file_cfg.memory_pressure {
+        config.memory_pressure = pressure;
+    }
+    if let Some(backoff) = file_cfg.overhead_backoff {
+        config.overhead_backoff = backoff;
+    }
+    if let Some(interval) = file_cfg.collection_interval_seconds {
+        config.tick_interval_secs = interval;
+    }
+    if let Some(budget) = file_cfg.overhead_budget {
+        if let Some(cpu) = budget.max_cpu_percent {
+            config.max_cpu_percent = cpu;
         }
-        if let Some(backoff) = file_cfg.overhead_backoff {
-            config.overhead_backoff = backoff;
+        if let Some(mem) = budget.max_memory_mb {
+            config.max_rss_mb = mem;
         }
-        if let Some(value) = file_cfg.enabled {
-            enabled = value;
+    }
+    if let Some(triggers) = file_cfg.triggers {
+        if let Some(regimes) = triggers.pressure_regimes {
+            config.triggers.pressure_regimes = regimes;
         }
-        if let Some(interval) = file_cfg.collection_interval_seconds {
-            config.tick_interval_secs = interval;
-        }
-        if let Some(budget) = file_cfg.overhead_budget {
-            if let Some(cpu) = budget.max_cpu_percent {
-                config.max_cpu_percent = cpu;
+        if let Some(load) = triggers.sustained_load {
+            if let Some(multiplier) = load.threshold_multiplier {
+                config.triggers.load_per_cpu_threshold = multiplier;
             }
-            if let Some(mem) = budget.max_memory_mb {
-                config.max_rss_mb = mem;
-            }
-        }
-        if let Some(triggers) = file_cfg.triggers {
-            if let Some(regimes) = triggers.pressure_regimes {
-                config.triggers.pressure_regimes = regimes;
-            }
-            if let Some(load) = triggers.sustained_load {
-                if let Some(multiplier) = load.threshold_multiplier {
-                    config.triggers.load_per_cpu_threshold = multiplier;
-                }
-                if let Some(seconds) = load.min_duration_seconds {
-                    let ticks = (seconds / config.tick_interval_secs.max(1)).max(1) as u32;
-                    config.triggers.sustained_ticks = ticks;
-                }
-            }
-            if let Some(mem) = triggers.memory_pressure {
-                if let Some(percent) = mem.threshold_percent {
-                    config.triggers.memory_threshold = (percent / 100.0).clamp(0.0, 1.0);
-                }
-                if let Some(seconds) = mem.min_duration_seconds {
-                    let ticks = (seconds / config.tick_interval_secs.max(1)).max(1) as u32;
-                    config.triggers.sustained_ticks = config.triggers.sustained_ticks.max(ticks);
-                }
-            }
-            if let Some(orphan) = triggers.orphan_spike {
-                if let Some(delta) = orphan.threshold_delta {
-                    config.triggers.orphan_threshold = delta;
-                }
-                if let Some(seconds) = orphan.window_seconds {
-                    let ticks = (seconds / config.tick_interval_secs.max(1)).max(1) as u32;
-                    config.triggers.sustained_ticks = config.triggers.sustained_ticks.max(ticks);
-                }
+            if let Some(seconds) = load.min_duration_seconds {
+                let ticks = (seconds / config.tick_interval_secs.max(1)).max(1) as u32;
+                config.triggers.sustained_ticks = ticks;
             }
         }
-        if let Some(auto) = file_cfg.auto_mitigate {
-            if let Some(enabled) = auto.enabled {
-                config.escalation.allow_auto_mitigation = enabled;
+        if let Some(mem) = triggers.memory_pressure {
+            if let Some(percent) = mem.threshold_percent {
+                config.triggers.memory_threshold = (percent / 100.0).clamp(0.0, 1.0);
+            }
+            if let Some(seconds) = mem.min_duration_seconds {
+                let ticks = (seconds / config.tick_interval_secs.max(1)).max(1) as u32;
+                config.triggers.sustained_ticks = config.triggers.sustained_ticks.max(ticks);
             }
         }
-        if let Some(cooldown) = file_cfg.cooldown {
-            if let Some(seconds) = cooldown.after_escalation_seconds {
-                config.escalation.min_interval_secs = seconds;
+        if let Some(orphan) = triggers.orphan_spike {
+            if let Some(delta) = orphan.threshold_delta {
+                config.triggers.orphan_threshold = delta;
             }
+            if let Some(seconds) = orphan.window_seconds {
+                let ticks = (seconds / config.tick_interval_secs.max(1)).max(1) as u32;
+                config.triggers.sustained_ticks = config.triggers.sustained_ticks.max(ticks);
+            }
+        }
+    }
+    if let Some(auto) = file_cfg.auto_mitigate {
+        if let Some(enabled) = auto.enabled {
+            config.escalation.allow_auto_mitigation = enabled;
+        }
+    }
+    if let Some(cooldown) = file_cfg.cooldown {
+        if let Some(seconds) = cooldown.after_escalation_seconds {
+            config.escalation.min_interval_secs = seconds;
         }
     }
 
     if global.dry_run {
         config.escalation.allow_auto_mitigation = false;
     }
-    (config, enabled)
+    Ok(Some((config, enabled)))
 }
 
 /// Stop only the incarnation named by the pid record, retaining tracking state

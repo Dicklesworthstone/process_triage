@@ -1515,6 +1515,12 @@ pt-core daemon status             # Check daemon state
 pt-core daemon stop               # Stop monitor
 ```
 
+`daemon stop` and `shadow stop` report success only after observing the recorded process exit. `--timeout` bounds this wait (five seconds by default); a delivered SIGTERM without confirmed exit returns a failure and preserves the tracking record. JSON distinguishes `signaled`, `stopped`, and `running`. On Linux, stop requires a saved boot, birth and owner identity plus kernel pidfd support, and uses the same pinned descriptor for signaling and exit observation. Missing identity and older birth-only Linux records cannot authorize a signal. macOS retains native birth checks around its signal and exit observations.
+
+`daemon.json` is optional at startup; an absent file selects built-in defaults. An existing unreadable, malformed, or incomplete native configuration prevents startup. The native and older file formats both honor top-level `enabled: false`; controls from the two formats cannot be mixed. `--dry-run` continues to disable automatic mitigation in either format.
+
+SIGHUP applies a valid replacement configuration. An unreadable, invalid, or removed file records `config_reload_rejected` and leaves the active policy and its collection cadence intact. An explicit empty object resets settings to defaults; an explicit `enabled: false` stops the daemon through its normal state-save and cleanup path. `daemon status` keeps saved incident evidence visible when the configuration is invalid, reports `config_error`, and leaves the computed next interval unavailable.
+
 ### How It Works
 
 The daemon polls every 60 seconds by default, increasing to 30 seconds under a memory warning and 15 seconds in a memory emergency. It evaluates these trigger conditions:

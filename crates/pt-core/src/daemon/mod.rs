@@ -1138,6 +1138,7 @@ pub enum DaemonEventType {
     OverheadBudgetExceeded,
     OverheadBackoffChanged,
     ConfigReloaded,
+    ConfigReloadRejected,
     LoadEvidenceUnavailable,
     MemoryPressureChanged,
     MemoryPressureUnavailable,
