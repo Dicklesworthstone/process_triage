@@ -836,7 +836,7 @@ pub(super) fn remote_health(
             "/proc/loadavg" | "getloadavg" => snapshot.load = None,
             "/proc/meminfo" => snapshot.meminfo = None,
             "/proc/vmstat" => snapshot.vmstat = None,
-            "/proc/sys/fs/file-nr" => snapshot.file_handles = None,
+            "/proc/sys/fs/file-nr" | "kern.num_files/kern.maxfiles" => snapshot.file_handles = None,
             "kern.memorystatus_vm_pressure_level" => {
                 if let Some(memory) = &mut snapshot.meminfo {
                     memory.macos_pressure = None;
@@ -2369,17 +2369,31 @@ mod tests {
         assert_eq!(quiet.health.status, HostHealthStatus::Unknown);
         assert_eq!(quiet.health.coverage, PressureCoverage::Partial);
 
+        document["system_state"]["pressure"]["file_handles"] =
+            serde_json::json!({"allocated": 951, "max": 1000});
+        let full = scan_result_to_host_input(&scan_from_document("mac", &document));
+        assert_eq!(full.health.status, HostHealthStatus::Crit);
+        assert!(full
+            .health
+            .assessment
+            .unwrap()
+            .regimes
+            .iter()
+            .any(|r| r.kind == RegimeKind::FdExhaustion));
+
         document["system_state"]["pressure"]["meminfo"]["macos_pressure"] =
             serde_json::json!("critical");
         document["system_state"]["pressure"]["unavailable"] = serde_json::json!([
             {"source": "kern.memorystatus_vm_pressure_level", "reason": "query timed out"},
             {"source": "vm.swapusage", "reason": "query failed"},
-            {"source": "hw.logicalcpu", "reason": "query failed"}
+            {"source": "hw.logicalcpu", "reason": "query failed"},
+            {"source": "kern.num_files/kern.maxfiles", "reason": "query failed"}
         ]);
         let failed = scan_result_to_host_input(&scan_from_document("mac", &document));
         assert_eq!(failed.health.status, HostHealthStatus::Unknown);
         let snapshot = failed.health.pressure.as_ref().unwrap();
         assert_eq!(snapshot.cpus, 0);
+        assert_eq!(snapshot.file_handles, None);
         assert_eq!(snapshot.meminfo.unwrap().macos_pressure, None);
         assert_eq!(snapshot.meminfo.unwrap().swap_used(), None);
     }

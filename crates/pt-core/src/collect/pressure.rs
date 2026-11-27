@@ -666,7 +666,7 @@ pub struct VmStat {
     pub oom_kill: Option<u64>,
 }
 
-/// `/proc/sys/fs/file-nr`.
+/// Allocated entries and configured capacity of the system-wide open file table.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct FileHandles {
     pub allocated: u64,
@@ -1042,7 +1042,8 @@ fn read_macos_pressure_snapshot_with(
     load: Result<LoadAvg, String>,
 ) -> PressureSnapshot {
     use super::pressure_macos::{
-        parse_logical_cpus, parse_memsize, parse_pressure_level, parse_swap_usage, parse_vm_stat,
+        parse_file_handles, parse_logical_cpus, parse_memsize, parse_pressure_level,
+        parse_swap_usage, parse_vm_stat,
     };
 
     let mut unavailable = Vec::new();
@@ -1077,6 +1078,12 @@ fn read_macos_pressure_snapshot_with(
     let swap = native_reading(
         run("/usr/sbin/sysctl", &["-n", "vm.swapusage"]).and_then(|text| parse_swap_usage(&text)),
         "vm.swapusage",
+        &mut unavailable,
+    );
+    let file_handles = native_reading(
+        run("/usr/sbin/sysctl", &["kern.num_files", "kern.maxfiles"])
+            .and_then(|text| parse_file_handles(&text)),
+        "kern.num_files/kern.maxfiles",
         &mut unavailable,
     );
     let macos_pressure = level.and_then(|value| match value {
@@ -1133,10 +1140,6 @@ fn read_macos_pressure_snapshot_with(
         source: "meminfo.available".to_string(),
         reason: "macOS has no Linux MemAvailable equivalent; free, inactive and compressed pages are not substituted for available RAM".to_string(),
     });
-    unavailable.push(Unavailable {
-        source: "/proc/sys/fs/file-nr".to_string(),
-        reason: "system file-handle table is not collected on macOS".to_string(),
-    });
     if vm
         .as_ref()
         .is_some_and(|vm| vm.swapins.is_none() || vm.swapouts.is_none())
@@ -1158,7 +1161,7 @@ fn read_macos_pressure_snapshot_with(
         load: None,
         meminfo,
         vmstat,
-        file_handles: None,
+        file_handles,
         unavailable,
     };
     apply_native_loadavg(&mut snapshot, load);
@@ -2033,6 +2036,9 @@ mod tests {
             ("/usr/sbin/sysctl", ["-n", "hw.logicalcpu"]) => "8\n",
             ("/usr/sbin/sysctl", ["-n", "hw.memsize"]) => "17179869184\n",
             ("/usr/sbin/sysctl", ["-n", "kern.memorystatus_vm_pressure_level"]) => "4\n",
+            ("/usr/sbin/sysctl", ["kern.num_files", "kern.maxfiles"]) => {
+                "kern.num_files: 96000\nkern.maxfiles: 100000\n"
+            }
             ("/usr/sbin/sysctl", ["-n", "vm.swapusage"]) => {
                 "total = 2048.00M  used = 512.00M  free = 1536.00M  (encrypted)\n"
             }
@@ -2054,6 +2060,13 @@ mod tests {
             checked_native_loadavg(3, [2.0, 1.0, 0.5]),
         );
         assert_eq!(snapshot.cpus, 8);
+        assert_eq!(
+            snapshot.file_handles,
+            Some(FileHandles {
+                allocated: 96_000,
+                max: 100_000
+            })
+        );
         assert_eq!(snapshot.load_ratio(), Some(0.25));
         let memory = snapshot.meminfo.unwrap();
         assert_eq!(memory.total, Some(16 * 1024 * 1024 * 1024));
@@ -2093,6 +2106,66 @@ mod tests {
                 .macos_pressure,
             None
         );
+    }
+
+    #[test]
+    fn macos_file_pressure_requires_both_native_counts() {
+        use crate::decision::pressure_regime::{assess, PressureThresholds, RegimeKind, Severity};
+
+        for (output, expected) in [
+            ("kern.num_files: 0\nkern.maxfiles: 100\n", Some(None)),
+            (
+                "kern.num_files: 80\nkern.maxfiles: 100\n",
+                Some(Some(Severity::Warn)),
+            ),
+            (
+                "kern.num_files: 101\nkern.maxfiles: 100\n",
+                Some(Some(Severity::Crit)),
+            ),
+            ("kern.num_files: 80\n", None),
+            ("kern.num_files: 10\nkern.maxfiles: 0\n", None),
+            ("kern.num_files: 10\nkern.maxfilesperproc: 100\n", None),
+            ("kern.num_files: -1\nkern.maxfiles: 100\n", None),
+            ("kern.num_files: 10\nkern.maxfiles: 2147483648\n", None),
+            (
+                "kern.num_files: 10\nkern.maxfiles: 100\nkern.num_files: 0\n",
+                None,
+            ),
+        ] {
+            let snapshot = read_macos_pressure_snapshot_with(
+                |program, args| {
+                    if args == ["kern.num_files", "kern.maxfiles"] {
+                        Ok(output.to_string())
+                    } else {
+                        macos_probe_fixture(program, args)
+                    }
+                },
+                checked_native_loadavg(3, [0.0; 3]),
+            );
+            assert_eq!(
+                snapshot.file_handles.is_some(),
+                expected.is_some(),
+                "{output}"
+            );
+            assert_eq!(
+                snapshot
+                    .unavailable
+                    .iter()
+                    .any(|e| e.source == "kern.num_files/kern.maxfiles"),
+                expected.is_none(),
+                "{output}"
+            );
+            let assessment = assess(&snapshot, None, None, &PressureThresholds::default());
+            let fd = assessment
+                .regimes
+                .iter()
+                .find(|r| r.kind == RegimeKind::FdExhaustion);
+            assert_eq!(fd.map(|r| r.severity), expected.flatten(), "{output}");
+            assert_eq!(
+                snapshot.meminfo.unwrap().macos_pressure,
+                Some(MacosPressureLevel::Critical)
+            );
+        }
     }
 
     #[test]

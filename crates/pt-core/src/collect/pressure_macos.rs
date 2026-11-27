@@ -13,6 +13,8 @@
 
 use std::collections::BTreeSet;
 
+use super::pressure::FileHandles;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MacosVmStats {
     /// Free plus speculative pages in bytes, matching Mach's `free_count`.
@@ -58,6 +60,32 @@ pub(crate) fn parse_logical_cpus(text: &str) -> Result<u32, String> {
         .ok()
         .filter(|cpus| *cpus > 0)
         .ok_or_else(|| "hw.logicalcpu: CPU count must be positive and fit u32".to_string())
+}
+
+/// XNU exports the system-wide open file count and limit as signed integers
+/// in bsd/kern/kern_sysctl.c. Query both in one invocation and require both
+/// named results. An administrator can lower the limit below current usage.
+pub(crate) fn parse_file_handles(text: &str) -> Result<FileHandles, String> {
+    let mut lines = text.lines();
+    let mut counter = |key: &str| {
+        let value = lines
+            .next()
+            .and_then(|line| line.split_once(':'))
+            .filter(|(name, _)| *name == key)
+            .ok_or_else(|| format!("missing {key} reading"))?
+            .1;
+        let value = unsigned(value.trim(), key)?;
+        if value > i32::MAX as u64 {
+            return Err(format!("{key}: value exceeds native int range"));
+        }
+        Ok(value)
+    };
+    let allocated = counter("kern.num_files")?;
+    let max = counter("kern.maxfiles")?;
+    if max == 0 || lines.next().is_some() {
+        return Err("invalid system file limit or extra sysctl output".to_string());
+    }
+    Ok(FileHandles { allocated, max })
 }
 
 /// Parse `kern.memorystatus_vm_pressure_level`'s dispatch flags. These are

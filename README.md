@@ -1741,6 +1741,11 @@ These native probes use 250 ms command deadlines and a shared one-second
 probe budget. A failed source stays unavailable while independent readings
 remain usable.
 
+Plans, watch, daemon regime triggers, and fleet health also diagnose system-wide
+file-handle exhaustion on macOS. They use the open file count (`kern.num_files`)
+and the system limit (`kern.maxfiles`), with the same default 80% warning and
+95% critical thresholds as Linux.
+
 macOS has no Linux `MemAvailable` equivalent, so `meminfo.available` remains
 unknown. Inactive pages, file-backed pages, and compressed memory are not
 counted as immediately available RAM. `vm_stat`'s reported page size controls
