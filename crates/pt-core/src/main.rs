@@ -9607,7 +9607,7 @@ fn build_tui_rows(
 }
 
 use pt_core::collect::{quick_scan, ProcessRecord, ProcessState, QuickScanOptions, ScanResult};
-#[cfg(test)]
+#[cfg(all(test, feature = "ui"))]
 use pt_core::decision::decide_action;
 use pt_core::decision::goal_progress::{
     self, ActionOutcome as GoalActionOutcome, GoalMetric, GoalProgressReport, MetricSnapshot,
