@@ -4266,8 +4266,8 @@ fn process_policy_candidate(
     #[cfg(target_os = "linux")]
     if enforcer.requires_builtin_placement() {
         if let pt_core::action::prechecks::PreCheckResult::Blocked { reason, .. } =
-            pt_core::action::prechecks::fuse_action_precheck(
-                pt_core::collect::protected::holds_fuse_device(proc.pid.0),
+            pt_core::action::prechecks::fuse_target_precheck(
+                proc.pid.0, &proc.comm, pt_core::collect::protected::holds_fuse_device(proc.pid.0),
                 action,
             )
         {
@@ -4365,8 +4365,8 @@ fn planned_zombie_parent_refusal(
         // writable-file evidence that could itself block on the parent's mount.
         #[cfg(target_os = "linux")]
         if let pt_core::action::prechecks::PreCheckResult::Blocked { reason, .. } =
-            pt_core::action::prechecks::fuse_action_precheck(
-                pt_core::collect::protected::holds_fuse_device(parent.pid.0),
+            pt_core::action::prechecks::fuse_target_precheck(
+                parent.pid.0, &parent.comm, pt_core::collect::protected::holds_fuse_device(parent.pid.0),
                 Action::Restart,
             )
         {
@@ -28903,6 +28903,77 @@ mod process_tree_safety_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn planning_and_live_policy_refuse_an_ssh_sftp_transport_pause() {
+        use pt_core::decision::{decide_action, Action, ActionFeasibility, PolicyEnforcer};
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("/bin/sh")
+            .arg0("ssh")
+            .args(["-s", "host", "sftp"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        input
+            .write_all(b"printf ssh >/proc/self/comm; printf 'ready\\n'; read -r finish\n")
+            .unwrap();
+        let mut ready = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready.trim(), "ready");
+        let scan = pt_core::collect::quick_scan(&pt_core::collect::QuickScanOptions {
+            pids: vec![child.id()],
+            ..Default::default()
+        })
+        .unwrap();
+        let process = scan
+            .processes
+            .iter()
+            .find(|row| row.pid.0 == child.id())
+            .unwrap();
+        assert_eq!(process.comm, "ssh");
+        let policy = pt_core::config::Policy::default();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
+        let scorer = pt_core::scoring::Scorer::new(
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
+        let score = scorer
+            .score(process, scorer.snapshot_evidence(process))
+            .unwrap();
+        let mut decision = decide_action(
+            &score.posterior.posterior,
+            &policy,
+            &ActionFeasibility::allow_all(),
+        )
+        .unwrap();
+        decision.optimal_action = Action::Pause;
+        for robot in [false, true] {
+            let advice = super::candidate_recommendation(
+                process, None, &score, &decision, &policy, &enforcer, robot,
+            );
+            assert_eq!(advice.action, "review");
+            assert!(
+                advice.rationale.contains("builtin.sftp_transport"),
+                "{}",
+                advice.rationale
+            );
+        }
+        let refusal =
+            super::process_policy_candidate(&enforcer, process, Action::Pause).unwrap_err();
+        assert!(refusal.contains("builtin.sftp_transport"), "{refusal}");
+        drop(input);
+        child.wait().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn live_policy_evidence_refuses_unknown_fuse_before_probes_but_allows_recovery() {
         use pt_core::decision::{Action, PolicyEnforcer};
         let policy = pt_core::config::Policy::default();
@@ -36720,8 +36791,8 @@ fn candidate_recommendation(
         Vec::new()
     };
     #[cfg(target_os = "linux")]
-    let fuse_refusal = if enforcer.requires_builtin_placement() && subject.is_some() {
-        match pt_core::action::prechecks::fuse_action_precheck(fuse_server, evidence_action) {
+    let fuse_refusal = if let Some(subject) = subject.filter(|_| enforcer.requires_builtin_placement()) {
+        match pt_core::action::prechecks::fuse_target_precheck(subject.pid.0, &subject.comm, fuse_server, evidence_action) {
             pt_core::action::prechecks::PreCheckResult::Blocked { reason, .. } => Some(reason),
             _ => None,
         }

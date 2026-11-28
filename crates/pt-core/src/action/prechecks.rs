@@ -851,6 +851,33 @@ pub fn observed_session_refusal(
     }
 }
 
+/// Shared planning and execution guard for the FUSE server and the SSH
+/// transport that can outlive its original parent after daemonization.
+#[cfg(target_os = "linux")]
+pub fn fuse_target_precheck(
+    pid: u32,
+    comm: &str,
+    evidence: Option<bool>,
+    action: Action,
+) -> PreCheckResult {
+    let device = fuse_action_precheck(evidence, action);
+    if !device.is_passed()
+        || matches!(
+            action,
+            Action::Keep | Action::Resume | Action::Unfreeze | Action::Unquarantine
+        )
+    {
+        return device;
+    }
+    match crate::collect::fuse_transport::refusal(pid, comm) {
+        Some(reason) => PreCheckResult::Blocked {
+            check: PreCheck::CheckNotProtected,
+            reason,
+        },
+        None => PreCheckResult::Passed,
+    }
+}
+
 /// Configuration for live pre-check provider.
 #[derive(Debug, Clone)]
 pub struct LivePreCheckConfig {
@@ -3118,8 +3145,8 @@ impl LivePreCheckProvider {
                 // a FUSE server always gets mount-specific remediation.
                 #[cfg(target_os = "linux")]
                 {
-                    let result = fuse_action_precheck(
-                        crate::collect::protected::holds_fuse_device(pid),
+                    let result = fuse_target_precheck(
+                        pid, &comm, crate::collect::protected::holds_fuse_device(pid),
                         action,
                     );
                     if !result.is_passed() {

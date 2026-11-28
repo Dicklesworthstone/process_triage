@@ -307,8 +307,8 @@ fn ensure_restart_subject(target: &ProcessIdentity) -> Result<(), ActionError> {
             "refusing restart of protected infrastructure or an agent".to_string(),
         ));
     }
-    let fuse = super::prechecks::fuse_action_precheck(
-        crate::collect::protected::holds_fuse_device(pid),
+    let fuse = super::prechecks::fuse_target_precheck(
+        pid, &stat.comm, crate::collect::protected::holds_fuse_device(pid),
         Action::Restart,
     );
     if let super::prechecks::PreCheckResult::Blocked { reason, .. } = fuse {

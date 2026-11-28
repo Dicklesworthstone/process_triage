@@ -31,6 +31,8 @@ mod deep_scan;
 pub mod disk;
 pub mod duplicates;
 #[cfg(target_os = "linux")]
+pub(crate) mod fuse_transport;
+#[cfg(target_os = "linux")]
 pub mod gpu;
 pub mod incremental;
 #[cfg(target_os = "linux")]

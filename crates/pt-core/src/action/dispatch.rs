@@ -477,10 +477,12 @@ pub(super) fn ensure_cgroup_action_target(
 
 #[cfg(target_os = "linux")]
 pub(super) fn ensure_cgroup_fuse_evidence(
+    pid: u32,
+    comm: &str,
     action: Action,
     evidence: Option<bool>,
 ) -> Result<(), ActionError> {
-    match super::prechecks::fuse_action_precheck(evidence, action) {
+    match super::prechecks::fuse_target_precheck(pid, comm, evidence, action) {
         super::prechecks::PreCheckResult::Passed => Ok(()),
         super::prechecks::PreCheckResult::Blocked { reason, .. } => {
             Err(ActionError::Failed(reason))
@@ -495,10 +497,10 @@ fn ensure_cgroup_target_for_action(
 ) -> Result<String, ActionError> {
     ensure_cgroup_target_with(
         || {
-            ensure_cgroup_identity(target)?;
+            let comm = ensure_cgroup_identity(target)?;
             if let Some(action) = action {
                 ensure_cgroup_fuse_evidence(
-                    action,
+                    target.pid.0, &comm, action,
                     crate::collect::protected::holds_fuse_device(target.pid.0),
                 )?;
             }
@@ -1316,7 +1318,7 @@ mod tests {
                 let result = ensure_cgroup_target_with(
                     || {
                         checks.set(checks.get() + 1);
-                        ensure_cgroup_fuse_evidence(action, evidence.get())
+                        ensure_cgroup_fuse_evidence(std::process::id(), "fixture", action, evidence.get())
                     },
                     || Ok("/owned/leaf".to_string()),
                     |_| {
@@ -1347,12 +1349,12 @@ mod tests {
             Action::Quarantine,
             Action::CapMemory,
         ] {
-            assert!(ensure_cgroup_fuse_evidence(action, Some(false)).is_ok());
+            assert!(ensure_cgroup_fuse_evidence(std::process::id(), "fixture", action, Some(false)).is_ok());
         }
         for action in [Action::Unfreeze, Action::Unquarantine] {
             for evidence in [Some(false), Some(true), None] {
                 let path = ensure_cgroup_target_with(
-                    || ensure_cgroup_fuse_evidence(action, evidence),
+                    || ensure_cgroup_fuse_evidence(std::process::id(), "fixture", action, evidence),
                     || Ok("/owned/leaf".to_string()),
                     |_| Ok(()),
                 )
