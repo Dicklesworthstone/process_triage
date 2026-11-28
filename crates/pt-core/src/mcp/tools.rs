@@ -7,6 +7,7 @@ use crate::collect::tool_runner::{ToolConfig, ToolOutput, ToolRunner, ToolSpec};
 #[cfg(target_os = "linux")]
 use crate::collect::{deep_scan_with_budget, DeepScanOptions, DeepScanRecord, DeepScanResult};
 use crate::collect::{quick_scan, ProcessActivity, ProcessRecord, QuickScanOptions, ScanResult};
+use crate::mcp::plan_response::{check_worker_coverage, PlanOutput, MAX_PLAN_BYTES, PLAN_FIELDS};
 use crate::mcp::protocol::{ToolContent, ToolDefinition};
 use crate::mcp::scan_response::{ScanOutput, DEFAULT_BYTES, MAX_BYTES, MAX_ROWS, MIN_BYTES};
 use crate::scoring::{filter_planning_scan, AgentActivityReport, ProcessScore, Scorer};
@@ -601,6 +602,9 @@ fn plan_command_args(params: &serde_json::Value) -> Result<Vec<String>, String> 
                 | "since_time"
                 | "include_predictions"
                 | "prediction_fields"
+                | "detail"
+                | "fields"
+                | "max_response_bytes"
         ) {
             return Err(format!("unknown pt_plan argument: {key}"));
         }
@@ -923,13 +927,20 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "pt_plan".to_string(),
-            description: "Generate a triage plan with the same engine, protections and \
-                 output as `pt agent plan --format json`. Supports resource recovery, \
-                 pressure relief and comparisons with saved sessions; never applies actions."
+            description: "Save a canonical triage plan and return a bounded review summary. \
+                 Use detail=full for the exact CLI plan. Includes decision coverage and \
+                 the saved session identity. This tool never applies actions."
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
+                    "detail": {"type": "string", "enum": ["brief","full"], "default": "brief",
+                        "description": "Brief returns a read-only summary. Full returns the exact canonical JSON if it fits, otherwise a saved session reference."},
+                    "fields": {"type": "array", "uniqueItems": true, "minItems": 1,
+                        "items": {"type": "string", "enum": PLAN_FIELDS},
+                        "description": "Optional evidence fields for the brief view, in priority order. Oversized requested fields are named in response.elided_fields."},
+                    "max_response_bytes": {"type": "integer", "minimum": MIN_BYTES, "maximum": MAX_PLAN_BYTES, "default": DEFAULT_BYTES,
+                        "description": "Byte budget for the escaped MCP tool result, including framing allowance."},
                     "deep": {
                         "type": "boolean",
                         "description": "Enable deep probes",
@@ -954,7 +965,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "minimum": 1,
                         "maximum": MAX_PLAN_TIMEOUT_SECS,
                         "default": DEFAULT_PLAN_TIMEOUT_SECS,
-                        "description": "Total planner deadline in seconds, including probes and output collection; an incomplete or timed-out response is an error"
+                        "description": "Total planner deadline in seconds, including probes and output collection; cut-off output or timeout is an error; a validated partial decision inventory reports its skipped rows"
                     },
                     "goal": {
                         "type": "string",
@@ -1003,6 +1014,10 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": [],
                 "allOf": [
+                    {"anyOf": [
+                        {"not": {"required": ["fields"]}},
+                        {"properties": {"detail": {"const": "brief"}}}
+                    ]},
                     {"not": {"required": ["since", "since_time"]}},
                     {"anyOf": [
                         {"not": {"required": ["prediction_fields"]}},
@@ -1438,16 +1453,17 @@ fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
 /// heuristic. The previous MCP-only scorer ignored protection, the posterior and the
 /// loss matrix, and recommended `kill` for zombies (which a signal cannot reap).
 fn tool_plan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
+    let options = PlanOutput::parse(params)?;
     let args = plan_command_args(params)?;
     let timeout = plan_timeout(params)?;
     let config = crate::config::resolve_config_dir(&crate::mcp::config_options())
         .map_err(|error| format!("cannot resolve plan config directory: {error}"))?;
     let exe = std::env::current_exe().map_err(|e| format!("cannot locate pt-core: {e}"))?;
     let spec = agent_worker_spec(&exe, &config, args, timeout)?;
-    let stdout = run_plan_worker(&spec)?;
+    let (stdout, document) = run_plan_worker(&spec)?;
     Ok(vec![ToolContent {
         content_type: "text".to_string(),
-        text: stdout,
+        text: options.render(&document, stdout)?,
     }])
 }
 
@@ -1508,7 +1524,7 @@ fn agent_worker_spec(
     Ok(spec)
 }
 
-fn run_plan_worker(spec: &ToolSpec) -> Result<String, String> {
+fn run_plan_worker(spec: &ToolSpec) -> Result<(String, serde_json::Value), String> {
     let output = run_agent_worker(spec, "agent plan")?;
     parse_plan_worker_output(&output)
 }
@@ -1595,7 +1611,7 @@ fn parse_explain_worker_output(
     Ok(stdout.to_string())
 }
 
-fn parse_plan_worker_output(output: &ToolOutput) -> Result<String, String> {
+fn parse_plan_worker_output(output: &ToolOutput) -> Result<(String, serde_json::Value), String> {
     if output.timed_out {
         return Err("agent plan timed out; no complete plan was returned".into());
     }
@@ -1603,7 +1619,7 @@ fn parse_plan_worker_output(output: &ToolOutput) -> Result<String, String> {
         return Err("agent plan output was truncated; no complete plan was returned".into());
     }
     // A valid JSON prefix is not success if the child failed afterwards.
-    if !matches!(output.exit_code, Some(0) | Some(1)) {
+    if !matches!(output.exit_code, Some(0 | 1 | 3)) {
         let stderr = output.stderr_str();
         let tail = stderr
             .lines()
@@ -1623,7 +1639,7 @@ fn parse_plan_worker_output(output: &ToolOutput) -> Result<String, String> {
         .map_err(|_| "agent plan returned invalid UTF-8".to_string())?;
     let document: serde_json::Value = serde_json::from_str(stdout)
         .map_err(|error| format!("agent plan returned invalid JSON: {error}"))?;
-    let plan: crate::plan::Plan = serde_json::from_value(document.clone())
+    let plan: crate::plan::Plan = serde::Deserialize::deserialize(&document)
         .map_err(|error| format!("agent plan returned an incomplete plan: {error}"))?;
     if document["command"] != "agent plan"
         || pt_common::SessionId::parse(&plan.session_id).is_none()
@@ -1639,11 +1655,11 @@ fn parse_plan_worker_output(output: &ToolOutput) -> Result<String, String> {
         || !document["summary"]["total_processes_scanned"]
             .as_u64()
             .is_some_and(|scanned| scanned >= count)
-        || output.exit_code != Some(i32::from(count > 0))
+        || !check_worker_coverage(&document["summary"], candidates, output.exit_code)
     {
         return Err("agent plan returned inconsistent candidate counts or exit status".into());
     }
-    Ok(stdout.to_string())
+    Ok((stdout.to_string(), document))
 }
 
 /// Persist through the shipped CLI so MCP uses the same locking, decay,
@@ -2027,7 +2043,7 @@ mod tests {
             timed_out: false,
         };
         assert_eq!(
-            parse_plan_worker_output(&original).unwrap(),
+            parse_plan_worker_output(&original).unwrap().0,
             document.to_string()
         );
         for (path, value) in [
@@ -2068,6 +2084,31 @@ mod tests {
         assert!(parse_plan_worker_output(&output)
             .unwrap_err()
             .contains("truncated"));
+    }
+
+    #[test]
+    fn plan_worker_recognizes_a_valid_partial_plan_with_no_returned_candidates() {
+        let mut doc = worker_plan_document(0);
+        doc["summary"]["decision_complete"] = serde_json::json!(false);
+        doc["summary"]["decision_skipped_count"] = serde_json::json!(1);
+        doc["summary"]["decision_skipped"] = serde_json::json!([{
+            "pid":42,"uid":1000,"start_id":"boot:50:42","stage":"inference","reason":"missing posterior"
+        }]);
+        let mut output = ToolOutput {
+            command: "pt-core".into(),
+            args: Vec::new(),
+            stdout: doc.to_string().into_bytes(),
+            stderr: Vec::new(),
+            exit_code: Some(3),
+            truncated: false,
+            duration: Duration::ZERO,
+            timed_out: false,
+        };
+        let (original, parsed) = parse_plan_worker_output(&output).unwrap();
+        assert_eq!(original, doc.to_string());
+        assert_eq!(parsed, doc);
+        output.exit_code = Some(0);
+        assert!(parse_plan_worker_output(&output).is_err());
     }
 
     #[test]
@@ -2217,7 +2258,7 @@ mod tests {
                 ],
             )
             .with_timeout(Duration::from_secs(5));
-            assert_eq!(run_plan_worker(&spec).unwrap(), document);
+            assert_eq!(run_plan_worker(&spec).unwrap().0, document);
             assert!(run_plan_worker(&spec.with_max_output(16))
                 .unwrap_err()
                 .contains("truncated"));

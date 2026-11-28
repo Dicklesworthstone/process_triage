@@ -1,5 +1,6 @@
 //! Bound a ranked scan after scoring the complete census.
 
+use super::response_budget::{escaped_len, result_size};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -120,18 +121,6 @@ impl ScanOutput {
         }
         Ok(text)
     }
-}
-
-// The inner JSON is compact, so it contains no literal ASCII control bytes.
-// Each quote and backslash uses one additional byte in the outer JSON string.
-fn escaped_len(text: &str) -> usize {
-    text.len() + text.bytes().filter(|b| matches!(b, b'"' | b'\\')).count()
-}
-
-fn result_size(text: &str) -> usize {
-    // Allow the success-result wrapper and ordinary JSON-RPC framing. Request
-    // IDs are echoed by the transport and can have an arbitrary client length.
-    128 + escaped_len(text)
 }
 
 #[cfg(test)]

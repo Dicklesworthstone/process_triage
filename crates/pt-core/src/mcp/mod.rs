@@ -3,7 +3,9 @@
 //! Exposes pt functionality to AI agents via the standardized MCP protocol
 //! over stdio (JSON-RPC 2.0).
 
+mod plan_response;
 pub mod protocol;
+mod response_budget;
 pub mod resources;
 mod scan_response;
 pub mod server;

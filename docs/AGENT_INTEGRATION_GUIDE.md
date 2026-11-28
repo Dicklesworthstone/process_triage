@@ -185,6 +185,20 @@ Command lines longer than 256 UTF-8 bytes have a character-boundary preview, `cm
 
 `matching_processes` counts all matches and `returned` counts the rows in this response. `response.omitted_by_row_limit` and `response.omitted_by_byte_budget` explain the difference. A row that exceeds the remaining byte budget is skipped, so smaller lower-ranked rows can still appear. `response.commands_truncated` counts returned previews. `response.elided_sections` names census-wide reports omitted for size, and `warning_count` is available even when the warning strings do not fit. Use `pt_explain` with an individual PID for a closer look.
 
+### MCP plan views and decision coverage
+
+`pt_plan` saves the canonical plan at `sessions/<session_id>/decision/plan.json`. Its default `view: "brief"` returns process identities, scores, recommended actions, their actual targets and short rationales in planner order. Command names, rationales and skipped-decision reasons have 256-byte UTF-8 previews with a per-field `_truncated` flag when shortened. The canonical document retains the original values.
+
+The default result budget is 65,536 bytes. Set `max_response_bytes` from 4,096 through 8,388,608 bytes. The budget covers the escaped text plus a 128-byte framing allowance. The transport separately echoes the client’s request ID. `summary.candidates_returned` counts candidates in the saved plan. `response.candidate_rows_omitted` counts those omitted from this response. A partial plan reports `summary.decision_complete: false`, its full `decision_skipped_count`, a bounded `decision_skipped` list and `response.decision_skipped_omitted`. A partial plan with zero candidates still has unresolved decisions.
+
+Select additional fields in priority order with `fields`. Available top-level fields are `responsible_units`, `agent_activity`, `goal_summary`, `goal_progress`, `differential` and `resource_predictions`. Per-candidate fields are `evidence_ledger`, `pressure_decision` and `predictions`. A selected per-candidate field is included for every displayed row that records it, or the entire column is omitted. Goal, comparison and prediction requests automatically select their associated fields. `response.requested_fields`, `elided_fields` and `unavailable_fields` distinguish selection, budget omissions and fields absent from the relevant records. For a detailed explanation of one process, call `pt_explain` with its saved `session`, `pid` and `start_id`.
+
+```json
+{"name":"pt_plan","arguments":{"fields":["pressure_decision","evidence_ledger"],"max_response_bytes":131072}}
+```
+
+Request `{"detail":"full","max_response_bytes":8388608}` to receive the exact canonical CLI document when it fits. An oversized document returns `view: "reference"` with its session, plan ID, artifact path, decision coverage and required size in `response.full_response_bytes`. Use that saved artifact to retrieve the same observation. A new `pt_plan` call performs a fresh scan. Only the full document carries the executable action inventory.
+
 ### Default JSON Structure
 
 Every response includes these envelope fields:

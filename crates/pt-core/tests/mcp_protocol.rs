@@ -1508,19 +1508,35 @@ fn actual_mcp_recorded_explanation_preserves_the_plan_after_exit_and_config_chan
     assert_eq!(planned["isError"], false, "{planned}");
     let plan: serde_json::Value =
         serde_json::from_str(planned["content"][0]["text"].as_str().unwrap()).unwrap();
-    let candidate = plan["candidates"]
+    assert_eq!(plan["view"], "brief");
+    assert_eq!(plan["artifact"], "decision/plan.json");
+    assert!(serde_json::to_vec(&planned).unwrap().len() <= 65536);
+    assert!(serde_json::from_value::<pt_core::plan::Plan>(plan.clone()).is_err());
+    let brief_candidate = plan["candidates"]
         .as_array()
         .unwrap()
         .iter()
         .find(|candidate| candidate["pid"] == pid)
         .expect("owned process in recorded plan");
     let session = plan["session_id"].as_str().unwrap();
-    let start_id = candidate["start_id"].as_str().unwrap();
+    let start_id = brief_candidate["start_id"].as_str().unwrap();
     let plan_path = data
         .join("sessions")
         .join(session)
         .join("decision/plan.json");
     let original_plan = std::fs::read(&plan_path).unwrap();
+    let saved: serde_json::Value = serde_json::from_slice(&original_plan).unwrap();
+    let candidate = saved["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|candidate| candidate["pid"] == pid && candidate["start_id"] == start_id)
+        .unwrap();
+    assert_eq!(candidate["uid"], brief_candidate["uid"]);
+    assert_eq!(
+        candidate["recommended_action"],
+        brief_candidate["recommended_action"]
+    );
     drop(target);
     // Neither a dead target nor an unreadable current signature catalog changes
     // the recorded explanation. A fallback to the live evaluator would fail.
@@ -1817,7 +1833,7 @@ fn actual_mcp_plan_child_uses_the_servers_explicit_config() {
         "method": "tools/call",
         "params": {
             "name": "pt_plan",
-            "arguments": {"min_age": u64::MAX}
+            "arguments": {"min_age": u64::MAX, "detail":"full", "max_response_bytes":8388608}
         }
     });
     std::fs::write(root.join("request.json"), request.to_string()).expect("retain request");
@@ -1908,6 +1924,9 @@ fn actual_mcp_plan_validates_scope_and_goal_before_loading_config() {
     std::fs::write(config.join("policy.json"), b"{").unwrap();
     let session = pt_common::SessionId::new();
     let invalid = [
+        (serde_json::json!({"fields":["unknown"]}), "unknown plan field"),
+        (serde_json::json!({"detail":"full","fields":["agent_activity"]}), "fields"),
+        (serde_json::json!({"max_response_bytes":4095}), "max_response_bytes"),
         (serde_json::json!({"pids": []}), "pids"),
         (serde_json::json!({"pids": [42, 42]}), "pids"),
         (serde_json::json!({"goal": "free port 0"}), "goal"),
@@ -1972,6 +1991,7 @@ fn actual_mcp_plan_validates_scope_and_goal_before_loading_config() {
         .unwrap();
     let properties = &definition["inputSchema"]["properties"];
     for field in [
+        "detail", "fields", "max_response_bytes",
         "goal",
         "pids",
         "max_candidates",
@@ -2012,7 +2032,9 @@ fn actual_mcp_plan_preserves_goals_scope_predictions_comparisons_and_robot_mode(
         serde_json::to_vec_pretty(&pt_core::config::Policy::default()).unwrap(),
     )
     .unwrap();
-    let run = |label: &str, arguments: serde_json::Value, robot: bool| {
+    let run = |label: &str, mut arguments: serde_json::Value, robot: bool| {
+        arguments["detail"] = serde_json::json!("full");
+        arguments["max_response_bytes"] = serde_json::json!(8 * 1024 * 1024);
         let request = serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": {"name": "pt_plan", "arguments": arguments},
@@ -2244,6 +2266,7 @@ fn actual_mcp_agent_activity_includes_young_children_before_candidate_filters() 
                 "name": "pt_plan",
                 "arguments": {
                     "pids": [agent_pid], "min_age": 0, "min_score": 0,
+                    "detail": "full", "max_response_bytes": 8388608,
                     "window_ms": 1000
                 }
             }
@@ -2254,6 +2277,7 @@ fn actual_mcp_agent_activity_includes_young_children_before_candidate_filters() 
                 "name": "pt_plan",
                 "arguments": {
                     "pids": [agent_pid], "min_age": 0, "min_score": 0,
+                    "detail": "full", "max_response_bytes": 8388608,
                     "window_ms": 0
                 }
             }
