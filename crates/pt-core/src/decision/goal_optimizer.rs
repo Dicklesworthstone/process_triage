@@ -333,8 +333,7 @@ fn marginal_rank(
 ) -> Option<GreedyRank> {
     let mut weighted_gain = f64::NEG_INFINITY;
     let mut unweighted_gain = f64::NEG_INFINITY;
-    for ((contribution, goal), deficit) in contributions.iter().zip(goals).zip(remaining)
-    {
+    for ((contribution, goal), deficit) in contributions.iter().zip(goals).zip(remaining) {
         if *contribution <= 0.0 || deficit <= 0.0 {
             continue;
         }

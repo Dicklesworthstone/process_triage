@@ -1462,7 +1462,9 @@ struct AgentExplainArgs {
 use pt_core::action::{ActionRunner, IdentityProvider, LiveIdentityProvider};
 use pt_core::decision::{
     goal_contribution::GoalResourceSnapshot,
-    goal_optimizer::{optimize_holder_sets_with_limit, OptCandidate, OptimizationResult, ResourceGoal},
+    goal_optimizer::{
+        optimize_holder_sets_with_limit, OptCandidate, OptimizationResult, ResourceGoal,
+    },
     goal_parser::{parse_goal, Comparator, Goal, Metric, ResourceTarget},
     relief::{select_relief_plan, ReliefGoal, ReliefPlan},
     ConstraintChecker, RobotCandidate, RuntimeRobotConstraints,
@@ -10675,11 +10677,15 @@ fn build_resource_goals(
 }
 
 fn parse_kill_loss(candidate: &serde_json::Value) -> Option<f64> {
-    let entry = candidate.get("expected_loss")?.as_array()?.iter().find(|entry| {
-        entry["action"]
-            .as_str()
-            .is_some_and(|action| action.eq_ignore_ascii_case("kill"))
-    })?;
+    let entry = candidate
+        .get("expected_loss")?
+        .as_array()?
+        .iter()
+        .find(|entry| {
+            entry["action"]
+                .as_str()
+                .is_some_and(|action| action.eq_ignore_ascii_case("kill"))
+        })?;
     entry["loss"]
         .as_f64()
         .filter(|loss| loss.is_finite() && *loss >= 0.0)
@@ -10702,9 +10708,16 @@ fn build_opt_candidates_for_goals(
         .iter()
         .map(|goal| {
             let port = goal.resource.strip_prefix("port_")?.parse::<u16>().ok()?;
-            resources.ports.get(&port)?.holders.as_ref().filter(|holders| {
-                holders.iter().all(|holder| eligible.iter().any(|id| id.matches(holder)))
-            })
+            resources
+                .ports
+                .get(&port)?
+                .holders
+                .as_ref()
+                .filter(|holders| {
+                    holders
+                        .iter()
+                        .all(|holder| eligible.iter().any(|id| id.matches(holder)))
+                })
         })
         .collect();
     candidates
@@ -11034,7 +11047,9 @@ fn build_goal_plan_from_candidates(
         })
         .count();
     if unknown_loss > 0 {
-        warnings.push(format!("kill_loss_unavailable_for_{unknown_loss}_candidates"));
+        warnings.push(format!(
+            "kill_loss_unavailable_for_{unknown_loss}_candidates"
+        ));
     }
     let requests_cpu = goal_requests_metric(goal, Metric::Cpu);
     let requests_memory = goal_requests_metric(goal, Metric::Memory);
@@ -13500,7 +13515,12 @@ mod executable_goal_tests {
             // then rebuild the forecast against the executable actions.
             let mut retained = vec![candidates[2].clone()];
             let executable = build_goal_plan_from_executable_actions(
-                text, &goal, 0.0, &mut retained, &plan, &resources,
+                text,
+                &goal,
+                0.0,
+                &mut retained,
+                &plan,
+                &resources,
             )
             .unwrap();
             assert_eq!(executable.selected_pids, [300], "{text}");
@@ -13537,11 +13557,14 @@ mod executable_goal_tests {
             assert!(output.selected_pids.is_empty());
             assert!(!output.result.feasible);
             assert_eq!(output.result.total_contributions, [0.0]);
-            assert!(output.warnings.iter().any(|w| w.starts_with("kill_loss_unavailable")));
+            assert!(output
+                .warnings
+                .iter()
+                .any(|w| w.starts_with("kill_loss_unavailable")));
         }
         candidates[0]["expected_loss"] = serde_json::json!([{"action": "kill", "loss": 0.0}]);
-        let output = build_goal_plan_from_candidates(text, &goal, 0.0, &candidates, &resources, 2)
-            .unwrap();
+        let output =
+            build_goal_plan_from_candidates(text, &goal, 0.0, &candidates, &resources, 2).unwrap();
         assert!(output.result.feasible);
         assert_eq!(output.selected_pids.len(), 2);
         assert_eq!(output.result.total_loss, 1.0);
@@ -28699,7 +28722,10 @@ mod process_tree_safety_tests {
                 "init" => parent.pid = ProcessId(1),
                 "named_pid" => policy.guardrails.never_kill_pid.push(base_parent.pid.0),
                 "protected_group" => policy.guardrails.protected_groups.push(group.to_owned()),
-                "other_group" => policy.guardrails.protected_groups.push(format!("nonmember-{group}")),
+                "other_group" => policy
+                    .guardrails
+                    .protected_groups
+                    .push(format!("nonmember-{group}")),
                 "service" => {
                     policy.guardrails.builtin_protection = true;
                     parent.comm = "sshd".to_string();
@@ -28723,13 +28749,21 @@ mod process_tree_safety_tests {
                 let identity = super::process_identity_from_record(&parent);
                 for planning in [true, false] {
                     assert_eq!(
-                        enforcer.observe_policy_group(&identity, Action::Renice, planning)
-                            .unwrap().as_deref(), Some(group)
+                        enforcer
+                            .observe_policy_group(&identity, Action::Renice, planning)
+                            .unwrap()
+                            .as_deref(),
+                        Some(group)
                     );
                     let mut stale = identity.clone();
                     stale.uid = stale.uid.wrapping_add(1);
-                    assert!(enforcer.observe_policy_group(&stale, Action::Renice, planning).is_err());
-                    assert_eq!(enforcer.observe_policy_group(&stale, Action::Keep, planning), Ok(None));
+                    assert!(enforcer
+                        .observe_policy_group(&stale, Action::Renice, planning)
+                        .is_err());
+                    assert_eq!(
+                        enforcer.observe_policy_group(&stale, Action::Keep, planning),
+                        Ok(None)
+                    );
                 }
             }
             let refusal = super::planned_zombie_parent_refusal(
@@ -36633,7 +36667,14 @@ fn candidate_recommendation(
             let evidence = pt_core::action::prechecks::descriptor_policy_evidence(
                 &process_identity_from_record(subject),
                 enforcer.requires_lock_evidence(),
-            ).map(|evidence| (Some(evidence.open_write_fds), evidence.has_locked_files, evidence.critical_writes));
+            )
+            .map(|evidence| {
+                (
+                    Some(evidence.open_write_fds),
+                    evidence.has_locked_files,
+                    evidence.critical_writes,
+                )
+            });
             match evidence {
                 Ok(evidence) => Some(evidence),
                 Err(error) => {
@@ -40380,9 +40421,20 @@ fn collect_occupied_ports_for_goal_progress(
         ("/proc/net/udp", false, false),
         ("/proc/net/udp6", false, true),
     ] {
-        if std::fs::read_to_string(path).ok().and_then(|content| {
-            observe_port_table(&content, tcp, ipv6, requested, &mut listeners, &mut bindings)
-        }).is_none() {
+        if std::fs::read_to_string(path)
+            .ok()
+            .and_then(|content| {
+                observe_port_table(
+                    &content,
+                    tcp,
+                    ipv6,
+                    requested,
+                    &mut listeners,
+                    &mut bindings,
+                )
+            })
+            .is_none()
+        {
             bindings.complete = false;
         }
     }
@@ -41702,9 +41754,10 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     let mut expected_by_action: HashMap<String, ExpectedGoalContribution> = HashMap::new();
     for action in &actions_to_apply {
         let pid = action.target.pid.0;
-        let before_proc = before_by_pid.get(&pid).copied().filter(|process| {
-            process.matches_saved_identity(&action.target)
-        });
+        let before_proc = before_by_pid
+            .get(&pid)
+            .copied()
+            .filter(|process| process.matches_saved_identity(&action.target));
         let label = before_proc
             .map(|proc| proc.cmd.clone())
             .unwrap_or_else(|| format!("pid {}", pid));

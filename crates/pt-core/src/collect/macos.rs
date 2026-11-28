@@ -1200,7 +1200,7 @@ fn parse_native_start(id: &StartId, pid: u32) -> Option<(&str, u64)> {
         && birth > 0
         && recorded_pid.parse::<u32>() == Ok(pid)
         && *id == StartId::from_macos(boot, birth, pid))
-        .then_some((boot, birth))
+    .then_some((boot, birth))
 }
 
 /// Compare a saved pre-UUID selector with one newly observed native Darwin birth.
@@ -1210,9 +1210,10 @@ pub(super) fn legacy_birth_matches(
     pid: u32,
     current_boot: Option<&str>,
 ) -> bool {
-    let (Some(("unknown", birth)), Some((boot, live_birth))) =
-        (parse_native_start(saved, pid), parse_native_start(observed, pid))
-    else {
+    let (Some(("unknown", birth)), Some((boot, live_birth))) = (
+        parse_native_start(saved, pid),
+        parse_native_start(observed, pid),
+    ) else {
         return false;
     };
     current_boot == Some(boot) && birth == live_birth
@@ -1780,7 +1781,12 @@ mod tests {
         assert!(!legacy_birth_matches(&current, &legacy, pid, Some(boot)));
         assert!(!legacy_birth_matches(&legacy, &current, pid, Some(other)));
         assert!(!legacy_birth_matches(&legacy, &current, pid, None));
-        assert!(!legacy_birth_matches(&legacy, &current, pid + 1, Some(boot)));
+        assert!(!legacy_birth_matches(
+            &legacy,
+            &current,
+            pid + 1,
+            Some(boot)
+        ));
         for (scope, value, id) in [
             ("synthetic", birth, pid),
             ("unknown", 0, pid),
@@ -1814,7 +1820,10 @@ mod tests {
         let mut target = row.identity();
         let provider = LiveIdentityProvider::new();
         assert_eq!(target.quality, IdentityQuality::Full);
-        assert_eq!(target.start_id, StartId::from_macos(&boot, native.start_us, pid));
+        assert_eq!(
+            target.start_id,
+            StartId::from_macos(&boot, native.start_us, pid)
+        );
         assert!(provider.revalidate(&target).unwrap());
         // SAFETY: getegid observes this test process's own effective group.
         let group = unsafe { libc::getegid() };
@@ -1827,7 +1836,10 @@ mod tests {
         assert!(!row.matches_saved_identity(&target));
         assert!(!provider.revalidate(&target).unwrap());
         assert_eq!(effective_gid(&target), None);
-        assert_eq!(crate::decision::goal_contribution::macos_fd_count(&target), None);
+        assert_eq!(
+            crate::decision::goal_contribution::macos_fd_count(&target),
+            None
+        );
         target.start_id = StartId::from_macos("unknown", native.start_us, pid);
         target.quality = IdentityQuality::NoBootId;
         assert!(row.matches_saved_identity(&target));
@@ -1858,7 +1870,10 @@ mod tests {
             if let Some(stat) = read_session_stat(pid).filter(|stat| stat.state == 'Z') {
                 break stat;
             }
-            assert!(std::time::Instant::now() < deadline, "unreaped child was not visible");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "unreaped child was not visible"
+            );
             std::thread::sleep(std::time::Duration::from_millis(5));
         };
         let scan = super::super::quick_scan(&super::super::QuickScanOptions {
@@ -1872,7 +1887,10 @@ mod tests {
         assert!(row.state.is_zombie());
         assert_eq!(row.ppid.0, std::process::id());
         assert_eq!(target.quality, IdentityQuality::Full);
-        assert_eq!(target_birth(&target, scan.metadata.boot_id.as_deref()), Some(stat.starttime));
+        assert_eq!(
+            target_birth(&target, scan.metadata.boot_id.as_deref()),
+            Some(stat.starttime)
+        );
         assert_eq!(target.sid, u32::try_from(stat.session).ok());
         let provider = LiveIdentityProvider::new();
         assert!(provider.revalidate(&target).unwrap());

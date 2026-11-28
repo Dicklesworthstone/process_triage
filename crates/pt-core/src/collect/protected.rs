@@ -127,8 +127,9 @@ pub(crate) fn group_name(gid: u32) -> Result<String, String> {
         max_output_bytes: 64 * 1024,
         ..Default::default()
     });
-    let observed = runner.run_tool(cmd, args, None)
-    .map_err(|error| format!("group directory lookup for GID {gid}: {error}"))?;
+    let observed = runner
+        .run_tool(cmd, args, None)
+        .map_err(|error| format!("group directory lookup for GID {gid}: {error}"))?;
     if !observed.success() || !observed.stderr.is_empty() {
         return Err(format!(
             "group directory lookup for GID {gid} did not complete"
@@ -224,8 +225,14 @@ mod group_evidence_tests {
         );
         assert_eq!(parse_directory_group("name: staff\ngid: 21\n", 20), None);
         assert_eq!(parse_directory_group("name: staff\n\ngid: 20\n", 20), None);
-        assert_eq!(parse_directory_group("name: staff\ngid: 20\nname:\n", 20), None);
-        assert_eq!(parse_directory_group("name: staff\ngid: 20\ngid:bad\n", 20), None);
+        assert_eq!(
+            parse_directory_group("name: staff\ngid: 20\nname:\n", 20),
+            None
+        );
+        assert_eq!(
+            parse_directory_group("name: staff\ngid: 20\ngid:bad\n", 20),
+            None
+        );
         assert_eq!(
             parse_directory_group("name: staff\ngid: 20\nname: alt\n", 20),
             None
