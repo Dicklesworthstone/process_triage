@@ -511,7 +511,7 @@ mod tests {
         let result = detect_supervision(pid);
 
         // Should succeed for current process
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "{result:?}");
 
         let result = result.unwrap();
         assert!(result.ancestry.is_some());
@@ -627,7 +627,7 @@ mod tests {
         let pid = std::process::id();
         let results = detect_supervision_batch(&[pid]);
 
-        assert!(results.is_ok());
+        assert!(results.is_ok(), "{results:?}");
         let results = results.unwrap();
         assert!(!results.is_empty());
     }
