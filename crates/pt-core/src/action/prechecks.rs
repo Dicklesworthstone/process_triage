@@ -19,7 +19,7 @@ use crate::config::policy::{DataLossGates, Guardrails};
 use crate::decision::Action;
 use crate::plan::{PlanAction, PreCheck};
 use crate::supervision::session::{SessionAnalyzer, SessionConfig, SessionProtectionType};
-use crate::supervision::{detect_supervision, is_human_supervised, SupervisorCategory};
+use crate::supervision::{detect_supervision, human_supervision_refusal, is_human_supervised};
 #[cfg(target_os = "linux")]
 use serde::Deserialize;
 use serde::Serialize;
@@ -3657,32 +3657,11 @@ impl PreCheckProvider for LivePreCheckProvider {
 
         match detect_supervision(pid) {
             Ok(result) => {
-                if is_human_supervised(&result) {
-                    let supervisor = result
-                        .supervisor_name
-                        .clone()
-                        .unwrap_or_else(|| "unknown supervisor".to_string());
-                    let category = result
-                        .supervisor_type
-                        .map(|t: SupervisorCategory| t.to_string())
-                        .unwrap_or_else(|| "unknown".to_string());
-
-                    debug!(
-                        pid,
-                        %supervisor,
-                        %category,
-                        confidence = result.confidence,
-                        "process is human-supervised"
-                    );
-
+                if let Some(reason) = human_supervision_refusal(&result) {
+                    debug!(pid, %reason, "process is human-supervised");
                     return PreCheckResult::Blocked {
                         check: PreCheck::CheckAgentSupervision,
-                        reason: format!(
-                            "supervised by {} ({}, confidence: {:.0}%): requires human confirmation",
-                            supervisor,
-                            category,
-                            result.confidence * 100.0
-                        ),
+                        reason,
                     };
                 }
             }

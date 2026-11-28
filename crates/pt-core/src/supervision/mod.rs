@@ -193,6 +193,34 @@ pub fn is_human_supervised(result: &CombinedResult) -> bool {
         })
 }
 
+/// The mandatory action refusal shared by live preflight and recommendations.
+/// An infrastructure manager can win the diagnostic ranking even while another
+/// signal establishes human supervision. Do not attribute that refusal to it.
+pub fn human_supervision_refusal(result: &CombinedResult) -> Option<String> {
+    if !is_human_supervised(result) {
+        return None;
+    }
+    if result.is_supervised
+        && result
+            .supervisor_type
+            .is_none_or(SupervisorCategory::requires_human_confirmation)
+    {
+        let name = result
+            .supervisor_name
+            .as_deref()
+            .unwrap_or("unknown supervisor");
+        let category = result
+            .supervisor_type
+            .map(|category| category.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        return Some(format!(
+            "supervised by {name} ({category}, confidence: {:.0}%): requires human confirmation",
+            result.confidence * 100.0
+        ));
+    }
+    Some("independent human supervision evidence requires human confirmation".to_string())
+}
+
 /// Combined supervision detector using all available methods.
 pub struct SupervisionDetector {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -435,6 +463,34 @@ mod tests {
             );
             assert_eq!(result.confidence, 0.95);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_agent_marked_child_requires_confirmation_despite_a_manager() {
+        use std::process::Command;
+
+        let mut child = Command::new("sleep")
+            .arg("20")
+            .env_clear()
+            .env("CLAUDECODE", "1")
+            .spawn()
+            .unwrap();
+        let observed = EnvironAnalyzer::new().analyze(child.id());
+        let _ = child.kill();
+        child.wait().unwrap();
+        let mut mixed = combined_orchestrator();
+        mixed.environ = Some(observed.unwrap());
+        assert_eq!(
+            mixed.supervisor_type,
+            Some(SupervisorCategory::Orchestrator)
+        );
+        let reason = human_supervision_refusal(&mixed).unwrap();
+        assert!(reason.contains("independent"));
+        assert!(reason.contains("requires human confirmation"));
+        assert!(!reason.contains("systemd"));
+        assert!(human_supervision_refusal(&combined_orchestrator()).is_none());
+        assert!(human_supervision_refusal(&CombinedResult::not_supervised()).is_none());
     }
 
     #[test]

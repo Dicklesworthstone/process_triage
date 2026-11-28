@@ -8530,6 +8530,7 @@ mod planning_probe_tests {
     #[cfg(target_os = "linux")]
     fn recommendation(action: &'static str) -> CandidateRecommendation {
         CandidateRecommendation {
+            fuse_refusal: None,
             session_refusal: None,
             action,
             rationale: "existing decision rationale".into(),
@@ -9449,12 +9450,28 @@ fn build_tui_rows(
                 ),
             );
         }
+        let agent_child_review = parent.and_then(|parent| {
+            pt_core::action::prechecks::AgentChildReview::from_records(proc, parent)
+        });
+        let direct_child_tree_review = decision_policy.guardrails.builtin_protection
+            && decision_outcome.optimal_action == Action::Kill
+            && recommendation == "kill"
+            && agent_child_review.is_some();
         let _ = finalize_candidate_remedy(
             proc,
             parent,
             &mut recommendation,
             &mut rationale,
-            |identity| planning_supervision_evidence(identity, &mut supervision),
+            |identity| {
+                let refusal = planning_human_supervision(identity, &mut supervision)?;
+                // The later tree gate makes this exact child review-only and
+                // excludes it from bulk selection. An explicit single-child
+                // confirmation must still revalidate the live child and parent.
+                match refusal {
+                    Some(reason) if !direct_child_tree_review => Err(reason),
+                    _ => Ok(()),
+                }
+            },
         );
         if recommendation == "review" {
             blocked_reasons.push(rationale.clone());
@@ -9475,11 +9492,7 @@ fn build_tui_rows(
                 parent_identity: parent.map(process_identity_from_record),
                 supervisor_restart: scorer.supervisor_restart_for(proc).cloned(),
                 memory_cap: memory_cap.clone(),
-                agent_child_review: parent
-                    .and_then(|parent| {
-                        pt_core::action::prechecks::AgentChildReview::from_records(proc, parent)
-                    })
-                    .map(|observation| TuiAgentChildReview {
+                agent_child_review: agent_child_review.map(|observation| TuiAgentChildReview {
                         observation,
                         reason: None,
                     }),
@@ -28430,7 +28443,7 @@ mod process_tree_safety_tests {
     #[test]
     fn inactive_recommendations_do_not_probe_supervision() {
         let process = rec(900, 500, "worker", ProcessState::Sleeping);
-        for initial in ["keep", "review"] {
+        for initial in ["keep", "review", "resume", "unquarantine"] {
             let mut action = initial;
             let mut rationale = "existing verdict".to_string();
             let target = super::finalize_candidate_remedy(
@@ -28689,6 +28702,49 @@ mod process_tree_safety_tests {
         assert!(target.is_none());
         assert!(rationale.contains("Mandatory supervision evidence unavailable"));
         assert!(rationale.contains("identity changed or is unavailable"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_agent_child_predicts_the_live_supervision_refusal() {
+        use pt_core::action::prechecks::{
+            LivePreCheckConfig, LivePreCheckProvider, PreCheckProvider, PreCheckResult,
+        };
+        use pt_core::plan::PreCheck;
+        use pt_core::supervision::SupervisionDetector;
+        use std::process::Command;
+
+        let mut child = Command::new("sleep")
+            .arg("20")
+            .env_clear()
+            .env("CLAUDECODE", "1")
+            .spawn()
+            .unwrap();
+        let scan = super::quick_scan(&super::QuickScanOptions {
+            pids: vec![child.id()],
+            ..Default::default()
+        })
+        .unwrap();
+        let process = scan
+            .processes
+            .iter()
+            .find(|p| p.pid.0 == child.id())
+            .unwrap();
+        let identity = process_identity_from_record(process);
+        let mut detector = SupervisionDetector::new();
+        let predicted = super::planning_supervision_evidence(&identity, &mut detector);
+        let diagnostic = super::supervisor_info_for_plan_identity(&identity, &mut detector);
+        let provider = LivePreCheckProvider::new(None, LivePreCheckConfig::default()).unwrap();
+        let live = provider.check_agent_supervision(child.id());
+        let _ = child.kill();
+        child.wait().unwrap();
+        let reason = predicted.unwrap_err();
+        assert!(reason.contains("requires human confirmation"), "{reason}");
+        assert_eq!(diagnostic["human_supervision_refusal"], reason.as_str());
+        assert_eq!(diagnostic["recommended_action"], "review");
+        assert!(
+            matches!(live, PreCheckResult::Blocked { check: PreCheck::CheckAgentSupervision, reason: current } if current == reason)
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -29084,6 +29140,7 @@ mod process_tree_safety_tests {
                 process, None, &score, &decision, &policy, &enforcer, robot,
             );
             assert_eq!(advice.action, "review");
+            assert!(advice.fuse_refusal.as_deref().is_some_and(|reason| reason.contains("builtin.sftp_transport")));
             assert!(
                 advice.rationale.contains("builtin.sftp_transport"),
                 "{}",
@@ -34677,6 +34734,7 @@ fn agent_liveness_json(
 /// presentation surface must apply this before turning an expected-loss action
 /// into a recommendation. Execution still revalidates the live evidence.
 struct CandidateRecommendation {
+    fuse_refusal: Option<String>,
     session_refusal: Option<String>,
     action: &'static str,
     rationale: String,
@@ -37088,7 +37146,7 @@ fn candidate_recommendation(
         action = "review";
         rationale = format!("check_session_safety: {reason}; {rationale}");
     }
-    if let Some(reason) = fuse_refusal {
+    if let Some(reason) = &fuse_refusal {
         // Keep is already safe. Preserve an earlier, independently sufficient
         // review reason while still exposing the FUSE evidence in the result.
         if action != "keep" {
@@ -37138,6 +37196,7 @@ fn candidate_recommendation(
         rationale = format!("{reason}; {rationale}");
     }
     CandidateRecommendation {
+        fuse_refusal,
         session_refusal,
         action,
         rationale,
@@ -37209,11 +37268,21 @@ fn workload_preservation_refusal(
 
 /// Check only the mandatory supervision evidence needed to authorize advice.
 /// Reuse the detector within one scan; optional adapter discovery is unnecessary
-/// for surfaces that only need to distinguish observed from unavailable evidence.
+/// for surfaces that only need the mandatory human-supervision refusal.
 fn planning_supervision_evidence(
     identity: &ProcessIdentity,
     detector: &mut pt_core::supervision::SupervisionDetector,
 ) -> Result<(), String> {
+    match planning_human_supervision(identity, detector)? {
+        Some(reason) => Err(reason),
+        None => Ok(()),
+    }
+}
+
+fn planning_human_supervision(
+    identity: &ProcessIdentity,
+    detector: &mut pt_core::supervision::SupervisionDetector,
+) -> Result<Option<String>, String> {
     let unavailable = |reason: &str| {
         format!(
             "Mandatory supervision evidence unavailable for PID {}: {reason}",
@@ -37228,7 +37297,7 @@ fn planning_supervision_evidence(
             "supervision subject identity changed or is unavailable",
         ));
     }
-    detector
+    let observed = detector
         .detect(identity.pid.0)
         .map_err(|error| unavailable(&error.to_string()))?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -37237,7 +37306,7 @@ fn planning_supervision_evidence(
             "supervision subject identity changed during probing",
         ));
     }
-    Ok(())
+    Ok(pt_core::supervision::human_supervision_refusal(&observed))
 }
 
 /// Resolve the subject of an actionable recommendation and require its own
@@ -37250,7 +37319,7 @@ fn finalize_candidate_remedy(
     rationale: &mut String,
     mut check_supervision: impl FnMut(&ProcessIdentity) -> Result<(), String>,
 ) -> Option<ProcessIdentity> {
-    if matches!(*action, "keep" | "review") {
+    if matches!(*action, "keep" | "review" | "resume" | "unquarantine") {
         return None;
     }
     let subject = if process.state.is_zombie() {
@@ -38508,9 +38577,14 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             "score": score,
             "classification": ledger.classification.label(),
         });
-        if let Some(reason) = &advice.session_refusal {
+        // Match mandatory live check ordering: infrastructure protection
+        // precedes the session and human-supervision checks.
+        let first_refusal = advice.fuse_refusal.as_ref()
+            .map(|reason| ("check_not_protected", reason))
+            .or_else(|| advice.session_refusal.as_ref().map(|reason| ("check_session_safety", reason)));
+        if let Some((check, reason)) = first_refusal {
             candidate["predicted_refusal"] = serde_json::json!({
-                "check": "check_session_safety",
+                "check": check,
                 "reason": reason,
                 "target_pid": if routed_supervision { proc.ppid.0 } else { proc.pid.0 },
             });
@@ -38603,14 +38677,23 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             candidate["blast_radius"]["gpu"] = shared_devices;
         }
 
-        let supervision_refusal = (candidate["supervisor"]["status"] == "unknown")
-            .then(|| {
-                candidate["supervisor"]["reason"]
-                    .as_str()
-                    .map(str::to_string)
-            })
-            .flatten();
+        let check_required = !matches!(decision_outcome.optimal_action, Action::Keep | Action::Resume | Action::Unquarantine);
+        let supervision_refusal = check_required.then(|| {
+            let info = &candidate["supervisor"];
+            if info["status"] == "unknown" {
+                info["reason"].as_str()
+            } else {
+                info["human_supervision_refusal"].as_str()
+            }
+        }).flatten().map(str::to_owned);
         if let Some(reason) = &supervision_refusal {
+            if candidate.get("predicted_refusal").is_none() {
+                candidate["predicted_refusal"] = serde_json::json!({
+                    "check": "check_agent_supervision",
+                    "reason": reason,
+                    "target_pid": if routed_supervision { proc.ppid.0 } else { proc.pid.0 },
+                });
+            }
             if !matches!(
                 candidate["recommended_action"].as_str(),
                 Some("keep" | "review")
@@ -38738,6 +38821,9 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             .map(|violation| format!("Policy blocked: {} ({})", violation.message, violation.rule))
             .into_iter()
             .collect();
+        if let Some(reason) = advice.fuse_refusal {
+            blocked_reasons.push(format!("check_not_protected: {reason}"));
+        }
         if let Some(reason) = advice.session_refusal {
             blocked_reasons.push(format!("check_session_safety: {reason}"));
         }
@@ -40506,8 +40592,9 @@ fn supervisor_info_for_plan(
         }
     }
 
-    // Human supervision (agents/IDEs/CI) for warning-only
-    if !detected && is_human_supervised(&human_supervision) {
+    let human_refusal = pt_core::supervision::human_supervision_refusal(&human_supervision);
+    // Keep infrastructure attribution even when independent human supervision requires review.
+    if !detected && human_refusal.is_some() {
         detected = true;
         supervisor_type = human_supervision.supervisor_type.map(|t| t.to_string());
         unit = human_supervision.supervisor_name;
@@ -40520,8 +40607,9 @@ fn supervisor_info_for_plan(
         "type": supervisor_type,
         "unit": unit,
         "manager": manager,
-        "recommended_action": recommended_action,
-        "supervisor_command": supervisor_command,
+        "recommended_action": if human_refusal.is_some() { "review" } else { &recommended_action },
+        "supervisor_command": supervisor_command.filter(|_| human_refusal.is_none()),
+        "human_supervision_refusal": human_refusal,
     })
 }
 
@@ -40545,7 +40633,8 @@ fn environment_supervision_for_plan(
         Ok(_) => return unknown_supervision_for_plan(pid, "environment was not observed"),
         Err(error) => return unknown_supervision_for_plan(pid, &error.to_string()),
     };
-    let requires_review = is_human_supervised(&observed) || observed.is_supervised;
+    let human_refusal = pt_core::supervision::human_supervision_refusal(&observed);
+    let requires_review = human_refusal.is_some() || observed.is_supervised;
     serde_json::json!({
         "detected": observed.is_supervised,
         "status": "observed",
@@ -40554,6 +40643,7 @@ fn environment_supervision_for_plan(
         "manager": serde_json::Value::Null,
         "recommended_action": if requires_review { "review" } else { "kill" },
         "supervisor_command": serde_json::Value::Null,
+        "human_supervision_refusal": human_refusal,
         "evidence_scope": "environment",
         "ancestry_observed": observed.ancestry.is_some(),
         "ipc_observed": observed.ipc.is_some(),
