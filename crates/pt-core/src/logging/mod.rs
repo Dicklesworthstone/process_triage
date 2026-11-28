@@ -90,8 +90,7 @@ pub fn set_redactor(engine: RedactionEngine) {
 /// Must be called once at startup before any logging occurs.
 /// Respects environment variables PT_LOG, RUST_LOG, and PT_LOG_FORMAT.
 pub fn init_logging(config: &LogConfig) {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(format!("pt_core={}", config.level)));
+    let filter = log_filter(config);
 
     match config.format {
         LogFormat::Human => {
@@ -125,6 +124,29 @@ pub fn init_logging(config: &LogConfig) {
                 .init();
         }
     }
+}
+
+fn log_filter(config: &LogConfig) -> EnvFilter {
+    EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(format!("pt_core={}", config.level)))
+}
+
+/// Install the same redacting JSONL layer for every TUI and collector thread.
+/// The session store has already created the owner's private logs directory.
+pub fn init_session_logging(config: &LogConfig, path: &std::path::Path) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    tracing_subscriber::registry()
+        .with(log_filter(config))
+        .with(JsonlLayer::new(file))
+        .try_init()
+        .map_err(std::io::Error::other)
 }
 
 /// Initialize logging with defaults (for tests and simple cases).

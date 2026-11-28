@@ -2298,7 +2298,15 @@ fn main() {
         timestamps: true,
         source_location: false,
     };
-    init_logging(&log_config);
+    // A redirected stderr or explicit verbosity retains the caller's log sink.
+    // The interactive session owns a file sink before it starts scanning.
+    let session_log = cfg!(feature = "ui")
+        && matches!(&cli.command, None | Some(Commands::Run(_)))
+        && interactive_session_log(&cli.global);
+    if !session_log {
+        init_logging(&log_config);
+    }
+    let session_log = session_log.then_some(&log_config);
 
     let exit_code = match cli.command {
         None => {
@@ -2320,9 +2328,10 @@ fn main() {
                     reduce_motion: false,
                     accessible: false,
                 },
+                session_log,
             )
         }
-        Some(Commands::Run(args)) => run_interactive(&cli.global, &args),
+        Some(Commands::Run(args)) => run_interactive(&cli.global, &args, session_log),
         Some(Commands::Scan(args)) => run_scan(&cli.global, &args),
         Some(Commands::Replay(args)) => run_replay(&cli.global, &args),
         Some(Commands::DeepScan(args)) => run_deep_scan(&cli.global, &args),
@@ -2618,13 +2627,26 @@ mod output_format_tests {
 // Command implementations (stubs)
 // ============================================================================
 
-fn run_interactive(global: &GlobalOpts, args: &RunArgs) -> ExitCode {
+fn interactive_session_log(global: &GlobalOpts) -> bool {
+    use std::io::IsTerminal;
+    !global.robot
+        && global.verbose == 0
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+        && std::io::stderr().is_terminal()
+}
+
+fn run_interactive(
+    global: &GlobalOpts,
+    args: &RunArgs,
+    session_log: Option<&LogConfig>,
+) -> ExitCode {
     let _lock = match acquire_global_lock(global, "run") {
         Ok(lock) => lock,
         Err(code) => return code,
     };
     #[cfg(not(feature = "ui"))]
-    let _ = args;
+    let _ = (args, session_log);
     #[cfg(feature = "ui")]
     {
         use std::io::IsTerminal;
@@ -2636,7 +2658,7 @@ fn run_interactive(global: &GlobalOpts, args: &RunArgs) -> ExitCode {
                  `pt agent plan` / `pt agent apply`",
             );
         }
-        match run_interactive_tui(global, args) {
+        match run_interactive_tui(global, args, session_log) {
             Ok(()) => ExitCode::Clean,
             Err(err) => {
                 eprintln!("run: {}", err);
@@ -2655,7 +2677,11 @@ fn run_interactive(global: &GlobalOpts, args: &RunArgs) -> ExitCode {
 }
 
 #[cfg(feature = "ui")]
-fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String> {
+fn run_interactive_tui(
+    global: &GlobalOpts,
+    args: &RunArgs,
+    session_log: Option<&LogConfig>,
+) -> Result<(), String> {
     let store = SessionStore::from_env().map_err(|e| format!("session store error: {}", e))?;
     let session_id = SessionId::new();
     let manifest = SessionManifest::new(&session_id, None, SessionMode::Interactive, None);
@@ -2663,6 +2689,11 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
         .create(&manifest)
         .map_err(|e| format!("failed to create session: {}", e))?;
 
+    if let Some(config) = session_log {
+        let path = handle.dir.join("logs").join("tui.jsonl");
+        pt_core::logging::init_session_logging(config, &path)
+            .map_err(|error| format!("initialize interactive log {}: {error}", path.display()))?;
+    }
     let ctx = SessionContext::new(
         &session_id,
         pt_core::logging::get_host_id(),

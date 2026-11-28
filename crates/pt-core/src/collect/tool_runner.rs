@@ -329,6 +329,13 @@ pub struct ToolRunner {
     config: ToolConfig,
     /// Cumulative time used in milliseconds.
     used_ms: Arc<AtomicU64>,
+    budget_refusals: AtomicU64,
+}
+
+impl Drop for ToolRunner {
+    fn drop(&mut self) {
+        self.report_budget_refusals();
+    }
 }
 
 type StdoutHandler<'a> = &'a mut dyn FnMut(&[u8]) -> std::io::Result<()>;
@@ -497,6 +504,7 @@ impl ToolRunner {
         Self {
             config,
             used_ms: Arc::new(AtomicU64::new(0)),
+            budget_refusals: AtomicU64::new(0),
         }
     }
 
@@ -523,7 +531,20 @@ impl ToolRunner {
 
     /// Reset the budget counter.
     pub fn reset_budget(&self) {
+        self.report_budget_refusals();
         self.used_ms.store(0, Ordering::SeqCst);
+    }
+
+    fn report_budget_refusals(&self) {
+        let refused = self.budget_refusals.swap(0, Ordering::Relaxed);
+        if refused != 0 {
+            warn!(
+                refused_probes = refused,
+                used_ms = self.used_budget_ms(),
+                budget_ms = self.config.budget_ms,
+                "probe budget exhausted"
+            );
+        }
     }
 
     /// Run a single tool with the given command and arguments.
@@ -582,11 +603,7 @@ impl ToolRunner {
 
         loop {
             if current >= self.config.budget_ms {
-                warn!(
-                    used_ms = current,
-                    budget_ms = self.config.budget_ms,
-                    "budget exhausted"
-                );
+                self.budget_refusals.fetch_add(1, Ordering::Relaxed);
                 return Err(ToolError::BudgetExhausted {
                     used_ms: current,
                     budget_ms: self.config.budget_ms,
