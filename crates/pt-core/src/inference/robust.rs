@@ -1444,7 +1444,7 @@ mod tests {
         let analysis = DecisionStabilityAnalysis::analyze(&action_losses, &credals, 0.5);
 
         assert!(analysis.is_stable);
-        assert!(analysis.viable_actions.contains(&"keep".to_string()));
+        assert!(analysis.viable_actions.iter().any(|i| i == "keep"));
         assert!(analysis.explanation.contains("stable"));
     }
 

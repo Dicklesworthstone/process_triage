@@ -1097,7 +1097,7 @@ mod tests {
 
         assert_eq!(evidence.total_features, 2);
         assert_eq!(evidence.drifted_count, 1);
-        assert!(evidence.drifted_features.contains(&"cpu".to_string()));
+        assert!(evidence.drifted_features.iter().any(|i| i == "cpu"));
         assert!(evidence.dro_triggered);
         assert!(evidence.overall_drifted);
     }

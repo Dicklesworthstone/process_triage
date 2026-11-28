@@ -1996,7 +1996,7 @@ mod tests {
             .iter()
             .map(|p| p.signature.name.clone())
             .collect();
-        assert!(!active.contains(&"test_pattern".to_string()));
+        assert!(!active.iter().any(|i: &String| i == "test_pattern"));
 
         lib.enable_pattern("test_pattern").expect("enable");
         assert!(!lib.disabled.is_disabled("test_pattern"));
@@ -2818,8 +2818,8 @@ mod tests {
             .iter()
             .map(|p| p.signature.name.clone())
             .collect();
-        assert!(names.contains(&"active_sig".to_string()));
-        assert!(!names.contains(&"disabled_sig".to_string()));
+        assert!(names.iter().any(|i: &String| i == "active_sig"));
+        assert!(!names.iter().any(|i: &String| i == "disabled_sig"));
     }
 
     // ── PatternLibrary: import with all strategies ──────────────────

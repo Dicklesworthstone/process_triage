@@ -513,7 +513,7 @@ fn rank_scores(
         precision: precision_bounds.filter(|_| unlabeled == 0).map(|p| p[0]),
         precision_bounds,
         reviewed_recall: (reviewed_abandoned_total > 0)
-            .then(|| abandoned as f64 / reviewed_abandoned_total as f64),
+            .then_some(abandoned as f64 / reviewed_abandoned_total as f64),
     }
 }
 

@@ -39948,7 +39948,7 @@ fn build_process_explanation(
     }
 
     // Add input evidence if requested
-    if args.include.contains(&"evidence".to_string()) {
+    if args.include.iter().any(|i| i == "evidence") {
         explanation["evidence"] = serde_json::json!({
             "cpu_occupancy": cpu_occupancy,
             "io_active": io_active,

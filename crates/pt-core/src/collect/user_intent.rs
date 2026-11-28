@@ -1394,7 +1394,7 @@ mod tests {
         // Simulate disabled signals
         privacy.skipped_signals.push("tty".to_string());
 
-        assert!(privacy.skipped_signals.contains(&"tty".to_string()));
+        assert!(privacy.skipped_signals.iter().any(|i| i == "tty"));
     }
 
     #[test]

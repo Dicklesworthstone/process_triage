@@ -21,7 +21,6 @@ tempfile = "3"
 dirs = "7"
 
 # Internal crates
-pt-common = { path = "../pt-common" }
 pt-redact = { path = "../pt-redact" }
 
 [target.'cfg(unix)'.dependencies]

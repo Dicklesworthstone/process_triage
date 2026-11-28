@@ -1370,10 +1370,10 @@ mod tests {
         let config = SshScanConfig::default();
         let args = build_ssh_args("myhost", &config).unwrap();
 
-        assert!(args.contains(&"-o".to_string()));
-        assert!(args.contains(&"ConnectTimeout=10".to_string()));
-        assert!(args.contains(&"BatchMode=yes".to_string()));
-        assert!(args.contains(&"myhost".to_string()));
+        assert!(args.iter().any(|i| i == "-o"));
+        assert!(args.iter().any(|i| i == "ConnectTimeout=10"));
+        assert!(args.iter().any(|i| i == "BatchMode=yes"));
+        assert!(args.iter().any(|i| i == "myhost"));
         assert_eq!(
             args.last().map(String::as_str),
             Some("pt-core --format json agent plan")
@@ -1564,7 +1564,8 @@ mod tests {
         assert!(previous.config_file.is_none());
         assert!(!build_ssh_args("worker", &previous)
             .unwrap()
-            .contains(&"-F".to_string()));
+            .iter()
+            .any(|i| i == "-F"));
     }
 
     #[test]
@@ -1585,7 +1586,7 @@ mod tests {
             ..SshScanConfig::default()
         };
         let args = build_ssh_args("myhost", &config).unwrap();
-        assert!(args.contains(&"admin@myhost".to_string()));
+        assert!(args.iter().any(|i| i == "admin@myhost"));
     }
 
     #[test]
@@ -1595,8 +1596,8 @@ mod tests {
             ..SshScanConfig::default()
         };
         let args = build_ssh_args("myhost", &config).unwrap();
-        assert!(args.contains(&"-p".to_string()));
-        assert!(args.contains(&"2222".to_string()));
+        assert!(args.iter().any(|i| i == "-p"));
+        assert!(args.iter().any(|i| i == "2222"));
     }
 
     #[test]
@@ -1606,8 +1607,8 @@ mod tests {
             ..SshScanConfig::default()
         };
         let args = build_ssh_args("myhost", &config).unwrap();
-        assert!(args.contains(&"-i".to_string()));
-        assert!(args.contains(&"/home/user/.ssh/fleet_key".to_string()));
+        assert!(args.iter().any(|i| i == "-i"));
+        assert!(args.iter().any(|i| i == "/home/user/.ssh/fleet_key"));
     }
 
     #[test]

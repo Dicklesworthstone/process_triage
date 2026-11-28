@@ -278,7 +278,7 @@ impl ConformalRobotGate {
             apply_small_sample_correction(&mut pred_set, health.n_samples, &self.config);
         }
 
-        let useful_in_set = pred_set.classes.contains(&"useful".to_string());
+        let useful_in_set = pred_set.classes.iter().any(|i| i == "useful");
 
         let certificate = ConfidenceCertificate {
             alpha: self.config.alpha,

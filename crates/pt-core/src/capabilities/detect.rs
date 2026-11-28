@@ -761,7 +761,7 @@ fn detect_permissions() -> PermissionCapabilities {
     let can_read_others_procs = check_read_others_procs(effective_uid);
 
     // Check if we can signal other users' processes
-    let can_signal_others = is_root || linux_capabilities.contains(&"CAP_KILL".to_string());
+    let can_signal_others = is_root || linux_capabilities.iter().any(|i| i == "CAP_KILL");
 
     PermissionCapabilities {
         effective_uid,
@@ -976,7 +976,8 @@ fn detect_actions(
     let renice = permissions.is_root
         || permissions
             .linux_capabilities
-            .contains(&"CAP_SYS_NICE".to_string())
+            .iter()
+            .any(|i| i == "CAP_SYS_NICE")
         || tools.renice.works;
 
     // ionice similar to renice (Linux only)
@@ -1134,8 +1135,8 @@ mod tests {
         // Test with known capability bits
         let bits = (1 << 5) | (1 << 21); // CAP_KILL + CAP_SYS_ADMIN
         let caps = decode_capabilities(bits);
-        assert!(caps.contains(&"CAP_KILL".to_string()));
-        assert!(caps.contains(&"CAP_SYS_ADMIN".to_string()));
+        assert!(caps.iter().any(|i| i == "CAP_KILL"));
+        assert!(caps.iter().any(|i| i == "CAP_SYS_ADMIN"));
     }
 
     #[test]

@@ -344,7 +344,7 @@ impl ConformalClassifier {
         let score = 1.0 - true_prob;
 
         // Track classes
-        if !self.classes.contains(&true_class.to_string()) {
+        if !self.classes.iter().any(|i| i == true_class) {
             self.classes.push(true_class.to_string());
         }
 
@@ -774,7 +774,7 @@ mod tests {
         // Test with high A probability -> should include A
         let pset = classifier.predict(&[("A".to_string(), 0.85), ("B".to_string(), 0.15)]);
 
-        assert!(pset.classes.contains(&"A".to_string()));
+        assert!(pset.classes.iter().any(|i| i == "A"));
     }
 
     #[test]
@@ -923,8 +923,8 @@ mod tests {
             classifier.calibrate("B", &[("A".to_string(), 0.3), ("B".to_string(), 0.7)]);
         }
 
-        assert!(classifier.classes().contains(&"A".to_string()));
-        assert!(classifier.classes().contains(&"B".to_string()));
+        assert!(classifier.classes().iter().any(|i| i == "A"));
+        assert!(classifier.classes().iter().any(|i| i == "B"));
     }
 
     #[test]

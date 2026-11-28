@@ -1951,11 +1951,9 @@ mod tests {
         assert_eq!(audit.warning_count, 0);
         assert_eq!(audit.integrity_sha256, loaded.integrity_sha256);
         assert!(audit.omitted_sections.is_empty());
-        assert!(audit
-            .persisted_sections
-            .contains(&"graph.nodes".to_string()));
-        assert!(audit.redacted_sections.contains(&"graph.nodes".to_string()));
-        assert!(audit.redacted_sections.contains(&"graph.edges".to_string()));
+        assert!(audit.persisted_sections.iter().any(|i| i == "graph.nodes"));
+        assert!(audit.redacted_sections.iter().any(|i| i == "graph.nodes"));
+        assert!(audit.redacted_sections.iter().any(|i| i == "graph.edges"));
     }
 
     #[test]
@@ -2051,13 +2049,13 @@ mod tests {
 
         persist_plan(&handle, "s1", "h1", sample_plan()).unwrap();
         let present = list_artifacts(&handle);
-        assert!(present.contains(&"inventory".to_string()));
-        assert!(present.contains(&"plan".to_string()));
+        assert!(present.iter().any(|i| i == "inventory"));
+        assert!(present.iter().any(|i| i == "plan"));
 
         persist_provenance(&handle, "s1", "h1", sample_provenance()).unwrap();
         let present = list_artifacts(&handle);
-        assert!(present.contains(&"provenance".to_string()));
-        assert!(present.contains(&"provenance_audit".to_string()));
+        assert!(present.iter().any(|i| i == "provenance"));
+        assert!(present.iter().any(|i| i == "provenance_audit"));
     }
 
     #[test]

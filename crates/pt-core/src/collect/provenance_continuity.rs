@@ -328,7 +328,8 @@ mod tests {
         assert_eq!(delta.gained_resources[0].pid, 100);
         assert!(delta.gained_resources[0]
             .resource_keys
-            .contains(&"/b.lock".to_string()));
+            .iter()
+            .any(|i| i == "/b.lock"));
     }
 
     #[test]
@@ -342,7 +343,8 @@ mod tests {
         assert_eq!(delta.lost_resources.len(), 1);
         assert!(delta.lost_resources[0]
             .resource_keys
-            .contains(&"/b.lock".to_string()));
+            .iter()
+            .any(|i| i == "/b.lock"));
     }
 
     #[test]
@@ -366,7 +368,7 @@ mod tests {
             (200, vec![lock_ev(200, "/x.lock")]),
         ]);
         let delta = compute_provenance_delta(&prev, &curr);
-        assert!(delta.new_contests.contains(&"/x.lock".to_string()));
+        assert!(delta.new_contests.iter().any(|i| i == "/x.lock"));
     }
 
     // ── PID continuity ────────────────────────────────────────────────

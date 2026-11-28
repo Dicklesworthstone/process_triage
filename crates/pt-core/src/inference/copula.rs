@@ -317,6 +317,7 @@ mod tests {
         assert!(summary.effective_evidence_multiplier == 1.0);
         assert!(summary
             .diagnostics
-            .contains(&"insufficient_samples".to_string()));
+            .iter()
+            .any(|i| i == "insufficient_samples"));
     }
 }

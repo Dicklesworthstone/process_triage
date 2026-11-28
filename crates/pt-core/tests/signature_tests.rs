@@ -1558,7 +1558,7 @@ mod persistence_tests {
             .iter()
             .map(|p| p.signature.name.clone())
             .collect();
-        assert!(!active.contains(&"toggle-pattern".to_string()));
+        assert!(!active.iter().any(|i| i == "toggle-pattern"));
 
         // Enable
         lib.enable_pattern("toggle-pattern").expect("enable");
@@ -1569,7 +1569,7 @@ mod persistence_tests {
             .iter()
             .map(|p| p.signature.name.clone())
             .collect();
-        assert!(active.contains(&"toggle-pattern".to_string()));
+        assert!(active.iter().any(|i| i == "toggle-pattern"));
     }
 
     #[test]

@@ -675,7 +675,7 @@ pub struct FileHandles {
 
 impl FileHandles {
     pub fn used_fraction(&self) -> Option<f64> {
-        (self.max > 0).then(|| self.allocated as f64 / self.max as f64)
+        (self.max > 0).then_some(self.allocated as f64 / self.max as f64)
     }
 }
 

@@ -2584,7 +2584,9 @@ mod tests {
                 assert!(command.contains(&request.binding.plan_sha256));
                 assert!(command.contains("--max-kills 3"));
                 assert!(command.contains("--yes --resume --abort-on-unknown"));
-                assert!(args.contains(&"StrictHostKeyChecking=yes".to_string()));
+                assert!(args
+                    .iter()
+                    .any(|i: &String| i == "StrictHostKeyChecking=yes"));
                 calls.lock().unwrap().push(request.targets.clone());
                 Ok(result_output(request, "success", 2))
             },
@@ -2617,7 +2619,7 @@ mod tests {
             |_request, args, timeout| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 assert_eq!(timeout, Duration::from_secs(1));
-                assert!(args.contains(&"ConnectTimeout=1".to_string()));
+                assert!(args.iter().any(|i: &String| i == "ConnectTimeout=1"));
                 assert!(args
                     .last()
                     .unwrap()
@@ -2649,7 +2651,7 @@ mod tests {
             ..config()
         };
         let args = remote_apply_args(&request, &transport, &options).unwrap();
-        assert!(args.contains(&"ConnectTimeout=17".to_string()));
+        assert!(args.iter().any(|i| i == "ConnectTimeout=17"));
         // Exercise the receiving shell's actual tokenization without invoking
         // SSH or the supplied executable. Shell syntax inside data must remain
         // literal, and --timeout must remain a separate global CLI argument.

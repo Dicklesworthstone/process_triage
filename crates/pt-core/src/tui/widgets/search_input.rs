@@ -394,8 +394,8 @@ mod tests {
         // Most recent should be first
         assert_eq!(state.history[0], "query_11");
         // Oldest entries should have been evicted
-        assert!(!state.history.contains(&"query_0".to_string()));
-        assert!(!state.history.contains(&"query_1".to_string()));
+        assert!(!state.history.iter().any(|i| i == "query_0"));
+        assert!(!state.history.iter().any(|i| i == "query_1"));
     }
 
     #[test]

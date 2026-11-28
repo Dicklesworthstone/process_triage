@@ -333,7 +333,7 @@ mod tests {
 
         // Should fall back to global (only 10 obs < min 50).
         assert!(fit.get("abandoned", "rare_tool", "cpu_beta").is_none());
-        assert!(fit.fallback_categories.contains(&"rare_tool".to_string()));
+        assert!(fit.fallback_categories.iter().any(|i| i == "rare_tool"));
     }
 
     #[test]

@@ -2094,7 +2094,7 @@ mod tests {
         else {
             panic!("session must not fall back to live observation");
         };
-        assert!(args.contains(&"--pids=42".to_string()));
+        assert!(args.iter().any(|i: &String| i == "--pids=42"));
         assert!(!args.iter().any(|arg| arg == "--live"));
         assert!(matches!(
             explain_request(&serde_json::json!({"pid": 42, "window_ms": 0})).unwrap(),
@@ -2956,7 +2956,7 @@ mod tests {
             }))
             .unwrap();
             assert!(args.contains(&format!("--goal={goal}")), "{args:?}");
-            assert!(args.contains(&"--since-time=2h".to_string()), "{args:?}");
+            assert!(args.iter().any(|i| i == "--since-time=2h"), "{args:?}");
         }
     }
 

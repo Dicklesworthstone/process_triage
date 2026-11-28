@@ -4260,7 +4260,6 @@ dependencies = [
  "filetime",
  "libc",
  "parquet",
- "pt-common",
  "pt-redact",
  "serde",
  "serde_json",

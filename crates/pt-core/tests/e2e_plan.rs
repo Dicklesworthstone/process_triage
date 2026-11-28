@@ -2148,12 +2148,12 @@ fn plan_deep_adds_network_evidence() {
     let _ = child.wait();
 
     assert!(
-        !factors(&quick).contains(&"net".to_string()),
+        !factors(&quick).iter().any(|i| i == "net"),
         "quick plan has no network evidence: {:?}",
         factors(&quick)
     );
     assert!(
-        factors(&deep).contains(&"net".to_string()),
+        factors(&deep).iter().any(|i| i == "net"),
         "deep plan should carry a net term: {:?}",
         factors(&deep)
     );
@@ -2268,7 +2268,7 @@ fn plan_deep_adds_network_evidence() {
         legacy_candidate["cpu_lifetime_percent"]
     );
     assert!(
-        !factors(&legacy).contains(&"io_active".to_string()),
+        !factors(&legacy).iter().any(|i| i == "io_active"),
         "single deep counters must not become current I/O evidence"
     );
     assert!(quick["summary"]["deep_scan_ms"].is_null());

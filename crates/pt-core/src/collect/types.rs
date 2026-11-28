@@ -203,18 +203,24 @@ impl ProcessRecord {
     /// Match an explicit selector to this observed PID, retaining the native
     /// birth component for Darwin selectors copied from pre-UUID inventories.
     pub fn matches_saved_start_id(&self, saved: &StartId) -> bool {
-        if self.start_id == *saved {
-            return true;
-        }
-        #[cfg(target_os = "macos")]
-        if saved.0.starts_with("unknown:") {
-            return super::macos::legacy_birth_matches(
+        self.start_id == *saved || self.matches_legacy_darwin_start_id(saved)
+    }
+
+    /// Pre-UUID Darwin inventories recorded an `unknown:` boot component; their
+    /// native birth still identifies the same process.
+    #[cfg(target_os = "macos")]
+    fn matches_legacy_darwin_start_id(&self, saved: &StartId) -> bool {
+        saved.0.starts_with("unknown:")
+            && super::macos::legacy_birth_matches(
                 saved,
                 &self.start_id,
                 self.pid.0,
                 super::macos::boot_session_id().as_deref(),
-            );
-        }
+            )
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn matches_legacy_darwin_start_id(&self, _saved: &StartId) -> bool {
         false
     }
 
