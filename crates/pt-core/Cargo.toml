@@ -5,7 +5,7 @@ edition = "2021"
 description = "Process Triage core inference and decision engine"
 license = "MIT"
 repository = "https://github.com/Dicklesworthstone/process_triage"
-rust-version = "1.88"
+rust-version = "1.89"
 readme = "README.md"
 
 [lib]
@@ -17,7 +17,7 @@ name = "pt-core"
 path = "src/main.rs"
 
 [dependencies]
-clap = { version = "4.6.9", features = ["derive", "env", "string"] }
+clap.workspace = true
 clap_complete = "4"
 serde.workspace = true
 serde_json.workspace = true
@@ -25,12 +25,12 @@ yaml_serde = "0.10.7"
 schemars = { version = "1.2.3", features = ["chrono04"] }
 toml = "1.2"
 chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid.workspace = true
 thiserror.workspace = true
 dirs = "7"
 libc = "0.2"
 regex = "1.13.2"
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 rand = "0.10.4"
 toon = { workspace = true }

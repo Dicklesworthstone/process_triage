@@ -14,8 +14,8 @@ thiserror = { workspace = true }
 chrono = { workspace = true }
 
 # Cryptographic hashing
-hmac = "0.12"
-sha2 = "0.10"
+hmac = "0.13"
+sha2 = "0.11"
 hex = "0.4"
 base64 = "0.23"
 

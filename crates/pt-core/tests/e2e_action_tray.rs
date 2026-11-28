@@ -1694,7 +1694,7 @@ mod cgroup_quarantine_undo {
         plan.session_id = session.0.clone();
         let plan_bytes = serde_json::to_vec_pretty(&plan).unwrap();
         fs::write(handle.dir.join("decision/plan.json"), &plan_bytes).unwrap();
-        let plan_hash = format!("{:x}", Sha256::digest(&plan_bytes));
+        let plan_hash = hex::encode(Sha256::digest(&plan_bytes));
         let journal = Arc::new(
             ReversalJournal::new(
                 handle.dir.join("action"),

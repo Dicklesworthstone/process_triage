@@ -2363,10 +2363,7 @@ mod tests {
     }
 
     fn plan_digest(plan: &Plan) -> String {
-        format!(
-            "{:x}",
-            sha2::Sha256::digest(serde_json::to_vec(plan).unwrap())
-        )
+        hex::encode(sha2::Sha256::digest(serde_json::to_vec(plan).unwrap()))
     }
 
     fn artifact_fixture() -> (

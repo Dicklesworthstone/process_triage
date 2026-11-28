@@ -783,10 +783,7 @@ mod tests {
             "action_id": "renice-42", "pid": 42, "action": "renice", "target": target, "status": "success",
             "executed_at": chrono::DateTime::<chrono::Utc>::from_timestamp_millis(2500).unwrap(), "execution_clock": {"boot_id": BOOT, "ticks": 250},
         })).unwrap();
-        let digest = format!(
-            "{:x}",
-            sha2::Sha256::digest(serde_json::to_vec(&plan).unwrap())
-        );
+        let digest = hex::encode(sha2::Sha256::digest(serde_json::to_vec(&plan).unwrap()));
         (plan, saved, digest)
     }
 
@@ -1171,10 +1168,9 @@ mod tests {
         let predictions = snapshot.validate(&plan).unwrap();
         let mut canonical = serde_json::to_value(&plan).unwrap();
         canonical["resource_predictions"] = serde_json::to_value(&snapshot).unwrap();
-        let digest = format!(
-            "{:x}",
-            sha2::Sha256::digest(serde_json::to_vec(&canonical).unwrap())
-        );
+        let digest = hex::encode(sha2::Sha256::digest(
+            serde_json::to_vec(&canonical).unwrap(),
+        ));
         let mut run = begin_resource_run_with(
             temp.path(),
             &plan,
@@ -1519,10 +1515,7 @@ mod tests {
         second.target = Some(second_action.target);
         second.executed_at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(6500);
         second.execution_clock.as_mut().unwrap().ticks = 650;
-        let digest = format!(
-            "{:x}",
-            sha2::Sha256::digest(serde_json::to_vec(&plan).unwrap())
-        );
+        let digest = hex::encode(sha2::Sha256::digest(serde_json::to_vec(&plan).unwrap()));
         persist_artifact(
             temp.path(),
             &artifact(&plan, &first, &digest, RUN_A, 1000, 3000),

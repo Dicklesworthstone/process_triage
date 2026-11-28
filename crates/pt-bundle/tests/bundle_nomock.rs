@@ -443,7 +443,7 @@ fn test_bundle_artifact_manifest_completeness() {
     assert_eq!(manifest.redaction_policy_version, policy.schema_version);
     assert_eq!(
         manifest.redaction_policy_hash,
-        format!("{:x}", Sha256::digest(&policy_bytes))
+        hex::encode(Sha256::digest(&policy_bytes))
     );
     assert_ne!(manifest.redaction_policy_hash, "sha256-test-hash");
 

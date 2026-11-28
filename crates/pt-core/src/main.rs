@@ -4300,7 +4300,9 @@ fn process_policy_candidate(
         memory_mb: Some(proc.rss_bytes as f64 / (1024.0 * 1024.0)),
         has_known_signature: false,
         open_write_fds: descriptors.as_ref().map(|evidence| evidence.open_write_fds),
-        has_locked_files: descriptors.as_ref().and_then(|evidence| evidence.has_locked_files),
+        has_locked_files: descriptors
+            .as_ref()
+            .and_then(|evidence| evidence.has_locked_files),
         has_active_tty: Some(proc.has_tty()),
         seconds_since_io: None,
         cwd_deleted: None,
@@ -5944,7 +5946,7 @@ mod tui_undo_backend {
             .map_err(|_| "control child has an invalid creation timestamp".to_string())?;
         let decision = session.child("decision")?;
         let bytes = decision.read("plan.json", MAX_PLAN_BYTES)?;
-        let plan_sha256 = format!("{:x}", Sha256::digest(&bytes));
+        let plan_sha256 = hex::encode(Sha256::digest(&bytes));
         if plan_sha256 != reference.plan_sha256 {
             return Err("immutable control plan bytes differ from the parent reference".into());
         }
@@ -6078,7 +6080,7 @@ mod tui_undo_backend {
         Ok(UndoBatch {
             session_id: id.to_string(),
             plan_sha256,
-            receipt_fingerprint: format!("{:x}", Sha256::digest(fingerprint)),
+            receipt_fingerprint: hex::encode(Sha256::digest(fingerprint)),
             created_at,
             pending,
             settled,
@@ -6329,7 +6331,7 @@ fn prepare_tui_control_session(
         let mut plan = selection.clone();
         plan.session_id = session_id.0.clone();
         let identity = format!("{}:{}", session_id.0, selection.plan_id);
-        plan.plan_id = format!("plan-{:x}", Sha256::digest(identity.as_bytes()));
+        plan.plan_id = format!("plan-{}", hex::encode(Sha256::digest(identity.as_bytes())));
         let mut document = serde_json::to_value(&plan)
             .map_err(|error| format!("serialize interactive control plan: {error}"))?;
         document["host_id"] = serde_json::json!(context.host_id);
@@ -6337,7 +6339,7 @@ fn prepare_tui_control_session(
         document["policy_snapshot"] = serde_json::json!(policy);
         let content = serde_json::to_vec_pretty(&document)
             .map_err(|error| format!("encode interactive control plan: {error}"))?;
-        let plan_sha256 = format!("{:x}", Sha256::digest(&content));
+        let plan_sha256 = hex::encode(Sha256::digest(&content));
         pt_core::session::write_serialized_json(&handle.dir.join("decision/plan.json"), &content)
             .map_err(|error| format!("persist immutable interactive control plan: {error}"))?;
         handle
@@ -6611,7 +6613,7 @@ fn execute_plan_actions(
             .map(|control| {
                 let content = fs::read(control.handle.dir.join("decision/plan.json"))
                     .map_err(|error| format!("read immutable interactive control plan: {error}"))?;
-                if format!("{:x}", Sha256::digest(&content)) != control.plan_sha256 {
+                if hex::encode(Sha256::digest(&content)) != control.plan_sha256 {
                     return Err(
                         "immutable interactive control plan changed before execution".into(),
                     );
@@ -10021,7 +10023,9 @@ fn run_replay(global: &GlobalOpts, args: &ReplayArgs) -> ExitCode {
             return run_score_grid_refit(global, &args.command);
         }
         if max_change_fraction.is_some() || grid_points.is_some() {
-            eprintln!("replay: --max-change-fraction and --grid-points require --method score-grid");
+            eprintln!(
+                "replay: --max-change-fraction and --grid-points require --method score-grid"
+            );
             return ExitCode::ArgsError;
         }
     }
@@ -10265,9 +10269,16 @@ fn run_replay(global: &GlobalOpts, args: &ReplayArgs) -> ExitCode {
                 coverage.candidate_only_count,
                 coverage.neither_scored_count
             );
-            for (name, ranking) in [("Baseline", &baseline_ranking), ("Candidate", &candidate_ranking)] {
+            for (name, ranking) in [
+                ("Baseline", &baseline_ranking),
+                ("Candidate", &candidate_ranking),
+            ] {
                 let precision = match ranking.precision_bounds {
-                    Some([low, high]) if ranking.unlabeled > 0 => format!("{low:.1}%–{high:.1}%", low = 100.0 * low, high = 100.0 * high),
+                    Some([low, high]) if ranking.unlabeled > 0 => format!(
+                        "{low:.1}%–{high:.1}%",
+                        low = 100.0 * low,
+                        high = 100.0 * high
+                    ),
                     Some([value, _]) => format!("{:.1}%", 100.0 * value),
                     None => "unavailable".to_string(),
                 };
@@ -10439,11 +10450,7 @@ fn run_score_grid_refit(global: &GlobalOpts, args: &ReplayCommands) -> ExitCode 
     )
 }
 
-fn output_replay_result(
-    global: &GlobalOpts,
-    output: serde_json::Value,
-    summary: &str,
-) -> ExitCode {
+fn output_replay_result(global: &GlobalOpts, output: serde_json::Value, summary: &str) -> ExitCode {
     match global.format {
         OutputFormat::Json | OutputFormat::Toon => {
             println!("{}", format_structured_output(global, output));
@@ -20226,8 +20233,8 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
                         notify_mgr.persisted_state(),
                     );
                     state_bundle.daemon.record_event(
-                    pt_core::daemon::DaemonEventType::ConfigReloaded,
-                    "config reloaded",
+                        pt_core::daemon::DaemonEventType::ConfigReloaded,
+                        "config reloaded",
                     );
                 }
                 Ok(None) => state_bundle.daemon.record_event(
@@ -21211,7 +21218,9 @@ fn run_daemon_stop(global: &GlobalOpts) -> ExitCode {
             println!("{}", format_structured_output(global, response));
         }
         _ if stopped => println!("Daemon stopped (pid {pid})."),
-        _ => eprintln!("Daemon {pid} was signaled; its exit is unconfirmed. Tracking state retained."),
+        _ => eprintln!(
+            "Daemon {pid} was signaled; its exit is unconfirmed. Tracking state retained."
+        ),
     }
     if stopped {
         ExitCode::Clean
@@ -28761,14 +28770,17 @@ mod process_tree_safety_tests {
             // The child's read-only descriptor shares our file description.
             // There are no writable FDs or critical filenames to trigger a refusal.
             // SAFETY: flock operates only on the retained temporary file.
-            assert_eq!(unsafe { libc::flock(lock_handle.as_raw_fd(), libc::LOCK_SH) }, 0);
+            assert_eq!(
+                unsafe { libc::flock(lock_handle.as_raw_fd(), libc::LOCK_SH) },
+                0
+            );
             for enabled in [true, false] {
                 let mut policy = base_policy.clone();
                 policy.data_loss_gates.block_if_locked_files = enabled;
                 let filter = super::ProtectedFilter::from_guardrails(&policy.guardrails).unwrap();
                 let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
-                let target = super::process_policy_candidate(&enforcer, &base_parent, Action::Kill)
-                    .unwrap();
+                let target =
+                    super::process_policy_candidate(&enforcer, &base_parent, Action::Kill).unwrap();
                 assert_eq!(target.open_write_fds, Some(0));
                 assert_eq!(target.has_locked_files, enabled.then_some(true));
                 let refusal = super::planned_zombie_parent_refusal(
@@ -29673,7 +29685,7 @@ mod process_tree_safety_tests {
             let content = std::fs::read_to_string(child.dir.join("decision/plan.json")).unwrap();
             assert_eq!(
                 captured["control_plan_sha256"],
-                format!("{:x}", Sha256::digest(content.as_bytes())),
+                hex::encode(Sha256::digest(content.as_bytes())),
             );
             let child_plan = pt_core::verify::parse_agent_plan(&content).unwrap();
             assert_eq!(child_plan.session_id, child.id.0);
@@ -30363,7 +30375,7 @@ mod process_tree_safety_tests {
                     // Keep the reference hash coherent: semantic ownership and
                     // host checks must reject these after the byte check passes.
                     reference["plan_sha256"] =
-                        serde_json::json!(format!("{:x}", Sha256::digest(&content)));
+                        serde_json::json!(hex::encode(Sha256::digest(&content)));
                     pt_core::session::write_serialized_json(&plan_path, &content).unwrap();
                     pt_core::session::write_json_pretty(&reference_path, &reference).unwrap();
                 }
@@ -33896,7 +33908,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                 } else {
                     "PidOnly"
                 }
-            .to_string(),
+                .to_string(),
             })
             .collect();
         let mut persisted_inference_records: Vec<PersistedInference> = Vec::new();
@@ -41041,7 +41053,7 @@ fn read_apply_scope(
     if scope.version != 1
         || scope.session_id != plan.session_id
         || scope.host_id != host_id
-        || scope.plan_sha256 != format!("{:x}", Sha256::digest(plan_content.as_bytes()))
+        || scope.plan_sha256 != hex::encode(Sha256::digest(plan_content.as_bytes()))
     {
         return Err("saved apply approval does not match this session, host and exact plan".into());
     }
@@ -42486,7 +42498,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 version: 1,
                 session_id: sid.0.clone(),
                 host_id,
-                plan_sha256: format!("{:x}", Sha256::digest(plan_content.as_bytes())),
+                plan_sha256: hex::encode(Sha256::digest(plan_content.as_bytes())),
                 action_ids: selected_ids,
                 limits: ApplyScopeLimits::from_args(args),
             };
@@ -42508,7 +42520,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
 
             // Observe before the action loop, then let every action perform its
             // normal fresh safety checks. Dry runs never enter this branch.
-            let plan_sha256 = format!("{:x}", Sha256::digest(plan_content.as_bytes()));
+            let plan_sha256 = hex::encode(Sha256::digest(plan_content.as_bytes()));
             let reversal_journal = match pt_core::action::ReversalJournal::new(
                 handle.dir.join("action"),
                 sid.0.as_str(),
@@ -44563,7 +44575,7 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
         return ExitCode::InternalError;
     }
 
-    let plan_sha256 = format!("{:x}", Sha256::digest(plan_content.as_bytes()));
+    let plan_sha256 = hex::encode(Sha256::digest(plan_content.as_bytes()));
     let reversal_journal = pt_core::action::ReversalJournal::new(
         handle.dir.join("action"),
         sid.0.as_str(),
@@ -45200,11 +45212,15 @@ fn format_diff_plain(
 }
 
 fn report_unverified_diff_pids(global: &GlobalOpts, count: usize) {
-    if count > 0 && !matches!(
-        global.format,
-        OutputFormat::Json | OutputFormat::Jsonl | OutputFormat::Toon | OutputFormat::Exitcode
-    ) {
-        eprintln!("Birth identity unavailable for {count} PID(s); their changes could not be determined.");
+    if count > 0
+        && !matches!(
+            global.format,
+            OutputFormat::Json | OutputFormat::Jsonl | OutputFormat::Toon | OutputFormat::Exitcode
+        )
+    {
+        eprintln!(
+            "Birth identity unavailable for {count} PID(s); their changes could not be determined."
+        );
     }
 }
 
@@ -45479,7 +45495,7 @@ fn run_agent_undo(global: &GlobalOpts, args: &AgentUndoArgs) -> ExitCode {
         }
     };
     // Hash the same complete saved bytes used by agent apply, not a reserialized Plan.
-    let plan_sha256 = format!("{:x}", Sha256::digest(content.as_bytes()));
+    let plan_sha256 = hex::encode(Sha256::digest(content.as_bytes()));
     let current_host = pt_core::logging::get_host_id();
     let recorded_host = document["host_id"].as_str();
     output["plan_sha256"] = serde_json::json!(&plan_sha256);
@@ -46294,12 +46310,18 @@ fn run_agent_diff(global: &GlobalOpts, args: &AgentDiffArgs) -> ExitCode {
     // identical argv, and a reused PID belongs to a new process incarnation.
     // Ordered maps also make repeated comparisons byte-stable.
     let mut base_map: BTreeMap<(u32, String, u32), DiffCandidate> = BTreeMap::new();
-    for cand in base_candidates.iter().filter(|c| !unverified_pids.contains(&c.pid)) {
+    for cand in base_candidates
+        .iter()
+        .filter(|c| !unverified_pids.contains(&c.pid))
+    {
         base_map.insert(candidate_key(cand), cand.clone());
     }
 
     let mut compare_map: BTreeMap<(u32, String, u32), DiffCandidate> = BTreeMap::new();
-    for cand in compare_candidates.iter().filter(|c| !unverified_pids.contains(&c.pid)) {
+    for cand in compare_candidates
+        .iter()
+        .filter(|c| !unverified_pids.contains(&c.pid))
+    {
         compare_map.insert(candidate_key(cand), cand.clone());
     }
 
@@ -49223,10 +49245,12 @@ mod pipe_consumer_safety_tests {
             &inputs,
             "2026-11-26T12:00:00Z".to_string(),
         );
-        assert!(baseline.actions.iter().any(|action| action.action == Action::Kill));
+        assert!(baseline
+            .actions
+            .iter()
+            .any(|action| action.action == Action::Kill));
 
-        let reason =
-            pipe_consumer_preservation_refusal(Some(&evidence), "kill", true).unwrap();
+        let reason = pipe_consumer_preservation_refusal(Some(&evidence), "kill", true).unwrap();
         candidates[1]["recommended_action"] = serde_json::json!("review");
         candidates[1]["action_rationale"] = serde_json::json!(reason);
         candidates[1]["pipe_liveness"] = serde_json::to_value(&evidence).unwrap();
@@ -49238,7 +49262,9 @@ mod pipe_consumer_safety_tests {
         assert_eq!(changed, 1);
         assert_eq!(candidates[0]["recommended_action"], "review");
         assert_eq!(candidates[0]["tree_safety"]["rule"], "live_child");
-        assert!(candidates.iter().all(|candidate| candidate["recommended_action"] == "review"));
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate["recommended_action"] == "review"));
         let reviewed = build_agent_action_plan(
             &SessionId::new(),
             &policy,
@@ -49246,14 +49272,19 @@ mod pipe_consumer_safety_tests {
             &inputs,
             "2026-11-26T12:00:00Z".to_string(),
         );
-        assert!(reviewed.actions.iter().all(|action| action.action == Action::Keep));
+        assert!(reviewed
+            .actions
+            .iter()
+            .all(|action| action.action == Action::Keep));
 
         // Partial census coverage cannot negate an already verified positive
         // path, and does not itself manufacture a path or an active peer.
         let mut partial = evidence;
         partial.census_complete = false;
         partial.collection_complete = false;
-        partial.unavailable.push("another process was unreadable".to_string());
+        partial
+            .unavailable
+            .push("another process was unreadable".to_string());
         assert!(pipe_consumer_preservation_refusal(Some(&partial), "kill", true).is_some());
         partial.path.clear();
         assert!(pipe_consumer_preservation_refusal(Some(&partial), "kill", true).is_none());
@@ -51134,7 +51165,10 @@ fn prepare_report_from_session(
             "manifest session ID does not match the requested session".into(),
         ));
     }
-    if context.as_ref().is_some_and(|ctx| ctx.session_id != handle.id.0) {
+    if context
+        .as_ref()
+        .is_some_and(|ctx| ctx.session_id != handle.id.0)
+    {
         return Err(pt_report::ReportError::MissingData(
             "session context identity does not match the requested session".into(),
         ));
@@ -51229,7 +51263,12 @@ fn prepare_report_from_session(
         .map_err(|error| pt_report::ReportError::MissingData(format!("verification: {error}")))?
         .map(|bytes| serde_json::from_slice(&bytes))
         .transpose()?;
-    generator.prepare_from_verified_session_artifacts(overview, &plan, &outcomes, verification.as_ref())
+    generator.prepare_from_verified_session_artifacts(
+        overview,
+        &plan,
+        &outcomes,
+        verification.as_ref(),
+    )
 }
 
 #[cfg(all(test, feature = "report"))]

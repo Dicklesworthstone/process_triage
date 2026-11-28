@@ -4676,7 +4676,7 @@ fn agent_apply_records_and_replays_bound_resource_windows_without_inventing_rate
         .unwrap();
     let plan_path = handle.dir.join("decision/plan.json");
     let original_plan = fs::read(&plan_path).expect("canonical saved plan");
-    let plan_sha256 = format!("{:x}", sha2::Sha256::digest(&original_plan));
+    let plan_sha256 = hex::encode(sha2::Sha256::digest(&original_plan));
 
     // This is a real, identity-bound reversible action on our owned child. Zero
     // settle time requests points, which cannot establish CPU or PSI rates.

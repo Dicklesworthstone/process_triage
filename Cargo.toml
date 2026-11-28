@@ -16,8 +16,8 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/Dicklesworthstone/process_triage"
-rust-version = "1.88"
-## NOTE: Raised to satisfy `toon` (edition 2024 + vergen-gix MSRV) dependency for TOON output support.
+rust-version = "1.89"
+## NOTE: Raised for `toon` (edition 2024 + vergen-gix MSRV) and zip 9.8 (rust-version 1.89).
 
 [workspace.dependencies]
 serde = { version = "1.0.229", features = ["derive"] }

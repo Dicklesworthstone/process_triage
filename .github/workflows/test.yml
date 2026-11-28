@@ -36,7 +36,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        rust: [nightly-2026-08-31]
+        rust: [nightly-2026-11-26]
 
     steps:
       - name: Checkout
@@ -80,7 +80,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        rust: [nightly-2026-08-31]
+        rust: [nightly-2026-11-26]
 
     steps:
       - name: Checkout
@@ -127,7 +127,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        rust: [nightly-2026-08-31]
+        rust: [nightly-2026-11-26]
 
     steps:
       - name: Checkout
@@ -182,7 +182,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
-          toolchain: nightly-2026-08-31
+          toolchain: nightly-2026-11-26
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -301,7 +301,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
-          toolchain: nightly-2026-08-31
+          toolchain: nightly-2026-11-26
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -371,7 +371,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
-          toolchain: nightly-2026-08-31
+          toolchain: nightly-2026-11-26
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -410,7 +410,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
-          toolchain: nightly-2026-08-31
+          toolchain: nightly-2026-11-26
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2

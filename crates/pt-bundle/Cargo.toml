@@ -14,15 +14,15 @@ chrono.workspace = true
 thiserror.workspace = true
 
 # Bundle format (ZIP)
-zip = { version = ">=9.7.3, <9.8.0", default-features = false, features = ["deflate", "time"] }
+zip = { version = "9.8.2", default-features = false, features = ["deflate", "time"] }
 
 # Checksums
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 
 # Encryption
 chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
-pbkdf2 = "0.12"
+pbkdf2 = "0.13"
 getrandom = "0.4"
 
 # Logging

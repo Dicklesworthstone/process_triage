@@ -539,7 +539,7 @@ fn test_manifest_redaction_metadata_preserved_through_encryption() {
     );
     assert_eq!(
         orig_manifest.redaction_policy_hash,
-        format!("{:x}", Sha256::digest(&policy_bytes))
+        hex::encode(Sha256::digest(&policy_bytes))
     );
     assert_ne!(orig_manifest.redaction_policy_hash, "sha256-abc123");
 
