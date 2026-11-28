@@ -1003,10 +1003,12 @@ mod replay_recording {
 
             // Equal likelihoods make P(abandoned or zombie) equal the prior
             // mass, giving a known optimum without relying on model heuristics.
-            let mut priors = Priors::default();
             // Categorical likelihoods are stored outside the class parameters.
-            priors.state_flags = None;
-            priors.command_categories = None;
+            let mut priors = Priors {
+                state_flags: None,
+                command_categories: None,
+                ..Default::default()
+            };
             let parameters = priors.classes.useful.clone();
             for (class, probability) in [
                 (&mut priors.classes.useful, 0.6),

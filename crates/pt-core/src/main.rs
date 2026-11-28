@@ -10763,16 +10763,17 @@ fn build_opt_candidates_for_goals(
                         .as_ref()
                         .and_then(|identity| resources.exclusive_disk_bytes(identity).ok())
                         .unwrap_or(0) as f64,
-                    resource if resource.starts_with("port_") => {
-                        if port_holders[column].is_some_and(|holders| {
-                            identity.as_ref().is_some_and(|identity| {
-                                holders.iter().any(|holder| holder.matches(identity))
-                            })
-                        }) {
-                            1.0
-                        } else {
-                            0.0
-                        }
+                    // A port holder that is not this exact identity falls
+                    // through to no credit.
+                    resource
+                        if resource.starts_with("port_")
+                            && port_holders[column].is_some_and(|holders| {
+                                identity.as_ref().is_some_and(|identity| {
+                                    holders.iter().any(|holder| holder.matches(identity))
+                                })
+                            }) =>
+                    {
+                        1.0
                     }
                     _ => 0.0,
                 })
@@ -35676,12 +35677,18 @@ mod planning_pressure_tests {
             "goal": "free port 8080 OR free port 3000",
             "goal_summary": {"targets": [{"resource": "port_3000"}]}
         });
-        assert_eq!(saved_goal_ports(&document), [3000, 8080].into());
+        assert_eq!(
+            saved_goal_ports(&document),
+            std::collections::BTreeSet::from([3000, 8080])
+        );
         let old = serde_json::json!({"goal_summary": {"targets": [
             {"resource": "port_8080"}, {"resource": "port_8080"}, {"resource": "memory_mb"},
             {"resource": "port_0"}, {"resource": "port_99999"}
         ]}});
-        assert_eq!(saved_goal_ports(&old), [8080].into());
+        assert_eq!(
+            saved_goal_ports(&old),
+            std::collections::BTreeSet::from([8080])
+        );
     }
 
     #[test]
