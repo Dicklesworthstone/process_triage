@@ -599,6 +599,7 @@ fn tools_call_scan_returns_processes() {
         "tools/call",
         serde_json::json!({"name": "pt_scan", "arguments": {}}),
     );
+    assert!(serde_json::to_vec(&resp).unwrap().len() <= 65_536);
     let result = assert_success(&resp);
     assert_eq!(result["isError"], false);
     let content = result["content"].as_array().unwrap();
@@ -608,6 +609,15 @@ fn tools_call_scan_returns_processes() {
     assert!(parsed.get("scanned_at").is_some());
     assert!(parsed.get("platform").is_some());
     assert!(parsed.get("processes").is_some());
+    assert_eq!(parsed["response"]["max_bytes"], 65_536);
+    assert_eq!(
+        parsed["matching_processes"].as_u64().unwrap(),
+        parsed["returned"].as_u64().unwrap()
+            + parsed["response"]["omitted_by_row_limit"].as_u64().unwrap()
+            + parsed["response"]["omitted_by_byte_budget"]
+                .as_u64()
+                .unwrap()
+    );
 }
 
 #[test]

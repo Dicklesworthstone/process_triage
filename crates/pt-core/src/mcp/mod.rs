@@ -5,6 +5,7 @@
 
 pub mod protocol;
 pub mod resources;
+mod scan_response;
 pub mod server;
 pub mod tools;
 

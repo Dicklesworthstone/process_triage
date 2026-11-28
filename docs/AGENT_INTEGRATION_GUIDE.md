@@ -177,6 +177,14 @@ pt agent apply --session pt-20260115-143022-a7xq --resume --recommended --yes
 
 ## Output Formats and Parsing
 
+### MCP scan size and command previews
+
+`pt_scan` returns compact JSON with a default 65,536-byte budget. Set `max_response_bytes` from 4,096 through 1,048,576 and `limit` from 1 through 200. Both apply after scoring and filtering the full census. The byte budget includes the escaped MCP text content. The JSON-RPC transport also echoes the client's request ID.
+
+Command lines longer than 256 UTF-8 bytes have a character-boundary preview, `cmd_truncated: true`, and `cmd_sha256` over the full captured display string. For full command lines request `{"full_cmd":true,"max_response_bytes":1048576}`. Use `pid`, `start_id`, and `uid` to identify the process.
+
+`matching_processes` counts all matches and `returned` counts the rows in this response. `response.omitted_by_row_limit` and `response.omitted_by_byte_budget` explain the difference. A row that exceeds the remaining byte budget is skipped, so smaller lower-ranked rows can still appear. `response.commands_truncated` counts returned previews. `response.elided_sections` names census-wide reports omitted for size, and `warning_count` is available even when the warning strings do not fit. Use `pt_explain` with an individual PID for a closer look.
+
 ### Default JSON Structure
 
 Every response includes these envelope fields:

@@ -8,6 +8,7 @@ use crate::collect::tool_runner::{ToolConfig, ToolOutput, ToolRunner, ToolSpec};
 use crate::collect::{deep_scan_with_budget, DeepScanOptions, DeepScanRecord, DeepScanResult};
 use crate::collect::{quick_scan, ProcessActivity, ProcessRecord, QuickScanOptions, ScanResult};
 use crate::mcp::protocol::{ToolContent, ToolDefinition};
+use crate::mcp::scan_response::{ScanOutput, DEFAULT_BYTES, MAX_BYTES, MAX_ROWS, MIN_BYTES};
 use crate::scoring::{filter_planning_scan, AgentActivityReport, ProcessScore, Scorer};
 use crate::supervision::pattern_persistence::{SignatureCatalog, SignatureOrigin};
 use crate::supervision::signature::ProcessMatchContext;
@@ -838,7 +839,19 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "minimum": 0
                     },
                     "window_ms": activity_window_schema(),
-                    "probe_budget_ms": probe_budget_schema()
+                    "probe_budget_ms": probe_budget_schema(),
+                    "max_response_bytes": {
+                        "type": "integer", "minimum": MIN_BYTES, "maximum": MAX_BYTES, "default": DEFAULT_BYTES,
+                        "description": "Byte budget for the compact serialized tool result, including escaped command text. The response reports omitted rows and census sections."
+                    },
+                    "limit": {
+                        "type": "integer", "minimum": 1, "maximum": MAX_ROWS, "default": MAX_ROWS,
+                        "description": "Maximum ranked process rows considered after applying the age and score filters"
+                    },
+                    "full_cmd": {
+                        "type": "boolean", "default": false,
+                        "description": "Include complete captured command lines within the byte budget. By default long commands have a 256-byte UTF-8 preview and a SHA-256 digest."
+                    }
                 },
                 "required": [],
                 "additionalProperties": false
@@ -1119,12 +1132,13 @@ fn tool_scan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
     let object = params
         .as_object()
         .ok_or("pt_scan arguments must be an object")?;
+    let output = ScanOutput::parse(params)?;
     let window_ms = activity_window_ms(params)?;
     let budget = probe_budget(params)?;
     for key in object.keys() {
         if !matches!(
             key.as_str(),
-            "deep" | "min_score" | "min_age" | "window_ms" | "probe_budget_ms"
+            "deep" | "min_score" | "min_age" | "window_ms" | "probe_budget_ms" | "max_response_bytes" | "limit" | "full_cmd"
         ) {
             return Err(format!("unknown pt_scan argument: {key}"));
         }
@@ -1199,18 +1213,20 @@ fn tool_scan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
             .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
     });
     let matching_processes = candidates.len();
-    candidates.truncate(200);
 
     let duration_ms = scan_started.elapsed().as_millis();
     let process_snapshots = candidates
         .iter()
         .map(|(p, score, posterior, protected, top_signature)| {
             let activity = evaluator.scorer.activity_for(p);
+            let (cmd, cmd_truncated, cmd_sha256) = output.command(&p.cmd);
             serde_json::json!({
                 "pid": p.pid.0,
                 "ppid": p.ppid.0,
                 "comm": p.comm,
-                "cmd": p.cmd,
+                "cmd": cmd,
+                "cmd_truncated": cmd_truncated,
+                "cmd_sha256": cmd_sha256,
                 "state": format!("{}", p.state),
                 "decision_state": p.decision_state(activity.as_ref()).0.to_string(),
                 "uid": p.uid,
@@ -1238,32 +1254,34 @@ fn tool_scan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
                 "supervisor_restart": evaluator.supervisor_restart(p),
                 "top_signature": top_signature,
             })
-        })
-        .collect::<Vec<_>>();
-    let result = serde_json::json!({
+        });
+    let metadata = serde_json::json!({
         "scanned_at": scan_result.metadata.started_at,
         "duration_ms": duration_ms,
         "quick_scan_duration_ms": scan_result.metadata.duration_ms,
         "platform": scan_result.metadata.platform,
-        "warnings": scan_result.metadata.warnings,
-        "deep_scan": deep_scan,
-        "workloads": workloads,
-        "agent_activity": agent_activity,
         "window_ms": window_ms,
         "total_processes": scan_result.processes.len(),
+        "warning_count": scan_result.metadata.warnings.len(),
         "min_age_seconds": evaluator.min_age_seconds,
         "younger_than_min_age": younger_than_min_age,
-        "returned": candidates.len(),
-        "matching_processes": matching_processes,
-        "truncated": matching_processes > candidates.len(),
         "score_definition": "P(abandoned or zombie) from pt's posterior (0-1); suspicion_score = 100 x score",
-        "processes": process_snapshots,
     });
 
+    let text = output.render(
+        metadata,
+        matching_processes,
+        process_snapshots,
+        [
+            ("deep_scan", deep_scan),
+            ("warnings", serde_json::json!(scan_result.metadata.warnings)),
+            ("agent_activity", serde_json::json!(agent_activity)),
+            ("workloads", workloads),
+        ],
+    )?;
     Ok(vec![ToolContent {
         content_type: "text".to_string(),
-        text: serde_json::to_string_pretty(&result)
-            .map_err(|e| format!("Serialization error: {}", e))?,
+        text,
     }])
 }
 
