@@ -4308,6 +4308,16 @@ fn process_policy_candidate(
             return Err(reason);
         }
     }
+    collect_policy_target_facts(enforcer, proc, action)
+}
+
+/// Infrastructure checks run first: collecting writable descriptor evidence
+/// from a protected filesystem server or its transport can itself block.
+fn collect_policy_target_facts(
+    enforcer: &pt_core::decision::PolicyEnforcer,
+    proc: &ProcessRecord,
+    action: Action,
+) -> Result<pt_core::decision::ProcessCandidate, String> {
     let group =
         enforcer.observe_policy_group(&process_identity_from_record(proc), action, false)?;
     // Critical lock rules are mandatory even when the configurable generic
@@ -4395,11 +4405,11 @@ fn planned_zombie_parent_refusal(
                 "parent is protected by builtin.service_child (ancestor {pid}: {comm})"
             ));
         }
-        // Restart acts on the parent, not the zombie. Refuse before collecting
-        // writable-file evidence that could itself block on the parent's mount.
-        #[cfg(target_os = "linux")]
+    }
+    #[cfg(target_os = "linux")]
+    if protection.filter.builtin_enabled() || enforcer.requires_builtin_placement() {
         if let pt_core::action::prechecks::PreCheckResult::Blocked { reason, .. } =
-            pt_core::action::prechecks::fuse_target_precheck(
+            enforcer.planning_fuse_target_precheck(
                 parent.pid.0, &parent.comm, pt_core::collect::protected::holds_fuse_device(parent.pid.0),
                 Action::Restart,
             )
@@ -4407,7 +4417,7 @@ fn planned_zombie_parent_refusal(
             return Some(format!("parent infrastructure protected: {reason}"));
         }
     }
-    let mut target = match process_policy_candidate(enforcer, parent, Action::Restart) {
+    let mut target = match collect_policy_target_facts(enforcer, parent, Action::Restart) {
         Ok(target) => target,
         Err(error) => return Some(format!("parent policy evidence unavailable: {error}")),
     };
@@ -36909,7 +36919,7 @@ fn candidate_recommendation(
     };
     #[cfg(target_os = "linux")]
     let fuse_refusal = if let Some(subject) = subject.filter(|_| enforcer.requires_builtin_placement()) {
-        match pt_core::action::prechecks::fuse_target_precheck(subject.pid.0, &subject.comm, fuse_server, evidence_action) {
+        match enforcer.planning_fuse_target_precheck(subject.pid.0, &subject.comm, fuse_server, evidence_action) {
             pt_core::action::prechecks::PreCheckResult::Blocked { reason, .. } => Some(reason),
             _ => None,
         }

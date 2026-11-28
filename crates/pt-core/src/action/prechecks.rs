@@ -860,6 +860,19 @@ pub fn fuse_target_precheck(
     evidence: Option<bool>,
     action: Action,
 ) -> PreCheckResult {
+    // Live dispatch and rechecks must observe a fresh socket table. Only the
+    // planning entry point below accepts a cache spanning multiple candidates.
+    fuse_target_precheck_with(pid, comm, evidence, action, &Default::default())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn fuse_target_precheck_with(
+    pid: u32,
+    comm: &str,
+    evidence: Option<bool>,
+    action: Action,
+    lookup: &crate::collect::fuse_transport::FusePeerLookup,
+) -> PreCheckResult {
     let device = fuse_action_precheck(evidence, action);
     if !device.is_passed()
         || matches!(
@@ -869,7 +882,7 @@ pub fn fuse_target_precheck(
     {
         return device;
     }
-    match crate::collect::fuse_transport::refusal(pid, comm) {
+    match lookup.refusal(pid, comm) {
         Some(reason) => PreCheckResult::Blocked {
             check: PreCheck::CheckNotProtected,
             reason,

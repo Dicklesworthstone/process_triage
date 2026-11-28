@@ -353,6 +353,8 @@ pub struct PolicyEnforcer {
     protected_groups: HashSet<String>,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     planning_group_names: crate::collect::protected::PlanningGroupNames,
+    #[cfg(target_os = "linux")]
+    planning_fuse_peers: crate::collect::fuse_transport::FusePeerLookup,
     /// Protected categories (lowercase).
     protected_categories: HashSet<String>,
     /// Never kill these PIDs.
@@ -453,6 +455,8 @@ impl PolicyEnforcer {
             protected_groups,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             planning_group_names: Default::default(),
+            #[cfg(target_os = "linux")]
+            planning_fuse_peers: Default::default(),
             protected_categories,
             never_kill_pid,
             never_kill_ppid,
@@ -542,6 +546,25 @@ impl PolicyEnforcer {
                 .recorded_policy
                 .as_ref()
                 .is_some_and(|policy| policy.requires_lock_evidence())
+    }
+
+    /// Planners construct a fresh enforcer per census. Share the bounded Unix
+    /// peer table across its candidates, rechecking both endpoints on each hit.
+    #[cfg(target_os = "linux")]
+    pub fn planning_fuse_target_precheck(
+        &self,
+        pid: u32,
+        comm: &str,
+        evidence: Option<bool>,
+        action: Action,
+    ) -> crate::action::prechecks::PreCheckResult {
+        crate::action::prechecks::fuse_target_precheck_with(
+            pid,
+            comm,
+            evidence,
+            action,
+            &self.planning_fuse_peers,
+        )
     }
 
     /// Retrieve the effective credential group for either applicable policy.

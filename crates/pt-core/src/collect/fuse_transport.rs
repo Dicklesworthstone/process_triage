@@ -3,7 +3,9 @@
 //! need not hold /dev/fuse or remain a descendant of the mount server.
 
 use super::{proc_parsers::read_required_proc_stat, procfs::read_bounded};
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::OnceLock;
 
 const RULE: &str = "builtin.sftp_transport";
 
@@ -80,8 +82,10 @@ struct Peer {
 
 /// Read the reverse socket row: the local endpoint belongs to a server FD,
 /// and the opposite endpoint must match a descriptor of this very transport.
-fn peers_for_stdio(table: &str, stdio: &[u64]) -> Vec<Peer> {
-    let mut peers = Vec::new();
+type PeerTable = HashMap<u64, Vec<Peer>>;
+
+fn index_peers(table: &str) -> PeerTable {
+    let mut peers = PeerTable::new();
     for row in table.lines() {
         let mut fields = row.split_ascii_whitespace();
         if fields.next() != Some("u_str") || fields.next() != Some("ESTAB") {
@@ -99,7 +103,7 @@ fn peers_for_stdio(table: &str, stdio: &[u64]) -> Vec<Peer> {
         let Some(remote) = fields.next().and_then(|value| value.parse::<u64>().ok()) else {
             continue;
         };
-        if local == 0 || remote == 0 || local == remote || !stdio.contains(&remote) {
+        if local == 0 || remote == 0 || local == remote {
             continue;
         }
         for owner in row.split(",pid=").skip(1) {
@@ -111,15 +115,16 @@ fn peers_for_stdio(table: &str, stdio: &[u64]) -> Vec<Peer> {
             };
             if let (Ok(pid), Ok(fd)) = (pid.parse::<u32>(), fd.parse::<u32>()) {
                 if pid != 0 {
-                    peers.push(Peer {
+                    let owners = peers.entry(remote).or_default();
+                    if owners.len() >= 16 {
+                        break;
+                    }
+                    owners.push(Peer {
                         target_inode: remote,
                         server_inode: local,
                         pid,
                         fd,
                     });
-                    if peers.len() == 16 {
-                        return peers;
-                    }
                 }
             }
         }
@@ -127,12 +132,8 @@ fn peers_for_stdio(table: &str, stdio: &[u64]) -> Vec<Peer> {
     peers
 }
 
-fn describe_peer(pid: u32) -> Option<String> {
+fn read_peer_table() -> Option<PeerTable> {
     use super::tool_runner::{ToolConfig, ToolRunner};
-    let stdio: Vec<_> = (0..=2).filter_map(|fd| socket_inode(pid, fd)).collect();
-    if stdio.is_empty() {
-        return None;
-    }
     let ss = ["/usr/bin/ss", "/usr/sbin/ss", "/bin/ss", "/sbin/ss"]
         .into_iter()
         .find(|path| Path::new(path).is_file())?;
@@ -146,19 +147,52 @@ fn describe_peer(pid: u32) -> Option<String> {
     if !table.success() || table.truncated || !table.stderr.is_empty() {
         return None;
     }
-    let started = std::time::Instant::now();
-    for peer in peers_for_stdio(std::str::from_utf8(&table.stdout).ok()?, &stdio) {
-        if started.elapsed() >= std::time::Duration::from_millis(300) {
-            break;
-        }
-        if let Some(description) = confirm_peer(pid, &peer, |server| {
+    Some(index_peers(std::str::from_utf8(&table.stdout).ok()?))
+}
+
+/// One bounded owner census per planning pass. A missing or truncated table
+/// is cached for that pass as well. Execution constructs its own observation.
+#[derive(Default)]
+pub(crate) struct FusePeerLookup {
+    table: OnceLock<Option<PeerTable>>,
+}
+
+impl FusePeerLookup {
+    pub(crate) fn refusal(&self, pid: u32, comm: &str) -> Option<String> {
+        self.refusal_with(pid, comm, read_peer_table, |server| {
             (super::protected::holds_fuse_device(server) == Some(true))
                 .then(|| super::protected::fuse_mountpoints(server))
-        }) {
-            return Some(description);
-        }
+        })
     }
-    None
+
+    fn refusal_with(
+        &self,
+        pid: u32,
+        comm: &str,
+        read: impl FnOnce() -> Option<PeerTable>,
+        server_mounts: impl Fn(u32) -> Option<Vec<String>>,
+    ) -> Option<String> {
+        let mut stdio: Vec<_> = (0..=2).filter_map(|fd| socket_inode(pid, fd)).collect();
+        stdio.sort_unstable();
+        stdio.dedup();
+        if !stdio.is_empty() {
+            let birth = read_required_proc_stat(pid).ok().map(|s| s.starttime);
+            if let (Some(birth), Some(table)) = (birth, self.table.get_or_init(read).as_ref()) {
+                let start = std::time::Instant::now();
+                for peer in stdio.iter().filter_map(|inode| table.get(inode)).flatten() {
+                    if start.elapsed() >= std::time::Duration::from_millis(300) {
+                        break;
+                    }
+                    if let Some(description) = confirm_peer(pid, peer, &server_mounts) {
+                        if read_required_proc_stat(pid).is_ok_and(|s| s.starttime == birth) {
+                            return Some(format!("builtin.fuse_transport: {description}; inspect the mount and transport before taking action"));
+                        }
+                    }
+                }
+            }
+        }
+        unresolved_ssh_refusal(pid, comm)
+    }
 }
 
 /// Verify that the reported owner still holds the exact peer endpoint, the
@@ -191,8 +225,7 @@ fn confirm_peer(
 }
 
 /// Absence of owner attribution cannot release an SFTP subsystem transport.
-/// Peer inspection is only used to enrich an already decided refusal.
-pub(crate) fn refusal(pid: u32, comm: &str) -> Option<String> {
+fn unresolved_ssh_refusal(pid: u32, comm: &str) -> Option<String> {
     if comm.trim_end() != "ssh" {
         return None;
     }
@@ -202,12 +235,7 @@ pub(crate) fn refusal(pid: u32, comm: &str) -> Option<String> {
     {
         Some(false) => None,
         None => Some(format!("{RULE}: SSH subsystem arguments unavailable; cannot exclude a live filesystem transport")),
-        Some(true) => {
-            let evidence = describe_peer(pid).unwrap_or_else(|| {
-                "mount ownership is unresolved; an orphaned SSH SFTP subsystem can still carry live filesystem traffic".to_string()
-            });
-            Some(format!("{RULE}: {evidence}; inspect the mount and transport before taking action"))
-        }
+        Some(true) => Some(format!("{RULE}: mount ownership is unresolved; an orphaned SSH SFTP subsystem can still carry live filesystem traffic; inspect the mount and transport before taking action")),
     }
 }
 
@@ -270,7 +298,7 @@ mod tests {
             "u_str LISTEN 0 0 * 500 * 100 users:((\"wrong\",pid=46,fd=0))\n",
         );
         assert_eq!(
-            peers_for_stdio(rows, &[100]),
+            index_peers(rows).remove(&100).unwrap(),
             [Peer {
                 target_inode: 100,
                 server_inode: 200,
@@ -278,6 +306,66 @@ mod tests {
                 fd: 4
             }]
         );
+    }
+
+    #[test]
+    fn confirmed_unix_peer_protects_any_stdio_helper_and_rechecks_reused_fds() {
+        use std::cell::Cell;
+        use std::os::fd::{AsRawFd, OwnedFd};
+        use std::os::unix::{net::UnixStream, process::CommandExt};
+        use std::process::{Command, Stdio};
+
+        let (peer, transport) = UnixStream::pair().unwrap();
+        let owner_pid = std::process::id();
+        let fd = peer.as_raw_fd();
+        let keep_peer = peer.try_clone().unwrap();
+        let mut child = Command::new("/bin/sh")
+            .arg0("ssh")
+            .args(["-c", "read -r line", "host", "/usr/libexec/sftp-server"])
+            .stdin(Stdio::from(OwnedFd::from(transport)))
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let local = socket_inode(owner_pid, fd as u32).unwrap();
+        let remote = socket_inode(pid, 0).unwrap();
+        let rows = format!(
+            "u_str ESTAB 0 0 * {local} * {remote} users:((\"server\",pid={owner_pid},fd={fd}))"
+        );
+        let calls = Cell::new(0);
+        let read = || {
+            calls.set(calls.get() + 1);
+            Some(index_peers(&rows))
+        };
+        let mount = |server| (server == owner_pid).then(|| vec!["/owned".to_owned()]);
+        let lookup = FusePeerLookup::default();
+        for name in ["custom-helper", "ssh"] {
+            assert!(lookup
+                .refusal_with(pid, name, read, mount)
+                .unwrap()
+                .contains("/owned"));
+            assert!(
+                lookup.refusal_with(pid, name, read, |_| None).is_none(),
+                "an unrelated ordinary peer does not establish mount protection"
+            );
+        }
+        assert_eq!(calls.get(), 1);
+
+        // Replace the server's numeric FD while retaining the original endpoint
+        // through another descriptor. The old ss entry must no longer match.
+        let (unrelated, _other) = UnixStream::pair().unwrap();
+        // SAFETY: both FDs refer to socket endpoints owned by this test.
+        assert_eq!(unsafe { libc::dup2(unrelated.as_raw_fd(), fd) }, fd);
+        assert!(lookup.refusal_with(pid, "ssh", read, mount).is_none());
+        assert!(lookup
+            .refusal_with(pid, "other-helper", read, mount)
+            .is_none());
+        assert_eq!(calls.get(), 1);
+        let fresh = FusePeerLookup::default();
+        assert!(fresh
+            .refusal_with(pid, "other-helper", || None, mount)
+            .is_none());
+        drop(keep_peer);
+        child.wait().unwrap();
     }
 
     #[test]
