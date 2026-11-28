@@ -519,7 +519,9 @@ pub struct SessionConfig {
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
-            max_ancestry_depth: 20,
+            // Same reach as supervision and protected-ancestry walks; deeper
+            // chains still fail closed with AncestryDepth.
+            max_ancestry_depth: 64,
             protect_same_session: true,
             protect_parent_shells: true,
             protect_multiplexers: true,

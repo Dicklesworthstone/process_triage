@@ -18,7 +18,13 @@ use std::path::Path;
 use thiserror::Error;
 
 /// Maximum depth to walk up the process tree.
-const MAX_ANCESTRY_DEPTH: u32 = 20;
+///
+/// Matches the lineage and protected-ancestry walks (64, see
+/// `collect::lineage_collector` and f438342). A deeper chain still fails closed
+/// with `DepthLimit`; at 20, ordinary agent wrapper stacks (multiplexer, shells,
+/// agent CLI, build proxies, test harnesses) made supervision evidence
+/// "unavailable" and refused every action on their children.
+const MAX_ANCESTRY_DEPTH: u32 = 64;
 
 /// Errors that can occur during ancestry analysis.
 #[derive(Debug, Error)]
@@ -414,9 +420,60 @@ mod tests {
     #[test]
     fn test_ancestry_config_default() {
         let config = AncestryConfig::default();
-        assert_eq!(config.max_depth, 20);
+        assert_eq!(config.max_depth, 64);
         assert!(config.include_cmdline);
         assert!(!config.database.patterns.is_empty());
+    }
+
+    /// A real chain deeper than the old 20-level cap must produce complete
+    /// evidence instead of `DepthLimit`, which made supervision "unavailable" and
+    /// refused every action in deep agent/test wrapper stacks.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ancestry_covers_wrapper_chains_deeper_than_twenty() {
+        use std::os::unix::process::CommandExt;
+        const LEVELS: u32 = 25;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("nest.sh");
+        let pid_file = dir.path().join("leaf.pid");
+        // Each level is a separate child process (no exec) until the leaf, which
+        // records its PID and then sleeps.
+        std::fs::write(
+            &script,
+            "if [ \"$1\" -gt 0 ]; then sh \"$0\" $(($1 - 1)) \"$2\"; \
+             else echo $$ > \"$2.tmp\" && mv \"$2.tmp\" \"$2\" && exec sleep 30; fi\n",
+        )
+        .unwrap();
+        let mut child = std::process::Command::new("sh")
+            .arg(&script)
+            .arg(LEVELS.to_string())
+            .arg(&pid_file)
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let leaf: u32 = loop {
+            if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                break text.trim().parse().unwrap();
+            }
+            assert!(std::time::Instant::now() < deadline, "leaf never started");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let mut analyzer = AncestryAnalyzer::with_config(AncestryConfig {
+            include_cmdline: false,
+            database: SupervisorDatabase::new(),
+            ..AncestryConfig::default()
+        });
+        let result = analyzer.analyze(leaf);
+        // SAFETY: the group was created for this test's own children only.
+        unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+        let _ = child.wait();
+        let result = result.expect("complete ancestry for a 25-level wrapper chain");
+        assert!(
+            result.ancestry_chain.len() > LEVELS as usize,
+            "chain covers every wrapper level: {}",
+            result.ancestry_chain.len()
+        );
     }
 
     #[test]
