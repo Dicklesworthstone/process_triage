@@ -150,12 +150,22 @@ fn verification_text(recorded: &serde_json::Value) -> String {
     let Some(summary) = recorded.get("verification") else {
         return "No independent verification is available in this report.".into();
     };
-    let counts = summary["outcomes"].as_object().into_iter().flatten()
+    let counts = summary["outcomes"]
+        .as_object()
+        .into_iter()
+        .flatten()
         .map(|(outcome, count)| format!("{} {count}", outcome.replace('_', " ")))
         .collect::<Vec<_>>();
-    format!("Independent verification at {}: {} observed outcomes{}.",
-        summary_text(&summary["completed_at"]), summary_count(&summary["count"]),
-        if counts.is_empty() { String::new() } else { format!(" ({})", counts.join(", ")) })
+    format!(
+        "Independent verification at {}: {} observed outcomes{}.",
+        summary_text(&summary["completed_at"]),
+        summary_count(&summary["count"]),
+        if counts.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", counts.join(", "))
+        }
+    )
 }
 
 /// Text formats deliberately consume the already redacted, null-aware snapshot
@@ -531,7 +541,8 @@ impl ReportGenerator {
         } else {
             None
         };
-        let verification = summary.as_mut()
+        let verification = summary
+            .as_mut()
             .and_then(serde_json::Value::as_object_mut)
             .and_then(|fields| fields.remove("action_verification"))
             .map(serde_json::from_value)
@@ -542,14 +553,23 @@ impl ReportGenerator {
             None if reader.has_file("inference/results.json") => {
                 archived_snapshot_report(reader, &recorded_overview)?
             }
-            None => summary.map_or_else(|| serde_json::json!({}), |summary| serde_json::json!({"summary":summary})),
+            None => summary.map_or_else(
+                || serde_json::json!({}),
+                |summary| serde_json::json!({"summary":summary}),
+            ),
         };
         let outcomes = if reader.has_file("logs/outcomes.jsonl") {
             parse_outcomes(&reader.read_verified("logs/outcomes.jsonl")?)?
         } else {
             Vec::new()
         };
-        self.prepare_recorded_artifacts(overview, recorded_overview, &plan, &outcomes, verification.as_ref())
+        self.prepare_recorded_artifacts(
+            overview,
+            recorded_overview,
+            &plan,
+            &outcomes,
+            verification.as_ref(),
+        )
     }
 
     /// Render recorded plan evidence and outcomes without reconstructing missing
@@ -582,11 +602,24 @@ impl ReportGenerator {
         outcomes: &[serde_json::Value],
         verification: Option<&serde_json::Value>,
     ) -> Result<PreparedReport> {
-        let verification = verification.map(|saved| {
-            pt_bundle::writer::VerificationSummary::from_artifacts(&overview.session_id, plan, saved)
-        }).transpose()?.flatten();
+        let verification = verification
+            .map(|saved| {
+                pt_bundle::writer::VerificationSummary::from_artifacts(
+                    &overview.session_id,
+                    plan,
+                    saved,
+                )
+            })
+            .transpose()?
+            .flatten();
         let recorded_overview = serde_json::to_value(&overview)?;
-        self.prepare_recorded_artifacts(overview, recorded_overview, plan, outcomes, verification.as_ref())
+        self.prepare_recorded_artifacts(
+            overview,
+            recorded_overview,
+            plan,
+            outcomes,
+            verification.as_ref(),
+        )
     }
 
     fn prepare_recorded_artifacts(
@@ -675,7 +708,9 @@ impl ReportGenerator {
                 recorded_overview["kills_successful"] = serde_json::json!(successful);
             }
         }
-        let verification = verification.map(|saved| saved.report_value(&overview.session_id)).transpose()?;
+        let verification = verification
+            .map(|saved| saved.report_value(&overview.session_id))
+            .transpose()?;
         let overview: OverviewSection = serde_json::from_value(
             engine.redact_json_for_export(&serde_json::to_value(overview)?, profile),
         )?;
@@ -753,16 +788,12 @@ impl ReportGenerator {
     }
 
     fn finish_html(&self, html: String, data: &ReportData) -> Result<String> {
-        // Optionally minify
+        // Release builds minify; debug builds keep readable output. Tests call
+        // `minify_report_html` directly so the shipped path is exercised too.
         let output = if cfg!(debug_assertions) {
             html
         } else {
-            let cfg = minify_html::Cfg {
-                minify_js: true,
-                minify_css: true,
-                ..Default::default()
-            };
-            String::from_utf8(minify_html::minify(html.as_bytes(), &cfg)).unwrap_or(html)
+            minify_report_html(html)
         };
 
         info!(
@@ -1731,9 +1762,122 @@ fn json_script_escape(s: &str) -> String {
     escaped
 }
 
+/// Minify a rendered report, as release builds do before writing it.
+///
+/// Inline JavaScript is deliberately left unminified. `minify-html` 0.16 hands
+/// scripts to `minify-js` 0.6, which panics on the report's own inline script
+/// (`pass1.rs:288: called Option::unwrap() on a None value`); under the release
+/// profile's `panic = "abort"` that aborted every `pt report` in v2.4.2. Later
+/// `minify-html` releases switch to `oxc`, which pins `bumpalo =3.19.0` and cannot
+/// share a lockfile with ftui's `bumpalo ^3.19.1`. With `minify_js: false` the JS
+/// minifier is never called; HTML whitespace and CSS are still minified.
+fn minify_report_html(html: String) -> String {
+    let cfg = minify_html::Cfg {
+        minify_js: false,
+        minify_css: true,
+        ..Default::default()
+    };
+    String::from_utf8(minify_html::minify(html.as_bytes(), &cfg)).unwrap_or(html)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The body of the inline script that defines `REPORT_DATA`.
+    fn report_data_script(html: &str) -> &str {
+        let start = html
+            .find("const REPORT_DATA = ")
+            .expect("report defines REPORT_DATA");
+        let open = html[..start].rfind("<script>").expect("opening script tag") + "<script>".len();
+        let close = start + html[start..].find("</script>").expect("closing script tag");
+        html[open..close].trim()
+    }
+
+    /// The recorded-artifact JSON block. The minifier may drop attribute quotes,
+    /// so locate the element by its id and read from the end of its opening tag.
+    fn recorded_session_data(html: &str) -> serde_json::Value {
+        let id = html
+            .find("recorded-session-data")
+            .expect("rendered recorded artifacts");
+        let body = id + html[id..].find('>').expect("end of opening tag") + 1;
+        let end = body + html[body..].find("</script>").expect("closing script tag");
+        serde_json::from_str(&html[body..end]).expect("recorded artifacts are valid JSON")
+    }
+
+    /// Debug builds skip minification, so the suite never ran the code that
+    /// shipped and every release `pt report` aborted. Run the release minifier
+    /// over real session and bundle reports here, in every build profile.
+    #[test]
+    fn release_minifier_preserves_report_data_and_never_rewrites_inline_scripts() {
+        let generator = ReportGenerator::new(
+            ReportConfig::new()
+                .with_embed_assets(true)
+                .with_galaxy_brain(true),
+        );
+        let plan = serde_json::json!({
+            "summary": {"deep_scan_ms": 17},
+            "scan": {"total_processes": 42},
+            "candidates": [{
+                "pid": 4242, "command": "sleep 86402", "score": 97,
+                "recommended_action": "kill",
+                "posterior": {"useful": 0.006, "useful_bad": 0.004, "abandoned": 0.97, "zombie": 0.02},
+                "evidence_ledger": {"evidence_terms": [{
+                    "feature": "cpu",
+                    "log_likelihood": {"abandoned": -0.4, "useful": -2.0}
+                }]}
+            }],
+        });
+        let outcome = serde_json::json!({
+            "pid": 4242, "command": "sleep 86402", "action": "kill", "status": "success",
+        });
+        let manifest = pt_bundle::BundleManifest::new(
+            "pt-20261127-230637-vqb4",
+            "minifier-host",
+            pt_redact::ExportProfile::Forensic,
+        );
+        let session_html = generator
+            .generate_from_session_artifacts(
+                generator.build_overview_from_manifest(&manifest),
+                &plan,
+                std::slice::from_ref(&outcome),
+            )
+            .unwrap();
+        let mut writer = pt_bundle::BundleWriter::new(
+            "pt-20261127-230637-vqb4",
+            "minifier-host",
+            pt_redact::ExportProfile::Forensic,
+        );
+        writer.add_plan(&plan).unwrap();
+        writer.add_log("outcomes", format!("{outcome}\n").into_bytes());
+        let (bytes, _) = writer.write_to_vec().unwrap();
+        let mut reader = pt_bundle::BundleReader::from_bytes(bytes).unwrap();
+        assert!(reader.verify_all().is_empty());
+        let bundle_html = generator.generate_from_bundle(&mut reader).unwrap();
+
+        for html in [session_html, bundle_html] {
+            let minified = minify_report_html(html.clone());
+            assert!(
+                minified.len() < html.len(),
+                "release minification must still shrink the document ({} >= {})",
+                minified.len(),
+                html.len()
+            );
+            assert_eq!(
+                recorded_session_data(&minified),
+                recorded_session_data(&html),
+                "embedded recorded artifacts must survive minification exactly"
+            );
+            assert_eq!(
+                report_data_script(&minified),
+                report_data_script(&html),
+                "inline scripts must reach the browser unmodified (JS minification panics)"
+            );
+            assert!(minified.contains("Recorded Evidence Ledger"));
+            // Optional closing tags such as </td> may be omitted after minification.
+            assert!(minified.contains("<td>4242"));
+        }
+    }
 
     #[test]
     fn reports_distinguish_apply_success_from_later_verification() {
@@ -1749,31 +1893,52 @@ mod tests {
                 "action_id": "a1", "target": target, "action": "kill", "outcome": "respawned", "note": "private note"
             }]
         });
-        for profile in [pt_bundle::ExportProfile::Safe, pt_bundle::ExportProfile::Forensic, pt_bundle::ExportProfile::Minimal] {
+        for profile in [
+            pt_bundle::ExportProfile::Safe,
+            pt_bundle::ExportProfile::Forensic,
+            pt_bundle::ExportProfile::Minimal,
+        ] {
             let mut writer = pt_bundle::BundleWriter::new(session, "host", profile);
             writer.add_plan(&plan).unwrap();
-            writer.add_summary(&serde_json::json!({"total": 19})).unwrap();
+            writer
+                .add_summary(&serde_json::json!({"total": 19}))
+                .unwrap();
             writer.set_recorded_verification(serde_json::to_vec(&saved).unwrap());
-            writer.add_file("logs/outcomes.jsonl", br#"{"action_id":"a1","action":"kill","status":"success"}"#.to_vec(),
-                Some(pt_bundle::FileType::Log));
+            writer.add_file(
+                "logs/outcomes.jsonl",
+                br#"{"action_id":"a1","action":"kill","status":"success"}"#.to_vec(),
+                Some(pt_bundle::FileType::Log),
+            );
             let (bytes, _) = writer.write_to_vec().unwrap();
             let mut reader = pt_bundle::BundleReader::from_bytes(bytes).unwrap();
             assert!(reader.verify_all().is_empty());
             assert!(!reader.has_file("action/verifications.json"));
             let summary = reader.read_summary::<serde_json::Value>().unwrap();
             assert_eq!(summary["total"], 19);
-            assert_eq!(summary["action_verification"]["session_id"], reader.manifest().session_id.as_str());
+            assert_eq!(
+                summary["action_verification"]["session_id"],
+                reader.manifest().session_id.as_str()
+            );
             if profile != pt_bundle::ExportProfile::Forensic {
                 assert_ne!(reader.manifest().session_id, session);
             }
             let summary_json = summary.to_string();
-            for private in ["private note", "\"pid\"", "\"uid\"", "action_outcomes", "start_id", "cmd_full"] {
+            for private in [
+                "private note",
+                "\"pid\"",
+                "\"uid\"",
+                "action_outcomes",
+                "start_id",
+                "cmd_full",
+            ] {
                 assert!(!summary_json.contains(private));
             }
             assert_eq!(summary["action_verification"]["outcomes"]["respawned"], 1);
             let mut config = ReportConfig::new();
             config.redaction_profile = profile.to_string();
-            let report = ReportGenerator::new(config).prepare_from_bundle(&mut reader).unwrap();
+            let report = ReportGenerator::new(config)
+                .prepare_from_bundle(&mut reader)
+                .unwrap();
             assert_eq!(report.recorded["verification"]["outcomes"]["respawned"], 1);
             if profile == pt_bundle::ExportProfile::Minimal {
                 assert!(report.recorded.get("plan").is_none());
@@ -1782,48 +1947,90 @@ mod tests {
                 assert_eq!(report.recorded["overview"]["kills_successful"], 1);
             }
             assert!(report.render_html().unwrap().contains("respawned 1"));
-            assert!(report.render_summary(TextReportFormat::Slack, TextReportStyle::Terse).contains("respawned 1"));
+            assert!(report
+                .render_summary(TextReportFormat::Slack, TextReportStyle::Terse)
+                .contains("respawned 1"));
         }
 
-        let mut older = pt_bundle::BundleWriter::new(session, "host", pt_bundle::ExportProfile::Forensic);
+        let mut older =
+            pt_bundle::BundleWriter::new(session, "host", pt_bundle::ExportProfile::Forensic);
         older.add_plan(&plan).unwrap();
         let (bytes, _) = older.write_to_vec().unwrap();
         let mut reader = pt_bundle::BundleReader::from_bytes(bytes).unwrap();
         let generator = ReportGenerator::default_config();
         let historical = generator.prepare_from_bundle(&mut reader).unwrap();
         assert!(historical.recorded.get("verification").is_none());
-        assert!(historical.render_summary(TextReportFormat::Prose, TextReportStyle::Terse)
+        assert!(historical
+            .render_summary(TextReportFormat::Prose, TextReportStyle::Terse)
             .contains("No independent verification is available"));
         let overview = generator.build_overview_from_manifest(reader.manifest());
-        let local = generator.prepare_from_verified_session_artifacts(overview, &plan, &[], Some(&saved)).unwrap();
+        let local = generator
+            .prepare_from_verified_session_artifacts(overview, &plan, &[], Some(&saved))
+            .unwrap();
         assert_eq!(local.recorded["verification"]["outcomes"]["respawned"], 1);
 
         let mut newer = saved.clone();
         newer["action_outcomes"][0]["outcome"] = serde_json::json!("private new label");
-        let aggregate = pt_bundle::writer::VerificationSummary::from_artifacts(session, &plan, &newer)
-            .unwrap().unwrap();
+        let aggregate =
+            pt_bundle::writer::VerificationSummary::from_artifacts(session, &plan, &newer)
+                .unwrap()
+                .unwrap();
         let projection = aggregate.report_value(session).unwrap();
         assert_eq!(projection["outcomes"]["other"], 1);
         assert!(!projection.to_string().contains("private new label"));
         assert!(aggregate.report_value("different archive").is_err());
         let mut legacy = saved.clone();
         legacy["action_outcomes"][0]["target"]["start_id"] = serde_json::Value::Null;
-        assert!(pt_bundle::writer::VerificationSummary::from_artifacts(session, &plan, &legacy).unwrap().is_none());
+        assert!(
+            pt_bundle::writer::VerificationSummary::from_artifacts(session, &plan, &legacy)
+                .unwrap()
+                .is_none()
+        );
         let mut wrong_target = saved.clone();
-        wrong_target["action_outcomes"][0]["target"]["start_id"] = serde_json::json!("boot:4567:4721");
-        assert!(pt_bundle::writer::VerificationSummary::from_artifacts(session, &plan, &wrong_target).is_err());
-        assert!(pt_bundle::writer::VerificationSummary::from_artifacts("other-session", &plan, &saved).is_err());
-        for uid in [serde_json::Value::Null, serde_json::json!(999), serde_json::json!("1000"), serde_json::json!(u64::MAX)] {
+        wrong_target["action_outcomes"][0]["target"]["start_id"] =
+            serde_json::json!("boot:4567:4721");
+        assert!(pt_bundle::writer::VerificationSummary::from_artifacts(
+            session,
+            &plan,
+            &wrong_target
+        )
+        .is_err());
+        assert!(pt_bundle::writer::VerificationSummary::from_artifacts(
+            "other-session",
+            &plan,
+            &saved
+        )
+        .is_err());
+        for uid in [
+            serde_json::Value::Null,
+            serde_json::json!(999),
+            serde_json::json!("1000"),
+            serde_json::json!(u64::MAX),
+        ] {
             let mut wrong_owner = saved.clone();
             wrong_owner["action_outcomes"][0]["target"]["uid"] = uid;
-            assert!(pt_bundle::writer::VerificationSummary::from_artifacts(session, &plan, &wrong_owner).is_err());
+            assert!(pt_bundle::writer::VerificationSummary::from_artifacts(
+                session,
+                &plan,
+                &wrong_owner
+            )
+            .is_err());
         }
         let mut legacy_plan = plan.clone();
         legacy_plan["actions"][0]["target"]["uid"] = serde_json::Value::Null;
-        assert!(pt_bundle::writer::VerificationSummary::from_artifacts(session, &legacy_plan, &saved).unwrap().is_none());
+        assert!(pt_bundle::writer::VerificationSummary::from_artifacts(
+            session,
+            &legacy_plan,
+            &saved
+        )
+        .unwrap()
+        .is_none());
         let mut reversed = saved;
         reversed["verification"]["completed_at"] = serde_json::json!("2026-01-15T12:00:59Z");
-        assert!(pt_bundle::writer::VerificationSummary::from_artifacts(session, &plan, &reversed).is_err());
+        assert!(
+            pt_bundle::writer::VerificationSummary::from_artifacts(session, &plan, &reversed)
+                .is_err()
+        );
     }
 
     fn archive_snapshot(
