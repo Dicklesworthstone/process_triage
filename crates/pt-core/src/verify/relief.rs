@@ -147,6 +147,10 @@ pub struct ResourceWindowSummary {
     pub sample_count: usize,
     /// The requested observation interval completed; this does not prove the host settled.
     pub complete: bool,
+    /// Exact endpoint for byte thresholds. Floating-point delta reports can
+    /// round adjacent integer byte counts to the same value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_memory_bytes: Option<u64>,
     pub cpu_usage: Option<HostCpuUsage>,
     pub pressure_rates: Option<PressureWindow>,
     pub unavailable: Vec<Unavailable>,
@@ -923,12 +927,20 @@ fn pressure_rates(
     }
 }
 
+fn available_memory_bytes(pressure: &PressureSnapshot) -> Option<u64> {
+    let memory = pressure.meminfo?;
+    memory
+        .available
+        .filter(|available| memory.total.is_none_or(|total| *available <= total))
+}
+
 pub(super) fn summarize_window(window: &ResourceObservationWindow) -> ResourceWindowSummary {
     let mut report = ResourceWindowSummary {
         requested_duration_ms: window.requested_duration_ms,
         observed_duration_ms: None,
         sample_count: window.samples.len(),
         complete: false,
+        available_memory_bytes: None,
         cpu_usage: None,
         pressure_rates: None,
         unavailable: Vec::new(),
@@ -955,6 +967,10 @@ pub(super) fn summarize_window(window: &ResourceObservationWindow) -> ResourceWi
     };
     report.observed_duration_ms = Some(evidence.elapsed_ns as f64 / 1_000_000.0);
     report.complete = evidence.complete;
+    report.available_memory_bytes = window
+        .samples
+        .last()
+        .and_then(|point| available_memory_bytes(&point.pressure));
     unavailable(&mut report.unavailable, "psi.cpu.full", "CPU full pressure is undefined at host scope; the kernel's compatibility zero is not a relief measurement");
     if !evidence.complete {
         unavailable(
@@ -1390,14 +1406,7 @@ pub fn compare_resource_windows(
         metric_delta(name, b, a, comparable, &mut errors)
     };
     let available_memory_bytes = delta("available_memory_bytes", |sample| {
-        sample
-            .meminfo
-            .and_then(|memory| {
-                memory
-                    .available
-                    .filter(|available| memory.total.is_none_or(|total| *available <= total))
-            })
-            .map(|bytes| bytes as f64)
+        available_memory_bytes(sample).map(|bytes| bytes as f64)
     });
     let swap_used_bytes = delta("swap_used_bytes", |sample| {
         sample

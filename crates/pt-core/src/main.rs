@@ -102,7 +102,7 @@ use pt_core::tui::{
 };
 use pt_core::verify::relief::{capture_resource_observation, ResourceDelta, DEFAULT_SETTLE_MS};
 use pt_core::verify::relief_store::{
-    begin_resource_run, finish_resource_run, load_resource_runs, ResourceRun, ResourceRunResult,
+    begin_resource_run, finish_resource_run, load_resource_runs, ResourceRun,
 };
 use pt_core::verify::resource_prediction::{
     ActionResourcePrediction, DiskRecoveryPrediction, FileDescriptorPrediction, HostCpuPrediction,
@@ -35547,34 +35547,78 @@ mod planning_pressure_tests {
         }
     }
 
+    fn goal_test_window(
+        at_ms: u64,
+        available: u64,
+    ) -> pt_core::verify::relief::ResourceObservationWindow {
+        use pt_core::verify::relief::{ResourceObservation, ResourceObservationWindow};
+
+        let mut pressure = host().snapshot.unwrap();
+        pressure.sampled_at_ms = at_ms;
+        pressure.meminfo.as_mut().unwrap().available = Some(available);
+        ResourceObservationWindow {
+            requested_duration_ms: 0,
+            sample_interval_ms: 1_000,
+            samples: vec![ResourceObservation {
+                boot_id: Some("11111111-1111-4111-8111-111111111111".into()),
+                clock_ticks_per_second: Some(100),
+                monotonic_start_ns: Some(at_ms * 1_000_000),
+                monotonic_end_ns: Some(at_ms * 1_000_000 + 1),
+                pressure,
+                cpu_times: None,
+                processes: Vec::new(),
+                unavailable: Vec::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn verify_keeps_each_bound_goal_window_separate_and_never_uses_host_file_handles_as_fds() {
+        use pt_core::verify::relief::{compare_resource_windows, ResourceEvidenceBinding};
+        let bound_delta = |run: &str, before, after| {
+            let mut delta = compare_resource_windows(
+                &goal_test_window(1000, before),
+                &goal_test_window(2000, after),
+            );
+            delta.binding = Some(ResourceEvidenceBinding {
+                run_id: run.into(),
+                action_ids: vec![format!("kill-{run}")],
+                boot_id: "11111111-1111-4111-8111-111111111111".into(),
+                execution_clock_resolution_ns: 10_000_000,
+                timing_validation: "execution_tick_interval_overlaps_inter_window_gap".into(),
+            });
+            delta
+        };
+        let document = serde_json::json!({"goal": "free 100B RAM OR free 1 FD"});
+        let first = bound_delta("first", 100, 200);
+        let mut second = bound_delta("second", 200, 100);
+        second.allocated_file_handles.delta = Some(-100.0);
+        let mut unbound = first.clone();
+        unbound.binding = None;
+        let report = historical_goal_attainment(&document, &[first, second, unbound]).unwrap();
+        let runs = report["runs"].as_array().unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0]["run_id"], "first");
+        assert_eq!(runs[0]["action_ids"], serde_json::json!(["kill-first"]));
+        assert_eq!(runs[0]["met"], true);
+        assert_eq!(runs[0]["targets"][0]["observed"], 100);
+        assert_eq!(runs[1]["run_id"], "second");
+        assert!(runs[1]["met"].is_null());
+        assert_eq!(runs[1]["targets"][0]["observed"], -100);
+        assert!(runs[1]["targets"][1]["observed"].is_null());
+        assert!(
+            historical_goal_attainment(&document, &[]).unwrap()["unavailable_reason"].is_string()
+        );
+    }
+
     #[test]
     fn measured_goal_resources_require_bound_valid_memory_and_cpu_capacity() {
         use pt_core::verify::relief::{
             compare_resource_windows, ObservedMetricDelta, ResourceEvidenceBinding,
-            ResourceObservation, ResourceObservationWindow,
         };
-        let make_window = |at_ms: u64, available: u64| {
-            let mut pressure = host().snapshot.unwrap();
-            pressure.sampled_at_ms = at_ms;
-            pressure.meminfo.as_mut().unwrap().available = Some(available);
-            ResourceObservationWindow {
-                requested_duration_ms: 0,
-                sample_interval_ms: 1_000,
-                samples: vec![ResourceObservation {
-                    boot_id: Some("11111111-1111-4111-8111-111111111111".into()),
-                    clock_ticks_per_second: Some(100),
-                    monotonic_start_ns: Some(at_ms * 1_000_000),
-                    monotonic_end_ns: Some(at_ms * 1_000_000 + 1),
-                    pressure,
-                    cpu_times: None,
-                    processes: Vec::new(),
-                    unavailable: Vec::new(),
-                }],
-            }
-        };
-        let before_window = make_window(1000, 100);
+        let before_window = goal_test_window(1000, 100);
         for available in [200, 1001] {
-            let after_window = make_window(2000, available);
+            let after_window = goal_test_window(2000, available);
             let mut delta = compare_resource_windows(&before_window, &after_window);
             delta.binding = Some(ResourceEvidenceBinding {
                 run_id: "33333333-3333-4333-8333-333333333333".into(),
@@ -35583,14 +35627,6 @@ mod planning_pressure_tests {
                 execution_clock_resolution_ns: 10_000_000,
                 timing_validation: "execution_tick_interval_overlaps_inter_window_gap".into(),
             });
-            let mut run = ResourceRunResult {
-                run_id: "33333333-3333-4333-8333-333333333333".into(),
-                before: Some(before_window.clone()),
-                after: Some(after_window),
-                artifact_path: None,
-                resource_delta: Some(delta),
-                unavailable: Vec::new(),
-            };
             let mut before = MetricSnapshot {
                 available_memory_bytes: None,
                 total_cpu_frac: None,
@@ -35604,7 +35640,7 @@ mod planning_pressure_tests {
                 timestamp: 2.0,
                 ..before.clone()
             };
-            attach_measured_goal_resources(&mut before, &mut after, Some(&run));
+            attach_measured_goal_resources(&mut before, &mut after, Some(&delta));
             let expected_memory = (available == 200).then_some(available);
             assert_eq!(after.available_memory_bytes, expected_memory);
             assert_eq!(before.available_memory_bytes, expected_memory.map(|_| 100));
@@ -35613,22 +35649,21 @@ mod planning_pressure_tests {
                 "point observations have no CPU rate"
             );
 
-            let delta = run.resource_delta.as_mut().unwrap();
             delta.cpu.busy_percent = ObservedMetricDelta {
                 before: Some(80.0),
                 after: Some(20.0),
                 delta: Some(-60.0),
             };
             delta.cpu_capacity_comparable = false;
-            attach_measured_goal_resources(&mut before, &mut after, Some(&run));
+            attach_measured_goal_resources(&mut before, &mut after, Some(&delta));
             assert!(before.total_cpu_frac.is_none());
-            run.resource_delta.as_mut().unwrap().cpu_capacity_comparable = true;
-            attach_measured_goal_resources(&mut before, &mut after, Some(&run));
+            delta.cpu_capacity_comparable = true;
+            attach_measured_goal_resources(&mut before, &mut after, Some(&delta));
             assert_eq!(before.total_cpu_frac, Some(0.8));
             assert_eq!(after.total_cpu_frac, Some(0.2));
 
-            run.resource_delta.as_mut().unwrap().binding = None;
-            attach_measured_goal_resources(&mut before, &mut after, Some(&run));
+            delta.binding = None;
+            attach_measured_goal_resources(&mut before, &mut after, Some(&delta));
             assert!(before.total_cpu_frac.is_none());
             assert!(before.available_memory_bytes.is_none());
             assert!(before.occupied_ports.is_none());
@@ -40321,6 +40356,61 @@ fn saved_goal_attainment(
     }
 }
 
+/// Replay measured outcomes separately for every run validated against this
+/// plan, execution journal and host. A later observation cannot fill holes in
+/// a saved window, nor can deltas across separate apply runs be added together.
+fn historical_goal_attainment(
+    document: &serde_json::Value,
+    deltas: &[ResourceDelta],
+) -> Option<serde_json::Value> {
+    let text = saved_goal_text(document)?;
+    let goal = match parse_goal(text) {
+        Ok(Goal::Relieve(_)) => return None,
+        Ok(goal) => goal,
+        Err(error) => {
+            return Some(serde_json::json!({
+                "goal": text, "runs": [], "unavailable_reason": error.to_string()
+            }))
+        }
+    };
+    let mut runs = Vec::new();
+    for delta in deltas {
+        let Some(binding) = &delta.binding else {
+            continue;
+        };
+        let empty = |at_ms: Option<u64>| MetricSnapshot {
+            timestamp: at_ms.map_or(f64::NAN, |t| t as f64 / 1000.0),
+            available_memory_bytes: None,
+            total_cpu_frac: None,
+            occupied_ports: None,
+            total_fds: None,
+            process_count: None,
+            disk_space: None,
+        };
+        let mut before = empty(delta.before_at_ms);
+        let mut after = empty(delta.after_at_ms);
+        let comparable = attach_measured_goal_resources(&mut before, &mut after, Some(delta));
+        let snapshots = if comparable {
+            Ok((&before, &after))
+        } else {
+            Err("Saved execution windows are incomparable")
+        };
+        // Host-wide file handles cannot establish a process-FD census. These
+        // artifacts also contain no port binding, mount-space, or process census.
+        let report = goal_progress::assess_goal(&goal, snapshots, |_| None)?;
+        runs.push(serde_json::json!({
+            "run_id": binding.run_id, "action_ids": binding.action_ids,
+            "before_at_ms": delta.before_at_ms, "after_at_ms": delta.after_at_ms,
+            "met": report.met, "targets": report.targets,
+        }));
+    }
+    Some(serde_json::json!({
+        "goal": text, "scope": "individual_saved_apply_windows",
+        "unavailable_reason": runs.is_empty().then_some("No validated execution windows"),
+        "runs": runs
+    }))
+}
+
 fn print_goal_attainment(attainment: Option<&serde_json::Value>) {
     if let Some(report) = attainment {
         let verdict = match report["met"].as_bool() {
@@ -40668,16 +40758,13 @@ fn observe_disk_goal_mount(
 fn attach_measured_goal_resources(
     before: &mut MetricSnapshot,
     after: &mut MetricSnapshot,
-    run: Option<&ResourceRunResult>,
+    delta: Option<&ResourceDelta>,
 ) -> bool {
     before.available_memory_bytes = None;
     after.available_memory_bytes = None;
     before.total_cpu_frac = None;
     after.total_cpu_frac = None;
-    let comparable = run
-        .and_then(|run| run.resource_delta.as_ref())
-        .is_some_and(|delta| delta.comparable && delta.binding.is_some());
-    if !comparable {
+    let Some(delta) = delta.filter(|delta| delta.comparable && delta.binding.is_some()) else {
         // Even complete-looking port/FD censuses need an executed, comparable run.
         before.occupied_ports = None;
         after.occupied_ports = None;
@@ -40688,15 +40775,10 @@ fn attach_measured_goal_resources(
         before.disk_space = None;
         after.disk_space = None;
         return false;
-    }
-    let run = run.unwrap();
-    let delta = run.resource_delta.as_ref().unwrap();
-    let available_memory = |window: &pt_core::verify::relief::ResourceObservationWindow| {
-        window.samples.last()?.pressure.meminfo?.available
     };
     if delta.available_memory_bytes.delta.is_some() {
-        before.available_memory_bytes = run.before.as_ref().and_then(available_memory);
-        after.available_memory_bytes = run.after.as_ref().and_then(available_memory);
+        before.available_memory_bytes = delta.before_window.available_memory_bytes;
+        after.available_memory_bytes = delta.after_window.available_memory_bytes;
     }
     if delta.cpu_capacity_comparable && delta.cpu.busy_percent.delta.is_some() {
         before.total_cpu_frac = delta.cpu.busy_percent.before.map(|percent| percent / 100.0);
@@ -43611,7 +43693,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     let goal_windows_comparable = attach_measured_goal_resources(
         &mut before_snapshot,
         &mut after_snapshot,
-        resource_observation.as_ref(),
+        resource_observation.as_ref().and_then(|run| run.resource_delta.as_ref()),
     );
     let (goal_executions, goal_evidence_error) =
         match successful_goal_action_outcomes(&plan, &outcomes) {
@@ -44593,11 +44675,15 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
         );
         return ExitCode::InternalError;
     }
+    let saved_document = match serde_json::from_str::<serde_json::Value>(&plan_content) {
+        Ok(document) => document,
+        Err(error) => {
+            eprintln!("agent verify: invalid plan document: {error}");
+            return ExitCode::InternalError;
+        }
+    };
     let (resource_predictions, resource_prediction_error) =
-        match serde_json::from_str::<serde_json::Value>(&plan_content)
-            .map_err(|error| error.to_string())
-            .and_then(|document| saved_resource_predictions(&document, &plan))
-        {
+        match saved_resource_predictions(&saved_document, &plan) {
             Ok(predictions) => (predictions, None),
             Err(error) => {
                 eprintln!("agent verify: resource comparisons unavailable: {error}");
@@ -44886,6 +44972,10 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
     } else {
         serde_json::Value::Null
     };
+    let goal_history = historical_goal_attainment(&saved_document, &resource_runs.reports);
+    if let Some(history) = &goal_history {
+        verification_output["goal_attainment"] = history.clone();
+    }
     verification_output["resource_runs"] = serde_json::json!(&resource_runs);
     verification_output["resource_observation_source"] = serde_json::json!("saved_apply_windows");
     verification_output["resource_observation_checked_at_ms"] =
@@ -44949,6 +45039,28 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
         return ExitCode::TimeoutError;
     }
 
+    if !matches!(
+        global.format,
+        OutputFormat::Json | OutputFormat::Jsonl | OutputFormat::Toon | OutputFormat::Exitcode
+    ) {
+        if let Some(history) = &goal_history {
+            if let Some(reason) = history["unavailable_reason"].as_str() {
+                println!("Historical goal unmeasured: {reason}");
+            }
+            for run in history["runs"].as_array().into_iter().flatten() {
+                let verdict = match run["met"].as_bool() {
+                    Some(true) => "met",
+                    Some(false) => "unmet",
+                    None => "unmeasured",
+                };
+                println!(
+                    "Goal {verdict} in apply run {}: {}",
+                    run["run_id"].as_str().unwrap_or_default(),
+                    history["goal"].as_str().unwrap_or_default()
+                );
+            }
+        }
+    }
     match global.format {
         OutputFormat::Json | OutputFormat::Toon => {
             // Extend report with respawn info if checked
