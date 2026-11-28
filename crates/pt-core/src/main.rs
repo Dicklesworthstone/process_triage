@@ -79,7 +79,7 @@ use pt_core::session::diff::{
 use pt_core::session::fleet::{create_fleet_session, HostInput};
 use pt_core::session::snapshot_persist::{
     load_recorded_snapshot_pair, persist_inference, persist_inventory, ArtifactEnvelope,
-    InferenceArtifact, InventoryArtifact, PersistedInference, PersistedProcess,
+    InferenceArtifact, InventoryArtifact, PersistedInference, PersistedProcess, SkippedDecision,
 };
 use pt_core::session::{
     ListSessionsOptions, SessionContext, SessionHandle, SessionManifest, SessionMode, SessionState,
@@ -2760,18 +2760,21 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
         app.reduce_motion = true;
     }
 
+    let decision_warning = snapshot.decision_warning.clone();
     app.replace_processes(snapshot);
     app.process_table.select_recommended();
     let deep_status = system_state
         .as_ref()
         .and_then(|state| state["deep_collection"]["status"].as_str())
         .unwrap_or("not_needed");
-    app.set_status(format!(
+    app.set_status(decision_warning.unwrap_or_else(|| {
+        format!(
         "Session {} • {} candidates • deep {}",
         session_id.0,
         app.process_table.rows.len(),
         deep_status,
-    ));
+    )
+    }));
 
     // ftui runtime path: terminal setup/teardown handled by Program RAII.
     // Closures capture cloned, Send + 'static data for Cmd::task.
@@ -9225,6 +9228,7 @@ fn build_tui_rows(
     let mut plan_candidates = HashMap::new();
     let mut goal_candidates: HashMap<u32, serde_json::Value> = HashMap::new();
     let cpu_total = pressure.cpu_goal_baseline().unwrap_or(f64::NAN);
+    let mut decision_skipped = Vec::new();
     let mut supervision = pt_core::supervision::SupervisionDetector::for_scan();
 
     for proc in processes {
@@ -9244,7 +9248,12 @@ fn build_tui_rows(
             ..scorer.snapshot_evidence(proc)
         };
 
-        let Some(score) = scorer.score(proc, evidence) else {
+        let Some(score) = decision_or_record(
+            scorer.score(proc, evidence).ok_or("Process scoring unavailable"),
+            proc,
+            "scoring",
+            &mut decision_skipped,
+        ) else {
             continue;
         };
         let posterior_result = &score.posterior;
@@ -9254,14 +9263,18 @@ fn build_tui_rows(
         // Reversible selections execute in immutable child sessions, so memory
         // caps use the same durable restoration contract as saved agent plans.
         let (feasibility, memory_cap) = candidate_action_capabilities(proc, &score);
-        let inputs = match prepare_pressure_decision(
-            &posterior_result.posterior,
-            &decision_policy,
-            &feasibility,
-            &pressure.for_process(proc, score.activity.as_ref()),
-        ) {
-            Ok(inputs) => inputs,
-            Err(_) => continue,
+        let Some(inputs) = decision_or_record(
+            prepare_pressure_decision(
+                &posterior_result.posterior,
+                &decision_policy,
+                &feasibility,
+                &pressure.for_process(proc, score.activity.as_ref()),
+            ),
+            proc,
+            "pressure_decision",
+            &mut decision_skipped,
+        ) else {
+            continue;
         };
         let mut decision_outcome = inputs.decision;
         let pressure_decision = inputs.report;
@@ -9595,6 +9608,7 @@ fn build_tui_rows(
         }));
     Ok(TuiBuildOutput {
         snapshot: RefreshOutcome {
+            decision_warning: decision_warning(&decision_skipped),
             rows,
             goal_summary,
             goal_selection,
@@ -26085,6 +26099,76 @@ mod process_tree_safety_tests {
         }
     }
 
+    #[test]
+    fn pressure_decision_failure_is_reported_with_identity_in_all_plan_shapes() {
+        use pt_core::decision::ActionFeasibility;
+        use pt_core::inference::ClassScores;
+        let proc = rec(316, 1, "worker", ProcessState::Sleeping);
+        let mut policy = pt_core::config::Policy::default();
+        let feasibility = ActionFeasibility::allow_all();
+        let posterior = ClassScores {
+            useful: 0.9,
+            useful_bad: 0.02,
+            abandoned: 0.06,
+            zombie: 0.02,
+        };
+        let mut skipped = Vec::new();
+        let prepared = |policy: &_| {
+            super::prepare_pressure_decision(
+                &posterior,
+                policy,
+                &feasibility,
+                &super::PressureContext::default(),
+            )
+        };
+        assert!(super::decision_or_record(
+            prepared(&policy),
+            &proc,
+            "pressure_decision",
+            &mut skipped
+        )
+        .is_some());
+        assert_eq!(
+            super::plan_decision_exit(&skipped, true),
+            super::ExitCode::Clean
+        );
+        assert_eq!(
+            super::plan_decision_exit(&skipped, false),
+            super::ExitCode::PlanReady
+        );
+        policy.load_aware.enabled = true;
+        policy.load_aware.pressure.kappa = -1.0;
+        assert!(super::decision_or_record(
+            prepared(&policy),
+            &proc,
+            "pressure_decision",
+            &mut skipped
+        )
+        .is_none());
+        for empty in [true, false] {
+            assert_eq!(
+                super::plan_decision_exit(&skipped, empty),
+                super::ExitCode::PartialFail
+            );
+        }
+        for mut summary in [
+            serde_json::json!({"protected_filtered": 3}),
+            serde_json::Value::Null,
+        ] {
+            super::record_decision_coverage(&mut summary, &skipped);
+            assert_eq!(summary["decision_complete"], false);
+            assert_eq!(summary["decision_skipped_count"], 1);
+            let failed = &summary["decision_skipped"][0];
+            assert_eq!(failed["pid"], proc.pid.0);
+            assert_eq!(failed["uid"], proc.uid);
+            assert_eq!(failed["start_id"], proc.start_id.to_string());
+            assert_eq!(failed["stage"], "pressure_decision");
+            assert!(failed["reason"].as_str().unwrap().contains("kappa"));
+            assert!(super::encode_toon_value(&summary).contains("kappa"));
+        }
+        assert!(super::decision_warning(&skipped).unwrap().contains("316"));
+    }
+
     fn cand(pid: u32) -> serde_json::Value {
         serde_json::json!({"pid": pid, "recommended_action": "kill", "recommendation": "KILL"})
     }
@@ -33725,6 +33809,7 @@ mod snapshot_completion_tests {
             &id.0,
             "fixture-host",
             InferenceArtifact {
+                decision_skipped: Vec::new(),
                 candidate_count: 0,
                 candidates: Vec::new(),
             },
@@ -34204,6 +34289,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
         // omitted inference rows must not appear to be absent candidates.
         if completion.inference_skipped_pids.is_empty() {
             let inf_artifact = InferenceArtifact {
+                decision_skipped: Vec::new(),
                 candidate_count: persisted_inference_records.len(),
                 candidates: persisted_inference_records,
             };
@@ -37621,10 +37707,60 @@ fn resolve_agent_plan_baseline(
 fn agent_plan_differential_summary(differential: &serde_json::Value) -> String {
     let summary = &differential["summary"];
     format!(
-        "Compared with {}: {} new, {} changed, {} unchanged, {} absent from current candidate observations (absence does not establish exit). Complete fresh plan retained.",
+        "Compared with {}: {} new, {} changed, {} unchanged, {} absent from current candidate observations (absence does not establish exit). {} fresh plan retained.",
         differential["baseline"]["session_id"].as_str().unwrap_or("?"),
-        summary["new_count"], summary["changed_count"], summary["unchanged_count"], summary["resolved_count"]
+        summary["new_count"], summary["changed_count"], summary["unchanged_count"], summary["resolved_count"],
+        if differential["plan_scope"] == "partial_fresh_plan" { "Partial" } else { "Complete" }
     )
+}
+
+/// Preserve the identity of failed decisions even when the candidate list is
+/// filtered, capped, or empty. Successfully scored rows remain usable.
+fn decision_or_record<T>(
+    result: Result<T, impl std::fmt::Display>,
+    process: &ProcessRecord,
+    stage: &str,
+    skipped: &mut Vec<SkippedDecision>,
+) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(error) => {
+            skipped.push(SkippedDecision {
+                pid: process.pid.0,
+                uid: process.uid,
+                start_id: process.start_id.to_string(),
+                stage: stage.into(),
+                reason: error.to_string(),
+            });
+            None
+        }
+    }
+}
+
+fn record_decision_coverage(summary: &mut serde_json::Value, skipped: &[SkippedDecision]) {
+    summary["decision_complete"] = serde_json::json!(skipped.is_empty());
+    summary["decision_skipped_count"] = serde_json::json!(skipped.len());
+    summary["decision_skipped"] = serde_json::json!(skipped);
+}
+
+fn decision_warning(skipped: &[SkippedDecision]) -> Option<String> {
+    let first = skipped.first()?;
+    Some(format!(
+        "Incomplete decisions ({} skipped). PID {}: {}",
+        skipped.len(),
+        first.pid,
+        first.reason
+    ))
+}
+
+fn plan_decision_exit(skipped: &[SkippedDecision], empty: bool) -> ExitCode {
+    if !skipped.is_empty() {
+        ExitCode::PartialFail
+    } else if empty {
+        ExitCode::Clean
+    } else {
+        ExitCode::PlanReady
+    }
 }
 
 fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
@@ -37973,6 +38109,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
 
     // Share namespace-bound IPC tables only for this candidate scan. Action-time
     // guards construct fresh detectors before authorizing a remedy.
+    let mut decision_skipped = Vec::new();
     let mut supervision = pt_core::supervision::SupervisionDetector::for_scan();
 
     // Use filtered (and optionally sampled) processes for inference
@@ -37994,7 +38131,12 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
 
         // One scoring path for every surface: learned verdicts, signatures (and their
         // fast path), desktop-application ownership and provenance.
-        let Some(score) = scorer.score(proc, evidence) else {
+        let Some(score) = decision_or_record(
+            scorer.score(proc, evidence).ok_or("Process scoring unavailable"),
+            proc,
+            "scoring",
+            &mut decision_skipped,
+        ) else {
             continue;
         };
         let posterior_result = &score.posterior;
@@ -38038,14 +38180,18 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
 
         // The action and any further-probe advice use the same process-specific
         // loss model and evidence-only eligibility for destructive actions.
-        let inputs = match prepare_pressure_decision(
-            &posterior_result.posterior,
-            &decision_policy,
-            &feasibility,
-            &pressure.for_process(proc, activity.as_ref()),
-        ) {
-            Ok(inputs) => inputs,
-            Err(_) => continue,
+        let Some(inputs) = decision_or_record(
+            prepare_pressure_decision(
+                &posterior_result.posterior,
+                &decision_policy,
+                &feasibility,
+                &pressure.for_process(proc, activity.as_ref()),
+            ),
+            proc,
+            "pressure_decision",
+            &mut decision_skipped,
+        ) else {
+            continue;
         };
         let sequential_probe = pt_core::decision::decide_sequential(
             &posterior_result.posterior,
@@ -38862,9 +39008,13 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         }
     }
 
-    // Comparison is advisory: every candidate was freshly scanned and scored,
-    // and every executable action above passed the normal current safety policy.
+    // A failed decision in either session cannot establish a change in candidacy.
     let differential = differential_baseline.as_ref().map(|baseline| {
+        let config = DiffConfig {
+            decision_skipped_pids: baseline.inference.payload.decision_skipped.iter()
+                .chain(&decision_skipped).map(|record| record.pid).collect(),
+            ..Default::default()
+        };
         let comparison = compute_diff(
             &baseline.session_id,
             &session_id.0,
@@ -38872,11 +39022,11 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             &baseline.inference.payload.candidates,
             &persisted_inventory_records,
             &persisted_inference_records,
-            &DiffConfig::default(),
+            &config,
         );
         serde_json::json!({
             "advisory_only": true,
-            "plan_scope": "complete_fresh_plan",
+            "plan_scope": if decision_skipped.is_empty() { "complete_fresh_plan" } else { "partial_fresh_plan" },
             "comparison_scope": "stored_process_observations_to_current_returned_candidates",
             "absence_semantics": "Resolved means absent from current candidate observations; filtering or selection can cause absence, which does not establish process exit.",
             "baseline": {
@@ -39039,6 +39189,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         "threshold_used": args.min_posterior,
         "filter_used": args.only,
     });
+    record_decision_coverage(&mut summary, &decision_skipped);
     if global.shadow {
         summary["shadow_observations_recorded"] = serde_json::json!(shadow_recorded);
     }
@@ -39279,6 +39430,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     }
 
     let inf_artifact = InferenceArtifact {
+        decision_skipped: decision_skipped.clone(),
         candidate_count: persisted_inference_records.len(),
         candidates: persisted_inference_records,
     };
@@ -39300,8 +39452,14 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             ProgressEvent::new(pt_core::events::event_names::PLAN_READY, Phase::Plan)
                 .with_session_id(session_id.to_string())
                 .with_detail("plan_path", plan_path.display().to_string())
-                .with_detail("count", candidates.len()),
+                .with_detail("count", candidates.len())
+                .with_detail("decision_complete", decision_skipped.is_empty())
+                .with_detail("decision_skipped_count", decision_skipped.len()),
         );
+    }
+
+    if let Some(warning) = decision_warning(&decision_skipped) {
+        eprintln!("agent plan: {warning}");
     }
 
     // Handle --narrative flag (outputs prose regardless of format)
@@ -39321,16 +39479,12 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         if let Some(comparison) = &differential {
             println!("\n{}", agent_plan_differential_summary(comparison));
         }
-        return if candidates.is_empty() {
-            ExitCode::Clean
-        } else {
-            ExitCode::PlanReady
-        };
+        return plan_decision_exit(&decision_skipped, candidates.is_empty());
     }
 
     // Output based on format
     match global.format {
-        OutputFormat::Json => {
+        OutputFormat::Json | OutputFormat::Jsonl => {
             // Build output based on --minimal, --brief, and --pretty flags
             let mut output_json = if args.brief {
                 // Brief output: minimal fields + single-line rationale
@@ -39386,13 +39540,16 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 output_json["differential"] = comparison.clone();
             }
             if args.brief || args.minimal {
+                record_decision_coverage(&mut output_json["summary"], &decision_skipped);
                 output_json["agent_activity"] = agent_activity_output(&agent_activity, Some(10));
                 output_json["memory_limits"] = memory_limit_report(&responsible_units);
                 output_json["deep_collection"] = serde_json::json!(deep_collection);
             }
 
             // Apply pretty-printing or compact based on --pretty flag
-            let output_str = if args.pretty {
+            let output_str = if global.format == OutputFormat::Jsonl {
+                format_structured_output(global, output_json)
+            } else if args.pretty {
                 serde_json::to_string_pretty(&output_json).unwrap()
             } else {
                 // Use global.process_output for token-efficient processing if not pretty
@@ -39454,6 +39611,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 output_json["differential"] = comparison.clone();
             }
             if args.brief || args.minimal {
+                record_decision_coverage(&mut output_json["summary"], &decision_skipped);
                 output_json["agent_activity"] = agent_activity_output(&agent_activity, Some(10));
                 output_json["memory_limits"] = memory_limit_report(&responsible_units);
                 output_json["deep_collection"] = serde_json::json!(deep_collection);
@@ -39524,11 +39682,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     }
 
     // Return appropriate exit code
-    if candidates.is_empty() {
-        ExitCode::Clean // 0: nothing to do
-    } else {
-        ExitCode::PlanReady // 1: candidates exist, plan produced
-    }
+    plan_decision_exit(&decision_skipped, candidates.is_empty())
 }
 
 fn parse_explain_target(target: &str) -> Result<(u32, pt_common::StartId), String> {
@@ -45133,7 +45287,7 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
         }
     }
     match global.format {
-        OutputFormat::Json | OutputFormat::Toon => {
+        OutputFormat::Json | OutputFormat::Jsonl | OutputFormat::Toon => {
             // Extend report with respawn info if checked
             let mut output = verification_output;
             if args.check_respawn {
@@ -45572,16 +45726,18 @@ fn format_diff_plain(
     output
 }
 
-fn report_unverified_diff_pids(global: &GlobalOpts, count: usize) {
-    if count > 0
-        && !matches!(
-            global.format,
-            OutputFormat::Json | OutputFormat::Jsonl | OutputFormat::Toon | OutputFormat::Exitcode
-        )
-    {
-        eprintln!(
-            "Birth identity unavailable for {count} PID(s); their changes could not be determined."
-        );
+fn report_incomplete_diff(global: &GlobalOpts, unverified: usize, skipped: usize) {
+    if matches!(
+        global.format,
+        OutputFormat::Json | OutputFormat::Jsonl | OutputFormat::Toon | OutputFormat::Exitcode
+    ) {
+        return;
+    }
+    if unverified > 0 {
+        eprintln!("Birth identity unavailable for {unverified} PID(s); their changes could not be determined.");
+    }
+    if skipped > 0 {
+        eprintln!("Decision unavailable for {skipped} PID(s) in one or both sessions; their changes could not be determined.");
     }
 }
 
@@ -45614,7 +45770,16 @@ fn run_diff(global: &GlobalOpts, args: &DiffArgs) -> ExitCode {
         inference: compare_inference,
     } = compare;
 
-    let mut config = DiffConfig::default();
+    let mut config = DiffConfig {
+        decision_skipped_pids: base_inference
+            .payload
+            .decision_skipped
+            .iter()
+            .chain(&compare_inference.payload.decision_skipped)
+            .map(|record| record.pid)
+            .collect(),
+        ..Default::default()
+    };
     if let Some(min) = args.min_score_delta {
         config.score_drift_threshold = min;
     }
@@ -45637,7 +45802,11 @@ fn run_diff(global: &GlobalOpts, args: &DiffArgs) -> ExitCode {
         }
     };
 
-    report_unverified_diff_pids(global, diff.summary.unverified_pids.len());
+    report_incomplete_diff(
+        global,
+        diff.summary.unverified_pids.len(),
+        diff.summary.decision_skipped_pids.len(),
+    );
     let filtered_summary = summarize_deltas(&filtered_deltas);
     let report = generate_comparison_report(
         &diff,
@@ -46638,6 +46807,12 @@ fn run_agent_diff(global: &GlobalOpts, args: &AgentDiffArgs) -> ExitCode {
         }
     };
 
+    let decision_skipped_pids: BTreeSet<u32> = [&base_plan, &compare_plan]
+        .into_iter()
+        .filter_map(|plan| plan.pointer("/summary/decision_skipped")?.as_array())
+        .flatten()
+        .filter_map(|record| u32::try_from(record["pid"].as_u64()?).ok())
+        .collect();
     let unverified_pids = pt_core::session::diff::unverified_comparison_pids(
         base_candidates
             .iter()
@@ -46673,7 +46848,7 @@ fn run_agent_diff(global: &GlobalOpts, args: &AgentDiffArgs) -> ExitCode {
     let mut base_map: BTreeMap<(u32, String, u32), DiffCandidate> = BTreeMap::new();
     for cand in base_candidates
         .iter()
-        .filter(|c| !unverified_pids.contains(&c.pid))
+        .filter(|c| !unverified_pids.contains(&c.pid) && !decision_skipped_pids.contains(&c.pid))
     {
         base_map.insert(candidate_key(cand), cand.clone());
     }
@@ -46681,7 +46856,7 @@ fn run_agent_diff(global: &GlobalOpts, args: &AgentDiffArgs) -> ExitCode {
     let mut compare_map: BTreeMap<(u32, String, u32), DiffCandidate> = BTreeMap::new();
     for cand in compare_candidates
         .iter()
-        .filter(|c| !unverified_pids.contains(&c.pid))
+        .filter(|c| !unverified_pids.contains(&c.pid) && !decision_skipped_pids.contains(&c.pid))
     {
         compare_map.insert(candidate_key(cand), cand.clone());
     }
@@ -46851,6 +47026,7 @@ fn run_agent_diff(global: &GlobalOpts, args: &AgentDiffArgs) -> ExitCode {
         "summary": {
             "prior_candidates": base_candidates.len(),
             "unverified_pids": unverified_pids,
+            "decision_skipped_pids": decision_skipped_pids,
             "current_candidates": compare_candidates.len(),
             "new_count": new_list.len(),
             "worsened_count": worsened.len(),
@@ -46862,7 +47038,7 @@ fn run_agent_diff(global: &GlobalOpts, args: &AgentDiffArgs) -> ExitCode {
         },
     });
 
-    report_unverified_diff_pids(global, unverified_pids.len());
+    report_incomplete_diff(global, unverified_pids.len(), decision_skipped_pids.len());
 
     match global.format {
         OutputFormat::Json | OutputFormat::Toon => {

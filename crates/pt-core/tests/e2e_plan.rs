@@ -247,6 +247,7 @@ mod plan_differential {
                     records: vec![],
                 },
                 InferenceArtifact {
+                    decision_skipped: Vec::new(),
                     candidate_count: 0,
                     candidates: vec![],
                 },

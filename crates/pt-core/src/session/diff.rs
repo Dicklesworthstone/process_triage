@@ -118,6 +118,8 @@ pub struct DiffSummary {
     /// A missing native birth on either side prevents lifecycle comparisons for that PID.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub unverified_pids: BTreeSet<u32>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub decision_skipped_pids: BTreeSet<u32>,
     pub new_count: usize,
     pub resolved_count: usize,
     pub changed_count: usize,
@@ -133,6 +135,8 @@ pub struct DiffSummary {
 /// Thresholds for classifying changes.
 #[derive(Debug, Clone)]
 pub struct DiffConfig {
+    /// Unscored PIDs on either side cannot establish a change in candidacy.
+    pub decision_skipped_pids: BTreeSet<u32>,
     /// Minimum absolute score drift to classify as "changed" (vs unchanged).
     pub score_drift_threshold: u32,
     /// Always treat classification changes as "changed" regardless of score.
@@ -142,6 +146,7 @@ pub struct DiffConfig {
 impl Default for DiffConfig {
     fn default() -> Self {
         Self {
+            decision_skipped_pids: BTreeSet::new(),
             score_drift_threshold: 5,
             always_flag_classification_change: true,
         }
@@ -202,7 +207,7 @@ pub fn compute_diff(
 
     // Processes in new snapshot: either New or Changed/Unchanged.
     for (key, new_proc) in &new_proc_map {
-        if unverified_pids.contains(&new_proc.pid) {
+        if unverified_pids.contains(&new_proc.pid) || config.decision_skipped_pids.contains(&new_proc.pid) {
             continue;
         }
         let new_inf = new_inf_map.get(key);
@@ -243,7 +248,7 @@ pub fn compute_diff(
 
     // Processes only in old snapshot: Resolved.
     for (key, old_proc) in &old_proc_map {
-        if !unverified_pids.contains(&old_proc.pid) && !new_proc_map.contains_key(key) {
+        if !unverified_pids.contains(&old_proc.pid) && !config.decision_skipped_pids.contains(&old_proc.pid) && !new_proc_map.contains_key(key) {
             let old_inf = old_inf_map.get(key);
             deltas.push(ProcessDelta {
                 pid: old_proc.pid,
@@ -282,6 +287,7 @@ pub fn compute_diff(
         total_old: old_procs.len(),
         total_new: new_procs.len(),
         unverified_pids,
+        decision_skipped_pids: config.decision_skipped_pids.clone(),
         new_count: 0,
         resolved_count: 0,
         changed_count: 0,
@@ -513,6 +519,24 @@ mod tests {
             elapsed_secs: 100,
             identity_quality: "Full".to_string(),
         }
+    }
+
+    #[test]
+    fn decisions_skipped_on_either_side_do_not_create_lifecycle_changes() {
+        let old = vec![proc(1, "b:88:1"), proc(2, "b:88:2")];
+        let new = vec![proc(3, "b:88:3"), proc(4, "b:88:4")];
+        let config = DiffConfig {
+            decision_skipped_pids: [1, 3].into_iter().collect(),
+            ..Default::default()
+        };
+        let diff = compute_diff("old", "new", &old, &[], &new, &[], &config);
+        assert_eq!(
+            diff.summary.decision_skipped_pids,
+            config.decision_skipped_pids
+        );
+        assert_eq!(diff.summary.resolved_count, 1);
+        assert_eq!(diff.summary.new_count, 1);
+        assert!(diff.deltas.iter().all(|d| [2, 4].contains(&d.pid)));
     }
 
     #[test]

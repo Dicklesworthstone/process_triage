@@ -174,6 +174,7 @@ fn create_custom_session(
         session_id,
         "host-test",
         InferenceArtifact {
+            decision_skipped: Vec::new(),
             candidate_count: inferences.len(),
             candidates: inferences,
         },
@@ -688,6 +689,7 @@ fn diff_uses_validated_snapshots_from_one_host() {
         &compare,
         "host-test",
         InferenceArtifact {
+            decision_skipped: Vec::new(),
             candidate_count: 1,
             candidates: vec![inf(100, "b1:999:100", "abandoned", 90, "kill", 0.9)],
         },

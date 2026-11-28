@@ -134,9 +134,21 @@ pub struct PersistedInference {
     pub provenance_log_odds_shift: Option<f64>,
 }
 
+/// An observed process for which scoring or action selection failed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkippedDecision {
+    pub pid: u32,
+    pub uid: u32,
+    pub start_id: String,
+    pub stage: String,
+    pub reason: String,
+}
+
 /// Inference artifact: inference results for all candidates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceArtifact {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decision_skipped: Vec<SkippedDecision>,
     pub candidate_count: usize,
     pub candidates: Vec<PersistedInference>,
 }
@@ -1367,6 +1379,7 @@ mod tests {
 
     fn sample_inference() -> InferenceArtifact {
         InferenceArtifact {
+            decision_skipped: Vec::new(),
             candidate_count: 1,
             candidates: vec![PersistedInference {
                 pid: 1234,

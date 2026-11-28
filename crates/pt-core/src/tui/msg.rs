@@ -51,6 +51,7 @@ pub struct PressureUnit {
 /// Rows, pressure observations, and goal metadata from the same completed scan.
 #[derive(Debug, Clone, Default)]
 pub struct RefreshOutcome {
+    pub decision_warning: Option<String>,
     pub rows: Vec<ProcessRow>,
     pub pressure: Option<PressureOverview>,
     pub goal_summary: Option<Vec<String>>,

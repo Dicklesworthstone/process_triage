@@ -1582,6 +1582,7 @@ impl App {
                 } else {
                     self.set_status("Refreshing process list (skeleton mode)...");
                     let prior = RefreshOutcome {
+                        decision_warning: None,
                         rows: self.process_table.rows.clone(),
                         pressure: self.pressure.clone(),
                         goal_summary: self.goal_summary.clone(),
@@ -1621,13 +1622,19 @@ impl App {
                 }
                 self.operation = PendingOperation::Idle;
                 let count = outcome.rows.len();
+                let warning = outcome.decision_warning.clone();
                 self.replace_processes(outcome);
-                self.set_status(format!("Process list refreshed ({})", count));
-                self.push_toast(
-                    format!("Refreshed: {} processes", count),
-                    ToastIcon::Success,
-                    ToastStyle::Success,
-                );
+                if let Some(warning) = warning {
+                    self.set_status(warning.clone());
+                    self.push_toast(warning, ToastIcon::Warning, ToastStyle::Warning);
+                } else {
+                    self.set_status(format!("Process list refreshed ({count})"));
+                    self.push_toast(
+                        format!("Refreshed: {count} processes"),
+                        ToastIcon::Success,
+                        ToastStyle::Success,
+                    );
+                }
                 FtuiCmd::log(format!("refresh: complete (rows={})", count))
             }
             Msg::RefreshComplete {
@@ -3172,6 +3179,24 @@ mod tests {
     }
 
     #[test]
+    fn partial_refresh_keeps_rows_and_reports_the_missing_decision() {
+        let mut app = App::new();
+        app.set_refresh_op(Arc::new(|| {
+            Ok(RefreshOutcome {
+                decision_warning: Some(
+                    "Incomplete decisions (1 skipped). PID 316: invalid loss".into(),
+                ),
+                rows: vec![make_row(99)],
+                ..RefreshOutcome::default()
+            })
+        }));
+        let refresh = deferred_task(<App as FtuiModel>::update(&mut app, Msg::RequestRefresh));
+        <App as FtuiModel>::update(&mut app, refresh());
+        assert_eq!(app.process_table.rows[0].pid, 99);
+        assert!(app.status_message.as_deref().unwrap().contains("PID 316"));
+    }
+
+    #[test]
     fn test_refresh_complete_err() {
         let mut app = App::new();
         app.set_refresh_op(Arc::new(|| Err("network error".to_string())));
@@ -3189,6 +3214,7 @@ mod tests {
         };
         let mut app = App::new();
         app.replace_processes(RefreshOutcome {
+            decision_warning: None,
             rows: vec![kill_row(42), kill_row(99)],
             pressure: None,
             goal_summary: Some(vec!["old forecast".to_string()]),
@@ -3198,6 +3224,7 @@ mod tests {
         assert_eq!(app.process_table.get_selected(), vec![42]);
         app.set_refresh_op(Arc::new(move || {
             Ok(RefreshOutcome {
+                decision_warning: None,
                 rows: vec![kill_row(42), kill_row(99)],
                 pressure: None,
                 goal_summary: Some(vec!["new forecast".to_string()]),

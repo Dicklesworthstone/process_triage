@@ -578,6 +578,7 @@ mod tests {
             ],
         };
         let inf_a = InferenceArtifact {
+            decision_skipped: Vec::new(),
             candidate_count: 2,
             candidates: vec![
                 PersistedInference {
@@ -655,6 +656,7 @@ mod tests {
             ],
         };
         let inf_b = InferenceArtifact {
+            decision_skipped: Vec::new(),
             candidate_count: 2,
             candidates: vec![
                 PersistedInference {
