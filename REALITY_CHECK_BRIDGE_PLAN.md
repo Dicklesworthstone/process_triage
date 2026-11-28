@@ -1,5 +1,92 @@
 # Reality Check & Bridge Plan — process_triage (`pt`)
 
+## Revision 3 — live reality check, 2026-11-27
+
+Method: fast-forwarded `main` to `280859c`, read AGENTS.md and README in full, ran the
+**installed release v2.4.2** (what `install.sh` serves) end to end on this host, and
+had two read-only auditors check all 138 non-closed beads against code. Host: 16 CPUs,
+load 16-31, CPU PSI some 16-35 %, 62 GiB RAM with 37 GiB swap in use, 435-450
+processes, dozens of agent sessions and one live sshfs mount. The probing shell was
+pinned to a single CPU (mask 0x400). Plan → apply → verify ran in an isolated
+`PT_CONFIG_DIR`/`PROCESS_TRIAGE_DATA` against disposable processes only.
+
+### Verdict
+
+`pt` works and is useful as a **safe hygiene tool**; the agent loop that revision 2
+reported broken now works. It is not yet safe for unattended robot use on hosts with
+FUSE mounts, and the release users install lags HEAD by 113 commits and crashes on
+every `pt report`.
+
+### Working (verified live, not from code reading)
+
+| Capability | Evidence |
+|---|---|
+| Plan on a busy host | 435 processes, 335 protected by 13 named rules, 37 evaluated, 19 returned; 4.9 s wall, 55 MB RSS, exit 1 = PlanReady |
+| Finds real junk | two 76 h stuck tmux `__apply_plugins` pipelines (10 processes); orphaned Claude Code `ugrep` and `tail -F` from a dead session; a 40 h orphaned `next dev` pair |
+| Leaves active work alone | all CPU load came from young rustc/biome/python processes; none was a candidate |
+| plan → apply → verify | clean-env orphan with a user signature prior: plan `kill`, apply exit 2 (SIGTERM honoured, no SIGKILL), verify `confirmed_dead`, overall success |
+| Guardrails refuse with reasons | `min_age_breach` ("process age 315s is below minimum 1800s"); `check_agent_supervision` for inherited Claude Code env; `check_session_safety` for a session leader |
+| MCP server | initialize, 7 tools, `pt_capabilities` and `pt_scan` succeed |
+| TUI | renders search, table, KILL/REVIEW classes, evidence detail pane (160x45 pty) |
+| Bundles | `bundle create` (safe) and the encrypted `PTBENC01` envelope; a wrong passphrase fails closed (exit 20) |
+| Doctor | real host findings: vfs_cache_pressure 200, no systemd-oomd, `/` at 7.7 % free |
+
+Manual ground truth for the 19 candidates: ~14 true positives, 5 false positives, and
+4 of the false positives carried an unsafe action.
+
+### Broken or misleading (beads under epic `bd-37xh`)
+
+| Bead | P | Finding |
+|---|---|---|
+| bd-37xh.1 | 0 | `pause` recommended for 4 live sshfs `ssh -s sftp` transports (ppid 1, score 99); `ss -xp` proves each is the socketpair peer of sshfs 621275. SIGSTOP hangs every accessor of the mount; robot gates would all pass. No FUSE-transport logic exists at HEAD. |
+| bd-37xh.2 | 0 | Every release `pt report` aborts: `minify-js 0.6` panic, exit 134. Minification was compiled out of debug builds, so the green suite never ran the shipped path. `minify-html` 0.17+ cannot be adopted while ftui is in the graph (`oxc` pins `bumpalo =3.19.0`; ftui needs `^3.19.1`). |
+| bd-37xh.8 | 0 | README documents HEAD; installer serves v2.4.2 (no `report --bundle`, no `agent undo --all`). All 8 CI workflows `disabled_manually` since 2026-08-12. |
+| bd-37xh.3 | 1 | `pt doctor` divides host load by the caller's affinity/quota: "load 28.5x the CPU count" on a 16-CPU host (plan said 16 cores). |
+| bd-37xh.4 | 1 | Plan lists executable `kill` for session leaders; apply refuses every one. |
+| bd-37xh.5 | 1 | `Err(_) => continue` drops candidates silently when the pressure decision fails. |
+| bd-37xh.6 | 1 | TUI writes tracing JSON and ~50 "budget exhausted" warnings onto its own terminal. |
+| bd-37xh.7 | 1 | MCP `pt_scan` default is 1.5 MB (1.0 MB untruncated argv); `agent plan --format json` is 1.5 MB for 19 candidates. |
+| bd-37xh.10 | 2 | `agent sessions --detail` prints `(?)` for every command. |
+| bd-37xh.9 | 2 | 15 audit-reported defects to reproduce, then fix or reject. |
+| bd-37xh.11 | 1 | Generalize .4: planner predicts every refusal knowable at plan time. |
+| bd-37xh.12 | 1 | Seed the WS0 false-positive corpus with this machine class. |
+
+### Bead landscape (static audit, 138 non-closed beads)
+
+| Verdict | Count |
+|---|---|
+| DONE_IN_CODE (false-open: implemented and tested) | 12 |
+| NEEDS_LIVE_PROOF (code + tests; needs host/root/macOS/CI run) | 17 |
+| PARTIAL | 83 |
+| NOT_DONE | 26 |
+
+334 commits landed after 2026-10-07 with almost no bead references and only 4 bead
+closures, so the graph stopped describing the code. Revision 2's P0 "plan→apply
+contract broken" (WS11.1) is resolved, verified live.
+
+### Would finishing every open bead close the gap?
+
+No. No open bead covered any of the defects above; they surfaced only by running the
+release on a real host. The structural gaps from revision 2 remain: no measured
+false-positive corpus (WS0 NOT_DONE: no fleet fixtures, no must_not_flag gate), so
+"never flags protected things" is unmeasured and the sshfs case shows it is false;
+and no CI, so release builds are never exercised.
+
+### How to make it more useful (by leverage)
+
+1. Ship: land the two P0s, re-enable CI with a release-profile smoke that runs
+   `pt report`, cut a release, keep the README on the release.
+2. Measure false positives on real hosts (bd-37xh.12 → WS0); the sshfs transport is
+   the first fixture.
+3. Peer liveness for daemonized helpers (bd-37xh.1, bd-bjrh.1): resolve unix socket
+   peers via sock_diag. sshfs, rclone, gvfs and ssh-agent-style helpers orphan
+   children by design.
+4. Make cleanup actionable: the default loss matrix answers `pause` for 76 h stuck
+   pipelines, and a paused abandoned process still holds memory and fds (comment on
+   bd-zi8p.1).
+5. Agent ergonomics: byte budgets, argv truncation, brief plans for MCP, quiet stderr,
+   plan/apply parity (bd-37xh.7, .11).
+
 ## Publication and next work — 2026-10-06 18:44 UTC
 
 The latest owner reply, "OK, so please do everything you think is advisable based
