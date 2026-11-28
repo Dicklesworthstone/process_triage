@@ -55,7 +55,7 @@ Manual ground truth for the 19 candidates: ~14 true positives, 5 false positives
 
 | Verdict | Count |
 |---|---|
-| DONE_IN_CODE (false-open: implemented and tested) | 12 |
+| DONE_IN_CODE (implementation and a cited test exist; left open with an evidence comment, see below) | 12 |
 | NEEDS_LIVE_PROOF (code + tests; needs host/root/macOS/CI run) | 17 |
 | PARTIAL | 83 |
 | NOT_DONE | 26 |
@@ -63,6 +63,35 @@ Manual ground truth for the 19 candidates: ~14 true positives, 5 false positives
 335 commits landed after 2026-10-07 (to `280859c`) with almost no bead references and
 only 2 bead closures, so the graph stopped describing the code. Revision 2's P0 "plan→apply
 contract broken" (WS11.1) is resolved, verified live.
+
+None of the 12 was closed: 10 cited tests passed, 2 apply-path tests failed in the
+root rch worker environment, and several beads carry criteria beyond those tests.
+
+### Build and test state after harmonizing (2026-11-28)
+
+`origin/main` (`ae44ad6`) did not compile: `a672222` (2026-11-26) referenced a
+`config::validation` module removed in `7eac120`, and three later test/code sites had
+never been compiled. After the fixes in this revision, workspace `cargo clippy
+--all-targets -D warnings`, `cargo fmt --check`, the lean build and a release build pass
+on nightly-2026-11-26. Workspace tests on a root rch worker: 8,934 passed, 77 failed,
+26 ignored. Every failure is in pt-core, and the dependency-affected crates (pt-bundle,
+pt-redact, pt-report) pass completely. The dominant failure causes are environmental or
+predate this revision: supervision ancestry capped at depth 20 on the worker's deep
+process tree; apply tests that hand-build plans without posteriors, refused by the
+Bayesian FDR gate that `bdb41fb` enforces at apply; uid-0 permission assumptions;
+config-lock contention; evidence budgets under load.
+
+Baseline for attribution: `280859c` plus only the one-line compile fix, on the old
+toolchain and old dependencies, pinned to the same root worker (vmi1152480): 7,708
+passed, 79 failed (77 unique). 64 failing tests are shared with the revised tree; 13
+baseline failures pass after this revision. The 11 that fail only on the revised tree
+are parallel-test lock contention ("cannot replace a plan while another command is
+executing", 6 occurrences in the baseline log as well), load-budget flakes, the
+depth-20 ancestry signature, and one shared-port test whose code `2f60c44` rewrote
+after `280859c`. None traces to this revision's edits, which are behaviour-preserving
+outside the four documented fixes. Raising the supervision and session ancestry caps
+from 20 to 64 (`14b5847`, matching the lineage/protection walks) targets the dominant
+environmental cause.
 
 ### Would finishing every open bead close the gap?
 
