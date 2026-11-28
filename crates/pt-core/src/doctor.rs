@@ -1895,21 +1895,28 @@ mod tests {
         let host = host_logical_cpus();
         assert!(host > 0, "a Linux host reports its logical CPUs");
         let (own, seen_by_doctor) = std::thread::spawn(|| {
-            let size = std::mem::size_of::<libc::cpu_set_t>();
-            // SAFETY: cpu_set_t is a plain bitmask and all-zero is the empty set.
-            let mut allowed: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-            // SAFETY: pid 0 names the calling thread and `allowed` holds `size` bytes.
-            assert_eq!(unsafe { libc::sched_getaffinity(0, size, &mut allowed) }, 0);
-            let first = (0..libc::CPU_SETSIZE as usize)
-                // SAFETY: `cpu` is below CPU_SETSIZE and `allowed` is initialized.
-                .find(|&cpu| unsafe { libc::CPU_ISSET(cpu, &allowed) })
+            // cpu_set_t is an array of unsigned-long words (glibc __cpu_mask) in
+            // which CPU n is bit n % BITS of word n / BITS. A zero-initialized
+            // word array has its exact size and alignment.
+            type Word = libc::c_ulong;
+            const BITS: usize = Word::BITS as usize;
+            const WORDS: usize =
+                std::mem::size_of::<libc::cpu_set_t>() / std::mem::size_of::<Word>();
+            let size = std::mem::size_of::<[Word; WORDS]>();
+            assert_eq!(size, std::mem::size_of::<libc::cpu_set_t>());
+            let mut allowed: [Word; WORDS] = [0; WORDS];
+            // SAFETY: pid 0 names the calling thread; `allowed` is `size` writable
+            // bytes with cpu_set_t's word layout and alignment.
+            let rc = unsafe { libc::sched_getaffinity(0, size, allowed.as_mut_ptr().cast()) };
+            assert_eq!(rc, 0);
+            let first = (0..WORDS * BITS)
+                .find(|&cpu| allowed[cpu / BITS] & (1 << (cpu % BITS)) != 0)
                 .expect("the thread may run on at least one CPU");
-            // SAFETY: as above; `single` starts as the empty set.
-            let mut single: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-            // SAFETY: `first` is below CPU_SETSIZE.
-            unsafe { libc::CPU_SET(first, &mut single) };
-            // SAFETY: pid 0 names this thread and `single` holds `size` bytes.
-            assert_eq!(unsafe { libc::sched_setaffinity(0, size, &single) }, 0);
+            let mut single: [Word; WORDS] = [0; WORDS];
+            single[first / BITS] |= 1 << (first % BITS);
+            // SAFETY: pid 0 names this thread; `single` is `size` readable bytes.
+            let rc = unsafe { libc::sched_setaffinity(0, size, single.as_ptr().cast()) };
+            assert_eq!(rc, 0);
             (
                 std::thread::available_parallelism().map_or(0, |n| n.get()),
                 host_logical_cpus(),
