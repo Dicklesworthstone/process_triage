@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::goal_parser::{Comparator, Goal, Metric, ResourceTarget};
 use crate::collect::disk::DiskMountObservation;
 
 /// Metric snapshot (before or after action application).
@@ -252,12 +253,160 @@ fn compute_expected_total(outcomes: &[ActionOutcome]) -> Result<f64, &'static st
     Ok(total)
 }
 
+/// Attainment of the user's requested goal against execution-bound observations.
+/// A null verdict means a missing measurement could still change the answer.
+#[derive(Debug, Serialize)]
+pub struct GoalAttainment {
+    pub met: Option<bool>,
+    pub targets: Vec<TargetAttainment>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TargetAttainment {
+    pub target: ResourceTarget,
+    pub observation: &'static str,
+    pub observed: Option<serde_json::Value>,
+    pub met: Option<bool>,
+    pub unavailable_reason: Option<&'static str>,
+}
+
+/// Preserve a known 'false' in AND and a known 'true' in OR even when another
+/// target is unmeasured. Compare all the original OR branches, including ones
+/// the optimizer did not choose. Qualitative pressure relief has no threshold.
+pub fn assess_goal(
+    goal: &Goal,
+    snapshots: Result<(&MetricSnapshot, &MetricSnapshot), &'static str>,
+    port_occupied: impl Fn(u16) -> Option<bool>,
+) -> Option<GoalAttainment> {
+    let (parts, any) = match goal {
+        Goal::Relieve(_) => return None,
+        Goal::Target(_) => (std::slice::from_ref(goal), false),
+        Goal::And(parts) => (parts.as_slice(), false),
+        Goal::Or(parts) => (parts.as_slice(), true),
+    };
+    let mut targets = Vec::with_capacity(parts.len());
+    for part in parts {
+        let Goal::Target(target) = part else {
+            return None;
+        };
+        let (metric, observation) = match (target.metric, target.comparator) {
+            (Metric::Cpu, Comparator::ReduceBelow) => (GoalMetric::Cpu, "after_busy_cpu_fraction"),
+            (Metric::ProcessCount, Comparator::ReduceBelow) => {
+                (GoalMetric::ProcessCount, "after_process_count")
+            }
+            (Metric::Memory, _) => (GoalMetric::Memory, "available_memory_increase_bytes"),
+            (Metric::Disk, _) => (GoalMetric::Disk, "available_disk_increase_bytes"),
+            (Metric::Cpu, _) => (GoalMetric::Cpu, "busy_cpu_reduction_fraction"),
+            (Metric::FileDescriptors, _) => (GoalMetric::FileDescriptors, "fd_count_reduction"),
+            (Metric::ProcessCount, _) => (GoalMetric::ProcessCount, "process_count_reduction"),
+            (Metric::Port, _) => (GoalMetric::Port, "after_port_occupied"),
+        };
+        let outcome = snapshots.and_then(|(before, after)| {
+            if !target.value.is_finite() || target.value < 0.0 {
+                return Err("Invalid goal threshold");
+            }
+            if !before.timestamp.is_finite()
+                || !after.timestamp.is_finite()
+                || after.timestamp <= before.timestamp
+            {
+                return Err("The execution observation window is unordered");
+            }
+            if metric == GoalMetric::Port {
+                let occupied = target
+                    .port
+                    .and_then(&port_occupied)
+                    .ok_or("No comparable binding observation for this port")?;
+                return Ok((serde_json::Value::Bool(occupied), !occupied));
+            }
+            let amount = match (target.metric, target.comparator) {
+                (Metric::ProcessCount, Comparator::ReduceBelow) => Amount::Count(i128::from(
+                    after
+                        .process_count
+                        .ok_or("No complete process census after application")?,
+                )),
+                (Metric::Cpu, Comparator::ReduceBelow) => Amount::Fraction(
+                    after
+                        .total_cpu_frac
+                        .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+                        .ok_or("No valid host CPU window after application")?,
+                ),
+                _ => observed_amount(metric, None, before, after)?,
+            };
+            let met = match (amount, target.comparator) {
+                (Amount::Count(n), Comparator::ReduceBelow) => n <= target.value.floor() as i128,
+                (Amount::Count(n), _) => n >= target.value.ceil() as i128,
+                (Amount::Fraction(v), Comparator::ReduceBelow) => v <= target.value,
+                (Amount::Fraction(v), _) => v >= target.value,
+            };
+            Ok((amount.json(), met))
+        });
+        let (observed, met, unavailable_reason) = match outcome {
+            Ok((value, met)) => (Some(value), Some(met), None),
+            Err(reason) => (None, None, Some(reason)),
+        };
+        targets.push(TargetAttainment {
+            target: target.clone(),
+            observation,
+            observed,
+            met,
+            unavailable_reason,
+        });
+    }
+    let met = if targets.iter().any(|target| target.met == Some(any)) {
+        Some(any)
+    } else if !targets.is_empty() && targets.iter().all(|target| target.met.is_some()) {
+        Some(!any)
+    } else {
+        None
+    };
+    Some(GoalAttainment { met, targets })
+}
+
+#[derive(Clone, Copy)]
+enum Amount {
+    Count(i128),
+    Fraction(f64),
+}
+
+impl Amount {
+    fn as_f64(self) -> f64 {
+        match self {
+            Self::Count(n) => n as f64,
+            Self::Fraction(v) => v,
+        }
+    }
+
+    fn json(self) -> serde_json::Value {
+        match self {
+            Self::Count(n) => {
+                // Preserve exact integer recovery, including a decline exceeding
+                // the signed JSON integer range on very large filesystems.
+                i64::try_from(n)
+                    .map(serde_json::Value::from)
+                    .ok()
+                    .or_else(|| u64::try_from(n).ok().map(serde_json::Value::from))
+                    .unwrap_or_else(|| serde_json::Value::String(n.to_string()))
+            }
+            Self::Fraction(v) => serde_json::Value::from(v),
+        }
+    }
+}
+
 fn compute_observed_delta(
     metric: GoalMetric,
     target_port: Option<u16>,
     before: &MetricSnapshot,
     after: &MetricSnapshot,
 ) -> Result<f64, &'static str> {
+    observed_amount(metric, target_port, before, after).map(Amount::as_f64)
+}
+
+fn observed_amount(
+    metric: GoalMetric,
+    target_port: Option<u16>,
+    before: &MetricSnapshot,
+    after: &MetricSnapshot,
+) -> Result<Amount, &'static str> {
     if !before.timestamp.is_finite()
         || !after.timestamp.is_finite()
         || after.timestamp <= before.timestamp
@@ -273,7 +422,7 @@ fn compute_observed_delta(
             let after = after
                 .available_memory_bytes
                 .ok_or("Available memory was not observed after application")?;
-            Ok((i128::from(after) - i128::from(before)) as f64)
+            Ok(Amount::Count(i128::from(after) - i128::from(before)))
         }
         GoalMetric::Cpu => {
             // CPU reduction = before_cpu - after_cpu.
@@ -290,7 +439,7 @@ fn compute_observed_delta(
             {
                 return Err("CPU observations must be finite host utilization fractions in [0, 1]");
             }
-            Ok(before - after)
+            Ok(Amount::Fraction(before - after))
         }
         GoalMetric::Port => {
             let before_ports = before
@@ -305,16 +454,18 @@ fn compute_observed_delta(
                 let was_occupied = before_ports.contains(&port);
                 let is_occupied = after_ports.contains(&port);
                 if was_occupied && !is_occupied {
-                    Ok(1.0)
+                    Ok(Amount::Count(1))
                 } else {
-                    Ok(0.0)
+                    Ok(Amount::Count(0))
                 }
             } else {
                 let before_ports: std::collections::HashSet<u16> =
                     before_ports.iter().copied().collect();
                 let after_ports: std::collections::HashSet<u16> =
                     after_ports.iter().copied().collect();
-                Ok(before_ports.difference(&after_ports).count() as f64)
+                Ok(Amount::Count(
+                    before_ports.difference(&after_ports).count() as i128
+                ))
             }
         }
         GoalMetric::FileDescriptors => {
@@ -325,7 +476,7 @@ fn compute_observed_delta(
             let after = after
                 .total_fds
                 .ok_or("A complete file-descriptor total is unavailable after application")?;
-            Ok((i128::from(before) - i128::from(after)) as f64)
+            Ok(Amount::Count(i128::from(before) - i128::from(after)))
         }
         GoalMetric::ProcessCount => {
             let before = before
@@ -336,7 +487,7 @@ fn compute_observed_delta(
                 .ok_or("A complete process census is unavailable after application")?;
             // Preserve growth as negative progress: concurrent spawns and
             // unreaped zombies can defeat the forecast even after a valid kill.
-            Ok((i128::from(before) - i128::from(after)) as f64)
+            Ok(Amount::Count(i128::from(before) - i128::from(after)))
         }
         GoalMetric::Disk => {
             let before = before
@@ -380,7 +531,7 @@ fn compute_observed_delta(
             // A concurrent writer can consume more space than the selected
             // processes released. Preserve that loss; this is a filesystem
             // observation, not proof of the actions' causal contribution.
-            Ok((i128::from(after) - i128::from(before)) as f64)
+            Ok(Amount::Count(i128::from(after) - i128::from(before)))
         }
     }
 }
@@ -439,6 +590,118 @@ fn diagnose_causes(outcomes: &[ActionOutcome], class: DiscrepancyClass) -> Vec<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn requested_threshold_is_independent_of_a_correct_forecast() {
+        let before = make_before();
+        let after = make_after_good();
+        let predicted = measure_progress(
+            GoalMetric::Memory,
+            None,
+            &before,
+            &after,
+            make_outcomes(1_000_000_000.0, true, false),
+            &ProgressConfig::default(),
+            None,
+        );
+        assert_eq!(predicted.classification, DiscrepancyClass::AsExpected);
+        let goal = super::super::goal_parser::parse_goal("free 4GB RAM").unwrap();
+        let report = assess_goal(&goal, Ok((&before, &after)), |_| None).unwrap();
+        assert_eq!(report.met, Some(false));
+        assert_eq!(
+            report.targets[0].observed,
+            Some(serde_json::json!(1_000_000_000))
+        );
+    }
+
+    #[test]
+    fn assessment_uses_absolute_limits_and_actual_port_state() {
+        let before = make_before();
+        let mut after = make_after_good();
+        after.process_count = Some(100);
+        for (text, expected) in [
+            ("processes < 100", Some(false)),
+            ("processes <= 100", Some(true)),
+            ("free 1 process", Some(false)),
+            ("CPU <= 50%", Some(true)),
+            ("free 40% CPU", Some(false)),
+            ("free 500 FDs", Some(true)),
+            ("free-disk 2GB", Some(false)),
+            ("free port 4040", Some(true)),
+        ] {
+            let goal = super::super::goal_parser::parse_goal(text).unwrap();
+            // Already free is a satisfied port target. Requested binding evidence
+            // includes connected sockets that a listener-only aggregate misses.
+            let report = assess_goal(&goal, Ok((&before, &after)), |p| {
+                (p == 4040).then_some(false)
+            })
+            .unwrap();
+            assert_eq!(report.met, expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn missing_measurements_only_mask_undecided_composites() {
+        let before = make_before();
+        let mut after = make_after_good();
+        after.total_cpu_frac = None;
+        for (text, expected) in [
+            ("free 4GB RAM AND CPU <= 50%", Some(false)),
+            ("free 1MB RAM AND CPU <= 50%", None),
+            ("free 4GB RAM OR CPU <= 50%", None),
+            ("CPU <= 50% OR free port 4040", Some(true)),
+            ("free 4GB RAM OR free port 8080", Some(false)),
+        ] {
+            let goal = super::super::goal_parser::parse_goal(text).unwrap();
+            let report =
+                assess_goal(&goal, Ok((&before, &after)), |port| Some(port == 8080)).unwrap();
+            assert_eq!(report.met, expected, "{text}");
+            assert_eq!(report.targets.len(), 2);
+            let preview =
+                assess_goal(&goal, Err("not executed"), |_| panic!("unbound port")).unwrap();
+            assert_eq!(preview.met, None);
+            assert!(preview
+                .targets
+                .iter()
+                .all(|t| t.unavailable_reason == Some("not executed")));
+        }
+    }
+
+    #[test]
+    fn disk_mount_change_reversed_windows_and_rounding_do_not_prove_attainment() {
+        let before = make_before();
+        let mut after = make_after_good();
+        after.disk_space.as_mut().unwrap().identity.mount_id += 1;
+        let disk = super::super::goal_parser::parse_goal("free-disk 1MB").unwrap();
+        assert_eq!(
+            assess_goal(&disk, Ok((&before, &after)), |_| None)
+                .unwrap()
+                .met,
+            None
+        );
+        after.timestamp = before.timestamp;
+        let absolute = super::super::goal_parser::parse_goal("processes <= 100").unwrap();
+        assert_eq!(
+            assess_goal(&absolute, Ok((&before, &after)), |_| None)
+                .unwrap()
+                .met,
+            None
+        );
+
+        let mut before = make_before();
+        before.available_memory_bytes = Some(0);
+        let mut after = make_after_good();
+        let threshold = 1_u64 << 54;
+        after.available_memory_bytes = Some(threshold - 1);
+        let goal =
+            super::super::goal_parser::parse_goal(&format!("free {threshold}B RAM")).unwrap();
+        let report = assess_goal(&goal, Ok((&before, &after)), |_| None).unwrap();
+        assert_eq!(report.met, Some(false));
+        assert_eq!(
+            report.targets[0].observed,
+            Some(serde_json::json!(threshold - 1))
+        );
+    }
 
     fn disk_observation(available_bytes: u64) -> DiskMountObservation {
         DiskMountObservation {

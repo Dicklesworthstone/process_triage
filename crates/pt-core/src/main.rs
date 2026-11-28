@@ -26868,7 +26868,9 @@ mod process_tree_safety_tests {
                 .optimize_with_limit("free port 3000", 0.0, &resources, 1)
                 .unwrap();
             assert_eq!(fixture.rows.len(), 1);
-            assert!([200, 300].contains(&fixture.rows[0].pid));
+            // Neither holder earns partial release credit, so the unranked rows
+            // retain their original order under this display limit.
+            assert_eq!(fixture.rows[0].pid, 100);
             assert!(!output.result.feasible);
             assert!(output.selected_pids.is_empty());
             assert_eq!(output.result.total_contributions, [0.0]);
@@ -35674,6 +35676,25 @@ mod planning_pressure_tests {
     }
 
     #[test]
+    fn apply_attainment_reads_the_original_request_and_keeps_unmeasured_goals_unknown() {
+        let document = serde_json::json!({
+            "args": {"goal": "free port 8080 OR free 8GB RAM"},
+            "goal_summary": {"targets": [{"resource": "memory_mb"}]}
+        });
+        let report = saved_goal_attainment(&document, Err("not executed"), &[]).unwrap();
+        assert_eq!(report["goal"], "free port 8080 OR free 8GB RAM");
+        assert_eq!(report["targets"].as_array().unwrap().len(), 2);
+        assert!(report["met"].is_null());
+        assert_eq!(report["targets"][0]["unavailable_reason"], "not executed");
+
+        for goal in [serde_json::json!({"goal":"relieve"}), serde_json::json!({})] {
+            assert!(saved_goal_attainment(&goal, Err("not executed"), &[]).is_none());
+        }
+        let old = serde_json::json!({"goal": "unrecognized legacy expression"});
+        assert!(saved_goal_attainment(&old, Err("not executed"), &[]).unwrap()["met"].is_null());
+    }
+
+    #[test]
     fn requested_ports_preserve_or_branches_and_read_older_targets() {
         let document = serde_json::json!({
             "goal": "free port 8080 OR free port 3000",
@@ -40272,6 +40293,47 @@ fn precheck_label_for_apply(check: &pt_core::plan::PreCheck) -> &'static str {
     }
 }
 
+fn saved_goal_text(document: &serde_json::Value) -> Option<&str> {
+    ["/goal", "/args/goal", "/goal_summary/goal"]
+        .iter()
+        .find_map(|path| document.pointer(path)?.as_str())
+}
+
+fn saved_goal_attainment(
+    document: &serde_json::Value,
+    snapshots: Result<(&MetricSnapshot, &MetricSnapshot), &'static str>,
+    ports: &[RequestedPortProgress],
+) -> Option<serde_json::Value> {
+    let text = saved_goal_text(document)?;
+    match parse_goal(text) {
+        Ok(goal) => {
+            let report = goal_progress::assess_goal(&goal, snapshots, |port| {
+                ports
+                    .iter()
+                    .find(|reading| reading.port == port)?
+                    .after_occupied
+            })?;
+            Some(serde_json::json!({"goal": text, "met": report.met, "targets": report.targets}))
+        }
+        Err(error) => Some(serde_json::json!({
+            "goal": text, "met": null, "targets": [], "unavailable_reason": error.to_string()
+        })),
+    }
+}
+
+fn print_goal_attainment(attainment: Option<&serde_json::Value>) {
+    if let Some(report) = attainment {
+        let verdict = match report["met"].as_bool() {
+            Some(true) => "met",
+            Some(false) => "unmet",
+            None => "unmeasured",
+        };
+        if let Some(goal) = report["goal"].as_str() {
+            println!("Goal {verdict}: {goal}");
+        }
+    }
+}
+
 fn saved_goal_ports(document: &serde_json::Value) -> BTreeSet<u16> {
     fn collect(goal: &Goal, ports: &mut BTreeSet<u16>) {
         match goal {
@@ -40289,9 +40351,7 @@ fn saved_goal_ports(document: &serde_json::Value) -> BTreeSet<u16> {
 
     // An OR plan's optimized targets contain only its winning branch.
     let mut ports = BTreeSet::new();
-    let goal = ["/goal", "/args/goal", "/goal_summary/goal"]
-        .iter()
-        .find_map(|path| document.pointer(path)?.as_str());
+    let goal = saved_goal_text(document);
     if let Some(goal) = goal.and_then(|text| parse_goal(text).ok()) {
         collect(&goal, &mut ports);
     } else if let Some(targets) = document
@@ -41701,6 +41761,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             &resumed_outcomes,
             resume_validated_at,
             &requested_ports,
+            &saved_document,
         );
         return ExitCode::Clean;
     }
@@ -43547,7 +43608,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     let (mut after_snapshot, after_bindings) =
         capture_metric_snapshot_for_goal_progress(after_scan_processes, &requested_ports);
     after_snapshot.disk_space = disk_goal_mount.as_ref().map(observe_disk_goal_mount);
-    let port_windows_comparable = attach_measured_goal_resources(
+    let goal_windows_comparable = attach_measured_goal_resources(
         &mut before_snapshot,
         &mut after_snapshot,
         resource_observation.as_ref(),
@@ -43771,9 +43832,24 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         &before_bindings,
         &after_bindings,
         planning_only,
-        port_windows_comparable,
+        goal_windows_comparable,
+    );
+    let attainment_snapshots = if planning_only {
+        Err("No executed attempt in this apply")
+    } else if goal_evidence_error.is_some() {
+        Err("Execution evidence is inconsistent")
+    } else if !goal_windows_comparable {
+        Err("No comparable observation windows bound to this execution")
+    } else {
+        Ok((&before_snapshot, &after_snapshot))
+    };
+    let attainment = saved_goal_attainment(
+        &saved_document,
+        attainment_snapshots,
+        &requested_port_results,
     );
     let goal_progress_payload = serde_json::json!({
+        "goal_attainment": attainment,
         "requested_ports": requested_port_results,
         "requested_port_scope": "local_endpoints_visible_in_observer_network_namespace_tcp_tcp6_udp_udp6_tables",
         "session_id": sid.0,
@@ -43982,6 +44058,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         global.format,
         OutputFormat::Json | OutputFormat::Jsonl | OutputFormat::Toon | OutputFormat::Exitcode
     ) {
+        print_goal_attainment(attainment.as_ref());
         for port in &requested_port_results {
             println!("Port {} {}", port.port, port.status.replace('_', " "));
         }
@@ -44389,6 +44466,7 @@ fn output_apply_nothing(
     resumed_outcomes: &[pt_core::verify::SavedActionOutcome],
     resume_validated_at: Option<chrono::DateTime<chrono::Utc>>,
     requested_ports: &BTreeSet<u16>,
+    document: &serde_json::Value,
 ) {
     let mut result = serde_json::json!({
         "session_id": sid.0,
@@ -44401,10 +44479,12 @@ fn output_apply_nothing(
         "resume_validated_at": resume_validated_at,
         "resume_evidence_scope": "historical_execution_completion_not_current_postcondition",
     });
-    if !requested_ports.is_empty() {
+    let attainment = saved_goal_attainment(document, Err("No executed attempt in this apply"), &[]);
+    if !requested_ports.is_empty() || attainment.is_some() {
         let bindings = RequestedPortBindings::default();
         result["goal_progress"] = serde_json::json!({
             "planning_only": true,
+            "goal_attainment": attainment,
             "requested_port_scope": "local_endpoints_visible_in_observer_network_namespace_tcp_tcp6_udp_udp6_tables",
             "requested_ports": requested_port_progress(requested_ports, &bindings, &bindings, true, false),
         });
@@ -44418,11 +44498,10 @@ fn output_apply_nothing(
         }
         OutputFormat::Jsonl => println!("{}", global.process_output_value(result)),
         OutputFormat::Exitcode => {}
-        _ => println!(
-            "[{}] apply: nothing to do; {} previously completed actions",
-            sid,
-            resumed_outcomes.len()
-        ),
+        _ => {
+            println!("[{}] apply: nothing to do; {} previously completed actions", sid, resumed_outcomes.len());
+            print_goal_attainment(attainment.as_ref());
+        }
     }
 }
 
