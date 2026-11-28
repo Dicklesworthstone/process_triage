@@ -4,7 +4,7 @@
 //! reports between two session snapshots.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use super::diff::{DeltaKind, DiffSummary, SessionDiff};
 use super::snapshot_persist::PersistedInference;
@@ -116,8 +116,10 @@ pub fn generate_comparison_report(
     old_inferences: &[PersistedInference],
     new_inferences: &[PersistedInference],
 ) -> ComparisonReport {
-    let class_dist = compute_class_distribution(old_inferences, new_inferences);
-    let action_dist = compute_action_distribution(old_inferences, new_inferences);
+    // A missing decision on either side cannot establish a class or action trend.
+    let skipped = &diff.summary.decision_skipped_pids;
+    let class_dist = compute_class_distribution(old_inferences, new_inferences, skipped);
+    let action_dist = compute_action_distribution(old_inferences, new_inferences, skipped);
     let recurring = find_recurring_offenders(diff, old_inferences, new_inferences);
     let drift = compute_drift_summary(diff, old_inferences, new_inferences);
 
@@ -133,12 +135,16 @@ pub fn generate_comparison_report(
     }
 }
 
-fn count_by<F>(inferences: &[PersistedInference], key_fn: F) -> HashMap<String, usize>
+fn count_by<F>(
+    inferences: &[PersistedInference],
+    skipped: &BTreeSet<u32>,
+    key_fn: F,
+) -> HashMap<String, usize>
 where
     F: Fn(&PersistedInference) -> String,
 {
     let mut counts = HashMap::new();
-    for inf in inferences {
+    for inf in inferences.iter().filter(|inf| !skipped.contains(&inf.pid)) {
         *counts.entry(key_fn(inf)).or_insert(0) += 1;
     }
     counts
@@ -147,9 +153,10 @@ where
 fn compute_class_distribution(
     old: &[PersistedInference],
     new: &[PersistedInference],
+    skipped: &BTreeSet<u32>,
 ) -> ClassDistributionComparison {
-    let old_counts = count_by(old, |i| i.classification.clone());
-    let new_counts = count_by(new, |i| i.classification.clone());
+    let old_counts = count_by(old, skipped, |i| i.classification.clone());
+    let new_counts = count_by(new, skipped, |i| i.classification.clone());
 
     let mut all_classes: Vec<String> = old_counts
         .keys()
@@ -185,9 +192,10 @@ fn compute_class_distribution(
 fn compute_action_distribution(
     old: &[PersistedInference],
     new: &[PersistedInference],
+    skipped: &BTreeSet<u32>,
 ) -> ActionDistributionComparison {
-    let old_counts = count_by(old, |i| i.recommended_action.clone());
-    let new_counts = count_by(new, |i| i.recommended_action.clone());
+    let old_counts = count_by(old, skipped, |i| i.recommended_action.clone());
+    let new_counts = count_by(new, skipped, |i| i.recommended_action.clone());
 
     let mut all_actions: Vec<String> = old_counts
         .keys()
@@ -432,6 +440,33 @@ mod tests {
         let report = generate_comparison_report(&diff, &[], &[]);
         assert!(report.recurring_offenders.is_empty());
         assert_eq!(report.drift_summary.overall_trend, TrendDirection::Stable);
+    }
+
+    #[test]
+    fn skipped_decisions_never_imply_a_change_in_the_distribution() {
+        let before = vec![proc(1, "b:1:1"), proc(2, "b:2:2")];
+        let after = vec![proc(2, "b:2:2")];
+        let old = vec![
+            inf(1, "b:1:1", "abandoned", 95, "kill"),
+            inf(2, "b:2:2", "useful", 12, "keep"),
+        ];
+        let new = vec![old[1].clone()];
+        let config = DiffConfig {
+            decision_skipped_pids: [1].into(),
+            ..Default::default()
+        };
+        let diff = compute_diff("old", "new", &before, &old, &after, &new, &config);
+        let report = generate_comparison_report(&diff, &old, &new);
+        assert_eq!(
+            report.class_distribution.old_counts,
+            report.class_distribution.new_counts
+        );
+        assert_eq!(
+            report.action_distribution.old_counts,
+            report.action_distribution.new_counts
+        );
+        assert_eq!(report.action_distribution.new_counts["keep"], 1);
+        assert_eq!(report.diff_summary.total_old, 2);
     }
 
     #[test]

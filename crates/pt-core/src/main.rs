@@ -39785,6 +39785,30 @@ fn recorded_process_explanation(
     explanation
 }
 
+fn recorded_skipped_explanation(
+    record: &SkippedDecision,
+    target: Option<&pt_common::StartId>,
+) -> (ExitCode, serde_json::Value) {
+    if target.is_some_and(|id| id.0 != record.start_id) {
+        return (
+            ExitCode::IdentityError,
+            serde_json::json!({
+                "pid": record.pid, "classification": null,
+                "error": "requested process identity does not match the recorded skipped decision",
+            }),
+        );
+    }
+    (
+        ExitCode::PartialFail,
+        serde_json::json!({
+            "pid": record.pid, "uid": record.uid, "start_id": record.start_id,
+            "classification": null, "ledger_status": "decision_skipped",
+            "decision_skipped": record,
+            "error": format!("{}: {}", record.stage, record.reason),
+        }),
+    )
+}
+
 fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
     let store = match SessionStore::from_env() {
         Ok(store) => store,
@@ -39840,6 +39864,12 @@ fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
         source = recorded.source;
         activity_window_ms = recorded.activity_window_ms;
         for pid in &pids_to_explain {
+            if let Some(record) = recorded.decision_skipped.get(pid) {
+                let (status, explanation) = recorded_skipped_explanation(record, target.as_ref().map(|(_, id)| id));
+                exit_code = status;
+                explanations.push(explanation);
+                continue;
+            }
             match recorded.candidates.get(pid) {
                 Some(candidate) if target.as_ref().is_some_and(|(_, start_id)| {
                     candidate["start_id"].as_str() != Some(start_id.0.as_str())
@@ -39993,11 +40023,15 @@ fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
     }
 
     match global.format {
-        OutputFormat::Json | OutputFormat::Toon => {
+        OutputFormat::Json | OutputFormat::Jsonl | OutputFormat::Toon => {
             println!("{}", format_structured_output(global, output));
         }
         OutputFormat::Summary => {
             for expl in &explanations {
+                if let Some(error) = expl["error"].as_str() {
+                    println!("[{}] PID {}: {}", sid, expl["pid"], error);
+                    continue;
+                }
                 if let Some(rule) = expl["protection"]["rule"].as_str() {
                     println!("[{}] PID {}: protected by {}", sid, expl["pid"], rule);
                     continue;
@@ -46838,12 +46872,16 @@ fn run_agent_diff(global: &GlobalOpts, args: &AgentDiffArgs) -> ExitCode {
         }
     };
 
-    let decision_skipped_pids: BTreeSet<u32> = [&base_plan, &compare_plan]
-        .into_iter()
-        .filter_map(|plan| plan.pointer("/summary/decision_skipped")?.as_array())
-        .flatten()
-        .filter_map(|record| u32::try_from(record["pid"].as_u64()?).ok())
-        .collect();
+    let mut decision_skipped_pids = BTreeSet::new();
+    for plan in [&base_plan, &compare_plan] {
+        match pt_core::session::snapshot_persist::recorded_plan_decision_skips(plan) {
+            Ok(skipped) => decision_skipped_pids.extend(skipped.into_keys()),
+            Err(error) => {
+                eprintln!("agent diff: {error}");
+                return ExitCode::ArgsError;
+            }
+        }
+    }
     let unverified_pids = pt_core::session::diff::unverified_comparison_pids(
         base_candidates
             .iter()

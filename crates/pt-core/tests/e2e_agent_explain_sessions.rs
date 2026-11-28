@@ -388,6 +388,65 @@ fn explain_nonexistent_pid_returns_error_entry() {
 }
 
 #[test]
+fn explain_recorded_skip_checks_identity_before_returning_saved_reason() {
+    with_temp_data_dir(|dir| {
+        let sid = create_session_with_plan(dir, test_identity(316), false);
+        let handle = SessionStore::from_env().unwrap().open(&sid).unwrap();
+        let skip = serde_json::json!({
+            "pid": 316, "uid": 1000, "start_id": "boot1:91:316",
+            "stage": "pressure_decision", "reason": "unavailable loss matrix",
+        });
+        let plan = serde_json::json!({
+            "session_id": sid.0, "candidates": [],
+            "summary": {"decision_complete": false, "decision_skipped_count": 1,
+                        "decision_skipped": [skip.clone()]},
+        });
+        fs::write(
+            handle.dir.join("decision/plan.json"),
+            serde_json::to_vec(&plan).unwrap(),
+        )
+        .unwrap();
+        for (birth, code) in [
+            ("91", ExitCode::PartialFail),
+            ("92", ExitCode::IdentityError),
+        ] {
+            let output = pt_core_fast()
+                .env("PROCESS_TRIAGE_DATA", dir.path())
+                .args([
+                    "--format",
+                    "jsonl",
+                    "agent",
+                    "explain",
+                    "--session",
+                    &sid.0,
+                    "--target",
+                    &format!("316:boot1:{birth}:316"),
+                ])
+                .assert()
+                .code(code.as_i32())
+                .get_output()
+                .stdout
+                .clone();
+            let report: Value = serde_json::from_slice(&output).unwrap();
+            let row = &report["explanations"][0];
+            assert_eq!(report["mode"], "recorded");
+            assert!(row["classification"].is_null());
+            if code == ExitCode::PartialFail {
+                assert_eq!(row["decision_skipped"], skip);
+                assert_eq!(row["ledger_status"], "decision_skipped");
+                assert!(row["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("unavailable loss matrix"));
+            } else {
+                assert!(row.get("decision_skipped").is_none());
+                assert!(row["error"].as_str().unwrap().contains("identity"));
+            }
+        }
+    });
+}
+
+#[test]
 fn explain_saves_to_session_dir() {
     with_temp_data_dir(|dir| {
         let fake_pid = 999_998u32;

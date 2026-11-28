@@ -1563,7 +1563,7 @@ fn parse_explain_worker_output(
     }
     let stdout = std::str::from_utf8(&output.stdout)
         .map_err(|_| "agent explain returned invalid UTF-8".to_string())?;
-    if output.exit_code != Some(0) {
+    if !matches!(output.exit_code, Some(0 | 3)) {
         let document = serde_json::from_str::<serde_json::Value>(stdout).ok();
         let detail = document
             .as_ref()
@@ -1602,11 +1602,27 @@ fn parse_explain_worker_output(
     if explanation["pid"].as_u64() != Some(u64::from(pid)) {
         return Err("agent explain returned a different process identity".into());
     }
-    if let Some(error) = explanation["error"].as_str() {
-        return Err(format!("agent explain: {error}"));
-    }
     if start_id.is_some_and(|expected| explanation["start_id"].as_str() != Some(expected)) {
         return Err("agent explain returned a different process birth identity".into());
+    }
+    if output.exit_code == Some(3) {
+        use crate::session::snapshot_persist::{validate_skipped_decisions, SkippedDecision};
+        let record: SkippedDecision =
+            serde_json::from_value(explanation["decision_skipped"].clone()).map_err(|_| {
+                "agent explain returned partial status without a recorded skipped decision"
+            })?;
+        validate_skipped_decisions(std::slice::from_ref(&record))?;
+        if explanation["ledger_status"] != "decision_skipped"
+            || record.pid != pid
+            || explanation["uid"].as_u64() != Some(u64::from(record.uid))
+            || explanation["start_id"].as_str() != Some(record.start_id.as_str())
+        {
+            return Err("agent explain returned inconsistent skipped decision evidence".into());
+        }
+    } else if let Some(error) = explanation["error"].as_str() {
+        return Err(format!("agent explain: {error}"));
+    } else if explanation["ledger_status"] == "decision_skipped" {
+        return Err("agent explain returned complete status for a skipped decision".into());
     }
     Ok(stdout.to_string())
 }
@@ -2234,6 +2250,32 @@ mod tests {
         output = original.clone();
         output.truncated = true;
         assert!(parse(&output).unwrap_err().contains("truncated"));
+        let mut partial = document.clone();
+        let skipped = serde_json::json!({
+            "pid":42, "uid":1000, "start_id":"test-boot:123:42",
+            "stage":"pressure_decision", "reason":"invalid loss matrix",
+        });
+        partial["explanations"][0] = serde_json::json!({
+            "pid":42, "uid":1000, "start_id":"test-boot:123:42", "classification":null,
+            "ledger_status":"decision_skipped", "decision_skipped":skipped,
+            "error":"pressure_decision: invalid loss matrix",
+        });
+        let mut output_partial = original.clone();
+        output_partial.stdout = partial.to_string().into_bytes();
+        assert!(parse(&output_partial).is_err());
+        output_partial.exit_code = Some(3);
+        assert_eq!(parse(&output_partial).unwrap(), partial.to_string());
+        for (key, value) in [
+            ("pid", serde_json::json!(43)),
+            ("uid", serde_json::json!(1001)),
+            ("start_id", serde_json::json!("test-boot:122:42")),
+            ("stage", serde_json::json!(" ")),
+        ] {
+            let mut invalid = partial.clone();
+            invalid["explanations"][0]["decision_skipped"][key] = value;
+            output_partial.stdout = invalid.to_string().into_bytes();
+            assert!(parse(&output_partial).is_err());
+        }
         let mut missing = document;
         missing["explanations"][0]["error"] =
             serde_json::json!("process not found in recorded session inference");

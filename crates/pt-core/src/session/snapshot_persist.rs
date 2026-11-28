@@ -838,6 +838,7 @@ pub fn load_inference_unchecked(
 pub struct RecordedExplanationSnapshot {
     pub candidates: BTreeMap<u32, serde_json::Value>,
     pub protected: BTreeMap<u32, RecordedProtection>,
+    pub decision_skipped: BTreeMap<u32, SkippedDecision>,
     pub source: serde_json::Value,
     pub activity_window_ms: Option<u64>,
 }
@@ -856,6 +857,75 @@ fn valid_recorded_start_id(pid: u32, start_id: &str) -> bool {
 fn valid_recorded_posterior(values: &[f64]) -> bool {
     values.iter().all(|value| (0.0..=1.0).contains(value))
         && (values.iter().sum::<f64>() - 1.0).abs() <= 1e-6
+}
+
+pub(crate) fn validate_skipped_decisions(skipped: &[SkippedDecision]) -> Result<(), String> {
+    let mut seen = std::collections::BTreeSet::new();
+    for record in skipped {
+        if record.pid == 0
+            || !valid_recorded_start_id(record.pid, &record.start_id)
+            || record.stage.trim().is_empty()
+            || record.reason.trim().is_empty()
+            || !seen.insert(record.pid)
+        {
+            return Err(format!(
+                "invalid or duplicate skipped decision for PID {}",
+                record.pid
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Legacy plans omit all three coverage fields. A partial or contradictory
+/// coverage record cannot establish why an observation is missing.
+pub fn recorded_plan_decision_skips(
+    plan: &serde_json::Value,
+) -> Result<BTreeMap<u32, SkippedDecision>, String> {
+    let summary = &plan["summary"];
+    if [
+        "decision_skipped",
+        "decision_complete",
+        "decision_skipped_count",
+    ]
+    .iter()
+    .all(|key| summary.get(*key).is_none())
+    {
+        return Ok(BTreeMap::new());
+    }
+    let skipped: Vec<SkippedDecision> = serde_json::from_value(summary["decision_skipped"].clone())
+        .map_err(|error| format!("invalid recorded decision coverage: {error}"))?;
+    if summary["decision_complete"].as_bool() != Some(skipped.is_empty())
+        || summary["decision_skipped_count"].as_u64() != Some(skipped.len() as u64)
+    {
+        return Err(
+            "recorded decision coverage count or completeness disagrees with skipped decisions"
+                .into(),
+        );
+    }
+    validate_skipped_decisions(&skipped)?;
+    let skipped: BTreeMap<_, _> = skipped
+        .into_iter()
+        .map(|record| (record.pid, record))
+        .collect();
+    if !skipped.is_empty() {
+        for candidate in plan["candidates"].as_array().into_iter().flatten() {
+            if let Some(pid) = candidate["pid"]
+                .as_u64()
+                .and_then(|pid| u32::try_from(pid).ok())
+            {
+                if skipped.contains_key(&pid) {
+                    return Err(format!("PID {pid} is both scored and skipped"));
+                }
+            }
+        }
+        for pid in skipped.keys() {
+            if summary["protected_by_pid"].get(pid.to_string()).is_some() {
+                return Err(format!("PID {pid} is both protected and skipped"));
+            }
+        }
+    }
+    Ok(skipped)
 }
 
 /// The inventory and scoring results from one historical observation.
@@ -900,7 +970,7 @@ pub fn load_recorded_snapshot_pair(handle: &SessionHandle) -> Result<RecordedSna
             ));
         }
         if identities
-            .insert(process.pid, process.start_id.as_str())
+            .insert(process.pid, (process.start_id.as_str(), process.uid))
             .is_some()
         {
             return Err("recorded inventory has duplicate process identities".into());
@@ -908,7 +978,7 @@ pub fn load_recorded_snapshot_pair(handle: &SessionHandle) -> Result<RecordedSna
     }
     let mut scored = std::collections::BTreeSet::new();
     for candidate in &inference.payload.candidates {
-        if identities.get(&candidate.pid).copied() != Some(candidate.start_id.as_str()) {
+        if identities.get(&candidate.pid).map(|(id, _)| *id) != Some(candidate.start_id.as_str()) {
             return Err(format!(
                 "recorded PID {} inference does not match its inventory",
                 candidate.pid
@@ -931,6 +1001,23 @@ pub fn load_recorded_snapshot_pair(handle: &SessionHandle) -> Result<RecordedSna
             return Err(format!(
                 "recorded PID {} has an invalid PID or posterior",
                 candidate.pid
+            ));
+        }
+    }
+    validate_skipped_decisions(&inference.payload.decision_skipped)?;
+    for record in &inference.payload.decision_skipped {
+        if scored.contains(&record.pid) {
+            return Err(format!("PID {} is both scored and skipped", record.pid));
+        }
+        // Compact plans can omit skipped PIDs from inventory. When the
+        // companion inventory has a row, its recorded birth and UID must agree.
+        if identities
+            .get(&record.pid)
+            .is_some_and(|identity| *identity != (record.start_id.as_str(), record.uid))
+        {
+            return Err(format!(
+                "recorded PID {} skipped decision does not match its inventory",
+                record.pid
             ));
         }
     }
@@ -1053,6 +1140,7 @@ pub fn load_recorded_explanation_snapshot(
                     .ok_or("recorded plan candidates must be an array")?;
                 let candidates = index_explanation_candidates(candidates.clone())?;
                 return Ok(RecordedExplanationSnapshot {
+                    decision_skipped: recorded_plan_decision_skips(&plan)?,
                     protected: recorded_protection(&plan["summary"], &candidates)?,
                     candidates,
                     source,
@@ -1074,6 +1162,7 @@ pub fn load_recorded_explanation_snapshot(
                 .map(|source| RecordedExplanationSnapshot {
                     candidates: BTreeMap::new(),
                     protected: BTreeMap::new(),
+                    decision_skipped: BTreeMap::new(),
                     source,
                     activity_window_ms: None,
                 })
@@ -1144,6 +1233,7 @@ pub fn load_recorded_explanation_snapshot(
     Ok(RecordedExplanationSnapshot {
         candidates,
         protected: BTreeMap::new(),
+        decision_skipped: inference.payload.decision_skipped.into_iter().map(|record| (record.pid, record)).collect(),
         source: serde_json::json!({
             "artifact": INFERENCE_FILE,
             "session_id": inference.session_id,
@@ -1666,6 +1756,79 @@ mod tests {
         assert_eq!(std::fs::read(inventory_path).unwrap(), inventory_bytes);
         assert_eq!(std::fs::read(inference_path).unwrap(), inference_bytes);
         assert!(!handle.dir.join(PLAN_FILE).exists());
+    }
+
+    #[test]
+    fn compact_skips_preserve_historical_reason_and_check_companion_identity() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        persist_inventory(&handle, &handle.id.0, "host1", sample_inventory()).unwrap();
+        let mut inference = sample_inference();
+        let skip = SkippedDecision {
+            pid: 5678,
+            uid: 1000,
+            start_id: "boot1:12346:5678".into(),
+            stage: "scoring".into(),
+            reason: "missing posterior".into(),
+        };
+        inference.decision_skipped.push(skip.clone());
+        persist_inference(&handle, &handle.id.0, "host1", inference.clone()).unwrap();
+        let saved = load_recorded_explanation_snapshot(&handle).unwrap();
+        assert_eq!(saved.decision_skipped[&5678].reason, "missing posterior");
+        assert!(saved.candidates.contains_key(&1234));
+        for (pid, uid, start_id) in [
+            (5678, 42, "boot1:12346:5678"),
+            (5678, 1000, "boot1:99:5678"),
+            (1234, 1000, "boot1:12345:1234"),
+        ] {
+            let mut invalid = inference.clone();
+            invalid.decision_skipped[0] = SkippedDecision {
+                pid,
+                uid,
+                start_id: start_id.into(),
+                ..skip.clone()
+            };
+            persist_inference(&handle, &handle.id.0, "host1", invalid).unwrap();
+            assert!(load_recorded_explanation_snapshot(&handle).is_err());
+        }
+        // Compact plans can persist only returned candidates in inventory.
+        inference.decision_skipped[0].pid = 999;
+        inference.decision_skipped[0].start_id = "boot1:77:999".into();
+        persist_inference(&handle, &handle.id.0, "host1", inference).unwrap();
+        assert_eq!(
+            load_recorded_explanation_snapshot(&handle)
+                .unwrap()
+                .decision_skipped[&999]
+                .uid,
+            1000
+        );
+    }
+
+    #[test]
+    fn plan_decision_coverage_accepts_legacy_and_rejects_conflicts() {
+        let mut plan = serde_json::json!({"candidates": []});
+        assert!(recorded_plan_decision_skips(&plan).unwrap().is_empty());
+        let row = serde_json::json!({"pid": 5, "uid": 42, "start_id": "boot:10:5",
+                                     "stage": "scoring", "reason": "no score"});
+        plan["summary"] = serde_json::json!({"decision_complete": false, "decision_skipped_count": 1,
+                                             "decision_skipped": [row.clone()]});
+        assert_eq!(recorded_plan_decision_skips(&plan).unwrap()[&5].uid, 42);
+        for (field, value) in [
+            ("decision_complete", serde_json::json!(true)),
+            ("decision_skipped_count", serde_json::json!(0)),
+            ("decision_skipped", serde_json::json!([{"pid": 5}])),
+            ("protected_by_pid", serde_json::json!({"5":"protected"})),
+        ] {
+            let mut invalid = plan.clone();
+            invalid["summary"][field] = value;
+            assert!(recorded_plan_decision_skips(&invalid).is_err());
+        }
+        let mut duplicate = plan.clone();
+        duplicate["summary"]["decision_skipped"] = serde_json::json!([row.clone(), row]);
+        duplicate["summary"]["decision_skipped_count"] = serde_json::json!(2);
+        assert!(recorded_plan_decision_skips(&duplicate).is_err());
+        plan["candidates"] = serde_json::json!([{"pid": 5}]);
+        assert!(recorded_plan_decision_skips(&plan).is_err());
     }
 
     #[test]
