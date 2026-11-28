@@ -521,11 +521,15 @@ impl PairedEvaluationReport {
     /// Compare what an operator inspecting the first k suspicion scores would see.
     pub fn score_rankings(&self, k: usize) -> (ScoreRanking, ScoreRanking) {
         let baseline = rank_scores(
-            self.processes.iter().map(|p| (p.pid, p.baseline_probability, p.verdict)),
+            self.processes
+                .iter()
+                .map(|p| (p.pid, p.baseline_probability, p.verdict)),
             k,
         );
         let candidate = rank_scores(
-            self.processes.iter().map(|p| (p.pid, p.candidate_probability, p.verdict)),
+            self.processes
+                .iter()
+                .map(|p| (p.pid, p.candidate_probability, p.verdict)),
             k,
         );
         (baseline, candidate)
@@ -1451,7 +1455,9 @@ fn refit_birth_identities(
 }
 
 fn validated_prior_mass(priors: &Priors) -> Result<f64, ReplayEvaluationError> {
-    crate::config::validation::validate_priors(priors).map_err(|error| {
+    // The same validator configuration loading applies, so an accepted
+    // candidate is one that `--config` can actually load.
+    pt_config::validate::validate_priors(priors).map_err(|error| {
         ReplayEvaluationError::InvalidEvaluation(format!("invalid refit priors: {error}"))
     })?;
     if priors.schema_version != crate::config::CONFIG_SCHEMA_VERSION {
@@ -1681,8 +1687,8 @@ pub fn refit_prior_mass(
 
     // Moving either group by this radius changes every member by at most the
     // requested fraction, including when the useful group is the smaller one.
-    let other_mass = incumbent.priors.classes.useful.prior_prob
-        + incumbent.priors.classes.useful_bad.prior_prob;
+    let other_mass =
+        incumbent.priors.classes.useful.prior_prob + incumbent.priors.classes.useful_bad.prior_prob;
     let radius = options.max_change_fraction * old_mass.min(other_mass);
     let midpoint = options.grid_points / 2;
     for index in 0..options.grid_points {
@@ -1732,9 +1738,10 @@ pub fn refit_prior_mass(
     let holdout_safeguards = refit_safeguards(&holdout, options.probability_threshold);
     let mut reasons = refit_comparison_reasons(&holdout, &holdout_safeguards, options);
     let changed = selected_mass != old_mass;
-    let heldout_improved = holdout.paired_metrics.as_ref().is_some_and(|metrics| {
-        metrics.candidate_minus_baseline.log_loss < -REFIT_LOSS_TOLERANCE
-    });
+    let heldout_improved = holdout
+        .paired_metrics
+        .as_ref()
+        .is_some_and(|metrics| metrics.candidate_minus_baseline.log_loss < -REFIT_LOSS_TOLERANCE);
     if !changed {
         reasons.push(
             "no eligible grid candidate improved training log loss; the incumbent is retained"
@@ -3103,7 +3110,7 @@ mod tests {
         );
         let restored: Priors =
             serde_json::from_slice(&serde_json::to_vec(&report.candidate_priors).unwrap()).unwrap();
-        crate::config::validation::validate_priors(&restored).unwrap();
+        pt_config::validate::validate_priors(&restored).unwrap();
         assert_eq!(serde_json::to_value(&model.priors).unwrap(), original);
     }
 
@@ -3295,7 +3302,11 @@ mod tests {
         for boot in [None, Some("unknown"), Some("different-boot")] {
             let mut weak = holdout.clone();
             weak.context.boot_id = boot.map(String::from);
-            assert!(fit(&weak, &bounded_refit_labels(&weak, ReviewSplit::Holdout, 10)).is_err());
+            assert!(fit(
+                &weak,
+                &bounded_refit_labels(&weak, ReviewSplit::Holdout, 10)
+            )
+            .is_err());
         }
         let mut weak = holdout;
         weak.scoring_context
@@ -3306,7 +3317,11 @@ mod tests {
             .unwrap()
             .identity
             .quality = IdentityQuality::NoBootId;
-        assert!(fit(&weak, &bounded_refit_labels(&weak, ReviewSplit::Holdout, 10)).is_err());
+        assert!(fit(
+            &weak,
+            &bounded_refit_labels(&weak, ReviewSplit::Holdout, 10)
+        )
+        .is_err());
     }
 
     #[test]
