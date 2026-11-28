@@ -1802,9 +1802,30 @@ pub fn run_doctor_with(
     }
 }
 
+/// Logical CPUs of the host whose load average is audited.
+///
+/// The load average counts runnable tasks host-wide, so it is normalized by the
+/// host's CPUs, exactly as `agent plan`'s pressure snapshot does.
+/// `std::thread::available_parallelism` reports the *caller's* allowance (sched
+/// affinity mask and cgroup quota): a shell pinned to one CPU on a 16-CPU host
+/// was told "load 28.5x the CPU count". An unknown count stays 0, which the
+/// pressure snapshot treats as unavailable instead of inventing one CPU.
+fn host_logical_cpus() -> u32 {
+    #[cfg(target_os = "linux")]
+    {
+        crate::collect::cpu_capacity::observed_logical_cpus().unwrap_or(0)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // SAFETY: sysconf has no preconditions.
+        let online = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+        u32::try_from(online).unwrap_or(0)
+    }
+}
+
 /// The audit of this machine.
 pub fn run_doctor() -> DoctorReport {
-    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get() as u32);
+    let cpus = host_logical_cpus();
     // SAFETY: sysconf has no preconditions.
     let tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     let sessions = crate::session::SessionStore::from_env()
@@ -1864,6 +1885,44 @@ pub fn fix_script(report: &DoctorReport) -> String {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// Doctor normalizes host-wide load by the host's CPUs. Pinning the calling
+    /// thread to one CPU shrinks only that thread's own allowance, never the
+    /// count doctor divides the load average by.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn host_cpu_count_ignores_the_callers_affinity_mask() {
+        let host = host_logical_cpus();
+        assert!(host > 0, "a Linux host reports its logical CPUs");
+        let (own, seen_by_doctor) = std::thread::spawn(|| {
+            let size = std::mem::size_of::<libc::cpu_set_t>();
+            // SAFETY: cpu_set_t is a plain bitmask and all-zero is the empty set.
+            let mut allowed: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+            // SAFETY: pid 0 names the calling thread and `allowed` holds `size` bytes.
+            assert_eq!(unsafe { libc::sched_getaffinity(0, size, &mut allowed) }, 0);
+            let first = (0..libc::CPU_SETSIZE as usize)
+                // SAFETY: `cpu` is below CPU_SETSIZE and `allowed` is initialized.
+                .find(|&cpu| unsafe { libc::CPU_ISSET(cpu, &allowed) })
+                .expect("the thread may run on at least one CPU");
+            // SAFETY: as above; `single` starts as the empty set.
+            let mut single: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+            // SAFETY: `first` is below CPU_SETSIZE.
+            unsafe { libc::CPU_SET(first, &mut single) };
+            // SAFETY: pid 0 names this thread and `single` holds `size` bytes.
+            assert_eq!(unsafe { libc::sched_setaffinity(0, size, &single) }, 0);
+            (
+                std::thread::available_parallelism().map_or(0, |n| n.get()),
+                host_logical_cpus(),
+            )
+        })
+        .join()
+        .unwrap();
+        assert_eq!(own, 1, "the pinned thread's own allowance is one CPU");
+        assert_eq!(
+            seen_by_doctor, host,
+            "doctor's host CPU count must not follow the caller's affinity"
+        );
+    }
 
     /// A fake root with the files a test writes.
     struct Root(tempfile::TempDir);
