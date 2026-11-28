@@ -8486,6 +8486,7 @@ mod planning_probe_tests {
     #[cfg(target_os = "linux")]
     fn recommendation(action: &'static str) -> CandidateRecommendation {
         CandidateRecommendation {
+            session_refusal: None,
             action,
             rationale: "existing decision rationale".into(),
             policy: pt_core::decision::PolicyCheckResult {
@@ -34476,6 +34477,7 @@ fn agent_liveness_json(
 /// presentation surface must apply this before turning an expected-loss action
 /// into a recommendation. Execution still revalidates the live evidence.
 struct CandidateRecommendation {
+    session_refusal: Option<String>,
     action: &'static str,
     rationale: String,
     policy: pt_core::decision::PolicyCheckResult,
@@ -36624,6 +36626,27 @@ fn candidate_recommendation(
     } else {
         decision.optimal_action
     };
+    // Apply checks the actual intervention target. A routed zombie signals its
+    // parent; only a live service with a bound restart adapter gets the service exception.
+    let bound_service_restart = cfg!(target_os = "linux")
+        && !routed_zombie
+        && evidence_action == Action::Restart
+        && score.supervisor_restart.is_some();
+    let session_refusal = subject
+        .filter(|_| evidence_action != Action::Keep)
+        .and_then(|target| {
+            pt_core::action::prechecks::observed_session_refusal(
+                target.pid.0,
+                target.sid,
+                bound_service_restart,
+                || {
+                    Ok(
+                        (bound_service_restart || policy.data_loss_gates.block_if_active_tty)
+                            && target.has_tty(),
+                    )
+                },
+            )
+        });
     // Only read descriptor links to recognize a FUSE server. Following files
     // under its mounts for a writable-file probe can itself block on a stalled
     // server, so do not probe them once the infrastructure gate has refused.
@@ -36652,7 +36675,7 @@ fn candidate_recommendation(
     #[cfg(not(target_os = "linux"))]
     let fuse_refusal: Option<String> = None;
     let group = subject
-        .filter(|_| fuse_refusal.is_none())
+        .filter(|_| fuse_refusal.is_none() && session_refusal.is_none())
         .and_then(|target| {
             match enforcer.observe_policy_group(
                 &process_identity_from_record(target),
@@ -36669,31 +36692,32 @@ fn candidate_recommendation(
         });
     let destructive =
         fuse_refusal.is_none() && matches!(decision.optimal_action, Action::Kill | Action::Restart);
-    let descriptor_evidence = if destructive && evidence_refusal.is_none() {
-        subject.and_then(|subject| {
-            let evidence = pt_core::action::prechecks::descriptor_policy_evidence(
-                &process_identity_from_record(subject),
-                enforcer.requires_lock_evidence(),
-            )
-            .map(|evidence| {
-                (
-                    Some(evidence.open_write_fds),
-                    evidence.has_locked_files,
-                    evidence.critical_writes,
+    let descriptor_evidence =
+        if destructive && evidence_refusal.is_none() && session_refusal.is_none() {
+            subject.and_then(|subject| {
+                let evidence = pt_core::action::prechecks::descriptor_policy_evidence(
+                    &process_identity_from_record(subject),
+                    enforcer.requires_lock_evidence(),
                 )
-            });
-            match evidence {
-                Ok(evidence) => Some(evidence),
-                Err(error) => {
-                    evidence_refusal =
-                        Some(format!("descriptor safety evidence unavailable: {error}"));
-                    None
+                .map(|evidence| {
+                    (
+                        Some(evidence.open_write_fds),
+                        evidence.has_locked_files,
+                        evidence.critical_writes,
+                    )
+                });
+                match evidence {
+                    Ok(evidence) => Some(evidence),
+                    Err(error) => {
+                        evidence_refusal =
+                            Some(format!("descriptor safety evidence unavailable: {error}"));
+                        None
+                    }
                 }
-            }
-        })
-    } else {
-        None
-    };
+            })
+        } else {
+            None
+        };
     let (open_write_fds, has_locked_files, critical_files) =
         descriptor_evidence.unwrap_or_default();
     #[cfg(target_os = "linux")]
@@ -36806,6 +36830,10 @@ fn candidate_recommendation(
             .unwrap_or("Keep: AI agent CLI has recent activity")
             .to_string();
     }
+    if let Some(reason) = &session_refusal {
+        action = "review";
+        rationale = format!("check_session_safety: {reason}; {rationale}");
+    }
     if let Some(reason) = fuse_refusal {
         // Keep is already safe. Preserve an earlier, independently sufficient
         // review reason while still exposing the FUSE evidence in the result.
@@ -36856,6 +36884,7 @@ fn candidate_recommendation(
         rationale = format!("{reason}; {rationale}");
     }
     CandidateRecommendation {
+        session_refusal,
         action,
         rationale,
         policy: policy_result,
@@ -38165,6 +38194,13 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             "score": score,
             "classification": ledger.classification.label(),
         });
+        if let Some(reason) = &advice.session_refusal {
+            candidate["predicted_refusal"] = serde_json::json!({
+                "check": "check_session_safety",
+                "reason": reason,
+                "target_pid": if routed_supervision { proc.ppid.0 } else { proc.pid.0 },
+            });
+        }
         let mut candidate_details = serde_json::json!({
             "posterior": {
                 "useful": posterior.useful,
@@ -38388,6 +38424,9 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             .map(|violation| format!("Policy blocked: {} ({})", violation.message, violation.rule))
             .into_iter()
             .collect();
+        if let Some(reason) = advice.session_refusal {
+            blocked_reasons.push(format!("check_session_safety: {reason}"));
+        }
         if let Some(reason) = supervision_refusal {
             blocked_reasons.push(reason);
         }

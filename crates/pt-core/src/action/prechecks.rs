@@ -832,6 +832,25 @@ pub fn fuse_action_precheck(evidence: Option<bool>, action: Action) -> PreCheckR
     }
 }
 
+/// Session facts shared by planning and live preflight. A bound single-service
+/// restart may own a detached session, but it must always have no controlling TTY.
+pub fn observed_session_refusal(
+    pid: u32,
+    sid: Option<u32>,
+    bound_service_restart: bool,
+    active_tty: impl FnOnce() -> Result<bool, String>,
+) -> Option<String> {
+    if !bound_service_restart && sid == Some(pid) {
+        return Some("process is session leader".into());
+    }
+    match active_tty() {
+        Ok(false) => None,
+        Ok(true) if bound_service_restart => Some("interactive service has an active TTY".into()),
+        Ok(true) => Some("process has active TTY".into()),
+        Err(error) => Some(format!("TTY evidence unavailable: {error}")),
+    }
+}
+
 /// Configuration for live pre-check provider.
 #[derive(Debug, Clone)]
 pub struct LivePreCheckConfig {
@@ -3187,10 +3206,9 @@ impl LivePreCheckProvider {
             check: PreCheck::CheckSessionSafety,
             reason,
         };
-        match self.has_active_tty(pid) {
-            Ok(false) => {}
-            Ok(true) => return blocked("interactive service has an active TTY".to_string()),
-            Err(error) => return blocked(format!("TTY evidence unavailable: {error}")),
+        if let Some(reason) = observed_session_refusal(pid, None, true, || self.has_active_tty(pid))
+        {
+            return blocked(reason);
         }
         if self.config.enhanced_session_safety {
             let mut analyzer = SessionAnalyzer::with_config(SessionConfig {
@@ -3646,35 +3664,17 @@ impl PreCheckProvider for LivePreCheckProvider {
     fn check_session_safety(&self, pid: u32, sid: Option<u32>) -> PreCheckResult {
         trace!(pid, ?sid, "checking session safety");
 
-        // Don't kill session leaders (would orphan entire session)
-        if let Some(session_id) = sid {
-            if session_id == pid {
-                debug!(pid, "process is session leader");
-                return PreCheckResult::Blocked {
-                    check: PreCheck::CheckSessionSafety,
-                    reason: "process is session leader".to_string(),
-                };
+        if let Some(reason) = observed_session_refusal(pid, sid, false, || {
+            if self.config.block_if_active_tty {
+                self.has_active_tty(pid)
+            } else {
+                Ok(false)
             }
-        }
-
-        // Check if process has active TTY (basic check, always enabled if configured)
-        if self.config.block_if_active_tty {
-            match self.has_active_tty(pid) {
-                Ok(false) => {}
-                Ok(true) => {
-                    debug!(pid, "process has active TTY");
-                    return PreCheckResult::Blocked {
-                        check: PreCheck::CheckSessionSafety,
-                        reason: "process has active TTY".to_string(),
-                    };
-                }
-                Err(error) => {
-                    return PreCheckResult::Blocked {
-                        check: PreCheck::CheckSessionSafety,
-                        reason: format!("TTY evidence unavailable: {error}"),
-                    };
-                }
-            }
+        }) {
+            return PreCheckResult::Blocked {
+                check: PreCheck::CheckSessionSafety,
+                reason,
+            };
         }
 
         // Enhanced session safety checks using SessionAnalyzer
@@ -7073,6 +7073,38 @@ finally:
             assert!(
                 matches!(provider.check_session_safety(attached.child.id(), None), PreCheckResult::Blocked { check, reason }
                 if check == PreCheck::CheckSessionSafety && reason == "process has active TTY")
+            );
+        }
+
+        #[test]
+        fn plan_and_apply_agree_on_owned_session_leaders() {
+            let child = descriptor_child(std::fs::File::open("/dev/null").unwrap(), false);
+            let pid = child.child.id();
+            let scan = crate::collect::quick_scan(&crate::collect::QuickScanOptions {
+                pids: vec![pid],
+                ..Default::default()
+            })
+            .unwrap();
+            let record = scan
+                .processes
+                .iter()
+                .find(|record| record.pid.0 == pid)
+                .unwrap();
+            assert_eq!(record.sid, Some(pid));
+            let planned = observed_session_refusal(pid, record.sid, false, || Ok(record.has_tty()));
+            let live = LivePreCheckProvider::new(None, LivePreCheckConfig::default()).unwrap();
+            assert!(matches!(
+                live.check_session_safety(pid, record.sid),
+                PreCheckResult::Blocked { check: PreCheck::CheckSessionSafety, reason }
+                    if Some(&reason) == planned.as_ref() && reason == "process is session leader"
+            ));
+            assert_eq!(
+                observed_session_refusal(pid, record.sid, true, || Ok(false)),
+                None
+            );
+            assert_eq!(
+                observed_session_refusal(pid, record.sid, true, || Ok(true)).as_deref(),
+                Some("interactive service has an active TTY"),
             );
         }
 
