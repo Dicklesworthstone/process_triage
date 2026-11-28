@@ -60,8 +60,8 @@ Manual ground truth for the 19 candidates: ~14 true positives, 5 false positives
 | PARTIAL | 83 |
 | NOT_DONE | 26 |
 
-334 commits landed after 2026-10-07 with almost no bead references and only 4 bead
-closures, so the graph stopped describing the code. Revision 2's P0 "plan→apply
+335 commits landed after 2026-10-07 (to `280859c`) with almost no bead references and
+only 2 bead closures, so the graph stopped describing the code. Revision 2's P0 "plan→apply
 contract broken" (WS11.1) is resolved, verified live.
 
 ### Would finishing every open bead close the gap?
