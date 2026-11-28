@@ -158,7 +158,9 @@ pub fn unverified_comparison_pids<'a>(
     observations: impl Iterator<Item = (u32, &'a str)>,
 ) -> BTreeSet<u32> {
     observations
-        .filter_map(|(pid, raw)| pt_common::StartId::is_unverified_observation_for(raw, pid).then_some(pid))
+        .filter_map(|(pid, raw)| {
+            pt_common::StartId::is_unverified_observation_for(raw, pid).then_some(pid)
+        })
         .collect()
 }
 
@@ -176,7 +178,10 @@ pub fn compute_diff(
     config: &DiffConfig,
 ) -> SessionDiff {
     let unverified_pids = unverified_comparison_pids(
-        old_procs.iter().chain(new_procs).map(|p| (p.pid, p.start_id.as_str())),
+        old_procs
+            .iter()
+            .chain(new_procs)
+            .map(|p| (p.pid, p.start_id.as_str())),
     );
     // Build lookup maps by identity key.
     let old_proc_map: HashMap<&str, &PersistedProcess> =
@@ -517,10 +522,21 @@ mod tests {
         for other in [&tag.0[..], "boot:20:42"] {
             let new = vec![proc(42, other), proc(44, "boot:22:44")];
             for (base, current) in [(&old, &new), (&new, &old)] {
-                let diff = compute_diff("base", "current", base, &[], current, &[], &DiffConfig::default());
+                let diff = compute_diff(
+                    "base",
+                    "current",
+                    base,
+                    &[],
+                    current,
+                    &[],
+                    &DiffConfig::default(),
+                );
                 assert_eq!(diff.summary.unverified_pids, BTreeSet::from([42]));
                 assert_eq!((diff.summary.total_old, diff.summary.total_new), (2, 2));
-                assert_eq!((diff.summary.new_count, diff.summary.resolved_count), (1, 1));
+                assert_eq!(
+                    (diff.summary.new_count, diff.summary.resolved_count),
+                    (1, 1)
+                );
                 assert!(diff.deltas.iter().all(|delta| delta.pid != 42));
             }
         }

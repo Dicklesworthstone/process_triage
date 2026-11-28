@@ -612,7 +612,11 @@ fn collect_activity_snapshot(
 
     // Only the final endpoint is reported. A sleeping task's hidden symbol
     // cannot distinguish between different waits.
-    let channel = if observe_wait && matches!(first_stat.state, ProcessState::Sleeping | ProcessState::DiskSleep) {
+    let channel = if observe_wait
+        && matches!(
+            first_stat.state,
+            ProcessState::Sleeping | ProcessState::DiskSleep
+        ) {
         super::proc_parsers::parse_wchan(pid)
     } else {
         None
@@ -884,7 +888,12 @@ pub fn sample_process_activity(
         .map(|process| {
             (
                 process,
-                collect_activity_snapshot(process, &accounting_before, &mut capacities_before, false),
+                collect_activity_snapshot(
+                    process,
+                    &accounting_before,
+                    &mut capacities_before,
+                    false,
+                ),
             )
         })
         .collect();
@@ -1006,12 +1015,31 @@ mod tests {
     #[test]
     fn window_reports_only_the_final_leader_wait_and_rejects_reused_identity() {
         let (proc, mut first, mut second) = activity_fixture();
-        first.leader_wait = LeaderWait::from_sample(ProcessState::Sleeping, ProcessState::Sleeping, Some("pipe_read"));
-        second.leader_wait = LeaderWait::from_sample(ProcessState::Sleeping, ProcessState::Sleeping, Some("do_wait"));
-        let sample = activity_from_snapshots(&proc, &first, &second, Duration::from_millis(500), 100);
-        assert_eq!(sample.pressure.unwrap().leader_wait.unwrap().wchan.as_deref(), Some("do_wait"));
+        first.leader_wait = LeaderWait::from_sample(
+            ProcessState::Sleeping,
+            ProcessState::Sleeping,
+            Some("pipe_read"),
+        );
+        second.leader_wait = LeaderWait::from_sample(
+            ProcessState::Sleeping,
+            ProcessState::Sleeping,
+            Some("do_wait"),
+        );
+        let sample =
+            activity_from_snapshots(&proc, &first, &second, Duration::from_millis(500), 100);
+        assert_eq!(
+            sample
+                .pressure
+                .unwrap()
+                .leader_wait
+                .unwrap()
+                .wchan
+                .as_deref(),
+            Some("do_wait")
+        );
         second.ticks.identity.uid += 1;
-        let rejected = activity_from_snapshots(&proc, &first, &second, Duration::from_millis(500), 100);
+        let rejected =
+            activity_from_snapshots(&proc, &first, &second, Duration::from_millis(500), 100);
         assert!(rejected.pressure.unwrap().leader_wait.is_none());
     }
 
@@ -1082,10 +1110,16 @@ mod tests {
             let activity =
                 activity_from_snapshots(&process, &first, &second, Duration::from_millis(500), 100);
             assert_eq!(activity.cpu_percent, Some(100.0));
-            assert_eq!(activity.normalized_cpu_occupancy(), Some(expected_occupancy));
+            assert_eq!(
+                activity.normalized_cpu_occupancy(),
+                Some(expected_occupancy)
+            );
             let serialized = serde_json::to_value(&activity).unwrap();
             let restored: ProcessActivity = serde_json::from_value(serialized.clone()).unwrap();
-            assert_eq!(restored.normalized_cpu_occupancy(), Some(expected_occupancy));
+            assert_eq!(
+                restored.normalized_cpu_occupancy(),
+                Some(expected_occupancy)
+            );
             for impossible in [0, 4] {
                 let mut damaged = serialized.clone();
                 damaged["cpu_occupancy"]["affinity_parallelism"] = serde_json::json!(impossible);

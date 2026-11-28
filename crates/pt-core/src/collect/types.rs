@@ -335,10 +335,13 @@ impl LeaderWait {
                 "pipe_read" | "anon_pipe_read" => WaitClass::PipeRead,
                 "unix_stream_read_generic" | "unix_stream_data_wait" => WaitClass::UnixSocketRead,
                 "hrtimer_nanosleep" | "do_nanosleep" => WaitClass::Timer,
-                "ep_poll" | "do_epoll_wait" | "do_select" | "do_poll" | "do_sys_poll"
-                | "poll_schedule_timeout" | "poll_schedule_timeout.constprop.0" => {
-                    WaitClass::EventLoop
-                }
+                "ep_poll"
+                | "do_epoll_wait"
+                | "do_select"
+                | "do_poll"
+                | "do_sys_poll"
+                | "poll_schedule_timeout"
+                | "poll_schedule_timeout.constprop.0" => WaitClass::EventLoop,
                 _ => WaitClass::Other,
             },
             _ => return None,
@@ -448,12 +451,16 @@ pub struct ProcessActivity {
 impl ProcessActivity {
     /// Read wait evidence only for its measured incarnation and sampling source.
     pub fn leader_wait_for(&self, process: &ProcessRecord) -> Option<&LeaderWait> {
-        if self.source != "procfs_window" || self.requested_window_ms == 0 || !self.matches_record(process) {
+        if self.source != "procfs_window"
+            || self.requested_window_ms == 0
+            || !self.matches_record(process)
+        {
             return None;
         }
         let wait = self.pressure.as_ref()?.leader_wait.as_ref()?;
         Some(wait).filter(|wait| {
-            LeaderWait::from_sample(wait.state, wait.state, wait.wchan.as_deref()).as_ref() == Some(*wait)
+            LeaderWait::from_sample(wait.state, wait.state, wait.wchan.as_deref()).as_ref()
+                == Some(*wait)
         })
     }
 
@@ -647,7 +654,12 @@ mod tests {
         }
         assert!(LeaderWait::from_sample(Sleeping, DiskSleep, Some("io_schedule")).is_none());
         assert!(LeaderWait::from_sample(Running, Running, Some("pipe_read")).is_none());
-        assert_eq!(LeaderWait::from_sample(Running, Running, None).unwrap().class, WaitClass::Runnable);
+        assert_eq!(
+            LeaderWait::from_sample(Running, Running, None)
+                .unwrap()
+                .class,
+            WaitClass::Runnable
+        );
     }
 
     #[test]
@@ -655,8 +667,11 @@ mod tests {
         let process = record(120, 1, Some(1));
         let mut sample = ProcessActivity::unavailable(&process, Duration::from_secs(1), "fixture");
         sample.source = "procfs_window".into();
-        sample.pressure.as_mut().unwrap().leader_wait =
-            LeaderWait::from_sample(ProcessState::DiskSleep, ProcessState::DiskSleep, Some("io_schedule"));
+        sample.pressure.as_mut().unwrap().leader_wait = LeaderWait::from_sample(
+            ProcessState::DiskSleep,
+            ProcessState::DiskSleep,
+            Some("io_schedule"),
+        );
         assert!(sample.leader_wait_for(&process).is_some());
         let mut reused = process.clone();
         reused.start_id = StartId::from_linux("b", 2, 120);

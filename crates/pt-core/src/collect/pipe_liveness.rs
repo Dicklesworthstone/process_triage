@@ -215,14 +215,10 @@ impl PipeLivenessSnapshot {
         let verified = |identity: &PipeProcessIdentity| {
             self.processes
                 .get(&identity.pid)
-                .is_some_and(|process| {
-                    process.identity_verified && process.identity == *identity
-                })
+                .is_some_and(|process| process.identity_verified && process.identity == *identity)
         };
-        let mut incoming: BTreeMap<
-            PipeProcessIdentity,
-            Vec<(PipeProcessIdentity, PipePeer)>,
-        > = BTreeMap::new();
+        let mut incoming: BTreeMap<PipeProcessIdentity, Vec<(PipeProcessIdentity, PipePeer)>> =
+            BTreeMap::new();
         for process in self.processes.values() {
             if !verified(&process.identity) {
                 continue;
@@ -397,11 +393,7 @@ mod linux {
         }
     }
 
-    fn bounded_read(
-        path: &Path,
-        limit: usize,
-        budget: &Budget,
-    ) -> Result<Vec<u8>, &'static str> {
+    fn bounded_read(path: &Path, limit: usize, budget: &Budget) -> Result<Vec<u8>, &'static str> {
         budget.check()?;
         let file = File::open(path).map_err(|_| "pipe_proc_field_unavailable")?;
         let mut bytes = Vec::new();
@@ -537,7 +529,10 @@ mod linux {
         if matches!(fields[0], "Z" | "X" | "x") {
             return Err("pipe_process_no_longer_live");
         }
-        if !matches!(fields[0], "R" | "S" | "D" | "T" | "t" | "I" | "P" | "W" | "K") {
+        if !matches!(
+            fields[0],
+            "R" | "S" | "D" | "T" | "t" | "I" | "P" | "W" | "K"
+        ) {
             return Err("pipe_process_state_unavailable");
         }
         let start_ticks = unsigned(fields[19])?;
@@ -730,20 +725,21 @@ mod linux {
         pending: PendingProcess,
         budget: &mut Budget,
     ) {
-        let process = match PinnedProcess::open(root, output.identity.pid, budget).and_then(|process| {
-            if process.identity != pending.directory {
-                return Err("pipe_process_directory_changed");
-            }
-            process.validate(output.identity, budget)?;
-            Ok(process)
-        }) {
-            Ok(process) => process,
-            Err(reason) => {
-                budget.release(pending.endpoints.len());
-                output.incomplete(reason);
-                return;
-            }
-        };
+        let process =
+            match PinnedProcess::open(root, output.identity.pid, budget).and_then(|process| {
+                if process.identity != pending.directory {
+                    return Err("pipe_process_directory_changed");
+                }
+                process.validate(output.identity, budget)?;
+                Ok(process)
+            }) {
+                Ok(process) => process,
+                Err(reason) => {
+                    budget.release(pending.endpoints.len());
+                    output.incomplete(reason);
+                    return;
+                }
+            };
         let mut endpoints = Vec::new();
         for expected in pending.endpoints {
             if let Err(reason) = budget.final_visit() {
@@ -780,7 +776,10 @@ mod linux {
                     snapshot.incomplete(reason);
                     return;
                 }
-                pipes.entry(endpoint.inode).or_default().push((process.identity, endpoint));
+                pipes
+                    .entry(endpoint.inode)
+                    .or_default()
+                    .push((process.identity, endpoint));
             }
         }
         let mut pair_work = 0usize;
@@ -978,10 +977,15 @@ mod tests {
     #[test]
     fn active_consumer_protects_a_pipeline_without_inventing_activity() {
         let snapshot = graph(&[1, 2, 3, 4], &[(1, 1, 2, 0, 50), (2, 1, 3, 0, 60)]);
-        assert!(snapshot.active_downstream_paths(&BTreeSet::new(), 32).is_empty());
+        assert!(snapshot
+            .active_downstream_paths(&BTreeSet::new(), 32)
+            .is_empty());
         let paths = snapshot.active_downstream_paths(&BTreeSet::from([identity(3)]), 32);
         assert_eq!(
-            paths[&identity(1)].iter().map(|peer| peer.identity.pid).collect::<Vec<_>>(),
+            paths[&identity(1)]
+                .iter()
+                .map(|peer| peer.identity.pid)
+                .collect::<Vec<_>>(),
             [2, 3]
         );
         assert_eq!(paths[&identity(2)][0].identity, identity(3));
@@ -996,28 +1000,47 @@ mod tests {
             &[1, 2, 3],
             &[(1, 1, 1, 0, 50), (1, 2, 2, 0, 60), (2, 1, 1, 0, 70)],
         );
-        assert!(snapshot.active_downstream_paths(&BTreeSet::new(), 32).is_empty());
+        assert!(snapshot
+            .active_downstream_paths(&BTreeSet::new(), 32)
+            .is_empty());
         let paths = snapshot.active_downstream_paths(&BTreeSet::from([identity(1)]), 32);
-        assert!(!paths.contains_key(&identity(1)), "a seed cannot prove itself by a cycle");
+        assert!(
+            !paths.contains_key(&identity(1)),
+            "a seed cannot prove itself by a cycle"
+        );
         assert_eq!(paths[&identity(2)][0].identity, identity(1));
         snapshot.processes.get_mut(&1).unwrap().identity_verified = false;
-        assert!(snapshot.active_downstream_paths(&BTreeSet::from([identity(1)]), 32).is_empty());
-        assert!(snapshot.active_downstream_paths(&BTreeSet::from([identity(99)]), 32).is_empty());
+        assert!(snapshot
+            .active_downstream_paths(&BTreeSet::from([identity(1)]), 32)
+            .is_empty());
+        assert!(snapshot
+            .active_downstream_paths(&BTreeSet::from([identity(99)]), 32)
+            .is_empty());
         let mut stale = identity(2);
         stale.start_ticks += 1;
-        assert!(snapshot.active_downstream_paths(&BTreeSet::from([stale]), 32).is_empty());
+        assert!(snapshot
+            .active_downstream_paths(&BTreeSet::from([stale]), 32)
+            .is_empty());
     }
 
     #[test]
     fn active_writer_can_have_a_different_active_downstream_consumer() {
         let snapshot = graph(
             &[1, 2, 3, 4],
-            &[(1, 1, 2, 0, 50), (2, 2, 1, 0, 60), (2, 1, 3, 0, 70), (3, 1, 4, 0, 80)],
+            &[
+                (1, 1, 2, 0, 50),
+                (2, 2, 1, 0, 60),
+                (2, 1, 3, 0, 70),
+                (3, 1, 4, 0, 80),
+            ],
         );
         let seeds = BTreeSet::from([identity(1), identity(4)]);
         let paths = snapshot.active_downstream_paths(&seeds, 32);
         assert_eq!(
-            paths[&identity(1)].iter().map(|peer| peer.identity.pid).collect::<Vec<_>>(),
+            paths[&identity(1)]
+                .iter()
+                .map(|peer| peer.identity.pid)
+                .collect::<Vec<_>>(),
             [2, 3, 4]
         );
         assert_eq!(paths[&identity(2)][0].identity, identity(1));
@@ -1026,7 +1049,12 @@ mod tests {
 
     #[test]
     fn shortest_paths_are_deterministic_bounded_and_only_follow_output() {
-        let edges = [(1, 1, 2, 0, 50), (2, 1, 3, 0, 60), (1, 2, 4, 0, 70), (5, 7, 3, 0, 80)];
+        let edges = [
+            (1, 1, 2, 0, 50),
+            (2, 1, 3, 0, 60),
+            (1, 2, 4, 0, 70),
+            (5, 7, 3, 0, 80),
+        ];
         let snapshot = graph(&[1, 2, 3, 4, 5], &edges);
         let mut reversed = edges;
         reversed.reverse();
@@ -1036,11 +1064,16 @@ mod tests {
         assert_eq!(paths, reordered.active_downstream_paths(&seeds, 32));
         assert_eq!(paths[&identity(1)].len(), 1);
         assert_eq!(paths[&identity(1)][0].identity, identity(4));
-        assert!(!paths.contains_key(&identity(5)), "arbitrary non-output pipes are diagnostic only");
+        assert!(
+            !paths.contains_key(&identity(5)),
+            "arbitrary non-output pipes are diagnostic only"
+        );
         assert!(snapshot.active_downstream_paths(&seeds, 0).is_empty());
 
         let pids: Vec<_> = (1..=40).collect();
-        let chain: Vec<_> = (1..40).map(|pid| (pid, 1, pid + 1, 0, u64::from(pid))).collect();
+        let chain: Vec<_> = (1..40)
+            .map(|pid| (pid, 1, pid + 1, 0, u64::from(pid)))
+            .collect();
         let long = graph(&pids, &chain);
         let paths = long.active_downstream_paths(&BTreeSet::from([identity(40)]), usize::MAX);
         assert!(!paths.contains_key(&identity(7)));
@@ -1051,9 +1084,15 @@ mod tests {
     fn partial_coverage_retains_verified_positive_paths_but_missing_boot_does_not() {
         let mut snapshot = graph(&[1, 2], &[(1, 1, 2, 0, 50)]);
         snapshot.complete = false;
-        snapshot.processes.get_mut(&2).unwrap().incomplete("another_descriptor_unavailable");
+        snapshot
+            .processes
+            .get_mut(&2)
+            .unwrap()
+            .incomplete("another_descriptor_unavailable");
         let seeds = BTreeSet::from([identity(2)]);
-        assert!(snapshot.active_downstream_paths(&seeds, 32).contains_key(&identity(1)));
+        assert!(snapshot
+            .active_downstream_paths(&seeds, 32)
+            .contains_key(&identity(1)));
         snapshot.boot_id = None;
         assert!(snapshot.active_downstream_paths(&seeds, 32).is_empty());
     }
@@ -1102,17 +1141,26 @@ mod tests {
                 fs::write(directory.join("stat"), stat_text(process, state)).unwrap();
                 fs::write(
                     directory.join("status"),
-                    format!("Name:\tpipe-worker\nUid:\t999\t{}\t{}\t{}\n", process.uid, process.uid, process.uid),
-                ).unwrap();
+                    format!(
+                        "Name:\tpipe-worker\nUid:\t999\t{}\t{}\t{}\n",
+                        process.uid, process.uid, process.uid
+                    ),
+                )
+                .unwrap();
             }
 
             fn endpoint(&self, pid: u32, fd: u32, inode: u64, flags: u64) {
                 let directory = self.root.join(pid.to_string());
-                symlink(format!("pipe:[{inode}]"), directory.join(format!("fd/{fd}"))).unwrap();
+                symlink(
+                    format!("pipe:[{inode}]"),
+                    directory.join(format!("fd/{fd}")),
+                )
+                .unwrap();
                 fs::write(
                     directory.join(format!("fdinfo/{fd}")),
                     format!("pos:\t0\nflags:\t{flags:08o}\nmnt_id:\t17\nino:\t{inode}\n"),
-                ).unwrap();
+                )
+                .unwrap();
             }
 
             fn link_only(&self, pid: u32, fd: u32, target: &str) {
@@ -1165,7 +1213,14 @@ mod tests {
             assert_eq!(snapshot.processes[&1].endpoints.len(), 2);
             assert_eq!(snapshot.processes[&1].output_readers().count(), 1);
             assert_eq!(snapshot.processes[&1].readers.len(), 2);
-            assert_eq!(snapshot.processes[&2].stdin_writers().next().unwrap().identity, identity(1));
+            assert_eq!(
+                snapshot.processes[&2]
+                    .stdin_writers()
+                    .next()
+                    .unwrap()
+                    .identity,
+                identity(1)
+            );
             let paths = snapshot.active_downstream_paths(&BTreeSet::from([identity(3)]), 32);
             assert_eq!(paths[&identity(1)].len(), 2, "fd 3 is not stdout/stderr");
             assert_eq!(paths[&identity(2)][0].local_fd, 2);
@@ -1180,8 +1235,13 @@ mod tests {
             assert!(!snapshot.processes[&1].complete);
             assert!(snapshot.processes[&1].identity_verified);
             assert_eq!(snapshot.processes[&1].readers.len(), 1);
-            assert!(snapshot.processes[&1].unavailable.iter().any(|reason| reason.contains("unavailable")));
-            assert!(snapshot.active_downstream_paths(&BTreeSet::from([identity(2)]), 32).contains_key(&identity(1)));
+            assert!(snapshot.processes[&1]
+                .unavailable
+                .iter()
+                .any(|reason| reason.contains("unavailable")));
+            assert!(snapshot
+                .active_downstream_paths(&BTreeSet::from([identity(2)]), 32)
+                .contains_key(&identity(1)));
         }
 
         #[test]
@@ -1193,18 +1253,33 @@ mod tests {
                     &[identity(1), identity(2)],
                     &test_limits(),
                     || match change {
-                        "start" => fixture.state(PipeProcessIdentity { start_ticks: 9999, ..identity(2) }, "S"),
-                        "uid" => fixture.state(PipeProcessIdentity { uid: 1001, ..identity(2) }, "S"),
+                        "start" => fixture.state(
+                            PipeProcessIdentity {
+                                start_ticks: 9999,
+                                ..identity(2)
+                            },
+                            "S",
+                        ),
+                        "uid" => fixture.state(
+                            PipeProcessIdentity {
+                                uid: 1001,
+                                ..identity(2)
+                            },
+                            "S",
+                        ),
                         "zombie" => fixture.state(identity(2), "Z"),
                         "fd_mode" => {
-                            fs::write(fixture.root.join("2/fdinfo/0"), "flags:\t1\nino:\t50\n").unwrap();
+                            fs::write(fixture.root.join("2/fdinfo/0"), "flags:\t1\nino:\t50\n")
+                                .unwrap();
                         }
                         "fd_inode" => {
-                            fs::rename(fixture.root.join("2/fd/0"), fixture.root.join("old-fd")).unwrap();
+                            fs::rename(fixture.root.join("2/fd/0"), fixture.root.join("old-fd"))
+                                .unwrap();
                             fixture.endpoint(2, 0, 51, 0);
                         }
                         "directory" => {
-                            fs::rename(fixture.root.join("2"), fixture.root.join("old-process")).unwrap();
+                            fs::rename(fixture.root.join("2"), fixture.root.join("old-process"))
+                                .unwrap();
                             fixture.process(identity(2));
                             fixture.endpoint(2, 0, 50, 0);
                         }
@@ -1214,7 +1289,12 @@ mod tests {
                 assert!(!snapshot.complete, "{change}: {snapshot:?}");
                 assert!(snapshot.processes[&1].readers.is_empty(), "{change}");
                 assert!(snapshot.processes[&2].endpoints.is_empty(), "{change}");
-                assert!(snapshot.active_downstream_paths(&BTreeSet::from([identity(2)]), 32).is_empty(), "{change}");
+                assert!(
+                    snapshot
+                        .active_downstream_paths(&BTreeSet::from([identity(2)]), 32)
+                        .is_empty(),
+                    "{change}"
+                );
             }
         }
 
@@ -1227,7 +1307,10 @@ mod tests {
             assert!(duplicate.processes[&1].readers.is_empty());
             let mismatch = fixture.collect(&[
                 identity(1),
-                PipeProcessIdentity { uid: 1001, ..identity(2) },
+                PipeProcessIdentity {
+                    uid: 1001,
+                    ..identity(2)
+                },
             ]);
             assert!(!mismatch.complete);
             assert!(mismatch.processes[&1].readers.is_empty());
@@ -1257,7 +1340,9 @@ mod tests {
                 assert!(snapshot.boot_id.is_none());
                 assert!(!snapshot.complete);
                 assert!(snapshot.processes.values().all(|process| {
-                    !process.identity_verified && process.endpoints.is_empty() && process.readers.is_empty()
+                    !process.identity_verified
+                        && process.endpoints.is_empty()
+                        && process.readers.is_empty()
                 }));
             }
         }
@@ -1273,27 +1358,47 @@ mod tests {
             let limited = linux::collect_from(&fixture.root, &inputs, &limits, || {});
             assert!(limited.descriptors_inspected <= 4);
             assert!(!limited.complete);
-            assert_eq!(limited.processes[&1].readers.len(), 1, "reserved final checks retain the first verified pair");
+            assert_eq!(
+                limited.processes[&1].readers.len(),
+                1,
+                "reserved final checks retain the first verified pair"
+            );
 
             limits = test_limits();
             limits.max_processes = 1;
             let limited = linux::collect_from(&fixture.root, &inputs, &limits, || {});
             assert!(!limited.complete);
             assert!(limited.processes[&1].readers.is_empty());
-            assert!(limited.processes[&2].unavailable.iter().any(|reason| reason == "pipe_process_limit"));
+            assert!(limited.processes[&2]
+                .unavailable
+                .iter()
+                .any(|reason| reason == "pipe_process_limit"));
 
             limits = test_limits();
             limits.max_links_total = 2;
             let limited = linux::collect_from(&fixture.root, &inputs, &limits, || {});
             assert!(!limited.complete);
-            assert_eq!(limited.processes.values().map(|process| process.readers.len() + process.writers.len()).sum::<usize>(), 2);
-            assert!(limited.unavailable.iter().any(|reason| reason == "pipe_total_link_limit"));
+            assert_eq!(
+                limited
+                    .processes
+                    .values()
+                    .map(|process| process.readers.len() + process.writers.len())
+                    .sum::<usize>(),
+                2
+            );
+            assert!(limited
+                .unavailable
+                .iter()
+                .any(|reason| reason == "pipe_total_link_limit"));
 
             limits = test_limits();
             limits.max_links_per_process = 1;
             let limited = linux::collect_from(&fixture.root, &inputs, &limits, || {});
             assert!(!limited.complete);
-            assert!(limited.processes.values().all(|process| process.readers.len() + process.writers.len() <= 1));
+            assert!(limited
+                .processes
+                .values()
+                .all(|process| process.readers.len() + process.writers.len() <= 1));
 
             limits = test_limits();
             limits.max_duration = Duration::ZERO;
@@ -1360,29 +1465,62 @@ mod tests {
             let close = stat.rfind(')').unwrap();
             let open = stat.find('(').unwrap();
             let pid = stat[..open].trim().parse().unwrap();
-            let start_ticks = stat[close + 1..].split_whitespace().nth(19).unwrap().parse().unwrap();
+            let start_ticks = stat[close + 1..]
+                .split_whitespace()
+                .nth(19)
+                .unwrap()
+                .parse()
+                .unwrap();
             let status = fs::read_to_string(path.join("status")).unwrap();
-            let uid = status.lines()
+            let uid = status
+                .lines()
                 .find_map(|line| line.strip_prefix("Uid:"))
-                .unwrap().split_whitespace().nth(1).unwrap().parse().unwrap();
-            PipeProcessIdentity { pid, start_ticks, uid }
+                .unwrap()
+                .split_whitespace()
+                .nth(1)
+                .unwrap()
+                .parse()
+                .unwrap();
+            PipeProcessIdentity {
+                pid,
+                start_ticks,
+                uid,
+            }
         }
 
         #[test]
         fn real_anonymous_pipeline_reports_exact_stream_endpoints_and_ignores_other_pipes() {
-            let mut producer = OwnedChild(Command::new("sh")
-                .args(["-c", "printf ready; exec sleep 30"])
-                .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
-                .spawn().unwrap());
+            let mut producer = OwnedChild(
+                Command::new("sh")
+                    .args(["-c", "printf ready; exec sleep 30"])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
             let producer_output = producer.0.stdout.take().unwrap();
-            let consumer = OwnedChild(Command::new("cat")
-                .stdin(Stdio::from(producer_output)).stdout(Stdio::null()).stderr(Stdio::null())
-                .spawn().unwrap());
-            let unrelated = OwnedChild(Command::new("sleep").arg("30")
-                .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null())
-                .spawn().unwrap());
-            let producer_id = observed_identity(&PathBuf::from(format!("/proc/{}", producer.0.id())));
-            let consumer_id = observed_identity(&PathBuf::from(format!("/proc/{}", consumer.0.id())));
+            let consumer = OwnedChild(
+                Command::new("cat")
+                    .stdin(Stdio::from(producer_output))
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+            let unrelated = OwnedChild(
+                Command::new("sleep")
+                    .arg("30")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+            let producer_id =
+                observed_identity(&PathBuf::from(format!("/proc/{}", producer.0.id())));
+            let consumer_id =
+                observed_identity(&PathBuf::from(format!("/proc/{}", consumer.0.id())));
             let other_id = observed_identity(&PathBuf::from(format!("/proc/{}", unrelated.0.id())));
             let parent_id = observed_identity(Path::new("/proc/self"));
             let parent_fd = producer.0.stdin.as_ref().unwrap().as_raw_fd() as u32;
@@ -1392,13 +1530,19 @@ mod tests {
             );
             let writer = &snapshot.processes[&producer_id.pid];
             assert!(writer.identity_verified, "{snapshot:?}");
-            assert!(writer.output_readers().any(|peer| {
-                peer.identity == consumer_id && peer.local_fd == 1 && peer.peer_fd == 0
-            }), "{snapshot:?}");
+            assert!(
+                writer.output_readers().any(|peer| {
+                    peer.identity == consumer_id && peer.local_fd == 1 && peer.peer_fd == 0
+                }),
+                "{snapshot:?}"
+            );
             assert!(!writer.readers.iter().any(|peer| peer.identity == other_id));
-            assert!(writer.stdin_writers().any(|peer| {
-                peer.identity == parent_id && peer.peer_fd == parent_fd
-            }), "{snapshot:?}");
+            assert!(
+                writer
+                    .stdin_writers()
+                    .any(|peer| { peer.identity == parent_id && peer.peer_fd == parent_fd }),
+                "{snapshot:?}"
+            );
             // This seed is supplied explicitly to test graph traversal. The
             // collector does not claim that cat consumed bytes or made progress.
             let paths = snapshot.active_downstream_paths(&BTreeSet::from([consumer_id]), 32);

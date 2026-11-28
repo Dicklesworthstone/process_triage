@@ -103,7 +103,9 @@ impl BundleWriter {
             let plan = self.files.iter().find(|(path, _)| path == "plan.json");
             match plan {
                 Some((_, bytes)) => VerificationSummary::from_artifacts(
-                    &source_session, &serde_json::from_slice(bytes)?, &saved,
+                    &source_session,
+                    &serde_json::from_slice(bytes)?,
+                    &saved,
                 )?,
                 None => None,
             }
@@ -290,7 +292,10 @@ impl BundleWriter {
                 let fields = summary.as_object_mut().ok_or_else(|| {
                     BundleError::CorruptedManifest("session summary must be an object".into())
                 })?;
-                fields.insert("action_verification".into(), serde_json::to_value(verification)?);
+                fields.insert(
+                    "action_verification".into(),
+                    serde_json::to_value(verification)?,
+                );
                 *bytes = serde_json::to_vec_pretty(&summary)?;
             } else {
                 self.add_summary(&serde_json::json!({"action_verification": verification}))?;

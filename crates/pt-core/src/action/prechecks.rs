@@ -1310,7 +1310,9 @@ fn lsof_descriptor_safety_evidence(
                 }
             } else if let Some(lock) = field.strip_prefix('l') {
                 if !inspect_locks || lock_seen {
-                    return Err(format!("unexpected or duplicate lsof lock field for pid {pid}"));
+                    return Err(format!(
+                        "unexpected or duplicate lsof lock field for pid {pid}"
+                    ));
                 }
                 lock_seen = true;
                 if lsof_field_is_locked(pid, lock)? {
@@ -1747,8 +1749,8 @@ where
             MAX_LOCK_TABLE_BYTES,
         )
         .ok()?;
-        let owned = proc_locks_mentions_target(&table, |owner| before.tasks.contains_key(&owner))
-            .ok()?;
+        let owned =
+            proc_locks_mentions_target(&table, |owner| before.tasks.contains_key(&owner)).ok()?;
         Some(owned || before.descriptors.values().any(|fd| fd.has_lock))
     } else {
         None
@@ -4872,7 +4874,8 @@ mod tests {
             "f6\0au\0tREG\0n/work/state.sqlite\0\n",
             "f7\0aw\0tCHR\0n/dev/transaction-wal\0\n",
         );
-        let observed = lsof_descriptor_safety_evidence(42, false, Ok(lsof_output(content))).unwrap();
+        let observed =
+            lsof_descriptor_safety_evidence(42, false, Ok(lsof_output(content))).unwrap();
         assert_eq!(observed.open_write_fds, 2);
         assert_eq!(observed.critical_writes.len(), 2);
         assert_eq!(observed.critical_writes[0].fd, 3);
@@ -4894,13 +4897,15 @@ mod tests {
     fn lsof_lock_policy_observes_read_locks_and_rejects_invalid_lock_fields() {
         let fields = |lock: &str| format!("p42\0\nf3\0ar\0tREG\0n/file\0{lock}\n");
         for (lock, expected) in [("", false), ("l \0", false), ("lR\0", true)] {
-            let observed = lsof_descriptor_safety_evidence(42, true, Ok(lsof_output(&fields(lock))))
-                .unwrap();
+            let observed =
+                lsof_descriptor_safety_evidence(42, true, Ok(lsof_output(&fields(lock)))).unwrap();
             assert_eq!(observed.has_locked_files, Some(expected));
             assert_eq!(observed.open_write_fds, 0);
         }
         for lock in ["l?\0", "lR\0l \0"] {
-            assert!(lsof_descriptor_safety_evidence(42, true, Ok(lsof_output(&fields(lock)))).is_err());
+            assert!(
+                lsof_descriptor_safety_evidence(42, true, Ok(lsof_output(&fields(lock)))).is_err()
+            );
         }
     }
 

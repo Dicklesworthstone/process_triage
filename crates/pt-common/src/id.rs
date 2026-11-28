@@ -58,14 +58,16 @@ impl StartId {
     /// Validate the opaque tag on a stored observation. Even two records carrying
     /// the same tag cannot establish that a process persisted across scans.
     pub fn is_unverified_observation_for(raw: &str, pid: u32) -> bool {
-        let Some((nonce, recorded_pid)) = raw.strip_prefix("unverified:").and_then(|s| s.split_once(':')) else {
+        let Some((nonce, recorded_pid)) = raw
+            .strip_prefix("unverified:")
+            .and_then(|s| s.split_once(':'))
+        else {
             return false;
         };
         pid > 0
             && recorded_pid.parse::<u32>() == Ok(pid)
-            && uuid::Uuid::parse_str(nonce).is_ok_and(|id| {
-                id.get_version_num() == 4 && id.hyphenated().to_string() == nonce
-            })
+            && uuid::Uuid::parse_str(nonce)
+                .is_ok_and(|id| id.get_version_num() == 4 && id.hyphenated().to_string() == nonce)
     }
 
     /// Stored observations can identify an inventory row even when no kernel

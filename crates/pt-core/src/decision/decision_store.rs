@@ -2212,7 +2212,11 @@ mod tests {
                 "python3 -W ignore /srv/worker.py",
                 "python3 -W error /srv/worker.py",
             ),
-            ("bash", "bash /srv/nightly backup", "bash /srv/nightly build"),
+            (
+                "bash",
+                "bash /srv/nightly backup",
+                "bash /srv/nightly build",
+            ),
         ] {
             for verdict in [Verdict::Kill, Verdict::Spare] {
                 let mut store = DecisionStore::default();
@@ -2251,7 +2255,10 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 (same.kill, same.spare),
-                (u32::from(verdict == Verdict::Kill), u32::from(verdict == Verdict::Spare))
+                (
+                    u32::from(verdict == Verdict::Kill),
+                    u32::from(verdict == Verdict::Spare)
+                )
             );
             assert!(restored
                 .learned_prior_at("bash", second, &global(), test_time())
@@ -2323,7 +2330,11 @@ mod tests {
     fn existing_script_and_module_spares_remain_effective() {
         for (comm, command, legacy_key) in [
             ("node", "node /srv/worker.js", "standard|node|.*worker.js"),
-            ("python3", "python3 -m pytest", "standard|python.*|-m pytest"),
+            (
+                "python3",
+                "python3 -m pytest",
+                "standard|python.*|-m pytest",
+            ),
             (
                 "python3",
                 "python3 /srv/worker.py",

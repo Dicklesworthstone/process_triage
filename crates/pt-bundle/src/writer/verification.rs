@@ -38,7 +38,9 @@ fn invalid(message: &str) -> BundleError {
 }
 
 fn identity_text(value: &Value) -> Option<&str> {
-    value.as_str().filter(|id| !id.is_empty() && *id != "[REDACTED]")
+    value
+        .as_str()
+        .filter(|id| !id.is_empty() && *id != "[REDACTED]")
 }
 
 impl VerificationSummary {
@@ -85,7 +87,9 @@ impl VerificationSummary {
             let Some(id) = identity_text(&row["action_id"]) else {
                 return Ok(None);
             };
-            let action = planned.get(id).ok_or_else(|| invalid("action absent from plan"))?;
+            let action = planned
+                .get(id)
+                .ok_or_else(|| invalid("action absent from plan"))?;
             let target = &action["target"];
             let observed = &row["target"];
             let (Some(birth), Some(observed_birth), Some(kind), Some(observed_kind)) = (
@@ -100,7 +104,9 @@ impl VerificationSummary {
                 return Ok(None);
             }
             let id_number = |record: &Value, field: &str| {
-                record[field].as_u64().and_then(|n| u32::try_from(n).ok())
+                record[field]
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
                     .ok_or_else(|| invalid("missing or invalid numeric target identity"))
             };
             let pid = id_number(target, "pid")?;
@@ -118,9 +124,15 @@ impl VerificationSummary {
             }
             let outcome = serde_json::from_value(row["outcome"].clone())?;
             let count = outcomes.entry(outcome).or_default();
-            *count = count.checked_add(1).ok_or_else(|| invalid("too many outcomes"))?;
+            *count = count
+                .checked_add(1)
+                .ok_or_else(|| invalid("too many outcomes"))?;
         }
-        Ok(Some(Self { session_id: session.into(), completed_at, outcomes }))
+        Ok(Some(Self {
+            session_id: session.into(),
+            completed_at,
+            outcomes,
+        }))
     }
 
     pub(super) fn bind_export_session(&mut self, exported_session: &str) {
@@ -133,6 +145,8 @@ impl VerificationSummary {
             return Err(invalid("exported summary belongs to another session"));
         }
         let count: u64 = self.outcomes.values().map(|n| u64::from(*n)).sum();
-        Ok(json!({"completed_at": self.completed_at.to_rfc3339(), "count": count, "outcomes": self.outcomes}))
+        Ok(
+            json!({"completed_at": self.completed_at.to_rfc3339(), "count": count, "outcomes": self.outcomes}),
+        )
     }
 }

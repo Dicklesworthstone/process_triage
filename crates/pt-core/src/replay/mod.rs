@@ -52,10 +52,10 @@ pub mod snapshot;
 
 pub use evaluation::{
     evaluate_pair, make_review_template, read_review_labels, refit_prior_mass, EvaluationCoverage,
-    EvaluationSide,
-    PairedEvaluationReport, PairedProbabilityMetrics, PairedProcessScore, ProbabilityMetricDelta,
-    ProbabilityMetrics, PriorRefitOptions, PriorRefitReport, PriorRefitSafeguards, PriorRefitStatus,
-    PriorRefitTrial, ProcessReview, ReplayEvaluationError, ReviewLabels, ReviewSplit, ReviewVerdict,
+    EvaluationSide, PairedEvaluationReport, PairedProbabilityMetrics, PairedProcessScore,
+    PriorRefitOptions, PriorRefitReport, PriorRefitSafeguards, PriorRefitStatus, PriorRefitTrial,
+    ProbabilityMetricDelta, ProbabilityMetrics, ProcessReview, ReplayEvaluationError, ReviewLabels,
+    ReviewSplit, ReviewVerdict,
 };
 
 pub use refit_artifact::{save_prior_refit_artifact, PriorRefitArtifact};

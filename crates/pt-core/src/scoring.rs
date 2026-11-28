@@ -1378,11 +1378,7 @@ impl Scorer {
     /// Observe pipe peers after the shared activity window has ended, so procfs
     /// traversal cannot inflate its CPU/I/O denominators. Never age-filter the
     /// population: a young or protected consumer still depends on its producer.
-    pub fn collect_pipe_liveness(
-        &mut self,
-        population: &[ProcessRecord],
-        census_complete: bool,
-    ) {
+    pub fn collect_pipe_liveness(&mut self, population: &[ProcessRecord], census_complete: bool) {
         self.pipe_liveness.clear();
         #[cfg(target_os = "linux")]
         {
@@ -1403,10 +1399,7 @@ impl Scorer {
     #[cfg(target_os = "linux")]
     fn prepare_pipe_liveness(
         &mut self,
-        eligible: &BTreeMap<
-            crate::collect::pipe_liveness::PipeProcessIdentity,
-            &ProcessRecord,
-        >,
+        eligible: &BTreeMap<crate::collect::pipe_liveness::PipeProcessIdentity, &ProcessRecord>,
         census_complete: bool,
         snapshot: &crate::collect::pipe_liveness::PipeLivenessSnapshot,
     ) {
@@ -1433,7 +1426,7 @@ impl Scorer {
                 && u128::from(activity.requested_window_ms) == window_ms
                 && activity.matches_record(process)
                 && pipe_consumer_activity_observed(activity))
-                .then_some(activity)
+            .then_some(activity)
         };
         let active = eligible
             .keys()
@@ -1441,16 +1434,16 @@ impl Scorer {
             .filter(|key| valid_sample(key).is_some())
             .collect();
         let paths = snapshot.active_downstream_paths(&active, PIPE_LIVENESS_MAX_HOPS);
-        let output_hop =
-            |writer: &PipeProcessIdentity, peer: &crate::collect::pipe_liveness::PipePeer| {
-                Some(PipeLivenessHop {
-                    writer: verified_identity(writer)?,
-                    writer_fd: peer.local_fd,
-                    reader: verified_identity(&peer.identity)?,
-                    reader_fd: peer.peer_fd,
-                    inode: peer.inode,
-                })
-            };
+        let output_hop = |writer: &PipeProcessIdentity,
+                          peer: &crate::collect::pipe_liveness::PipePeer| {
+            Some(PipeLivenessHop {
+                writer: verified_identity(writer)?,
+                writer_fd: peer.local_fd,
+                reader: verified_identity(&peer.identity)?,
+                reader_fd: peer.peer_fd,
+                inode: peer.inode,
+            })
+        };
         for (key, process) in eligible {
             let Some(identity) = pipe_record_identity(process) else {
                 continue;
@@ -3363,9 +3356,14 @@ mod tests {
             model.activity_window = Some(Duration::from_millis(500));
             model.activity.insert(process.pid.0, activity);
             for quick in [
-                ProcessState::Running, ProcessState::Sleeping, ProcessState::DiskSleep,
-                ProcessState::Stopped, ProcessState::Idle, ProcessState::Unknown,
-                ProcessState::Zombie, ProcessState::Dead,
+                ProcessState::Running,
+                ProcessState::Sleeping,
+                ProcessState::DiskSleep,
+                ProcessState::Stopped,
+                ProcessState::Idle,
+                ProcessState::Unknown,
+                ProcessState::Zombie,
+                ProcessState::Dead,
             ] {
                 process.state = quick;
                 let evidence = model.snapshot_evidence(&process);
@@ -3373,17 +3371,32 @@ mod tests {
                 let mut expected_process = process.clone();
                 if !matches!(quick, ProcessState::Zombie | ProcessState::Dead) {
                     expected_process.state = ProcessState::DiskSleep;
-                    assert_eq!(model.snapshot_evidence(&expected_process).state_flag, expected_index);
+                    assert_eq!(
+                        model.snapshot_evidence(&expected_process).state_flag,
+                        expected_index
+                    );
                 }
                 let mut baseline = captured.clone();
                 baseline.activity.as_mut().unwrap().pressure = None;
                 let expected = model
-                    .score_recorded(&expected_process, model.snapshot_evidence(&expected_process), baseline)
+                    .score_recorded(
+                        &expected_process,
+                        model.snapshot_evidence(&expected_process),
+                        baseline,
+                    )
                     .unwrap();
-                let live = model.score_with_desktop(&process, evidence.clone(), None).unwrap();
+                let live = model
+                    .score_with_desktop(&process, evidence.clone(), None)
+                    .unwrap();
                 let replayed = model.score_recorded(&process, evidence, captured).unwrap();
-                assert_eq!(live.posterior.evidence_terms, expected.posterior.evidence_terms, "{quick:?}");
-                assert_eq!(replayed.posterior.evidence_terms, expected.posterior.evidence_terms, "{quick:?}");
+                assert_eq!(
+                    live.posterior.evidence_terms, expected.posterior.evidence_terms,
+                    "{quick:?}"
+                );
+                assert_eq!(
+                    replayed.posterior.evidence_terms, expected.posterior.evidence_terms,
+                    "{quick:?}"
+                );
             }
         }
     }
@@ -5178,16 +5191,20 @@ int main(int argc, char **argv) {
             serde_json::to_value(&expected.posterior.evidence_terms).unwrap()
         );
         assert!(actual.pipe_liveness.unwrap().preserves_active_consumer());
-        assert!(actual.ledger.top_evidence.iter().any(|line| {
-            line.contains("6102") && line.contains("does not prove traffic")
-        }));
+        assert!(actual
+            .ledger
+            .top_evidence
+            .iter()
+            .any(|line| { line.contains("6102") && line.contains("does not prove traffic") }));
         assert!(reference.pipe_liveness_for(&producer).is_none());
 
         let mut older = serialized;
         older.as_object_mut().unwrap().remove("pipe_liveness");
         let older: ScoringObservations = serde_json::from_value(older).unwrap();
         assert!(older.pipe_liveness.is_none());
-        let replayed = reference.score_recorded(&producer, evidence, older).unwrap();
+        let replayed = reference
+            .score_recorded(&producer, evidence, older)
+            .unwrap();
         assert_eq!(replayed.posterior.posterior, expected.posterior.posterior);
     }
 
@@ -5196,10 +5213,9 @@ int main(int argc, char **argv) {
         let producer = record(6101, "producer", "producer", FOUR_DAYS);
         let consumer = record(6102, "consumer", "consumer", FOUR_DAYS);
         let mut measured = scorer(SignatureDatabase::new());
-        measured.pipe_liveness.insert(
-            producer.pid.0,
-            pipe_evidence_fixture(&producer, &consumer),
-        );
+        measured
+            .pipe_liveness
+            .insert(producer.pid.0, pipe_evidence_fixture(&producer, &consumer));
         assert!(measured.pipe_liveness_for(&producer).is_some());
         for field in ["start", "uid", "pgid", "sid"] {
             let mut changed = producer.clone();
@@ -5214,10 +5230,9 @@ int main(int argc, char **argv) {
         }
         measured.collect_activity(&[], Duration::ZERO);
         assert!(measured.pipe_liveness_for(&producer).is_none());
-        measured.pipe_liveness.insert(
-            producer.pid.0,
-            pipe_evidence_fixture(&producer, &consumer),
-        );
+        measured
+            .pipe_liveness
+            .insert(producer.pid.0, pipe_evidence_fixture(&producer, &consumer));
         measured.collect_activity(&[], Duration::from_millis(500));
         assert!(measured.pipe_liveness_for(&producer).is_none());
     }
@@ -5255,9 +5270,12 @@ int main(int argc, char **argv) {
             assert!(!pipes.preserves_active_consumer(), "mutation {mutation}");
             let mut observed = reference.recorded_observations(&producer, None);
             observed.pipe_liveness = Some(pipes);
-            assert!(reference
-                .score_recorded(&producer, reference.snapshot_evidence(&producer), observed)
-                .is_none(), "mutation {mutation}");
+            assert!(
+                reference
+                    .score_recorded(&producer, reference.snapshot_evidence(&producer), observed)
+                    .is_none(),
+                "mutation {mutation}"
+            );
         }
     }
 
@@ -5271,7 +5289,13 @@ int main(int argc, char **argv) {
         sample.io_read_bytes = Some(1024);
         sample.read_bytes_per_second = Some(2048.0);
         assert!(pipe_consumer_activity_observed(&sample));
-        for value in [None, Some(0.0), Some(0.1), Some(f64::NAN), Some(f64::INFINITY)] {
+        for value in [
+            None,
+            Some(0.0),
+            Some(0.1),
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+        ] {
             let mut invalid = sample.clone();
             invalid.io_window_seconds = value;
             assert!(!pipe_consumer_activity_observed(&invalid));
@@ -5394,16 +5418,23 @@ int main(int argc, char **argv) {
                 2 => changed.requested_window_ms = 1000,
                 3 => observation.boot_id = Some("different-boot".to_string()),
                 4 => {
-                    observation.processes.get_mut(&6103).unwrap().identity_verified = false;
+                    observation
+                        .processes
+                        .get_mut(&6103)
+                        .unwrap()
+                        .identity_verified = false;
                 }
                 _ => unreachable!(),
             }
             measured.activity.insert(6103, changed);
             measured.prepare_pipe_liveness(&eligible, true, &observation);
-            assert!(!measured
-                .pipe_liveness_for(&population[0])
-                .unwrap()
-                .preserves_active_consumer(), "mutation {mutation}");
+            assert!(
+                !measured
+                    .pipe_liveness_for(&population[0])
+                    .unwrap()
+                    .preserves_active_consumer(),
+                "mutation {mutation}"
+            );
         }
         measured.activity.clear();
         measured.prepare_pipe_liveness(&eligible, true, &snapshot);

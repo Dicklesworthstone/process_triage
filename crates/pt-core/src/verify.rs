@@ -1022,10 +1022,9 @@ fn recorded_action_outcomes<'a>(
         }
         if is_failed_attempt(&outcome.status) {
             if outcome.pid != action.target.pid.0
-                || outcome
-                    .target
-                    .as_ref()
-                    .is_some_and(|target| target != &action.target && !target.matches(&action.target))
+                || outcome.target.as_ref().is_some_and(|target| {
+                    target != &action.target && !target.matches(&action.target)
+                })
             {
                 return Err(VerifyError::InvalidOutcomes(format!(
                     "{} failed attempt target does not match the plan",
@@ -3166,10 +3165,16 @@ mod tests {
         failed.target = Some(action.target.clone());
         let success = execution(&action);
         let plan = make_plan(vec![action]);
-        assert!(executed_plan_actions(&plan, std::slice::from_ref(&failed)).unwrap().is_empty());
+        assert!(executed_plan_actions(&plan, std::slice::from_ref(&failed))
+            .unwrap()
+            .is_empty());
         assert!(executed_plan_actions(&plan, &[success]).is_err());
 
-        failed.target = Some(ProcessIdentity::new(123, pt_common::StartId::unverified(123), 1000));
+        failed.target = Some(ProcessIdentity::new(
+            123,
+            pt_common::StartId::unverified(123),
+            1000,
+        ));
         assert!(executed_plan_actions(&plan, &[failed]).is_err());
     }
 

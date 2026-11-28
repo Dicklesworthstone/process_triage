@@ -563,14 +563,16 @@ pub fn regime_evidence_available(
             // PSI proves memory stalls even when available-RAM accounting is
             // absent. The latter refines the diagnosis into cache bloat; it is
             // not a prerequisite for observing generic memory pressure.
-            psi_stall_percent(snapshot.memory, window, window.and_then(|w| w.memory?.some)).is_some()
+            psi_stall_percent(snapshot.memory, window, window.and_then(|w| w.memory?.some))
+                .is_some()
                 || (snapshot.memory.and_then(|resource| resource.some).is_none()
                     && snapshot
                         .meminfo
                         .is_some_and(|memory| memory.macos_pressure.is_some()))
         }
         RegimeKind::CacheBloat => {
-            psi_stall_percent(snapshot.memory, window, window.and_then(|w| w.memory?.some)).is_some()
+            psi_stall_percent(snapshot.memory, window, window.and_then(|w| w.memory?.some))
+                .is_some()
                 && memory
         }
         RegimeKind::SwapThrash => swap_rate(window).is_some(),
@@ -999,7 +1001,10 @@ mod tests {
                     oom_kills: Some(u64::from(fraction > 0.0)),
                 };
                 let unknown = assess(&snap, Some(&window), None, &thresholds);
-                assert!(unknown.regimes.is_empty(), "{seconds}/{fraction}: {unknown:?}");
+                assert!(
+                    unknown.regimes.is_empty(),
+                    "{seconds}/{fraction}: {unknown:?}"
+                );
                 assert_eq!(unknown.severity, ResourceSeverity::default());
                 assert_eq!(unknown.cpu_some, None);
                 assert_eq!(unknown.memory_some, None);
@@ -1013,7 +1018,12 @@ mod tests {
                     RegimeKind::OomKills,
                 ] {
                     assert!(!regime_evidence_available(
-                        kind, &snap, Some(&window), None, false, false,
+                        kind,
+                        &snap,
+                        Some(&window),
+                        None,
+                        false,
+                        false,
                     ));
                 }
                 let mut tracker = RegimeTracker::new(1, 1);

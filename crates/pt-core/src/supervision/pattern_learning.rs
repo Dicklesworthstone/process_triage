@@ -271,7 +271,10 @@ impl CommandNormalizer {
                         .all(|character| character.is_ascii_digit() || character == '.')
             })
         };
-        if matches!(name, "sh" | "bash" | "dash" | "ash" | "zsh" | "ksh" | "fish") {
+        if matches!(
+            name,
+            "sh" | "bash" | "dash" | "ash" | "zsh" | "ksh" | "fish"
+        ) {
             Some(InterpreterFamily::Shell)
         } else if versioned("python") || versioned("pypy") {
             Some(InterpreterFamily::Python)
@@ -1126,7 +1129,11 @@ mod tests {
             ("bash", "bash backup", "bash build"),
             ("bash", "bash -eu /srv/backup", "bash -eu /srv/build"),
             ("sh", "sh -- /srv/backup/run", "sh -- /srv/build/run"),
-            ("bash", "bash /srv/nightly backup", "bash /srv/nightly build"),
+            (
+                "bash",
+                "bash /srv/nightly backup",
+                "bash /srv/nightly build",
+            ),
             (
                 "python3",
                 "python3 /srv/jobs/cleanup",
@@ -1169,17 +1176,10 @@ mod tests {
             let a = normalizer.generate_candidates(comm, first);
             let b = normalizer.generate_candidates(comm, second);
             for level in [SpecificityLevel::Exact, SpecificityLevel::Standard] {
-                let first_pattern = a
-                    .iter()
-                    .find(|candidate| candidate.level == level)
-                    .unwrap();
-                let second_pattern = b
-                    .iter()
-                    .find(|candidate| candidate.level == level)
-                    .unwrap();
+                let first_pattern = a.iter().find(|candidate| candidate.level == level).unwrap();
+                let second_pattern = b.iter().find(|candidate| candidate.level == level).unwrap();
                 assert_ne!(
-                    first_pattern.arg_patterns,
-                    second_pattern.arg_patterns,
+                    first_pattern.arg_patterns, second_pattern.arg_patterns,
                     "{first}"
                 );
                 let expression = Regex::new(&first_pattern.arg_patterns[0]).unwrap();
@@ -1203,7 +1203,11 @@ mod tests {
                 "python3 -I /srv/worker.py",
                 vec!["-I", ".*worker.py"],
             ),
-            ("python3", "python3 -m pytest -v", vec!["-m", "pytest", "-v"]),
+            (
+                "python3",
+                "python3 -m pytest -v",
+                vec!["-m", "pytest", "-v"],
+            ),
             ("node", "node -- /srv/worker.js", vec!["--", ".*worker.js"]),
             ("ruby", "ruby /srv/worker.rb", vec![".*worker.rb"]),
             ("cargo", "cargo build --release", vec!["build", "--release"]),

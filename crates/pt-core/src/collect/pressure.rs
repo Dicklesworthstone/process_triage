@@ -1808,14 +1808,12 @@ mod tests {
             let line = format!("some avg10=0 avg60=0 avg300=0 total=0 {duplicate}\n");
             assert!(parse_psi(&line).is_none(), "{line}");
         }
-        assert!(parse_psi(
-            "some avg10=NaN avg10=0 avg60=0 avg300=0 total=0\n"
-        )
-        .is_none());
+        assert!(parse_psi("some avg10=NaN avg10=0 avg60=0 avg300=0 total=0\n").is_none());
         assert!(parse_psi(&format!("{PSI_CPU}{PSI_CPU}")).is_none());
-        assert!(
-            parse_psi(&format!("{PSI_CPU}full avg10=NaN avg60=0 avg300=0 total=0\n")).is_none()
-        );
+        assert!(parse_psi(&format!(
+            "{PSI_CPU}full avg10=NaN avg60=0 avg300=0 total=0\n"
+        ))
+        .is_none());
         assert!(parse_loadavg("0 1 1000 1/100 42\n").is_some());
         assert!(parse_loadavg("0 0 0 0/0 42\n").is_none());
         assert!(parse_loadavg("0 0 0 2/1 42\n").is_none());
@@ -1846,10 +1844,9 @@ mod tests {
         assert_eq!(memory.used_fraction(), None);
         assert_eq!(memory.swap_used(), None);
         assert_eq!(memory.committed_as, Some(10 * 1024));
-        let zero = parse_meminfo(
-            "MemTotal: 4 kB\nMemAvailable: 4 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n",
-        )
-        .unwrap();
+        let zero =
+            parse_meminfo("MemTotal: 4 kB\nMemAvailable: 4 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n")
+                .unwrap();
         assert_eq!(zero.used_fraction(), Some(0.0));
         assert_eq!(zero.swap_used(), Some(0));
     }

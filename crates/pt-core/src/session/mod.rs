@@ -842,7 +842,9 @@ impl SessionStore {
                 continue;
             };
             let path = entry.path();
-            cleanup_lock.revalidate().map_err(|e| session_io(&path, e))?;
+            cleanup_lock
+                .revalidate()
+                .map_err(|e| session_io(&path, e))?;
             if retention_requires_preservation(&path, &session_id.0, older_than) {
                 result.preserved_count += 1;
                 continue;
@@ -861,7 +863,9 @@ impl SessionStore {
                 #[cfg(not(target_os = "linux"))]
                 CleanupMode::Automatic => None,
             };
-            cleanup_lock.revalidate().map_err(|e| session_io(&path, e))?;
+            cleanup_lock
+                .revalidate()
+                .map_err(|e| session_io(&path, e))?;
             if retention_requires_preservation(&path, &session_id.0, older_than) {
                 result.preserved_count += 1;
                 continue;
@@ -910,7 +914,11 @@ fn session_file_bytes(root: &Path, session: &Path) -> Result<u64, SessionError> 
         #[cfg(not(target_os = "linux"))]
         {
             use std::os::unix::fs::MetadataExt;
-            Ok(dir.handle.metadata().map_err(|e| session_io(path, e))?.dev() as u64)
+            Ok(dir
+                .handle
+                .metadata()
+                .map_err(|e| session_io(path, e))?
+                .dev() as u64)
         }
     }
     #[cfg(unix)]

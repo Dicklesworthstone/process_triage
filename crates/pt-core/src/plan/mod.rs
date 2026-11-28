@@ -343,7 +343,8 @@ pub fn generate_plan(bundle: &DecisionBundle) -> Plan {
     let mut blocked_candidates = 0;
 
     for candidate in &bundle.candidates {
-        let blocked = !candidate.blocked_reasons.is_empty() || !candidate.identity.can_safely_revalidate();
+        let blocked =
+            !candidate.blocked_reasons.is_empty() || !candidate.identity.can_safely_revalidate();
         if blocked {
             blocked_candidates += 1;
             continue;

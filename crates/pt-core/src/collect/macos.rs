@@ -1138,9 +1138,8 @@ impl MacosScanBirthFence {
         let mut usage = std::mem::MaybeUninit::<libc::rusage_info_v0>::zeroed();
         // SAFETY: libproc's V0 flavor writes one rusage_info_v0 into this buffer.
         // The C API types the output parameter as rusage_info_t *, an opaque pointer.
-        let status = unsafe {
-            libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V0, usage.as_mut_ptr().cast())
-        };
+        let status =
+            unsafe { libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V0, usage.as_mut_ptr().cast()) };
         let absolute_birth = (status == 0).then(|| {
             // SAFETY: the buffer was zeroed and the syscall reported success.
             unsafe { usage.assume_init() }.ri_proc_start_abstime

@@ -152,11 +152,10 @@ impl CpuCapacitySampler {
             return Err("thread inventory or cgroup changed during capacity sampling".into());
         }
         capacity_budget(started, self.started)?;
-        let (affinity_cores, affinity_parallelism) = thread_affinity_capacity(
-            &observed_tasks,
-            online,
-            || capacity_budget(started, self.started),
-        )?;
+        let (affinity_cores, affinity_parallelism) =
+            thread_affinity_capacity(&observed_tasks, online, || {
+                capacity_budget(started, self.started)
+            })?;
         Ok(CpuCapacitySample {
             online_cores,
             online: online.clone(),
@@ -376,7 +375,9 @@ fn thread_affinity_capacity(
                 .collect(),
         );
         if union.len() + mask.len() > CAPACITY_MAX_MASK_RANGES {
-            return Err("online thread affinity ranges exceed CPU capacity inspection limit".into());
+            return Err(
+                "online thread affinity ranges exceed CPU capacity inspection limit".into(),
+            );
         }
         union.extend(mask);
     }

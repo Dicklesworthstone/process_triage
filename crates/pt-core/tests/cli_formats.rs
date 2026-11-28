@@ -851,6 +851,7 @@ mod replay_recording {
 
     mod prior_refit {
         use super::*;
+        use pt_common::{IdentityQuality, ProcessId, ProcessIdentity, StartId};
         use pt_core::collect::cgroup::CgroupRole;
         use pt_core::collect::{ProcessRecord, ProcessState, ScanMetadata, ScanResult};
         use pt_core::config::{Policy, Priors};
@@ -866,7 +867,6 @@ mod replay_recording {
             SignatureDatabase, SignatureSchema, SupervisorSignature,
         };
         use pt_core::supervision::SupervisorCategory;
-        use pt_common::{IdentityQuality, ProcessId, ProcessIdentity, StartId};
         use std::collections::BTreeSet;
         use std::path::{Path, PathBuf};
 
@@ -1097,8 +1097,17 @@ mod replay_recording {
         fn assert_private_tree(path: &Path) {
             use std::os::unix::fs::PermissionsExt;
             let metadata = std::fs::symlink_metadata(path).unwrap();
-            assert!(metadata.is_file() || metadata.is_dir(), "{}", path.display());
-            assert_eq!(metadata.permissions().mode() & 0o077, 0, "{}", path.display());
+            assert!(
+                metadata.is_file() || metadata.is_dir(),
+                "{}",
+                path.display()
+            );
+            assert_eq!(
+                metadata.permissions().mode() & 0o077,
+                0,
+                "{}",
+                path.display()
+            );
             if metadata.is_dir() {
                 for entry in std::fs::read_dir(path).unwrap() {
                     assert_private_tree(&entry.unwrap().path());
@@ -1193,7 +1202,10 @@ mod replay_recording {
                     output["artifact"]["incumbent_config"],
                     serde_json::json!(&incumbent)
                 );
-                assert_eq!(output["artifact"]["report"], serde_json::json!(&report_path));
+                assert_eq!(
+                    output["artifact"]["report"],
+                    serde_json::json!(&report_path)
+                );
                 let saved_report = std::fs::read(&report_path).unwrap();
                 assert_eq!(
                     serde_json::from_slice::<serde_json::Value>(&saved_report).unwrap(),
@@ -1310,7 +1322,10 @@ mod replay_recording {
                 !version.exists(),
                 "invalid holdout must not publish a model version"
             );
-            assert_eq!(std::fs::read(case.config.join("priors.json")).unwrap(), priors);
+            assert_eq!(
+                std::fs::read(case.config.join("priors.json")).unwrap(),
+                priors
+            );
             assert_eq!(
                 std::fs::read(case.config.join("decisions.json")).unwrap(),
                 decisions

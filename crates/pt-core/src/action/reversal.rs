@@ -2961,8 +2961,7 @@ fn restore_signal_stop_with(
     };
     let stopped = job_control_stopped(observe_before_deadline()?)?;
     if already_restored || was_stopped {
-        if stopped != was_stopped
-            || job_control_stopped(observe_before_deadline()?)? != was_stopped
+        if stopped != was_stopped || job_control_stopped(observe_before_deadline()?)? != was_stopped
         {
             return Err(failed(
                 "original job-control state changed after pause restoration",
@@ -3925,7 +3924,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let journal = journal(directory.path());
         let (action, record) = leased_pause(&journal);
-        for alteration in ["preexisting", "kind", "target", "snapshot", "plan", "unsent"] {
+        for alteration in [
+            "preexisting",
+            "kind",
+            "target",
+            "snapshot",
+            "plan",
+            "unsent",
+        ] {
             let mut changed = record.clone();
             match alteration {
                 "preexisting" => changed.operation = pause_operation(&action, true),
@@ -4708,7 +4714,10 @@ mod tests {
         .unwrap();
         assert!(report.errors.is_empty());
         assert!(report.candidates.is_empty());
-        assert_eq!(super::super::signal::signal_state(&action.target).unwrap(), 'T');
+        assert_eq!(
+            super::super::signal::signal_state(&action.target).unwrap(),
+            'T'
+        );
         assert!(matches!(
             journal.restore_before(
                 &action,
@@ -4718,7 +4727,10 @@ mod tests {
             Err(ActionError::Timeout)
         ));
         assert!(journal.inspect(&action).unwrap()[0].restorations.is_empty());
-        assert_eq!(super::super::signal::signal_state(&action.target).unwrap(), 'T');
+        assert_eq!(
+            super::super::signal::signal_state(&action.target).unwrap(),
+            'T'
+        );
 
         let mut wrong_namespace = record.clone();
         if let ReversalOperation::SignalStop {
@@ -4733,7 +4745,10 @@ mod tests {
             Some(Instant::now() + Duration::from_secs(1)),
         )
         .is_err());
-        assert_eq!(super::super::signal::signal_state(&action.target).unwrap(), 'T');
+        assert_eq!(
+            super::super::signal::signal_state(&action.target).unwrap(),
+            'T'
+        );
 
         let report = recover_expired_freezes_with(
             &journal.sessions_root,
@@ -4775,7 +4790,10 @@ mod tests {
         assert!(repeated.errors.is_empty());
         assert!(repeated.candidates.is_empty());
         assert!(repeated.outcomes.is_empty());
-        assert_eq!(super::super::signal::signal_state(&action.target).unwrap(), 'T');
+        assert_eq!(
+            super::super::signal::signal_state(&action.target).unwrap(),
+            'T'
+        );
     }
 
     #[test]
@@ -4822,10 +4840,10 @@ mod tests {
             let outcome = report.outcomes[0].outcome.as_ref().unwrap();
             assert_eq!(outcome.status, RestorationStatus::Restored);
             assert_eq!(outcome.changed, Some(true));
-            assert!(
-                !job_control_stopped(super::super::signal::signal_state(&action.target).unwrap())
-                    .unwrap()
-            );
+            assert!(!job_control_stopped(
+                super::super::signal::signal_state(&action.target).unwrap()
+            )
+            .unwrap());
         }
     }
 
@@ -4885,8 +4903,14 @@ mod tests {
         .unwrap();
         assert!(retry.candidates.is_empty());
         assert!(retry.outcomes.is_empty());
-        assert!(retry.errors.iter().any(|error| error.contains("cannot retry")));
-        assert_eq!(super::super::signal::signal_state(&action.target).unwrap(), 'T');
+        assert!(retry
+            .errors
+            .iter()
+            .any(|error| error.contains("cannot retry")));
+        assert_eq!(
+            super::super::signal::signal_state(&action.target).unwrap(),
+            'T'
+        );
         assert_eq!(journal.inspect(&action).unwrap()[0].restorations.len(), 1);
     }
 
@@ -5099,7 +5123,10 @@ mod tests {
         assert!(recovery.errors.is_empty());
         assert!(recovery.candidates.is_empty());
         assert!(recovery.outcomes.is_empty());
-        assert_eq!(super::super::signal::signal_state(&action.target).unwrap(), 'T');
+        assert_eq!(
+            super::super::signal::signal_state(&action.target).unwrap(),
+            'T'
+        );
         let restored = journal.restore(&action, None).unwrap();
         assert_eq!(restored.status, RestorationStatus::Restored);
         assert_eq!(restored.changed, Some(true));
