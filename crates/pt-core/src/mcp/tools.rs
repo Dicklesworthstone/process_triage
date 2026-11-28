@@ -1668,10 +1668,7 @@ fn parse_plan_worker_output(output: &ToolOutput) -> Result<(String, serde_json::
         .ok_or("agent plan returned no candidate inventory")?;
     let count = candidates.len() as u64;
     if document["summary"]["candidates_returned"].as_u64() != Some(count)
-        || !document["summary"]["total_processes_scanned"]
-            .as_u64()
-            .is_some_and(|scanned| scanned >= count)
-        || !check_worker_coverage(&document["summary"], candidates, output.exit_code)
+        || !check_worker_coverage(&document, candidates.len(), output.exit_code)
     {
         return Err("agent plan returned inconsistent candidate counts or exit status".into());
     }

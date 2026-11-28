@@ -279,52 +279,23 @@ fn field_cost(name: &str, value: &Value) -> usize {
 /// their original clean/plan-ready statuses. A partial child must supply the
 /// complete inventory of decisions it could not make.
 pub(super) fn check_worker_coverage(
-    summary: &Value,
-    candidates: &[Value],
+    document: &Value,
+    candidate_count: usize,
     exit: Option<i32>,
 ) -> bool {
-    let ready = Some(i32::from(!candidates.is_empty()));
-    let Some(marker) = summary.get("decision_complete") else {
-        return summary.get("decision_skipped").is_none()
-            && summary.get("decision_skipped_count").is_none()
-            && exit == ready;
-    };
-    let Some(complete) = marker.as_bool() else {
+    let Ok(skipped) = crate::session::snapshot_persist::recorded_plan_decision_skips(document)
+    else {
         return false;
     };
-    let Some(skipped) = summary["decision_skipped"].as_array() else {
-        return false;
+    let expected_exit = if skipped.is_empty() {
+        i32::from(candidate_count != 0)
+    } else {
+        3
     };
-    if summary["decision_skipped_count"].as_u64() != Some(skipped.len() as u64)
-        || complete != skipped.is_empty()
-    {
-        return false;
-    }
-    if complete {
-        return exit == ready;
-    }
-    if exit != Some(3)
-        || !summary["total_processes_scanned"]
+    exit == Some(expected_exit)
+        && document["summary"]["total_processes_scanned"]
             .as_u64()
-            .is_some_and(|count| count >= (candidates.len() + skipped.len()) as u64)
-    {
-        return false;
-    }
-    let mut seen: std::collections::HashSet<u64> = candidates
-        .iter()
-        .filter_map(|row| row["pid"].as_u64())
-        .collect();
-    skipped.iter().all(|row| {
-        row["pid"]
-            .as_u64()
-            .is_some_and(|pid| pid > 0 && pid <= u32::MAX as u64 && seen.insert(pid))
-            && row["uid"]
-                .as_u64()
-                .is_some_and(|uid| uid <= u32::MAX as u64)
-            && ["start_id", "stage", "reason"]
-                .iter()
-                .all(|key| row[key].as_str().is_some_and(|v| !v.is_empty()))
-    })
+            .is_some_and(|total| total >= (candidate_count + skipped.len()) as u64)
 }
 
 #[cfg(test)]
@@ -354,10 +325,10 @@ mod tests {
             "responsible_units": evidence, "agent_activity": {"live":true},
             "summary": {"total_processes_scanned":n+skipped, "candidates_returned":n,
                 "decision_complete":skipped == 0, "decision_skipped_count":skipped,
-                "decision_skipped":(0..skipped).map(|i| json!({"pid":i+n+1,"uid":1,"start_id":format!("skip:{i}"),
+                "decision_skipped":(0..skipped).map(|i| json!({"pid":i+n+1,"uid":1,"start_id":format!("boot:{i}:{}", i+n+1),
                     "stage":"inference","reason":why})).collect::<Vec<_>>()
             },
-            "candidates":(0..n).map(|i| json!({"pid":i+1,"uid":1,"start_id":format!("born:{i}"),"score":88,
+            "candidates":(0..n).map(|i| json!({"pid":i+1,"uid":1,"start_id":format!("boot:{i}:{}", i+1),"score":88,
                 "command_short":"worker", "recommended_action":"review","action_rationale":why,
                 "predictions":{"observations":1},"evidence_ledger":evidence})).collect::<Vec<_>>(),
         })
@@ -391,7 +362,7 @@ mod tests {
         assert_eq!(failures[0]["reason_truncated"], true);
         assert_eq!(failures[0]["reason"].as_str().unwrap().len(), 256);
         assert_eq!(candidates[0]["pid"], 1);
-        assert_eq!(candidates[0]["start_id"], "born:0");
+        assert_eq!(candidates[0]["start_id"], "boot:0:1");
         assert_eq!(candidates[0]["action_rationale_truncated"], true);
         assert!(candidates
             .iter()
@@ -441,12 +412,12 @@ mod tests {
     fn partial_exit_requires_consistent_coverage_even_when_no_candidates_survive() {
         for n in [0, 1] {
             let mut doc = plan(n, 1);
-            let candidates = doc["candidates"].as_array().unwrap().clone();
             let clean = Some(i32::from(n > 0));
-            assert!(check_worker_coverage(&json!({}), &candidates, clean));
-            assert!(!check_worker_coverage(&json!({}), &candidates, Some(3)));
-            assert!(check_worker_coverage(&doc["summary"], &candidates, Some(3)));
-            assert!(!check_worker_coverage(&doc["summary"], &candidates, clean));
+            let legacy = json!({"summary":{"total_processes_scanned":n}, "candidates":doc["candidates"]});
+            assert!(check_worker_coverage(&legacy, n, clean));
+            assert!(!check_worker_coverage(&legacy, n, Some(3)));
+            assert!(check_worker_coverage(&doc, n, Some(3)));
+            assert!(!check_worker_coverage(&doc, n, clean));
             let text = PlanOutput::parse(&json!({}))
                 .unwrap()
                 .render(&doc, doc.to_string())
@@ -454,39 +425,31 @@ mod tests {
             let brief: Value = serde_json::from_str(&text).unwrap();
             assert_eq!(brief["summary"]["decision_complete"], false);
             assert_eq!(brief["candidates"].as_array().unwrap().len(), n);
-            doc["summary"]["decision_skipped_count"] = json!(2);
-            assert!(!check_worker_coverage(
-                &doc["summary"],
-                &candidates,
-                Some(3)
-            ));
-            doc["summary"]["decision_skipped_count"] = json!(1);
-            doc["summary"]["decision_skipped"][0]["reason"] = Value::Null;
-            assert!(!check_worker_coverage(
-                &doc["summary"],
-                &candidates,
-                Some(3)
-            ));
+            for (path, value) in [
+                ("/summary/decision_skipped_count", json!(2)),
+                ("/summary/total_processes_scanned", json!(n)),
+                ("/summary/decision_skipped/0/reason", Value::Null),
+                ("/summary/decision_skipped/0/reason", json!(" ")),
+                ("/summary/decision_skipped/0/stage", json!(" ")),
+                ("/summary/decision_skipped/0/start_id", json!("boot:22:99")),
+            ] {
+                let mut invalid = doc.clone();
+                *invalid.pointer_mut(path).unwrap() = value;
+                assert!(!check_worker_coverage(&invalid, n, Some(3)), "{path}");
+            }
+            let skipped_pid = (n + 1).to_string();
+            doc["summary"]["protected_by_pid"] = json!({skipped_pid: "protected"});
+            assert!(!check_worker_coverage(&doc, n, Some(3)));
             if n > 0 {
-                doc["summary"]["decision_skipped"][0]["reason"] = json!("unavailable");
-                doc["summary"]["decision_skipped"][0]["pid"] = candidates[0]["pid"].clone();
-                assert!(!check_worker_coverage(
-                    &doc["summary"],
-                    &candidates,
-                    Some(3)
-                ));
+                let mut overlap = plan(n, 1);
+                overlap["summary"]["decision_skipped"][0]["pid"] = json!(1);
+                overlap["summary"]["decision_skipped"][0]["start_id"] = json!("boot:0:1");
+                assert!(!check_worker_coverage(&overlap, n, Some(3)));
             }
             let complete = plan(n, 0);
-            assert!(check_worker_coverage(
-                &complete["summary"],
-                &candidates,
-                clean
-            ));
-            assert!(!check_worker_coverage(
-                &complete["summary"],
-                &candidates,
-                Some(3)
-            ));
+            assert!(check_worker_coverage(&complete, n, clean));
+            assert!(!check_worker_coverage(&complete, n, Some(3)));
+
         }
     }
 
