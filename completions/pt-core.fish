@@ -148,9 +148,9 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand scan" -l compact -d 'Ena
 complete -c pt-core -n "__fish_pt_core_using_subcommand scan" -l estimate-tokens -d 'Estimate token count without full response'
 complete -c pt-core -n "__fish_pt_core_using_subcommand scan" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c pt-core -n "__fish_pt_core_using_subcommand scan" -s V -l version -d 'Print version'
-complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
-complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -l config -d 'Override config directory' -r
-complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate refit help" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate refit help" -l config -d 'Override config directory' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate refit help" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
 toon\t'Token-Optimized Object Notation (TOON)'
 md\t'Human-readable Markdown'
 jsonl\t'Streaming JSON Lines for progress events'
@@ -159,23 +159,24 @@ metrics\t'Key=value pairs for monitoring systems'
 slack\t'Human-friendly narrative for chat/notifications'
 exitcode\t'Minimal output (exit code only)'
 prose\t'Structured natural language for agent-to-user communication'"
-complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -l timeout -d 'Abort if operation exceeds time limit (seconds)' -r
-complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -l fields -d 'Select specific output fields (comma-separated or preset: minimal, standard, full)' -r
-complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
-complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -s v -l verbose -d 'Increase verbosity (-v, -vv, -vvv)'
-complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -s q -l quiet -d 'Decrease verbosity (quiet mode)'
-complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -l no-color -d 'Disable colored output'
-complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -l robot -d 'Non-interactive mode; execute policy-approved actions automatically'
-complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -l shadow -d 'Full pipeline but never execute actions (calibration mode)'
-complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -l dry-run -d 'Compute plan only, no execution even with --robot'
-complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -l standalone -d 'Run without wrapper (uses detected/default capabilities)'
-complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -l compact -d 'Enable compact output (short keys, minified JSON)'
-complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -l estimate-tokens -d 'Estimate token count without full response'
-complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -s h -l help -d 'Print help (see more with \'--help\')'
-complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -s V -l version -d 'Print version'
-complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -f -a "label-template" -d 'Create a private review document with every captured identity left unlabeled'
-complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -f -a "evaluate" -d 'Compare an incumbent and the current --config using the same reviewed capture'
-complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate refit help" -l timeout -d 'Abort if operation exceeds time limit (seconds)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate refit help" -l fields -d 'Select specific output fields (comma-separated or preset: minimal, standard, full)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate refit help" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate refit help" -s v -l verbose -d 'Increase verbosity (-v, -vv, -vvv)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate refit help" -s q -l quiet -d 'Decrease verbosity (quiet mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate refit help" -l no-color -d 'Disable colored output'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate refit help" -l robot -d 'Non-interactive mode; execute policy-approved actions automatically'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate refit help" -l shadow -d 'Full pipeline but never execute actions (calibration mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate refit help" -l dry-run -d 'Compute plan only, no execution even with --robot'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate refit help" -l standalone -d 'Run without wrapper (uses detected/default capabilities)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate refit help" -l compact -d 'Enable compact output (short keys, minified JSON)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate refit help" -l estimate-tokens -d 'Estimate token count without full response'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate refit help" -s h -l help -d 'Print help (see more with \'--help\')'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate refit help" -s V -l version -d 'Print version'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate refit help" -f -a "label-template" -d 'Create a private review document with every captured identity left unlabeled'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate refit help" -f -a "evaluate" -d 'Compare an incumbent and the current --config using the same reviewed capture'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate refit help" -f -a "refit" -d 'Fit candidate class priors from reviewed training data and evaluate a separate holdout'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and not __fish_seen_subcommand_from label-template evaluate refit help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from label-template" -l snapshot -r -F
 complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from label-template" -l output -d 'New private destination; existing files and symlinks are refused' -r -F
 complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from label-template" -l host-id -d 'Operator-supplied host identifier for the review cohort' -r
@@ -209,6 +210,7 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_
 complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from evaluate" -l snapshot -r -F
 complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from evaluate" -l labels -r -F
 complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from evaluate" -l baseline-config -d 'Existing configuration directory for the incumbent model' -r -F
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from evaluate" -l top-k -d 'Compare the highest K suspicion scores from each configuration' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from evaluate" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from evaluate" -l config -d 'Override config directory' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from evaluate" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
@@ -234,8 +236,43 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_
 complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from evaluate" -l estimate-tokens -d 'Estimate token count without full response'
 complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from evaluate" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from evaluate" -s V -l version -d 'Print version'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from refit" -l training-snapshot -r -F
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from refit" -l training-labels -r -F
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from refit" -l snapshot -l holdout-snapshot -d 'Separate holdout capture; its labels never participate in fitting' -r -F
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from refit" -l labels -l holdout-labels -r -F
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from refit" -l output -d 'New private output directory; existing paths are refused' -r -F
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from refit" -l method -d 'Counts fits label prevalence; score-grid optimizes production-score log loss' -r -f -a "counts\t''
+score-grid\t''"
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from refit" -l max-change-fraction -d 'Score-grid only: maximum relative class-prior change (default 0.2; at most 0.5)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from refit" -l grid-points -d 'Score-grid only: odd number of candidates (default 21; 3 through 101)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from refit" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from refit" -l config -d 'Override config directory' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from refit" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
+toon\t'Token-Optimized Object Notation (TOON)'
+md\t'Human-readable Markdown'
+jsonl\t'Streaming JSON Lines for progress events'
+summary\t'One-line summary for quick status checks'
+metrics\t'Key=value pairs for monitoring systems'
+slack\t'Human-friendly narrative for chat/notifications'
+exitcode\t'Minimal output (exit code only)'
+prose\t'Structured natural language for agent-to-user communication'"
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from refit" -l timeout -d 'Abort if operation exceeds time limit (seconds)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from refit" -l fields -d 'Select specific output fields (comma-separated or preset: minimal, standard, full)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from refit" -l max-tokens -d 'Maximum token budget for output (enables truncation with continuation)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from refit" -s v -l verbose -d 'Increase verbosity (-v, -vv, -vvv)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from refit" -s q -l quiet -d 'Decrease verbosity (quiet mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from refit" -l no-color -d 'Disable colored output'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from refit" -l robot -d 'Non-interactive mode; execute policy-approved actions automatically'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from refit" -l shadow -d 'Full pipeline but never execute actions (calibration mode)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from refit" -l dry-run -d 'Compute plan only, no execution even with --robot'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from refit" -l standalone -d 'Run without wrapper (uses detected/default capabilities)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from refit" -l compact -d 'Enable compact output (short keys, minified JSON)'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from refit" -l estimate-tokens -d 'Estimate token count without full response'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from refit" -s h -l help -d 'Print help (see more with \'--help\')'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from refit" -s V -l version -d 'Print version'
 complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from help" -f -a "label-template" -d 'Create a private review document with every captured identity left unlabeled'
 complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from help" -f -a "evaluate" -d 'Compare an incumbent and the current --config using the same reviewed capture'
+complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from help" -f -a "refit" -d 'Fit candidate class priors from reviewed training data and evaluate a separate holdout'
 complete -c pt-core -n "__fish_pt_core_using_subcommand replay; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand deep-scan" -l pids -d 'Target specific PIDs only' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand deep-scan" -l budget -d 'Wall-clock deadline for deep collection (seconds); incomplete scans fail with exit 22' -r
@@ -1011,7 +1048,7 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_s
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from undo" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from undo" -s V -l version -d 'Print version'
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from verify" -l session -d 'Session ID (required)' -r
-complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from verify" -l wait -d 'Wait for process termination with timeout in seconds (default: 0 = no wait)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from verify" -l wait -d 'Wait for termination; with --check-respawn, observe after the full window (0 = no wait)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from verify" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from verify" -l config -d 'Override config directory' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand agent; and __fish_seen_subcommand_from verify" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
@@ -1716,7 +1753,7 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_s
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from undo" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from undo" -s V -l version -d 'Print version'
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from verify" -l session -d 'Session ID (required)' -r
-complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from verify" -l wait -d 'Wait for process termination with timeout in seconds (default: 0 = no wait)' -r
+complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from verify" -l wait -d 'Wait for termination; with --check-respawn, observe after the full window (0 = no wait)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from verify" -l capabilities -d 'Path to capabilities manifest (from pt wrapper)' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from verify" -l config -d 'Override config directory' -r
 complete -c pt-core -n "__fish_pt_core_using_subcommand robot; and __fish_seen_subcommand_from verify" -s f -l format -d 'Output format' -r -f -a "json\t'Token-efficient structured JSON (default for machine consumption)'
@@ -3651,6 +3688,7 @@ complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_see
 complete -c pt-core -n "__fish_pt_core_using_subcommand help; and not __fish_seen_subcommand_from run scan replay deep-scan __deep-scan-worker diff query bundle report check doctor learn agent config daemon telemetry shadow signature schema update mcp completions version help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from replay" -f -a "label-template" -d 'Create a private review document with every captured identity left unlabeled'
 complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from replay" -f -a "evaluate" -d 'Compare an incumbent and the current --config using the same reviewed capture'
+complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from replay" -f -a "refit" -d 'Fit candidate class priors from reviewed training data and evaluate a separate holdout'
 complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from query" -f -a "sessions" -d 'Query recent sessions'
 complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from query" -f -a "actions" -d 'Query action history'
 complete -c pt-core -n "__fish_pt_core_using_subcommand help; and __fish_seen_subcommand_from query" -f -a "telemetry" -d 'Query recent rows from a persisted Parquet telemetry table'

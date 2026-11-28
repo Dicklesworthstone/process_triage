@@ -269,6 +269,59 @@ _arguments "${_arguments_options[@]}" : \
 '--snapshot=[]:PATH:_files' \
 '--labels=[]:PATH:_files' \
 '--baseline-config=[Existing configuration directory for the incumbent model]:DIR:_files' \
+'--top-k=[Compare the highest K suspicion scores from each configuration]:TOP_K:_default' \
+'--capabilities=[Path to capabilities manifest (from pt wrapper)]:CAPABILITIES:_default' \
+'--config=[Override config directory]:CONFIG:_default' \
+'-f+[Output format]:FORMAT:((json\:"Token-efficient structured JSON (default for machine consumption)"
+toon\:"Token-Optimized Object Notation (TOON)"
+md\:"Human-readable Markdown"
+jsonl\:"Streaming JSON Lines for progress events"
+summary\:"One-line summary for quick status checks"
+metrics\:"Key=value pairs for monitoring systems"
+slack\:"Human-friendly narrative for chat/notifications"
+exitcode\:"Minimal output (exit code only)"
+prose\:"Structured natural language for agent-to-user communication"))' \
+'--format=[Output format]:FORMAT:((json\:"Token-efficient structured JSON (default for machine consumption)"
+toon\:"Token-Optimized Object Notation (TOON)"
+md\:"Human-readable Markdown"
+jsonl\:"Streaming JSON Lines for progress events"
+summary\:"One-line summary for quick status checks"
+metrics\:"Key=value pairs for monitoring systems"
+slack\:"Human-friendly narrative for chat/notifications"
+exitcode\:"Minimal output (exit code only)"
+prose\:"Structured natural language for agent-to-user communication"))' \
+'--timeout=[Abort if operation exceeds time limit (seconds)]:TIMEOUT:_default' \
+'--fields=[Select specific output fields (comma-separated or preset\: minimal, standard, full)]:FIELDS:_default' \
+'--max-tokens=[Maximum token budget for output (enables truncation with continuation)]:TOKENS:_default' \
+'*-v[Increase verbosity (-v, -vv, -vvv)]' \
+'*--verbose[Increase verbosity (-v, -vv, -vvv)]' \
+'-q[Decrease verbosity (quiet mode)]' \
+'--quiet[Decrease verbosity (quiet mode)]' \
+'--no-color[Disable colored output]' \
+'--robot[Non-interactive mode; execute policy-approved actions automatically]' \
+'--shadow[Full pipeline but never execute actions (calibration mode)]' \
+'--dry-run[Compute plan only, no execution even with --robot]' \
+'--standalone[Run without wrapper (uses detected/default capabilities)]' \
+'--compact[Enable compact output (short keys, minified JSON)]' \
+'--estimate-tokens[Estimate token count without full response]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'-V[Print version]' \
+'--version[Print version]' \
+&& ret=0
+;;
+(refit)
+_arguments "${_arguments_options[@]}" : \
+'--training-snapshot=[]:PATH:_files' \
+'--training-labels=[]:PATH:_files' \
+'--snapshot=[Separate holdout capture; its labels never participate in fitting]:PATH:_files' \
+'--holdout-snapshot=[Separate holdout capture; its labels never participate in fitting]:PATH:_files' \
+'--labels=[]:PATH:_files' \
+'--holdout-labels=[]:PATH:_files' \
+'--output=[New private output directory; existing paths are refused]:DIR:_files' \
+'--method=[Counts fits label prevalence; score-grid optimizes production-score log loss]:METHOD:(counts score-grid)' \
+'--max-change-fraction=[Score-grid only\: maximum relative class-prior change (default 0.2; at most 0.5)]:MAX_CHANGE_FRACTION:_default' \
+'--grid-points=[Score-grid only\: odd number of candidates (default 21; 3 through 101)]:GRID_POINTS:_default' \
 '--capabilities=[Path to capabilities manifest (from pt wrapper)]:CAPABILITIES:_default' \
 '--config=[Override config directory]:CONFIG:_default' \
 '-f+[Output format]:FORMAT:((json\:"Token-efficient structured JSON (default for machine consumption)"
@@ -326,6 +379,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (evaluate)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(refit)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -1653,7 +1710,7 @@ prose\:"Structured natural language for agent-to-user communication"))' \
 (verify)
 _arguments "${_arguments_options[@]}" : \
 '--session=[Session ID (required)]:SESSION:_default' \
-'--wait=[Wait for process termination with timeout in seconds (default\: 0 = no wait)]:WAIT:_default' \
+'--wait=[Wait for termination; with --check-respawn, observe after the full window (0 = no wait)]:WAIT:_default' \
 '--capabilities=[Path to capabilities manifest (from pt wrapper)]:CAPABILITIES:_default' \
 '--config=[Override config directory]:CONFIG:_default' \
 '-f+[Output format]:FORMAT:((json\:"Token-efficient structured JSON (default for machine consumption)"
@@ -3505,7 +3562,7 @@ prose\:"Structured natural language for agent-to-user communication"))' \
 (verify)
 _arguments "${_arguments_options[@]}" : \
 '--session=[Session ID (required)]:SESSION:_default' \
-'--wait=[Wait for process termination with timeout in seconds (default\: 0 = no wait)]:WAIT:_default' \
+'--wait=[Wait for termination; with --check-respawn, observe after the full window (0 = no wait)]:WAIT:_default' \
 '--capabilities=[Path to capabilities manifest (from pt wrapper)]:CAPABILITIES:_default' \
 '--config=[Override config directory]:CONFIG:_default' \
 '-f+[Output format]:FORMAT:((json\:"Token-efficient structured JSON (default for machine consumption)"
@@ -7637,6 +7694,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(refit)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
         esac
     ;;
 esac
@@ -9461,6 +9522,7 @@ _pt-core__subcmd__help__subcmd__replay_commands() {
     local commands; commands=(
 'label-template:Create a private review document with every captured identity left unlabeled' \
 'evaluate:Compare an incumbent and the current --config using the same reviewed capture' \
+'refit:Fit candidate class priors from reviewed training data and evaluate a separate holdout' \
     )
     _describe -t commands 'pt-core help replay commands' commands "$@"
 }
@@ -9473,6 +9535,11 @@ _pt-core__subcmd__help__subcmd__replay__subcmd__evaluate_commands() {
 _pt-core__subcmd__help__subcmd__replay__subcmd__label-template_commands() {
     local commands; commands=()
     _describe -t commands 'pt-core help replay label-template commands' commands "$@"
+}
+(( $+functions[_pt-core__subcmd__help__subcmd__replay__subcmd__refit_commands] )) ||
+_pt-core__subcmd__help__subcmd__replay__subcmd__refit_commands() {
+    local commands; commands=()
+    _describe -t commands 'pt-core help replay refit commands' commands "$@"
 }
 (( $+functions[_pt-core__subcmd__help__subcmd__report_commands] )) ||
 _pt-core__subcmd__help__subcmd__report_commands() {
@@ -9823,6 +9890,7 @@ _pt-core__subcmd__replay_commands() {
     local commands; commands=(
 'label-template:Create a private review document with every captured identity left unlabeled' \
 'evaluate:Compare an incumbent and the current --config using the same reviewed capture' \
+'refit:Fit candidate class priors from reviewed training data and evaluate a separate holdout' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'pt-core replay commands' commands "$@"
@@ -9837,6 +9905,7 @@ _pt-core__subcmd__replay__subcmd__help_commands() {
     local commands; commands=(
 'label-template:Create a private review document with every captured identity left unlabeled' \
 'evaluate:Compare an incumbent and the current --config using the same reviewed capture' \
+'refit:Fit candidate class priors from reviewed training data and evaluate a separate holdout' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'pt-core replay help commands' commands "$@"
@@ -9856,10 +9925,20 @@ _pt-core__subcmd__replay__subcmd__help__subcmd__label-template_commands() {
     local commands; commands=()
     _describe -t commands 'pt-core replay help label-template commands' commands "$@"
 }
+(( $+functions[_pt-core__subcmd__replay__subcmd__help__subcmd__refit_commands] )) ||
+_pt-core__subcmd__replay__subcmd__help__subcmd__refit_commands() {
+    local commands; commands=()
+    _describe -t commands 'pt-core replay help refit commands' commands "$@"
+}
 (( $+functions[_pt-core__subcmd__replay__subcmd__label-template_commands] )) ||
 _pt-core__subcmd__replay__subcmd__label-template_commands() {
     local commands; commands=()
     _describe -t commands 'pt-core replay label-template commands' commands "$@"
+}
+(( $+functions[_pt-core__subcmd__replay__subcmd__refit_commands] )) ||
+_pt-core__subcmd__replay__subcmd__refit_commands() {
+    local commands; commands=()
+    _describe -t commands 'pt-core replay refit commands' commands "$@"
 }
 (( $+functions[_pt-core__subcmd__report_commands] )) ||
 _pt-core__subcmd__report_commands() {

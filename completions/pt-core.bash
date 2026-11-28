@@ -694,6 +694,9 @@ _pt__core() {
             pt__core__subcmd__help__subcmd__replay,label-template)
                 cmd="pt__core__subcmd__help__subcmd__replay__subcmd__label__subcmd__template"
                 ;;
+            pt__core__subcmd__help__subcmd__replay,refit)
+                cmd="pt__core__subcmd__help__subcmd__replay__subcmd__refit"
+                ;;
             pt__core__subcmd__help__subcmd__shadow,export)
                 cmd="pt__core__subcmd__help__subcmd__shadow__subcmd__export"
                 ;;
@@ -841,6 +844,9 @@ _pt__core() {
             pt__core__subcmd__replay,label-template)
                 cmd="pt__core__subcmd__replay__subcmd__label__subcmd__template"
                 ;;
+            pt__core__subcmd__replay,refit)
+                cmd="pt__core__subcmd__replay__subcmd__refit"
+                ;;
             pt__core__subcmd__replay__subcmd__help,evaluate)
                 cmd="pt__core__subcmd__replay__subcmd__help__subcmd__evaluate"
                 ;;
@@ -849,6 +855,9 @@ _pt__core() {
                 ;;
             pt__core__subcmd__replay__subcmd__help,label-template)
                 cmd="pt__core__subcmd__replay__subcmd__help__subcmd__label__subcmd__template"
+                ;;
+            pt__core__subcmd__replay__subcmd__help,refit)
+                cmd="pt__core__subcmd__replay__subcmd__help__subcmd__refit"
                 ;;
             pt__core__subcmd__shadow,export)
                 cmd="pt__core__subcmd__shadow__subcmd__export"
@@ -6111,7 +6120,7 @@ _pt__core() {
             return 0
             ;;
         pt__subcmd__core__subcmd__help__subcmd__replay)
-            opts="label-template evaluate"
+            opts="label-template evaluate refit"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -6139,6 +6148,20 @@ _pt__core() {
             return 0
             ;;
         pt__subcmd__core__subcmd__help__subcmd__replay__subcmd__label__subcmd__template)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pt__subcmd__core__subcmd__help__subcmd__replay__subcmd__refit)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -7317,7 +7340,7 @@ _pt__core() {
             return 0
             ;;
         pt__subcmd__core__subcmd__replay)
-            opts="-f -v -q -h -V --capabilities --config --format --verbose --quiet --no-color --timeout --robot --shadow --dry-run --standalone --fields --compact --max-tokens --estimate-tokens --help --version label-template evaluate help"
+            opts="-f -v -q -h -V --capabilities --config --format --verbose --quiet --no-color --timeout --robot --shadow --dry-run --standalone --fields --compact --max-tokens --estimate-tokens --help --version label-template evaluate refit help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -7359,7 +7382,7 @@ _pt__core() {
             return 0
             ;;
         pt__subcmd__core__subcmd__replay__subcmd__evaluate)
-            opts="-f -v -q -h -V --snapshot --labels --baseline-config --capabilities --config --format --verbose --quiet --no-color --timeout --robot --shadow --dry-run --standalone --fields --compact --max-tokens --estimate-tokens --help --version"
+            opts="-f -v -q -h -V --snapshot --labels --baseline-config --top-k --capabilities --config --format --verbose --quiet --no-color --timeout --robot --shadow --dry-run --standalone --fields --compact --max-tokens --estimate-tokens --help --version"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -7374,6 +7397,10 @@ _pt__core() {
                     return 0
                     ;;
                 --baseline-config)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --top-k)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -7413,7 +7440,7 @@ _pt__core() {
             return 0
             ;;
         pt__subcmd__core__subcmd__replay__subcmd__help)
-            opts="label-template evaluate help"
+            opts="label-template evaluate refit help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -7468,6 +7495,20 @@ _pt__core() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        pt__subcmd__core__subcmd__replay__subcmd__help__subcmd__refit)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         pt__subcmd__core__subcmd__replay__subcmd__label__subcmd__template)
             opts="-f -v -q -h -V --snapshot --output --host-id --split --capabilities --config --format --verbose --quiet --no-color --timeout --robot --shadow --dry-run --standalone --fields --compact --max-tokens --estimate-tokens --help --version"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
@@ -7489,6 +7530,88 @@ _pt__core() {
                     ;;
                 --split)
                     COMPREPLY=($(compgen -W "training holdout" -- "${cur}"))
+                    return 0
+                    ;;
+                --capabilities)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --config)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "json toon md jsonl summary metrics slack exitcode prose" -- "${cur}"))
+                    return 0
+                    ;;
+                -f)
+                    COMPREPLY=($(compgen -W "json toon md jsonl summary metrics slack exitcode prose" -- "${cur}"))
+                    return 0
+                    ;;
+                --timeout)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --fields)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --max-tokens)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pt__subcmd__core__subcmd__replay__subcmd__refit)
+            opts="-f -v -q -h -V --training-snapshot --training-labels --holdout-snapshot --snapshot --holdout-labels --labels --output --method --max-change-fraction --grid-points --capabilities --config --format --verbose --quiet --no-color --timeout --robot --shadow --dry-run --standalone --fields --compact --max-tokens --estimate-tokens --help --version"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --training-snapshot)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --training-labels)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --snapshot)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --holdout-snapshot)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --labels)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --holdout-labels)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --output)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --method)
+                    COMPREPLY=($(compgen -W "counts score-grid" -- "${cur}"))
+                    return 0
+                    ;;
+                --max-change-fraction)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --grid-points)
+                    COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
                 --capabilities)
