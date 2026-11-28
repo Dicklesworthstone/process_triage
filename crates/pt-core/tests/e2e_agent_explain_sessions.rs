@@ -1134,7 +1134,12 @@ fn sessions_report_interrupted_admissions_without_completed_progress_or_resume_h
             (vec![started, completed.clone(), later], 0, 0, true),
             // Older journals contain terminal records without admission lines.
             (vec![failed.clone(), skipped.clone()], 0, 1, false),
-            (vec![failed, completed.clone(), skipped.clone()], 1, 0, false),
+            (
+                vec![failed, completed.clone(), skipped.clone()],
+                1,
+                0,
+                false,
+            ),
             (vec![completed.clone(), completed], 1, 0, false),
             (vec![skipped], 0, 0, false),
             (vec![wrong_pid], 0, 0, true),
@@ -1165,7 +1170,10 @@ fn sessions_report_interrupted_admissions_without_completed_progress_or_resume_h
             assert_eq!(status["progress"]["failed_actions"], failures, "{status}");
             assert_eq!(status["resumable"], false, "{status}");
             assert!(status["resume_command"].is_null(), "{status}");
-            assert_eq!(status["progress"]["approved_pending_actions"], 0, "{status}");
+            assert_eq!(
+                status["progress"]["approved_pending_actions"], 0,
+                "{status}"
+            );
             assert_eq!(
                 status["resume_refusal_reason"].is_string(),
                 uncertain || count == 0,
@@ -1182,24 +1190,44 @@ fn sessions_offer_resume_only_for_an_executable_plan_and_intact_journal() {
     with_temp_data_dir(|dir| {
         let session = create_session_with_plan(dir, test_identity(222_225), false);
         let handle = SessionStore::from_env().unwrap().open(&session).unwrap();
-        handle.update_state(pt_core::session::SessionState::Planned).unwrap();
+        handle
+            .update_state(pt_core::session::SessionState::Planned)
+            .unwrap();
         let path = handle.dir.join("decision/plan.json");
         let plan: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         let journal = handle.dir.join("action/outcomes.jsonl");
         let status = || {
-            let output = pt_core_fast().env("PROCESS_TRIAGE_DATA", dir.path())
-                .args(["--format", "json", "agent", "sessions", "--session", &session.0])
-                .assert().success().get_output().stdout.clone();
+            let output = pt_core_fast()
+                .env("PROCESS_TRIAGE_DATA", dir.path())
+                .args([
+                    "--format",
+                    "json",
+                    "agent",
+                    "sessions",
+                    "--session",
+                    &session.0,
+                ])
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone();
             serde_json::from_slice::<Value>(&output).unwrap()
         };
         let unapproved = status();
         assert!(unapproved["resume_command"].is_null());
-        assert!(unapproved["resume_refusal_reason"].as_str().unwrap().contains("no saved apply scope"));
+        assert!(unapproved["resume_refusal_reason"]
+            .as_str()
+            .unwrap()
+            .contains("no saved apply scope"));
 
         fs::rename(&path, path.with_extension("backup")).unwrap();
         let missing = status();
         assert!(missing["resume_command"].is_null());
-        assert!(missing["resume_refusal_reason"].as_str().unwrap().contains("missing"));
+        assert!(missing["resume_refusal_reason"]
+            .as_str()
+            .unwrap()
+            .contains("missing"));
         assert_eq!(missing["execution_uncertain"], false);
 
         fs::write(&path, b"{corrupt").unwrap();
@@ -1210,7 +1238,10 @@ fn sessions_offer_resume_only_for_an_executable_plan_and_intact_journal() {
         let mut wrong = plan.clone();
         wrong["session_id"] = serde_json::json!("pt-20260101-000000-wxyz");
         fs::write(&path, serde_json::to_vec(&wrong).unwrap()).unwrap();
-        assert!(status()["resume_refusal_reason"].as_str().unwrap().contains("another session"));
+        assert!(status()["resume_refusal_reason"]
+            .as_str()
+            .unwrap()
+            .contains("another session"));
 
         let mut blocked = plan.clone();
         blocked["actions"][0]["blocked"] = serde_json::json!(true);
@@ -1222,10 +1253,17 @@ fn sessions_offer_resume_only_for_an_executable_plan_and_intact_journal() {
 
         fs::write(&path, serde_json::to_vec(&plan).unwrap()).unwrap();
         fs::create_dir_all(journal.parent().unwrap()).unwrap();
-        fs::write(&journal, br#"{"action_id":"action-1","pid":222225,"status":"dry_run"}"#).unwrap();
+        fs::write(
+            &journal,
+            br#"{"action_id":"action-1","pid":222225,"status":"dry_run"}"#,
+        )
+        .unwrap();
         let partial = status();
         assert_eq!(partial["execution_uncertain"], true);
-        assert!(partial["resume_refusal_reason"].as_str().unwrap().contains("incomplete final record"));
+        assert!(partial["resume_refusal_reason"]
+            .as_str()
+            .unwrap()
+            .contains("incomplete final record"));
         assert!(partial["resume_command"].is_null());
     });
 }
@@ -1265,6 +1303,55 @@ fn sessions_detail_marks_successful_outcomes_in_human_output() {
         assert!(
             text.contains("PID 222223 ✓ success"),
             "expected successful outcome marker, got:\n{text}"
+        );
+    });
+}
+
+/// `agent plan` writes each candidate's display command as `command_short`.
+/// The detail view used to read a field no plan writes and printed `(?)`.
+#[test]
+fn sessions_detail_names_each_candidates_command() {
+    with_temp_data_dir(|dir| {
+        let session_id = create_session_with_plan(dir, test_identity(222_226), false);
+        let store = SessionStore::from_env().expect("session store from env");
+        let handle = store.open(&session_id).expect("open session");
+        let plan_path = handle.dir.join("decision").join("plan.json");
+        let mut plan: serde_json::Value =
+            serde_json::from_slice(&fs::read(&plan_path).expect("read plan")).expect("plan json");
+        // The candidate fields an actual `agent plan` document carries.
+        plan["candidates"] = serde_json::json!([{
+            "pid": 222226,
+            "command": "sleep 86402",
+            "command_short": "sleep",
+            "recommended_action": "kill",
+        }]);
+        fs::write(&plan_path, serde_json::to_vec_pretty(&plan).unwrap()).expect("write plan");
+
+        let output = pt_core_fast()
+            .env("PROCESS_TRIAGE_DATA", dir.path())
+            .args([
+                "--format",
+                "md",
+                "agent",
+                "sessions",
+                "--session",
+                &session_id.0,
+                "--detail",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+
+        let text = String::from_utf8(output).expect("utf8 output");
+        assert!(
+            text.contains("PID 222226 (sleep) -> kill"),
+            "expected the candidate's command in the detail view, got:\n{text}"
+        );
+        assert!(
+            !text.contains("(?)"),
+            "no candidate may render as (?):\n{text}"
         );
     });
 }

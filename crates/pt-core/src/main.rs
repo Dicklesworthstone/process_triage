@@ -52211,7 +52211,10 @@ fn run_agent_session_status(
                         println!("  Candidates: {}", candidates.len());
                         for (i, c) in candidates.iter().take(5).enumerate() {
                             let pid = c.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
-                            let cmd = c.get("cmd_short").and_then(|v| v.as_str()).unwrap_or("?");
+                            let cmd = c
+                                .get("command_short")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("?");
                             let action = c
                                 .get("recommended_action")
                                 .and_then(|v| v.as_str())
